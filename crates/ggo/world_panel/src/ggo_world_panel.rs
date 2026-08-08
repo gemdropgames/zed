@@ -1,48 +1,97 @@
 //! GGO World panel: a dock panel that lists the project's `worlds/**.toml`
-//! files and renders the selected world with real pixels (composed sprite/
-//! map images via `ggo-worldlib`), pan (middle-mouse drag) and wheel zoom.
+//! files, renders the selected world with real pixels (composed sprite/
+//! map images via `ggo-worldlib`), and edits it: click select, drag
+//! placement (live `WorldOp` moves coalesced per gesture), a schema-driven
+//! inspector, undo/redo, and save.
 //!
 //! Split: `loader` owns everything that runs off the UI thread (world
-//! read, instance resolution, asset composition); `canvas` owns camera
-//! math and painting; this module owns the panel entity, the picker, and
-//! the state machine between them.
+//! read, instance resolution, asset composition, manifest schemas);
+//! `canvas` owns camera math, drag math and painting; `inspector` owns the
+//! pure field-target/commit logic; this module owns the panel entity, the
+//! picker, the state machine, and all gpui wiring.
+//!
+//! Editing semantics are ported from ggo-ide's `pages/world/mod.rs`:
+//! primary-down hit-tests the CURRENT draw list in world coords and both
+//! selects and arms a drag; every drag move applies a live
+//! `MoveEntity`/`MoveInstance` with the gesture id (the store coalesces
+//! them into one undo entry); snap goes through `drag_ops::snap_to_tile`
+//! on the result. One deliberate divergence: empty-space left-drag does
+//! NOT pan (W6 chose middle-drag pan; left-click on empty is a pure
+//! deselect).
 
 mod canvas;
+mod inspector;
 mod loader;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage,
-    ScrollWheelEvent, Styled, Task, WeakEntity, Window, actions, div, px,
+    Action, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task,
+    WeakEntity, Window, actions, div, px,
 };
+use serde_json::Value;
 use ui::prelude::*;
+use ui::{Checkbox, ContextMenu, Divider, DropdownMenu, ToggleState};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::backgrounds::MergedBackground;
-use ggo_worldlib::render::{AssetLoads, active_camera_origin, build_draw_list};
-use ggo_worldlib::world_doc::WorldDocStore;
+use ggo_worldlib::drag_ops::{self, View};
+use ggo_worldlib::render::{
+    AssetLoads, DrawItem, Selection, active_camera_origin, build_draw_list, hit_test, world_label,
+};
+use ggo_worldlib::schemas::{ComponentSchema, defaults_for};
+use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
+use ggo_worldlib::world_file::write_world;
 use ggo_worldlib::world_files::WorldListing;
 
 actions!(
     ggo_world,
     [
         /// Toggles focus on the GGO world panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Undoes the last edit to the open world.
+        Undo,
+        /// Redoes the last undone edit to the open world.
+        Redo,
+        /// Saves the open world to its `worlds/*.toml` file.
+        Save,
+        /// Commits the focused inspector field (bound to Enter inside the
+        /// panel's field editors).
+        CommitField
     ]
 );
 
 const GGO_WORLD_PANEL_KEY: &str = "GGOWorldPanel";
 
+/// The panel's key-dispatch context (`.key_context`), which the
+/// [`bind_panel_keys`] bindings are scoped to.
+const KEY_CONTEXT: &str = "GgoWorldPanel";
+
 /// Fixed default width until the panel grows real settings persistence.
 const DEFAULT_WIDTH: Pixels = px(360.);
 
+/// Inspector column width inside the panel.
+const INSPECTOR_WIDTH: Pixels = px(220.);
+
 pub fn init(cx: &mut App) {
+    bind_panel_keys(cx);
+    // `zed::reload_keymaps` CLEARS all key bindings and rebuilds them from
+    // keymap files on every keymap/settings change (including once at
+    // startup) -- and this fork's rule is that keymap assets are upstream
+    // files we don't edit. `KeymapEventChannel` is triggered at the end of
+    // every such reload, so re-adding our panel-scoped bindings there
+    // keeps them alive without touching any upstream keymap.
+    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
+        .detach();
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -57,6 +106,25 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+fn bind_panel_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
+        // Single-line editors don't bind Enter themselves (the default
+        // keymap's `enter -> editor::Newline` is `mode == full` only), so
+        // this fires while an inspector field editor is focused.
+        KeyBinding::new(
+            "enter",
+            CommitField,
+            Some(&format!("{KEY_CONTEXT} > Editor")),
+        ),
+    ]);
 }
 
 // ------------------------------------------------------------- view state
@@ -80,7 +148,25 @@ struct Drag {
     start_pan: [f64; 2],
 }
 
-/// A loaded world plus its render-side caches.
+/// An in-flight left-mouse placement drag on the selected entity/instance
+/// -- ggo-ide's `CanvasGesture::Drag` plus its `drag_start_pos`/
+/// `drag_start_world` anchors.
+#[derive(Clone)]
+struct EditDrag {
+    gesture_id: String,
+    start_pos: [f64; 2],
+    start_world: [f64; 2],
+}
+
+/// One inspector text input: which field it edits and the single-line
+/// editor entity backing it. The subscription commits on blur.
+struct InspectorEntry {
+    target: inspector::FieldTarget,
+    editor: Entity<Editor>,
+    _subscription: Subscription,
+}
+
+/// A loaded world plus its render-side caches and editor state.
 struct OpenWorld {
     listing: WorldListing,
     store: WorldDocStore,
@@ -88,17 +174,24 @@ struct OpenWorld {
     map_loads: AssetLoads,
     meta_sprite_loads: AssetLoads,
     merged: Vec<MergedBackground>,
+    schemas: Vec<ComponentSchema>,
     /// One gpui `RenderImage` (BGRA) per composed worldlib image, built
     /// once at load time -- see `canvas::build_image_cache`.
-    images: Arc<std::collections::HashMap<usize, Arc<RenderImage>>>,
+    images: Arc<HashMap<usize, Arc<RenderImage>>>,
     view: Rc<RefCell<ViewShared>>,
+    selected: Option<Selection>,
+    snap: bool,
+    edit_drag: Option<EditDrag>,
+    gesture_counter: u64,
+    inspector: Vec<InspectorEntry>,
+    save_error: Option<String>,
 }
 
 impl OpenWorld {
     fn new(
         listing: WorldListing,
         loaded: loader::LoadedWorld,
-        images: std::collections::HashMap<usize, Arc<RenderImage>>,
+        images: HashMap<usize, Arc<RenderImage>>,
     ) -> Self {
         OpenWorld {
             listing,
@@ -107,6 +200,7 @@ impl OpenWorld {
             map_loads: loaded.map_loads,
             meta_sprite_loads: loaded.meta_sprite_loads,
             merged: loaded.merged,
+            schemas: loaded.schemas,
             images: Arc::new(images),
             view: Rc::new(RefCell::new(ViewShared {
                 zoom: 1.0,
@@ -114,8 +208,27 @@ impl OpenWorld {
                 last_bounds: None,
                 drag: None,
             })),
+            selected: None,
+            snap: false,
+            edit_drag: None,
+            gesture_counter: 0,
+            inspector: Vec::new(),
+            save_error: None,
         }
     }
+}
+
+/// The current paint-ordered draw list -- built fresh per use (render,
+/// hit test, tests), same per-frame-of-change cadence as ggo-ide.
+fn draw_items(open: &OpenWorld) -> Vec<DrawItem> {
+    build_draw_list(
+        &open.store.state(),
+        &open.merged,
+        open.selected,
+        &open.sprite_loads,
+        &open.map_loads,
+        &open.meta_sprite_loads,
+    )
 }
 
 enum ViewerState {
@@ -220,6 +333,281 @@ impl WorldPanel {
         }));
     }
 
+    // ------------------------------------------------------------ editing
+
+    /// Apply one op to the open world's store and repaint. Every editor
+    /// mutation funnels through here (or the drag/undo/redo paths, which
+    /// notify themselves), so the draw list -- rebuilt per render --
+    /// always reflects the store.
+    fn apply_op(&mut self, op: WorldOp, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.store.apply(op);
+            cx.notify();
+        }
+    }
+
+    fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.store.undo()
+        {
+            cx.notify();
+        }
+    }
+
+    fn redo_impl(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.store.redo()
+        {
+            cx.notify();
+        }
+    }
+
+    /// `to_doc()` -> `write_world` -> `mark_saved`. Synchronous by choice:
+    /// world files are small TOML, and the async save ggo-ide uses is an
+    /// iced task-architecture artifact, not an op-flow semantic (writing
+    /// then `mark_saved` in one step also avoids the marked-depth race a
+    /// mid-flight edit would cause).
+    fn save_impl(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        match write_world(&root, &open.listing.rel_path, &open.store.to_doc()) {
+            Ok(()) => {
+                open.store.mark_saved();
+                open.save_error = None;
+            }
+            Err(e) => open.save_error = Some(e.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// The current camera transform, if the canvas has laid out.
+    fn canvas_view(&self) -> Option<View> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let v = open.view.borrow();
+        let pan = v.pan?;
+        Some(View {
+            zoom: v.zoom,
+            pan_x: pan[0],
+            pan_y: pan[1],
+            dpr: None,
+        })
+    }
+
+    /// Left-mouse down at canvas-relative `local` px: hit-test in world
+    /// coords, update the selection, and arm a placement drag on a hit --
+    /// ggo-ide's `PrimaryDown` arm (minus its empty-space pan; panning is
+    /// middle-drag here).
+    fn canvas_primary_down(&mut self, local: [f64; 2], cx: &mut Context<Self>) {
+        let Some(view) = self.canvas_view() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let world = drag_ops::screen_to_world(local[0], local[1], &view);
+        let items = draw_items(open);
+        let hit = hit_test(&items, world[0], world[1]);
+        open.selected = hit;
+        let start_pos = match hit {
+            Some(Selection::Entity(i)) => inspector::entity_pos(&open.store.state(), i),
+            Some(Selection::Instance(i)) => {
+                open.store.state().instances.get(i).map(|inst| inst.pos)
+            }
+            None => None,
+        };
+        open.edit_drag = match start_pos {
+            Some(start_pos) => {
+                open.gesture_counter += 1;
+                Some(EditDrag {
+                    gesture_id: format!("drag-{}", open.gesture_counter),
+                    start_pos,
+                    start_world: world,
+                })
+            }
+            None => None,
+        };
+        cx.notify();
+    }
+
+    /// Continue the in-flight placement drag to canvas-relative `local`
+    /// px: live `MoveEntity`/`MoveInstance` applies sharing the drag's
+    /// gesture id (the store coalesces them into ONE undo entry) --
+    /// ggo-ide's `Moved` arm, snap included.
+    fn canvas_drag_to(&mut self, local: [f64; 2], cx: &mut Context<Self>) {
+        let Some(view) = self.canvas_view() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(drag) = open.edit_drag.clone() else {
+            return;
+        };
+        let world = drag_ops::screen_to_world(local[0], local[1], &view);
+        let pos = canvas::dragged_pos(drag.start_pos, drag.start_world, world, open.snap);
+        match open.selected {
+            Some(Selection::Entity(entity)) => open.store.apply(WorldOp::MoveEntity {
+                entity,
+                pos,
+                gesture: Some(drag.gesture_id),
+            }),
+            Some(Selection::Instance(index)) => open.store.apply(WorldOp::MoveInstance {
+                index,
+                pos,
+                gesture: Some(drag.gesture_id),
+            }),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// Middle-mouse pan handling for a move event. Returns true if the
+    /// event belonged to an in-flight pan (handled or cancelled).
+    fn handle_pan_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let ViewerState::Ready(open) = &self.state else {
+            return false;
+        };
+        let mut v = open.view.borrow_mut();
+        let Some(drag) = &v.drag else {
+            return false;
+        };
+        if event.pressed_button != Some(MouseButton::Middle) {
+            v.drag = None;
+            return true;
+        }
+        let dx = f64::from(event.position.x) - drag.start_cursor[0];
+        let dy = f64::from(event.position.y) - drag.start_cursor[1];
+        v.pan = Some([drag.start_pan[0] + dx, drag.start_pan[1] + dy]);
+        drop(v);
+        cx.notify();
+        true
+    }
+
+    /// Canvas-relative position for an in-flight placement drag's move
+    /// event; cancels the drag when the left button is no longer held.
+    fn edit_drag_local(&mut self, event: &MouseMoveEvent) -> Option<[f64; 2]> {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return None;
+        };
+        open.edit_drag.as_ref()?;
+        if event.pressed_button != Some(MouseButton::Left) {
+            open.edit_drag = None;
+            return None;
+        }
+        let v = open.view.borrow();
+        let bounds = v.last_bounds?;
+        Some([
+            f64::from(event.position.x - bounds.origin.x),
+            f64::from(event.position.y - bounds.origin.y),
+        ])
+    }
+
+    // -------------------------------------------------- inspector editors
+
+    /// Keep the inspector's editor entities in sync with the selection:
+    /// rebuild when the set of editable fields changed (selection change,
+    /// component add/remove, undo/redo restructure), otherwise refresh
+    /// unfocused editors' text from the doc (a focused editor keeps the
+    /// user's in-progress buffer, ggo-ide's `field_edit` rule).
+    fn ensure_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let state = open.store.state();
+        let specs = inspector::selection_field_specs(open.selected, &state, &open.schemas);
+        let same_targets = open.inspector.len() == specs.len()
+            && open
+                .inspector
+                .iter()
+                .zip(&specs)
+                .all(|(entry, spec)| entry.target == spec.target);
+
+        if same_targets {
+            for entry in &open.inspector {
+                if entry.editor.focus_handle(cx).is_focused(window) {
+                    continue;
+                }
+                let text = inspector::display_text(&entry.target, &state, &open.schemas);
+                if entry.editor.read(cx).text(cx) != text {
+                    entry
+                        .editor
+                        .update(cx, |editor, cx| editor.set_text(text, window, cx));
+                }
+            }
+            return;
+        }
+
+        let mut entries = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let text = inspector::display_text(&spec.target, &state, &open.schemas);
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(text, window, cx);
+                editor
+            });
+            let subscription = cx.subscribe(&editor, Self::handle_editor_event);
+            entries.push(InspectorEntry {
+                target: spec.target.clone(),
+                editor,
+                _subscription: subscription,
+            });
+        }
+        open.inspector = entries;
+    }
+
+    /// Blur commits the field, matching the brief's enter/blur rule (and
+    /// ggo-ide's cross-field commit-on-input). An unchanged or unparsable
+    /// buffer is a no-op in the store, so committing every blur is safe.
+    fn handle_editor_event(
+        &mut self,
+        editor: Entity<Editor>,
+        event: &EditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, EditorEvent::Blurred) {
+            self.commit_editor(editor.entity_id(), cx);
+        }
+    }
+
+    fn commit_editor(&mut self, editor_id: EntityId, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some((target, text)) = open
+            .inspector
+            .iter()
+            .find(|e| e.editor.entity_id() == editor_id)
+            .map(|e| (e.target.clone(), e.editor.read(cx).text(cx)))
+        else {
+            return;
+        };
+        let state = open.store.state();
+        if let Some(op) = inspector::commit_field(&target, &text, &state, &open.schemas) {
+            open.store.apply(op);
+            cx.notify();
+        }
+    }
+
+    fn on_commit_field(&mut self, _: &CommitField, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let focused = open
+            .inspector
+            .iter()
+            .find(|e| e.editor.focus_handle(cx).is_focused(window))
+            .map(|e| e.editor.entity_id());
+        if let Some(id) = focused {
+            self.commit_editor(id, cx);
+        }
+    }
+
     // ------------------------------------------------------------- render
 
     fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -261,24 +649,82 @@ impl WorldPanel {
             .into_any_element()
     }
 
-    fn render_viewer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Save / undo / redo / snap row, with the dirty dot on the world's
+    /// title.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_viewer is only called in the Ready state");
+            unreachable!("render_toolbar is only called in the Ready state");
+        };
+        let dirty = open.store.state().dirty;
+        let snap = open.snap;
+        let weak = cx.weak_entity();
+        let title = format!(
+            "{}{}",
+            world_label(&open.listing.stem),
+            if dirty { " ●" } else { "" }
+        );
+        h_flex()
+            .gap_1()
+            .p_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(Label::new(title).size(LabelSize::Small).color(if dirty {
+                Color::Modified
+            } else {
+                Color::Muted
+            }))
+            .child(div().flex_1())
+            .child(
+                Checkbox::new("ggo-world-snap", ToggleState::from(snap))
+                    .label("Snap")
+                    .on_click(move |toggle, _window, cx| {
+                        let on = matches!(toggle, ToggleState::Selected);
+                        weak.update(cx, |this, cx| {
+                            if let ViewerState::Ready(open) = &mut this.state {
+                                open.snap = on;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }),
+            )
+            .child(
+                IconButton::new("ggo-world-undo", IconName::Undo)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Undo"))
+                    .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
+            )
+            .child(
+                IconButton::new("ggo-world-redo", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Redo"))
+                    .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
+            )
+            .child(
+                Button::new("ggo-world-save", "Save")
+                    .disabled(!dirty)
+                    .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
+            )
+            .children(open.save_error.as_ref().map(|e| {
+                Label::new(format!("save failed: {e}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Error)
+            }))
+            .into_any_element()
+    }
+
+    fn render_canvas(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_canvas is only called in the Ready state");
         };
 
         // Build the paint-ordered draw list from current state + loads --
         // per render (i.e. per notify), matching ggo-ide's
         // per-frame-of-change rebuild; images inside are `Arc` clones.
-        let state = open.store.state();
-        let items = build_draw_list(
-            &state,
-            &open.merged,
-            None,
-            &open.sprite_loads,
-            &open.map_loads,
-            &open.meta_sprite_loads,
-        );
-        let screen_origin = active_camera_origin(&state);
+        // Selection is threaded through so `build_draw_list` emits the
+        // `SelectionOutline` overlay.
+        let items = draw_items(open);
+        let screen_origin = active_camera_origin(&open.store.state());
         let world_center = canvas::camera_center(screen_origin);
         let images = open.images.clone();
         let view = open.view.clone();
@@ -320,6 +766,36 @@ impl WorldPanel {
             .overflow_hidden()
             .child(element)
             .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    // Take focus so the panel's Undo/Redo/Save bindings
+                    // apply (and any in-progress field edit blur-commits).
+                    window.focus(&this.focus_handle, cx);
+                    let local = {
+                        let ViewerState::Ready(open) = &this.state else {
+                            return;
+                        };
+                        let v = open.view.borrow();
+                        let Some(bounds) = v.last_bounds else {
+                            return;
+                        };
+                        [
+                            f64::from(event.position.x - bounds.origin.x),
+                            f64::from(event.position.y - bounds.origin.y),
+                        ]
+                    };
+                    this.canvas_primary_down(local, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                    if let ViewerState::Ready(open) = &mut this.state {
+                        open.edit_drag = None;
+                    }
+                }),
+            )
+            .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
                     let ViewerState::Ready(open) = &this.state else {
@@ -338,22 +814,13 @@ impl WorldPanel {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                let ViewerState::Ready(open) = &this.state else {
-                    return;
-                };
-                let mut v = open.view.borrow_mut();
-                let Some(drag) = &v.drag else {
-                    return;
-                };
-                if event.pressed_button != Some(MouseButton::Middle) {
-                    v.drag = None;
+                if this.handle_pan_move(event, cx) {
                     return;
                 }
-                let dx = f64::from(event.position.x) - drag.start_cursor[0];
-                let dy = f64::from(event.position.y) - drag.start_cursor[1];
-                v.pan = Some([drag.start_pan[0] + dx, drag.start_pan[1] + dy]);
-                drop(v);
-                cx.notify();
+                let Some(local) = this.edit_drag_local(event) else {
+                    return;
+                };
+                this.canvas_drag_to(local, cx);
             }))
             .on_mouse_up(
                 MouseButton::Middle,
@@ -391,19 +858,338 @@ impl WorldPanel {
             }))
             .into_any_element()
     }
+
+    /// One inspector text input, wrapped in a minimal bordered box (the
+    /// brief's "primitive gpui/ui components" rule -- no widget framework).
+    fn editor_input(editor: &Entity<Editor>, cx: &Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .px_1()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .rounded_sm()
+            .bg(cx.theme().colors().editor_background)
+            .child(editor.clone())
+            .into_any_element()
+    }
+
+    fn field_label(label: &str) -> gpui::AnyElement {
+        div()
+            .w(px(72.))
+            .flex_none()
+            .child(
+                Label::new(SharedString::from(label.to_string()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    fn render_entity_inspector(
+        &self,
+        entity_ix: usize,
+        entity: &ggo_worldlib::world_doc::WorldEntity,
+        editors: &HashMap<inspector::FieldTarget, Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("inspector renders only in the Ready state");
+        };
+        let schemas = &open.schemas;
+        let mut col = v_flex()
+            .gap_1()
+            .child(Label::new(format!("Entity #{entity_ix}")).size(LabelSize::Small));
+
+        for (component, value) in &entity.components {
+            let name = component.clone();
+            let mut panel = v_flex().gap_1().child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new(SharedString::from(component.clone())))
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("ggo-remove-{component}")),
+                            IconName::Trash,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // Direct undoable removal (ggo-ide's
+                            // Transform-with-visual confirm modal is not
+                            // ported; undo covers it).
+                            this.apply_op(
+                                WorldOp::RemoveComponent {
+                                    entity: entity_ix,
+                                    name: name.clone(),
+                                },
+                                cx,
+                            );
+                        })),
+                    ),
+            );
+
+            match value.as_object() {
+                Some(fields) => {
+                    for (field, field_value) in fields {
+                        match inspector::field_kind(schemas, component, field) {
+                            Some(ggo_worldlib::schemas::FieldKind::Bool) => {
+                                let checked = field_value.as_bool().unwrap_or(false);
+                                let weak = cx.weak_entity();
+                                let component = component.clone();
+                                let field_name = field.clone();
+                                panel = panel.child(
+                                    Checkbox::new(
+                                        SharedString::from(format!(
+                                            "ggo-field-{component}-{field}"
+                                        )),
+                                        ToggleState::from(checked),
+                                    )
+                                    .label(SharedString::from(field.clone()))
+                                    .on_click(
+                                        move |toggle, _window, cx| {
+                                            let value = matches!(toggle, ToggleState::Selected);
+                                            weak.update(cx, |this, cx| {
+                                                this.apply_op(
+                                                    WorldOp::SetField {
+                                                        entity: entity_ix,
+                                                        component: component.clone(),
+                                                        field: field_name.clone(),
+                                                        value: Value::Bool(value),
+                                                    },
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                        },
+                                    ),
+                                );
+                            }
+                            Some(ggo_worldlib::schemas::FieldKind::Vec2) => {
+                                let axis_editor = |axis: usize| {
+                                    editors.get(&inspector::FieldTarget::EntityVec2Axis {
+                                        entity: entity_ix,
+                                        component: component.clone(),
+                                        field: field.clone(),
+                                        axis,
+                                    })
+                                };
+                                let mut row =
+                                    h_flex().gap_1().child(Self::field_label(field.as_str()));
+                                for axis in 0..2 {
+                                    if let Some(editor) = axis_editor(axis) {
+                                        row = row.child(Self::editor_input(editor, cx));
+                                    }
+                                }
+                                panel = panel.child(row);
+                            }
+                            _ => {
+                                let target = inspector::FieldTarget::EntityField {
+                                    entity: entity_ix,
+                                    component: component.clone(),
+                                    field: field.clone(),
+                                };
+                                if let Some(editor) = editors.get(&target) {
+                                    panel = panel.child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(Self::field_label(field.as_str()))
+                                            .child(Self::editor_input(editor, cx)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // A component in a non-object state (marker bool, string,
+                // array) still shows its raw value with a working Remove
+                // button -- ggo-ide dogfood round 2.
+                None => {
+                    panel = panel.child(
+                        Label::new(format!("(non-object value: {value})"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    );
+                }
+            }
+
+            col = col.child(panel).child(Divider::horizontal());
+        }
+
+        // Add-component picker over every schema not already present,
+        // seeded by `defaults_for` -- ggo-ide's `pick_list` flow.
+        let addable: Vec<ComponentSchema> = schemas
+            .iter()
+            .filter(|s| !entity.components.contains_key(&s.name))
+            .cloned()
+            .collect();
+        if !addable.is_empty() {
+            let weak = cx.weak_entity();
+            let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                for schema in addable {
+                    let weak = weak.clone();
+                    let name = schema.name.clone();
+                    menu = menu.entry(
+                        SharedString::from(name.clone()),
+                        None,
+                        move |_window, cx| {
+                            let defaults = defaults_for(&schema);
+                            let name = name.clone();
+                            weak.update(cx, |this, cx| {
+                                this.apply_op(
+                                    WorldOp::AddComponent {
+                                        entity: entity_ix,
+                                        name,
+                                        defaults,
+                                    },
+                                    cx,
+                                );
+                            })
+                            .ok();
+                        },
+                    );
+                }
+                menu
+            });
+            col = col.child(DropdownMenu::new(
+                "ggo-add-component",
+                "Add component…",
+                menu,
+            ));
+        }
+
+        col.into_any_element()
+    }
+
+    fn render_instance_inspector(
+        &self,
+        index: usize,
+        editors: &HashMap<inspector::FieldTarget, Entity<Editor>>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("inspector renders only in the Ready state");
+        };
+        let state = open.store.state();
+        let Some(instance) = state.instances.get(index) else {
+            return Label::new("Nothing selected.")
+                .color(Color::Muted)
+                .into_any_element();
+        };
+        let mut col = v_flex()
+            .gap_1()
+            .child(Label::new(format!("Instance #{index}")).size(LabelSize::Small))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Self::field_label("world"))
+                    .child(Label::new(SharedString::from(
+                        world_label(&instance.world).to_string(),
+                    ))),
+            );
+        let mut row = h_flex().gap_1().child(Self::field_label("pos"));
+        for axis in 0..2 {
+            if let Some(editor) =
+                editors.get(&inspector::FieldTarget::InstancePosAxis { index, axis })
+            {
+                row = row.child(Self::editor_input(editor, cx));
+            }
+        }
+        col = col.child(row);
+        if let Some(error) = &instance.error {
+            if !error.is_null() {
+                col = col.child(
+                    Label::new(error.to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                );
+            }
+        }
+        col.into_any_element()
+    }
+
+    /// The right-side inspector column -- rendered only with a selection.
+    fn render_inspector(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let selection = open.selected?;
+        let editors: HashMap<inspector::FieldTarget, Entity<Editor>> = open
+            .inspector
+            .iter()
+            .map(|e| (e.target.clone(), e.editor.clone()))
+            .collect();
+        let state = open.store.state();
+        let body = match selection {
+            Selection::Entity(i) => match state.entities.get(i) {
+                Some(entity) => {
+                    let entity = entity.clone();
+                    self.render_entity_inspector(i, &entity, &editors, window, cx)
+                }
+                None => Label::new("Nothing selected.")
+                    .color(Color::Muted)
+                    .into_any_element(),
+            },
+            Selection::Instance(i) => self.render_instance_inspector(i, &editors, cx),
+        };
+        Some(
+            div()
+                .id("ggo-world-inspector")
+                .w(INSPECTOR_WIDTH)
+                .h_full()
+                .flex_none()
+                .border_l_1()
+                .border_color(cx.theme().colors().border)
+                .overflow_y_scroll()
+                .child(v_flex().p_1().gap_1().child(body))
+                .into_any_element(),
+        )
+    }
+
+    fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let inspector = self.render_inspector(window, cx);
+        v_flex()
+            .size_full()
+            .child(self.render_toolbar(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.render_canvas(cx)),
+                    )
+                    .children(inspector),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for WorldPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_inspector(window, cx);
         let body = match &self.state {
             ViewerState::Empty => self.render_message("Select a world".to_string(), cx),
             ViewerState::Loading { stem } => self.render_message(format!("Loading {stem}…"), cx),
             ViewerState::Error(e) => self.render_message(format!("Failed to load: {e}"), cx),
-            ViewerState::Ready(_) => self.render_viewer(cx),
+            ViewerState::Ready(_) => self.render_ready(window, cx),
         };
         v_flex()
+            .key_context(KEY_CONTEXT)
             .size_full()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
+            .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
+            .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
+            .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
             .child(self.render_picker(cx))
             .child(div().flex_1().min_h_0().child(body))
@@ -485,7 +1271,9 @@ impl Panel for WorldPanel {
 mod tests {
     use super::*;
     use ggo_worldlib::render::DrawKind;
-    use ggo_worldlib::world_file::{WorldEntity, WorldFile, WorldInstance, write_world};
+    use ggo_worldlib::world_file::{
+        WorldEntity, WorldFile, WorldInstance, read_world, write_world,
+    };
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use serde_json::json;
@@ -590,6 +1378,41 @@ mod tests {
         write_world(root, "worlds/test.toml", &main).unwrap();
     }
 
+    /// Load `worlds/test` into a fresh panel and return it Ready, with the
+    /// camera at identity (pan `[0, 0]`, zoom 1) so canvas-local px ==
+    /// world px in the editor tests.
+    async fn ready_panel(
+        cx: &mut TestAppContext,
+        root: &std::path::Path,
+    ) -> gpui::Entity<WorldPanel> {
+        write_fixture(root);
+        let root = root.to_path_buf();
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = WorldPanel::new(None, cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_worlds(cx);
+            let ix = panel
+                .worlds
+                .iter()
+                .position(|w| w.stem == "worlds/test")
+                .unwrap();
+            panel.select_world(ix, cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready state after load");
+            };
+            open.view.borrow_mut().pan = Some([0.0, 0.0]);
+        });
+        panel
+    }
+
     /// End-to-end viewer load against a real-fs temp project: picker
     /// enumerates both worlds, selecting `worlds/test` runs the off-thread
     /// loader (including recursive instance resolution of `worlds/sub`),
@@ -627,15 +1450,7 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready state after load");
             };
-            let state = open.store.state();
-            let items = build_draw_list(
-                &state,
-                &open.merged,
-                None,
-                &open.sprite_loads,
-                &open.map_loads,
-                &open.meta_sprite_loads,
-            );
+            let items = draw_items(open);
             assert!(!items.is_empty(), "draw list should not be empty");
 
             let rects = items
@@ -657,6 +1472,220 @@ mod tests {
                     .iter()
                     .any(|i| matches!(i.kind, DrawKind::InstanceOrigin)),
                 "instance origin gizmo should be in the draw list"
+            );
+        });
+    }
+
+    /// Click select: a primary-down over the RectFill (world [4,4]..[20,16]
+    /// at identity view) selects Entity(0) and the rebuilt draw list gains
+    /// a SelectionOutline; a primary-down over empty space deselects.
+    #[gpui::test]
+    async fn test_click_selects_entity_and_empty_click_deselects(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down([10.0, 10.0], cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(open.selected, Some(Selection::Entity(0)));
+            assert!(
+                open.edit_drag.is_some(),
+                "a hit should also arm a placement drag"
+            );
+            let items = draw_items(open);
+            assert!(
+                items
+                    .iter()
+                    .any(|i| matches!(i.kind, DrawKind::SelectionOutline)),
+                "selection outline should be emitted for the selected entity"
+            );
+
+            panel.canvas_primary_down([300.0, 300.0], cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(open.selected, None, "empty-space click deselects");
+            assert!(open.edit_drag.is_none());
+            let items = draw_items(open);
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i.kind, DrawKind::SelectionOutline)),
+                "no outline without a selection"
+            );
+        });
+    }
+
+    /// Drag placement: live gesture moves coalesce into ONE undo entry;
+    /// snap lands the result on the tile grid; undo/redo round-trips the
+    /// position and the dirty flag.
+    #[gpui::test]
+    async fn test_drag_moves_entity_with_gesture_coalescing_snap_and_undo_redo(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down([10.0, 10.0], cx);
+            panel.canvas_drag_to([26.0, 13.0], cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            // start [4,4] + world delta [16,3].
+            assert_eq!(
+                inspector::entity_pos(&open.store.state(), 0),
+                Some([20.0, 7.0])
+            );
+            assert!(open.store.state().dirty);
+        });
+
+        panel.update(cx, |panel, cx| {
+            // Snap mid-gesture: result snaps to the grid, not the delta.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.snap = true;
+            }
+            panel.canvas_drag_to([27.0, 10.0], cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            // [4,4] + [17,0] = [21,4] -> snapped [16,0].
+            assert_eq!(
+                inspector::entity_pos(&open.store.state(), 0),
+                Some([16.0, 0.0])
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            // One undo unwinds the WHOLE drag (gesture coalescing), and
+            // clears dirty back to the load state.
+            panel.undo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                inspector::entity_pos(&open.store.state(), 0),
+                Some([4.0, 4.0])
+            );
+            assert!(!open.store.state().dirty, "undo back to saved => clean");
+
+            panel.redo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                inspector::entity_pos(&open.store.state(), 0),
+                Some([16.0, 0.0])
+            );
+            assert!(open.store.state().dirty, "redo re-dirties");
+        });
+    }
+
+    /// Save: `to_doc()` -> `write_world` -> `mark_saved`; the written file
+    /// `read_world`-round-trips equal to `to_doc()` and the dirty flag
+    /// clears.
+    #[gpui::test]
+    async fn test_save_writes_file_that_round_trips_and_clears_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [50.0, 60.0],
+                    gesture: None,
+                },
+                cx,
+            );
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.store.state().dirty);
+
+            panel.save_impl(cx);
+
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.save_error.is_none(), "save should succeed");
+            assert!(!open.store.state().dirty, "mark_saved clears dirty");
+            let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+            let doc = open.store.to_doc();
+            assert!(
+                world_files_equal(&on_disk, &doc),
+                "written file must read back equal to to_doc(): {on_disk:?} vs {doc:?}"
+            );
+        });
+    }
+
+    /// `WorldFile` equality under JS-number semantics (`50` == `50.0`) --
+    /// the TOML writer canonicalizes whole floats to integers, so derived
+    /// `PartialEq` (which distinguishes `serde_json` int/float reprs) is
+    /// stricter than the actual round-trip contract; worldlib's own
+    /// `world_doc::values_equal` makes the same call.
+    fn world_files_equal(a: &WorldFile, b: &WorldFile) -> bool {
+        fn values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+            use serde_json::Value;
+            match (a, b) {
+                (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+                (Value::Array(x), Value::Array(y)) => {
+                    x.len() == y.len() && x.iter().zip(y).all(|(a, b)| values_equal(a, b))
+                }
+                (Value::Object(x), Value::Object(y)) => {
+                    x.len() == y.len()
+                        && x.iter()
+                            .all(|(k, v)| y.get(k).is_some_and(|v2| values_equal(v, v2)))
+                }
+                _ => a == b,
+            }
+        }
+        a.entities.len() == b.entities.len()
+            && a.entities.iter().zip(&b.entities).all(|(x, y)| {
+                values_equal(
+                    &serde_json::Value::Object(x.components.clone()),
+                    &serde_json::Value::Object(y.components.clone()),
+                )
+            })
+            && a.instances == b.instances
+            && a.backgrounds == b.backgrounds
+    }
+
+    /// Field commits map inspector text to ops against the LIVE panel
+    /// store: an int field edit applies SetField; undo restores it.
+    #[gpui::test]
+    async fn test_commit_field_applies_set_field_through_the_store(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.selected = Some(Selection::Entity(0));
+            let state = open.store.state();
+            let target = inspector::FieldTarget::EntityField {
+                entity: 0,
+                component: "Transform".to_string(),
+                field: "z".to_string(),
+            };
+            let op = inspector::commit_field(&target, "7", &state, &open.schemas).unwrap();
+            open.store.apply(op);
+            assert_eq!(
+                open.store.state().entities[0].components["Transform"]["z"],
+                json!(7)
+            );
+            panel.undo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            // The TOML reader canonicalizes the fixture's `0.0` to the
+            // integer `0`; undo restores that exact stored value.
+            assert_eq!(
+                open.store.state().entities[0].components["Transform"]["z"],
+                json!(0)
             );
         });
     }

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use ggo_worldlib::backgrounds::{MergedBackground, merge_backgrounds};
 use ggo_worldlib::render::{self, AssetLoads, Loadable, collect_load_targets};
+use ggo_worldlib::schemas::{ComponentSchema, ManifestComponent, all_schemas, manifest_components};
 use ggo_worldlib::sprites::{io, map_doc, palette565, preview};
 use ggo_worldlib::world_doc::{Background, WorldDocStore, WorldDocWire};
 use ggo_worldlib::world_file::read_world;
@@ -31,6 +32,9 @@ pub struct LoadedWorld {
     pub map_loads: AssetLoads,
     pub meta_sprite_loads: AssetLoads,
     pub merged: Vec<MergedBackground>,
+    /// Inspector schema set: builtins + this project's manifest
+    /// components (see [`manifest_schemas`]).
+    pub schemas: Vec<ComponentSchema>,
 }
 
 // ------------------------------------------------------------ worlds list
@@ -145,7 +149,38 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
         map_loads,
         meta_sprite_loads,
         merged,
+        schemas: manifest_schemas(project_dir),
     })
+}
+
+// -------------------------------------------------------- manifest schemas
+
+/// emerald's `MANIFEST_VERSION` -- a `components.toml` whose `version`
+/// exceeds this was written by a newer `emd` than this build knows about
+/// (same gate as ggo-ide's `emerald::read_one_manifest`).
+const MANIFEST_SCHEMA_VERSION: u64 = 1;
+
+/// The inspector's schema set: builtins plus `manifests/components.toml`'s
+/// `[[component]]` entries. Ports ggo-ide's `manifests_task` ->
+/// `ManifestsResult` feed (`manifest_components` on `components.toml` only
+/// -- the other manifest files carry no `component` array); any failure
+/// (unmanaged project, parse error, missing/newer `version`) falls back to
+/// builtins only, exactly like ggo-ide's `Err` arm. Adaptation noted: this
+/// reads just `components.toml` instead of enumerating every
+/// `manifests/*.toml`, since the schema feed never consumed the others.
+pub fn manifest_schemas(project_dir: &Path) -> Vec<ComponentSchema> {
+    all_schemas(&read_components_manifest(project_dir).unwrap_or_default())
+}
+
+fn read_components_manifest(project_dir: &Path) -> Option<Vec<ManifestComponent>> {
+    let path = project_dir.join("manifests").join("components.toml");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = toml::from_str(&content).ok()?;
+    let version = json.get("version").and_then(serde_json::Value::as_u64)?;
+    if version > MANIFEST_SCHEMA_VERSION {
+        return None;
+    }
+    Some(manifest_components(&json))
 }
 
 fn settle(result: Result<render::RgbaImage, String>) -> Loadable<render::RgbaImage> {
@@ -296,5 +331,39 @@ mod tests {
     fn list_worlds_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(list_worlds(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn manifest_schemas_unmanaged_project_is_builtins_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            manifest_schemas(dir.path()),
+            ggo_worldlib::schemas::builtin_schemas()
+        );
+    }
+
+    #[test]
+    fn manifest_schemas_appends_manifest_components_and_gates_on_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let toml = "version = 1\n\n[[component]]\nname = \"Health\"\n\n[[component.field]]\nname = \"hp\"\nkind = \"int\"\n";
+        std::fs::write(manifests.join("components.toml"), toml).unwrap();
+
+        let schemas = manifest_schemas(dir.path());
+        let health = schemas.iter().find(|s| s.name == "Health").unwrap();
+        assert_eq!(health.fields[0].name, "hp");
+
+        // A newer-than-known version falls back to builtins (same gate as
+        // ggo-ide's read_one_manifest).
+        std::fs::write(
+            manifests.join("components.toml"),
+            "version = 99\n\n[[component]]\nname = \"Health\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_schemas(dir.path()),
+            ggo_worldlib::schemas::builtin_schemas()
+        );
     }
 }

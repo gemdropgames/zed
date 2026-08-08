@@ -12,18 +12,18 @@ workspace = true
 path = "src/ggo_world_panel.rs"
 
 [dependencies]
+editor.workspace = true
 gpui.workspace = true
 image.workspace = true
+keymap_editor.workspace = true
 project.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
+toml.workspace = true
 ui.workspace = true
 workspace.workspace = true
 ggo-worldlib.workspace = true # GGO
-# Crate-local path dep (not a workspace dep -- keeps this task free of
-# upstream Cargo.toml edits): the RGB565<->RGB888 pixel helpers worldlib's
-# own compose path uses; single source, no local copy.
-ggo-asset-formats = { path = "../../../../ggo/sdk/ggo-asset-formats" } # GGO
+ggo-asset-formats.workspace = true # GGO
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

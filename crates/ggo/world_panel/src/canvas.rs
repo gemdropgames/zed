@@ -83,6 +83,27 @@ pub fn camera_center(origin: [f64; 2]) -> [f64; 2] {
     ]
 }
 
+/// Where a left-drag places the dragged entity/instance: the drag-start
+/// position plus the world-space cursor delta, snapped to the tile grid
+/// when the editor's snap toggle is on -- ggo-ide's `CanvasGesture::Drag`
+/// move math (snap applies to the RESULT, not the delta, via
+/// `drag_ops::snap_to_tile`).
+pub fn dragged_pos(
+    start_pos: [f64; 2],
+    start_world: [f64; 2],
+    world: [f64; 2],
+    snap: bool,
+) -> [f64; 2] {
+    let mut pos = [
+        start_pos[0] + world[0] - start_world[0],
+        start_pos[1] + world[1] - start_world[1],
+    ];
+    if snap {
+        pos = drag_ops::snap_to_tile(pos);
+    }
+    pos
+}
+
 // -------------------------------------------------------- BGRA conversion
 
 /// In-place RGBA8 -> BGRA8 (straight alpha in, straight alpha out --
@@ -428,6 +449,25 @@ mod tests {
             },
         );
         assert_eq!(screen, [200.0, 150.0]);
+    }
+
+    #[test]
+    fn dragged_pos_applies_world_delta_from_the_drag_start() {
+        // Start pos [4, 4], cursor went from world [10, 10] to [26, 13].
+        assert_eq!(
+            dragged_pos([4.0, 4.0], [10.0, 10.0], [26.0, 13.0], false),
+            [20.0, 7.0]
+        );
+    }
+
+    #[test]
+    fn dragged_pos_snaps_the_result_not_the_delta() {
+        // Off-grid start [4, 4] + delta [17, 0] = [21, 4] -> snapped [16, 0]:
+        // the dragged item lands ON grid even from an off-grid start.
+        assert_eq!(
+            dragged_pos([4.0, 4.0], [10.0, 10.0], [27.0, 10.0], true),
+            [16.0, 0.0]
+        );
     }
 
     /// The classic red/blue swap bug: RGBA in, BGRA out, alpha untouched.
