@@ -83,6 +83,7 @@ members = [
     "crates/fs_benchmarks",
     "crates/fuzzy",
     "crates/fuzzy_nucleo",
+    "crates/ggo/*", # GGO
     "crates/git",
     "crates/git_hosting_providers",
     "crates/git_ui",
@@ -345,6 +346,7 @@ file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
+ggo_hello = { path = "crates/ggo/hello" } # GGO
 git = { path = "crates/git" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
