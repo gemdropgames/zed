@@ -28,3 +28,4 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
 - 2026-08-07 incremental rebuild after touching ggo_hello: 7.58s
 - pane smoke: headless gpui test added (test_open_hello_action); human visual run still welcome
 - 2026-08-07 merge drill: upstream/main was zero-delta (0 new commits since clone) — `git merge upstream/main --no-edit` was a no-op, no conflicts. `cargo test -p ggo_hello && cargo check -p zed` passed clean, fully cached (<1s). Procedure validated but not exercised against real upstream churn — repeat drill pending in a few days before F1 starts.
+- 2026-08-08 merge drill #2 (real): 6 upstream commits, 0 conflicts, ggo_hello 3/3 + check clean in ~40s
