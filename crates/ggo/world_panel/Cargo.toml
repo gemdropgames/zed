@@ -1,0 +1,23 @@
+[package]
+name = "ggo_world_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ggo_world_panel.rs"
+
+[dependencies]
+gpui.workspace = true
+ui.workspace = true
+workspace.workspace = true
+ggo-worldlib.workspace = true # GGO
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

@@ -346,7 +346,9 @@ file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
+ggo-worldlib = { path = "../ggo/tools/ggo-worldlib" } # GGO
 ggo_hello = { path = "crates/ggo/hello" } # GGO
+ggo_world_panel = { path = "crates/ggo/world_panel" } # GGO
 git = { path = "crates/git" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
