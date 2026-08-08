@@ -7325,9 +7325,14 @@ dependencies = [
 name = "ggo_world_panel"
 version = "0.1.0"
 dependencies = [
+ "ggo-asset-formats",
  "ggo-worldlib",
  "gpui",
+ "image",
  "project",
+ "serde_json",
+ "smallvec",
+ "tempfile",
  "ui",
  "workspace",
 ]
