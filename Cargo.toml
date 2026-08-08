@@ -350,6 +350,7 @@ ggo-asset-formats = { path = "../ggo/sdk/ggo-asset-formats" } # GGO
 ggo-worldlib = { path = "../ggo/tools/ggo-worldlib" } # GGO
 ggo_common = { path = "crates/ggo/common" } # GGO
 ggo_hello = { path = "crates/ggo/hello" } # GGO
+ggo_metasprite_panel = { path = "crates/ggo/metasprite_panel" } # GGO
 ggo_world_panel = { path = "crates/ggo/world_panel" } # GGO
 git = { path = "crates/git" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }

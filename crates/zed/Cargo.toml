@@ -113,6 +113,7 @@ file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
 ggo_hello.workspace = true # GGO
+ggo_metasprite_panel.workspace = true # GGO
 ggo_world_panel.workspace = true # GGO
 git.workspace = true
 git_hosting_providers.workspace = true

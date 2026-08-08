@@ -7330,6 +7330,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_metasprite_panel"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "keymap_editor",
+ "project",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "ggo_world_panel"
 version = "0.1.0"
 dependencies = [
@@ -23425,6 +23436,7 @@ dependencies = [
  "fs",
  "futures 0.3.32",
  "ggo_hello",
+ "ggo_metasprite_panel",
  "ggo_world_panel",
  "git",
  "git_hosting_providers",
