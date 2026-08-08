@@ -15,3 +15,8 @@ path = "src/ggo_hello.rs"
 gpui.workspace = true
 ui.workspace = true
 workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
