@@ -1,0 +1,16 @@
+[package]
+name = "ggo_common"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ggo_common.rs"
+
+[dependencies]
+gpui.workspace = true
+image.workspace = true

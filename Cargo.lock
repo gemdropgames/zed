@@ -7312,6 +7312,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_common"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "image",
+]
+
+[[package]]
 name = "ggo_hello"
 version = "0.1.0"
 dependencies = [
@@ -7328,12 +7336,11 @@ dependencies = [
  "editor",
  "ggo-asset-formats",
  "ggo-worldlib",
+ "ggo_common",
  "gpui",
- "image",
  "keymap_editor",
  "project",
  "serde_json",
- "smallvec",
  "tempfile",
  "toml 0.8.23",
  "ui",

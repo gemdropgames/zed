@@ -11,9 +11,8 @@ use gpui::{
     App, BorderStyle, Bounds, ContentMask, Corners, Hsla, Path as GpuiPath, Pixels, Point,
     RenderImage, SharedString, TextAlign, TextRun, Window, bounds, fill, outline, point, px, size,
 };
-use image::Frame;
-use smallvec::SmallVec;
 
+use ggo_common::to_render_image;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::render::{
     AssetLoads, DEVICE_SCREEN_H, DEVICE_SCREEN_W, DrawItem, DrawKind, Loadable, RgbaImage,
@@ -106,29 +105,6 @@ pub fn dragged_pos(
 
 // -------------------------------------------------------- BGRA conversion
 
-/// In-place RGBA8 -> BGRA8 (straight alpha in, straight alpha out --
-/// gpui's own non-SVG decode paths do exactly this `swap(0, 2)`, see
-/// `gpui/src/elements/img.rs`'s WebP branch; the SVG path's extra alpha
-/// divide is for tiny-skia's PREMULTIPLIED output, which worldlib's
-/// composes are not).
-pub fn rgba_to_bgra(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-}
-
-/// Build the one gpui-side image for a composed worldlib image. Called
-/// once per stem at load time, never per frame.
-pub fn to_render_image(img: &RgbaImage) -> Option<Arc<RenderImage>> {
-    let mut data = img.rgba.to_vec();
-    rgba_to_bgra(&mut data);
-    let buffer = image::ImageBuffer::from_raw(img.w, img.h, data)?;
-    Some(Arc::new(RenderImage::new(SmallVec::from_elem(
-        Frame::new(buffer),
-        1,
-    ))))
-}
-
 /// Key an [`RgbaImage`] by its shared pixel buffer's address --
 /// `DrawKind::Image` carries an `Arc` clone of the load-map entry's
 /// buffer, so the address is stable for the lifetime of a load set and
@@ -145,7 +121,7 @@ pub fn build_image_cache(loads: &[&AssetLoads]) -> HashMap<usize, Arc<RenderImag
     for map in loads {
         for load in map.values() {
             if let Loadable::Ready(img) = load
-                && let Some(render_image) = to_render_image(img)
+                && let Some(render_image) = to_render_image(&img.rgba, img.w, img.h)
             {
                 cache.insert(image_key(img), render_image);
             }
@@ -467,30 +443,6 @@ mod tests {
         assert_eq!(
             dragged_pos([4.0, 4.0], [10.0, 10.0], [27.0, 10.0], true),
             [16.0, 0.0]
-        );
-    }
-
-    /// The classic red/blue swap bug: RGBA in, BGRA out, alpha untouched.
-    #[test]
-    fn rgba_to_bgra_swaps_red_and_blue_only() {
-        let mut data = vec![10, 20, 30, 40, 1, 2, 3, 4];
-        rgba_to_bgra(&mut data);
-        assert_eq!(data, vec![30, 20, 10, 40, 3, 2, 1, 4]);
-    }
-
-    #[test]
-    fn to_render_image_produces_one_frame_of_the_right_size() {
-        let img = RgbaImage {
-            rgba: vec![255, 0, 0, 255, 0, 0, 255, 255].into(),
-            w: 2,
-            h: 1,
-        };
-        let rendered = to_render_image(&img).unwrap();
-        assert_eq!(rendered.frame_count(), 1);
-        // Red pixel first: BGRA bytes [0, 0, 255, 255].
-        assert_eq!(
-            rendered.as_bytes(0).unwrap(),
-            &[0, 0, 255, 255, 255, 0, 0, 255]
         );
     }
 
