@@ -511,7 +511,7 @@ impl EmuPanel {
                 // noise in the charts picker.
                 None => IngestStatus::NoFrames,
                 Some(perf) if perf.frames == 0 => IngestStatus::NoFrames,
-                Some(perf) => match db_path_override.or_else(ingest::default_db_path) {
+                Some(perf) => match db_path_override.or_else(ggo_common::default_db_path) {
                     None => IngestStatus::Failed("no HOME to resolve ~/.ggo".into()),
                     Some(db_path) => match ingest::ingest_run(
                         &db_path,

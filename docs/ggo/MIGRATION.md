@@ -43,7 +43,7 @@ ggo-ide is still in-tree and still the only place the "dropped" and several
 | Nav side-effects (leave Assets → pause timeline; leave Emulator → pause; enter World → rescan) | Panels re-enumerate on `set_active`; metasprite pauses on edit | partial | Docks have no page-crossing event. A cart keeps running when the emu dock is collapsed; only focus loss stops input reaching it. |
 | Cross-page handoffs (Reports Re-run, World Emulate, inspector "→" sprite, Emulator View in Reports) | emu → charts "View in Reports" only | partial | Only that one hop shipped; the other three are listed separately below. |
 | Native OS confirm dialogs with per-dialog action binding | none | dropped | The destructive operations that used them (world delete, sprite delete, file delete, project remove) are not in the fork. |
-| Window-close unsaved-changes guard naming dirty pages | none | deferred | Panel doc stores live outside Zed's buffer/dirty model, so Zed's own prompt cannot see them; closing with a dirty world or sprite loses the edit silently. |
+| Window-close unsaved-changes guard naming dirty pages | `ggo_common::prepare_to_close_dirty`, wired through each panel's `Panel::prepare_to_close` | ✓ | |
 | Typing guard (single-letter hotkeys suppressed while a text field is live) | gpui focus contexts (`not_editing` predicate on the metasprite panel; emu pad keys are focus-scoped) | ✓ | Real focus/blur exists here, so the Iced workaround is unnecessary. |
 | Theme (22 Iced themes, persisted) | Zed themes | ✓ | |
 | `capture_lint` source lint | none | dropped | Guards an Iced `ButtonReleased`/`and_capture` bug class that has no gpui analogue. |
@@ -133,7 +133,7 @@ edit and `emd` is a command you run.
 | "Build & run project" (full system: OS + FAT image + game) | `emd: run` task (launches the standalone `ggo-emu`, with audio) | partial | The panel runs `.cart` files only. The full-system build+boot path stays external. |
 | Run / Stop | ✓ (`ctrl-alt-r` / `ctrl-alt-s`; Run over a running cart restarts cleanly) | ✓ | |
 | Cart library (`~/.ggo/ggo-ide/carts`: list, Upload with magic-header validation, Remove) | Cart dropdown over `.cart` files found under the project root | partial | Discovery instead of a managed library — no upload, no delete, no header validation (a bad cart fails loudly at Run, deliberately). |
-| Keyboard → gamepad (both the full-system and 18-button cart maps) | ✓ (18-bit level-triggered mask, pinned key-by-key against the standalone binary) | ✓ | Focus-scoped, so pad keys never leak into an editor. |
+| Keyboard → gamepad (18-button cart map) | ✓ (18-bit level-triggered mask, 10 of 17 keys pinned key-by-key against the standalone binary) | partial | Only the cart map exists (`emu_panel/src/input.rs`); ggo-ide's second full-system `FS_BTN_*` map has no fork equivalent, since the panel has no full-system mode. Focus-scoped, so pad keys never leak into an editor. |
 | Audio + Mute/Unmute + underrun counter | `emd: run` / standalone `ggo-emu` | deferred | Explicitly out of scope for F3 (`constraints.md`); the standalone binary remains the with-audio path. |
 | Stats line (fps / drops / step+blit ms) | ✓ | ✓ | |
 | Live guest UART console (collapsible, N lines, 2000-line ring) | ✓ (plus cart `log()` output, via ggo PR #75's `Peripherals::log_sink`) | ✓ | |
@@ -181,7 +181,6 @@ edit and `emd` is a command you run.
 | Click-drag x-zoom + double-click reset | none | deferred | C2's not-ported list. |
 | Click-to-select a frame (drives the inspect panel) | none | deferred | Dead without the inspect panel (§7). |
 | Historic overlays (grey, age-ramped opacity, contribute to y-scale) | none | deferred | Same list. |
-| No legends | none | ✓ | Same deliberate omission, inherited. |
 | Cached static layer, cheap hover redraws | Scenes rebuilt on hover | partial | Hover `notify()` rebuilds every chart's scene; fine at real run sizes, a documented ceiling at the 100k-frame cap. |
 
 ## 10. Settings page
@@ -200,10 +199,11 @@ edit and `emd` is a command you run.
 
 | Feature | Where | Notes |
 |---|---|---|
-| "GGO World" language: tree-sitter grammar, syntax highlighting, bracket/quote autoclose, outline symbols for `[[entity]]`/`[[instance]]`/`[[background]]` | `ggo_language` + the repo's `.zed/settings.json` `file_types` glob | Native registration (no extension sandbox), grammar via `tree-sitter-toml-ng` since upstream extracted TOML. |
+| "GGO World" language: tree-sitter grammar, syntax highlighting, bracket/quote autoclose, outline symbols for `[[entity]]`/`[[instance]]`/`[[background]]` | `ggo_language` + the repo's `.zed/settings.json` `file_types` glob | Native registration (no extension sandbox), grammar via `tree-sitter-toml-ng` since upstream extracted TOML. **Does not activate today**: the `.zed/settings.json` that carries the `file_types` glob lives in the `ggo` repo, which has zero `worlds/*.toml` files; real world files live in game projects (e.g. `~/projects/wilds/worlds/`), which have no `.zed/` directory of their own. The glob has to be copied into each game project's `.zed/settings.json` for the language to apply there — a per-project setup step, not shipped by this fork. This is a config-placement gap, not a code gap; fixing it is copying config into the game repos, not moving anything between `ggo` and this fork. |
 | `.zed/tasks.json` task layer (6 tasks) + `scripts/check-zed-config.sh` JSONC validator | ggo repo | Committed, per-user values via env, all six verified against real invocations. |
 | Native perf ingest straight from the emulator pane into `ggo_ide.db` | `ggo_emu_panel::ingest` | Replaces the spec's CLI-chained ingest task. |
 | **LSP** (diagnostics, completion, hover, code actions on worlds/manifests) | — | The pure-extension spec's central mechanism. **Deferred**: `ggo_language` registers grammar + queries only; there is no `ggo-lsp` binary and no `LspAdapter`. Every capability the old spec assigned to the LSP (world validation, hardware-budget diagnostics, snap/center/offset code actions, import diagnostics) is therefore unbuilt. |
+| Legend band on chart widgets | `chart_geom.rs` `legend_layout` (:612), `legend_height` (:642), consumed at :783-811 | ggo-ide's charts have no legends (a deliberate omission); the fork adds one. Documented as a divergence in the module doc (`chart_geom.rs:25-29`). §9's "No legends" row does not apply here — this is new surface, not parity. |
 
 ---
 
@@ -211,11 +211,11 @@ edit and `emd` is a command you run.
 
 | Status | Rows |
 |---|---|
-| ✓ | 32 |
-| partial | 27 |
-| deferred | 32 |
+| ✓ | 31 |
+| partial | 28 |
+| deferred | 31 |
 | dropped | 13 |
-| **total** | **104** |
+| **total** | **103** |
 
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
@@ -274,8 +274,6 @@ guards and follow-ups that someone has to pick up:
   (drop frame 0) and captions it, but there is no way to change the set.
 - **Hover rebuild ceiling.** Every hover move rebuilds all chart scenes;
   O(charts × frames) per mouse-move frame.
-- **`ggo_common` is unused.** All four panels build their `RenderImage`s
-  inline; the shared crate has two helpers and no callers.
 - **Glob duplicated between the fork and the repo.** `ggo_language`'s
   `PROJECT_FILE_TYPE_GLOB` and the ggo repo's `.zed/settings.json` `file_types`
   entry must agree, and nothing checks that they do across the two repos.

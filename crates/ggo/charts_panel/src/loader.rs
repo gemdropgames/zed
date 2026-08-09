@@ -18,27 +18,9 @@
 //! thread, not the UI thread (same rule `ggo_world_panel::loader::load_world`
 //! leans on for its own synchronous fs walk).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use turso::Value;
-
-/// Database filename under `~/.ggo/`, matching `ggo-ide`'s
-/// `backend/db.rs::DB_FILE` exactly -- this reads the SAME file, not a
-/// copy. Mirrored as a literal rather than imported: ggo-ide is a
-/// separate (Iced/Tauri-facing) crate this fork does not depend on.
-const DB_FILE: &str = "ggo_ide.db";
-const DOT_GGO: &str = ".ggo";
-
-/// `~/.ggo/ggo_ide.db`, matching `ggo-ide`'s `backend/db.rs::default_db_path`.
-/// `None` only if neither `HOME` nor `USERPROFILE` resolves (mirrors that
-/// function's `anyhow` error, downgraded to `Option` here since the
-/// panel's only use for this is "where to look", not something worth a
-/// hard error -- an unresolvable home directory reads the same as "no db
-/// yet" to the picker).
-pub fn default_db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(DOT_GGO).join(DB_FILE))
-}
 
 /// One row of the runs list: enough to identify a run in the picker.
 /// Selecting one loads its samples through [`load_run_samples`].

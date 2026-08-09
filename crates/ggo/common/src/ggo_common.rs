@@ -8,6 +8,7 @@
 //! be a cycle: `workspace` is what calls the guard) -- so any GGO panel
 //! can use it without pulling in world-doc types.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{Context, PromptLevel, RenderImage, Task, Window};
@@ -32,6 +33,30 @@ pub fn to_render_image(rgba: &[u8], w: u32, h: u32) -> Option<Arc<RenderImage>> 
     rgba_to_bgra(&mut data);
     let buffer = image::ImageBuffer::from_raw(w, h, data)?;
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
+}
+
+// --------------------------------------------------------- shared db path
+
+/// Database filename under `~/.ggo/`, matching `ggo-ide`'s
+/// `backend/db.rs::DB_FILE`.
+const DB_FILE: &str = "ggo_ide.db";
+const DOT_GGO: &str = ".ggo";
+
+/// `~/.ggo/ggo_ide.db`, matching `ggo-ide`'s `backend/db.rs::default_db_path`.
+/// `None` only if neither `HOME` nor `USERPROFILE` resolves (mirrors that
+/// function's `anyhow` error, downgraded to `Option` here since neither
+/// caller treats an unresolvable home directory as a hard error).
+///
+/// Shared by `ggo_charts_panel::loader` (reads runs for the picker) and
+/// `ggo_emu_panel::ingest` (writes a finished run) -- both touch the SAME
+/// file, not copies, so a run the emu pane ingests shows up in the charts
+/// panel's picker with no configuration. Kept in one place because the two
+/// crates diverging here would be a silent split-brain: the round-trip test
+/// that exercises both sides passes a `db_path_override`, so it would never
+/// catch drift in this default.
+pub fn default_db_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(DOT_GGO).join(DB_FILE))
 }
 
 // ------------------------------------------------- unsaved-document guard
@@ -139,6 +164,15 @@ mod tests {
         assert_eq!(close_choice(Some(2)), CloseChoice::Cancel);
         assert_eq!(close_choice(Some(99)), CloseChoice::Cancel);
         assert_eq!(close_choice(None), CloseChoice::Cancel);
+    }
+
+    /// `default_db_path` must land on `~/.ggo/ggo_ide.db` -- the file both
+    /// `ggo_charts_panel` and `ggo_emu_panel` read/write. HOME reliably
+    /// resolves in the test environment.
+    #[test]
+    fn default_db_path_is_dot_ggo_ggo_ide_db() {
+        let path = default_db_path().expect("HOME resolves in the test env");
+        assert!(path.ends_with(".ggo/ggo_ide.db"));
     }
 
     #[test]

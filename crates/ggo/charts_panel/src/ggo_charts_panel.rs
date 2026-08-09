@@ -199,7 +199,7 @@ impl ChartsPanel {
     fn db_path(&self) -> Option<PathBuf> {
         self.db_path_override
             .clone()
-            .or_else(loader::default_db_path)
+            .or_else(ggo_common::default_db_path)
     }
 
     /// Select a run and kick off its sample load -- same off-thread

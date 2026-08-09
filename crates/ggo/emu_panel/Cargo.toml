@@ -15,6 +15,7 @@ path = "src/ggo_emu_panel.rs"
 async-channel.workspace = true
 ggo-db.workspace = true # GGO -- the ggo_ide.db schema/migrations, shared with ggo-ide + the charts panel
 ggo-emu-core.workspace = true # GGO
+ggo_common.workspace = true # GGO -- shared `default_db_path`, also with the charts panel
 gpui.workspace = true
 image.workspace = true
 keymap_editor.workspace = true

@@ -7557,6 +7557,7 @@ dependencies = [
  "ggo-db",
  "ggo-emu-core",
  "ggo_charts_panel",
+ "ggo_common",
  "gpui",
  "image",
  "keymap_editor",

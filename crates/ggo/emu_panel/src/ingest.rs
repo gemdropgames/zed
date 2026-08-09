@@ -24,28 +24,10 @@
 //! it inside `cx.background_spawn`, the same rule
 //! `ggo_charts_panel::loader` follows for its reads.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as Json;
-
-/// Database filename under `~/.ggo/`, matching `ggo-ide`'s
-/// `backend/db.rs::DB_FILE` and `ggo_charts_panel::loader::DB_FILE` --
-/// all three touch the SAME file, not copies. Mirrored as a literal for
-/// the same reason the charts panel mirrors it: ggo-ide is a separate
-/// (Iced-facing) crate this fork does not depend on.
-const DB_FILE: &str = "ggo_ide.db";
-const DOT_GGO: &str = ".ggo";
-
-/// `~/.ggo/ggo_ide.db` -- byte-for-byte the path
-/// `ggo_charts_panel::loader::default_db_path` resolves, so a run this
-/// pane ingests shows up in the charts panel's picker with no
-/// configuration. `None` only if neither `HOME` nor `USERPROFILE`
-/// resolves.
-pub fn default_db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(DOT_GGO).join(DB_FILE))
-}
 
 /// Hard cap on frames per run ("sane size": ~28 min at 60 fps).
 /// `ggo-ide::backend::ingest::MAX_FRAMES` verbatim.
@@ -577,16 +559,6 @@ mod tests {
         let now = iso8601_utc_now();
         assert_eq!(now.len(), 20, "{now} not ISO-8601 shaped");
         assert!(now.ends_with('Z'));
-    }
-
-    // ----------------------------------------------------- default path
-
-    /// Must resolve to the exact file the charts panel reads, or the two
-    /// panels quietly stop seeing each other's runs.
-    #[test]
-    fn default_db_path_is_dot_ggo_ggo_ide_db() {
-        let path = default_db_path().expect("HOME resolves in the test env");
-        assert!(path.ends_with(".ggo/ggo_ide.db"), "{}", path.display());
     }
 
     // ----------------------------------------------------- parse_output
