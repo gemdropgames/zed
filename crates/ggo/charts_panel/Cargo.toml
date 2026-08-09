@@ -13,6 +13,7 @@ path = "src/ggo_charts_panel.rs"
 
 [dependencies]
 ggo-db.workspace = true # GGO
+ggo-worldlib.workspace = true # GGO -- LinearScale/nice_step, shared with ggo-ide's charts
 ggo_common.workspace = true
 gpui.workspace = true
 keymap_editor.workspace = true

@@ -7529,6 +7529,7 @@ name = "ggo_charts_panel"
 version = "0.1.0"
 dependencies = [
  "ggo-db",
+ "ggo-worldlib",
  "ggo_common",
  "gpui",
  "keymap_editor",
