@@ -1,0 +1,16 @@
+name = "GGO World"
+grammar = "ggo-world"
+# Deliberately no `path_suffixes`: a bare `.toml` suffix here would make every
+# TOML file in every project a GGO world. Matching is scoped per project by the
+# `file_types` key in the repo's committed `.zed/settings.json`
+# (`"GGO World": ["**/worlds/**/*.toml"]`), which `AvailableLanguages::
+# find_for_file` applies at `UserConfigured` precedence -- strictly above the
+# suffix-derived `PathOrContent` match any real TOML language would get.
+line_comments = ["# "]
+autoclose_before = ",]}"
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["comment", "string"] },
+    { start = "'", end = "'", close = true, newline = false, not_in = ["comment", "string"] },
+]

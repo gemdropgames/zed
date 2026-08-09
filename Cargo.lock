@@ -7581,6 +7581,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_language"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "language",
+ "settings",
+ "syntax_theme",
+ "toml 0.8.23",
+ "tree-sitter-toml-ng",
+ "util",
+]
+
+[[package]]
 name = "ggo_metasprite_panel"
 version = "0.1.0"
 dependencies = [
@@ -20625,6 +20639,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-toml-ng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-typescript"
 version = "0.23.2"
 source = "git+https://github.com/zed-industries/tree-sitter-typescript?rev=e2c53597d6a5d9cf7bbe8dccde576fe1e46c5899#e2c53597d6a5d9cf7bbe8dccde576fe1e46c5899"
@@ -22547,7 +22571,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "once_cell",
- "ordered-float 4.6.0",
+ "ordered-float 5.3.0",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
@@ -24355,6 +24379,7 @@ dependencies = [
  "ggo_charts_panel",
  "ggo_emu_panel",
  "ggo_hello",
+ "ggo_language",
  "ggo_metasprite_panel",
  "ggo_world_panel",
  "git",
