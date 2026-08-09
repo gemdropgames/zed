@@ -30,8 +30,11 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
   (8 tests) plus `test_dirty_panel_vetoes_workspace_prepare_to_close`.
   - `crates/workspace/src/workspace.rs`: the `PathOpenInterceptor` registry
     (`register_path_open_interceptor` + `Workspace::intercept_path_open`) — one
-    GGO-marked block, ~44 lines, placed right after `register_project_item`
-    (F4). `try_global`-gated: an empty registry is byte-identical to upstream.
+    GGO-marked block, ~46 lines, placed right after `register_project_item`
+    (F4). Opening AND closing `// GGO` markers (X4 added the closing one), so
+    `grep -n GGO crates/workspace/src/workspace.rs` shows the block's extent
+    rather than just where it starts. `try_global`-gated: with an empty
+    registry every call site behaves exactly as it did before.
   - `crates/project_panel/src/project_panel.rs`: two guarded call sites (F4) —
     the `Event::OpenedEntry` funnel (`open_path_preview`, currently `:893-924`)
     and the `Event::SplitEntry` path (`split_path_preview`, currently
@@ -40,14 +43,20 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
     **NEW territory for our hooks** as of F4 (previously only `dock.rs` +
     `workspace.rs`'s `prepare_to_close` poll above), and `project_panel.rs`
     churns considerably more than `dock.rs` upstream — expect to hand-reapply
-    this one more often. The guarded bodies are deliberately **not**
-    re-indented, so the original `open_path_preview`/`split_path_preview`
-    statements stay byte-identical inside the new `if` — re-verified true at
-    the F4 wrap (`cargo fmt --check` clean before and after, diff is
-    add-a-guard-line not reformat-the-body). Verify with
-    `cargo test -p workspace --lib -p project_panel --lib` plus
+    this one more often. The body is not re-indented; the only edit inside it
+    is the `ProjectPath` literal hoisted to a `ggo_project_path` local (needed
+    twice — once by the interceptor, once by the open). That hoist is the
+    8 deleted lines in the F4 diff; everything else inside the guard is the
+    original statement, unmoved (`cargo fmt --check` clean before and after).
+    Verify with `cargo test -p workspace --lib -p project_panel --lib` plus
     `cargo test -p ggo_world_panel -p ggo_metasprite_panel -p ggo_tileset_panel`
-    (interceptor-routing + already-open-fast-path tests).
+    (interceptor-routing + already-open-fast-path tests) and, above all,
+    `cargo test -p ggo_emu_panel test_project_panel_opened_entry` — the one
+    test in the fork that enters at the real `Event::OpenedEntry`
+    subscription, so it fails if this guard is dropped in a merge (X4;
+    verified by deleting the guard and watching it go red). Every other
+    routing test enters at `Workspace::intercept_path_open` and would stay
+    green.
 - Anything else conflicting means upstream moved a registration site: relocate the marker line, never keep a stale copy of upstream code.
 - After each merge: verify `reload_keymaps` (crates/zed/src/zed.rs) still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed` — ggo_world_panel's, ggo_metasprite_panel's, ggo_charts_panel's, and ggo_emu_panel's keybindings all silently die if that call disappears.
 

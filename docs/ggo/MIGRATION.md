@@ -1,7 +1,8 @@
 # ggo-ide → fork: feature disposition audit
 
 Date: 2026-08-08 (end of F3), rows amended 2026-08-09 (end of F4: explorer-driven
-panel routing + the read-only tileset viewer). Fork branch `ggo`.
+panel routing + the read-only tileset viewer; then X4, which removed the last
+in-panel file picker — the emulator's `.cart` dropdown). Fork branch `ggo`.
 
 What this is: a row for **every** user-facing ggo-ide feature, and what — if
 anything — answers it in the fork today. It exists so nobody has to guess
@@ -67,7 +68,7 @@ covered by the fork at all.
 
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
-| Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; clicking a `.spr`/`.til`/world `.toml` there routes directly into its GGO panel (F4) | partial | Generic file search, not asset-typed sections with extension badges. The in-panel pickers this row used to credit are gone — see the Assets/World picker rows and Known deferrals for what explorer-driven routing does and doesn't cover. |
+| Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; clicking a `.spr`/`.til`/`.cart`/world `.toml` there routes directly into its GGO panel (F4) | partial | Generic file search, not asset-typed sections with extension badges. The in-panel pickers this row used to credit are all gone as of X4 — see the Assets/World/cart-library rows and Known deferrals for what explorer-driven routing does and doesn't cover. |
 | Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | none | deferred | No CLI exists for them and no panel affordance was built; the file tree can delete but not create the `.spr`/`.til`/`.pal` trio. |
 | New tileset / new map | none | deferred | Same — no CLI, no panel. |
 | Files tree (create folder, delete file/dir, extension badges) | Zed project panel | partial | Create/delete/rename exist; the GGO extension badges do not. |
@@ -79,7 +80,7 @@ covered by the fork at all.
 | Preview panel (1:1 live frame, background picker, LCD filter) | metasprite panel centre preview | partial | Live composed frame with aspect fit shipped; checker/black/white background picker and the LCD scanline filter did not. |
 | Hardware budget meter (4 traffic-light rows + tooltips) | metasprite panel `hw_meter_line` | partial | Same four value/cap pairs from worldlib `sprites::hw`, condensed into one header line — no per-row dots or tooltips. |
 | Per-cell tile assignment from the pool | metasprite panel tile palette + preview cell click | ✓ | |
-| Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | `ggo_tileset_panel` — read-only overview grid + 16-slot palette swatch row, integer zoom 1x-8x | partial | Viewing shipped (F4): routed off a `.til` click in the project panel, no in-panel picker. Pencil/fill/eyedropper, palette slot editing, append/duplicate/delete-last and the cols setting are all still dropped — this is a viewer, not the editor ggo-ide had; do not read it as more than that. |
+| Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | `ggo_tileset_panel` — read-only overview grid + 16-slot palette swatch row, integer zoom 1x-8x | partial | Viewing shipped (F4): routed off a `.til` click in the project panel, no in-panel picker. The **magnified tile canvas**, pencil/fill/eyedropper, palette slot editing, append/duplicate/delete-last and the cols setting are all still dropped — the fork's zoom magnifies the whole sheet, not one selected tile, so there is no per-tile editing surface at all. This is a viewer, not the editor ggo-ide had; do not read it as more than that. |
 | Map editor (`.map`): tileset binding, multi-tile stamp, H/V flip, palSub, brush/rect-fill/eraser/eyedropper, grid, zoom, resize | none | dropped | Same. Maps still *render* in the world panel as backgrounds/tilemaps. |
 | PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | none | deferred | T1 checked `tools/*/Cargo.toml` and the feature inventory: **there is no import CLI**, so `.zed/tasks.json` deliberately ships no import task rather than inventing one. The wizard is ggo-ide-only until a CLI exists. |
 | Legacy `.meta.json` sidecar import | none | dropped | One-shot migration aid for a format generation that is already past. |
@@ -133,7 +134,7 @@ edit and `emd` is a command you run.
 | Embedded 320×240 screen, integer scale, latest-wins frames | `ggo_emu_panel` live video (`RenderImage` per frame, bounded depth-1 channel) | partial | Scaling is gpui's `img()` fit, i.e. linear — not the guaranteed integer nearest-neighbour ggo-ide hard-coded. See Known deferrals. |
 | "Build & run project" (full system: OS + FAT image + game) | `emd: run` task (launches the standalone `ggo-emu`, with audio) | partial | The panel runs `.cart` files only. The full-system build+boot path stays external. |
 | Run / Stop | ✓ (`ctrl-alt-r` / `ctrl-alt-s`; Run over a running cart restarts cleanly) | ✓ | |
-| Cart library (`~/.ggo/ggo-ide/carts`: list, Upload with magic-header validation, Remove) | Cart dropdown over `.cart` files found under the project root | partial | Discovery instead of a managed library — no upload, no delete, no header validation (a bad cart fails loudly at Run, deliberately). |
+| Cart library (`~/.ggo/ggo-ide/carts`: list, Upload with magic-header validation, Remove) | Zed project panel — clicking a `.cart` there selects it in the emu panel, routed by `ggo_emu_panel::intercept_cart_open` | partial | Browsing instead of a managed library — no upload, no delete, no header validation (a bad cart fails loudly at Run, deliberately). Explorer-driven since F4 X4: the panel's own `.cart` dropdown and its filesystem walk are gone, so this row is now the project panel plus the interceptor. A click **selects** the cart; Run stays an explicit user action, because starting a cart spawns an emulator thread and takes over the keyboard. Clicking a different cart mid-run stops the running one through the normal `finish_run` path, so its perf data still reaches `ggo_ide.db`. |
 | Keyboard → gamepad (18-button cart map) | ✓ (18-bit level-triggered mask, 10 of 17 keys pinned key-by-key against the standalone binary) | partial | Only the cart map exists (`emu_panel/src/input.rs`); ggo-ide's second full-system `FS_BTN_*` map has no fork equivalent, since the panel has no full-system mode. Focus-scoped, so pad keys never leak into an editor. |
 | Audio + Mute/Unmute + underrun counter | `emd: run` / standalone `ggo-emu` | deferred | Explicitly out of scope for F3 (`constraints.md`); the standalone binary remains the with-audio path. |
 | Stats line (fps / drops / step+blit ms) | ✓ | ✓ | |
@@ -224,6 +225,14 @@ deferred 31 / dropped 13. The sprite/world-picker rows also changed *text*
 (explorer-driven instead of in-panel pickers) but not *status* — both were
 already ✓/partial and stay there.)
 
+(X4: **no status moved, so these counts are unchanged** — ✓ 31 / partial 29 /
+deferred 31 / dropped 12 both before and after. The cart-library row was
+already `partial` for the in-panel dropdown and stays `partial` for
+explorer-driven selection: browsing is still materially smaller than ggo-ide's
+managed library with upload, delete and magic-header validation. What changed
+is that row's *text*, plus the Assets browser-rail row's and the routing
+deferral's.)
+
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
 own right.)
@@ -287,9 +296,12 @@ guards and follow-ups that someone has to pick up:
 - **Explorer-driven routing is project-panel-only (F4).** `cmd-p` file finder,
   go-to-definition, drag-and-drop, the `zed <path>` CLI, and session restore
   all call `Workspace::open_path_preview`/`open_paths` directly, bypassing
-  `Workspace::intercept_path_open` — opening a `.spr`/`.til`/world `.toml`
-  through any of them yields a dead editor tab instead of routing into its
-  panel. Named upgrade path: option 2 in
+  `Workspace::intercept_path_open` — opening a `.spr`/`.til`/`.cart`/world
+  `.toml` through any of them yields a dead editor tab instead of routing into
+  its panel. Sharper since X4: with the emu panel's `.cart` dropdown removed,
+  the project panel is the *only* way to get a cart into the emulator, so a
+  cart reached through the file finder has no fallback at all. Named upgrade
+  path: option 2 in
   `.superpowers/sdd/explorer-routing-investigation.md` (hooking inside
   `open_path_preview` itself, `workspace.rs:4713`), not taken because
   `cx: &mut App` there forces a fake `Task` return (toast or leak) instead of
