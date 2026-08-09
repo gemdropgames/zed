@@ -20,7 +20,7 @@ use ggo_worldlib::backgrounds::{MergedBackground, merge_backgrounds};
 use ggo_worldlib::render::{self, AssetLoads, Loadable, collect_load_targets};
 use ggo_worldlib::schemas::{ComponentSchema, ManifestComponent, all_schemas, manifest_components};
 use ggo_worldlib::sprites::{io, map_doc, palette565, preview};
-use ggo_worldlib::world_doc::{Background, WorldDocStore, WorldDocWire};
+use ggo_worldlib::world_doc::{Background, WorldDocStore, WorldDocWire, WorldState};
 use ggo_worldlib::world_file::read_world;
 use ggo_worldlib::world_files::{self, WORLD_EXT, WorldListing};
 
@@ -151,6 +151,48 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
         merged,
         schemas: manifest_schemas(project_dir),
     })
+}
+
+// --------------------------------------------------- incremental (add time)
+
+/// Resolve ONE instance stem's subtree, exactly as [`load_world`] does for
+/// every stem at load -- the add-instance path's incremental resolver.
+/// ggo-ide re-resolves after every message (`dispatch_new_asset_loads`);
+/// without this a freshly added instance renders only its origin marker
+/// until the world is re-selected (M7 review, fix round 1).
+pub fn resolve_instance(project_dir: &Path, stem: &str) -> Result<serde_json::Value, String> {
+    resolve_world_value(project_dir, stem, &mut Vec::new())
+}
+
+/// Compose any `collect_load_targets` stems missing from the given load
+/// maps, in place -- the incremental version of [`load_world`]'s asset
+/// pass, for targets a freshly resolved instance subtree introduced.
+/// Already-present stems are never recomposed (same image, and their
+/// pointer identity keys the panel's `RenderImage` cache).
+pub fn fill_missing_asset_loads(
+    project_dir: &Path,
+    state: &WorldState,
+    sprite_loads: &mut AssetLoads,
+    map_loads: &mut AssetLoads,
+    meta_sprite_loads: &mut AssetLoads,
+) {
+    let (sprite_stems, map_stems, meta_targets) = collect_load_targets(state);
+    for stem in sprite_stems {
+        sprite_loads
+            .entry(stem.clone())
+            .or_insert_with(|| settle(compose_sprite_rgba(project_dir, &stem)));
+    }
+    for stem in map_stems {
+        map_loads
+            .entry(stem.clone())
+            .or_insert_with(|| settle(compose_map_rgba(project_dir, &stem)));
+    }
+    for (stem, clip) in meta_targets {
+        let key = render::meta_sprite_load_key(&stem, &clip);
+        meta_sprite_loads
+            .entry(key)
+            .or_insert_with(|| settle(compose_meta_sprite_rgba(project_dir, &stem, &clip)));
+    }
 }
 
 // -------------------------------------------------------- manifest schemas

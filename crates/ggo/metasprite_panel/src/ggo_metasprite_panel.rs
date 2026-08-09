@@ -2303,6 +2303,9 @@ mod tests {
                     start_offset_ms: 0,
                     frame: 1,
                 });
+                // Arm a (dummy) tick task so the drop assertion below
+                // is not vacuously true.
+                open._tick_task = Some(cx.spawn(async move |_, _| {}));
             }
             *ready(panel).preview_bounds.borrow_mut() = Some(gpui::bounds(
                 gpui::point(px(0.), px(0.)),

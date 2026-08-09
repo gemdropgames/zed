@@ -431,8 +431,8 @@ impl WorldPanel {
     /// graph), then `AddInstance` + a follow-up `MoveInstance` to the
     /// view center (worldlib's op itself lands at its fixed
     /// `DEFAULT_INSTANCE_POS`; the move is a second undo entry -- first
-    /// undo returns it to the default spot, second removes it), and
-    /// select it.
+    /// undo returns it to the default spot, second removes it), select
+    /// it, and resolve its subtree so it renders immediately.
     fn add_instance_impl(&mut self, stem: String, cx: &mut Context<Self>) {
         if !self.instance_candidates().contains(&stem) {
             return;
@@ -441,7 +441,9 @@ impl WorldPanel {
             return;
         };
         let center = view_center_world(open);
-        open.store.apply(WorldOp::AddInstance { world: stem });
+        open.store.apply(WorldOp::AddInstance {
+            world: stem.clone(),
+        });
         let index = open.store.state().instances.len() - 1;
         open.store.apply(WorldOp::MoveInstance {
             index,
@@ -450,6 +452,32 @@ impl WorldPanel {
         });
         open.selected = Some(Selection::Instance(index));
         open.edit_drag = None;
+
+        // Resolve the new stem's subtree and stamp it NOW -- ggo-ide
+        // re-resolves after every message (`dispatch_new_asset_loads`),
+        // so parity means the added instance's entities/assets render
+        // without a reload, not just its origin marker (M7 review, fix
+        // round 1). Synchronous by choice: small TOML IO at world-add
+        // frequency, the same trade as `save_impl`. A failed resolve
+        // stamps the instance's error badge; it never fails the add.
+        let result = loader::resolve_instance(&open.root, &stem);
+        open.store.set_instances_resolved(&stem, &result, true);
+        // Compose whatever load targets the subtree introduced and fold
+        // them into the RenderImage cache (existing entries keep their
+        // images -- `fill_missing_asset_loads` never recomposes).
+        let state = open.store.state();
+        loader::fill_missing_asset_loads(
+            &open.root,
+            &state,
+            &mut open.sprite_loads,
+            &mut open.map_loads,
+            &mut open.meta_sprite_loads,
+        );
+        open.images = Arc::new(canvas::build_image_cache(&[
+            &open.sprite_loads,
+            &open.map_loads,
+            &open.meta_sprite_loads,
+        ]));
         cx.notify();
     }
 
@@ -1988,6 +2016,53 @@ mod tests {
                 assert_eq!(open.selected, Some(Selection::Instance(1)));
                 assert!(state.dirty);
             }
+        });
+    }
+
+    /// M7 fix round 1: a freshly added instance's subtree must render
+    /// WITHOUT a reload -- add resolves the stem and composes its
+    /// assets immediately (ggo-ide re-resolves after every message).
+    /// `worlds/sub` carries a RectFill child, so the draw list's rect
+    /// count must grow right after the add.
+    #[gpui::test]
+    async fn test_add_instance_resolves_subtree_without_reload(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let rect_count = |open: &OpenWorld| {
+                draw_items(open)
+                    .iter()
+                    .filter(|i| matches!(i.kind, DrawKind::Rect { .. }))
+                    .count()
+            };
+            {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                assert_eq!(
+                    rect_count(open),
+                    2,
+                    "fixture baseline: top-level RectFill + the existing sub instance's"
+                );
+            }
+
+            panel.add_instance_impl("worlds/sub".to_string(), cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let state = open.store.state();
+            assert_eq!(state.instances.len(), 2);
+            assert!(
+                state.instances[1].resolved.is_some(),
+                "the subtree is resolved at add time"
+            );
+            assert!(state.instances[1].error.is_none());
+            assert_eq!(
+                rect_count(open),
+                3,
+                "the new instance's RectFill child renders without a reload"
+            );
         });
     }
 
