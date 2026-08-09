@@ -237,6 +237,16 @@ pub struct EmuPanel {
     /// built from -- see [`EmuPanel::cart_menu`].
     cart_menu: Option<(u64, Entity<ContextMenu>)>,
 
+    /// Bumped every time [`Self::run`] starts a new session. [`Self::
+    /// finish_run`] captures this at call time and its background
+    /// completion closure re-checks it before writing `status`/
+    /// `ingest_status` -- the same staleness guard `load_generation`
+    /// gives [`Self::refresh_carts`]. Needed because a run's completion
+    /// (`Session::wait`, joined off-thread) can land seconds after a
+    /// later run has already started and become the one the pane is
+    /// showing; without this, run A's late completion would stomp run
+    /// B's live status.
+    run_generation: u64,
     /// The running emulator, if any. Dropping it signals the thread to
     /// stop (see [`Session::stop`]).
     session: Option<Session>,
@@ -320,6 +330,7 @@ impl EmuPanel {
             load_generation: 0,
             _load_task: None,
             cart_menu: None,
+            run_generation: 0,
             session: None,
             _pump_task: None,
             status: None,
@@ -408,6 +419,11 @@ impl EmuPanel {
             return;
         };
         self.stop(window, cx);
+        // AFTER `stop`, not before: `stop` -> `finish_run` reads
+        // `run_generation` to tag the run it is finishing (the OLD one),
+        // so it must still see the pre-bump value. This is the new
+        // current run from here on -- see `run_generation`'s doc.
+        self.run_generation += 1;
 
         let (session, rx) = drive::start(root.join(&cart), cart);
         self.console = Some(session.uart().clone());
@@ -470,6 +486,11 @@ impl EmuPanel {
         let Some(session) = self.session.take() else {
             return;
         };
+        // The run this call is finishing -- captured now, before anything
+        // async, so it names THIS run regardless of whichever run
+        // `run_generation` points at by the time the background task
+        // below actually resolves. See `run_generation`'s doc.
+        let generation = self.run_generation;
         self.input.clear();
         self.ingest_status = IngestStatus::Uploading;
         cx.notify();
@@ -508,6 +529,14 @@ impl EmuPanel {
         cx.spawn(async move |this, cx| {
             let (reason, status) = finish.await;
             this.update(cx, |this, cx| {
+                if this.run_generation != generation {
+                    // A later run has started (and possibly already
+                    // ended) since this one was taken -- this completion
+                    // is stale, so don't let it stomp the live run's
+                    // status. Same guard `refresh_carts` applies to
+                    // `load_generation`.
+                    return;
+                }
                 this.status = Some(reason);
                 this.ingest_status = status;
                 cx.notify();
@@ -748,10 +777,11 @@ impl EmuPanel {
     /// always-available-but-collapsed default and its
     /// [`LIVE_CONSOLE_TAIL_LINES`] cap on what gets laid out.
     ///
-    /// See [`uart`]'s module doc for the honest scope of this in cart
-    /// mode: `ggo-emu-core` has no host-visible guest-UART channel for a
-    /// `.cart` run, so these are the driver's own per-run diagnostics --
-    /// which is exactly what ggo-ide's cart runner shows too.
+    /// See [`uart`]'s module doc for what lands here in cart mode: the
+    /// driver's own per-run markers interleaved with the cart's own
+    /// `log()` output, via the `Peripherals::log_sink` [`crate::drive`]
+    /// attaches and drains every turn -- the same pairing ggo-ide's cart
+    /// runner uses.
     fn render_console(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let log = self.console.as_ref()?;
         if log.is_empty() {
@@ -1180,6 +1210,61 @@ mod tests {
                 panel.ingest_status,
                 IngestStatus::NoFrames,
                 "a cart that never loaded has nothing to ingest"
+            );
+        });
+    }
+
+    /// A stale run's late completion must not stomp a live run's status.
+    /// `Session::wait` is joined off-thread, so run A's `finish_run` can
+    /// still be mid-flight (background `wait` in progress) when the user
+    /// starts run B; when A's result finally lands, `run_generation` must
+    /// have already moved the pane past it. Mirrors `test_an_ended_run_
+    /// reports_and_clears_the_session`'s direct-session-manipulation
+    /// style, but interleaves two runs' `finish_run` calls instead of
+    /// going through the real thread timing (which can't be raced
+    /// deterministically from a test).
+    #[gpui::test]
+    async fn test_a_stale_runs_late_completion_does_not_stomp_a_live_run(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (panel, cx) = windowed_panel(cx);
+        let (session_a, rx_a) =
+            drive::start("/definitely/not/here.cart".into(), "run-a.cart".into());
+        drop(rx_a);
+
+        panel.update(cx, |panel, cx| {
+            // Run A, already under way.
+            panel.run_generation = 1;
+            panel.session = Some(session_a);
+            // `finish_run` captures generation 1 and hands session A's
+            // `wait()` to a background task -- deliberately not awaited
+            // here, so it's still in flight when run B starts below,
+            // exactly like a completion landing seconds late.
+            panel.finish_run(cx);
+
+            // Run B starts before A's completion has landed: a new
+            // generation, a live session, and a status of its own.
+            panel.run_generation = 2;
+            panel.session = Some(drive::start("/also/not/here.cart".into(), "run-b.cart".into()).0);
+            panel.status = Some("run B is live".to_string());
+            panel.ingest_status = IngestStatus::Idle;
+        });
+
+        // Let A's background `wait()` resolve and its completion closure
+        // run. Without the generation guard this overwrites `status`/
+        // `ingest_status` with A's ("here.cart" / NoFrames) even though B
+        // is now the live run.
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.status.as_deref(),
+                Some("run B is live"),
+                "run A's late completion must not overwrite run B's status"
+            );
+            assert_eq!(
+                panel.ingest_status,
+                IngestStatus::Idle,
+                "nor run B's ingest status"
             );
         });
     }

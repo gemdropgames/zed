@@ -10,25 +10,20 @@
 //!
 //! # What actually reaches this log in cart mode
 //!
-//! **`ggo-emu-core` exposes no host-visible guest-UART channel for a
-//! `.cart` XIP run.** The `log(ptr, len)` syscall is handled in
-//! `ggo-emu-core/src/runtime.rs` (the `Some(Syscall::Log)` arm) by a bare
-//! `println!("cart-log: {..}")` straight to the host process's stdout --
-//! there is no sink, no buffer and no hook on `Peripherals` to redirect it
-//! to. Only the full-system boot path has a real UART
-//! (`FullSystemBus::take_uart`), and that path is not what this pane
-//! drives.
-//!
-//! ggo-ide's cart runner has exactly the same hole and documents it the
-//! same way (`tools/ggo-ide/src/emu/mod.rs`, `CartStepper::drain_uart`:
-//! "A running cart has no host-visible UART channel", returning only its
-//! own synthetic `[cart load failed]` line). So this log carries the same
-//! thing ggo-ide's does for a cart: the driver's own per-run diagnostics
-//! (load failure, exit code, fault trap, the run's start/end markers),
-//! which is also exactly what gets ingested. Making the guest's own
-//! `log()` lines land here needs a one-line sink on
-//! `ggo_emu_core::Peripherals` -- a `ggo`-repo change, out of scope for a
-//! fork-side task; see this task's report.
+//! `ggo-emu-core` gives a `.cart` XIP run no *hardware* UART -- only the
+//! full-system boot path has one (`FullSystemBus::take_uart`), and that
+//! path is not what this pane drives. But the `log(ptr, len)` syscall
+//! (`ggo-emu-core/src/runtime.rs`'s `Some(Syscall::Log)` arm) has its own
+//! channel: `Peripherals::log_sink`, an `Option<Vec<u8>>` a driver attaches
+//! at construction and drains with `Peripherals::take_log`. [`crate::drive`]
+//! attaches one and drains it every turn, so a cart's own `log()` calls
+//! land here alongside the driver's per-run markers (`[run]`,
+//! `[run ended]`, `[cart load failed]`) -- exactly what `ggo-ide`'s cart
+//! runner does with the same sink (`tools/ggo-ide/src/emu/mod.rs`,
+//! `CartStepper::new` attaches it, `CartStepper::drain_uart` forwards it).
+//! Without a sink attached, the syscall falls back to a bare
+//! `println!("cart-log: {..}")` to the host process's stdout, which is
+//! what every standalone CLI binary (`ggo-emu`) still gets.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

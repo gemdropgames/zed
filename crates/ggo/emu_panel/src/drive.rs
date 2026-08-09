@@ -134,9 +134,10 @@ pub struct FinishedRun {
     /// Human-readable end-of-run line for the pane's status.
     pub reason: String,
     pub perf: Option<PerfSnapshot>,
-    /// The run's diagnostic lines, ingested into the `uart` table (see
-    /// [`crate::uart`] for what does and does not reach this in cart
-    /// mode).
+    /// The run's diagnostic lines, ingested into the `uart` table -- the
+    /// driver's own per-run markers (`[run]`, `[run ended]`,
+    /// `[cart load failed]`) interleaved with whatever the cart's own
+    /// `log()` calls emitted (see [`crate::uart`]).
     pub uart: Vec<String>,
 }
 
@@ -313,6 +314,12 @@ fn run(
     // do by default). Cart mode keeps `PerfSim`'s default cache base
     // (`CART_XIP_BASE`) -- only the full-system boot path moves it.
     p.perf.enable();
+    // Attach a log sink so `log()` calls land in the pane's console (and
+    // from there the ingested `uart` table) instead of vanishing into
+    // this GUI process's invisible stdout -- mirrors `ggo-ide`'s
+    // `CartStepper::new` (see `Peripherals::log_sink`'s doc). Drained
+    // every turn below, alongside the rest of the loop's per-turn work.
+    p.log_sink = Some(Vec::new());
     if let Some(toc) = cart.toc {
         p.assets.set_toc(toc);
     }
@@ -331,12 +338,19 @@ fn run(
         }
         let turn_started = Instant::now();
         let (event, _insns) = run_until_event(&mut cpu, &mut mmu, &mut p, PER_TURN_BUDGET, false);
+        // Drain every turn, regardless of what the turn ended with (Vsync,
+        // Budget, Exit or Fault) -- not just on a completed frame. This is
+        // the cadence `ggo-ide`'s `thread::run_loop` uses too
+        // (`uart.push(&s.drain_uart())` once per `step`), and it is what
+        // keeps `Peripherals::log_sink` bounded: a cart that logs a lot
+        // between vsync waits (or never reaches one) can't grow the sink
+        // past one turn's worth of bytes.
+        uart.push(&p.take_log());
         match event {
             // Frame boundary: the cart drew a complete frame and called
             // vsync_wait. Publish it, pace, then latch input --
             // `run_cart`'s Vsync arm, minus the present and the stall.
             FrameEvent::Vsync(number) => {
-                p.set_ticks_ms(start.elapsed().as_millis().min(u32::MAX as u128) as u32);
                 let bgra = rgb565_to_bgra(&p.default_fb);
                 let step_ms = turn_started.elapsed().as_secs_f32() * MILLIS_PER_SEC;
                 // Full channel = the UI hasn't drained the previous
@@ -361,6 +375,12 @@ fn run(
                 // was ~16 ms earlier. Latching before the sleep costs a
                 // whole frame of input latency.
                 p.input_mask = input.load(Ordering::Acquire);
+                // AFTER the hold and the input latch -- `ggo-emu/src/
+                // lib.rs`'s Vsync arm calls `set_ticks_ms` last too
+                // (present -> refresh_input -> set_ticks_ms), so the
+                // clock the cart reads next turn accounts for the pacing
+                // sleep it just went through.
+                p.set_ticks_ms(start.elapsed().as_millis().min(u32::MAX as u128) as u32);
             }
             // Budget exhausted mid-frame: the framebuffer is half-drawn,
             // so do NOT publish it (`run_cart` likewise refuses to
@@ -454,10 +474,26 @@ pub mod fixture {
     /// ingested run of it lands on.
     pub const GREEN_CART_TITLE: &str = "Green Fix";
 
-    /// `addi rd, x0, imm` -- the only instruction form the fixture needs
-    /// besides `ecall` and a backwards `jal`.
+    /// `addi rd, x0, imm` -- the load-immediate special case (`rs1 = x0`),
+    /// the only form [`green_screen_cart`] needs besides `ecall` and a
+    /// backwards `jal`.
     fn addi(rd: u32, imm: i32) -> u32 {
         ((imm as u32 & 0xFFF) << 20) | (rd << 7) | 0x13
+    }
+
+    /// `addi rd, rs1, imm` -- the general two-register form. [`addi`]
+    /// above is the `rs1 = x0` special case; [`logging_cart`] needs this
+    /// one to add an offset onto the base [`lui`] just loaded.
+    fn addi_reg(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+    }
+
+    /// `lui rd, imm20` -- loads `imm20 << 12` into `rd`. Only
+    /// [`logging_cart`] needs this, to build the XIP address of its
+    /// `log()` message; every other fixture instruction fits a single
+    /// 12-bit `addi` immediate.
+    fn lui(rd: u32, imm20: u32) -> u32 {
+        ((imm20 & 0xF_FFFF) << 12) | (rd << 7) | 0x37
     }
 
     /// `jal x0, offset` (offset in bytes, relative to this instruction).
@@ -480,6 +516,7 @@ pub mod fixture {
     const SYS_PRESENT: i32 = 0x00;
     const SYS_VSYNC_WAIT: i32 = 0x01;
     const SYS_SET_PALETTE: i32 = 0x05;
+    const SYS_LOG: i32 = 0x4B;
 
     /// RGB565 green -- 0x07E0, which happens to fit in a 12-bit signed
     /// immediate, so the program needs no `lui`.
@@ -523,6 +560,85 @@ pub mod fixture {
         h[0x04..0x06].copy_from_slice(&SUPPORTED_HEADER_VERSION.to_le_bytes());
         h[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // required_abi
         h[0x08..0x08 + GREEN_CART_TITLE.len()].copy_from_slice(GREEN_CART_TITLE.as_bytes());
+        h[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes()); // entry_offset
+        h[0x2C..0x30].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        h[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // save_bytes
+        h[0x34..0x38].copy_from_slice(&0u32.to_le_bytes()); // ram_needed
+        h[0x38..0x3C].copy_from_slice(&0u32.to_le_bytes()); // flags
+        let crc = crc32(&h[0x00..0x3C]);
+        h[0x3C..0x40].copy_from_slice(&crc.to_le_bytes());
+
+        let mut out = h.to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The cart header title [`logging_cart`] stamps.
+    pub const LOGGING_CART_TITLE: &str = "Log Fix";
+
+    /// The message [`logging_cart`]'s single `log()` call emits -- what
+    /// the end-to-end drive test asserts lands in the console verbatim.
+    pub const LOG_MESSAGE: &str = "hi from cart";
+
+    /// [`green_screen_cart`] plus one real `log(ptr, len)` ecall before
+    /// the paint loop:
+    ///
+    /// ```text
+    ///     a0 = CART_XIP_BASE + STR_OFFSET   ; lui + addi -- STR_OFFSET
+    ///                                       ; points at LOG_MESSAGE's
+    ///                                       ; bytes, appended as data
+    ///                                       ; after this program's own
+    ///                                       ; instructions (never
+    ///                                       ; executed, just addressed)
+    ///     a1 = len(LOG_MESSAGE)
+    ///     log()
+    ///     set_palette(bank 0, entry 0, 0x07E0)
+    /// loop:
+    ///     present()
+    ///     vsync_wait()
+    ///     j loop
+    /// ```
+    ///
+    /// Exists to prove the sink `drive::run` attaches carries a REAL
+    /// guest `log` ecall's bytes end to end -- ggo-ide's equivalent test
+    /// (`emu/mod.rs::drain_uart_returns_cart_log_output_via_the_attached_sink`)
+    /// pokes `Peripherals::log_sink` directly instead and says why in its
+    /// own doc; this fixture goes one step further because a hand-rolled
+    /// `log()` call is cheap here (no toolchain needed, same as every
+    /// other fixture in this module).
+    pub fn logging_cart() -> Vec<u8> {
+        // 15 instructions precede the message text, so it lands at byte
+        // offset 15 * 4 = 60 -- comfortably inside a 12-bit signed `addi`
+        // immediate (max 2047).
+        const STR_OFFSET: i32 = 15 * 4;
+        let xip_base_hi20 = super::CART_XIP_BASE >> 12;
+
+        let body: Vec<u32> = vec![
+            lui(A0, xip_base_hi20),             // a0 = CART_XIP_BASE (hi bits)
+            addi_reg(A0, A0, STR_OFFSET),       // a0 += offset of the message
+            addi(A1, LOG_MESSAGE.len() as i32), // a1 = message length
+            addi(A7, SYS_LOG),                  //
+            ECALL,                              // log(a0, a1)
+            addi(A0, 0),                        // bank 0 (BANK_BGFG)
+            addi(A1, 0),                        // entry 0 (the backdrop)
+            addi(A2, GREEN as i32),             // colour
+            addi(A7, SYS_SET_PALETTE),          //
+            ECALL,                              //
+            addi(A7, SYS_PRESENT),              // loop:
+            ECALL,                              //
+            addi(A7, SYS_VSYNC_WAIT),           //
+            ECALL,                              //
+            jal_x0(-16),                        // back to `loop`
+        ];
+        debug_assert_eq!(body.len(), 15, "STR_OFFSET assumes exactly 15 instructions");
+        let mut body: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+        body.extend_from_slice(LOG_MESSAGE.as_bytes());
+
+        let mut h = [0u8; HEADER_LEN];
+        h[0x00..0x04].copy_from_slice(&MAGIC);
+        h[0x04..0x06].copy_from_slice(&SUPPORTED_HEADER_VERSION.to_le_bytes());
+        h[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // required_abi
+        h[0x08..0x08 + LOGGING_CART_TITLE.len()].copy_from_slice(LOGGING_CART_TITLE.as_bytes());
         h[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes()); // entry_offset
         h[0x2C..0x30].copy_from_slice(&(body.len() as u32).to_le_bytes());
         h[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // save_bytes
@@ -804,6 +920,36 @@ mod tests {
             perf.frames, 0,
             "a cart that never reached vsync recorded no frames -- ggo-ide's \
              'nothing to upload' case"
+        );
+    }
+
+    /// End-to-end: a REAL guest `log()` ecall -- not a value poked
+    /// directly into `Peripherals::log_sink` -- reaches the pane's
+    /// console. Proves the whole chain `run`'s sink attachment ->
+    /// `Syscall::Log`'s handler -> the per-turn `uart.push(&p.take_log())`
+    /// drain -> [`crate::uart::UartLog`] -> what [`Session::wait`] hands
+    /// back for ingest.
+    #[test]
+    fn a_carts_own_log_call_reaches_the_console() {
+        use super::fixture::{LOG_MESSAGE, logging_cart};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logging.cart");
+        std::fs::write(&path, logging_cart()).unwrap();
+
+        let (session, rx) = start(path, "logging.cart".to_string());
+        // The cart's single `log()` call runs on the very first turn,
+        // before its first `vsync_wait` -- so by the time the first frame
+        // arrives, that turn's drain has already moved it into the
+        // console.
+        rx.recv_blocking().expect("the emulator thread must run");
+        drop(rx);
+        let finished = session.wait();
+
+        assert!(
+            finished.uart.iter().any(|line| line == LOG_MESSAGE),
+            "the cart's log() output must reach the console verbatim: {:?}",
+            finished.uart
         );
     }
 

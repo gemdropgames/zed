@@ -15,10 +15,12 @@ path = "src/ggo_language.rs"
 anyhow.workspace = true
 language.workspace = true
 toml.workspace = true
-# Same grammar Zed's own TOML extension uses (zed-extensions/toml pins
-# tree-sitter-grammars/tree-sitter-toml, published as `-ng`). The fork has
-# no vendored TOML grammar of its own -- upstream extracted TOML into an
-# extension in d074586fbf -- so this crate carries the dependency.
+# The maintained successor of the grammar Zed's own TOML extension pins
+# (zed-extensions/toml pins tree-sitter/tree-sitter-toml, archived Feb
+# 2024; this is tree-sitter-grammars/tree-sitter-toml, published as
+# `-ng`). The fork has no vendored TOML grammar of its own -- upstream
+# extracted TOML into an extension in d074586fbf -- so this crate carries
+# the dependency.
 tree-sitter-toml-ng.workspace = true
 
 [dev-dependencies]
