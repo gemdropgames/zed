@@ -3,8 +3,10 @@
 //! edits it: click select, drag placement (live `WorldOp` moves coalesced
 //! per gesture), a schema-driven inspector, undo/redo, and save. Which
 //! world is open is driven ENTIRELY by the file explorer (F4 X1): clicking
-//! a `worlds/**/*.toml` there routes here through
-//! [`intercept_world_open`]; the panel has no picker of its own.
+//! a `**/worlds/**/*.toml` there routes here through
+//! [`intercept_world_open`]; the panel has no picker of its own. The ASSET
+//! ROOT the document (and every stem inside it) resolves against is derived
+//! from that clicked path -- see [`split_world_path`].
 //!
 //! Split: `loader` owns everything that runs off the UI thread (world
 //! read, instance resolution, asset composition, manifest schemas);
@@ -98,7 +100,7 @@ pub fn init(cx: &mut App) {
     cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
         .detach();
 
-    // Explorer-driven routing: clicking a `worlds/**/*.toml` in the project
+    // Explorer-driven routing: clicking a `**/worlds/**/*.toml` in the project
     // panel loads it HERE instead of opening a TOML editor tab. This is the
     // panel's only way in -- there is no in-panel world picker.
     workspace::register_path_open_interceptor(cx, intercept_world_open);
@@ -120,34 +122,57 @@ pub fn init(cx: &mut App) {
 }
 
 /// Empty-state text. The panel has no picker of its own by design (F4 X1):
-/// worlds arrive by clicking a `worlds/**/*.toml` in the project panel.
+/// worlds arrive by clicking a `**/worlds/**/*.toml` in the project panel.
 const EMPTY_MESSAGE: &str = "Open a world file from the project panel";
 
-/// `rel` as a world listing, or `None` when `rel` is not a world file.
-///
-/// The filter is worldlib's own `world_files`: under the project's TOP-LEVEL
-/// `worlds/` (nested subdirectories included), ending in `.toml`. A bare
-/// `foo.toml`, or a `.toml` outside `worlds/`, is NOT a world and must not
-/// hijack this panel.
-///
-/// This is deliberately NARROWER than the syntax-highlighting glob a GGO
-/// project's `.zed/settings.json` uses (`**/worlds/**/*.toml`, see
-/// `ggo_language::PROJECT_FILE_TYPE_GLOB`), which also matches a `worlds/`
-/// directory nested anywhere -- `assets/worlds/deep/arena.toml` highlights as
-/// a world but does NOT route here, because worldlib resolves every world rel
-/// path against `<project root>/worlds` and could not load it. Highlighting a
-/// file we can't open is harmless; routing one is not. Both cases are pinned
-/// by tests (`ggo_language::tests` for the glob, `world_listing` below).
-fn world_listing(rel: &str) -> Option<WorldListing> {
-    world_files::world_files(std::slice::from_ref(&rel.to_string()))
-        .into_iter()
-        .next()
+/// Byte index of the LAST `worlds/` path COMPONENT in `rel`, or `None` when
+/// `rel` has none. Component-anchored: `myworlds/x.toml` does not match,
+/// only a segment that IS `worlds`.
+fn last_worlds_dir_index(rel: &str) -> Option<usize> {
+    rel.rmatch_indices(world_files::WORLDS_DIR)
+        .map(|(i, _)| i)
+        .find(|i| *i == 0 || rel.as_bytes()[i - 1] == b'/')
 }
 
-/// `workspace::PathOpenInterceptor` for `worlds/**/*.toml`: claim the path,
-/// open the panel, and load it. Declines (so the normal open path runs) for
-/// any other file, for a path outside the primary worktree, and when no
-/// panel is docked.
+/// Split a worktree-relative path into its ASSET ROOT (worktree-relative,
+/// `""` for the worktree root itself) and the asset-root-relative world
+/// listing -- or `None` when `rel` is not a world file.
+///
+/// Worlds do NOT live at `<project>/worlds` in a real project: they live
+/// under an asset root, `<project>/assets/worlds/*.toml`, and that asset
+/// root is what EVERY stem in the engine's world format resolves against --
+/// `emerald.toml`'s `default_world = "worlds/boot"`, each
+/// `[[instance]] world = "worlds/arena"`, each `[[background]]` map path and
+/// each `Sprite`/`MetaSprite`/`Tilemap` asset stem. So the root can't be
+/// hardcoded; it is DERIVED here from the clicked path by splitting at the
+/// last `worlds/` component:
+///
+/// | clicked rel                     | asset root      | world rel         |
+/// |---------------------------------|-----------------|-------------------|
+/// | `assets/worlds/main.toml`       | `assets`        | `worlds/main.toml`|
+/// | `worlds/main.toml`              | `` (worktree)   | `worlds/main.toml`|
+/// | `assets/worlds/sub/worlds/x.toml` | `assets/worlds/sub` | `worlds/x.toml` |
+///
+/// The tail is validated by worldlib's own `world_files` rule, so the
+/// "what counts as a world file" half stays single-sourced. The result
+/// accepts exactly what the syntax-highlighting glob a GGO project's
+/// `.zed/settings.json` uses accepts (`**/worlds/**/*.toml`, see
+/// `ggo_language::PROJECT_FILE_TYPE_GLOB`); the two were divergent until F4
+/// and the glob was the one that was right. A bare `foo.toml`, a `.toml`
+/// outside any `worlds/` directory, or a FILE named `worlds.toml` is NOT a
+/// world and must not hijack this panel.
+fn split_world_path(rel: &str) -> Option<(String, WorldListing)> {
+    let cut = last_worlds_dir_index(rel)?;
+    let listing = world_files::world_files(std::slice::from_ref(&rel[cut..].to_string()))
+        .into_iter()
+        .next()?;
+    Some((rel[..cut].trim_end_matches('/').to_string(), listing))
+}
+
+/// `workspace::PathOpenInterceptor` for `**/worlds/**/*.toml`: claim the
+/// path, open the panel, and load it. Declines (so the normal open path
+/// runs) for any other file, for a path outside the primary worktree, and
+/// when no panel is docked.
 fn intercept_world_open(
     workspace: &mut Workspace,
     path: &ProjectPath,
@@ -157,7 +182,7 @@ fn intercept_world_open(
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return false;
     };
-    if world_listing(&rel).is_none() {
+    if split_world_path(&rel).is_none() {
         return false;
     }
     ggo_common::open_in_panel(
@@ -232,8 +257,19 @@ struct InspectorEntry {
 
 /// A loaded world plus its render-side caches and editor state.
 struct OpenWorld {
+    /// The world's listing RELATIVE TO [`Self::root`] (e.g. stem
+    /// `worlds/main`), which is the same frame every engine-side stem
+    /// resolves in -- not the worktree-relative path that was clicked.
     listing: WorldListing,
-    /// The project root this world was LOADED from. Save writes under
+    /// The worktree-relative path as CLICKED (e.g.
+    /// `assets/worlds/main.toml`). Kept alongside the listing because it,
+    /// not the asset-root-relative rel, is what identifies the file to the
+    /// explorer and to the user: it answers "is this click the world that
+    /// is already open?" and it is what the unsaved-edits prompt names.
+    source_rel: String,
+    /// The ASSET ROOT this world was LOADED from -- `<worktree>/assets`
+    /// for `assets/worlds/main.toml`, the worktree root for
+    /// `worlds/main.toml` (see [`split_world_path`]). Save writes under
     /// THIS root, not the panel's live `project_root` -- a refresh can
     /// repoint the panel at a different worktree while a world from the
     /// old root is still open, and saving the open doc under the new
@@ -261,12 +297,14 @@ struct OpenWorld {
 impl OpenWorld {
     fn new(
         listing: WorldListing,
+        source_rel: String,
         root: PathBuf,
         loaded: loader::LoadedWorld,
         images: HashMap<usize, Arc<RenderImage>>,
     ) -> Self {
         OpenWorld {
             listing,
+            source_rel,
             root,
             store: loaded.store,
             sprite_loads: loaded.sprite_loads,
@@ -366,12 +404,18 @@ impl WorldPanel {
     }
 
     /// Re-discover the project root (the workspace's first visible
-    /// worktree) and re-enumerate its worlds. Runs on every panel
-    /// activation -- the walk only touches `<root>/worlds`, so it's cheap.
+    /// worktree) and re-enumerate the worlds under the ACTIVE asset root.
+    /// Runs on every panel activation -- the walk only touches
+    /// `<asset root>/worlds`, so it's cheap.
     ///
     /// The listing is no longer a picker feed (F4 X1 removed the picker);
     /// it survives because `AddInstance` needs the set of OTHER worlds this
-    /// one may instance -- see [`Self::instance_candidates`].
+    /// one may instance -- see [`Self::instance_candidates`]. That set has
+    /// to come from the OPEN document's asset root, not the worktree root:
+    /// an `[[instance]]` stem resolves against the same root its parent
+    /// world did, so enumerating `<worktree>/worlds` while
+    /// `<worktree>/assets/worlds/main.toml` is open would offer stems that
+    /// resolve to nothing.
     ///
     /// MUST NOT run while the workspace itself is mid-update (it reads the
     /// workspace entity) -- see the deferral in `set_active` and in
@@ -383,11 +427,21 @@ impl WorldPanel {
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
-        self.worlds = match &self.project_root {
-            Some(root) => loader::list_worlds(root),
+        self.worlds = match self.asset_root() {
+            Some(root) => loader::list_worlds(&root),
             None => Vec::new(),
         };
         cx.notify();
+    }
+
+    /// The root world stems are enumerated and resolved against: the open
+    /// document's derived asset root while one is loaded, else the
+    /// worktree root (nothing better is known before the first open).
+    fn asset_root(&self) -> Option<PathBuf> {
+        match &self.state {
+            ViewerState::Ready(open) => Some(open.root.clone()),
+            _ => self.project_root.clone(),
+        }
     }
 
     /// Load the project-relative world path `rel`, prompting FIRST if the
@@ -408,7 +462,7 @@ impl WorldPanel {
         // prompt (offering a "Don't Save" the user never asked for) or drop
         // the undo stack, selection and camera on the floor.
         if let ViewerState::Ready(open) = &self.state
-            && open.listing.rel_path == rel
+            && open.source_rel == rel
         {
             return;
         }
@@ -432,15 +486,27 @@ impl WorldPanel {
         .detach();
     }
 
-    /// Kick off the off-thread load of `rel`. A stale result (superseded by
-    /// a later open) is dropped by generation check.
+    /// Kick off the off-thread load of the worktree-relative path `rel`,
+    /// against the asset root DERIVED from it ([`split_world_path`]). A
+    /// stale result (superseded by a later open) is dropped by generation
+    /// check.
     fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
-        let Some(listing) = world_listing(rel) else {
+        let Some((asset_root_rel, listing)) = split_world_path(rel) else {
             return;
         };
-        let Some(root) = self.project_root.clone() else {
+        let Some(project_root) = self.project_root.clone() else {
             return;
         };
+        let root = if asset_root_rel.is_empty() {
+            project_root
+        } else {
+            project_root.join(&asset_root_rel)
+        };
+        let source_rel = rel.to_string();
+        // Re-enumerate under the root THIS document resolves against, so
+        // `+ Instance` offers stems that actually resolve. `refresh_worlds`
+        // ran before this against the previously-open root.
+        self.worlds = loader::list_worlds(&root);
         self.load_generation += 1;
         let generation = self.load_generation;
         self.state = ViewerState::Loading {
@@ -471,6 +537,7 @@ impl WorldPanel {
                 this.state = match result {
                     Ok((loaded, images)) => ViewerState::Ready(Box::new(OpenWorld::new(
                         listing,
+                        source_rel,
                         loaded_root,
                         loaded,
                         images,
@@ -667,10 +734,9 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        open.store
-            .state()
-            .dirty
-            .then(|| open.listing.rel_path.clone())
+        // The CLICKED path, not the asset-root-relative one: the prompt has
+        // to name the file the way the user sees it in the explorer.
+        open.store.state().dirty.then(|| open.source_rel.clone())
     }
 
     /// The current camera transform, if the canvas has laid out.
@@ -1780,6 +1846,70 @@ mod tests {
         });
     }
 
+    /// F4 regression (user-reported): real projects keep their worlds under
+    /// an ASSET ROOT -- `<project>/assets/worlds/*.toml` -- because that is
+    /// the root `emerald.toml`'s `default_world = "worlds/boot"` stem (and
+    /// every `[[instance]] world = "worlds/…"` stem, and every sprite/map
+    /// asset stem) resolves against. Clicking `assets/worlds/test.toml` must
+    /// load, with the asset root DERIVED from the clicked path.
+    ///
+    /// The rect count is the load-bearing assertion: it only reaches 2 if
+    /// the derived root was threaded into instance resolution, not merely
+    /// used to read the top-level file (a wrong root resolves the
+    /// `worlds/sub` instance to nothing and silently renders a placeholder).
+    #[gpui::test]
+    async fn test_asset_root_world_loads_and_resolves_its_instance_subtree(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        // The whole fixture lives under `<root>/assets`, exactly the
+        // `~/projects/wilds` layout.
+        write_fixture(&dir.path().join("assets"));
+
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = WorldPanel::new(None, cx);
+                panel.root_override = Some(dir.path().to_path_buf());
+                panel
+            })
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.refresh_worlds(cx);
+            panel.load_rel_path("assets/worlds/test.toml", cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready after loading a world under an asset root");
+            };
+            assert_eq!(
+                open.root,
+                dir.path().join("assets"),
+                "the asset root must be derived from the clicked path"
+            );
+            assert_eq!(
+                open.listing.stem, "worlds/test",
+                "the listing is asset-root-relative, matching engine-side stems"
+            );
+            let rects = draw_items(open)
+                .iter()
+                .filter(|i| matches!(i.kind, DrawKind::Rect { .. }))
+                .count();
+            assert_eq!(
+                rects, 2,
+                "top-level RectFill + the worlds/sub instance's, which only \
+                 resolves if the derived root reached instance resolution"
+            );
+            assert_eq!(
+                panel.instance_candidates(),
+                vec!["worlds/sub".to_string()],
+                "+ Instance must enumerate from the SAME derived root"
+            );
+        });
+    }
+
     /// Click select: a primary-down over the RectFill (world [4,4]..[20,16]
     /// at identity view) selects Entity(0) and the rebuilt draw list gains
     /// a SelectionOutline; a primary-down over empty space deselects.
@@ -2424,38 +2554,107 @@ mod tests {
     // ------------------------------------------ explorer-driven routing
 
     /// The predicate that decides what the panel claims from the file
-    /// explorer: worldlib's top-level `worlds/**/*.toml` rule, NOT a bare
-    /// `.toml` test -- a stray `Cargo.toml` click must still open an editor.
+    /// explorer: a `worlds/` directory ANYWHERE in the path with a `.toml`
+    /// leaf, NOT a bare `.toml` test -- a stray `Cargo.toml` click must
+    /// still open an editor.
     ///
-    /// The last case pins the DELIBERATE divergence from
-    /// `ggo_language::PROJECT_FILE_TYPE_GLOB` (`**/worlds/**/*.toml`, which
-    /// `ggo_language::tests` pins as matching `assets/worlds/deep/nested/
-    /// arena.toml`): that file highlights as a world but must not route
-    /// here, because worldlib could not load it from `<root>/worlds`.
+    /// This is exactly `ggo_language::PROJECT_FILE_TYPE_GLOB`
+    /// (`**/worlds/**/*.toml`, which `ggo_language::tests` pins as matching
+    /// `assets/worlds/deep/nested/arena.toml`). The two used to diverge --
+    /// routing accepted only a TOP-LEVEL `worlds/` -- and the glob was the
+    /// one that was right: real projects keep worlds under an asset root,
+    /// so the narrow predicate silently declined every real world file.
     #[gpui::test]
     fn test_world_predicate_matches_only_world_files(_cx: &mut gpui::App) {
+        let stem = |rel: &str| split_world_path(rel).map(|(_, l)| l.stem);
+        assert_eq!(stem("worlds/test.toml"), Some("worlds/test".to_string()));
         assert_eq!(
-            world_listing("worlds/test.toml").map(|l| l.stem),
-            Some("worlds/test".to_string())
-        );
-        assert_eq!(
-            world_listing("worlds/nested/arena.toml").map(|l| l.stem),
+            stem("worlds/nested/arena.toml"),
             Some("worlds/nested/arena".to_string()),
-            "nested worlds under the top-level worlds/ dir count"
+            "nested worlds under a worlds/ dir count"
         );
+        assert_eq!(
+            stem("assets/worlds/main.toml"),
+            Some("worlds/main".to_string()),
+            "the real-project layout: worlds under an asset root"
+        );
+        assert_eq!(
+            stem("deep/nested/worlds/x.toml"),
+            Some("worlds/x".to_string()),
+            "a worlds/ dir at ANY depth routes"
+        );
+
         assert!(
-            world_listing("Cargo.toml").is_none(),
+            split_world_path("Cargo.toml").is_none(),
             "a bare .toml is not a world"
         );
         assert!(
-            world_listing("assets/worlds.toml").is_none(),
-            "only files UNDER worlds/ count"
+            split_world_path("assets/worlds.toml").is_none(),
+            "a FILE named worlds is not a worlds/ DIRECTORY"
         );
-        assert!(world_listing("worlds/readme.md").is_none());
         assert!(
-            world_listing("assets/worlds/deep/nested/arena.toml").is_none(),
-            "the highlighting glob is broader than the routing rule: a nested \
-             worlds/ dir highlights but is not loadable, so it must not route"
+            split_world_path("worlds/readme.md").is_none(),
+            "only .toml leaves count"
+        );
+        assert!(
+            split_world_path("myworlds/x.toml").is_none(),
+            "the worlds/ match is anchored to a whole path component"
+        );
+    }
+
+    /// Root derivation: the asset root is everything BEFORE the last
+    /// `worlds/` component, and the listing is asset-root-relative -- which
+    /// is the frame `[[instance]]`/sprite/map stems resolve in.
+    #[gpui::test]
+    fn test_split_world_path_derives_the_asset_root(_cx: &mut gpui::App) {
+        let split = |rel: &str| {
+            let (root, listing) = split_world_path(rel).expect("a world path");
+            (root, listing.rel_path, listing.stem)
+        };
+        assert_eq!(
+            split("assets/worlds/main.toml"),
+            (
+                "assets".to_string(),
+                "worlds/main.toml".to_string(),
+                "worlds/main".to_string()
+            )
+        );
+        assert_eq!(
+            split("worlds/main.toml"),
+            (
+                // Empty root == the worktree root itself: the pre-F4
+                // behaviour, preserved exactly.
+                String::new(),
+                "worlds/main.toml".to_string(),
+                "worlds/main".to_string()
+            )
+        );
+        assert_eq!(
+            split("deep/nested/worlds/x.toml"),
+            (
+                "deep/nested".to_string(),
+                "worlds/x.toml".to_string(),
+                "worlds/x".to_string()
+            )
+        );
+        assert_eq!(
+            split("assets/worlds/sub/worlds/x.toml"),
+            (
+                // LAST worlds/ wins: the inner one is the world directory,
+                // everything left of it is the root.
+                "assets/worlds/sub".to_string(),
+                "worlds/x.toml".to_string(),
+                "worlds/x".to_string()
+            ),
+        );
+        assert_eq!(
+            split("assets/worlds/nested/arena.toml"),
+            (
+                // A nested dir INSIDE worlds/ stays part of the stem.
+                "assets".to_string(),
+                "worlds/nested/arena.toml".to_string(),
+                "worlds/nested/arena".to_string()
+            )
         );
     }
 
@@ -2531,7 +2730,7 @@ mod tests {
         );
     }
 
-    /// The registered world predicate claims `worlds/**/*.toml` (so the
+    /// The registered world predicate claims `**/worlds/**/*.toml` (so the
     /// project panel opens NO pane item for it), opens the dock, and loads
     /// the world -- while a root-level `Cargo.toml` is declined.
     #[gpui::test]
