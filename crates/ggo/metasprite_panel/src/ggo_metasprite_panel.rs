@@ -1,13 +1,19 @@
-//! GGO MetaSprite panel (F2 task M4): sprite picker, frame strip, and
-//! playback preview. Structural mirror of `ggo_world_panel` -- `Panel`
-//! impl, keybinding-reload observer, off-thread loading with a
-//! load-generation guard -- with the sprite-specific pieces split out:
-//! `loader` owns everything off the UI thread (`.spr` enumeration +
-//! open + per-frame compose), `playback` owns the pure range/loop/
-//! offset/fit math; this module owns the panel entity, the picker, the
-//! transport timer loop, and all gpui wiring. Frame/hitbox EDITING lands
-//! in later F2 tasks (M5+) -- this panel is a viewer with a transport.
+//! GGO MetaSprite panel (F2 tasks M4+M5): sprite picker, frame strip,
+//! playback preview, and animation EDITING -- clip CRUD, frame ops,
+//! undo/redo/save over worldlib's `SpriteDocStore`. Structural mirror of
+//! `ggo_world_panel` -- `Panel` impl, keybinding-reload observer,
+//! off-thread loading with a load-generation guard, blur/Enter-committed
+//! single-line editors -- with the sprite-specific pieces split out:
+//! `loader` owns everything off the UI thread (`.spr` enumeration + open
+//! + per-frame compose), `playback` owns the pure range/loop/offset/fit
+//! math, `edits` owns the pure edit rules (new-clip defaults, range
+//! validation, duration parsing, post-op selection bookkeeping); this
+//! module owns the panel entity, the store wiring, the transport timer
+//! loop, and all gpui glue. Op semantics mirror ggo-ide's
+//! `sprites/timeline.rs` message handlers; guards are re-checked here
+//! because the store's frame/clip index ops currently panic out of range.
 
+mod edits;
 mod loader;
 mod playback;
 
@@ -15,17 +21,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
-    ParentElement, Pixels, Render, RenderImage, Styled, Task, WeakEntity, Window, actions, div,
-    img, px,
+    Action, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement,
+    KeyBinding, KeyContext, ParentElement, Pixels, Render, RenderImage, Styled, Subscription, Task,
+    WeakEntity, Window, actions, div, img, px,
 };
 use ui::prelude::*;
-use ui::{ContextMenu, DropdownMenu};
+use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
-use ggo_worldlib::sprites::cow::SpriteState;
+use ggo_worldlib::sprites::cow::{ClipEdit, SpriteState};
+use ggo_worldlib::sprites::io::save_sprite;
+use ggo_worldlib::sprites::sprite_doc::{DocOp, SpriteDocStore, clamp_clip_name_bytes};
 use ggo_worldlib::sprites::timeline_ops::{playback_frame_at, playback_total_ms};
 
 actions!(
@@ -34,15 +43,26 @@ actions!(
         /// Toggles focus on the GGO metasprite panel.
         ToggleFocus,
         /// Toggles playback of the open sprite's active clip range.
-        PlayPause
+        PlayPause,
+        /// Undoes the last edit to the open sprite.
+        Undo,
+        /// Redoes the last undone edit to the open sprite.
+        Redo,
+        /// Saves the open sprite to its `.spr`/`.til`/`.pal` trio.
+        Save,
+        /// Commits the focused clip/duration field editor's text.
+        CommitField
     ]
 );
 
 const GGO_METASPRITE_PANEL_KEY: &str = "GGOMetaSpritePanel";
 
-/// The panel's key-dispatch context (`.key_context`), which the
-/// [`bind_panel_keys`] bindings are scoped to -- same shape as
-/// `ggo_world_panel::KEY_CONTEXT`.
+/// The panel's key-dispatch context identifier. [`dispatch_context`]
+/// additionally stamps `editing`/`not_editing` (project_panel's pattern)
+/// so plain-key bindings (space) can be scoped away from focused text
+/// editors -- see [`bind_panel_keys`].
+///
+/// [`dispatch_context`]: MetaSpritePanel::dispatch_context
 const KEY_CONTEXT: &str = "GgoMetaSpritePanel";
 
 /// Fixed default width until the panel grows real settings persistence.
@@ -54,6 +74,9 @@ const THUMB_PX: f32 = 48.0;
 
 /// Large center preview box (px, square).
 const PREVIEW_PX: f32 = 240.0;
+
+/// The clip-CRUD side column's width.
+const CLIPS_WIDTH: Pixels = px(148.);
 
 /// Playback timer cadence. 16ms tracks a 60Hz frame; the ACTUAL frame
 /// shown each tick is recomputed from wall-clock elapsed time
@@ -89,14 +112,61 @@ pub fn init(cx: &mut App) {
 }
 
 fn bind_panel_keys(cx: &mut App) {
-    // Scoped to the panel's own key context, so space only toggles
-    // playback while the panel has focus. (`ToggleFocus` stays unbound,
-    // dispatched via `Panel::toggle_action` / the command palette, same
-    // as `ggo_world::ToggleFocus`.)
-    cx.bind_keys([KeyBinding::new("space", PlayPause, Some(KEY_CONTEXT))]);
+    // All scoped to the panel's key context. Space additionally requires
+    // `not_editing` (the panel's dispatch context stamps `editing` while
+    // any clip/duration field editor is focused, project_panel's
+    // `not_editing` pattern) -- otherwise a panel-depth space binding
+    // would win over a focused editor's plain-character input, since no
+    // deeper binding shadows it. Ctrl-z/ctrl-s DON'T need the guard: the
+    // default keymap binds them at the deeper `Editor` context, which
+    // takes precedence while a field editor is focused. Enter is bound at
+    // `KEY_CONTEXT > Editor` (single-line editors leave Enter unbound --
+    // `editor::Newline` is `mode == full` only), committing the focused
+    // field. `ToggleFocus` stays unbound, dispatched via
+    // `Panel::toggle_action` / the command palette.
+    cx.bind_keys([
+        KeyBinding::new(
+            "space",
+            PlayPause,
+            Some(&format!("{KEY_CONTEXT} && not_editing")),
+        ),
+        KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
+        KeyBinding::new(
+            "enter",
+            CommitField,
+            Some(&format!("{KEY_CONTEXT} > Editor")),
+        ),
+    ]);
 }
 
 // ------------------------------------------------------------- view state
+
+/// What one panel text input edits. `Duration` deliberately carries no
+/// frame index -- there is ONE duration editor, always bound to the
+/// currently selected frame, so a selection change re-syncs its text
+/// instead of rebuilding the editor set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditTarget {
+    ClipName(usize),
+    ClipFrom(usize),
+    ClipTo(usize),
+    Duration,
+}
+
+/// One panel text input: the target it edits and the single-line editor
+/// entity backing it. Commit on blur (subscription) or Enter
+/// ([`CommitField`]); the focus subscription re-renders the panel so the
+/// key context's `editing` flag tracks reality.
+struct EditorEntry {
+    target: EditTarget,
+    editor: Entity<Editor>,
+    _subscriptions: [Subscription; 2],
+}
 
 /// An in-flight playback: wall-clock anchored (the shown frame is
 /// recomputed from `started.elapsed()` every tick, never incremented), so
@@ -110,33 +180,54 @@ struct Playing {
     frame: usize,
 }
 
-/// A loaded sprite plus its per-frame image cache and transport state.
+/// A loaded sprite: its doc store, per-frame image cache, transport
+/// state, and field editors.
 struct OpenSprite {
     rel_path: String,
-    state: SpriteState,
-    /// One composed BGRA image per frame index, built once at load (see
-    /// `loader::LoadedSprite::frames` for the M5 invalidation hook).
+    /// Sidecar rels resolved at open time -- `save_sprite` writes the
+    /// same trio back.
+    til_path: String,
+    pal_path: String,
+    store: SpriteDocStore,
+    /// One composed BGRA image per frame index; rebuilt wholesale after
+    /// every doc mutation (see `loader::LoadedSprite::frames`).
     frames: Vec<Arc<RenderImage>>,
     selected_frame: usize,
-    /// Index into `state.clips`; `None` = whole-sprite range.
+    /// Index into the doc's clips; `None` = whole-sprite range.
     active_clip: Option<usize>,
     playing: Option<Playing>,
     /// The transport's timer loop -- dropping it (new sprite selected,
     /// panel dropped) cancels playback; a finished loop leaves a spent
     /// task behind, which the next play simply replaces.
     _tick_task: Option<Task<()>>,
+    /// Clip/duration field editors, rebuilt by `ensure_editors` when the
+    /// target set changes.
+    editors: Vec<EditorEntry>,
+    /// Inline rejection from a clip-range edit: `(clip index, message)`.
+    /// Cleared on the next applied op.
+    clip_error: Option<(usize, String)>,
+    /// A store-level op rejection (shouldn't happen -- ops are
+    /// bounds-guarded before apply -- but surfaced instead of swallowed).
+    op_error: Option<String>,
+    save_error: Option<String>,
 }
 
 impl OpenSprite {
     fn new(rel_path: String, loaded: loader::LoadedSprite) -> Self {
         OpenSprite {
             rel_path,
-            state: loaded.state,
+            til_path: loaded.til_path,
+            pal_path: loaded.pal_path,
+            store: SpriteDocStore::new(loaded.state),
             frames: loaded.frames,
             selected_frame: 0,
             active_clip: None,
             playing: None,
             _tick_task: None,
+            editors: Vec::new(),
+            clip_error: None,
+            op_error: None,
+            save_error: None,
         }
     }
 
@@ -150,7 +241,12 @@ impl OpenSprite {
     }
 
     fn durations(&self) -> Vec<u16> {
-        self.state.frames.iter().map(|f| f.duration_ms).collect()
+        self.store
+            .state()
+            .frames
+            .iter()
+            .map(|f| f.duration_ms)
+            .collect()
     }
 }
 
@@ -251,7 +347,7 @@ impl MetaSpritePanel {
     /// it stops).
     fn select_frame(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state
-            && ix < open.state.frames.len()
+            && ix < open.store.state().frames.len()
         {
             open.selected_frame = ix;
             cx.notify();
@@ -283,12 +379,12 @@ impl MetaSpritePanel {
             cx.notify();
             return;
         }
-        if open.state.frames.is_empty() {
+        if open.store.state().frames.is_empty() {
             return;
         }
         let durations = open.durations();
-        let range =
-            playback::play_range(&open.state.clips, open.active_clip, open.state.frames.len());
+        let state = open.store.state();
+        let range = playback::play_range(&state.clips, open.active_clip, state.frames.len());
         let start_offset_ms = playback::start_offset_ms(&durations, range, open.selected_frame);
         open.playing = Some(Playing {
             started: Instant::now(),
@@ -319,31 +415,538 @@ impl MetaSpritePanel {
     }
 
     /// One transport tick: re-read durations/range/loop from the doc
-    /// (mid-playback edits -- M5 -- get picked up immediately, ggo-ide's
-    /// `tick` rule) and recompute the shown frame. Returns true when the
-    /// loop should stop: playback was cancelled, or a non-looping range
-    /// ran past its total (which also resets the preview to the selected
-    /// frame).
+    /// (mid-playback edits get picked up immediately, ggo-ide's `tick`
+    /// rule -- a deleted clip falls back to the whole strip via
+    /// `play_range`'s stale-index rule) and recompute the shown frame.
+    /// Notifies only when the shown frame actually changed (or playback
+    /// stopped) -- at 16ms ticks over >= 16ms frames most ticks change
+    /// nothing, and a no-op notify would re-render the whole panel at
+    /// 60Hz for the duration of playback (M4 review fix). Returns true
+    /// when the loop should stop: playback was cancelled, or a
+    /// non-looping range ran past its total (which also resets the
+    /// preview to the selected frame).
     fn advance_playback(&mut self, cx: &mut Context<Self>) -> bool {
         let ViewerState::Ready(open) = &mut self.state else {
             return true;
         };
-        let Some(playing) = &mut open.playing else {
+        if open.playing.is_none() {
             return true;
-        };
-        let durations: Vec<u16> = open.state.frames.iter().map(|f| f.duration_ms).collect();
-        let range =
-            playback::play_range(&open.state.clips, open.active_clip, open.state.frames.len());
-        let loop_ = playback::play_loop(&open.state.clips, open.active_clip);
+        }
+        let state = open.store.state();
+        let durations: Vec<u16> = state.frames.iter().map(|f| f.duration_ms).collect();
+        let range = playback::play_range(&state.clips, open.active_clip, state.frames.len());
+        let loop_ = playback::play_loop(&state.clips, open.active_clip);
+        let playing = open
+            .playing
+            .as_mut()
+            .expect("checked playing.is_some() above");
         let t_ms = playing.start_offset_ms + playing.started.elapsed().as_millis() as i64;
         if !loop_ && t_ms >= playback_total_ms(&durations, range) {
             open.playing = None;
             cx.notify();
             return true;
         }
-        playing.frame = playback_frame_at(&durations, range, t_ms, loop_);
-        cx.notify();
+        let frame = playback_frame_at(&durations, range, t_ms, loop_);
+        if playing.frame != frame {
+            playing.frame = frame;
+            cx.notify();
+        }
         false
+    }
+
+    // ------------------------------------------------------------ doc ops
+
+    /// Apply one op to the store, then refresh everything derived from the
+    /// doc. All callers bounds-check their indices FIRST -- the store's
+    /// `ClipSet{None}`/`FrameDelete`/`FrameMove`/`FrameDuration` arms
+    /// currently panic on an out-of-range index (worldlib hardening is
+    /// landing separately), so the panel never forwards one. A store-level
+    /// rejection (e.g. an over-long clip name, pre-clamped here so it
+    /// shouldn't fire) is surfaced inline rather than swallowed.
+    fn apply_doc(&mut self, op: DocOp, cx: &mut Context<Self>) -> bool {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        match open.store.apply(op) {
+            Ok(()) => {
+                self.refresh_after_doc_change(cx);
+                true
+            }
+            Err(e) => {
+                open.op_error = Some(e.to_string());
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// After any doc mutation (op, undo, redo, save fold-back): rebuild
+    /// the composed per-frame images (the whole Vec -- M4's documented
+    /// invalidation point; wholesale recompose keeps every thumbnail *and*
+    /// the frame-index -> image mapping trivially correct after
+    /// adds/deletes/moves, at O(frames x sprite px) per edit, cheap at
+    /// sprite scale), clamp the frame/clip selections into the new
+    /// bounds, and clear stale inline errors. A running transport needs no
+    /// help: range/loop/durations are re-read from the doc every tick.
+    fn refresh_after_doc_change(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let frames = loader::compose_frames(open.store.state()).unwrap_or_default();
+        let frame_count = open.store.state().frames.len();
+        let clip_count = open.store.state().clips.len();
+        open.frames = frames;
+        open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
+        if open.active_clip.is_some_and(|c| c >= clip_count) {
+            open.active_clip = None;
+        }
+        open.clip_error = None;
+        open.op_error = None;
+        cx.notify();
+    }
+
+    fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        let undone = match &mut self.state {
+            ViewerState::Ready(open) => open.store.undo(),
+            _ => false,
+        };
+        if undone {
+            self.refresh_after_doc_change(cx);
+        }
+    }
+
+    fn redo_impl(&mut self, cx: &mut Context<Self>) {
+        let redone = match &mut self.state {
+            ViewerState::Ready(open) => open.store.redo(),
+            _ => false,
+        };
+        if redone {
+            self.refresh_after_doc_change(cx);
+        }
+    }
+
+    /// `save_sprite` -> `set_saved_state` with its fold-back result --
+    /// worldlib's own save flow (ggo-ide `editor.rs` parity: the folded
+    /// state silently replaces `current` WITHOUT an undo entry, so Ctrl+Z
+    /// after saving steps through the user's edits, not the fold-back).
+    /// Synchronous by choice, same reasoning as `ggo_world_panel`'s save.
+    fn save_impl(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let saved = {
+            let ViewerState::Ready(open) = &mut self.state else {
+                return;
+            };
+            match save_sprite(
+                &root,
+                &open.rel_path,
+                open.store.state(),
+                &open.til_path,
+                &open.pal_path,
+            ) {
+                Ok(folded) => {
+                    open.store.set_saved_state(folded);
+                    open.save_error = None;
+                    true
+                }
+                Err(e) => {
+                    open.save_error = Some(e.to_string());
+                    false
+                }
+            }
+        };
+        if saved {
+            // Fold-back may have re-identified pool tiles; recompose from
+            // the state the store now actually holds.
+            self.refresh_after_doc_change(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    // --------------------------------------------------------- frame ops
+
+    /// Append a blank frame -- ggo-ide `Msg::AddFrame` (insert at the end,
+    /// no `copy_of`; the store finds or appends an all-zero tile).
+    fn add_blank_frame(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let at = open.store.state().frames.len();
+        self.apply_doc(
+            DocOp::FrameAdd {
+                at,
+                copy_of: None,
+                map: None,
+            },
+            cx,
+        );
+    }
+
+    /// Duplicate the selected frame right after itself and select the
+    /// copy -- ggo-ide `Msg::DupFrame`.
+    fn duplicate_selected_frame(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let i = open.selected_frame;
+        if i >= open.store.state().frames.len() {
+            return;
+        }
+        if self.apply_doc(
+            DocOp::FrameAdd {
+                at: i + 1,
+                copy_of: Some(i),
+                map: None,
+            },
+            cx,
+        ) && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.selected_frame = i + 1;
+        }
+    }
+
+    /// Delete the selected frame -- ggo-ide `Msg::DeleteFrame`: refuses to
+    /// drop the last frame; the store adjusts clip ranges in the same op;
+    /// the selection follows `edits::selection_after_frame_delete`.
+    fn delete_selected_frame(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let i = open.selected_frame;
+        let len = open.store.state().frames.len();
+        if len <= 1 || i >= len {
+            return; // always keep at least one frame
+        }
+        let next = edits::selection_after_frame_delete(i, i, len);
+        if self.apply_doc(DocOp::FrameDelete { at: i }, cx)
+            && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.selected_frame = next;
+        }
+    }
+
+    /// Move the selected frame one slot left/right -- ggo-ide
+    /// `Msg::MoveFrame`: for an ADJACENT move, `to` is already the correct
+    /// post-removal splice index (a neighbor swap), so no drop-target
+    /// conversion is needed; the selection follows the moved frame.
+    fn move_selected_frame(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let i = open.selected_frame;
+        let len = open.store.state().frames.len();
+        let to = if delta < 0 {
+            i.checked_sub(1)
+        } else {
+            i.checked_add(1)
+        };
+        let Some(to) = to else {
+            return;
+        };
+        if i >= len || to >= len {
+            return;
+        }
+        if self.apply_doc(DocOp::FrameMove { from: i, to }, cx)
+            && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.selected_frame = to;
+        }
+    }
+
+    // ---------------------------------------------------------- clip ops
+
+    /// Add a clip with ggo-ide `Msg::AddClip`'s defaults (see
+    /// `edits::default_new_clip`).
+    fn add_clip(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let state = open.store.state();
+        let clip =
+            edits::default_new_clip(state.clips.len(), open.selected_frame, state.frames.len());
+        self.apply_doc(DocOp::ClipAdd { clip }, cx);
+    }
+
+    /// Delete clip `i` -- ggo-ide `Msg::DeleteClip`, including its
+    /// active-selection shift rule. Bounds-checked: a stale index (clip
+    /// removed by an undo between render and click) must not reach the
+    /// store's panicking `ClipSet{None}` arm.
+    fn delete_clip(&mut self, i: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        if i >= open.store.state().clips.len() {
+            return;
+        }
+        let next_active = edits::active_clip_after_clip_delete(open.active_clip, i);
+        if self.apply_doc(DocOp::ClipSet { at: i, clip: None }, cx)
+            && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.active_clip = next_active;
+        }
+    }
+
+    /// Toggle clip `i`'s loop flag -- ggo-ide `Msg::ClipLoop` (whole-clip
+    /// `ClipSet` with just the flag changed).
+    fn set_clip_loop(&mut self, i: usize, loop_: bool, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(clip) = open.store.state().clips.get(i).cloned() else {
+            return;
+        };
+        if clip.loop_ == loop_ {
+            return;
+        }
+        self.apply_doc(
+            DocOp::ClipSet {
+                at: i,
+                clip: Some(ClipEdit { loop_, ..clip }),
+            },
+            cx,
+        );
+    }
+
+    // ------------------------------------------------------ field editors
+
+    /// A completed edit's buffer -> the op, mirroring ggo-ide's guard
+    /// order per field:
+    ///
+    /// - clip name (`Msg::ClipNameSubmit`): trim, byte-clamp
+    ///   (`clamp_clip_name_bytes`), empty -> dropped; then `ClipSet`.
+    /// - clip from/to: parse `usize` (unparsable -> dropped, world_panel's
+    ///   commit rule); validate the CANDIDATE range via
+    ///   `edits::clip_range_error` BEFORE building the op -- a failure is
+    ///   shown inline on that clip's row and nothing is applied. (ggo-ide
+    ///   edits ranges with clamped sliders, so its equivalent guard is the
+    ///   clamp itself; typed input needs the explicit check.)
+    /// - duration (`Msg::DurationSubmit`): parse-or-0 then floor to
+    ///   `MIN_FRAME_MS` (`edits::parse_duration_ms`), applied to the
+    ///   selected frame.
+    ///
+    /// Unchanged values are dropped without an op: blur commits every
+    /// focus exit, and a no-change `ClipSet`/`FrameDuration` would still
+    /// push an undo entry.
+    fn commit_edit(&mut self, target: EditTarget, text: String, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        match target {
+            EditTarget::ClipName(i) => {
+                let Some(clip) = open.store.state().clips.get(i).cloned() else {
+                    return;
+                };
+                let name = clamp_clip_name_bytes(text.trim());
+                if name.is_empty() || name == clip.name {
+                    cx.notify(); // re-sync the editor's text from the doc
+                    return;
+                }
+                self.apply_doc(
+                    DocOp::ClipSet {
+                        at: i,
+                        clip: Some(ClipEdit { name, ..clip }),
+                    },
+                    cx,
+                );
+            }
+            EditTarget::ClipFrom(i) | EditTarget::ClipTo(i) => {
+                let Some(clip) = open.store.state().clips.get(i).cloned() else {
+                    return;
+                };
+                let Ok(value) = text.trim().parse::<usize>() else {
+                    cx.notify(); // dropped, not committed -- editor re-syncs
+                    return;
+                };
+                let (from, to) = match target {
+                    EditTarget::ClipFrom(_) => (value, clip.to),
+                    _ => (clip.from, value),
+                };
+                if (from, to) == (clip.from, clip.to) {
+                    cx.notify();
+                    return;
+                }
+                let frame_count = open.store.state().frames.len();
+                if let Some(err) = edits::clip_range_error(from, to, frame_count) {
+                    open.clip_error = Some((i, err));
+                    cx.notify();
+                    return;
+                }
+                open.clip_error = None;
+                self.apply_doc(
+                    DocOp::ClipSet {
+                        at: i,
+                        clip: Some(ClipEdit { from, to, ..clip }),
+                    },
+                    cx,
+                );
+            }
+            EditTarget::Duration => {
+                let ms = edits::parse_duration_ms(&text);
+                let at = open.selected_frame;
+                let Some(frame) = open.store.state().frames.get(at) else {
+                    return;
+                };
+                if frame.duration_ms == ms {
+                    cx.notify();
+                    return;
+                }
+                self.apply_doc(DocOp::FrameDuration { at, ms }, cx);
+            }
+        }
+    }
+
+    /// The display string an unfocused input shows for `target`.
+    fn edit_display_text(
+        target: &EditTarget,
+        state: &SpriteState,
+        selected_frame: usize,
+    ) -> String {
+        match target {
+            EditTarget::ClipName(i) => state
+                .clips
+                .get(*i)
+                .map_or_else(String::new, |c| c.name.clone()),
+            EditTarget::ClipFrom(i) => state
+                .clips
+                .get(*i)
+                .map_or_else(String::new, |c| c.from.to_string()),
+            EditTarget::ClipTo(i) => state
+                .clips
+                .get(*i)
+                .map_or_else(String::new, |c| c.to.to_string()),
+            EditTarget::Duration => state
+                .frames
+                .get(selected_frame)
+                .map_or_else(String::new, |f| f.duration_ms.to_string()),
+        }
+    }
+
+    /// Keep the field-editor entities in sync with the doc: rebuild when
+    /// the target set changed (clip added/deleted, undo/redo
+    /// restructure), otherwise refresh unfocused editors' text from the
+    /// doc -- a focused editor keeps the user's in-progress buffer
+    /// (`ggo_world_panel::ensure_inspector`'s rule, itself ggo-ide's
+    /// draft pattern).
+    fn ensure_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let mut targets = Vec::with_capacity(open.store.state().clips.len() * 3 + 1);
+        for i in 0..open.store.state().clips.len() {
+            targets.push(EditTarget::ClipName(i));
+            targets.push(EditTarget::ClipFrom(i));
+            targets.push(EditTarget::ClipTo(i));
+        }
+        targets.push(EditTarget::Duration);
+
+        let same_targets = open.editors.len() == targets.len()
+            && open
+                .editors
+                .iter()
+                .zip(&targets)
+                .all(|(entry, target)| entry.target == *target);
+
+        if same_targets {
+            let state = open.store.state();
+            for entry in &open.editors {
+                if entry.editor.focus_handle(cx).is_focused(window) {
+                    continue;
+                }
+                let text = Self::edit_display_text(&entry.target, state, open.selected_frame);
+                if entry.editor.read(cx).text(cx) != text {
+                    entry
+                        .editor
+                        .update(cx, |editor, cx| editor.set_text(text, window, cx));
+                }
+            }
+            return;
+        }
+
+        let mut entries = Vec::with_capacity(targets.len());
+        for target in targets {
+            let text = Self::edit_display_text(&target, open.store.state(), open.selected_frame);
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(text, window, cx);
+                editor
+            });
+            let commit = cx.subscribe(&editor, Self::handle_editor_event);
+            // Focus entering a field flips the key context's flag to
+            // `editing` (space types instead of toggling playback) -- but
+            // only a re-render re-reads `dispatch_context`, so nudge one.
+            let focus = cx.on_focus(&editor.focus_handle(cx), window, |_, _, cx| cx.notify());
+            entries.push(EditorEntry {
+                target,
+                editor,
+                _subscriptions: [commit, focus],
+            });
+        }
+        open.editors = entries;
+    }
+
+    /// Blur commits the field (world_panel's rule; ggo-ide commits on
+    /// Enter only because iced has no blur event -- see its
+    /// `timeline.rs` module doc). The notify re-evaluates the key
+    /// context's `editing` flag either way.
+    fn handle_editor_event(
+        &mut self,
+        editor: Entity<Editor>,
+        event: &EditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, EditorEvent::Blurred) {
+            self.commit_editor(editor.entity_id(), cx);
+            cx.notify();
+        }
+    }
+
+    fn commit_editor(&mut self, editor_id: EntityId, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some((target, text)) = open
+            .editors
+            .iter()
+            .find(|e| e.editor.entity_id() == editor_id)
+            .map(|e| (e.target.clone(), e.editor.read(cx).text(cx)))
+        else {
+            return;
+        };
+        self.commit_edit(target, text, cx);
+    }
+
+    fn on_commit_field(&mut self, _: &CommitField, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let focused = open
+            .editors
+            .iter()
+            .find(|e| e.editor.focus_handle(cx).is_focused(window))
+            .map(|e| e.editor.entity_id());
+        if let Some(id) = focused {
+            self.commit_editor(id, cx);
+        }
+    }
+
+    /// The panel's key context: the panel identifier plus an
+    /// `editing`/`not_editing` flag from live editor focus
+    /// (project_panel's `dispatch_context` pattern) -- see
+    /// [`bind_panel_keys`] for why space needs it.
+    fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add(KEY_CONTEXT);
+        let editing = match &self.state {
+            ViewerState::Ready(open) => open
+                .editors
+                .iter()
+                .any(|e| e.editor.focus_handle(cx).is_focused(window)),
+            _ => false,
+        };
+        key_context.add(if editing { "editing" } else { "not_editing" });
+        key_context
     }
 
     // ------------------------------------------------------------- render
@@ -387,18 +990,21 @@ impl MetaSpritePanel {
             .into_any_element()
     }
 
-    /// Transport row: play/pause, the clip selector, and the sprite name.
+    /// Transport row: play/pause, the clip selector, undo/redo/save, and
+    /// the sprite name with world_panel's dirty dot.
     fn render_transport(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_transport is only called in the Ready state");
         };
         let playing = open.playing.is_some();
-        let clip_label: SharedString = match open.active_clip.and_then(|i| open.state.clips.get(i))
-        {
+        let dirty = open.store.dirty();
+        let state = open.store.state();
+        let clip_label: SharedString = match open.active_clip.and_then(|i| state.clips.get(i)) {
             Some(c) => c.name.clone().into(),
             None => "All frames".into(),
         };
-        let clip_names: Vec<String> = open.state.clips.iter().map(|c| c.name.clone()).collect();
+        let clip_names: Vec<String> = state.clips.iter().map(|c| c.name.clone()).collect();
+        let title = format!("{}{}", open.rel_path, if dirty { " ●" } else { "" });
         let weak = cx.weak_entity();
         let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
             {
@@ -431,10 +1037,32 @@ impl MetaSpritePanel {
             .child(DropdownMenu::new("ggo-metasprite-clip", clip_label, menu))
             .child(div().flex_1())
             .child(
-                Label::new(SharedString::from(open.rel_path.clone()))
+                Label::new(SharedString::from(title))
                     .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    .color(if dirty { Color::Modified } else { Color::Muted }),
             )
+            .child(
+                IconButton::new("ggo-metasprite-undo", IconName::Undo)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Undo"))
+                    .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
+            )
+            .child(
+                IconButton::new("ggo-metasprite-redo", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Redo"))
+                    .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
+            )
+            .child(
+                Button::new("ggo-metasprite-save", "Save")
+                    .disabled(!dirty)
+                    .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
+            )
+            .children(open.save_error.as_ref().map(|e| {
+                Label::new(format!("save failed: {e}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Error)
+            }))
             .into_any_element()
     }
 
@@ -447,7 +1075,8 @@ impl MetaSpritePanel {
         let shown = open.shown_frame();
         let mut preview = div()
             .flex_1()
-            .min_h_0()
+            .min_w_0()
+            .h_full()
             .flex()
             .justify_center()
             .items_center()
@@ -460,6 +1089,175 @@ impl MetaSpritePanel {
         preview.into_any_element()
     }
 
+    /// One field text input, in world_panel's minimal bordered box.
+    fn editor_input(editor: Entity<Editor>, cx: &Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .px_1()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .rounded_sm()
+            .bg(cx.theme().colors().editor_background)
+            .child(editor)
+            .into_any_element()
+    }
+
+    /// The clip-CRUD side column: per clip a name row (+ delete) and a
+    /// from/to/loop row, an inline range error under the offending clip,
+    /// and an add button.
+    fn render_clips(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_clips is only called in the Ready state");
+        };
+        let state = open.store.state();
+        let editor_for = |target: EditTarget| {
+            open.editors
+                .iter()
+                .find(|e| e.target == target)
+                .map(|e| e.editor.clone())
+        };
+        let mut col = v_flex().p_1().gap_1();
+        for (i, clip) in state.clips.iter().enumerate() {
+            let mut row = v_flex()
+                .gap_0p5()
+                .p_0p5()
+                .border_1()
+                .rounded_sm()
+                .border_color(if open.active_clip == Some(i) {
+                    cx.theme().colors().border_focused
+                } else {
+                    cx.theme().colors().border_variant
+                })
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .children(
+                            editor_for(EditTarget::ClipName(i)).map(|e| Self::editor_input(e, cx)),
+                        )
+                        .child(
+                            IconButton::new(("ggo-metasprite-clip-delete", i), IconName::Trash)
+                                .icon_size(IconSize::Small)
+                                .tooltip(ui::Tooltip::text("Delete clip"))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.delete_clip(i, cx)),
+                                ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .children(
+                            editor_for(EditTarget::ClipFrom(i)).map(|e| Self::editor_input(e, cx)),
+                        )
+                        .children(
+                            editor_for(EditTarget::ClipTo(i)).map(|e| Self::editor_input(e, cx)),
+                        )
+                        .child({
+                            let weak = cx.weak_entity();
+                            Checkbox::new(
+                                ("ggo-metasprite-clip-loop", i),
+                                ToggleState::from(clip.loop_),
+                            )
+                            .label("loop")
+                            .on_click(move |toggle, _window, cx| {
+                                let on = matches!(toggle, ToggleState::Selected);
+                                weak.update(cx, |this, cx| this.set_clip_loop(i, on, cx))
+                                    .ok();
+                            })
+                        }),
+                );
+            if let Some((at, message)) = &open.clip_error
+                && *at == i
+            {
+                row = row.child(
+                    Label::new(SharedString::from(message.clone()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                );
+            }
+            col = col.child(row);
+        }
+        col = col.child(
+            Button::new("ggo-metasprite-clip-add", "+ Clip")
+                .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
+        );
+        div()
+            .id("ggo-metasprite-clips")
+            .w(CLIPS_WIDTH)
+            .h_full()
+            .flex_none()
+            .border_l_1()
+            .border_color(cx.theme().colors().border)
+            .overflow_y_scroll()
+            .child(col)
+            .into_any_element()
+    }
+
+    /// Frame-op row above the strip: add/duplicate/delete/move buttons
+    /// acting on the selected frame, plus its duration editor.
+    fn render_frame_ops(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_frame_ops is only called in the Ready state");
+        };
+        let len = open.store.state().frames.len();
+        let selected = open.selected_frame;
+        h_flex()
+            .gap_1()
+            .p_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                IconButton::new("ggo-metasprite-frame-add", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Add blank frame"))
+                    .on_click(cx.listener(|this, _, _, cx| this.add_blank_frame(cx))),
+            )
+            .child(
+                IconButton::new("ggo-metasprite-frame-dup", IconName::Copy)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Duplicate frame"))
+                    .on_click(cx.listener(|this, _, _, cx| this.duplicate_selected_frame(cx))),
+            )
+            .child(
+                IconButton::new("ggo-metasprite-frame-delete", IconName::Trash)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Delete frame"))
+                    .disabled(len <= 1)
+                    .on_click(cx.listener(|this, _, _, cx| this.delete_selected_frame(cx))),
+            )
+            .child(
+                IconButton::new("ggo-metasprite-frame-left", IconName::ChevronLeft)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Move frame left"))
+                    .disabled(selected == 0)
+                    .on_click(cx.listener(|this, _, _, cx| this.move_selected_frame(-1, cx))),
+            )
+            .child(
+                IconButton::new("ggo-metasprite-frame-right", IconName::ChevronRight)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Move frame right"))
+                    .disabled(selected + 1 >= len)
+                    .on_click(cx.listener(|this, _, _, cx| this.move_selected_frame(1, cx))),
+            )
+            .child(div().flex_1())
+            .child(Label::new("ms").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                div().w(px(56.)).flex_none().children(
+                    open.editors
+                        .iter()
+                        .find(|e| e.target == EditTarget::Duration)
+                        .map(|e| Self::editor_input(e.editor.clone(), cx)),
+                ),
+            )
+            .children(open.op_error.as_ref().map(|e| {
+                Label::new(SharedString::from(e.clone()))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+            }))
+            .into_any_element()
+    }
+
     /// The bottom frame strip: one thumbnail + duration label per frame,
     /// click to select, selected frame outlined.
     fn render_strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -469,6 +1267,7 @@ impl MetaSpritePanel {
         let selected = open.selected_frame;
         let border = cx.theme().colors().border;
         let accent = cx.theme().colors().border_focused;
+        let state = open.store.state();
         div()
             .id("ggo-metasprite-strip")
             .flex_none()
@@ -479,7 +1278,7 @@ impl MetaSpritePanel {
             .child(
                 h_flex()
                     .gap_1()
-                    .children(open.state.frames.iter().enumerate().map(|(ix, frame)| {
+                    .children(state.frames.iter().enumerate().map(|(ix, frame)| {
                         let thumb = open.frames.get(ix).map(|image| {
                             let (w, h) = image_px_size(image);
                             let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
@@ -517,7 +1316,15 @@ impl MetaSpritePanel {
         v_flex()
             .size_full()
             .child(self.render_transport(window, cx))
-            .child(self.render_preview(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .child(self.render_preview(cx))
+                    .child(self.render_clips(cx)),
+            )
+            .child(self.render_frame_ops(cx))
             .child(self.render_strip(cx))
             .into_any_element()
     }
@@ -532,6 +1339,7 @@ fn image_px_size(image: &Arc<RenderImage>) -> (u32, u32) {
 
 impl Render for MetaSpritePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_editors(window, cx);
         let body = match &self.state {
             ViewerState::Empty => self.render_message("Select a sprite".to_string(), cx),
             ViewerState::Loading { rel_path } => {
@@ -541,10 +1349,14 @@ impl Render for MetaSpritePanel {
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
         v_flex()
-            .key_context(KEY_CONTEXT)
+            .key_context(self.dispatch_context(window, cx))
             .size_full()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &PlayPause, _window, cx| this.toggle_play(cx)))
+            .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
+            .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
+            .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
+            .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
             .child(self.render_picker(cx))
             .child(div().flex_1().min_h_0().child(body))
@@ -634,7 +1446,9 @@ mod tests {
     use super::*;
     use ggo_worldlib::sprites::cow::{ClipEdit, Frame};
     use ggo_worldlib::sprites::hw::{TILE_BYTES, TILE_PX};
-    use ggo_worldlib::sprites::io::save_sprite;
+    use ggo_worldlib::sprites::io::{open_sprite, save_sprite};
+    use ggo_worldlib::sprites::sprite_doc::DEFAULT_FRAME_DURATION_MS;
+    use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use workspace::{AppState, MultiWorkspace};
@@ -738,44 +1552,56 @@ mod tests {
         .unwrap();
     }
 
-    /// End-to-end viewer load against a real-fs temp project: the picker
-    /// enumerates the fixture `.spr`, selecting it runs the off-thread
-    /// loader, and the panel reaches Ready with one composed thumbnail
-    /// per frame (frame 0 all-transparent, frame 1 opaque red -- proving
-    /// per-frame compose order survived the BGRA bridge).
-    #[gpui::test]
-    async fn test_select_sprite_reaches_ready_with_frame_thumbnails(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        write_sprite_fixture(dir.path());
-
+    /// Load the fixture sprite into a fresh panel and return it Ready.
+    async fn ready_panel(
+        cx: &mut TestAppContext,
+        root: &std::path::Path,
+    ) -> gpui::Entity<MetaSpritePanel> {
+        write_sprite_fixture(root);
+        let root = root.to_path_buf();
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = MetaSpritePanel::new(None, cx);
-                panel.root_override = Some(dir.path().to_path_buf());
+                panel.root_override = Some(root);
                 panel
             })
         });
-
         panel.update(cx, |panel, cx| {
             panel.refresh_sprites(cx);
             assert_eq!(panel.sprites, ["sprites/hero.spr"]);
             panel.select_sprite(0, cx);
-            assert!(matches!(panel.state, ViewerState::Loading { .. }));
         });
-
         cx.executor().run_until_parked();
+        panel
+    }
+
+    /// End-to-end viewer load against a real-fs temp project: the picker
+    /// enumerates the fixture `.spr`, selecting it runs the off-thread
+    /// loader, and the panel reaches Ready with one composed thumbnail
+    /// per frame (frame 0 all-transparent, frame 1 opaque red -- proving
+    /// per-frame compose order survived the BGRA bridge) and the resolved
+    /// sidecar rels the save path writes back to (M5's `LoadedSprite`
+    /// extension).
+    #[gpui::test]
+    async fn test_select_sprite_reaches_ready_with_frame_thumbnails(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, _cx| {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready state after load");
             };
             assert_eq!(open.rel_path, "sprites/hero.spr");
-            assert_eq!(open.state.frames.len(), 2);
+            assert_eq!(open.til_path, "sprites/hero.til");
+            assert_eq!(open.pal_path, "sprites/hero.pal");
+            let state = open.store.state();
+            assert_eq!(state.frames.len(), 2);
             assert_eq!(open.frames.len(), 2, "one thumbnail per frame");
-            assert_eq!(open.state.frames[0].duration_ms, 100);
-            assert_eq!(open.state.frames[1].duration_ms, 200);
-            assert_eq!(open.state.clips.len(), 1);
+            assert_eq!(state.frames[0].duration_ms, 100);
+            assert_eq!(state.frames[1].duration_ms, 200);
+            assert_eq!(state.clips.len(), 1);
             assert_eq!(open.shown_frame(), 0, "not playing => selected frame");
+            assert!(!open.store.dirty(), "freshly opened => clean");
 
             let px_count = TILE_PX * TILE_PX;
             let f0 = open.frames[0].as_bytes(0).unwrap();
@@ -798,20 +1624,7 @@ mod tests {
     #[gpui::test]
     async fn test_frame_and_clip_selection(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        write_sprite_fixture(dir.path());
-
-        let panel = cx.update(|cx| {
-            cx.new(|cx| {
-                let mut panel = MetaSpritePanel::new(None, cx);
-                panel.root_override = Some(dir.path().to_path_buf());
-                panel
-            })
-        });
-        panel.update(cx, |panel, cx| {
-            panel.refresh_sprites(cx);
-            panel.select_sprite(0, cx);
-        });
-        cx.executor().run_until_parked();
+        let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
             panel.select_frame(1, cx);
@@ -833,7 +1646,7 @@ mod tests {
             };
             assert_eq!(open.active_clip, Some(0));
             assert_eq!(
-                playback::play_range(&open.state.clips, open.active_clip, 2),
+                playback::play_range(&open.store.state().clips, open.active_clip, 2),
                 (1, 1)
             );
 
@@ -842,6 +1655,331 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(open.active_clip, None);
+        });
+    }
+
+    fn ready(panel: &MetaSpritePanel) -> &OpenSprite {
+        match &panel.state {
+            ViewerState::Ready(open) => open,
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    /// Clip CRUD round trip through the store: add with ggo-ide's
+    /// defaults, rename (trim + apply), retarget the range, toggle loop,
+    /// delete (clearing the active selection) -- then undo each step back
+    /// to the fixture and redo forward again, with the dirty flag
+    /// tracking the whole way.
+    #[gpui::test]
+    async fn test_clip_add_edit_delete_undo_round_trip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.add_clip(cx);
+            {
+                let open = ready(panel);
+                let clips = &open.store.state().clips;
+                assert_eq!(clips.len(), 2);
+                assert_eq!(
+                    clips[1],
+                    ClipEdit {
+                        name: "clip2".into(), // fixture has 1 clip -> clip{len+1}
+                        from: 0,              // selected frame
+                        to: 0,
+                        loop_: false
+                    }
+                );
+                assert!(open.store.dirty());
+            }
+
+            panel.commit_edit(EditTarget::ClipName(1), "  run  ".into(), cx);
+            assert_eq!(ready(panel).store.state().clips[1].name, "run");
+
+            panel.commit_edit(EditTarget::ClipTo(1), "1".into(), cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().clips[1].to, 1);
+                assert!(open.clip_error.is_none());
+            }
+
+            panel.set_clip_loop(1, true, cx);
+            assert!(ready(panel).store.state().clips[1].loop_);
+
+            panel.select_clip(Some(1), cx);
+            panel.delete_clip(1, cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().clips.len(), 1);
+                assert_eq!(
+                    open.active_clip, None,
+                    "deleting the active clip clears the selection"
+                );
+            }
+
+            panel.undo_impl(cx); // un-delete
+            assert!(ready(panel).store.state().clips[1].loop_);
+            panel.undo_impl(cx); // un-loop
+            assert!(!ready(panel).store.state().clips[1].loop_);
+            panel.undo_impl(cx); // un-retarget
+            assert_eq!(ready(panel).store.state().clips[1].to, 0);
+            panel.undo_impl(cx); // un-rename
+            assert_eq!(ready(panel).store.state().clips[1].name, "clip2");
+            panel.undo_impl(cx); // un-add
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().clips.len(), 1);
+                assert!(
+                    !open.store.dirty(),
+                    "undo back to the loaded state => clean"
+                );
+            }
+
+            panel.redo_impl(cx);
+            assert_eq!(ready(panel).store.state().clips[1].name, "clip2");
+        });
+    }
+
+    /// Clip-edit guards: an out-of-range or reversed typed range is shown
+    /// inline and NOT applied; unparsable text is dropped silently; stale
+    /// clip indices (undo raced a click) are ignored everywhere instead of
+    /// reaching the store's panicking arms.
+    #[gpui::test]
+    async fn test_clip_edit_guards_and_stale_indices(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Fixture clip walk = (1, 1) over 2 frames.
+            panel.commit_edit(EditTarget::ClipTo(0), "9".into(), cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().clips[0].to, 1, "not applied");
+                let (at, msg) = open.clip_error.as_ref().expect("inline error set");
+                assert_eq!(*at, 0);
+                assert!(msg.contains("outside frames"), "range message: {msg}");
+            }
+
+            panel.commit_edit(EditTarget::ClipTo(0), "0".into(), cx);
+            {
+                let open = ready(panel);
+                assert_eq!(
+                    open.store.state().clips[0].to,
+                    1,
+                    "reversed range not applied"
+                );
+                let (_, msg) = open.clip_error.as_ref().expect("inline error set");
+                assert!(msg.contains('>'), "inversion message: {msg}");
+            }
+
+            panel.commit_edit(EditTarget::ClipFrom(0), "abc".into(), cx);
+            assert_eq!(
+                ready(panel).store.state().clips[0].from,
+                1,
+                "unparsable text dropped"
+            );
+
+            // A valid edit applies and clears the inline error.
+            panel.commit_edit(EditTarget::ClipFrom(0), "0".into(), cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().clips[0].from, 0);
+                assert!(open.clip_error.is_none());
+            }
+
+            // Whitespace-only rename is dropped; over-long is byte-clamped.
+            panel.commit_edit(EditTarget::ClipName(0), "   ".into(), cx);
+            assert_eq!(ready(panel).store.state().clips[0].name, "walk");
+            let long = "z".repeat(200);
+            panel.commit_edit(EditTarget::ClipName(0), long, cx);
+            assert_eq!(
+                ready(panel).store.state().clips[0].name.len(),
+                ggo_worldlib::sprites::sprite_doc::SPR_CLIP_NAME_MAX
+            );
+
+            // Stale indices: no panic, no change.
+            panel.delete_clip(7, cx);
+            panel.set_clip_loop(7, true, cx);
+            panel.commit_edit(EditTarget::ClipName(7), "x".into(), cx);
+            panel.commit_edit(EditTarget::ClipFrom(7), "0".into(), cx);
+            assert_eq!(ready(panel).store.state().clips.len(), 1);
+
+            // Stale FRAME selection: force one, then run every frame op.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selected_frame = 9;
+            }
+            panel.delete_selected_frame(cx);
+            panel.duplicate_selected_frame(cx);
+            panel.move_selected_frame(1, cx);
+            panel.commit_edit(EditTarget::Duration, "40".into(), cx);
+            assert_eq!(ready(panel).store.state().frames.len(), 2, "all ignored");
+        });
+    }
+
+    /// Frame ops through the store: blank add, duplicate (selects the
+    /// copy, thumbnail cache refreshed with the copied pixels), adjacent
+    /// move (selection follows), duration floor, delete with ggo-ide's
+    /// selection rule and last-frame guard -- then undo everything back to
+    /// the fixture, thumbnails included.
+    #[gpui::test]
+    async fn test_frame_ops_with_undo(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Add blank: appended at the end, default duration.
+            panel.add_blank_frame(cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(state.frames.len(), 3);
+                assert_eq!(state.frames[2].duration_ms, DEFAULT_FRAME_DURATION_MS);
+                assert_eq!(open.frames.len(), 3, "thumbnail cache refreshed");
+            }
+
+            // Duplicate the red frame 1: copy lands at 2, selected, and
+            // its RECOMPOSED thumbnail carries the copied pixels (the M5
+            // invalidation hook actually recomposing, not just resizing).
+            panel.select_frame(1, cx);
+            panel.duplicate_selected_frame(cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(state.frames.len(), 4);
+                assert_eq!(open.selected_frame, 2);
+                assert_eq!(state.frames[2].duration_ms, 200, "copy_of copies duration");
+                let dup = open.frames[2].as_bytes(0).unwrap();
+                assert!(
+                    dup.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
+                    "duplicated frame's thumbnail is the copied red frame"
+                );
+            }
+
+            // Move the copy left: neighbor swap, selection follows.
+            panel.move_selected_frame(-1, cx);
+            {
+                let open = ready(panel);
+                let durations: Vec<u16> = open
+                    .store
+                    .state()
+                    .frames
+                    .iter()
+                    .map(|f| f.duration_ms)
+                    .collect();
+                assert_eq!(durations, [100, 200, 200, 100]);
+                assert_eq!(open.selected_frame, 1);
+            }
+            // Move left at index 0 is a no-op.
+            panel.select_frame(0, cx);
+            panel.move_selected_frame(-1, cx);
+            assert_eq!(ready(panel).store.state().frames[0].duration_ms, 100);
+
+            // Duration: sub-floor input floors to MIN_FRAME_MS; a real
+            // value sticks; the strip label data (doc) and cache agree.
+            panel.select_frame(3, cx);
+            panel.commit_edit(EditTarget::Duration, "1".into(), cx);
+            assert_eq!(
+                ready(panel).store.state().frames[3].duration_ms,
+                MIN_FRAME_MS
+            );
+            panel.commit_edit(EditTarget::Duration, "320".into(), cx);
+            assert_eq!(ready(panel).store.state().frames[3].duration_ms, 320);
+
+            // Delete the selected last frame: selection clamps to the new
+            // end (ggo-ide's rule), fixture clip survives untouched.
+            panel.delete_selected_frame(cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().frames.len(), 3);
+                assert_eq!(open.selected_frame, 2);
+                assert_eq!(open.frames.len(), 3);
+            }
+
+            // Delete down to one, then verify the last-frame guard.
+            panel.delete_selected_frame(cx);
+            panel.delete_selected_frame(cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().frames.len(), 1);
+                assert_eq!(open.selected_frame, 0);
+                assert_eq!(
+                    open.store.state().clips.len(),
+                    0,
+                    "deleting the walk clip's sole frame dropped the clip (store rule)"
+                );
+            }
+            panel.delete_selected_frame(cx);
+            assert_eq!(
+                ready(panel).store.state().frames.len(),
+                1,
+                "the last frame can't be deleted"
+            );
+
+            // Undo everything: back to the loaded fixture, clean, with the
+            // thumbnail cache re-derived from the restored doc.
+            for _ in 0..20 {
+                panel.undo_impl(cx);
+            }
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                let durations: Vec<u16> = state.frames.iter().map(|f| f.duration_ms).collect();
+                assert_eq!(durations, [100, 200]);
+                assert_eq!(state.clips.len(), 1, "walk clip restored");
+                assert_eq!(open.frames.len(), 2);
+                assert!(!open.store.dirty());
+                let f1 = open.frames[1].as_bytes(0).unwrap();
+                assert!(f1.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
+            }
+        });
+    }
+
+    /// Save: `save_sprite` -> `set_saved_state` clears dirty without an
+    /// undo entry; the written trio `open_sprite`-round-trips equal to the
+    /// store's state; undo after save still steps back through the user's
+    /// edits (and re-dirties, since the saved generation moved on).
+    #[gpui::test]
+    async fn test_save_round_trips_through_open_sprite_and_clears_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.commit_edit(EditTarget::Duration, "40".into(), cx);
+            panel.add_clip(cx);
+            assert!(ready(panel).store.dirty());
+
+            panel.save_impl(cx);
+            {
+                let open = ready(panel);
+                assert!(!open.store.dirty(), "save clears dirty");
+                assert!(open.save_error.is_none());
+            }
+        });
+
+        let reopened = open_sprite(dir.path(), "sprites/hero.spr").unwrap();
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(reopened.state.frames, state.frames);
+                assert_eq!(reopened.state.clips, state.clips);
+                assert_eq!(reopened.state.palette, state.palette);
+                assert_eq!(reopened.state.pool, state.pool);
+                assert_eq!(reopened.state.tile_count, state.tile_count);
+                assert_eq!(reopened.state.w_tiles, state.w_tiles);
+                assert_eq!(reopened.state.h_tiles, state.h_tiles);
+                assert_eq!(reopened.til_path, open.til_path);
+                assert_eq!(reopened.pal_path, open.pal_path);
+                assert_eq!(reopened.state.frames[0].duration_ms, 40);
+                assert_eq!(reopened.state.clips.len(), 2);
+            }
+
+            panel.undo_impl(cx); // fold-back wasn't an undo entry; this undoes add_clip
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().clips.len(), 1);
+                assert!(open.store.dirty(), "undo past the save point re-dirties");
+            }
         });
     }
 }

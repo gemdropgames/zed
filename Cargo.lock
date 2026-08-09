@@ -7333,6 +7333,7 @@ dependencies = [
 name = "ggo_metasprite_panel"
 version = "0.1.0"
 dependencies = [
+ "editor",
  "ggo-worldlib",
  "ggo_common",
  "gpui",

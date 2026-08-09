@@ -25,11 +25,17 @@ use gpui::RenderImage;
 /// entirely off the UI thread.
 pub struct LoadedSprite {
     pub state: SpriteState,
-    /// One composed BGRA image per frame index, built once at load time
-    /// (frame-strip thumbnail AND large preview -- gpui scales the same
-    /// image to both sizes). M5 hook: when the doc becomes editable,
-    /// recompose the touched frame's entry on each doc op instead of
-    /// reloading; this per-index Vec is the cache to invalidate.
+    /// The `.til`/`.pal` sidecar rels `open_sprite` resolved (bare-sibling
+    /// fallback already applied) -- `io::save_sprite` needs them back to
+    /// rewrite the same trio the sprite was read from.
+    pub til_path: String,
+    pub pal_path: String,
+    /// One composed BGRA image per frame index (frame-strip thumbnail AND
+    /// large preview -- gpui scales the same image to both sizes). Built
+    /// here at load; after every doc mutation the panel rebuilds the whole
+    /// Vec via [`compose_frames`] (M4's documented invalidation point --
+    /// wholesale recompose is O(frames x sprite px) per op, acceptable at
+    /// sprite scale: <= 16x16 tiles, undo-capped edit cadence).
     pub frames: Vec<Arc<RenderImage>>,
 }
 
@@ -38,18 +44,29 @@ pub fn list_sprites(root: &Path) -> Vec<String> {
     io::list_sprites(root)
 }
 
-/// Open `rel` and compose every frame (no LCD filter -- thumbnails and
-/// preview alike, matching ggo-ide's frame strip).
-pub fn load_sprite(project_dir: &Path, rel: &str) -> Result<LoadedSprite, String> {
-    let opened = io::open_sprite(project_dir, rel).map_err(|e| e.to_string())?;
-    let state = opened.state;
+/// Compose every frame of `state` into a BGRA [`RenderImage`] (no LCD
+/// filter -- thumbnails and preview alike, matching ggo-ide's frame
+/// strip). Shared by the initial load and the panel's after-op refresh.
+pub fn compose_frames(state: &SpriteState) -> Result<Vec<Arc<RenderImage>>, String> {
     let mut frames = Vec::with_capacity(state.frames.len());
     for idx in 0..state.frames.len() {
-        let rgba = compose_frame_rgba(&state, idx, false);
+        let rgba = compose_frame_rgba(state, idx, false);
         let (w, h) = rgba.dimensions();
         let image = to_render_image(rgba.as_raw(), w, h)
             .ok_or_else(|| format!("frame {idx}: composed image had invalid dimensions"))?;
         frames.push(image);
     }
-    Ok(LoadedSprite { state, frames })
+    Ok(frames)
+}
+
+/// Open `rel` and compose every frame.
+pub fn load_sprite(project_dir: &Path, rel: &str) -> Result<LoadedSprite, String> {
+    let opened = io::open_sprite(project_dir, rel).map_err(|e| e.to_string())?;
+    let frames = compose_frames(&opened.state)?;
+    Ok(LoadedSprite {
+        state: opened.state,
+        til_path: opened.til_path,
+        pal_path: opened.pal_path,
+        frames,
+    })
 }

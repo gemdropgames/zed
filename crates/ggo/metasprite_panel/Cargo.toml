@@ -12,6 +12,7 @@ workspace = true
 path = "src/ggo_metasprite_panel.rs"
 
 [dependencies]
+editor.workspace = true
 ggo-worldlib.workspace = true # GGO
 ggo_common.workspace = true
 gpui.workspace = true
