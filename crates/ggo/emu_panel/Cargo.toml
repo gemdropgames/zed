@@ -38,6 +38,22 @@ workspace.workspace = true
 # fails a test instead of silently producing runs the picker can't see.
 ggo_charts_panel.workspace = true # GGO
 gpui = { workspace = true, features = ["test-support"] }
+path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
+# X4: the `.cart` routing test that enters at the REAL `project_panel`
+# `Event::OpenedEntry` subscription rather than at
+# `Workspace::intercept_path_open` -- the only test in the fork that would
+# notice the GGO guard in `project_panel.rs` disappearing in a merge. Both
+# are dev-only: no GGO test code lives in an upstream file, and neither
+# crate is linked into the panel itself. `editor` is required for the
+# control half (an unclaimed path must actually produce a tab).
+editor.workspace = true
+project_panel.workspace = true
+# Not used by any test here: pure feature unification. `project/test-support`
+# turns on `remote/test-support`, which adds a `RemoteConnectionOptions`
+# variant that `remote_connection`'s lib only matches on under ITS
+# `test-support`. Upstream's own `project_panel` dev-deps carry this exact
+# line for the same reason.
+remote_connection = { workspace = true, features = ["test-support"] }

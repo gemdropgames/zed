@@ -1,10 +1,21 @@
-//! GGO Emulator panel (F3 tasks E1/E2): an embedded `ggo-emu` -- cart
-//! picker, Run/Stop, live 320x240 video, keyboard -> pad input, a live
-//! stats row, a diagnostic console, and an end-of-run perf ingest into
+//! GGO Emulator panel (F3 tasks E1/E2, F4 X4): an embedded `ggo-emu` --
+//! Run/Stop, live 320x240 video, keyboard -> pad input, a live stats row,
+//! a diagnostic console, and an end-of-run perf ingest into
 //! `~/.ggo/ggo_ide.db`. The emulation itself is `ggo-emu-core` verbatim;
 //! [`drive`] ports the standalone binary's drive loop
 //! (`ggo-emu/src/lib.rs::run_cart` + `src/native.rs`) onto a background
 //! thread, and this module is the gpui shell around it.
+//!
+//! # How a cart gets here
+//!
+//! The same way every other GGO panel gets its document: from the file
+//! explorer. Clicking a `.cart` in the project panel routes here through
+//! [`intercept_cart_open`]; the panel has no picker of its own (X4 removed
+//! the last one in the fork). A click SELECTS the cart -- it does not run
+//! it. Running spawns an emulator thread and takes over the keyboard, so
+//! it stays an explicit user action (Run / `ctrl-alt-r`), exactly as
+//! opening a document in the world/sprite/tileset panels does not start
+//! playback.
 //!
 //! # End of run
 //!
@@ -57,7 +68,6 @@
 //! covers the two teardown paths (Stop, and panel release) where no
 //! further render will come.
 
-mod carts;
 mod drive;
 mod ingest;
 mod input;
@@ -69,13 +79,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, Pixels, Render,
-    RenderImage, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
-    actions, div, img, px,
+    Action, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, Pixels, Render, RenderImage,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, div, img,
+    px,
 };
+use project::ProjectPath;
+use ui::Tooltip;
 use ui::prelude::*;
-use ui::{ContextMenu, DropdownMenu, Tooltip};
 use util::ResultExt as _;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -134,6 +145,11 @@ pub fn init(cx: &mut App) {
     cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
         .detach();
 
+    // Explorer-driven routing: clicking a `.cart` in the project panel
+    // selects it HERE instead of opening a (binary, unreadable) editor tab.
+    // This is the panel's only way in -- there is no in-panel cart picker.
+    workspace::register_path_open_interceptor(cx, intercept_cart_open);
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -148,6 +164,45 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// The cart extension this panel claims from the file explorer. The
+/// single-file `.ggo` variant carries the same `GGOC` header plus an asset
+/// section and `ggo_emu_core::cart::Cart::parse` handles both, but F3's
+/// brief scoped the panel to `.cart` and X4 kept that scope.
+const CART_EXT: &str = "cart";
+
+/// Empty-state text. The panel has no picker of its own by design (F4 X4):
+/// carts arrive by clicking a `.cart` in the project panel. Worded like
+/// the sprite/tileset/world panels' own empty states.
+const EMPTY_MESSAGE: &str = "Open a .cart file from the project panel";
+
+/// `workspace::PathOpenInterceptor` for `*.cart`: claim the path, open the
+/// panel, and select the cart. Declines (so the normal open path runs) for
+/// any other file, for a path outside the primary worktree, and when no
+/// panel is docked.
+fn intercept_cart_open(
+    workspace: &mut Workspace,
+    path: &ProjectPath,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    if !path
+        .path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(CART_EXT))
+    {
+        return false;
+    }
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return false;
+    };
+    ggo_common::open_in_panel(
+        workspace,
+        window,
+        cx,
+        move |panel: &mut EmuPanel, window, cx| panel.open_rel_path(&rel, window, cx),
+    )
 }
 
 /// Transport bindings only. The 18 pad keys are deliberately NOT
@@ -172,13 +227,6 @@ fn bind_panel_keys(cx: &mut App) {
 }
 
 // ------------------------------------------------------------- view state
-
-enum LoadState {
-    /// Nothing enumerated yet -- before the panel's first activation.
-    Empty,
-    Loading,
-    Ready(Vec<String>),
-}
 
 /// The end-of-run perf ingest's state, shown under the transport.
 /// Mirrors `ggo-ide`'s `pages/emulator.rs::IngestStatus`, minus its
@@ -226,16 +274,9 @@ pub struct EmuPanel {
     /// into the developer's actual database.
     db_path_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
-    state: LoadState,
-    /// Index into the `LoadState::Ready` list. Held as a rel path rather
-    /// than an index so a refresh that reorders or shortens the list
-    /// can't silently repoint the selection at a different cart.
+    /// The cart the file explorer last routed here, as a project-relative
+    /// `/`-separated path. `None` until something is clicked.
     selected: Option<String>,
-    load_generation: u64,
-    _load_task: Option<Task<()>>,
-    /// The cart dropdown's menu, keyed by the `load_generation` it was
-    /// built from -- see [`EmuPanel::cart_menu`].
-    cart_menu: Option<(u64, Entity<ContextMenu>)>,
 
     /// Bumped every time [`Self::run`] starts a new session. [`Self::
     /// finish_run`] captures this at call time and its background
@@ -325,11 +366,7 @@ impl EmuPanel {
             root_override: None,
             db_path_override: None,
             project_root: None,
-            state: LoadState::Empty,
             selected: None,
-            load_generation: 0,
-            _load_task: None,
-            cart_menu: None,
             run_generation: 0,
             session: None,
             _pump_task: None,
@@ -348,65 +385,70 @@ impl EmuPanel {
         }
     }
 
-    /// Re-resolve the project root (first visible worktree) and
-    /// re-enumerate its carts. Runs on every panel activation, the same
-    /// trigger `ggo_world_panel::refresh_worlds` uses.
-    fn refresh_carts(&mut self, cx: &mut Context<Self>) {
+    /// Re-discover the project root (the workspace's first visible
+    /// worktree) -- the directory `run` joins the selected rel path onto.
+    /// MUST NOT run while the workspace itself is mid-update (it reads the
+    /// workspace entity); see the deferrals in `set_active` and in
+    /// [`Self::open_rel_path`].
+    fn refresh_root(&mut self, cx: &mut Context<Self>) {
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
             let project = workspace.read(cx).project().clone();
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
-        // The generation bump happens before the early return, not after
-        // it: it is what invalidates the dropdown's menu cache, and a
-        // refresh that finds no root still changes the list (to empty).
-        self.load_generation += 1;
-        let generation = self.load_generation;
+        cx.notify();
+    }
 
-        let Some(root) = self.project_root.clone() else {
-            self.state = LoadState::Ready(Vec::new());
-            self.selected = None;
-            cx.notify();
+    /// Select the project-relative `.cart` path `rel`. This is the panel's
+    /// entry point from the file explorer ([`intercept_cart_open`]); there
+    /// is no in-panel picker.
+    ///
+    /// **A click selects, it does not run.** Starting a cart spawns an
+    /// emulator thread and takes over the keyboard, which is far too much
+    /// to happen as a side effect of a single click in a file tree; the
+    /// user presses Run. This mirrors the other GGO panels, where a click
+    /// opens a document without acting on it.
+    ///
+    /// **Re-clicking the cart that is already selected does nothing at
+    /// all** -- in particular it must not touch a run in progress. The
+    /// interceptor has already revealed and focused the dock by the time
+    /// we get here, so an already-selected click IS the focus/reveal.
+    ///
+    /// **Clicking a DIFFERENT cart while one is running stops the running
+    /// one first**, through the ordinary [`Self::stop`] path rather than
+    /// by dropping the session on the floor. That matters because
+    /// `stop` -> [`Self::finish_run`] is what collects the run's perf
+    /// snapshot and writes it into `~/.ggo/ggo_ide.db`: silently losing a
+    /// run's diagnostics because the user clicked the next cart would be a
+    /// data loss, small but real. There is no unsaved *document* here, so
+    /// no [`ggo_common::prepare_to_close_dirty`] prompt -- a running
+    /// process is not user data, and the one thing it produces is
+    /// preserved.
+    ///
+    /// The root re-discovery runs on a spawned task, deliberately: the
+    /// interceptor calls this from INSIDE the workspace's own update, and
+    /// [`Self::refresh_root`] has to read that same workspace entity.
+    /// `stop` reads no entity, so it happens inline while we still have a
+    /// `Window`.
+    pub fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(rel) {
             return;
-        };
-
-        self.state = LoadState::Loading;
+        }
+        // Switching carts: end the current run the normal way, so its perf
+        // data still lands in the database.
+        self.stop(window, cx);
+        self.selected = Some(rel.to_string());
+        // The previous cart's counters would otherwise sit under the newly
+        // selected one's name.
+        self.frame = 0;
+        self.stats = RunStats::default();
         cx.notify();
 
-        let load = cx.background_spawn(async move { carts::list_carts(&root) });
-        self._load_task = Some(cx.spawn(async move |this, cx| {
-            let found = load.await;
-            this.update(cx, |this, cx| {
-                if this.load_generation != generation {
-                    // Superseded by a later refresh -- drop this stale
-                    // result, same guard the other GGO panels use.
-                    return;
-                }
-                // A selection that survived the refresh keeps pointing at
-                // the same cart; one whose file vanished is dropped
-                // rather than silently sliding onto a neighbour.
-                if this.selected_still_present(&found).is_none() {
-                    this.selected = None;
-                }
-                this.selected = this.selected.take().or_else(|| found.first().cloned());
-                this.state = LoadState::Ready(found);
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    /// `self.selected` if it is still in `found`. Split out only so
-    /// `refresh_carts`'s closure reads as one thought.
-    fn selected_still_present<'a>(&'a self, found: &[String]) -> Option<&'a String> {
-        let selected = self.selected.as_ref()?;
-        found.iter().any(|c| c == selected).then_some(selected)
-    }
-
-    fn select_cart(&mut self, cart: String, cx: &mut Context<Self>) {
-        self.selected = Some(cart);
-        cx.notify();
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| this.refresh_root(cx)).ok();
+        })
+        .detach();
     }
 
     /// Start the selected cart. A run already in flight is stopped first,
@@ -643,57 +685,12 @@ impl EmuPanel {
 
     // ---------------------------------------------------------- render
 
-    /// The cart dropdown's menu entity, rebuilt only when the enumeration
-    /// changes.
-    ///
-    /// This cache is not a micro-optimisation. `render` runs on every
-    /// `cx.notify`, and a running cart notifies 60 times a second, so
-    /// building the menu inline (which is what the other GGO panels do --
-    /// they only re-render on interaction) would allocate a fresh gpui
-    /// entity plus one boxed closure per cart, sixty times a second, for
-    /// a widget that is disabled while the cart runs.
-    fn cart_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ContextMenu> {
-        if let Some((generation, menu)) = &self.cart_menu
-            && *generation == self.load_generation
-        {
-            return menu.clone();
-        }
-        let found = match &self.state {
-            LoadState::Ready(carts) => carts.clone(),
-            _ => Vec::new(),
-        };
-        let weak = cx.weak_entity();
-        let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-            for cart in found {
-                let weak = weak.clone();
-                menu = menu.entry(
-                    SharedString::from(cart.clone()),
-                    None,
-                    move |_window, cx| {
-                        weak.update(cx, |this, cx| this.select_cart(cart.clone(), cx))
-                            .ok();
-                    },
-                );
-            }
-            menu
-        });
-        self.cart_menu = Some((self.load_generation, menu.clone()));
-        menu
-    }
-
-    fn render_transport(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_transport(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let running = self.is_running();
-        let label: SharedString = match (&self.state, &self.selected) {
-            (_, Some(cart)) => cart.clone().into(),
-            (LoadState::Loading, _) => "Scanning…".into(),
-            (LoadState::Empty, _) => "Select the panel".into(),
-            (LoadState::Ready(_), None) => "No .cart files".into(),
+        let label: SharedString = match &self.selected {
+            Some(cart) => cart.clone().into(),
+            None => EMPTY_MESSAGE.into(),
         };
-        let menu = self.cart_menu(window, cx);
 
         h_flex()
             .gap_1()
@@ -714,7 +711,17 @@ impl EmuPanel {
                     .tooltip(Tooltip::text("Stop"))
                     .on_click(cx.listener(|this, _event, window, cx| this.stop(window, cx))),
             )
-            .child(DropdownMenu::new("ggo-emu-cart", label, menu).disabled(running))
+            // The selected cart, as plain text: the file explorer is the
+            // picker now, so there is nothing here to click.
+            .child(
+                Label::new(label)
+                    .size(LabelSize::Small)
+                    .color(if self.selected.is_some() {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }),
+            )
             .child(div().flex_1())
             // The "is it actually running" readout: the cart's own frame
             // counter, straight off the last `EmuMsg::Frame`.
@@ -741,12 +748,10 @@ impl EmuPanel {
                 .child(img(frame.clone()).w_full().h_full())
                 .into_any_element();
         }
-        let message = match (&self.state, self.is_running(), &self.selected) {
-            (_, true, _) => "Starting…".to_string(),
-            (LoadState::Empty, _, _) => "Select the panel to find carts".to_string(),
-            (LoadState::Loading, _, _) => "Scanning for carts…".to_string(),
-            (LoadState::Ready(_), _, None) => "No .cart files under the project root".to_string(),
-            (LoadState::Ready(_), _, Some(_)) => "Press Run".to_string(),
+        let message = match (self.is_running(), &self.selected) {
+            (true, _) => "Starting…",
+            (false, None) => EMPTY_MESSAGE,
+            (false, Some(_)) => "Press Run",
         };
         div()
             .size_full()
@@ -859,7 +864,7 @@ impl Render for EmuPanel {
                     this.on_shift(event.modifiers.shift);
                 },
             ))
-            .child(self.render_transport(window, cx))
+            .child(self.render_transport(cx))
             .child(div().flex_1().min_h_0().child(self.render_screen(cx)))
             .children(self.render_stats())
             .children(self.status.as_ref().map(|status| {
@@ -951,12 +956,14 @@ impl Panel for EmuPanel {
         if active {
             // Deferred for the same reason `ggo_world_panel::set_active`
             // defers its own refresh: `set_active` fires inside the
-            // workspace's own update (dock toggle), and `refresh_carts`
+            // workspace's own update (dock toggle), and `refresh_root`
             // reads the project's worktrees -- a re-entrant read of the
-            // entity currently being updated.
+            // entity currently being updated. Still worth doing with the
+            // picker gone: the root can change under the panel (a folder
+            // opened after the panel was first shown), and `run` needs it.
             let this = cx.weak_entity();
             cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_carts(cx)).ok();
+                this.update(cx, |this, cx| this.refresh_root(cx)).ok();
             });
         }
     }
@@ -975,8 +982,8 @@ impl EmuPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
-    use project::{FakeFs, Project};
+    use gpui::{Entity, TestAppContext};
+    use project::{FakeFs, Project, WorktreeId};
     use workspace::dock::DockPosition;
     use workspace::{AppState, MultiWorkspace};
 
@@ -1039,106 +1046,6 @@ mod tests {
                 workspace.right_dock().read(cx).is_open(),
                 "ToggleFocus should have opened the right dock"
             );
-        });
-    }
-
-    /// `refresh_carts` walks the real filesystem off-thread and lands in
-    /// `Ready` with the fixture carts listed, first one preselected.
-    /// Calls `refresh_carts` directly rather than through `set_active`
-    /// (which needs a live `Window`) -- the same shortcut
-    /// `ggo_world_panel`'s test helper takes.
-    #[gpui::test]
-    async fn test_refresh_carts_enumerates_the_project_root(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("build")).unwrap();
-        std::fs::write(dir.path().join("build/second.cart"), b"x").unwrap();
-        std::fs::write(dir.path().join("first.cart"), b"x").unwrap();
-        std::fs::write(dir.path().join("readme.md"), b"x").unwrap();
-
-        let panel = cx.update(|cx| {
-            cx.new(|cx| {
-                let mut panel = EmuPanel::new(None, None, cx);
-                panel.root_override = Some(dir.path().to_path_buf());
-                panel
-            })
-        });
-        panel.update(cx, |panel, cx| panel.refresh_carts(cx));
-        cx.executor().run_until_parked();
-
-        panel.update(cx, |panel, _cx| {
-            match &panel.state {
-                LoadState::Ready(carts) => assert_eq!(
-                    carts,
-                    &vec!["build/second.cart".to_string(), "first.cart".to_string()]
-                ),
-                _ => panic!("expected Ready"),
-            }
-            assert_eq!(
-                panel.selected.as_deref(),
-                Some("build/second.cart"),
-                "the first cart in sorted order is preselected"
-            );
-        });
-    }
-
-    /// A selection whose file disappeared between refreshes is dropped
-    /// rather than sliding onto whatever now occupies its index.
-    #[gpui::test]
-    async fn test_a_vanished_selection_is_not_silently_repointed(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.cart"), b"x").unwrap();
-        std::fs::write(dir.path().join("b.cart"), b"x").unwrap();
-
-        let panel = cx.update(|cx| {
-            cx.new(|cx| {
-                let mut panel = EmuPanel::new(None, None, cx);
-                panel.root_override = Some(dir.path().to_path_buf());
-                panel
-            })
-        });
-        panel.update(cx, |panel, cx| {
-            panel.refresh_carts(cx);
-        });
-        cx.executor().run_until_parked();
-        panel.update(cx, |panel, cx| panel.select_cart("b.cart".to_string(), cx));
-
-        std::fs::remove_file(dir.path().join("b.cart")).unwrap();
-        panel.update(cx, |panel, cx| panel.refresh_carts(cx));
-        cx.executor().run_until_parked();
-
-        panel.update(cx, |panel, _cx| {
-            assert_eq!(
-                panel.selected.as_deref(),
-                Some("a.cart"),
-                "the stale selection is dropped and the list's first entry takes over"
-            );
-        });
-    }
-
-    /// A stale enumeration must not clobber a newer one -- the
-    /// load-generation guard every GGO panel carries.
-    #[gpui::test]
-    async fn test_a_stale_enumeration_is_dropped(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.cart"), b"x").unwrap();
-
-        let panel = cx.update(|cx| {
-            cx.new(|cx| {
-                let mut panel = EmuPanel::new(None, None, cx);
-                panel.root_override = Some(dir.path().to_path_buf());
-                panel
-            })
-        });
-        panel.update(cx, |panel, cx| {
-            panel.refresh_carts(cx);
-            let stale = panel.load_generation;
-            // A second refresh before the first lands.
-            panel.refresh_carts(cx);
-            assert!(panel.load_generation > stale);
-        });
-        cx.executor().run_until_parked();
-        panel.update(cx, |panel, _cx| {
-            assert!(matches!(&panel.state, LoadState::Ready(carts) if carts.len() == 1));
         });
     }
 
@@ -1330,22 +1237,6 @@ mod tests {
         });
     }
 
-    /// The dropdown menu entity is built once per enumeration, not once
-    /// per render -- `render` runs 60x a second while a cart is running.
-    #[gpui::test]
-    async fn test_the_cart_menu_is_not_rebuilt_every_render(cx: &mut TestAppContext) {
-        let (panel, cx) = windowed_panel(cx);
-        let first = panel.update_in(cx, |panel, window, cx| panel.cart_menu(window, cx));
-        let second = panel.update_in(cx, |panel, window, cx| panel.cart_menu(window, cx));
-        assert_eq!(first.entity_id(), second.entity_id());
-
-        // A new enumeration invalidates it.
-        panel.update(cx, |panel, cx| panel.refresh_carts(cx));
-        cx.executor().run_until_parked();
-        let third = panel.update_in(cx, |panel, window, cx| panel.cart_menu(window, cx));
-        assert_ne!(first.entity_id(), third.entity_id());
-    }
-
     // ------------------------------------------------- atlas retention
 
     /// Feed one synthetic frame and paint the panel, returning the
@@ -1491,14 +1382,18 @@ mod tests {
         .unwrap();
 
         let (panel, cx) = windowed_panel(cx);
-        panel.update(cx, |panel, cx| {
+        panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
             panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
-            panel.refresh_carts(cx);
+        });
+        // Exactly how the file explorer gets a cart in here.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
             assert_eq!(panel.selected.as_deref(), Some("green.cart"));
+            assert!(!panel.is_running(), "selecting a cart must not run it");
         });
 
         panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
@@ -1583,6 +1478,330 @@ mod tests {
             panel.stop(window, cx);
             assert!(!panel.is_running());
             assert!(panel.latest_frame.is_none());
+        });
+    }
+
+    // ------------------------------------------ explorer-driven routing
+
+    /// A fake-fs project with one visible worktree holding cart-shaped
+    /// names. The panel never reads a cart's bytes at selection time (only
+    /// `run` opens the file), so a fake fs is enough for every routing
+    /// assertion here.
+    async fn routed_project(cx: &mut TestAppContext, run_init: bool) -> Entity<Project> {
+        cx.update(|cx| {
+            AppState::test(cx);
+            if run_init {
+                init(cx);
+            }
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/proj",
+            serde_json::json!({
+                "carts": { "green.cart": "", "other.cart": "" },
+                "notes.txt": "",
+            }),
+        )
+        .await;
+        Project::test(fs, ["/proj".as_ref()], cx).await
+    }
+
+    fn worktree_id(project: &Entity<Project>, cx: &mut gpui::VisualTestContext) -> WorktreeId {
+        project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("one visible worktree")
+                .read(cx)
+                .id()
+        })
+    }
+
+    fn project_path(worktree_id: WorktreeId, rel: &str) -> ProjectPath {
+        ProjectPath {
+            worktree_id,
+            path: path::rel_path::rel_path(rel).into_arc(),
+        }
+    }
+
+    /// The registered `.cart` predicate claims the path (so the project
+    /// panel opens NO pane item for it), opens the dock, and selects the
+    /// cart -- *without* running it. A non-`.cart` in the same worktree is
+    /// declined.
+    #[gpui::test]
+    async fn test_cart_click_routes_into_the_panel_and_is_claimed(cx: &mut TestAppContext) {
+        let project = routed_project(cx, true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<EmuPanel>(cx)
+                .expect("init() adds the panel")
+        });
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "carts/green.cart"),
+                window,
+                cx,
+            )
+        });
+        assert!(
+            claimed,
+            "a .cart must be claimed, suppressing the pane item"
+        );
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.selected.as_deref(), Some("carts/green.cart"));
+            assert!(
+                !panel.is_running(),
+                "a click selects a cart; running is the user's call"
+            );
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.right_dock().read(cx).is_open(),
+                "routing must open the panel's dock even if it was closed"
+            );
+        });
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(&project_path(worktree_id, "notes.txt"), window, cx)
+        });
+        assert!(!claimed, "everything but .cart opens the normal way");
+    }
+
+    /// Re-clicking the cart that is ALREADY selected must not disturb a run
+    /// in progress -- the interceptor has already done the focus/reveal, so
+    /// there is nothing left to do, and stopping/restarting the emulator
+    /// under the user would be actively destructive.
+    #[gpui::test]
+    async fn test_re_clicking_the_selected_cart_does_not_disturb_a_run(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, _cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+        let generation = panel.read_with(cx, |panel, _| panel.run_generation);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.is_running(),
+                "an already-selected click must leave the run alone"
+            );
+            assert_eq!(
+                panel.run_generation, generation,
+                "and must not have restarted it"
+            );
+            assert!(
+                panel.latest_frame.is_some(),
+                "nor blanked the screen out from under it"
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
+    }
+
+    /// Clicking a DIFFERENT cart mid-run stops the running one *through the
+    /// ordinary stop path*, so the run's perf snapshot still reaches the
+    /// database the charts panel reads. Then it selects the new cart and
+    /// waits for the user to press Run.
+    #[gpui::test]
+    async fn test_switching_carts_mid_run_stops_and_still_ingests(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, _cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.db_path_override = Some(db_path.clone());
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("other.cart", window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.selected.as_deref(), Some("other.cart"));
+            assert!(!panel.is_running(), "the previous run is stopped");
+            assert!(
+                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                "the stopped run's perf data must still have been ingested, \
+                 not silently dropped: {:?}",
+                panel.ingest_status
+            );
+            assert_eq!(panel.frame, 0, "the old run's counters are cleared");
+        });
+
+        // ...and it really is in the database, readable by the charts panel.
+        let runs = ggo_charts_panel::loader::list_runs(&db_path).unwrap();
+        assert_eq!(runs.len(), 1, "one run row for the interrupted run");
+        assert_eq!(runs[0].label.as_deref(), Some("green.cart"));
+    }
+
+    /// Drive the panel until the emulator thread delivers a frame. Bounded,
+    /// so a broken pump fails the test instead of hanging it.
+    fn await_first_frame(panel: &Entity<EmuPanel>, cx: &mut gpui::VisualTestContext) {
+        let mut waited = std::time::Duration::ZERO;
+        let step = std::time::Duration::from_millis(10);
+        while panel.read_with(cx, |panel, _| panel.latest_frame.is_none()) {
+            assert!(
+                waited < std::time::Duration::from_secs(10),
+                "no frame reached the panel from the emulator thread"
+            );
+            std::thread::sleep(step);
+            cx.run_until_parked();
+            waited += step;
+        }
+    }
+
+    /// **The `project_panel.rs` hook itself, end to end.** Every other
+    /// routing test enters at `Workspace::intercept_path_open`, which means
+    /// none of them would notice if the `if !workspace.intercept_path_open(
+    /// &ggo_project_path, …)` guard in `crates/project_panel/src/
+    /// project_panel.rs` were lost in an upstream merge -- and that guard is
+    /// the fork's single most merge-fragile line (see `docs/ggo/UPSTREAM.md`:
+    /// `project_panel.rs` churns considerably more than our other hook
+    /// sites).
+    ///
+    /// So this one builds a REAL `ProjectPanel` (via its public
+    /// `ProjectPanel::load`, the same constructor `zed::zed` uses), which
+    /// installs the real `Event::OpenedEntry` subscription containing the
+    /// guard, then emits that event for a `.cart` entry and checks BOTH
+    /// halves of what the guard buys: the cart lands in this panel, and no
+    /// pane item is opened for it. `editor::init` is load-bearing for the
+    /// second half -- without an editor registered as a project item,
+    /// `open_path_preview` would fail to produce a tab even with the guard
+    /// deleted, and the test would pass for the wrong reason. The control
+    /// case at the end proves the tab really does appear when the path is
+    /// NOT claimed.
+    ///
+    /// The one step not covered is `ProjectPanel::open_internal` ->
+    /// `open_entry` -> `cx.emit`, which is private to `project_panel` and
+    /// entirely upstream-owned; the fork's edit is in the subscriber, which
+    /// is what this exercises.
+    #[gpui::test]
+    async fn test_project_panel_opened_entry_routes_a_cart_into_the_panel(cx: &mut TestAppContext) {
+        let project = routed_project(cx, true).await;
+        cx.update(|cx| {
+            editor::init(cx);
+            project_panel::init(cx);
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        // The real project panel, with the real `OpenedEntry` subscription.
+        let (weak_workspace, async_cx) =
+            cx.update(|window, cx| (workspace.downgrade(), window.to_async(cx)));
+        let project_panel = project_panel::ProjectPanel::load(weak_workspace, async_cx)
+            .await
+            .expect("the project panel loads");
+
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<EmuPanel>(cx)
+                .expect("init() adds the emu panel")
+        });
+        let worktree_id = worktree_id(&project, cx);
+
+        fn entry_id(
+            project: &Entity<Project>,
+            worktree_id: WorktreeId,
+            rel: &str,
+            cx: &mut gpui::VisualTestContext,
+        ) -> project::ProjectEntryId {
+            project.read_with(cx, |project, cx| {
+                project
+                    .entry_for_path(&project_path(worktree_id, rel), cx)
+                    .unwrap_or_else(|| panic!("{rel} is in the fake worktree"))
+                    .id
+            })
+        }
+
+        // The click, as the project panel publishes it.
+        let cart_entry = entry_id(&project, worktree_id, "carts/green.cart", cx);
+        project_panel.update(cx, |_, cx| {
+            cx.emit(project_panel::Event::OpenedEntry {
+                entry_id: cart_entry,
+                focus_opened_item: true,
+                allow_preview: true,
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.selected.as_deref(),
+                Some("carts/green.cart"),
+                "the project panel's own open event must reach the emu panel \
+                 -- if this fails, the GGO guard in project_panel.rs is gone"
+            );
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_pane().read(cx).items().count(),
+                0,
+                "a claimed path must open no editor tab"
+            );
+        });
+
+        // Control: an unclaimed path DOES open a tab, so the assertion
+        // above is testing the guard rather than a dead code path.
+        let txt_entry = entry_id(&project, worktree_id, "notes.txt", cx);
+        project_panel.update(cx, |_, cx| {
+            cx.emit(project_panel::Event::OpenedEntry {
+                entry_id: txt_entry,
+                focus_opened_item: true,
+                allow_preview: true,
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_pane().read(cx).items().count(),
+                1,
+                "an unclaimed path still opens the normal way"
+            );
         });
     }
 }

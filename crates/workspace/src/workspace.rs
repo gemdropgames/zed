@@ -1008,6 +1008,8 @@ impl Workspace {
             .any(|intercept| intercept(self, path, window, cx))
     }
 }
+// GGO: end of the fork-local open-interceptor block opened above. Everything
+// between the two markers is ours; nothing outside them was touched.
 
 #[derive(Default)]
 pub struct FollowableViewRegistry(TypeIdHashMap<FollowableViewDescriptor>);

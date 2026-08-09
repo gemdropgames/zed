@@ -7556,6 +7556,7 @@ name = "ggo_emu_panel"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "editor",
  "ggo-db",
  "ggo-emu-core",
  "ggo_charts_panel",
@@ -7563,7 +7564,10 @@ dependencies = [
  "gpui",
  "image",
  "keymap_editor",
+ "path",
  "project",
+ "project_panel",
+ "remote_connection",
  "serde_json",
  "tempfile",
  "tokio",
