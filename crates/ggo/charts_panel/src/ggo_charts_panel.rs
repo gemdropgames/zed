@@ -306,7 +306,7 @@ impl ChartsPanel {
                 if this.load_generation != generation {
                     // Superseded by a later refresh (rapid re-activation)
                     // -- drop this stale result, same guard
-                    // `ggo_world_panel::select_world` uses.
+                    // `ggo_world_panel::load_rel_path` uses.
                     return;
                 }
                 this.state = match result {

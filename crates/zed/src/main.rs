@@ -779,6 +779,7 @@ fn main() {
         ggo_emu_panel::init(cx); // GGO
         ggo_hello::init(cx); // GGO
         ggo_metasprite_panel::init(cx); // GGO
+        ggo_tileset_panel::init(cx); // GGO
         ggo_world_panel::init(cx); // GGO
         onboarding::init(cx);
         settings_ui::init(cx);

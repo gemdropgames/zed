@@ -7615,6 +7615,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_tileset_panel"
+version = "0.1.0"
+dependencies = [
+ "ggo-asset-formats",
+ "ggo-worldlib",
+ "ggo_common",
+ "gpui",
+ "keymap_editor",
+ "path",
+ "project",
+ "serde_json",
+ "tempfile",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "ggo_world_panel"
 version = "0.1.0"
 dependencies = [
@@ -24387,6 +24404,7 @@ dependencies = [
  "ggo_hello",
  "ggo_language",
  "ggo_metasprite_panel",
+ "ggo_tileset_panel",
  "ggo_world_panel",
  "git",
  "git_hosting_providers",

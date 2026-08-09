@@ -1,0 +1,30 @@
+[package]
+name = "ggo_tileset_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ggo_tileset_panel.rs"
+
+[dependencies]
+ggo-asset-formats.workspace = true # GGO
+ggo-worldlib.workspace = true # GGO
+ggo_common.workspace = true
+gpui.workspace = true
+keymap_editor.workspace = true
+project.workspace = true
+ui.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+path = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
