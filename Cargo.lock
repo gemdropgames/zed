@@ -7333,9 +7333,12 @@ dependencies = [
 name = "ggo_metasprite_panel"
 version = "0.1.0"
 dependencies = [
+ "ggo-worldlib",
+ "ggo_common",
  "gpui",
  "keymap_editor",
  "project",
+ "tempfile",
  "ui",
  "workspace",
 ]
