@@ -28,7 +28,7 @@ mod playback;
 mod tiles;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -146,6 +146,63 @@ const SPRITE_EXT: &str = "spr";
 /// sprites arrive by clicking a `.spr` in the project panel.
 const EMPTY_MESSAGE: &str = "Open a .spr file from the project panel";
 
+/// The emerald manifest that marks a project root, and the assets
+/// subdirectory hanging off it. Both are hardcoded upstream -- the assets dir
+/// is NOT a configurable `emerald.toml` key.
+const EMERALD_MANIFEST: &str = "emerald.toml";
+const ASSETS_DIR: &str = "assets";
+
+/// Walk up from `start`'s own directory to the nearest emerald project root
+/// (the nearest ancestor holding `emerald.toml`, mirroring emerald's
+/// `Project::discover`), returning that project's `assets/` dir.
+fn emerald_asset_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = start.parent();
+    while let Some(dir) = cur {
+        if dir.join(EMERALD_MANIFEST).is_file() {
+            let assets = dir.join(ASSETS_DIR);
+            return assets.is_dir().then_some(assets);
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// The asset root a `.spr` resolves its `til_path`/`pal_path` against, plus
+/// the sprite's path relative to THAT root.
+///
+/// Emerald treats those sidecar rels as **asset-root-relative**, where the
+/// asset root is `<project>/assets`: `crates/cli/src/commands/pack.rs:42`
+/// packs `project.root.join("assets")`, `crates/assets/src/lib.rs:398` strips
+/// that dir off every asset path, and `:244`/`:308` derive `til_path`/
+/// `pal_path` from the *stripped* name -- so a correct sidecar rel never
+/// carries an `assets/` segment.
+///
+/// Clicking `<wilds>/assets/hh.spr` therefore has to yield root
+/// `<wilds>/assets` and rel `hh.spr`, so a save writes `hh.til`/`hh.pal`.
+/// Treating the WORKTREE root as the asset root is precisely what wrote
+/// `assets/hh.til` into `hh.spr` in the first place.
+///
+/// This is the sprite analog of world_panel's `split_world_path`, but the
+/// rule differs in kind: a world announces its root with a literal `worlds/`
+/// path component, so that split is pure string work, whereas a sprite's
+/// root is only discoverable on disk.
+///
+/// Falls back to `(project_root, rel)` when the file isn't inside an emerald
+/// project's `assets/` tree -- a bare `.spr` in a non-emerald worktree keeps
+/// resolving exactly as it does today.
+fn split_sprite_path(project_root: &Path, rel: &str) -> (PathBuf, String) {
+    let abs = project_root.join(rel);
+    if let Some(assets) = emerald_asset_root(&abs)
+        && let Ok(under) = abs.strip_prefix(&assets)
+    {
+        let under = under
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        return (assets, under);
+    }
+    (project_root.to_path_buf(), rel.to_string())
+}
+
 /// `workspace::PathOpenInterceptor` for `*.spr`: claim the path, open the
 /// panel, and load it. Declines (so the normal open path runs) for any other
 /// file, for a path outside the primary worktree, and when no panel is
@@ -251,7 +308,19 @@ struct Playing {
 /// A loaded sprite: its doc store, per-frame image cache, transport
 /// state, and field editors.
 struct OpenSprite {
+    /// The doc's path relative to [`Self::root`] -- the frame `save_sprite`
+    /// and the sidecar rels all live in.
     rel_path: String,
+    /// The path the user actually clicked, worktree-relative. Kept apart
+    /// from [`Self::rel_path`] because they differ whenever the asset root
+    /// isn't the worktree root (`assets/hh.spr` vs `hh.spr`); this is the
+    /// one shown in the title and the dirty-close prompt, and the one the
+    /// "already open?" guard compares.
+    source_rel: String,
+    /// The asset root this doc was READ from, captured at open time so a
+    /// save can't land somewhere else if the worktree is repointed
+    /// meanwhile (world_panel's `OpenWorld::root` idiom).
+    root: PathBuf,
     /// Sidecar rels resolved at open time -- `save_sprite` writes the
     /// same trio back.
     til_path: String,
@@ -294,9 +363,16 @@ struct OpenSprite {
 }
 
 impl OpenSprite {
-    fn new(rel_path: String, loaded: loader::LoadedSprite) -> Self {
+    fn new(
+        rel_path: String,
+        source_rel: String,
+        root: PathBuf,
+        loaded: loader::LoadedSprite,
+    ) -> Self {
         OpenSprite {
             rel_path,
+            source_rel,
+            root,
             til_path: loaded.til_path,
             pal_path: loaded.pal_path,
             store: SpriteDocStore::new(loaded.state),
@@ -403,7 +479,7 @@ impl MetaSpritePanel {
         // the undo stack, selection, tile choice and transport state on the
         // floor.
         if let ViewerState::Ready(open) = &self.state
-            && open.rel_path == rel
+            && open.source_rel == rel
         {
             return;
         }
@@ -430,19 +506,24 @@ impl MetaSpritePanel {
     /// Kick off the off-thread load of `rel`. A stale result (superseded by
     /// a later open) is dropped by generation check.
     fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
-        let rel = rel.to_string();
-        let Some(root) = self.project_root.clone() else {
+        let source_rel = rel.to_string();
+        let Some(project_root) = self.project_root.clone() else {
             return;
         };
+        // Resolve the asset root the sidecars inside this `.spr` are written
+        // against BEFORE loading, and carry it on the open doc -- the save
+        // path must use this root, not the worktree root.
+        let (root, rel) = split_sprite_path(&project_root, &source_rel);
         self.load_generation += 1;
         let generation = self.load_generation;
         self.state = ViewerState::Loading {
-            rel_path: rel.clone(),
+            rel_path: source_rel.clone(),
         };
         cx.notify();
 
         let load = {
             let rel = rel.clone();
+            let root = root.clone();
             cx.background_spawn(async move { loader::load_sprite(&root, &rel) })
         };
         self._load_task = Some(cx.spawn(async move |this, cx| {
@@ -452,7 +533,9 @@ impl MetaSpritePanel {
                     return;
                 }
                 this.state = match result {
-                    Ok(loaded) => ViewerState::Ready(Box::new(OpenSprite::new(rel, loaded))),
+                    Ok(loaded) => {
+                        ViewerState::Ready(Box::new(OpenSprite::new(rel, source_rel, root, loaded)))
+                    }
                     Err(e) => ViewerState::Error(e),
                 };
                 cx.notify();
@@ -660,7 +743,7 @@ impl MetaSpritePanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        open.store.dirty().then(|| open.rel_path.clone())
+        open.store.dirty().then(|| open.source_rel.clone())
     }
 
     /// Save on behalf of a "Save" answer to the unsaved-edits prompt,
@@ -681,13 +764,14 @@ impl MetaSpritePanel {
     /// after saving steps through the user's edits, not the fold-back).
     /// Synchronous by choice, same reasoning as `ggo_world_panel`'s save.
     fn save_impl(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.project_root.clone() else {
-            return;
-        };
         let saved = {
             let ViewerState::Ready(open) = &mut self.state else {
                 return;
             };
+            // `open.root`, NOT `self.project_root`: the doc must be written
+            // back against the asset root it was READ from, or the sidecar
+            // rels get an extra `assets/` segment (see `split_sprite_path`).
+            let root = open.root.clone();
             match save_sprite(
                 &root,
                 &open.rel_path,
@@ -1230,7 +1314,7 @@ impl MetaSpritePanel {
             None => "All frames".into(),
         };
         let clip_names: Vec<String> = state.clips.iter().map(|c| c.name.clone()).collect();
-        let title = format!("{}{}", open.rel_path, if dirty { " ●" } else { "" });
+        let title = format!("{}{}", open.source_rel, if dirty { " ●" } else { "" });
         let weak = cx.weak_entity();
         let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
             {
@@ -1843,6 +1927,30 @@ mod tests {
     /// [`write_sprite_fixture`] under an arbitrary stem, so a test can hold
     /// two distinct sprites (the routing tests switch between them).
     fn write_sprite_fixture_named(root: &std::path::Path, stem: &str) {
+        write_sprite_fixture_at(root, &format!("sprites/{stem}"));
+    }
+
+    /// [`write_sprite_fixture`] at an arbitrary root-relative stem, so a
+    /// test can put the trio DIRECTLY at an asset root (stem `hh` ->
+    /// `hh.spr`/`hh.til`/`hh.pal`) rather than under `sprites/`. That is
+    /// the wilds layout, and the one where a wrong root is unrecoverable:
+    /// with no subdirectory there is no sibling for `resolve_sidecar` to
+    /// fall back to.
+    fn write_sprite_fixture_at(root: &std::path::Path, stem: &str) {
+        save_fixture(
+            root,
+            &format!("{stem}.spr"),
+            &format!("{stem}.til"),
+            &format!("{stem}.pal"),
+        );
+    }
+
+    /// The fixture trio with each of the three rels named INDEPENDENTLY, so
+    /// a test can reproduce a `.spr` whose stored sidecars don't match the
+    /// root they'll later be read against -- i.e. the exact corruption this
+    /// change exists to stop, produced by the exact call that caused it
+    /// (`save_sprite` handed a PROJECT root where the asset root belonged).
+    fn save_fixture(root: &std::path::Path, spr_rel: &str, til_rel: &str, pal_rel: &str) {
         let mut pool = vec![0u8; 2 * TILE_BYTES];
         for b in &mut pool[TILE_BYTES..] {
             *b = 0x11; // both nibbles = palette index 1
@@ -1874,14 +1982,7 @@ mod tests {
             h_tiles: 1,
             pool_shared: false,
         };
-        save_sprite(
-            root,
-            &format!("sprites/{stem}.spr"),
-            &state,
-            &format!("sprites/{stem}.til"),
-            &format!("sprites/{stem}.pal"),
-        )
-        .unwrap();
+        save_sprite(root, spr_rel, &state, til_rel, pal_rel).unwrap();
     }
 
     /// Load the fixture sprite into a fresh panel and return it Ready.
@@ -2861,6 +2962,203 @@ mod tests {
                 assert_eq!(open.store.state().clips.len(), 1);
                 assert!(open.store.dirty(), "undo past the save point re-dirties");
             }
+        });
+    }
+
+    // ------------------------------------------------- asset-root resolution
+
+    /// An emerald project skeleton: `emerald.toml` at the root, the sprite
+    /// trio directly inside `assets/`. Mirrors the wilds layout that
+    /// surfaced this bug.
+    fn emerald_project(stem: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("emerald.toml"),
+            "[project]\nname='t'\ntitle='t'\n",
+        )
+        .unwrap();
+        let assets = dir.path().join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        write_sprite_fixture_at(&assets, stem);
+        dir
+    }
+
+    /// The split itself: inside an emerald project the asset root is
+    /// `<project>/assets` and the doc rel is relative to THAT, so a sidecar
+    /// written from it can never carry an `assets/` segment. Outside one,
+    /// nothing changes.
+    #[gpui::test]
+    async fn test_split_sprite_path_derives_the_asset_root(_cx: &mut TestAppContext) {
+        let dir = emerald_project("hh");
+        let root = dir.path();
+        let assets = root.join("assets");
+
+        // The wilds case: sprite directly at the asset root.
+        assert_eq!(
+            split_sprite_path(root, "assets/hh.spr"),
+            (assets.clone(), "hh.spr".to_string())
+        );
+
+        // Nested under the asset root: the nesting stays in the rel.
+        std::fs::create_dir_all(assets.join("sprites")).unwrap();
+        write_sprite_fixture_named(&assets, "hero");
+        assert_eq!(
+            split_sprite_path(root, "assets/sprites/hero.spr"),
+            (assets, "sprites/hero.spr".to_string())
+        );
+
+        // Inside the project but OUTSIDE assets/: no asset root applies, so
+        // the worktree root is kept rather than guessed at.
+        assert_eq!(
+            split_sprite_path(root, "scratch/x.spr"),
+            (root.to_path_buf(), "scratch/x.spr".to_string())
+        );
+
+        // Not an emerald project at all: today's behavior, untouched.
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            split_sprite_path(plain.path(), "sprites/hero.spr"),
+            (plain.path().to_path_buf(), "sprites/hero.spr".to_string())
+        );
+    }
+
+    /// The Part C contract: opening `assets/hh.spr` resolves the asset root
+    /// to `<project>/assets`, and a SAVE therefore writes `hh.til`/`hh.pal`
+    /// -- asset-root-relative, exactly what emerald's packer expects -- not
+    /// `assets/hh.til`. The regression this whole change exists to prevent.
+    #[gpui::test]
+    async fn test_save_writes_asset_root_relative_sidecars(cx: &mut TestAppContext) {
+        let dir = emerald_project("hh");
+        let root = dir.path().to_path_buf();
+        let assets = dir.path().join("assets");
+
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = MetaSpritePanel::new(None, cx);
+                // The WORKTREE root -- the panel must narrow it itself.
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("assets/hh.spr", cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                assert_eq!(open.root, assets, "asset root is <project>/assets");
+                assert_eq!(open.rel_path, "hh.spr", "doc rel is asset-root-relative");
+                assert_eq!(open.source_rel, "assets/hh.spr", "clicked path is kept");
+                assert_eq!(open.til_path, "hh.til");
+                assert_eq!(open.pal_path, "hh.pal");
+            }
+            panel.commit_edit(EditTarget::Duration, "40".into(), cx);
+            panel.save_impl(cx);
+            assert!(ready(panel).save_error.is_none());
+        });
+
+        // The bytes on disk are what actually matter: the sidecar strings
+        // stored INSIDE the `.spr` must be asset-root-relative.
+        let bytes = std::fs::read(assets.join("hh.spr")).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("hh.til") && text.contains("hh.pal"),
+            "sidecar rels missing from the saved .spr: {text:?}"
+        );
+        assert!(
+            !text.contains("assets/hh.til") && !text.contains("assets/hh.pal"),
+            "a saved sidecar must never carry the assets/ prefix: {text:?}"
+        );
+        // The trio landed at the asset root, not one level up.
+        assert!(assets.join("hh.til").is_file() && assets.join("hh.pal").is_file());
+        assert!(
+            !dir.path().join("hh.til").exists(),
+            "nothing may be written outside the asset root"
+        );
+        // Re-reading against the asset root (what emerald's packer does)
+        // resolves the sidecars and sees the edit.
+        let reopened = open_sprite(&assets, "hh.spr").unwrap();
+        assert_eq!(reopened.til_path, "hh.til");
+        assert_eq!(reopened.state.frames[0].duration_ms, 40);
+    }
+
+    /// A LEGACY `.spr` (sidecars stored project-root-relative, the wilds
+    /// corruption) is surfaced, not silently perpetuated.
+    ///
+    /// The panel deliberately does NOT rescue it: teaching the loader to
+    /// strip a leading `assets/` would mask this exact signature and
+    /// silently launder future instances. Repairing the DATA is
+    /// `ggo-sprfix`'s job. What this test pins is that the panel can't make
+    /// things worse -- the corrupt file never reaches Ready, so there is no
+    /// document to save the bad value back from, and the bytes on disk are
+    /// left untouched.
+    #[gpui::test]
+    async fn test_a_legacy_prefixed_sprite_surfaces_instead_of_being_perpetuated(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = emerald_project("hh");
+        let assets = dir.path().join("assets");
+
+        // Reproduce the corruption the way it was actually produced: hand
+        // `save_sprite` the PROJECT root, so every rel picks up an extra
+        // `assets/` segment. The trio lands in the right places on disk; it
+        // is the strings STORED in the `.spr` that are wrong.
+        save_fixture(
+            dir.path(),
+            "assets/hh.spr",
+            "assets/hh.til",
+            "assets/hh.pal",
+        );
+        let corrupt = std::fs::read(assets.join("hh.spr")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&corrupt).contains("assets/hh.til"),
+            "fixture should carry the legacy prefixed sidecar"
+        );
+
+        let root = dir.path().to_path_buf();
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = MetaSpritePanel::new(None, cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("assets/hh.spr", cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Error(message) = &panel.state else {
+                panic!("a legacy prefixed .spr must not silently reach Ready");
+            };
+            assert!(
+                message.contains("assets/hh.til"),
+                "the error must name the unresolvable sidecar, got: {message}"
+            );
+            // Saving in this state is a no-op, not a write of the bad value.
+            panel.save_impl(cx);
+        });
+        assert_eq!(
+            std::fs::read(assets.join("hh.spr")).unwrap(),
+            corrupt,
+            "the corrupt file must be left exactly as found"
+        );
+
+        // After the documented repair (what `ggo-sprfix --write` does to the
+        // stored rels), the same click loads and resolves cleanly.
+        save_fixture(&assets, "hh.spr", "hh.til", "hh.pal");
+
+        panel.update(cx, |panel, cx| panel.load_rel_path("assets/hh.spr", cx));
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let open = ready(panel);
+            assert_eq!(open.til_path, "hh.til");
+            assert_eq!(open.rel_path, "hh.spr");
         });
     }
 }
