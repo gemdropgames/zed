@@ -44,6 +44,7 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
+use ggo_worldlib::merge_candidates::merge_candidates;
 use ggo_worldlib::render::{
     AssetLoads, DrawItem, Selection, active_camera_origin, build_draw_list, hit_test, world_label,
 };
@@ -65,7 +66,9 @@ actions!(
         Save,
         /// Commits the focused inspector field (bound to Enter inside the
         /// panel's field editors).
-        CommitField
+        CommitField,
+        /// Deletes the selected entity or instance from the open world.
+        DeleteSelected
     ]
 );
 
@@ -116,6 +119,10 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
+        // Panel-focused only: an inspector field editor's own (deeper)
+        // Editor-context bindings win while typing.
+        KeyBinding::new("delete", DeleteSelected, Some(KEY_CONTEXT)),
+        KeyBinding::new("backspace", DeleteSelected, Some(KEY_CONTEXT)),
         // Single-line editors don't bind Enter themselves (the default
         // keymap's `enter -> editor::Newline` is `mode == full` only), so
         // this fires while an inspector field editor is focused.
@@ -169,6 +176,13 @@ struct InspectorEntry {
 /// A loaded world plus its render-side caches and editor state.
 struct OpenWorld {
     listing: WorldListing,
+    /// The project root this world was LOADED from. Save writes under
+    /// THIS root, not the panel's live `project_root` -- a refresh can
+    /// repoint the panel at a different worktree while a world from the
+    /// old root is still open, and saving the open doc under the new
+    /// root would write a file that was never read (stale-root finding,
+    /// task M7).
+    root: PathBuf,
     store: WorldDocStore,
     sprite_loads: AssetLoads,
     map_loads: AssetLoads,
@@ -190,11 +204,13 @@ struct OpenWorld {
 impl OpenWorld {
     fn new(
         listing: WorldListing,
+        root: PathBuf,
         loaded: loader::LoadedWorld,
         images: HashMap<usize, Arc<RenderImage>>,
     ) -> Self {
         OpenWorld {
             listing,
+            root,
             store: loaded.store,
             sprite_loads: loaded.sprite_loads,
             map_loads: loaded.map_loads,
@@ -229,6 +245,29 @@ fn draw_items(open: &OpenWorld) -> Vec<DrawItem> {
         &open.map_loads,
         &open.meta_sprite_loads,
     )
+}
+
+/// The world point at the canvas center -- ggo-ide's `view_center_world`,
+/// where a freshly added entity/instance lands. Before the first layout
+/// (no bounds/pan yet -- possible when adding right after load, and the
+/// normal case in headless tests) it falls back to the panel's default
+/// width as a square at identity pan, the same fixed-canvas spirit as
+/// ggo-ide's `CANVAS_DEFAULT_W/H`.
+fn view_center_world(open: &OpenWorld) -> [f64; 2] {
+    let v = open.view.borrow();
+    let (w, h) = v
+        .last_bounds
+        .map_or((f64::from(DEFAULT_WIDTH), f64::from(DEFAULT_WIDTH)), |b| {
+            (f64::from(b.size.width), f64::from(b.size.height))
+        });
+    let pan = v.pan.unwrap_or([0.0, 0.0]);
+    let view = View {
+        zoom: v.zoom,
+        pan_x: pan[0],
+        pan_y: pan[1],
+        dpr: None,
+    };
+    drag_ops::screen_to_world(w / 2.0, h / 2.0, &view)
 }
 
 enum ViewerState {
@@ -303,6 +342,7 @@ impl WorldPanel {
         cx.notify();
 
         let rel = listing.rel_path.clone();
+        let loaded_root = root.clone();
         let load = cx.background_spawn(async move {
             loader::load_world(&root, &rel).map(|loaded| {
                 // Build the BGRA `RenderImage`s off-thread too -- one per
@@ -322,9 +362,12 @@ impl WorldPanel {
                     return;
                 }
                 this.state = match result {
-                    Ok((loaded, images)) => {
-                        ViewerState::Ready(Box::new(OpenWorld::new(listing, loaded, images)))
-                    }
+                    Ok((loaded, images)) => ViewerState::Ready(Box::new(OpenWorld::new(
+                        listing,
+                        loaded_root,
+                        loaded,
+                        images,
+                    ))),
                     Err(e) => ViewerState::Error(e),
                 };
                 cx.notify();
@@ -344,6 +387,91 @@ impl WorldPanel {
             open.store.apply(op);
             cx.notify();
         }
+    }
+
+    /// Toolbar "add entity": a fresh entity with just a Transform
+    /// skeleton -- schema defaults (`defaults_for`, per the M7 brief;
+    /// builtins guarantee a Transform schema) with `pos` overridden to
+    /// the current view center, ggo-ide's `WorldMsg::AddEntity` -- then
+    /// select it.
+    fn add_entity_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let center = view_center_world(open);
+        let mut transform = open
+            .schemas
+            .iter()
+            .find(|s| s.name == "Transform")
+            .map(defaults_for)
+            .unwrap_or_default();
+        transform.insert("pos".to_string(), serde_json::json!([center[0], center[1]]));
+        let mut components = serde_json::Map::new();
+        components.insert("Transform".to_string(), Value::Object(transform));
+        open.store.apply(WorldOp::AddEntity { components });
+        open.selected = Some(Selection::Entity(open.store.state().entities.len() - 1));
+        open.edit_drag = None;
+        cx.notify();
+    }
+
+    /// Worlds safe to `AddInstance` into the open world: the picker's
+    /// stems through worldlib's cycle-guarded `merge_candidates` (always
+    /// excludes the open world itself, plus any stem the last load
+    /// proved cycles somewhere in this doc's resolved instance graph).
+    fn instance_candidates(&self) -> Vec<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return Vec::new();
+        };
+        let stems: Vec<String> = self.worlds.iter().map(|w| w.stem.clone()).collect();
+        merge_candidates(&stems, &open.listing.stem, &open.store.state().instances)
+    }
+
+    /// Add-instance picker pick: re-check the cycle guard at apply time
+    /// (a built menu can outlive an undo/redo that changed the instance
+    /// graph), then `AddInstance` + a follow-up `MoveInstance` to the
+    /// view center (worldlib's op itself lands at its fixed
+    /// `DEFAULT_INSTANCE_POS`; the move is a second undo entry -- first
+    /// undo returns it to the default spot, second removes it), and
+    /// select it.
+    fn add_instance_impl(&mut self, stem: String, cx: &mut Context<Self>) {
+        if !self.instance_candidates().contains(&stem) {
+            return;
+        }
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let center = view_center_world(open);
+        open.store.apply(WorldOp::AddInstance { world: stem });
+        let index = open.store.state().instances.len() - 1;
+        open.store.apply(WorldOp::MoveInstance {
+            index,
+            pos: center,
+            gesture: None,
+        });
+        open.selected = Some(Selection::Instance(index));
+        open.edit_drag = None;
+        cx.notify();
+    }
+
+    /// Delete the selected entity or instance (toolbar button and the
+    /// `DeleteSelected` action). Bounds-guarded: a selection gone stale
+    /// against an undo/redo restructure is a no-op, not a panic.
+    fn delete_selected_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        match open.selected {
+            Some(Selection::Entity(index)) if index < open.store.state().entities.len() => {
+                open.store.apply(WorldOp::RemoveEntity { index });
+            }
+            Some(Selection::Instance(index)) if index < open.store.state().instances.len() => {
+                open.store.apply(WorldOp::RemoveInstance { index });
+            }
+            _ => return,
+        }
+        open.selected = None;
+        open.edit_drag = None;
+        cx.notify();
     }
 
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
@@ -368,13 +496,12 @@ impl WorldPanel {
     /// then `mark_saved` in one step also avoids the marked-depth race a
     /// mid-flight edit would cause).
     fn save_impl(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.project_root.clone() else {
-            return;
-        };
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        match write_world(&root, &open.listing.rel_path, &open.store.to_doc()) {
+        // `open.root`, NOT `self.project_root`: the doc must be written
+        // back where it was read from (see the `OpenWorld::root` doc).
+        match write_world(&open.root, &open.listing.rel_path, &open.store.to_doc()) {
             Ok(()) => {
                 open.store.mark_saved();
                 open.save_error = None;
@@ -649,14 +776,32 @@ impl WorldPanel {
             .into_any_element()
     }
 
-    /// Save / undo / redo / snap row, with the dirty dot on the world's
-    /// title.
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Add-entity / add-instance / delete / save / undo / redo / snap
+    /// row, with the dirty dot on the world's title.
+    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_toolbar is only called in the Ready state");
         };
         let dirty = open.store.state().dirty;
         let snap = open.snap;
+        let has_selection = open.selected.is_some();
+        let candidates = self.instance_candidates();
+        let weak = cx.weak_entity();
+
+        // Add-instance picker over the cycle-guarded candidate stems.
+        let instance_menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+            for stem in candidates {
+                let weak = weak.clone();
+                let label = world_label(&stem).to_string();
+                menu = menu.entry(SharedString::from(label), None, move |_window, cx| {
+                    let stem = stem.clone();
+                    weak.update(cx, |this, cx| this.add_instance_impl(stem, cx))
+                        .ok();
+                });
+            }
+            menu
+        });
+
         let weak = cx.weak_entity();
         let title = format!(
             "{}{}",
@@ -674,6 +819,24 @@ impl WorldPanel {
                 Color::Muted
             }))
             .child(div().flex_1())
+            .child(
+                IconButton::new("ggo-world-add-entity", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Add entity"))
+                    .on_click(cx.listener(|this, _, _, cx| this.add_entity_impl(cx))),
+            )
+            .child(DropdownMenu::new(
+                "ggo-world-add-instance",
+                "+ Instance",
+                instance_menu,
+            ))
+            .child(
+                IconButton::new("ggo-world-delete", IconName::Trash)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Delete selected"))
+                    .disabled(!has_selection)
+                    .on_click(cx.listener(|this, _, _, cx| this.delete_selected_impl(cx))),
+            )
             .child(
                 Checkbox::new("ggo-world-snap", ToggleState::from(snap))
                     .label("Snap")
@@ -1152,9 +1315,10 @@ impl WorldPanel {
 
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let inspector = self.render_inspector(window, cx);
+        let toolbar = self.render_toolbar(window, cx);
         v_flex()
             .size_full()
-            .child(self.render_toolbar(cx))
+            .child(toolbar)
             .child(
                 h_flex()
                     .flex_1()
@@ -1189,6 +1353,9 @@ impl Render for WorldPanel {
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
+            .on_action(
+                cx.listener(|this, _: &DeleteSelected, _window, cx| this.delete_selected_impl(cx)),
+            )
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
             .child(self.render_picker(cx))
@@ -1651,6 +1818,226 @@ mod tests {
             })
             && a.instances == b.instances
             && a.backgrounds == b.backgrounds
+    }
+
+    /// M7 add/delete: the toolbar add drops a Transform-only entity at
+    /// the view center (schema defaults, `pos` overridden), selected;
+    /// it renders as a `Marker` in the draw list; `DeleteSelected`
+    /// removes it (and clears the selection); undo restores it and a
+    /// second undo returns to the loaded, clean state.
+    #[gpui::test]
+    async fn test_add_entity_appears_in_draw_list_delete_and_undo_restores(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let markers_before = {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                draw_items(open)
+                    .iter()
+                    .filter(|i| matches!(i.kind, DrawKind::Marker))
+                    .count()
+            };
+
+            panel.add_entity_impl(cx);
+            let center = {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                let center = view_center_world(open);
+                let state = open.store.state();
+                assert_eq!(state.entities.len(), 4);
+                assert_eq!(open.selected, Some(Selection::Entity(3)));
+                assert!(state.dirty, "add dirties the doc");
+                let t = state.entities[3].components["Transform"]
+                    .as_object()
+                    .expect("Transform skeleton");
+                assert_eq!(t["pos"], json!([center[0], center[1]]));
+                assert_eq!(t["z"], json!(0), "defaults_for seeds the z field");
+                let markers = draw_items(open)
+                    .iter()
+                    .filter(|i| matches!(i.kind, DrawKind::Marker))
+                    .count();
+                assert_eq!(
+                    markers,
+                    markers_before + 1,
+                    "the Transform-only entity draws as a Marker"
+                );
+                center
+            };
+
+            panel.delete_selected_impl(cx);
+            {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                assert_eq!(open.store.state().entities.len(), 3);
+                assert_eq!(open.selected, None, "delete clears the selection");
+            }
+
+            // Stale-selection guard: nothing selected => no-op.
+            panel.delete_selected_impl(cx);
+            {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                assert_eq!(open.store.state().entities.len(), 3);
+            }
+
+            panel.undo_impl(cx);
+            {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                let state = open.store.state();
+                assert_eq!(state.entities.len(), 4, "undo restores the deleted entity");
+                assert_eq!(
+                    state.entities[3].components["Transform"]["pos"],
+                    json!([center[0], center[1]])
+                );
+            }
+            panel.undo_impl(cx);
+            {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                assert_eq!(open.store.state().entities.len(), 3);
+                assert!(!open.store.state().dirty, "back to the loaded state");
+            }
+        });
+    }
+
+    /// M7 add-instance: candidates exclude the open world itself and any
+    /// stem the load proved cycles in the resolved instance graph (a <->
+    /// b fixture); a guarded pick is dropped without an op; a legal pick
+    /// adds the instance at the view center, selected.
+    #[gpui::test]
+    async fn test_add_instance_honors_cycle_guard(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Mutually-recursive pair on top of the standard fixture:
+        // worlds/a instances worlds/b, worlds/b instances worlds/a.
+        let cyclic = |other: &str| WorldFile {
+            entities: vec![],
+            instances: vec![WorldInstance {
+                world: format!("worlds/{other}"),
+                pos: [0.0, 0.0],
+                background_priority: false,
+            }],
+            backgrounds: vec![],
+        };
+        write_world(root, "worlds/a.toml", &cyclic("b")).unwrap();
+        write_world(root, "worlds/b.toml", &cyclic("a")).unwrap();
+
+        let panel = ready_panel(cx, root).await;
+        panel.update(cx, |panel, cx| {
+            let ix = panel
+                .worlds
+                .iter()
+                .position(|w| w.stem == "worlds/a")
+                .unwrap();
+            panel.select_world(ix, cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let candidates = panel.instance_candidates();
+            assert!(
+                !candidates.contains(&"worlds/a".to_string()),
+                "the open world is never a candidate"
+            );
+            assert!(
+                !candidates.contains(&"worlds/b".to_string()),
+                "a stem the load proved cyclic is excluded"
+            );
+            assert!(
+                candidates.contains(&"worlds/sub".to_string()),
+                "unrelated worlds stay offered: {candidates:?}"
+            );
+
+            // A guarded pick (self or proven-cyclic) is dropped.
+            panel.add_instance_impl("worlds/a".to_string(), cx);
+            panel.add_instance_impl("worlds/b".to_string(), cx);
+            {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                assert_eq!(
+                    open.store.state().instances.len(),
+                    1,
+                    "guarded picks must not add instances"
+                );
+                assert!(!open.store.state().dirty);
+            }
+
+            // A legal pick lands at the view center, selected.
+            panel.add_instance_impl("worlds/sub".to_string(), cx);
+            {
+                let ViewerState::Ready(open) = &panel.state else {
+                    panic!("expected Ready");
+                };
+                let center = view_center_world(open);
+                let state = open.store.state();
+                assert_eq!(state.instances.len(), 2);
+                assert_eq!(state.instances[1].world, "worlds/sub");
+                assert_eq!(state.instances[1].pos, center);
+                assert_eq!(open.selected, Some(Selection::Instance(1)));
+                assert!(state.dirty);
+            }
+        });
+    }
+
+    /// M7 stale-root regression: repointing the panel's project root
+    /// (workspace/worktree change + refresh) while a world is open must
+    /// not redirect Save -- the doc writes back under the root it was
+    /// LOADED from, and nothing appears under the new root.
+    #[gpui::test]
+    async fn test_save_after_root_repoint_writes_under_captured_root(cx: &mut TestAppContext) {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir1.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    // Non-integral on purpose: the TOML writer
+                    // canonicalizes whole floats to ints, which would
+                    // trip the exact json! comparison below.
+                    pos: [77.5, 88.25],
+                    gesture: None,
+                },
+                cx,
+            );
+
+            // Repoint the panel at a different (empty) root, as a
+            // worktree change + activation refresh would.
+            panel.root_override = Some(dir2.path().to_path_buf());
+            panel.refresh_worlds(cx);
+            assert_eq!(panel.project_root.as_deref(), Some(dir2.path()));
+
+            panel.save_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.save_error.is_none(), "save should succeed");
+            assert!(!open.store.state().dirty);
+        });
+
+        let saved = read_world(dir1.path(), "worlds/test.toml").unwrap();
+        assert_eq!(
+            saved.entities[0].components["Transform"]["pos"],
+            json!([77.5, 88.25]),
+            "the edit was saved under the LOAD root"
+        );
+        assert!(
+            !dir2.path().join("worlds").exists(),
+            "nothing may be written under the repointed root"
+        );
     }
 
     /// Field commits map inspector text to ops against the LIVE panel
