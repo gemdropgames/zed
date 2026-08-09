@@ -774,6 +774,7 @@ fn main() {
         markdown_preview::init(cx);
         csv_preview::init(cx);
         svg_preview::init(cx);
+        ggo_charts_panel::init(cx); // GGO
         ggo_hello::init(cx); // GGO
         ggo_metasprite_panel::init(cx); // GGO
         ggo_world_panel::init(cx); // GGO

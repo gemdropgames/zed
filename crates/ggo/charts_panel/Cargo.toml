@@ -1,0 +1,32 @@
+[package]
+name = "ggo_charts_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ggo_charts_panel.rs"
+
+[dependencies]
+ggo-db.workspace = true # GGO
+ggo_common.workspace = true
+gpui.workspace = true
+keymap_editor.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# Same pure-Rust SQLite engine ggo-db's migrate() takes a connection from
+# (mirrors ggo-ide's tools/ggo-ide/Cargo.toml: it depends on turso
+# directly too, alongside ggo-db, for the exact same reason -- `loader`
+# opens its own connection rather than adding a bespoke method to ggo-db).
+turso = "0.7"
+ui.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
