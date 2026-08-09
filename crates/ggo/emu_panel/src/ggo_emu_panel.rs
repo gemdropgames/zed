@@ -31,10 +31,13 @@
 //! Structural mirror of `ggo_world_panel`/`ggo_metasprite_panel`/
 //! `ggo_charts_panel`: `Panel` impl, `ToggleFocus`, `observe_new`
 //! registration into every new workspace, a `KeymapEventChannel` observer
-//! that re-binds the panel's keys on every keymap reload, project-root
+//! that re-binds the panel's keys on every keymap reload, and project-root
 //! discovery off the workspace's first visible worktree with a
-//! `root_override` test hook, and off-thread loading behind a
-//! load-generation staleness guard.
+//! `root_override` test hook. Unlike those panels, selecting a cart here is
+//! synchronous (routed straight off the project panel's intercept, no
+//! background load); this panel's own generation counter instead guards a
+//! *run's* off-thread completion against a later run stomping it (see
+//! `run_generation` below).
 //!
 //! Audio is explicitly out of scope for F3 (constraints.md) -- see
 //! [`drive`]'s module doc for exactly what else is not ported.
@@ -281,12 +284,11 @@ pub struct EmuPanel {
     /// Bumped every time [`Self::run`] starts a new session. [`Self::
     /// finish_run`] captures this at call time and its background
     /// completion closure re-checks it before writing `status`/
-    /// `ingest_status` -- the same staleness guard `load_generation`
-    /// gives [`Self::refresh_carts`]. Needed because a run's completion
-    /// (`Session::wait`, joined off-thread) can land seconds after a
-    /// later run has already started and become the one the pane is
-    /// showing; without this, run A's late completion would stomp run
-    /// B's live status.
+    /// `ingest_status`, discarding the result if it no longer matches.
+    /// Needed because a run's completion (`Session::wait`, joined
+    /// off-thread) can land seconds after a later run has already started
+    /// and become the one the pane is showing; without this, run A's late
+    /// completion would stomp run B's live status.
     run_generation: u64,
     /// The running emulator, if any. Dropping it signals the thread to
     /// stop (see [`Session::stop`]).
@@ -575,8 +577,7 @@ impl EmuPanel {
                     // A later run has started (and possibly already
                     // ended) since this one was taken -- this completion
                     // is stale, so don't let it stomp the live run's
-                    // status. Same guard `refresh_carts` applies to
-                    // `load_generation`.
+                    // status.
                     return;
                 }
                 this.status = Some(reason);
@@ -1801,6 +1802,101 @@ mod tests {
                 workspace.active_pane().read(cx).items().count(),
                 1,
                 "an unclaimed path still opens the normal way"
+            );
+        });
+    }
+
+    /// The `Event::SplitEntry` sibling of the test above. Same real
+    /// `ProjectPanel`, same real subscription, but this time the click is a
+    /// split-open (e.g. alt-click) rather than a plain open. It exercises
+    /// the second guard at `crates/project_panel/src/project_panel.rs`'s
+    /// `Event::SplitEntry` arm, which is otherwise untested: nothing else
+    /// would notice if that `if !workspace.intercept_path_open(&ggo_project_path,
+    /// …)` guard were dropped from a merge.
+    #[gpui::test]
+    async fn test_project_panel_split_entry_routes_a_cart_into_the_panel(cx: &mut TestAppContext) {
+        let project = routed_project(cx, true).await;
+        cx.update(|cx| {
+            editor::init(cx);
+            project_panel::init(cx);
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        let (weak_workspace, async_cx) =
+            cx.update(|window, cx| (workspace.downgrade(), window.to_async(cx)));
+        let project_panel = project_panel::ProjectPanel::load(weak_workspace, async_cx)
+            .await
+            .expect("the project panel loads");
+
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<EmuPanel>(cx)
+                .expect("init() adds the emu panel")
+        });
+        let worktree_id = worktree_id(&project, cx);
+
+        fn entry_id(
+            project: &Entity<Project>,
+            worktree_id: WorktreeId,
+            rel: &str,
+            cx: &mut gpui::VisualTestContext,
+        ) -> project::ProjectEntryId {
+            project.read_with(cx, |project, cx| {
+                project
+                    .entry_for_path(&project_path(worktree_id, rel), cx)
+                    .unwrap_or_else(|| panic!("{rel} is in the fake worktree"))
+                    .id
+            })
+        }
+
+        // The alt-click / split-open, as the project panel publishes it.
+        let cart_entry = entry_id(&project, worktree_id, "carts/green.cart", cx);
+        project_panel.update(cx, |_, cx| {
+            cx.emit(project_panel::Event::SplitEntry {
+                entry_id: cart_entry,
+                allow_preview: true,
+                split_direction: Some(workspace::SplitDirection::Right),
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.selected.as_deref(),
+                Some("carts/green.cart"),
+                "the project panel's split-open event must reach the emu panel \
+                 -- if this fails, the GGO guard in project_panel.rs's SplitEntry \
+                 arm is gone"
+            );
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_pane().read(cx).items().count(),
+                0,
+                "a claimed path must open no editor tab, split or not"
+            );
+        });
+
+        // Control: an unclaimed path DOES split-open a tab, so the assertion
+        // above is testing the guard rather than a dead code path.
+        let txt_entry = entry_id(&project, worktree_id, "notes.txt", cx);
+        project_panel.update(cx, |_, cx| {
+            cx.emit(project_panel::Event::SplitEntry {
+                entry_id: txt_entry,
+                allow_preview: true,
+                split_direction: Some(workspace::SplitDirection::Right),
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_pane().read(cx).items().count(),
+                1,
+                "an unclaimed path still splits open the normal way"
             );
         });
     }
