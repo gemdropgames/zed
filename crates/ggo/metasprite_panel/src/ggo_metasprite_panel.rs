@@ -1,31 +1,39 @@
-//! GGO MetaSprite panel (F2 tasks M4+M5): sprite picker, frame strip,
-//! playback preview, and animation EDITING -- clip CRUD, frame ops,
-//! undo/redo/save over worldlib's `SpriteDocStore`. Structural mirror of
-//! `ggo_world_panel` -- `Panel` impl, keybinding-reload observer,
-//! off-thread loading with a load-generation guard, blur/Enter-committed
-//! single-line editors -- with the sprite-specific pieces split out:
-//! `loader` owns everything off the UI thread (`.spr` enumeration + open
-//! + per-frame compose), `playback` owns the pure range/loop/offset/fit
-//! math, `edits` owns the pure edit rules (new-clip defaults, range
-//! validation, duration parsing, post-op selection bookkeeping); this
-//! module owns the panel entity, the store wiring, the transport timer
-//! loop, and all gpui glue. Op semantics mirror ggo-ide's
-//! `sprites/timeline.rs` message handlers; guards are re-checked here
-//! because the store's frame/clip index ops currently panic out of range.
+//! GGO MetaSprite panel (F2 tasks M4-M6): sprite picker, frame strip,
+//! playback preview, animation EDITING -- clip CRUD, frame ops,
+//! undo/redo/save over worldlib's `SpriteDocStore` -- and per-cell tile
+//! assignment from a pool-tile palette, with the hardware budget line.
+//! Structural mirror of `ggo_world_panel` -- `Panel` impl,
+//! keybinding-reload observer, off-thread loading with a load-generation
+//! guard, blur/Enter-committed single-line editors -- with the
+//! sprite-specific pieces split out: `loader` owns everything off the UI
+//! thread (`.spr` enumeration + open + per-frame/per-tile compose),
+//! `playback` owns the pure range/loop/offset/fit math, `edits` owns the
+//! pure edit rules (new-clip defaults, range validation, duration
+//! parsing, post-op selection bookkeeping), `tiles` owns the preview
+//! cell-hit math and the hw meter line; this module owns the panel
+//! entity, the store wiring, the transport timer loop, and all gpui
+//! glue. Op semantics mirror ggo-ide's `sprites/timeline.rs` message
+//! handlers; guards are still re-checked here BEFORE apply -- the store
+//! rejects out-of-range indices with a `DocError` these days (worldlib
+//! DocOp hardening, ggo PR #73) rather than panicking, but a stale-index
+//! click is a UI race to swallow silently, not an error to surface.
 
 mod edits;
 mod loader;
 mod playback;
+mod tiles;
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement,
-    KeyBinding, KeyContext, ParentElement, Pixels, Render, RenderImage, Styled, Subscription, Task,
-    WeakEntity, Window, actions, div, img, px,
+    Action, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    IntoElement, KeyBinding, KeyContext, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    Render, RenderImage, Styled, Subscription, Task, WeakEntity, Window, actions, div, img, px,
 };
 use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState};
@@ -51,7 +59,10 @@ actions!(
         /// Saves the open sprite to its `.spr`/`.til`/`.pal` trio.
         Save,
         /// Commits the focused clip/duration field editor's text.
-        CommitField
+        CommitField,
+        /// Deselects the active pool tile, so preview clicks stop
+        /// assigning it to cells.
+        DeselectTile
     ]
 );
 
@@ -74,6 +85,13 @@ const THUMB_PX: f32 = 48.0;
 
 /// Large center preview box (px, square).
 const PREVIEW_PX: f32 = 240.0;
+
+/// Tile-palette thumbnail box (px, square -- pool tiles are always
+/// `TILE_PX` square, so no fit math needed).
+const TILE_THUMB_PX: f32 = 24.0;
+
+/// The tile-palette grid's max height before it scrolls.
+const TILES_MAX_H: Pixels = px(92.);
 
 /// The clip-CRUD side column's width.
 const CLIPS_WIDTH: Pixels = px(148.);
@@ -141,6 +159,11 @@ fn bind_panel_keys(cx: &mut App) {
             CommitField,
             Some(&format!("{KEY_CONTEXT} > Editor")),
         ),
+        // Escape drops the active tile selection (the click-doesn't-
+        // mutate affordance). No `not_editing` guard needed: while a
+        // field editor is focused, the default keymap's deeper
+        // `Editor`-context escape binding wins.
+        KeyBinding::new("escape", DeselectTile, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -192,6 +215,19 @@ struct OpenSprite {
     /// One composed BGRA image per frame index; rebuilt wholesale after
     /// every doc mutation (see `loader::LoadedSprite::frames`).
     frames: Vec<Arc<RenderImage>>,
+    /// One composed BGRA image per pool tile index -- the tile palette's
+    /// thumbnails; same invalidation as `frames`.
+    pool_tiles: Vec<Arc<RenderImage>>,
+    /// The active pool tile: while `Some`, a preview-cell click assigns
+    /// it (`FrameTileSet`); `None` means clicks don't mutate. Cleared by
+    /// re-clicking the tile, Escape, or the tile vanishing under an
+    /// undo/fold-back.
+    selected_tile: Option<u16>,
+    /// The preview image's on-screen bounds, recorded at prepaint by the
+    /// overlay canvas so the click handler can map window coords to cell
+    /// hits (world_panel's `last_bounds` idiom). `None` until the first
+    /// Ready-state paint.
+    preview_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     selected_frame: usize,
     /// Index into the doc's clips; `None` = whole-sprite range.
     active_clip: Option<usize>,
@@ -220,6 +256,9 @@ impl OpenSprite {
             pal_path: loaded.pal_path,
             store: SpriteDocStore::new(loaded.state),
             frames: loaded.frames,
+            pool_tiles: loaded.pool_tiles,
+            selected_tile: None,
+            preview_bounds: Rc::new(RefCell::new(None)),
             selected_frame: 0,
             active_clip: None,
             playing: None,
@@ -457,12 +496,13 @@ impl MetaSpritePanel {
     // ------------------------------------------------------------ doc ops
 
     /// Apply one op to the store, then refresh everything derived from the
-    /// doc. All callers bounds-check their indices FIRST -- the store's
-    /// `ClipSet{None}`/`FrameDelete`/`FrameMove`/`FrameDuration` arms
-    /// currently panic on an out-of-range index (worldlib hardening is
-    /// landing separately), so the panel never forwards one. A store-level
-    /// rejection (e.g. an over-long clip name, pre-clamped here so it
-    /// shouldn't fire) is surfaced inline rather than swallowed.
+    /// doc. All callers bounds-check their indices FIRST: the store
+    /// validates every index itself now (worldlib DocOp hardening, ggo
+    /// PR #73 -- a bad index comes back as a `DocError`, not a panic),
+    /// but a stale index from a click racing an undo is a UI no-op, not
+    /// an error the user should see. A genuine store-level rejection
+    /// (e.g. an over-long clip name, pre-clamped here so it shouldn't
+    /// fire) is surfaced inline rather than swallowed.
     fn apply_doc(&mut self, op: DocOp, cx: &mut Context<Self>) -> bool {
         let ViewerState::Ready(open) = &mut self.state else {
             return false;
@@ -493,12 +533,21 @@ impl MetaSpritePanel {
             return;
         };
         let frames = loader::compose_frames(open.store.state()).unwrap_or_default();
+        let pool_tiles = loader::compose_pool_tiles(open.store.state()).unwrap_or_default();
         let frame_count = open.store.state().frames.len();
         let clip_count = open.store.state().clips.len();
+        let tile_count = open.store.state().tile_count;
         open.frames = frames;
+        open.pool_tiles = pool_tiles;
         open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
         if open.active_clip.is_some_and(|c| c >= clip_count) {
             open.active_clip = None;
+        }
+        if open.selected_tile.is_some_and(|t| t as usize >= tile_count) {
+            // The tile went away (undo past a COW clone, dedup fold-back
+            // on save) -- drop the selection rather than repointing cells
+            // at whatever tile inherits the index.
+            open.selected_tile = None;
         }
         open.clip_error = None;
         open.op_error = None;
@@ -655,6 +704,82 @@ impl MetaSpritePanel {
         }
     }
 
+    // ----------------------------------------------------------- tile ops
+
+    /// Click a tile-palette thumbnail: select it as the active tile, or
+    /// deselect on a re-click of the already-active tile (the brief's
+    /// "clicks don't always mutate" affordance, alongside Escape).
+    fn select_tile(&mut self, tile: u16, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if (tile as usize) >= open.store.state().tile_count {
+            return; // stale click racing an undo
+        }
+        open.selected_tile = if open.selected_tile == Some(tile) {
+            None
+        } else {
+            Some(tile)
+        };
+        cx.notify();
+    }
+
+    fn deselect_tile(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.selected_tile.is_some()
+        {
+            open.selected_tile = None;
+            cx.notify();
+        }
+    }
+
+    /// Click a cell of the selected-frame preview with a tile active:
+    /// repoint that cell at the tile (`DocOp::FrameTileSet`, M1's op)
+    /// through the same `apply_doc` path as every other edit -- undo,
+    /// thumbnail recompose, and error surfacing come with it. Targets the
+    /// SELECTED frame (the transport keeps playing; its shown frame isn't
+    /// what's being edited). No-tile-selected and unchanged-cell clicks
+    /// are dropped without an op (M5's undo-stack hygiene rule).
+    fn set_tile_on_cell(&mut self, cell: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(tile) = open.selected_tile else {
+            return;
+        };
+        let frame = open.selected_frame;
+        let state = open.store.state();
+        let Some(f) = state.frames.get(frame) else {
+            return;
+        };
+        if cell >= f.map.len() || (tile as usize) >= state.tile_count {
+            return; // stale geometry/selection racing an undo
+        }
+        if f.map[cell] == tile {
+            return; // already that tile -- don't push a no-op undo entry
+        }
+        self.apply_doc(DocOp::FrameTileSet { frame, cell, tile }, cx);
+    }
+
+    /// The preview click handler's window->cell mapping: local coords
+    /// against the recorded preview bounds, then `tiles::cell_at` over
+    /// the selected frame's tile grid.
+    fn preview_cell_at(&self, position: gpui::Point<Pixels>) -> Option<usize> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let bounds = (*open.preview_bounds.borrow())?;
+        let state = open.store.state();
+        tiles::cell_at(
+            f32::from(position.x - bounds.origin.x),
+            f32::from(position.y - bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            state.w_tiles as usize,
+            state.h_tiles as usize,
+        )
+    }
+
     // ---------------------------------------------------------- clip ops
 
     /// Add a clip with ggo-ide `Msg::AddClip`'s defaults (see
@@ -671,8 +796,8 @@ impl MetaSpritePanel {
 
     /// Delete clip `i` -- ggo-ide `Msg::DeleteClip`, including its
     /// active-selection shift rule. Bounds-checked: a stale index (clip
-    /// removed by an undo between render and click) must not reach the
-    /// store's panicking `ClipSet{None}` arm.
+    /// removed by an undo between render and click) should vanish as a
+    /// no-op, not surface as the store's `ClipOutOfRange` error.
     fn delete_clip(&mut self, i: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
@@ -1066,8 +1191,12 @@ impl MetaSpritePanel {
             .into_any_element()
     }
 
-    /// The big center preview: the shown frame fit into a
-    /// [`PREVIEW_PX`] box.
+    /// The big center preview: the shown frame fit into a [`PREVIEW_PX`]
+    /// box. An invisible overlay canvas records the image's on-screen
+    /// bounds at prepaint (world_panel's `last_bounds` idiom -- gpui
+    /// mouse listeners only get window coords), and a left click with an
+    /// active tile maps through `tiles::cell_at` to a `FrameTileSet` on
+    /// the SELECTED frame.
     fn render_preview(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_preview is only called in the Ready state");
@@ -1084,9 +1213,92 @@ impl MetaSpritePanel {
         if let Some(image) = open.frames.get(shown) {
             let (w, h) = image_px_size(image);
             let (fit_w, fit_h) = playback::fit_size(w, h, PREVIEW_PX);
-            preview = preview.child(img(image.clone()).w(px(fit_w)).h(px(fit_h)));
+            let bounds_cell = open.preview_bounds.clone();
+            let overlay = gpui::canvas(
+                move |bounds, _window, _cx| {
+                    *bounds_cell.borrow_mut() = Some(bounds);
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .size_full();
+            preview = preview.child(
+                div()
+                    .relative()
+                    .w(px(fit_w))
+                    .h(px(fit_h))
+                    .child(img(image.clone()).w(px(fit_w)).h(px(fit_h)))
+                    .child(overlay)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // Take focus so Escape/undo bindings apply
+                            // (and any in-flight field edit blur-commits).
+                            window.focus(&this.focus_handle, cx);
+                            if let Some(cell) = this.preview_cell_at(event.position) {
+                                this.set_tile_on_cell(cell, cx);
+                            }
+                        }),
+                    ),
+            );
         }
         preview.into_any_element()
+    }
+
+    /// The tile-palette section: every pool tile as a thumbnail, wrap
+    /// grid, click to select (re-click to deselect), the active tile
+    /// outlined; the hw budget line rides along on the header row.
+    fn render_tiles(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_tiles is only called in the Ready state");
+        };
+        let state = open.store.state();
+        let border = cx.theme().colors().border;
+        let accent = cx.theme().colors().border_focused;
+        let meter = tiles::hw_meter_line(state, state.frames.get(open.selected_frame));
+        v_flex()
+            .flex_none()
+            .border_t_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .px_1()
+                    .pt_1()
+                    .child(
+                        Label::new("Tiles")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Label::new(SharedString::from(meter))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                div()
+                    .id("ggo-metasprite-tiles")
+                    .max_h(TILES_MAX_H)
+                    .overflow_y_scroll()
+                    .child(h_flex().flex_wrap().gap_1().p_1().children(
+                        open.pool_tiles.iter().enumerate().map(|(ix, image)| {
+                            let selected = open.selected_tile == Some(ix as u16);
+                            div()
+                                .id(("ggo-metasprite-tile", ix))
+                                .p_0p5()
+                                .border_1()
+                                .rounded_sm()
+                                .border_color(if selected { accent } else { border })
+                                .child(img(image.clone()).w(px(TILE_THUMB_PX)).h(px(TILE_THUMB_PX)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_tile(ix as u16, cx)
+                                }))
+                        }),
+                    )),
+            )
+            .into_any_element()
     }
 
     /// One field text input, in world_panel's minimal bordered box.
@@ -1324,6 +1536,7 @@ impl MetaSpritePanel {
                     .child(self.render_preview(cx))
                     .child(self.render_clips(cx)),
             )
+            .child(self.render_tiles(cx))
             .child(self.render_frame_ops(cx))
             .child(self.render_strip(cx))
             .into_any_element()
@@ -1356,6 +1569,7 @@ impl Render for MetaSpritePanel {
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
+            .on_action(cx.listener(|this, _: &DeselectTile, _window, cx| this.deselect_tile(cx)))
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
             .child(self.render_picker(cx))
@@ -1931,6 +2145,110 @@ mod tests {
                 let f1 = open.frames[1].as_bytes(0).unwrap();
                 assert!(f1.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
             }
+        });
+    }
+
+    /// Tile setting end to end (M6): the pool-tile palette composes one
+    /// pinned-byte thumbnail per tile; selection toggles (re-click and
+    /// the Escape action's path both deselect) and ignores stale
+    /// indices; a cell click with a tile active applies `FrameTileSet`
+    /// on the SELECTED frame and the recomposed frame pixels become the
+    /// assigned tile's pixels; unchanged-cell / out-of-range / no-tile
+    /// clicks don't touch the store; undo restores the prior bytes and
+    /// redo re-applies. Plus the window->cell mapping through manually
+    /// stamped preview bounds (the headless panel never paints).
+    #[gpui::test]
+    async fn test_tile_palette_and_cell_set_with_undo(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                assert_eq!(open.pool_tiles.len(), 2, "one thumbnail per pool tile");
+                let t0 = open.pool_tiles[0].as_bytes(0).unwrap();
+                assert_eq!(t0.len(), TILE_PX * TILE_PX * 4);
+                assert!(
+                    t0.chunks_exact(4).all(|p| p[3] == 0),
+                    "tile 0 (all index 0) must compose fully transparent"
+                );
+                let t1 = open.pool_tiles[1].as_bytes(0).unwrap();
+                assert!(
+                    t1.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
+                    "tile 1 (palette red) must compose opaque red in BGRA"
+                );
+                assert_eq!(open.selected_tile, None);
+            }
+
+            // Selection toggles; stale indices are ignored.
+            panel.select_tile(1, cx);
+            assert_eq!(ready(panel).selected_tile, Some(1));
+            panel.select_tile(1, cx);
+            assert_eq!(ready(panel).selected_tile, None, "re-click deselects");
+            panel.select_tile(9, cx);
+            assert_eq!(ready(panel).selected_tile, None, "stale tile index ignored");
+            panel.select_tile(1, cx);
+
+            // Guarded clicks leave the store untouched: out-of-range
+            // cell; a cell that already shows the selected tile.
+            panel.set_tile_on_cell(5, cx);
+            assert!(!ready(panel).store.dirty(), "out-of-range cell dropped");
+            panel.select_frame(1, cx); // frame 1's sole cell is already tile 1
+            panel.set_tile_on_cell(0, cx);
+            assert!(!ready(panel).store.dirty(), "same-tile click drops the op");
+
+            // The real edit: frame 0 cell 0 -> tile 1.
+            panel.select_frame(0, cx);
+            panel.set_tile_on_cell(0, cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().frames[0].map, vec![1]);
+                assert!(open.store.dirty());
+                let f0 = open.frames[0].as_bytes(0).unwrap();
+                assert!(
+                    f0.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
+                    "frame 0 recomposed to the assigned tile's red pixels"
+                );
+            }
+
+            // Escape's action body; with nothing selected, clicks stop
+            // mutating.
+            panel.deselect_tile(cx);
+            assert_eq!(ready(panel).selected_tile, None);
+            panel.set_tile_on_cell(0, cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![1]);
+
+            // Undo restores the prior composed bytes; redo re-applies.
+            panel.undo_impl(cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().frames[0].map, vec![0]);
+                assert!(!open.store.dirty(), "back to the loaded state");
+                let f0 = open.frames[0].as_bytes(0).unwrap();
+                assert!(
+                    f0.chunks_exact(4).all(|p| p[3] == 0),
+                    "undo recomposed frame 0 back to transparent"
+                );
+            }
+            panel.redo_impl(cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![1]);
+
+            // Window->cell mapping over stamped bounds: a 1x1-tile sprite
+            // maps every in-box point to cell 0 and rejects outside.
+            *ready(panel).preview_bounds.borrow_mut() = Some(gpui::bounds(
+                gpui::point(px(10.), px(20.)),
+                gpui::size(px(240.), px(240.)),
+            ));
+            assert_eq!(
+                panel.preview_cell_at(gpui::point(px(10.), px(20.))),
+                Some(0)
+            );
+            assert_eq!(
+                panel.preview_cell_at(gpui::point(px(249.), px(259.))),
+                Some(0)
+            );
+            assert_eq!(panel.preview_cell_at(gpui::point(px(9.), px(20.))), None);
+            assert_eq!(panel.preview_cell_at(gpui::point(px(250.), px(20.))), None);
         });
     }
 
