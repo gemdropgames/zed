@@ -142,18 +142,23 @@ pub fn prepare_to_close_dirty<T: 'static>(
 /// only) worktree every GGO panel resolves its project root from. A path in
 /// any other worktree yields `None` so an interceptor declines it instead of
 /// loading the same rel path out of the wrong project.
+///
+/// A non-local project (SSH remote, or a collab guest) yields `None` for the
+/// same reason: the GGO panels read their documents with `std::fs` against
+/// the worktree's `abs_path`, which on a remote project names a directory
+/// that does not exist on this machine. Declining lets the click fall through
+/// to upstream's normal open, which DOES understand remote projects -- an
+/// editor tab beats a panel stuck in an error state.
 pub fn rel_in_primary_worktree(
     workspace: &Workspace,
     path: &ProjectPath,
     cx: &App,
 ) -> Option<String> {
-    let primary = workspace
-        .project()
-        .read(cx)
-        .visible_worktrees(cx)
-        .next()?
-        .read(cx)
-        .id();
+    let project = workspace.project().read(cx);
+    if !project.is_local() {
+        return None;
+    }
+    let primary = project.visible_worktrees(cx).next()?.read(cx).id();
     (primary == path.worktree_id).then(|| path.path.as_unix_str().to_string())
 }
 

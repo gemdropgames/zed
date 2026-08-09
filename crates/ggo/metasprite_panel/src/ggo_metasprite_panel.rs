@@ -394,6 +394,19 @@ impl MetaSpritePanel {
     /// interceptor calls this from INSIDE the workspace's own update, and
     /// [`Self::refresh_root`] has to read that same workspace entity.
     pub fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Clicking the file that is ALREADY open is how you bring the panel
+        // back into focus, and upstream's semantics for that click on a tab
+        // are "activate the existing item", not "reload it". The interceptor
+        // has already revealed and focused the dock by the time we get here,
+        // so there is nothing left to do -- and doing anything would either
+        // prompt (offering a "Don't Save" the user never asked for) or drop
+        // the undo stack, selection, tile choice and transport state on the
+        // floor.
+        if let ViewerState::Ready(open) = &self.state
+            && open.rel_path == rel
+        {
+            return;
+        }
         let rel = rel.to_string();
         let proceed = ggo_common::prepare_to_close_dirty(
             self.dirty_sprite_name(),
@@ -2276,6 +2289,47 @@ mod tests {
         cx.run_until_parked();
         panel.update(cx, |panel, _cx| {
             assert_eq!(ready(panel).rel_path, "sprites/other.spr");
+        });
+    }
+
+    /// Clicking the file that is ALREADY open must be a pure focus/reveal:
+    /// no prompt (a dirty doc would otherwise be offered a "Don't Save" the
+    /// user never asked for) and no reload (which would silently drop the
+    /// undo stack). The undo assertion is the load-bearing one -- a reload
+    /// would leave the frame at its on-disk 100ms with nothing to undo.
+    #[gpui::test]
+    async fn test_open_rel_path_on_the_open_sprite_does_not_reload(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_sprite(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("sprites/hero.spr", window, cx)
+            })
+        });
+        assert!(
+            !cx.has_pending_prompt(),
+            "re-opening the open sprite must not prompt"
+        );
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let open = ready(panel);
+            assert_eq!(
+                open.store.state().frames[0].duration_ms,
+                500,
+                "the in-memory edit must survive an already-open click"
+            );
+            assert!(open.store.dirty(), "and the doc must still be dirty");
+
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().frames[0].duration_ms,
+                100,
+                "the undo stack must have survived too"
+            );
         });
     }
 

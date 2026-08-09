@@ -125,11 +125,19 @@ const EMPTY_MESSAGE: &str = "Open a world file from the project panel";
 
 /// `rel` as a world listing, or `None` when `rel` is not a world file.
 ///
-/// The filter is worldlib's own `world_files` -- under `worlds/`, ending in
-/// `.toml` -- which is what the `**/worlds/**/*.toml` glob in a GGO
-/// project's `.zed/settings.json` (see `ggo_language::PROJECT_FILE_TYPE_GLOB`)
-/// mirrors for syntax highlighting. A bare `foo.toml`, or a `.toml` outside
-/// `worlds/`, is NOT a world and must not hijack this panel.
+/// The filter is worldlib's own `world_files`: under the project's TOP-LEVEL
+/// `worlds/` (nested subdirectories included), ending in `.toml`. A bare
+/// `foo.toml`, or a `.toml` outside `worlds/`, is NOT a world and must not
+/// hijack this panel.
+///
+/// This is deliberately NARROWER than the syntax-highlighting glob a GGO
+/// project's `.zed/settings.json` uses (`**/worlds/**/*.toml`, see
+/// `ggo_language::PROJECT_FILE_TYPE_GLOB`), which also matches a `worlds/`
+/// directory nested anywhere -- `assets/worlds/deep/arena.toml` highlights as
+/// a world but does NOT route here, because worldlib resolves every world rel
+/// path against `<project root>/worlds` and could not load it. Highlighting a
+/// file we can't open is harmless; routing one is not. Both cases are pinned
+/// by tests (`ggo_language::tests` for the glob, `world_listing` below).
 fn world_listing(rel: &str) -> Option<WorldListing> {
     world_files::world_files(std::slice::from_ref(&rel.to_string()))
         .into_iter()
@@ -392,6 +400,18 @@ impl WorldPanel {
     /// interceptor calls this from INSIDE the workspace's own update, and
     /// [`Self::refresh_worlds`] has to read that same workspace entity.
     pub fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Clicking the file that is ALREADY open is how you bring the panel
+        // back into focus, and upstream's semantics for that click on a tab
+        // are "activate the existing item", not "reload it". The interceptor
+        // has already revealed and focused the dock by the time we get here,
+        // so there is nothing left to do -- and doing anything would either
+        // prompt (offering a "Don't Save" the user never asked for) or drop
+        // the undo stack, selection and camera on the floor.
+        if let ViewerState::Ready(open) = &self.state
+            && open.listing.rel_path == rel
+        {
+            return;
+        }
         let rel = rel.to_string();
         let proceed = ggo_common::prepare_to_close_dirty(
             self.dirty_world_name(),
@@ -2403,9 +2423,14 @@ mod tests {
     // ------------------------------------------ explorer-driven routing
 
     /// The predicate that decides what the panel claims from the file
-    /// explorer. It is worldlib's `worlds/**/*.toml` rule (which the
-    /// project's `.zed/settings.json` glob mirrors), NOT a bare `.toml`
-    /// test: a stray `Cargo.toml` click must still open an editor.
+    /// explorer: worldlib's top-level `worlds/**/*.toml` rule, NOT a bare
+    /// `.toml` test -- a stray `Cargo.toml` click must still open an editor.
+    ///
+    /// The last case pins the DELIBERATE divergence from
+    /// `ggo_language::PROJECT_FILE_TYPE_GLOB` (`**/worlds/**/*.toml`, which
+    /// `ggo_language::tests` pins as matching `assets/worlds/deep/nested/
+    /// arena.toml`): that file highlights as a world but must not route
+    /// here, because worldlib could not load it from `<root>/worlds`.
     #[gpui::test]
     fn test_world_predicate_matches_only_world_files(_cx: &mut gpui::App) {
         assert_eq!(
@@ -2415,7 +2440,7 @@ mod tests {
         assert_eq!(
             world_listing("worlds/nested/arena.toml").map(|l| l.stem),
             Some("worlds/nested/arena".to_string()),
-            "nested worlds count, matching the `worlds/**/*.toml` glob"
+            "nested worlds under the top-level worlds/ dir count"
         );
         assert!(
             world_listing("Cargo.toml").is_none(),
@@ -2426,6 +2451,11 @@ mod tests {
             "only files UNDER worlds/ count"
         );
         assert!(world_listing("worlds/readme.md").is_none());
+        assert!(
+            world_listing("assets/worlds/deep/nested/arena.toml").is_none(),
+            "the highlighting glob is broader than the routing rule: a nested \
+             worlds/ dir highlights but is not loadable, so it must not route"
+        );
     }
 
     /// A fake-fs project with one visible worktree holding the same file
@@ -2576,6 +2606,53 @@ mod tests {
                 panic!("expected Ready after the switch");
             };
             assert_eq!(open.listing.rel_path, "worlds/sub.toml");
+        });
+    }
+
+    /// Clicking the file that is ALREADY open must be a pure focus/reveal:
+    /// no prompt (a dirty doc would otherwise be offered a "Don't Save" the
+    /// user never asked for) and no reload (which would silently drop the
+    /// undo stack, selection and camera). The undo assertion is the
+    /// load-bearing one -- a reload would leave the entity at its on-disk
+    /// `[4,4]` with nothing to undo.
+    #[gpui::test]
+    async fn test_open_rel_path_on_the_open_world_does_not_reload(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_world(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("worlds/test.toml", window, cx)
+            })
+        });
+        assert!(
+            !cx.has_pending_prompt(),
+            "re-opening the open world must not prompt"
+        );
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                inspector::entity_pos(&open.store.state(), 0),
+                Some([50.0, 60.0]),
+                "the in-memory edit must survive an already-open click"
+            );
+            assert!(open.store.state().dirty, "and the doc must still be dirty");
+
+            panel.undo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                inspector::entity_pos(&open.store.state(), 0),
+                Some([4.0, 4.0]),
+                "the undo stack must have survived too"
+            );
         });
     }
 

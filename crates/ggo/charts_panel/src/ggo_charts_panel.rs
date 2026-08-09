@@ -725,7 +725,7 @@ mod tests {
     /// `loader::list_runs` directly. Calls `refresh_runs` directly rather
     /// than through `set_active` (which needs a live `Window`) -- the
     /// same shortcut `ggo_world_panel`'s `ready_panel` test helper takes
-    /// with `refresh_worlds`/`select_world`.
+    /// with `refresh_worlds`/`load_rel_path`.
     #[gpui::test]
     async fn test_refresh_runs_loads_fixture_runs_into_ready(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
