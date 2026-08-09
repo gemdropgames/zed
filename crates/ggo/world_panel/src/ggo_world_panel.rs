@@ -1,14 +1,16 @@
-//! GGO World panel: a dock panel that lists the project's `worlds/**.toml`
-//! files, renders the selected world with real pixels (composed sprite/
-//! map images via `ggo-worldlib`), and edits it: click select, drag
-//! placement (live `WorldOp` moves coalesced per gesture), a schema-driven
-//! inspector, undo/redo, and save.
+//! GGO World panel: a dock panel that renders the open `worlds/**.toml`
+//! with real pixels (composed sprite/map images via `ggo-worldlib`) and
+//! edits it: click select, drag placement (live `WorldOp` moves coalesced
+//! per gesture), a schema-driven inspector, undo/redo, and save. Which
+//! world is open is driven ENTIRELY by the file explorer (F4 X1): clicking
+//! a `worlds/**/*.toml` there routes here through
+//! [`intercept_world_open`]; the panel has no picker of its own.
 //!
 //! Split: `loader` owns everything that runs off the UI thread (world
 //! read, instance resolution, asset composition, manifest schemas);
 //! `canvas` owns camera math, drag math and painting; `inspector` owns the
 //! pure field-target/commit logic; this module owns the panel entity, the
-//! picker, the state machine, and all gpui wiring.
+//! state machine, and all gpui wiring.
 //!
 //! Editing semantics are ported from ggo-ide's `pages/world/mod.rs`:
 //! primary-down hit-tests the CURRENT draw list in world coords and both
@@ -51,7 +53,8 @@ use ggo_worldlib::render::{
 use ggo_worldlib::schemas::{ComponentSchema, defaults_for};
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
 use ggo_worldlib::world_file::write_world;
-use ggo_worldlib::world_files::WorldListing;
+use ggo_worldlib::world_files::{self, WorldListing};
+use project::ProjectPath;
 
 actions!(
     ggo_world,
@@ -95,6 +98,11 @@ pub fn init(cx: &mut App) {
     cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
         .detach();
 
+    // Explorer-driven routing: clicking a `worlds/**/*.toml` in the project
+    // panel loads it HERE instead of opening a TOML editor tab. This is the
+    // panel's only way in -- there is no in-panel world picker.
+    workspace::register_path_open_interceptor(cx, intercept_world_open);
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -109,6 +117,47 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// Empty-state text. The panel has no picker of its own by design (F4 X1):
+/// worlds arrive by clicking a `worlds/**/*.toml` in the project panel.
+const EMPTY_MESSAGE: &str = "Open a world file from the project panel";
+
+/// `rel` as a world listing, or `None` when `rel` is not a world file.
+///
+/// The filter is worldlib's own `world_files` -- under `worlds/`, ending in
+/// `.toml` -- which is what the `**/worlds/**/*.toml` glob in a GGO
+/// project's `.zed/settings.json` (see `ggo_language::PROJECT_FILE_TYPE_GLOB`)
+/// mirrors for syntax highlighting. A bare `foo.toml`, or a `.toml` outside
+/// `worlds/`, is NOT a world and must not hijack this panel.
+fn world_listing(rel: &str) -> Option<WorldListing> {
+    world_files::world_files(std::slice::from_ref(&rel.to_string()))
+        .into_iter()
+        .next()
+}
+
+/// `workspace::PathOpenInterceptor` for `worlds/**/*.toml`: claim the path,
+/// open the panel, and load it. Declines (so the normal open path runs) for
+/// any other file, for a path outside the primary worktree, and when no
+/// panel is docked.
+fn intercept_world_open(
+    workspace: &mut Workspace,
+    path: &ProjectPath,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return false;
+    };
+    if world_listing(&rel).is_none() {
+        return false;
+    }
+    ggo_common::open_in_panel(
+        workspace,
+        window,
+        cx,
+        move |panel: &mut WorldPanel, window, cx| panel.open_rel_path(&rel, window, cx),
+    )
 }
 
 fn bind_panel_keys(cx: &mut App) {
@@ -311,6 +360,14 @@ impl WorldPanel {
     /// Re-discover the project root (the workspace's first visible
     /// worktree) and re-enumerate its worlds. Runs on every panel
     /// activation -- the walk only touches `<root>/worlds`, so it's cheap.
+    ///
+    /// The listing is no longer a picker feed (F4 X1 removed the picker);
+    /// it survives because `AddInstance` needs the set of OTHER worlds this
+    /// one may instance -- see [`Self::instance_candidates`].
+    ///
+    /// MUST NOT run while the workspace itself is mid-update (it reads the
+    /// workspace entity) -- see the deferral in `set_active` and in
+    /// [`Self::open_rel_path`].
     fn refresh_worlds(&mut self, cx: &mut Context<Self>) {
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
@@ -325,10 +382,40 @@ impl WorldPanel {
         cx.notify();
     }
 
-    /// Kick off the off-thread load of `self.worlds[ix]`. A stale result
-    /// (superseded by a later selection) is dropped by generation check.
-    fn select_world(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(listing) = self.worlds.get(ix).cloned() else {
+    /// Load the project-relative world path `rel`, prompting FIRST if the
+    /// open world has unsaved edits -- Cancel leaves the current document
+    /// loaded and dirty and abandons the open. This is the panel's entry
+    /// point from the file explorer ([`intercept_world_open`]); there is no
+    /// in-panel picker.
+    ///
+    /// Everything after the guard runs on a spawned task, deliberately: the
+    /// interceptor calls this from INSIDE the workspace's own update, and
+    /// [`Self::refresh_worlds`] has to read that same workspace entity.
+    pub fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let rel = rel.to_string();
+        let proceed = ggo_common::prepare_to_close_dirty(
+            self.dirty_world_name(),
+            window,
+            cx,
+            Self::save_for_close,
+        );
+        cx.spawn(async move |this, cx| {
+            if !proceed.await {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.refresh_worlds(cx);
+                this.load_rel_path(&rel, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Kick off the off-thread load of `rel`. A stale result (superseded by
+    /// a later open) is dropped by generation check.
+    fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
+        let Some(listing) = world_listing(rel) else {
             return;
         };
         let Some(root) = self.project_root.clone() else {
@@ -537,6 +624,20 @@ impl WorldPanel {
             Err(e) => open.save_error = Some(e.to_string()),
         }
         cx.notify();
+    }
+
+    /// Save on behalf of a "Save" answer to the unsaved-edits prompt,
+    /// reporting whether the write actually landed (a failed write must not
+    /// let the caller discard the document). Shared by
+    /// [`Panel::prepare_to_close`] and [`Self::open_rel_path`].
+    fn save_for_close(&mut self, cx: &mut Context<Self>) -> bool {
+        self.save_impl(cx);
+        match &self.state {
+            ViewerState::Ready(open) => open.save_error.is_none(),
+            // The panel can't have gone un-Ready between the prompt and
+            // here, but if it somehow did there is nothing left to lose.
+            _ => true,
+        }
     }
 
     /// The open world's display path when it has unsaved edits, else
@@ -777,34 +878,6 @@ impl WorldPanel {
     }
 
     // ------------------------------------------------------------- render
-
-    fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_stem = match &self.state {
-            ViewerState::Ready(open) => Some(open.listing.stem.clone()),
-            ViewerState::Loading { stem } => Some(stem.clone()),
-            _ => None,
-        };
-        h_flex()
-            .flex_wrap()
-            .gap_1()
-            .p_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .when(self.worlds.is_empty(), |this| {
-                let message = if self.project_root.is_some() {
-                    "No worlds found"
-                } else {
-                    "No project open"
-                };
-                this.child(Label::new(message).color(Color::Muted))
-            })
-            .children(self.worlds.iter().enumerate().map(|(ix, listing)| {
-                let selected = selected_stem.as_deref() == Some(listing.stem.as_str());
-                Button::new(("ggo-world", ix), SharedString::from(listing.stem.clone()))
-                    .toggle_state(selected)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_world(ix, cx)))
-            }))
-    }
 
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
@@ -1382,7 +1455,7 @@ impl Render for WorldPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inspector(window, cx);
         let body = match &self.state {
-            ViewerState::Empty => self.render_message("Select a world".to_string(), cx),
+            ViewerState::Empty => self.render_message(EMPTY_MESSAGE.to_string(), cx),
             ViewerState::Loading { stem } => self.render_message(format!("Loading {stem}…"), cx),
             ViewerState::Error(e) => self.render_message(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(window, cx),
@@ -1399,7 +1472,6 @@ impl Render for WorldPanel {
             )
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
-            .child(self.render_picker(cx))
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -1466,15 +1538,12 @@ impl Panel for WorldPanel {
     /// the same Save/Don't-Save/Cancel warning a dirty buffer gets; a
     /// failed write cancels the close rather than dropping the edits.
     fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
-        ggo_common::prepare_to_close_dirty(self.dirty_world_name(), window, cx, |this, cx| {
-            this.save_impl(cx);
-            match &this.state {
-                ViewerState::Ready(open) => open.save_error.is_none(),
-                // The panel can't have gone un-Ready between the prompt and
-                // here, but if it somehow did there is nothing left to lose.
-                _ => true,
-            }
-        })
+        ggo_common::prepare_to_close_dirty(
+            self.dirty_world_name(),
+            window,
+            cx,
+            Self::save_for_close,
+        )
     }
 
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1499,7 +1568,7 @@ mod tests {
         WorldEntity, WorldFile, WorldInstance, read_world, write_world,
     };
     use gpui::TestAppContext;
-    use project::{FakeFs, Project};
+    use project::{FakeFs, Project, WorktreeId};
     use serde_json::json;
     use workspace::dock::DockPosition;
     use workspace::{AppState, MultiWorkspace};
@@ -1620,12 +1689,7 @@ mod tests {
         });
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            let ix = panel
-                .worlds
-                .iter()
-                .position(|w| w.stem == "worlds/test")
-                .unwrap();
-            panel.select_world(ix, cx);
+            panel.load_rel_path("worlds/test.toml", cx);
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
@@ -1659,12 +1723,7 @@ mod tests {
             panel.refresh_worlds(cx);
             let stems: Vec<&str> = panel.worlds.iter().map(|w| w.stem.as_str()).collect();
             assert_eq!(stems, ["worlds/sub", "worlds/test"]);
-            let ix = panel
-                .worlds
-                .iter()
-                .position(|w| w.stem == "worlds/test")
-                .unwrap();
-            panel.select_world(ix, cx);
+            panel.load_rel_path("worlds/test.toml", cx);
             assert!(matches!(panel.state, ViewerState::Loading { .. }));
         });
 
@@ -1992,12 +2051,7 @@ mod tests {
 
         let panel = ready_panel(cx, root).await;
         panel.update(cx, |panel, cx| {
-            let ix = panel
-                .worlds
-                .iter()
-                .position(|w| w.stem == "worlds/a")
-                .unwrap();
-            panel.select_world(ix, cx);
+            panel.load_rel_path("worlds/a.toml", cx);
         });
         cx.executor().run_until_parked();
 
@@ -2326,12 +2380,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
             panel.refresh_worlds(cx);
-            let ix = panel
-                .worlds
-                .iter()
-                .position(|w| w.stem == "worlds/test")
-                .unwrap();
-            panel.select_world(ix, cx);
+            panel.load_rel_path("worlds/test.toml", cx);
         });
         cx.run_until_parked();
         dirty_the_world(&panel, cx);
@@ -2348,6 +2397,227 @@ mod tests {
         assert!(
             !close.await.unwrap(),
             "Cancel in the panel guard must cancel the whole close"
+        );
+    }
+
+    // ------------------------------------------ explorer-driven routing
+
+    /// The predicate that decides what the panel claims from the file
+    /// explorer. It is worldlib's `worlds/**/*.toml` rule (which the
+    /// project's `.zed/settings.json` glob mirrors), NOT a bare `.toml`
+    /// test: a stray `Cargo.toml` click must still open an editor.
+    #[gpui::test]
+    fn test_world_predicate_matches_only_world_files(_cx: &mut gpui::App) {
+        assert_eq!(
+            world_listing("worlds/test.toml").map(|l| l.stem),
+            Some("worlds/test".to_string())
+        );
+        assert_eq!(
+            world_listing("worlds/nested/arena.toml").map(|l| l.stem),
+            Some("worlds/nested/arena".to_string()),
+            "nested worlds count, matching the `worlds/**/*.toml` glob"
+        );
+        assert!(
+            world_listing("Cargo.toml").is_none(),
+            "a bare .toml is not a world"
+        );
+        assert!(
+            world_listing("assets/worlds.toml").is_none(),
+            "only files UNDER worlds/ count"
+        );
+        assert!(world_listing("worlds/readme.md").is_none());
+    }
+
+    /// A fake-fs project with one visible worktree holding the same file
+    /// names the real-fs `root` fixture does: the interceptor only needs a
+    /// worktree id and a rel path, while the panel reads the actual world
+    /// TOML through `std::fs` from `root` (`root_override`).
+    async fn routed_project(
+        cx: &mut TestAppContext,
+        root: &std::path::Path,
+        run_init: bool,
+    ) -> Entity<Project> {
+        write_fixture(root);
+        cx.update(|cx| {
+            AppState::test(cx);
+            if run_init {
+                init(cx);
+            }
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/proj",
+            json!({
+                "worlds": { "test.toml": "", "sub.toml": "" },
+                "Cargo.toml": "",
+            }),
+        )
+        .await;
+        Project::test(fs, ["/proj".as_ref()], cx).await
+    }
+
+    fn project_path(worktree_id: WorktreeId, rel: &str) -> ProjectPath {
+        ProjectPath {
+            worktree_id,
+            path: path::rel_path::rel_path(rel).into_arc(),
+        }
+    }
+
+    fn worktree_id(project: &Entity<Project>, cx: &mut gpui::VisualTestContext) -> WorktreeId {
+        project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("one visible worktree")
+                .read(cx)
+                .id()
+        })
+    }
+
+    /// With nothing registered, `intercept_path_open` claims nothing --
+    /// i.e. the upstream open path is completely unchanged, world files
+    /// included. `init` is deliberately NOT run here.
+    #[gpui::test]
+    async fn test_empty_interceptor_registry_claims_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), false).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "worlds/test.toml"),
+                window,
+                cx,
+            )
+        });
+        assert!(
+            !claimed,
+            "an empty registry must never claim a path -- upstream behaviour byte for byte"
+        );
+    }
+
+    /// The registered world predicate claims `worlds/**/*.toml` (so the
+    /// project panel opens NO pane item for it), opens the dock, and loads
+    /// the world -- while a root-level `Cargo.toml` is declined.
+    #[gpui::test]
+    async fn test_world_click_routes_into_the_panel_and_is_claimed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+        let root = dir.path().to_path_buf();
+        panel.update(cx, |panel, _| panel.root_override = Some(root));
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "worlds/test.toml"),
+                window,
+                cx,
+            )
+        });
+        assert!(
+            claimed,
+            "a world file must be claimed, suppressing the pane item"
+        );
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready after routing");
+            };
+            assert_eq!(open.listing.rel_path, "worlds/test.toml");
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.right_dock().read(cx).is_open(),
+                "routing must open the panel's dock even if it was closed"
+            );
+        });
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(&project_path(worktree_id, "Cargo.toml"), window, cx)
+        });
+        assert!(
+            !claimed,
+            "a .toml outside worlds/ must still open in the editor"
+        );
+    }
+
+    /// A clean panel switches worlds without a prompt.
+    #[gpui::test]
+    async fn test_open_rel_path_switches_a_clean_panel_directly(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("worlds/sub.toml", window, cx)
+            })
+        });
+        assert!(
+            !cx.has_pending_prompt(),
+            "a clean panel must switch without asking"
+        );
+        cx.run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready after the switch");
+            };
+            assert_eq!(open.listing.rel_path, "worlds/sub.toml");
+        });
+    }
+
+    /// The data-loss guard: a file-tree click while the open world has
+    /// unsaved edits must PROMPT, and Cancel must abort the open -- the
+    /// previously loaded document stays loaded, stays dirty, and stays
+    /// unwritten.
+    #[gpui::test]
+    async fn test_open_rel_path_cancel_keeps_the_dirty_document(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_world(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("worlds/sub.toml", window, cx)
+            })
+        });
+        assert_eq!(
+            cx.pending_prompt().map(|(msg, _)| msg),
+            Some("worlds/test.toml contains unsaved edits. Do you want to save it?".to_string()),
+            "switching away from a dirty world must prompt first"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("Cancel must leave the panel Ready");
+            };
+            assert_eq!(
+                open.listing.rel_path, "worlds/test.toml",
+                "Cancel must abort the open and leave the current world loaded"
+            );
+            assert!(open.store.state().dirty, "and leave its edits in place");
+        });
+        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([4, 4]),
+            "Cancel must not have written the file"
         );
     }
 }

@@ -7547,6 +7547,8 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "image",
+ "project",
+ "workspace",
 ]
 
 [[package]]
@@ -7604,7 +7606,9 @@ dependencies = [
  "ggo_common",
  "gpui",
  "keymap_editor",
+ "path",
  "project",
+ "serde_json",
  "tempfile",
  "ui",
  "workspace",
@@ -7620,6 +7624,7 @@ dependencies = [
  "ggo_common",
  "gpui",
  "keymap_editor",
+ "path",
  "project",
  "serde_json",
  "tempfile",

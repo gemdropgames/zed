@@ -890,12 +890,14 @@ impl ProjectPanel {
                             let entry_id = entry.id;
                             let is_via_ssh = project.read(cx).is_via_remote_server();
 
+                            // GGO: fork-local dock panels (sprite/tileset/world) own their
+                            // own file types; a claimed path loads into its panel and gets
+                            // no pane item. Empty registry upstream => never claimed.
+                            let ggo_project_path = ProjectPath { worktree_id, path: file_path.clone() };
+                            if !workspace.intercept_path_open(&ggo_project_path, window, cx) {
                             workspace
                                 .open_path_preview(
-                                    ProjectPath {
-                                        worktree_id,
-                                        path: file_path.clone(),
-                                    },
+                                    ggo_project_path,
                                     None,
                                     focus_opened_item,
                                     allow_preview,
@@ -919,6 +921,7 @@ impl ProjectPanel {
                                         _ => None,
                                     }
                                 });
+                            } // GGO
 
                             if let Some(project_panel) = project_panel.upgrade() {
                                 // Always select and mark the entry, regardless of whether it is opened or not.
@@ -942,17 +945,23 @@ impl ProjectPanel {
                 } => {
                     if let Some(worktree) = project.read(cx).worktree_for_entry(entry_id, cx)
                         && let Some(entry) = worktree.read(cx).entry_for_id(entry_id) {
+                            // GGO: same claim check as `OpenedEntry` above -- splitting a
+                            // panel-owned file into a new pane is no more meaningful than
+                            // opening it in the current one.
+                            let ggo_project_path = ProjectPath {
+                                worktree_id: worktree.read(cx).id(),
+                                path: entry.path.clone(),
+                            };
+                            if !workspace.intercept_path_open(&ggo_project_path, window, cx) {
                             workspace
                                 .split_path_preview(
-                                    ProjectPath {
-                                        worktree_id: worktree.read(cx).id(),
-                                        path: entry.path.clone(),
-                                    },
+                                    ggo_project_path,
                                     allow_preview,
                                     split_direction,
                                     window, cx,
                                 )
                                 .detach_and_log_err(cx);
+                            } // GGO
                         }
                 }
 

@@ -1,16 +1,12 @@
-//! Off-thread sprite loading: enumerate `.spr` files and open one into a
-//! [`SpriteState`] plus per-frame composed [`RenderImage`]s -- the
-//! metasprite-panel analog of `ggo_world_panel::loader` (same one-shot
-//! background pass; the panel guards staleness with a load-generation
-//! counter).
+//! Off-thread sprite loading: open one `.spr` into a [`SpriteState`] plus
+//! per-frame composed [`RenderImage`]s -- the metasprite-panel analog of
+//! `ggo_world_panel::loader` (same one-shot background pass; the panel
+//! guards staleness with a load-generation counter).
 //!
-//! Enumeration is worldlib's own `sprites::io::list_sprites` -- the exact
-//! walk ggo-ide's asset rail uses for its sprite listing
-//! (`pages/assets/sprite.rs` -> `io::list_sprites`): every decode-valid
-//! `.spr` under the project root, case-insensitive extension, dotfiles +
-//! `target`/`node_modules`/`.git`/`dist` skipped, depth-capped, sorted
-//! forward-slash rel paths. Nothing to port -- the semantics live in the
-//! shared crate.
+//! There is no enumeration here any more: F4 X1 replaced the in-panel
+//! picker with file-explorer routing, so the panel is handed one rel path
+//! at a time and never lists the project's sprites (worldlib still owns
+//! `sprites::io::list_sprites` for callers that do).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -43,11 +39,6 @@ pub struct LoadedSprite {
     /// wholesale via [`compose_pool_tiles`] after every doc mutation
     /// (pixel writes, dedup fold-back on save, undo across either).
     pub pool_tiles: Vec<Arc<RenderImage>>,
-}
-
-/// Every `.spr` under `root`, sorted rel paths -- the picker's feed.
-pub fn list_sprites(root: &Path) -> Vec<String> {
-    io::list_sprites(root)
 }
 
 /// Compose every frame of `state` into a BGRA [`RenderImage`] (no LCD

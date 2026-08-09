@@ -26,6 +26,7 @@ ggo_common.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

@@ -14,3 +14,5 @@ path = "src/ggo_common.rs"
 [dependencies]
 gpui.workspace = true
 image.workspace = true
+project.workspace = true
+workspace.workspace = true

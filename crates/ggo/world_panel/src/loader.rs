@@ -41,7 +41,8 @@ pub struct LoadedWorld {
 
 /// Recursively collect the project-relative paths (forward-slash
 /// separated) of every file under `<root>/worlds`, sorted, then filter
-/// through `world_files::world_files` -- the panel's picker feed.
+/// through `world_files::world_files`. Feeds the panel's `AddInstance`
+/// candidate set (F4 X1 removed the picker this also used to feed).
 pub fn list_worlds(root: &Path) -> Vec<WorldListing> {
     let mut rels = Vec::new();
     walk_files(&root.join("worlds"), &PathBuf::from("worlds"), &mut rels);

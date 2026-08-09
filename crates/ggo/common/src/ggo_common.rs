@@ -2,17 +2,23 @@
 //! bridge (gpui's `RenderImage` frames are BGRA, see `gpui/src/assets.rs`'s
 //! "A cached and processed image, in BGRA format"; worldlib composes
 //! straight-alpha RGBA, so only a channel swap is needed, no alpha
-//! unpremultiply), and the unsaved-document close guard shared by the
-//! world and metasprite panels. Deliberately depends on only `gpui` and
-//! `image` -- no worldlib and no `workspace` dependency (the latter would
-//! be a cycle: `workspace` is what calls the guard) -- so any GGO panel
-//! can use it without pulling in world-doc types.
+//! unpremultiply), the unsaved-document close guard shared by the world and
+//! metasprite panels, and the file-explorer routing glue every panel's
+//! `PathOpenInterceptor` needs. Deliberately depends on no worldlib, so any
+//! GGO panel can use it without pulling in world-doc types. It DOES depend
+//! on `workspace` (the routing helpers below take a `Workspace`); that is
+//! not a cycle -- `workspace` knows nothing about this crate, it only
+//! exposes the `Panel::prepare_to_close` and `PathOpenInterceptor`
+//! extension points these helpers plug into.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{Context, PromptLevel, RenderImage, Task, Window};
+use gpui::{App, Context, PromptLevel, RenderImage, Task, Window};
 use image::Frame;
+use project::ProjectPath;
+use workspace::Workspace;
+use workspace::dock::Panel;
 
 /// In-place RGBA8 -> BGRA8 (straight alpha in, straight alpha out --
 /// gpui's own non-SVG decode paths do exactly this `swap(0, 2)`, see
@@ -127,6 +133,47 @@ pub fn prepare_to_close_dirty<T: 'static>(
             CloseChoice::Cancel => false,
         },
     )
+}
+
+// -------------------------------------------------- explorer-driven routing
+
+/// The project-relative, `/`-separated path `path` names -- but only when it
+/// lives in the workspace's FIRST visible worktree, which is the one (and
+/// only) worktree every GGO panel resolves its project root from. A path in
+/// any other worktree yields `None` so an interceptor declines it instead of
+/// loading the same rel path out of the wrong project.
+pub fn rel_in_primary_worktree(
+    workspace: &Workspace,
+    path: &ProjectPath,
+    cx: &App,
+) -> Option<String> {
+    let primary = workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()?
+        .read(cx)
+        .id();
+    (primary == path.worktree_id).then(|| path.path.as_unix_str().to_string())
+}
+
+/// Reveal + focus panel `P` and run `open` on it -- the body every GGO
+/// `PathOpenInterceptor` ends with. Returns `false` (i.e. "not claimed, open
+/// it the normal way") when no `P` is docked in this workspace, so a missing
+/// panel degrades to upstream's editor rather than swallowing the click.
+pub fn open_in_panel<P: Panel>(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    open: impl FnOnce(&mut P, &mut Window, &mut Context<P>),
+) -> bool {
+    let Some(panel) = workspace.focus_panel::<P>(window, cx) else {
+        return false;
+    };
+    // A zoomed center item would otherwise hide the dock we just focused.
+    workspace.reveal_panel::<P>(window, cx);
+    panel.update(cx, |panel, cx| open(panel, window, cx));
+    true
 }
 
 #[cfg(test)]

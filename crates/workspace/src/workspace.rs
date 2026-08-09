@@ -965,6 +965,50 @@ pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
     cx.default_global::<ProjectItemRegistry>().register::<I>();
 }
 
+// GGO: fork-local open interceptors. A registered fn may claim a project
+// path -- e.g. route a `.spr` into the metasprite dock panel -- and returns
+// `true` to mean "handled, open no pane item for this path". Nothing
+// upstream registers one, so with an empty registry every call site behaves
+// exactly as it did before. `register_project_item` above cannot express
+// this: `Item::for_project_item` returns `Self`, not `Option<Self>`, so the
+// registry is structurally committed to producing an item.
+pub type PathOpenInterceptor =
+    fn(&mut Workspace, &ProjectPath, &mut Window, &mut Context<Workspace>) -> bool;
+
+#[derive(Default)]
+struct PathOpenInterceptors(Vec<PathOpenInterceptor>);
+
+impl Global for PathOpenInterceptors {}
+
+/// Registers a [`PathOpenInterceptor`] for the app. GGO.
+pub fn register_path_open_interceptor(cx: &mut App, interceptor: PathOpenInterceptor) {
+    cx.default_global::<PathOpenInterceptors>()
+        .0
+        .push(interceptor);
+}
+
+impl Workspace {
+    /// Offers `path` to every registered [`PathOpenInterceptor`], returning
+    /// `true` as soon as one claims it. `false` (always, with an empty
+    /// registry) means "open it the normal way". GGO.
+    pub fn intercept_path_open(
+        &mut self,
+        path: &ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Copy out first: the interceptors take `&mut self`, which cannot be
+        // held across a borrow of the global.
+        let interceptors = match cx.try_global::<PathOpenInterceptors>() {
+            Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+            _ => return false,
+        };
+        interceptors
+            .iter()
+            .any(|intercept| intercept(self, path, window, cx))
+    }
+}
+
 #[derive(Default)]
 pub struct FollowableViewRegistry(TypeIdHashMap<FollowableViewDescriptor>);
 

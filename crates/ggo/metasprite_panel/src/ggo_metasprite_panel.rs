@@ -1,4 +1,4 @@
-//! GGO MetaSprite panel (F2 tasks M4-M6): sprite picker, frame strip,
+//! GGO MetaSprite panel (F2 tasks M4-M6): frame strip,
 //! playback preview, animation EDITING -- clip CRUD, frame ops,
 //! undo/redo/save over worldlib's `SpriteDocStore` -- and per-cell tile
 //! assignment from a pool-tile palette, with the hardware budget line.
@@ -6,7 +6,7 @@
 //! keybinding-reload observer, off-thread loading with a load-generation
 //! guard, blur/Enter-committed single-line editors -- with the
 //! sprite-specific pieces split out: `loader` owns everything off the UI
-//! thread (`.spr` enumeration + open + per-frame/per-tile compose),
+//! thread (`.spr` open + per-frame/per-tile compose),
 //! `playback` owns the pure range/loop/offset/fit math, `edits` owns the
 //! pure edit rules (new-clip defaults, range validation, duration
 //! parsing, post-op selection bookkeeping), `tiles` owns the preview
@@ -17,6 +17,10 @@
 //! rejects out-of-range indices with a `DocError` these days (worldlib
 //! DocOp hardening, ggo PR #73) rather than panicking, but a stale-index
 //! click is a UI race to swallow silently, not an error to surface.
+//!
+//! Which sprite is open is driven ENTIRELY by the file explorer (F4 X1):
+//! clicking a `.spr` there routes here through [`intercept_sprite_open`];
+//! the panel has no picker of its own.
 
 mod edits;
 mod loader;
@@ -35,6 +39,7 @@ use gpui::{
     IntoElement, KeyBinding, KeyContext, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Render, RenderImage, Styled, Subscription, Task, WeakEntity, Window, actions, div, img, px,
 };
+use project::ProjectPath;
 use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState};
 use workspace::Workspace;
@@ -113,6 +118,11 @@ pub fn init(cx: &mut App) {
     cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
         .detach();
 
+    // Explorer-driven routing: clicking a `.spr` in the project panel loads
+    // it HERE instead of opening a (binary, unreadable) editor tab. This is
+    // the panel's only way in -- there is no in-panel file picker.
+    workspace::register_path_open_interceptor(cx, intercept_sprite_open);
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -127,6 +137,41 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// The sprite extension this panel claims from the file explorer.
+const SPRITE_EXT: &str = "spr";
+
+/// Empty-state text. The panel has no picker of its own by design (F4 X1):
+/// sprites arrive by clicking a `.spr` in the project panel.
+const EMPTY_MESSAGE: &str = "Open a .spr file from the project panel";
+
+/// `workspace::PathOpenInterceptor` for `*.spr`: claim the path, open the
+/// panel, and load it. Declines (so the normal open path runs) for any other
+/// file, for a path outside the primary worktree, and when no panel is
+/// docked.
+fn intercept_sprite_open(
+    workspace: &mut Workspace,
+    path: &ProjectPath,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    if !path
+        .path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(SPRITE_EXT))
+    {
+        return false;
+    }
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return false;
+    };
+    ggo_common::open_in_panel(
+        workspace,
+        window,
+        cx,
+        move |panel: &mut MetaSpritePanel, window, cx| panel.open_rel_path(&rel, window, cx),
+    )
 }
 
 fn bind_panel_keys(cx: &mut App) {
@@ -306,8 +351,6 @@ pub struct MetaSpritePanel {
     /// Test hook: bypass workspace worktree discovery.
     root_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
-    /// Sorted `.spr` rel paths under the project root -- the picker feed.
-    sprites: Vec<String>,
     state: ViewerState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
@@ -321,7 +364,6 @@ impl MetaSpritePanel {
             workspace,
             root_override: None,
             project_root: None,
-            sprites: Vec::new(),
             state: ViewerState::Empty,
             load_generation: 0,
             _load_task: None,
@@ -329,28 +371,53 @@ impl MetaSpritePanel {
     }
 
     /// Re-discover the project root (the workspace's first visible
-    /// worktree) and re-enumerate its sprites. Runs on every panel
-    /// activation -- same discovery as `ggo_world_panel::refresh_worlds`.
-    fn refresh_sprites(&mut self, cx: &mut Context<Self>) {
+    /// worktree). MUST NOT run while the workspace itself is mid-update
+    /// (it reads the workspace entity) -- see the deferral in `set_active`
+    /// and in [`Self::open_rel_path`].
+    fn refresh_root(&mut self, cx: &mut Context<Self>) {
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
             let project = workspace.read(cx).project().clone();
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
-        self.sprites = match &self.project_root {
-            Some(root) => loader::list_sprites(root),
-            None => Vec::new(),
-        };
         cx.notify();
     }
 
-    /// Kick off the off-thread load of `self.sprites[ix]`. A stale result
-    /// (superseded by a later selection) is dropped by generation check.
-    fn select_sprite(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(rel) = self.sprites.get(ix).cloned() else {
-            return;
-        };
+    /// Load the project-relative `.spr` path `rel`, prompting FIRST if the
+    /// open sprite has unsaved edits -- Cancel leaves the current document
+    /// loaded and dirty and abandons the open. This is the panel's entry
+    /// point from the file explorer ([`intercept_sprite_open`]); there is no
+    /// in-panel picker.
+    ///
+    /// Everything after the guard runs on a spawned task, deliberately: the
+    /// interceptor calls this from INSIDE the workspace's own update, and
+    /// [`Self::refresh_root`] has to read that same workspace entity.
+    pub fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let rel = rel.to_string();
+        let proceed = ggo_common::prepare_to_close_dirty(
+            self.dirty_sprite_name(),
+            window,
+            cx,
+            Self::save_for_close,
+        );
+        cx.spawn(async move |this, cx| {
+            if !proceed.await {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.refresh_root(cx);
+                this.load_rel_path(&rel, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Kick off the off-thread load of `rel`. A stale result (superseded by
+    /// a later open) is dropped by generation check.
+    fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
+        let rel = rel.to_string();
         let Some(root) = self.project_root.clone() else {
             return;
         };
@@ -581,6 +648,18 @@ impl MetaSpritePanel {
             return None;
         };
         open.store.dirty().then(|| open.rel_path.clone())
+    }
+
+    /// Save on behalf of a "Save" answer to the unsaved-edits prompt,
+    /// reporting whether the write actually landed (a failed write must not
+    /// let the caller discard the document). Shared by
+    /// [`Panel::prepare_to_close`] and [`Self::open_rel_path`].
+    fn save_for_close(&mut self, cx: &mut Context<Self>) -> bool {
+        self.save_impl(cx);
+        match &self.state {
+            ViewerState::Ready(open) => open.save_error.is_none(),
+            _ => true,
+        }
     }
 
     /// `save_sprite` -> `set_saved_state` with its fold-back result --
@@ -1113,34 +1192,6 @@ impl MetaSpritePanel {
 
     // ------------------------------------------------------------- render
 
-    fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_rel = match &self.state {
-            ViewerState::Ready(open) => Some(open.rel_path.clone()),
-            ViewerState::Loading { rel_path } => Some(rel_path.clone()),
-            _ => None,
-        };
-        h_flex()
-            .flex_wrap()
-            .gap_1()
-            .p_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .when(self.sprites.is_empty(), |this| {
-                let message = if self.project_root.is_some() {
-                    "No sprites found"
-                } else {
-                    "No project open"
-                };
-                this.child(Label::new(message).color(Color::Muted))
-            })
-            .children(self.sprites.iter().enumerate().map(|(ix, rel)| {
-                let selected = selected_rel.as_deref() == Some(rel.as_str());
-                Button::new(("ggo-metasprite", ix), SharedString::from(rel.clone()))
-                    .toggle_state(selected)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_sprite(ix, cx)))
-            }))
-    }
-
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .size_full()
@@ -1590,7 +1641,7 @@ impl Render for MetaSpritePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_editors(window, cx);
         let body = match &self.state {
-            ViewerState::Empty => self.render_message("Select a sprite".to_string(), cx),
+            ViewerState::Empty => self.render_message(EMPTY_MESSAGE.to_string(), cx),
             ViewerState::Loading { rel_path } => {
                 self.render_message(format!("Loading {rel_path}…"), cx)
             }
@@ -1608,7 +1659,6 @@ impl Render for MetaSpritePanel {
             .on_action(cx.listener(|this, _: &DeselectTile, _window, cx| this.deselect_tile(cx)))
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
-            .child(self.render_picker(cx))
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -1682,24 +1732,23 @@ impl Panel for MetaSpritePanel {
     /// `ggo_world_panel`: Save/Don't-Save/Cancel, and a failed write
     /// cancels the close rather than dropping the edits.
     fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
-        ggo_common::prepare_to_close_dirty(self.dirty_sprite_name(), window, cx, |this, cx| {
-            this.save_impl(cx);
-            match &this.state {
-                ViewerState::Ready(open) => open.save_error.is_none(),
-                _ => true,
-            }
-        })
+        ggo_common::prepare_to_close_dirty(
+            self.dirty_sprite_name(),
+            window,
+            cx,
+            Self::save_for_close,
+        )
     }
 
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         if active {
             // Deferred: `set_active` fires inside the workspace's own
-            // update (dock toggle), and `refresh_sprites` needs to READ
-            // the workspace to find the project root -- reading it
+            // update (dock toggle), and `refresh_root` needs to READ the
+            // workspace to find the project root -- reading it
             // re-entrantly panics (same as `ggo_world_panel`).
             let this = cx.weak_entity();
             cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_sprites(cx)).ok();
+                this.update(cx, |this, cx| this.refresh_root(cx)).ok();
             });
         }
     }
@@ -1714,7 +1763,7 @@ mod tests {
     use ggo_worldlib::sprites::sprite_doc::DEFAULT_FRAME_DURATION_MS;
     use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
     use gpui::TestAppContext;
-    use project::{FakeFs, Project};
+    use project::{FakeFs, Project, WorktreeId};
     use workspace::{AppState, MultiWorkspace};
 
     #[gpui::test]
@@ -1775,6 +1824,12 @@ mod tests {
     /// index 1 (red) -- distinguishable thumbnails. One non-looping
     /// single-frame clip exercises the clip selector path.
     fn write_sprite_fixture(root: &std::path::Path) {
+        write_sprite_fixture_named(root, "hero");
+    }
+
+    /// [`write_sprite_fixture`] under an arbitrary stem, so a test can hold
+    /// two distinct sprites (the routing tests switch between them).
+    fn write_sprite_fixture_named(root: &std::path::Path, stem: &str) {
         let mut pool = vec![0u8; 2 * TILE_BYTES];
         for b in &mut pool[TILE_BYTES..] {
             *b = 0x11; // both nibbles = palette index 1
@@ -1808,10 +1863,10 @@ mod tests {
         };
         save_sprite(
             root,
-            "sprites/hero.spr",
+            &format!("sprites/{stem}.spr"),
             &state,
-            "sprites/hero.til",
-            "sprites/hero.pal",
+            &format!("sprites/{stem}.til"),
+            &format!("sprites/{stem}.pal"),
         )
         .unwrap();
     }
@@ -1831,16 +1886,15 @@ mod tests {
             })
         });
         panel.update(cx, |panel, cx| {
-            panel.refresh_sprites(cx);
-            assert_eq!(panel.sprites, ["sprites/hero.spr"]);
-            panel.select_sprite(0, cx);
+            panel.refresh_root(cx);
+            panel.load_rel_path("sprites/hero.spr", cx);
         });
         cx.executor().run_until_parked();
         panel
     }
 
-    /// End-to-end viewer load against a real-fs temp project: the picker
-    /// enumerates the fixture `.spr`, selecting it runs the off-thread
+    /// End-to-end viewer load against a real-fs temp project: opening the
+    /// fixture `.spr` by rel path runs the off-thread
     /// loader, and the panel reaches Ready with one composed thumbnail
     /// per frame (frame 0 all-transparent, frame 1 opaque red -- proving
     /// per-frame compose order survived the BGRA bridge) and the resolved
@@ -2064,8 +2118,8 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.refresh_sprites(cx);
-            panel.select_sprite(0, cx);
+            panel.refresh_root(cx);
+            panel.load_rel_path("sprites/hero.spr", cx);
         });
         cx.run_until_parked();
         dirty_the_sprite(&panel, cx);
@@ -2082,6 +2136,186 @@ mod tests {
         assert!(
             !close.await.unwrap(),
             "Cancel in the panel guard must cancel the whole close"
+        );
+    }
+
+    // ------------------------------------------ explorer-driven routing
+
+    /// A fake-fs project with one visible worktree holding the same file
+    /// names the real-fs `root` fixture does: the interceptor only needs a
+    /// worktree id and a rel path, while the panel loads the actual sprite
+    /// bytes through `std::fs` from `root` (`root_override`).
+    async fn routed_project(
+        cx: &mut TestAppContext,
+        root: &std::path::Path,
+        run_init: bool,
+    ) -> Entity<Project> {
+        write_sprite_fixture(root);
+        write_sprite_fixture_named(root, "other");
+        cx.update(|cx| {
+            AppState::test(cx);
+            if run_init {
+                init(cx);
+            }
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/proj",
+            serde_json::json!({ "sprites": { "hero.spr": "", "other.spr": "" }, "notes.txt": "" }),
+        )
+        .await;
+        Project::test(fs, ["/proj".as_ref()], cx).await
+    }
+
+    fn worktree_id(project: &Entity<Project>, cx: &mut gpui::VisualTestContext) -> WorktreeId {
+        project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("one visible worktree")
+                .read(cx)
+                .id()
+        })
+    }
+
+    fn project_path(worktree_id: WorktreeId, rel: &str) -> ProjectPath {
+        ProjectPath {
+            worktree_id,
+            path: path::rel_path::rel_path(rel).into_arc(),
+        }
+    }
+
+    /// With nothing registered, `intercept_path_open` claims nothing --
+    /// i.e. the upstream open path (editor tab) is completely unchanged for
+    /// every file, `.spr` included. `init` is deliberately NOT run here.
+    #[gpui::test]
+    async fn test_empty_interceptor_registry_claims_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), false).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "sprites/hero.spr"),
+                window,
+                cx,
+            )
+        });
+        assert!(
+            !claimed,
+            "an empty registry must never claim a path -- upstream behaviour byte for byte"
+        );
+    }
+
+    /// The registered `.spr` predicate claims the path (so the project
+    /// panel opens NO pane item for it), opens the dock, and loads the
+    /// sprite. A non-`.spr` in the same worktree is declined.
+    #[gpui::test]
+    async fn test_spr_click_routes_into_the_panel_and_is_claimed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<MetaSpritePanel>(cx)
+                .expect("init() adds the panel")
+        });
+        let root = dir.path().to_path_buf();
+        panel.update(cx, |panel, _| panel.root_override = Some(root));
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "sprites/hero.spr"),
+                window,
+                cx,
+            )
+        });
+        assert!(claimed, "a .spr must be claimed, suppressing the pane item");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(ready(panel).rel_path, "sprites/hero.spr");
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.right_dock().read(cx).is_open(),
+                "routing must open the panel's dock even if it was closed"
+            );
+        });
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(&project_path(worktree_id, "notes.txt"), window, cx)
+        });
+        assert!(!claimed, "everything but .spr opens the normal way");
+    }
+
+    /// A clean panel switches documents without a prompt.
+    #[gpui::test]
+    async fn test_open_rel_path_switches_a_clean_panel_directly(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture_named(dir.path(), "other");
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("sprites/other.spr", window, cx)
+            })
+        });
+        assert!(
+            !cx.has_pending_prompt(),
+            "a clean panel must switch without asking"
+        );
+        cx.run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(ready(panel).rel_path, "sprites/other.spr");
+        });
+    }
+
+    /// The data-loss guard: a file-tree click while the open sprite has
+    /// unsaved edits must PROMPT, and Cancel must abort the open -- the
+    /// previously loaded document stays loaded, stays dirty, and stays
+    /// unwritten.
+    #[gpui::test]
+    async fn test_open_rel_path_cancel_keeps_the_dirty_document(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture_named(dir.path(), "other");
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_sprite(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("sprites/other.spr", window, cx)
+            })
+        });
+        assert_eq!(
+            cx.pending_prompt().map(|(msg, _)| msg),
+            Some("sprites/hero.spr contains unsaved edits. Do you want to save it?".to_string()),
+            "switching away from a dirty sprite must prompt first"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let open = ready(panel);
+            assert_eq!(
+                open.rel_path, "sprites/hero.spr",
+                "Cancel must abort the open and leave the current sprite loaded"
+            );
+            assert!(open.store.dirty(), "and leave its edits in place");
+        });
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            100,
+            "Cancel must not have written the file"
         );
     }
 
