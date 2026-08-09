@@ -17,7 +17,7 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
   - `crates/zed/src/main.rs`: `ggo_*::init(cx)` calls
   Resolution = keep upstream's version of the region, re-insert the marker lines.
 - Anything else conflicting means upstream moved a registration site: relocate the marker line, never keep a stale copy of upstream code.
-- After each merge: verify `reload_keymaps` (crates/zed/src/zed.rs) still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed` — ggo_world_panel's, ggo_metasprite_panel's, and ggo_charts_panel's keybindings all silently die if that call disappears.
+- After each merge: verify `reload_keymaps` (crates/zed/src/zed.rs) still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed` — ggo_world_panel's, ggo_metasprite_panel's, ggo_charts_panel's, and ggo_emu_panel's keybindings all silently die if that call disappears.
 
 ## Rules
 - All GGO code lives in `crates/ggo/*`. Upstream files get registration lines only.
@@ -33,3 +33,4 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
 - 2026-08-08 F1 wrap (W5-W7 landed: world panel skeleton/viewer/editor): `cargo test -p ggo_hello -p ggo_world_panel` 3+30 passed, `cargo clippy -p ggo_world_panel --all-targets` clean, `cargo build -p zed` 3m 25s (warm incremental, not cold)
 - 2026-08-08 merge drill #3 (F1 wrap, real): 1 upstream commit (`08827f9208` terminal `starts_open` setting), 0 conflicts, `git merge upstream/main --no-edit` clean; `cargo test -p ggo_hello -p ggo_world_panel` 3+30 passed, `cargo clippy -p ggo_world_panel --all-targets` clean, `cargo check -p zed` 35s; `reload_keymaps` invariant re-verified intact post-merge
 - 2026-08-08 F2 wrap (M2-M7 landed: metasprite panel viewer/editor/clips/transport/save + world panel add-delete/save-root parity): `cargo test -p ggo_world_panel -p ggo_metasprite_panel` 32+36 passed, `cargo clippy -p ggo_world_panel -p ggo_metasprite_panel --all-targets -- -D warnings` clean, `cargo build -p zed` 2m 45s (warm incremental, not cold)
+- 2026-08-08 F3 wrap (C1-C2 charts panel, E1-E2 emu pane, L1 GGO World language, T1 `.zed` task layer, cleanup landed): `cargo test -p ggo_hello -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel -p ggo_charts_panel -p ggo_emu_panel -p ggo_language` = 3+2+32+36+95+77+15 = 260 passed, 0 failed; `cargo clippy` on all seven `--all-targets -- -D warnings` clean; `cargo fmt --check` clean; merge drill #4: `git rev-list --count ggo..upstream/main` = 0 (upstream/main still `08827f9208`, unchanged since drill #3) — no merge to exercise, `reload_keymaps` invariant re-verified intact (`crates/zed/src/zed.rs:2356`). Feature disposition audit vs ggo-ide: `docs/ggo/MIGRATION.md`.

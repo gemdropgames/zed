@@ -1,0 +1,281 @@
+# ggo-ide → fork: feature disposition audit
+
+Date: 2026-08-08 (end of F3). Fork branch `ggo`.
+
+What this is: a row for **every** user-facing ggo-ide feature, and what — if
+anything — answers it in the fork today. It exists so nobody has to guess
+whether a thing was ported, replaced, or simply dropped. It is a reference,
+not a status report to be proud of; the honest answer for a large part of the
+Assets suite is "not covered".
+
+**Sources of truth.** ggo-ide's surface is enumerated from
+`ggo/tools/ggo-ide/src/pages/` + `nav.rs` and from
+`ggo/docs/ggo-ide-feature-inventory.md` (the redesign brief, which is the
+complete list). The intended dispositions come from
+`ggo/docs/superpowers/specs/2026-08-07-zed-pure-extension-design.md` (its
+feature-disposition table) as amended by
+`2026-08-07-zed-fork-design.md` (native dock panels, F1-F3 phasing). What
+actually shipped was read out of `crates/ggo/*` in this fork, plus the ggo
+repo's `.zed/settings.json`, `.zed/tasks.json` and
+`scripts/check-zed-config.sh`.
+
+**Status legend.**
+
+| | meaning |
+|---|---|
+| ✓ | covered in the fork (possibly by a different surface — a task or a CLI counts) |
+| partial | the capability exists but is materially smaller than ggo-ide's |
+| deferred | intended, not built yet; the rationale says why |
+| dropped | deliberately not coming back |
+
+ggo-ide is still in-tree and still the only place the "dropped" and several
+"deferred" rows work. Freezing or removing it is a separate decision.
+
+---
+
+## 1. App shell
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| 8-page nav rail | Dock panels with toggle buttons: GGO World, GGO MetaSprite, GGO Charts, GGO Emulator (+ file tree, editor, terminal, task picker) | ✓ | |
+| Single window, settings DB opened before first paint | Zed window; `~/.ggo/ggo_ide.db` opened lazily and only by the charts/emu panels | ✓ | |
+| App-wide active project + persistence + fan-out | Workspace's first visible worktree root | partial | Panels read the open folder. No in-app project switch, no persisted "active project", no per-panel project guard view. |
+| Nav side-effects (leave Assets → pause timeline; leave Emulator → pause; enter World → rescan) | Panels re-enumerate on `set_active`; metasprite pauses on edit | partial | Docks have no page-crossing event. A cart keeps running when the emu dock is collapsed; only focus loss stops input reaching it. |
+| Cross-page handoffs (Reports Re-run, World Emulate, inspector "→" sprite, Emulator View in Reports) | emu → charts "View in Reports" only | partial | Only that one hop shipped; the other three are listed separately below. |
+| Native OS confirm dialogs with per-dialog action binding | none | dropped | The destructive operations that used them (world delete, sprite delete, file delete, project remove) are not in the fork. |
+| Window-close unsaved-changes guard naming dirty pages | none | deferred | Panel doc stores live outside Zed's buffer/dirty model, so Zed's own prompt cannot see them; closing with a dirty world or sprite loses the edit silently. |
+| Typing guard (single-letter hotkeys suppressed while a text field is live) | gpui focus contexts (`not_editing` predicate on the metasprite panel; emu pad keys are focus-scoped) | ✓ | Real focus/blur exists here, so the Iced workaround is unnecessary. |
+| Theme (22 Iced themes, persisted) | Zed themes | ✓ | |
+| `capture_lint` source lint | none | dropped | Guards an Iced `ButtonReleased`/`and_capture` bug class that has no gpui analogue. |
+
+## 2. Projects page
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Project library (list, add existing, select, remove) | Zed open-folder / recent projects | dropped | The page is superseded by the editor's own project model; the spec's disposition table already called the library and its persistence dropped. |
+| Launcher view (branding screen when nothing is open) | Zed's own welcome/recent-projects screen | dropped | Same. |
+| "Create Emerald project" (`emd new <name>`) | `emd: new project scaffold` task | partial | Zed's `tasks.json` has no interactive input variable, so the name comes from `GGO_NEW_NAME` or the task picker's edit-and-spawn flow — not a prompt. |
+| Saved launch-target badges | none | dropped | Display-only data in ggo-ide with no consumer. |
+
+## 3. Assets page (pixel-art suite)
+
+This is the largest gap in the migration and the least ambiguous: per the fork
+spec, `ggo_metasprite_panel` is "animation creation/editing (clips/timeline)
+and tile setting … **not a full pixel editor**". Pixel authoring is not
+covered by the fork at all.
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; each GGO panel has its own asset picker | partial | Generic file search, not asset-typed sections with extension badges. |
+| Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | none | deferred | No CLI exists for them and no panel affordance was built; the file tree can delete but not create the `.spr`/`.til`/`.pal` trio. |
+| New tileset / new map | none | deferred | Same — no CLI, no panel. |
+| Files tree (create folder, delete file/dir, extension badges) | Zed project panel | partial | Create/delete/rename exist; the GGO extension badges do not. |
+| **Pixel editor**: 14 tools, brush sizes, mirror, pixel-perfect, shapes, marquee/lasso/wand, floating-selection move/flip/rotate, eyedropper, zoom/pan, per-editor undo | none | dropped | Explicit spec scope call. Pixel authoring is an external editor plus an import path. |
+| **Palette panel**: RGB565 16-slot editor, draft picker (5/6/5 sliders, 565 + 888 hex, quantized preview), swap / sort / ramp, shared-palette warnings | none | dropped | Part of the pixel-editor scope not taken. |
+| **Tile-pool panel** + dedup preview/apply | none | dropped | Same. Dedup still happens implicitly on metasprite save (worldlib's fold-back). |
+| Animation timeline: transport, clip lanes (name/from/to/loop/delete/add), frame strip (select, add, duplicate, delete, move, per-frame ms), playback honouring durations + clip range + loop | `ggo_metasprite_panel` | ✓ | |
+| Onion skin (toggle, back/fwd ghost counts, opacity) | none | deferred | The timeline was ported without ghost compositing; no blocker beyond effort. |
+| Preview panel (1:1 live frame, background picker, LCD filter) | metasprite panel centre preview | partial | Live composed frame with aspect fit shipped; checker/black/white background picker and the LCD scanline filter did not. |
+| Hardware budget meter (4 traffic-light rows + tooltips) | metasprite panel `hw_meter_line` | partial | Same four value/cap pairs from worldlib `sprites::hw`, condensed into one header line — no per-row dots or tooltips. |
+| Per-cell tile assignment from the pool | metasprite panel tile palette + preview cell click | ✓ | |
+| Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | none | dropped | Pixel editing; same scope call as the sprite editor. |
+| Map editor (`.map`): tileset binding, multi-tile stamp, H/V flip, palSub, brush/rect-fill/eraser/eyedropper, grid, zoom, resize | none | dropped | Same. Maps still *render* in the world panel as backgrounds/tilemaps. |
+| PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | none | deferred | T1 checked `tools/*/Cargo.toml` and the feature inventory: **there is no import CLI**, so `.zed/tasks.json` deliberately ships no import task rather than inventing one. The wizard is ggo-ide-only until a CLI exists. |
+| Legacy `.meta.json` sidecar import | none | dropped | One-shot migration aid for a format generation that is already past. |
+| Save / dirty marker / save-status / discard guards | Per-panel Save button + dirty dot + `ctrl-s`/`cmd-s` + inline `save failed:` | partial | Per-document save and dirty state shipped; the cross-page discard confirms and the "doc changed during save" race message did not. |
+| Draggable splitters (rail / right column) persisted | Zed dock resize | ✓ | |
+
+## 4. World editor page
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| World file picker (list + open) | world panel picker over `worlds/**.toml` | ✓ | |
+| "+ New world" (snake_case validated, overwrite confirm) | none | deferred | Carried on the F2 gap list. worldlib can `write_world`; the panel has no create affordance. |
+| Delete world (confirm + rescan) | none | deferred | Same gap list entry. |
+| Canvas rendering: sprites, metasprites (per-clip), tilemaps, text, rect fills, transform markers, instance gizmos, merged backgrounds, error placeholders, selection outline | world panel `canvas` + `loader` (worldlib compose / `build_draw_list`) | ✓ | |
+| Click-select + drag-move with one undo entry per gesture | ✓ | ✓ | One deliberate divergence: empty-space left-drag deselects instead of panning; pan is middle-drag. |
+| Wheel zoom / pan | ✓ (cursor-anchored zoom, middle-drag pan) | ✓ | Zoom is cursor-anchored here, which ggo-ide's is not. |
+| Snap-to-tile checkbox | ✓ | ✓ | |
+| Grid checkbox, "Reset" view, preview-size stepper (`- Preview Nx +`) | none | deferred | F2 final-review gap list; the canvas chrome row shipped with Snap only. |
+| Sidebar entity/instance lists | none (selection is canvas-driven; inspector shows the selection) | partial | No list-based selection or navigation; a hard-to-click entity has no list fallback. |
+| "+ Entity" (default Transform at view centre) | Add-entity toolbar button | ✓ | |
+| "+ Merge" fuzzy world search → add instance | "+ Instance" dropdown over cycle-guarded `merge_candidates` | partial | Instance add shipped, including the cycle guard and immediate subtree resolve; the fuzzy-search picker UI became a plain dropdown. |
+| Delete entity / remove instance | `Delete selected` button + `delete`/`backspace` | partial | ggo-ide confirms before removing an instance; the fork does not confirm anything. |
+| Inspector: schema-driven typed fields (int/fixed/str/bool/vec2), asset dropdowns, MetaSprite clip dropdown, per-component Remove, "+ Add component…" | world panel `inspector` | ✓ | Commit on Enter **and** on blur — strictly better than ggo-ide's Enter-only. |
+| MetaSprite `stem` "→" goto sprite on Assets | none | deferred | Cross-panel navigation (world → metasprite panel) is unwired; on the F2 gap list. |
+| Background merging from instances (priority, first-claimant, drawn at origin) | ✓ (worldlib `backgrounds::MergedBackground`) | ✓ | |
+| Undo / redo / dirty / Save (`WorldDocStore` + `write_world`) | ✓ | ✓ | |
+| "Emulate" (save, full-system build with this boot world, jump to Emulator) | `emd: run` task, or the emu panel on an already-packed `.cart` | deferred | On the F2 gap list. The panel cannot bake a boot world, and no task takes one. |
+| Arrow-key nudge (1 px / 16 px with Shift) | none | deferred | Not ported; drag + snap is the only placement path. |
+| Confirm dialogs (delete world, overwrite, remove instance, remove Transform from a visual entity) | none | dropped | See §1 — no confirm system in the fork. |
+
+## 5. Emerald page (ECS manifests)
+
+The pure-extension spec expected "full for ops; no dashboard view". The fork
+landed neither the dashboard nor the ops surface: manifests are text files you
+edit and `emd` is a command you run.
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Project tab: structured `emerald.toml` viewer | Open `emerald.toml` in the editor | partial | Text, not a structured section/entry view. |
+| Components / Systems / Schedules browsing (module groups, list → detail) | Open `manifests/*.toml` in the editor | partial | Text only. No list/detail dashboard, no field counts, no "used by schedules". |
+| Create component/system/schedule (validated forms → `emd generate …`) | `emd` in the terminal | deferred | T1 shipped build/pack/run/flash/monitor/new tasks only; the generate/rm/field/schedule verbs have no task and no panel. |
+| Remove component/system/schedule, add/remove field (with cascade-aware and compiler-check confirms) | `emd` in the terminal | deferred | Same. The "Reverted" compiler-rollback surfacing is lost with it. |
+| Schedule ordered run-list editor (reorder, cadence, add/remove, optimistic commit) | `emd schedule set` by hand | deferred | Richest interaction in ggo-ide; nothing ported. |
+| emd version-lock banner + gating + mtime poll + mid-run drift check | none | deferred | Nothing gates `emd` invocations in the fork; a version-skewed `emd` fails at the terminal instead of being pre-empted. |
+| emd run console panel (live merged stdout/stderr, Cancel) | Zed terminal panel | ✓ | |
+
+## 6. Emulator page
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Embedded 320×240 screen, integer scale, latest-wins frames | `ggo_emu_panel` live video (`RenderImage` per frame, bounded depth-1 channel) | partial | Scaling is gpui's `img()` fit, i.e. linear — not the guaranteed integer nearest-neighbour ggo-ide hard-coded. See Known deferrals. |
+| "Build & run project" (full system: OS + FAT image + game) | `emd: run` task (launches the standalone `ggo-emu`, with audio) | partial | The panel runs `.cart` files only. The full-system build+boot path stays external. |
+| Run / Stop | ✓ (`ctrl-alt-r` / `ctrl-alt-s`; Run over a running cart restarts cleanly) | ✓ | |
+| Cart library (`~/.ggo/ggo-ide/carts`: list, Upload with magic-header validation, Remove) | Cart dropdown over `.cart` files found under the project root | partial | Discovery instead of a managed library — no upload, no delete, no header validation (a bad cart fails loudly at Run, deliberately). |
+| Keyboard → gamepad (both the full-system and 18-button cart maps) | ✓ (18-bit level-triggered mask, pinned key-by-key against the standalone binary) | ✓ | Focus-scoped, so pad keys never leak into an editor. |
+| Audio + Mute/Unmute + underrun counter | `emd: run` / standalone `ggo-emu` | deferred | Explicitly out of scope for F3 (`constraints.md`); the standalone binary remains the with-audio path. |
+| Stats line (fps / drops / step+blit ms) | ✓ | ✓ | |
+| Live guest UART console (collapsible, N lines, 2000-line ring) | ✓ (plus cart `log()` output, via ggo PR #75's `Peripherals::log_sink`) | ✓ | |
+| End-of-run perf ingest into `ggo_ide.db` (+ status line, + "View in Reports") | ✓, natively — Stop / cart exit / fault / restart all funnel through one `finish_run` | ✓ | Subsumes the spec's CLI-chained `ggo-emu --perf` → `ggo-cli ingest` task. |
+| Implicit pause on navigating away, resume on return | none | dropped | Docks have no page crossing; the cart keeps running when the dock is hidden. |
+| Reports "Re-run" entry point | none | deferred | Charts panel → emu panel handoff unwired (the reverse direction shipped). |
+| Build error surfaced in a scrollable read-only editor | Terminal output of the `emd:` tasks | ✓ | |
+
+## 7. Reports page
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Carts → Runs → Detail drill-down with slim back headers | `ggo_charts_panel`: flat run picker (cart · label · started_at) → detail with a Back button | partial | The cart level is collapsed away; there is no per-cart grouping or last-run relative time. |
+| Per-cart "Re-run" | none | deferred | Needs the charts → emu handoff (see §6). |
+| Run detail header + config line (budget, wire-model constants, wire-wait tag) | Run title only | deferred | C2's not-ported list. |
+| "Copy for agent" text export | none | deferred | Same list. |
+| Failed-asset-loads table, Panics table | none | deferred | Same list. |
+| Guest UART console for a stored run | none | deferred | The emu panel shows the *live* console; the ingested one is written to the DB but never read back. |
+| Ignored-frames editor (chips, comma/space input, "N of M excluded") | Default frame-0 ignore + a muted `"N frame(s) ignored"` caption | partial | Parity of the *filter* shipped; the editor did not — an ignore set is a UI task, not a port. |
+| KPI tile rows (Frames, Over-budget, Avg wire vs budget, IPC, I$/D$ hit rate, max misses, conditional PPU/APU tiles) | none | deferred | C2's not-ported list; the panel has no KPI row at all. |
+| Chart set (wire vs budget, wire breakdown, cache misses, syscalls, tile working set, I$ misses + evictions by function, i/d-miss histograms, PPU evictions, tile-load wire, APU fetch wire, instructions) | ✓ — `chart_set::build_charts` mirrors `reports.rs::charts_section`, same order and same gating | ✓ | |
+| Historic overlay (up to 5 prior runs, age-faded) | none | deferred | C2's not-ported list. |
+| Click-to-inspect frame → per-function misses/evicted table | none | deferred | Same. |
+| I$ profile table with sortable header | none | deferred | Same. |
+| Reads `~/.ggo/ggo_ide.db` off-thread, stale-response-guarded | ✓ — the same DB file, not a copy; load-generation guards on both the list and the detail | ✓ | |
+
+## 8. Device page
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Serial port picker (scan `/dev/serial/by-id`, auto-select a lone port, refresh) | `GGO_TTY` env var read by the tasks | partial | No discovery UI; you set the variable or accept `/dev/ttyUSB0`. |
+| Flash `.ggo` via `ggo-diag --provision --launch` (file picker + magic check, Full-run/Skip-PnR toggle, collect seconds, baud) | `ulx3s: flash bitstream (fujprog)` task | partial | The task flashes a **bitstream** with `fujprog`, which is the canonical `scripts/fpga-test` invocation — it is not the `ggo-diag` provision+launch flow with its options. |
+| "Run hardware diagnostics" (built-in diagnostic cart, no project needed) | none | deferred | No task wraps `ggo-diag`; T1 stayed inside verbs it could verify. |
+| Live run log with stick-to-bottom autoscroll, Cancel, PASS/FAIL/TIMEOUT verdict | Terminal panel output; Ctrl-C | partial | Raw stdout with no verdict parsing and no state machine. |
+| History rail (clone `~/.ggo/diag.db`, 50 recent runs, per-run log viewer) | none | deferred | Nothing clones or reads `diag.db` in the fork. |
+| UART monitor | `ulx3s: UART monitor` task (mirrors `fpga-test`'s `configure_tty`, documents the FT231X re-enum gap) | ✓ | |
+
+## 9. Shared chart widgets
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Line / StackedArea / Histogram with nice-step gridlines, compact tick labels, axis captions | `chart_geom` (renderer-independent `ChartScene`) + `chart_paint` (gpui) | ✓ | |
+| Hover crosshair + flipping tooltip | ✓ | ✓ | |
+| Dashed budget line participating in the y-scale | ✓ | ✓ | |
+| Click-drag x-zoom + double-click reset | none | deferred | C2's not-ported list. |
+| Click-to-select a frame (drives the inspect panel) | none | deferred | Dead without the inspect panel (§7). |
+| Historic overlays (grey, age-ramped opacity, contribute to y-scale) | none | deferred | Same list. |
+| No legends | none | ✓ | Same deliberate omission, inherited. |
+| Cached static layer, cheap hover redraws | Scenes rebuilt on hover | partial | Hover `notify()` rebuilds every chart's scene; fine at real run sizes, a documented ceiling at the 100k-frame cap. |
+
+## 10. Settings page
+
+| ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
+|---|---|---|---|
+| Theme | Zed settings | ✓ | |
+| Repository path | `GGO_PROJECT_DIR` env (tasks) / the open worktree | partial | No stored setting; the tasks default to `..` and the panels use the worktree root. |
+| Serial device (tty) + scanned-port dropdown | `GGO_TTY` env | partial | Free-form env var, no scan, no picker. |
+| Baud rate (validated positive integer) | `GGO_BAUD` env | partial | No validation; a bad value fails at `stty`. |
+| `emd` binary path (blank = resolve from PATH) | PATH | partial | The override is gone; `emd` must be on PATH. |
+| Version/environment row + `emd` re-check | none | deferred | Nothing probes `emd --version` in the fork. |
+| Per-key persistence in the settings DB | `.zed/settings.json` (repo-shared) + shell env (per-user) | ✓ | Split exactly as the spec's disposition table proposed. |
+
+## 11. Fork-only additions (no ggo-ide equivalent)
+
+| Feature | Where | Notes |
+|---|---|---|
+| "GGO World" language: tree-sitter grammar, syntax highlighting, bracket/quote autoclose, outline symbols for `[[entity]]`/`[[instance]]`/`[[background]]` | `ggo_language` + the repo's `.zed/settings.json` `file_types` glob | Native registration (no extension sandbox), grammar via `tree-sitter-toml-ng` since upstream extracted TOML. |
+| `.zed/tasks.json` task layer (6 tasks) + `scripts/check-zed-config.sh` JSONC validator | ggo repo | Committed, per-user values via env, all six verified against real invocations. |
+| Native perf ingest straight from the emulator pane into `ggo_ide.db` | `ggo_emu_panel::ingest` | Replaces the spec's CLI-chained ingest task. |
+| **LSP** (diagnostics, completion, hover, code actions on worlds/manifests) | — | The pure-extension spec's central mechanism. **Deferred**: `ggo_language` registers grammar + queries only; there is no `ggo-lsp` binary and no `LspAdapter`. Every capability the old spec assigned to the LSP (world validation, hardware-budget diagnostics, snap/center/offset code actions, import diagnostics) is therefore unbuilt. |
+
+---
+
+## Counts
+
+| Status | Rows |
+|---|---|
+| ✓ | 32 |
+| partial | 27 |
+| deferred | 32 |
+| dropped | 13 |
+| **total** | **104** |
+
+(Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
+feature and are excluded, except that the LSP row there is a deferral in its
+own right.)
+
+Read that shape honestly: the panels the fork set out to build (world,
+metasprite, charts, emulator) are largely ✓; the *ancillary* pages — Emerald
+ops, Device, Settings, Reports' non-chart furniture — are mostly "partial via a
+task or a text file"; and the pixel-art half of Assets is a deliberate drop
+with no replacement in this repo.
+
+---
+
+## Known deferrals (consolidated ledger)
+
+Open items carried out of F1-F3 that are not feature-disposition rows — bugs,
+guards and follow-ups that someone has to pick up:
+
+**worldlib / ggo repo**
+
+- **PaletteSet slot guard** and **last-frame `FrameDelete` guard** — the next
+  worldlib doc-op hardening PR (follow-on to ggo #73). Panels re-check both
+  before applying, so this is defence in depth, not a live crash.
+- **Redo of an add leaves the instance subtree unresolved** — `AddInstance`
+  resolves the subtree at add time (fork `ade65c4d`), but a redo of that op
+  replays the doc op without the resolve, so the instance renders as a
+  placeholder until the world is reopened.
+- **`ggo-db` index PR**: `frame(run_id)` and `profile(run_id)` have no index;
+  the charts panel's per-run sample query full-scans. Not felt at current run
+  counts.
+- **`scripts/check-zed-config.sh` trailing-comma stripping** can mangle string
+  content containing `,]` or `,}` (fix-forward, low: no such string exists in
+  either committed file today).
+
+**fork**
+
+- **Atlas retention in the two document panels.** Only `ggo_emu_panel`
+  implements the `Window::drop_image` release contract (double-buffered retire,
+  full release on stop, `on_release` at teardown). `ggo_world_panel` rebuilds
+  its whole image cache on add-instance and on every world switch, and
+  `ggo_metasprite_panel` rebuilds every frame + pool-tile `RenderImage` after
+  *every* op/undo/redo/save — neither ever calls `drop_image`, so both leak
+  atlas tiles at edit frequency. Bounded by session length, not by a loop, so it
+  was not an F2/F3 blocker; it is still a real leak.
+- **Linear-upscale blur in the emu pane.** The framebuffer is painted with
+  `img().w_full().h_full()`, i.e. gpui's default filtering, where ggo-ide
+  hard-coded a 2× integer nearest-neighbour scale. Violates the
+  "integer-scale pixel rendering" guardrail in the feature inventory.
+- **Stuck keys on window deactivation.** `on_focus_out` clears the pad mask,
+  but alt-tabbing away with a key held while the panel keeps focus leaves the
+  bit set until the key is pressed and released again.
+- **`MAX_FRAMES = 100_000` ingest rejection.** Ported verbatim from ggo-ide for
+  parity: a run longer than roughly 28 minutes at 60 Hz is rejected outright at
+  ingest rather than truncated.
+- **Frame-0 ignore-set editor.** The charts panel applies ggo-ide's default
+  (drop frame 0) and captions it, but there is no way to change the set.
+- **Hover rebuild ceiling.** Every hover move rebuilds all chart scenes;
+  O(charts × frames) per mouse-move frame.
+- **`ggo_common` is unused.** All four panels build their `RenderImage`s
+  inline; the shared crate has two helpers and no callers.
+- **Glob duplicated between the fork and the repo.** `ggo_language`'s
+  `PROJECT_FILE_TYPE_GLOB` and the ggo repo's `.zed/settings.json` `file_types`
+  entry must agree, and nothing checks that they do across the two repos.
