@@ -51,6 +51,14 @@ workspace = { workspace = true, features = ["test-support"] }
 # control half (an unclaimed path must actually produce a tab).
 editor.workspace = true
 project_panel.workspace = true
+# G1: the non-local half of the context-menu-contributor gate. A mock remote
+# connection is the cheapest project whose `is_local()` is false; nothing
+# else here talks to it. `release_channel` (+ `semver` for the version it
+# takes) is what a `RemoteClient` reads out of the app globals on connect.
+release_channel.workspace = true
+remote = { workspace = true, features = ["test-support"] }
+rpc.workspace = true
+semver.workspace = true
 # Not used by any test here: pure feature unification. `project/test-support`
 # turns on `remote/test-support`, which adds a `RemoteConnectionOptions`
 # variant that `remote_connection`'s lib only matches on under ITS

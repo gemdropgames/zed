@@ -63,6 +63,36 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
     (F4 review follow-up; same red/green drill). Both guarded call sites are
     now covered. Every other routing test enters at
     `Workspace::intercept_path_open` and would stay green.
+  - `crates/workspace/src/workspace.rs`: the `ContextMenuContributor` registry
+    (`register_context_menu_contributor` + `Workspace::context_menu_contributions`)
+    — the fork's **third** behavioural hook (F5.0/G1), one GGO-marked block of
+    71 lines with opening AND closing markers, placed immediately after the
+    `PathOpenInterceptor` block above. Same `try_global` gate: an absent or
+    empty registry returns an empty `Vec` and the menu is byte-identical to
+    upstream's. A contributor returns `Vec<ui::ContextMenuItem>` rather than
+    taking and returning the half-built `ContextMenu` on purpose — `ContextMenu`
+    exposes no item count, so "did anything get added?" would be unanswerable
+    and the separator the call site emits ahead of the fork's block would be
+    stray whenever every contributor declined. Non-local projects (SSH remote,
+    collab guest) contribute nothing, mirroring
+    `ggo_common::rel_in_primary_worktree`'s rule.
+  - `crates/project_panel/src/project_panel.rs`: a THIRD guarded call site
+    (F5.0/G1), and the **second** hook in this file — inside
+    `deploy_context_menu` (currently `:1122-1261`): a `ggo_items` local
+    computed just before `ContextMenu::build`, and a trailing `.map(…)` chained
+    onto the builder closure's existing `.map(…)`. 26 added lines, **0
+    deleted** — unlike the F4 sites, nothing upstream is wrapped, re-indented
+    or moved, so a conflict here should always resolve as "take upstream's
+    region, paste both GGO chunks back in". Order is load-bearing: the fork's
+    entries go last, after everything upstream builds, and the `separator()`
+    is inside the `else` branch so an empty registry adds no divider.
+    Verify with `cargo test -p workspace --lib -p project_panel --lib`
+    (237 + 116) plus, above all, `cargo test -p ggo_emu_panel context_menu`
+    (3 tests) — `test_project_panel_context_menu_shows_a_contributed_entry`
+    builds a REAL `ProjectPanel`, docks it, right-clicks a real row and looks
+    for the contributed entry in the RENDERED menu, so a dropped hook fails it
+    rather than merging in silently (verified red twice: with the trailing
+    `.map` neutered, and with both GGO chunks deleted).
 - Anything else conflicting means upstream moved a registration site: relocate the marker line, never keep a stale copy of upstream code.
 - After each merge: verify `reload_keymaps` (crates/zed/src/zed.rs) still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed` — ggo_world_panel's, ggo_metasprite_panel's, ggo_charts_panel's, and ggo_emu_panel's keybindings all silently die if that call disappears.
 

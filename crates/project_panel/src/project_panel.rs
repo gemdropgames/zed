@@ -1119,8 +1119,26 @@ impl ProjectPanel {
             };
 
             let has_pasteable_content = self.has_pasteable_content(cx);
+            // GGO: fork-local menu contributors (sprite/tileset/world panels)
+            // add their own entries for the clicked path. Empty registry
+            // upstream => an empty Vec => the menu below is untouched, down to
+            // the separator.
+            let ggo_project_path = project::ProjectPath {
+                worktree_id,
+                path: entry.path.clone(),
+            };
+            let ggo_items = self
+                .workspace
+                .update(cx, |workspace, cx| {
+                    workspace.context_menu_contributions(&ggo_project_path, is_dir, window, cx)
+                })
+                .unwrap_or_default();
+            // GGO
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
-                menu.context(self.focus_handle.clone()).map(|menu| {
+                // GGO: `let menu =` (and the `;` closing this statement) --
+                // upstream's expression is otherwise unchanged, and its body
+                // is not re-indented.
+                let menu = menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
                         menu.when(is_markdown, |menu| {
                             menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
@@ -1229,7 +1247,16 @@ impl ProjectPanel {
                                     .action("Collapse All", Box::new(CollapseAllEntries))
                             })
                     }
-                })
+                });
+                // GGO: the fork's entries go last, after everything upstream
+                // built, and the separator ahead of them is emitted ONLY when
+                // there is something to separate.
+                if ggo_items.is_empty() {
+                    menu
+                } else {
+                    menu.separator().extend(ggo_items)
+                }
+                // GGO
             });
 
             window.focus(&context_menu.focus_handle(cx), cx);

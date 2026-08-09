@@ -1011,6 +1011,77 @@ impl Workspace {
 // GGO: end of the fork-local open-interceptor block opened above. Everything
 // between the two markers is ours; nothing outside them was touched.
 
+// GGO: fork-local project-panel context-menu contributors. A registered fn is
+// offered the right-clicked path and returns the entries it wants appended to
+// the menu -- "Delete World" on a world `.toml`, "Import as tileset…" on a
+// `.png`. Nothing upstream registers one, so with an empty registry the menu
+// is byte-identical to what it was before.
+//
+// Returning the items instead of taking the half-built `ContextMenu` and
+// handing it back is deliberate. Threading the menu through would compile
+// (`Context<ContextMenu>` derefs to `App`), but `ContextMenu` exposes no way
+// to ask "did anything get added?": `items` is private and there is no length
+// accessor. A contributor that declined would then be indistinguishable from
+// one that contributed, so the separator the fork emits ahead of its block
+// would be stray whenever every contributor declined -- exactly the upstream-
+// visible regression this hook must not cause. A `Vec` makes "contributed
+// nothing" observable both to the call site (which skips the separator) and
+// to the tests (which can count).
+pub type ContextMenuContributor = fn(
+    &mut Workspace,
+    &ProjectPath,
+    bool, // the clicked entry is a directory
+    &mut Window,
+    &mut Context<Workspace>,
+) -> Vec<ui::ContextMenuItem>;
+
+#[derive(Default)]
+struct ContextMenuContributors(Vec<ContextMenuContributor>);
+
+impl Global for ContextMenuContributors {}
+
+/// Registers a [`ContextMenuContributor`] for the app. GGO.
+pub fn register_context_menu_contributor(cx: &mut App, contributor: ContextMenuContributor) {
+    cx.default_global::<ContextMenuContributors>()
+        .0
+        .push(contributor);
+}
+
+impl Workspace {
+    /// Offers `path` to every registered [`ContextMenuContributor`] and
+    /// returns their entries, in registration order. Empty (always, with an
+    /// empty registry) means "add nothing at all" -- not even a separator.
+    ///
+    /// A non-local project contributes nothing, mirroring the rule the fork's
+    /// path interceptors already follow: GGO panels read their documents with
+    /// `std::fs` against the worktree's `abs_path`, which on an SSH remote or
+    /// a collab guest names a directory that does not exist on this machine.
+    /// GGO.
+    pub fn context_menu_contributions(
+        &mut self,
+        path: &ProjectPath,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<ui::ContextMenuItem> {
+        if !self.project.read(cx).is_local() {
+            return Vec::new();
+        }
+        // Copy out first: the contributors take `&mut self`, which cannot be
+        // held across a borrow of the global.
+        let contributors = match cx.try_global::<ContextMenuContributors>() {
+            Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+            _ => return Vec::new(),
+        };
+        let mut items = Vec::new();
+        for contribute in contributors {
+            items.extend(contribute(self, path, is_dir, window, cx));
+        }
+        items
+    }
+}
+// GGO: end of the fork-local context-menu-contributor block opened above.
+
 #[derive(Default)]
 pub struct FollowableViewRegistry(TypeIdHashMap<FollowableViewDescriptor>);
 

@@ -1900,4 +1900,332 @@ mod tests {
             );
         });
     }
+
+    // ------------------------------ project-panel context-menu contributors
+
+    /// The label the test contributor appends. Deliberately not a real GGO
+    /// entry: these tests guard the HOOK, not any particular menu item.
+    const GGO_ENTRY: &str = "Re-run (perf)";
+    const GGO_ITEM: &str = "MENU_ITEM-Re-run (perf)";
+    /// Upstream entries every writable project-panel menu carries. Their
+    /// presence proves a menu really deployed, and that the fork APPENDED to
+    /// upstream's menu rather than replacing it.
+    const UPSTREAM_ITEMS: [&str; 5] = [
+        "MENU_ITEM-New File",
+        "MENU_ITEM-New Folder",
+        "MENU_ITEM-Copy Path",
+        "MENU_ITEM-Copy Relative Path",
+        "MENU_ITEM-Rename",
+    ];
+
+    /// Every `(path, is_dir)` the registered contributor was offered, in
+    /// order. A gpui `Global` rather than a `thread_local!`: `#[gpui::test]`
+    /// bodies share a thread, and a global dies with its `App`.
+    #[derive(Default)]
+    struct Offered(Vec<(String, bool)>);
+
+    impl gpui::Global for Offered {}
+
+    /// A `ContextMenuContributor` shaped like the real ones: it records what
+    /// it was offered, and contributes one entry for `.cart` paths only.
+    fn cart_contributor(
+        _workspace: &mut Workspace,
+        path: &ProjectPath,
+        is_dir: bool,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Vec<ui::ContextMenuItem> {
+        let rel = path.path.as_unix_str().to_string();
+        cx.default_global::<Offered>().0.push((rel.clone(), is_dir));
+        if rel.ends_with(".cart") {
+            vec![ui::ContextMenuEntry::new(GGO_ENTRY).into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A project whose `is_local()` is false, built on a mock remote
+    /// connection. No `HeadlessProject` is set up on the server side and no
+    /// worktree is opened: the non-local gate declines before anything is
+    /// asked of the connection.
+    async fn remote_project(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Entity<()>) {
+        let app_state = cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            AppState::test(cx)
+        });
+        let (opts, server_client, connect_guard) = remote::RemoteClient::fake_server(cx, server_cx);
+        // The client handshakes with a `Ping` before it reports connected;
+        // answering it is the whole server this test needs. (The returned
+        // entity is the handler's owner -- dropping it unregisters it.)
+        let ping_handler = server_cx.new(|_| ());
+        server_client.add_request_handler::<rpc::proto::Ping, (), _, _>(
+            ping_handler.downgrade(),
+            |_, _, _| async { Ok(rpc::proto::Ack {}) },
+        );
+        drop(connect_guard);
+        let remote_client = remote::RemoteClient::connect_mock(opts, cx).await;
+        let project = cx.update(|cx| {
+            Project::remote(
+                remote_client,
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                false,
+                cx,
+            )
+        });
+        // `Workspace::test_new` builds its own `WorkspaceStore` on the same
+        // client, and the client refuses two handlers for one message: let
+        // this one's go first (every other test here drops its `AppState`
+        // immediately, which is why none of them trip over this).
+        drop(app_state);
+        cx.run_until_parked();
+        (project, ping_handler)
+    }
+
+    /// A project + a REAL `ProjectPanel`, docked and rendered, so a
+    /// right-click on a row runs upstream's own `deploy_context_menu`.
+    /// Returns the workspace and the window x to right-click at -- the
+    /// project panel docks wherever upstream's settings default puts it
+    /// (currently the right), and a hardcoded column would silently stop
+    /// hitting any row the day that changes.
+    async fn context_menu_panel(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, Pixels, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            editor::init(cx);
+            project_panel::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/proj",
+            serde_json::json!({
+                "worlds": {},
+                "hero.cart": "",
+                "notes.txt": "",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, ["/proj".as_ref()], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        let (weak_workspace, async_cx) =
+            cx.update(|window, cx| (workspace.downgrade(), window.to_async(cx)));
+        let project_panel = project_panel::ProjectPanel::load(weak_workspace, async_cx)
+            .await
+            .expect("the project panel loads");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(project_panel, window, cx);
+            workspace.open_panel::<project_panel::ProjectPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let column_x = workspace.update_in(cx, |workspace, window, cx| {
+            let position = workspace
+                .panel::<project_panel::ProjectPanel>(cx)
+                .expect("the project panel is docked")
+                .read(cx)
+                .position(window, cx);
+            match position {
+                DockPosition::Right => viewport.width - px(40.),
+                _ => px(40.),
+            }
+        });
+
+        (workspace, column_x, cx)
+    }
+
+    /// Right-click at `position` in the rendered window, dismissing whatever
+    /// menu the previous probe left open first (an open menu is drawn OVER
+    /// the rows, and would eat the next click).
+    fn right_click(cx: &mut gpui::VisualTestContext, position: gpui::Point<Pixels>) {
+        cx.simulate_keystrokes("escape");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+    }
+
+    /// Walk the project panel's rows top-down until the context menu deploys
+    /// for the entry named `rel`, and leave that menu open. Scanning rather
+    /// than hardcoding a row height is on purpose: `project_panel.rs` is the
+    /// fork's highest-churn hook site, and a test that dies of a two-pixel
+    /// layout change is a test nobody re-applies the hook for.
+    fn right_click_row(cx: &mut gpui::VisualTestContext, column_x: Pixels, rel: &str) {
+        let mut y = px(0.);
+        while y < px(400.) {
+            right_click(cx, gpui::point(column_x, y));
+            let hit = cx.update(|_, cx| cx.default_global::<Offered>().0.last().cloned());
+            if hit.as_ref().is_some_and(|(path, _)| path == rel) {
+                return;
+            }
+            y += px(4.);
+        }
+        let seen = cx.update(|_, cx| cx.default_global::<Offered>().0.clone());
+        panic!("no row for {rel:?} was right-clickable; the scan saw {seen:?}");
+    }
+
+    /// **The `deploy_context_menu` hook itself, end to end.** Everything else
+    /// here enters at `Workspace::context_menu_contributions`, so nothing but
+    /// this would notice the GGO block in
+    /// `crates/project_panel/src/project_panel.rs`'s `deploy_context_menu`
+    /// disappearing in an upstream merge (see `docs/ggo/UPSTREAM.md`).
+    ///
+    /// It builds a REAL `ProjectPanel` via its public `ProjectPanel::load`,
+    /// docks it so it renders, and right-clicks a real row -- upstream's own
+    /// `on_secondary_mouse_down` listener, upstream's own menu. The
+    /// contributed entry must show up in the RENDERED menu (`MENU_ITEM-…`
+    /// debug bounds), next to upstream's own entries.
+    #[gpui::test]
+    async fn test_project_panel_context_menu_shows_a_contributed_entry(cx: &mut TestAppContext) {
+        let (_workspace, column_x, cx) = context_menu_panel(cx).await;
+        cx.update(|_, cx| workspace::register_context_menu_contributor(cx, cart_contributor));
+
+        right_click_row(cx, column_x, "hero.cart");
+
+        assert!(
+            cx.debug_bounds(GGO_ITEM).is_some(),
+            "the contributed entry must be in the deployed menu -- if this \
+             fails, the GGO block in project_panel.rs's deploy_context_menu \
+             is gone"
+        );
+        for item in UPSTREAM_ITEMS {
+            assert!(
+                cx.debug_bounds(item).is_some(),
+                "{item} must still be there: the fork APPENDS to upstream's menu"
+            );
+        }
+        assert_eq!(
+            cx.update(|_, cx| cx.default_global::<Offered>().0.last().cloned()),
+            Some(("hero.cart".to_string(), false)),
+            "the contributor is offered the clicked path, and told it is a file"
+        );
+
+        // A path the contributor declines gets upstream's menu, unchanged.
+        right_click_row(cx, column_x, "notes.txt");
+        assert!(
+            cx.debug_bounds(GGO_ITEM).is_none(),
+            "a declined path must not carry the entry"
+        );
+        for item in UPSTREAM_ITEMS {
+            assert!(cx.debug_bounds(item).is_some(), "{item} is still there");
+        }
+
+        // Directories are offered too, flagged as such.
+        right_click_row(cx, column_x, "worlds");
+        assert_eq!(
+            cx.update(|_, cx| cx.default_global::<Offered>().0.last().cloned()),
+            Some(("worlds".to_string(), true)),
+            "a directory is offered with is_dir = true"
+        );
+    }
+
+    /// The empty-registry case: upstream's menu, untouched. The separator
+    /// the hook emits ahead of the fork's block is conditional on there
+    /// being a block, so an unregistered fork adds nothing at all -- not
+    /// even a divider.
+    #[gpui::test]
+    async fn test_project_panel_context_menu_is_untouched_without_contributors(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, column_x, cx) = context_menu_panel(cx).await;
+
+        // No contributor registered: nothing to append, so nothing to
+        // separate. The call site's `is_empty()` branch returns the menu
+        // upstream built, by identity.
+        let contributions = workspace.update_in(cx, |workspace, window, cx| {
+            let worktree_id = workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .expect("one visible worktree")
+                .read(cx)
+                .id();
+            workspace.context_menu_contributions(
+                &project_path(worktree_id, "hero.cart"),
+                false,
+                window,
+                cx,
+            )
+        });
+        assert!(
+            contributions.is_empty(),
+            "an empty registry contributes nothing"
+        );
+
+        // And the deployed menu is upstream's, with no GGO entry in it.
+        let mut y = px(0.);
+        while y < px(400.) && cx.debug_bounds(UPSTREAM_ITEMS[0]).is_none() {
+            right_click(cx, gpui::point(column_x, y));
+            y += px(4.);
+        }
+        for item in UPSTREAM_ITEMS {
+            assert!(
+                cx.debug_bounds(item).is_some(),
+                "{item} must be in the untouched menu"
+            );
+        }
+        assert!(
+            cx.debug_bounds(GGO_ITEM).is_none(),
+            "nothing was registered, so nothing was contributed"
+        );
+    }
+
+    /// A non-local project (SSH remote, collab guest) contributes nothing:
+    /// GGO panels read their documents with `std::fs` against the worktree's
+    /// `abs_path`, which names a directory that does not exist on this
+    /// machine. Same rule `ggo_common::rel_in_primary_worktree` applies to
+    /// the F4 open interceptors.
+    #[gpui::test]
+    async fn test_context_menu_contributions_decline_a_non_local_project(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (project, _ping_handler) = remote_project(cx, server_cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.update(|_, cx| workspace::register_context_menu_contributor(cx, cart_contributor));
+        cx.run_until_parked();
+
+        project.read_with(cx, |project, _| {
+            assert!(!project.is_local(), "the fixture really is non-local")
+        });
+
+        // The gate declines before it ever looks at a worktree, so any id
+        // does (the fixture has none: connecting a mock server is enough to
+        // make the project non-local).
+        let contributions = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.context_menu_contributions(
+                &project_path(WorktreeId::from_usize(1), "hero.cart"),
+                false,
+                window,
+                cx,
+            )
+        });
+        assert!(
+            contributions.is_empty(),
+            "a non-local project contributes nothing"
+        );
+        assert!(
+            cx.update(|_, cx| cx.default_global::<Offered>().0.is_empty()),
+            "the contributor is not even consulted"
+        );
+    }
 }
