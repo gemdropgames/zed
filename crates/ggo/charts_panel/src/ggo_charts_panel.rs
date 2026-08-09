@@ -25,7 +25,11 @@
 mod chart_geom;
 mod chart_paint;
 mod chart_set;
-mod loader;
+// `pub`: `ggo_emu_panel`'s ingest round-trip test reads its own writes back
+// through THESE query functions (as a dev-dependency), which is what proves
+// the two panels agree on `ggo_ide.db`'s schema rather than each having its
+// own idea of it.
+pub mod loader;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

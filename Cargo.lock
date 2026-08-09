@@ -7554,12 +7554,17 @@ name = "ggo_emu_panel"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "ggo-db",
  "ggo-emu-core",
+ "ggo_charts_panel",
  "gpui",
  "image",
  "keymap_editor",
  "project",
+ "serde_json",
  "tempfile",
+ "tokio",
+ "turso",
  "ui",
  "util",
  "workspace",

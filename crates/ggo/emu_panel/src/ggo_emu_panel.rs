@@ -1,9 +1,21 @@
-//! GGO Emulator panel (F3 task E1): an embedded `ggo-emu` -- cart picker,
-//! Run/Stop, live 320x240 video, keyboard -> pad input. The emulation
-//! itself is `ggo-emu-core` verbatim; [`drive`] ports the standalone
-//! binary's drive loop (`ggo-emu/src/lib.rs::run_cart` +
-//! `src/native.rs`) onto a background thread, and this module is the gpui
-//! shell around it.
+//! GGO Emulator panel (F3 tasks E1/E2): an embedded `ggo-emu` -- cart
+//! picker, Run/Stop, live 320x240 video, keyboard -> pad input, a live
+//! stats row, a diagnostic console, and an end-of-run perf ingest into
+//! `~/.ggo/ggo_ide.db`. The emulation itself is `ggo-emu-core` verbatim;
+//! [`drive`] ports the standalone binary's drive loop
+//! (`ggo-emu/src/lib.rs::run_cart` + `src/native.rs`) onto a background
+//! thread, and this module is the gpui shell around it.
+//!
+//! # End of run
+//!
+//! Stop, a cart exit, a CPU fault and a Run-over-a-running-cart all funnel
+//! into one place ([`EmuPanel::finish_run`]), which hands the session to a
+//! background task: [`drive::Session::wait`] joins the emulator thread and
+//! collects its perf snapshot plus the run's console lines, and
+//! [`ingest`] writes them into the SAME `cart`/`run`/`frame`/`uart` tables
+//! `ggo_charts_panel` reads back. That replaces ggo-ide's CLI-chained
+//! `ggo-emu --perf` -> `ggo_ide.db` step with a native one; run a cart
+//! here, and it is in the charts panel's picker the moment it stops.
 //!
 //! Structural mirror of `ggo_world_panel`/`ggo_metasprite_panel`/
 //! `ggo_charts_panel`: `Panel` impl, `ToggleFocus`, `observe_new`
@@ -47,15 +59,20 @@
 
 mod carts;
 mod drive;
+mod ingest;
 mod input;
+mod stats;
+mod uart;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
-    KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, Pixels, Render, RenderImage, Styled,
-    Subscription, Task, WeakEntity, Window, actions, div, img, px,
+    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, Pixels, Render,
+    RenderImage, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
+    actions, div, img, px,
 };
 use ui::prelude::*;
 use ui::{ContextMenu, DropdownMenu, Tooltip};
@@ -63,8 +80,10 @@ use util::ResultExt as _;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
-use drive::{EmuMsg, Session};
+use drive::{Frame, Session};
 use input::InputState;
+use stats::RunStats;
+use uart::UartLog;
 
 actions!(
     ggo_emu,
@@ -90,6 +109,20 @@ const KEY_CONTEXT: &str = "GgoEmuPanel";
 /// (the same call the other three GGO panels made). Wide enough for the
 /// 320px screen plus the dock's padding.
 const DEFAULT_WIDTH: Pixels = px(360.);
+
+/// How many of the newest console lines the expanded console shows.
+/// `ggo-ide`'s `pages/emulator.rs::LIVE_CONSOLE_TAIL_LINES` verbatim, for
+/// its reason: this is deliberately far smaller than
+/// [`uart::UART_LOG_CAP`] (2000, the full window the ingest receives),
+/// because re-laying-out a couple of thousand text elements on every
+/// `render` -- i.e. up to sixty times a second while a cart runs -- would
+/// be real, needless cost for a debugging aid nobody reads that fast.
+/// `UartLog::peek_tail` drains nothing, so this bounds only what is SHOWN.
+const LIVE_CONSOLE_TAIL_LINES: usize = 100;
+
+/// Height of the console's scroll region when expanded -- ggo-ide's
+/// `CONSOLE_HEIGHT`, itself a port of `EmulatorPage.tsx`'s `max-h-64`.
+const CONSOLE_HEIGHT: Pixels = px(200.);
 
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
@@ -147,6 +180,38 @@ enum LoadState {
     Ready(Vec<String>),
 }
 
+/// The end-of-run perf ingest's state, shown under the transport.
+/// Mirrors `ggo-ide`'s `pages/emulator.rs::IngestStatus`, minus its
+/// "View in Reports" navigation button (this fork's charts panel is a
+/// separate dock panel with its own picker, not a route to push).
+#[derive(Debug, Clone, PartialEq)]
+enum IngestStatus {
+    /// Nothing has finished yet.
+    Idle,
+    /// The run never reached a single `vsync_wait`, so there is nothing
+    /// worth a `run` row -- ggo-ide's identical "no frames recorded"
+    /// guard, which is also what keeps a cart that fails to load from
+    /// writing an empty run.
+    NoFrames,
+    Uploading,
+    Done(i64),
+    Failed(String),
+}
+
+impl IngestStatus {
+    fn label(&self) -> Option<String> {
+        match self {
+            IngestStatus::Idle => None,
+            IngestStatus::NoFrames => Some("no frames recorded — nothing ingested".into()),
+            IngestStatus::Uploading => Some("ingesting perf diagnostics…".into()),
+            IngestStatus::Done(run_id) => Some(format!(
+                "perf run #{run_id} ingested — see the GGO Charts panel"
+            )),
+            IngestStatus::Failed(e) => Some(format!("perf ingest failed: {e}")),
+        }
+    }
+}
+
 pub struct EmuPanel {
     focus_handle: FocusHandle,
     position: DockPosition,
@@ -154,6 +219,12 @@ pub struct EmuPanel {
     /// Test hook: bypass workspace worktree discovery
     /// (`ggo_world_panel::root_override`'s analog).
     root_override: Option<PathBuf>,
+    /// Test hook: ingest into this database instead of `~/.ggo/ggo_ide.db`
+    /// -- `ggo_charts_panel`'s `db_path_override`, same name, same reason.
+    /// Load-bearing here rather than merely convenient: without it, any
+    /// test that ran a real cart to completion would write a `run` row
+    /// into the developer's actual database.
+    db_path_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
     state: LoadState,
     /// Index into the `LoadState::Ready` list. Held as a rel path rather
@@ -169,8 +240,9 @@ pub struct EmuPanel {
     /// The running emulator, if any. Dropping it signals the thread to
     /// stop (see [`Session::stop`]).
     session: Option<Session>,
-    /// Pumps [`EmuMsg`]s from the emulator thread onto the UI thread.
-    /// Dropped together with `session`.
+    /// Pumps [`Frame`]s from the emulator thread onto the UI thread. Its
+    /// completion (the emulator thread dropping its sender) is also how
+    /// the panel learns a run ended on its own.
     _pump_task: Option<Task<()>>,
     /// Last run's exit/error line, shown under the transport.
     status: Option<String>,
@@ -179,6 +251,19 @@ pub struct EmuPanel {
     frame: u32,
     /// Latched pad mask, published into the session on every change.
     input: InputState,
+
+    /// fps / dropped frames / step cost for the current run.
+    stats: RunStats,
+    /// When the current FPS window opened. Lives here rather than in
+    /// [`RunStats`] so all of that module's math stays pure.
+    fps_window_started: Instant,
+    /// The current (or most recent) run's diagnostic log. Kept after the
+    /// run ends -- in cart mode the interesting lines are written on the
+    /// way out, so blanking the console at that moment would hide exactly
+    /// what the user wants to read.
+    console: Option<UartLog>,
+    console_expanded: bool,
+    ingest_status: IngestStatus,
 
     /// The frame to paint. `None` before the first frame of a run.
     latest_frame: Option<Arc<RenderImage>>,
@@ -228,6 +313,7 @@ impl EmuPanel {
             position: DockPosition::Right,
             workspace,
             root_override: None,
+            db_path_override: None,
             project_root: None,
             state: LoadState::Empty,
             selected: None,
@@ -239,6 +325,11 @@ impl EmuPanel {
             status: None,
             frame: 0,
             input: InputState::default(),
+            stats: RunStats::default(),
+            fps_window_started: Instant::now(),
+            console: None,
+            console_expanded: false,
+            ingest_status: IngestStatus::Idle,
             latest_frame: None,
             current_rendered_frame: None,
             previous_rendered_frame: None,
@@ -319,61 +410,133 @@ impl EmuPanel {
         self.stop(window, cx);
 
         let (session, rx) = drive::start(root.join(&cart), cart);
+        self.console = Some(session.uart().clone());
         self.session = Some(session);
         self.status = None;
         self.frame = 0;
+        self.stats = RunStats::default();
+        self.fps_window_started = Instant::now();
+        self.ingest_status = IngestStatus::Idle;
         self._pump_task = Some(cx.spawn(async move |this, cx| {
-            while let Ok(msg) = rx.recv().await {
+            while let Ok(frame) = rx.recv().await {
                 if this
-                    .update(cx, |this, cx| this.on_emu_msg(msg, cx))
+                    .update(cx, |this, cx| this.on_frame(frame, cx))
                     .is_err()
                 {
                     return;
                 }
             }
+            // The emulator thread dropped its sender: the run is over on
+            // its own terms (cart exit, CPU fault, or a stop flag it has
+            // now acted on). There is no terminal message on the wire --
+            // the close IS the message. See `drive::start`'s doc.
+            this.update(cx, |this, cx| this.finish_run(cx)).ok();
         }));
         cx.notify();
     }
 
-    fn on_emu_msg(&mut self, msg: EmuMsg, cx: &mut Context<Self>) {
-        match msg {
-            EmuMsg::Frame { bgra, frame } => {
-                self.frame = frame;
-                // `from_raw` takes the Vec by value: the emulator thread
-                // already produced BGRA, so this is a move, not a copy.
-                let Some(buffer) = image::ImageBuffer::from_raw(drive::WIDTH, drive::HEIGHT, bgra)
-                else {
-                    return;
-                };
-                self.latest_frame =
-                    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
-            }
-            EmuMsg::Ended(reason) => {
-                self.status = Some(reason);
-                // The thread is already gone; just drop the handles so
-                // the transport flips back to Run. The last frame stays
-                // on screen (and stays retired normally by
-                // `retire_atlas_frames`) -- a run that ends shouldn't
-                // blank the pane.
-                self.session = None;
-                self._pump_task = None;
-                self.input.clear();
-            }
+    fn on_frame(&mut self, frame: Frame, cx: &mut Context<Self>) {
+        self.frame = frame.number;
+        if self.stats.on_frame(
+            frame.number,
+            frame.step_ms,
+            self.fps_window_started.elapsed(),
+        ) {
+            self.fps_window_started = Instant::now();
+        }
+        // `from_raw` takes the Vec by value: the emulator thread
+        // already produced BGRA, so this is a move, not a copy.
+        if let Some(buffer) = image::ImageBuffer::from_raw(drive::WIDTH, drive::HEIGHT, frame.bgra)
+        {
+            self.latest_frame = Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
         }
         cx.notify();
     }
 
-    /// Tear the run down: signal the thread (which drops the core on its
-    /// way out), drop the pump task, release the pad, and hand every
-    /// atlas tile the pane still owns back to the window -- no further
-    /// render will come to retire them through the double buffer.
+    /// The single end-of-run path: Stop, a cart exit, a CPU fault, and a
+    /// Run over a still-running cart all arrive here.
+    ///
+    /// Takes the session (so the transport flips back to Run immediately)
+    /// and hands it to a background task, because both halves of the work
+    /// block: [`Session::wait`] joins the emulator thread, and
+    /// [`ingest::ingest_run`] opens and writes a SQLite database. Neither
+    /// may touch the UI thread.
+    ///
+    /// No idempotence guard is needed here -- unlike ggo-ide, whose Stop
+    /// click and terminal frame could both fire for one run and write two
+    /// duplicate `run` rows. `self.session.take()` IS the guard: the
+    /// second caller for the same run finds `None` and returns.
+    fn finish_run(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        self.input.clear();
+        self.ingest_status = IngestStatus::Uploading;
+        cx.notify();
+
+        // The rel path, as the run's `label` column -- the free-text run
+        // identity the charts panel's picker shows next to the cart name.
+        // ggo-ide passes `None` here only because neither of its run
+        // sources has an identity to attach; this pane always knows which
+        // file it ran.
+        let label = session.cart.clone();
+        let db_path_override = self.db_path_override.clone();
+        let finish = cx.background_spawn(async move {
+            let finished = session.wait();
+            let status = match &finished.perf {
+                // ggo-ide's "no frames recorded (cart never reached
+                // vsync)" guard, and the only case for a cart that failed
+                // to load: writing a zero-frame run row would just be
+                // noise in the charts picker.
+                None => IngestStatus::NoFrames,
+                Some(perf) if perf.frames == 0 => IngestStatus::NoFrames,
+                Some(perf) => match db_path_override.or_else(ingest::default_db_path) {
+                    None => IngestStatus::Failed("no HOME to resolve ~/.ggo".into()),
+                    Some(db_path) => match ingest::ingest_run(
+                        &db_path,
+                        &perf.perf_json,
+                        &finished.uart,
+                        Some(&label),
+                    ) {
+                        Ok(run) => IngestStatus::Done(run.run_id),
+                        Err(e) => IngestStatus::Failed(e),
+                    },
+                },
+            };
+            (finished.reason, status)
+        });
+        cx.spawn(async move |this, cx| {
+            let (reason, status) = finish.await;
+            this.update(cx, |this, cx| {
+                this.status = Some(reason);
+                this.ingest_status = status;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stop the run and blank the pane: signal the thread (which drops the
+    /// core on its way out), release the pad, and hand every atlas tile
+    /// the pane still owns back to the window -- no further render will
+    /// come to retire them through the double buffer. The run's perf
+    /// snapshot and console lines are collected off-thread by
+    /// [`Self::finish_run`].
     fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.session.is_none() && self.latest_frame.is_none() {
             return;
         }
-        self.session = None;
+        // Drop the pump BEFORE finishing: it owns the frame receiver, and
+        // dropping that is what makes the emulator thread's next
+        // `try_send` fail closed instead of publishing one more frame
+        // into a pane that has just been blanked (and re-populating the
+        // atlas slots `release_atlas_all` is about to hand back). Safe to
+        // do from here because `stop` is only ever a user action -- the
+        // pump's own completion path calls `finish_run` directly, never
+        // this, so nothing drops the task from inside itself.
         self._pump_task = None;
-        self.input.clear();
+        self.finish_run(cx);
         self.release_atlas_all(window);
         cx.notify();
     }
@@ -565,6 +728,74 @@ impl EmuPanel {
             .bg(cx.theme().colors().panel_background)
             .into_any_element()
     }
+
+    /// The live counters row -- `ggo-ide`'s `State::status_text` fps /
+    /// drops / step-time triple. Only shown once a run has produced a
+    /// frame; an all-zero row before that is noise.
+    fn render_stats(&self) -> Option<gpui::AnyElement> {
+        (self.frame > 0 || self.stats.dropped > 0).then(|| {
+            Label::new(self.stats.label())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
+        })
+    }
+
+    /// The run's diagnostic console: a collapsed one-line toggle, and a
+    /// scrollable tail when expanded. Ported from `ggo-ide`'s
+    /// `State::console_view` (which is itself the native port of
+    /// `EmulatorPage.tsx`'s "Console (N lines)" panel), including its
+    /// always-available-but-collapsed default and its
+    /// [`LIVE_CONSOLE_TAIL_LINES`] cap on what gets laid out.
+    ///
+    /// See [`uart`]'s module doc for the honest scope of this in cart
+    /// mode: `ggo-emu-core` has no host-visible guest-UART channel for a
+    /// `.cart` run, so these are the driver's own per-run diagnostics --
+    /// which is exactly what ggo-ide's cart runner shows too.
+    fn render_console(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let log = self.console.as_ref()?;
+        if log.is_empty() {
+            return None;
+        }
+        // The header counts every line the run has logged (and that the
+        // ingest will carry); the body lays out only the newest
+        // `LIVE_CONSOLE_TAIL_LINES` of them.
+        let total = log.len();
+        let lines = log.peek_tail(LIVE_CONSOLE_TAIL_LINES);
+        let arrow = if self.console_expanded { "▾" } else { "▸" };
+        let toggle = Button::new(
+            "ggo-emu-console",
+            format!("{arrow} Console ({total} lines)"),
+        )
+        .label_size(LabelSize::XSmall)
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.console_expanded = !this.console_expanded;
+            cx.notify();
+        }));
+
+        let body = self.console_expanded.then(|| {
+            v_flex()
+                .id("ggo-emu-console-lines")
+                .max_h(CONSOLE_HEIGHT)
+                .overflow_y_scroll()
+                .px_1()
+                .children(lines.into_iter().map(|line| {
+                    Label::new(line)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .into_any_element()
+                }))
+        });
+
+        Some(
+            v_flex()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(toggle)
+                .children(body)
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for EmuPanel {
@@ -600,11 +831,22 @@ impl Render for EmuPanel {
             ))
             .child(self.render_transport(window, cx))
             .child(div().flex_1().min_h_0().child(self.render_screen(cx)))
+            .children(self.render_stats())
             .children(self.status.as_ref().map(|status| {
                 Label::new(status.clone())
                     .size(LabelSize::Small)
                     .color(Color::Muted)
             }))
+            .children(self.ingest_status.label().map(|label| {
+                Label::new(label).size(LabelSize::XSmall).color(
+                    if matches!(self.ingest_status, IngestStatus::Failed(_)) {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    },
+                )
+            }))
+            .children(self.render_console(cx))
     }
 }
 
@@ -909,48 +1151,97 @@ mod tests {
         });
     }
 
-    /// The `Ended` half of the pump: a run that dies clears the session
-    /// (so Stop stops being offered) and surfaces its reason.
-    ///
-    /// Note what is NOT tested here: driving a real cart through
-    /// `EmuPanel::run`'s real emulator thread. gpui's test scheduler
-    /// panics with "Detected activity on thread ... your test is not
-    /// deterministic" the moment a foreign thread wakes a task on it, and
-    /// the whole point of `drive::start` is that it runs on a foreign
-    /// thread. That path is covered instead by `drive`'s own plain
-    /// `#[test]`s, which drive the hand-assembled cart end to end without
-    /// a gpui window; what is left for this side is the message handling,
-    /// which is exactly what this and the atlas tests below exercise.
+    /// A run that dies clears the session (so Stop stops being offered),
+    /// surfaces its reason, and reports what happened to the ingest --
+    /// here, a cart that never loaded, which has no frames to write.
     #[gpui::test]
     async fn test_an_ended_run_reports_and_clears_the_session(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
         let (panel, cx) = windowed_panel(cx);
-        // A session whose thread has already failed and exited. Nothing
-        // awaits the receiver, so no foreign-thread wake can reach the
-        // test scheduler.
         let (session, rx) = drive::start("/definitely/not/here.cart".into(), "gone.cart".into());
+        drop(rx);
         panel.update(cx, |panel, cx| {
             panel.session = Some(session);
             assert!(panel.is_running());
-
-            panel.on_emu_msg(EmuMsg::Ended("cart exited with 0".to_string()), cx);
+            panel.finish_run(cx);
             assert!(!panel.is_running(), "an ended run clears the session");
-            assert_eq!(panel.status.as_deref(), Some("cart exited with 0"));
         });
-        drop(rx);
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("here.cart")),
+                "{:?}",
+                panel.status
+            );
+            assert_eq!(
+                panel.ingest_status,
+                IngestStatus::NoFrames,
+                "a cart that never loaded has nothing to ingest"
+            );
+        });
     }
 
     /// An ended run leaves its last frame on screen rather than blanking
     /// the pane -- the opposite of Stop.
     #[gpui::test]
     async fn test_an_ended_run_keeps_its_last_frame(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
         let (panel, cx) = windowed_panel(cx);
         push_frame_and_draw(&panel, cx, 1);
         panel.update(cx, |panel, cx| {
-            panel.on_emu_msg(EmuMsg::Ended("cart exited with 0".to_string()), cx);
+            panel.finish_run(cx);
             assert!(
                 panel.latest_frame.is_some(),
                 "the final frame must stay on screen"
             );
+        });
+    }
+
+    /// The stats row folds every delivered frame in, and hides itself
+    /// before a run has produced one.
+    #[gpui::test]
+    async fn test_the_stats_row_tracks_frames_and_drops(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.render_stats().is_none(),
+                "no stats row before the first frame"
+            );
+        });
+        push_frame_and_draw(&panel, cx, 1);
+        // Frame 4 next: two frames were dropped in between.
+        push_frame_and_draw(&panel, cx, 4);
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.stats.dropped, 2);
+            assert_eq!(panel.frame, 4);
+            assert!(panel.render_stats().is_some());
+        });
+    }
+
+    /// The console is hidden until something is logged, collapsed by
+    /// default, and toggles.
+    #[gpui::test]
+    async fn test_the_console_appears_with_content_and_toggles(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        panel.update_in(cx, |panel, _window, cx| {
+            assert!(
+                panel.render_console(cx).is_none(),
+                "no console before a run"
+            );
+            let log = uart::UartLog::new();
+            panel.console = Some(log.clone());
+            assert!(
+                panel.render_console(cx).is_none(),
+                "an empty log renders nothing rather than an empty box"
+            );
+            log.push_line("[run] green.cart");
+            assert!(panel.render_console(cx).is_some());
+            assert!(!panel.console_expanded, "collapsed by default");
+            panel.console_expanded = true;
+            assert!(panel.render_console(cx).is_some(), "expanded also renders");
         });
     }
 
@@ -982,7 +1273,14 @@ mod tests {
     ) -> Arc<RenderImage> {
         let bgra = vec![0x7Fu8; (drive::WIDTH * drive::HEIGHT * 4) as usize];
         let image = panel.update(cx, |panel, cx| {
-            panel.on_emu_msg(EmuMsg::Frame { bgra, frame: n }, cx);
+            panel.on_frame(
+                Frame {
+                    bgra,
+                    number: n,
+                    step_ms: 1.0,
+                },
+                cx,
+            );
             panel
                 .latest_frame
                 .clone()
@@ -1077,6 +1375,118 @@ mod tests {
             assert!(panel.current_rendered_frame.is_none());
             assert!(panel.previous_rendered_frame.is_none());
         });
+    }
+
+    /// **The panel <-> emulator-thread seam, end to end.** E1's report
+    /// claimed this could not be written, on the grounds that gpui's test
+    /// scheduler panics ("Detected activity on thread ...") as soon as a
+    /// foreign thread wakes a task on it. That was wrong:
+    /// `cx.executor().allow_parking()` sets `parking_allowed_once`, and
+    /// `scheduler::test_scheduler::assert_correct_thread` returns early on
+    /// that flag (`test_scheduler.rs:492-495`) -- which is exactly what
+    /// every other test in this repo that talks to a real thread relies
+    /// on. Parking also makes `block` wait on real time and advance the
+    /// test clock by however long it parked (`test_scheduler.rs:445-450`),
+    /// so a real 60 Hz emulator can drive a real panel here.
+    ///
+    /// So this drives the hand-assembled green cart through the WHOLE
+    /// production path -- `EmuPanel::run` -> `drive::start`'s OS thread ->
+    /// the bounded frame channel -> the `cx.spawn` pump -> `on_frame` ->
+    /// `render` -> the window's sprite atlas -- and checks the pixels that
+    /// come out the far end are the green the cart actually painted.
+    #[gpui::test]
+    async fn test_a_real_cart_drives_the_panel_end_to_end(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+            panel.refresh_carts(cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.selected.as_deref(), Some("green.cart"));
+        });
+
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        assert!(panel.read_with(cx, |panel, _| panel.is_running()));
+
+        // Wait for a genuine frame off the emulator thread. The loop is
+        // bounded so a broken pump fails the test instead of hanging it
+        // (and the scheduler's own 15 s park ceiling backs that up).
+        let mut waited = std::time::Duration::ZERO;
+        let step = std::time::Duration::from_millis(10);
+        while panel.read_with(cx, |panel, _| panel.latest_frame.is_none()) {
+            assert!(
+                waited < std::time::Duration::from_secs(10),
+                "no frame reached the panel from the emulator thread"
+            );
+            cx.executor().timer(step).await;
+            cx.executor().run_until_parked();
+            waited += step;
+        }
+
+        let image = panel.read_with(cx, |panel, _| panel.latest_frame.clone().unwrap());
+        let bytes = image.as_bytes(0).expect("a single-frame RenderImage");
+        assert_eq!(
+            bytes.len(),
+            (drive::WIDTH * drive::HEIGHT * 4) as usize,
+            "one BGRA8 pixel per screen pixel"
+        );
+        assert!(
+            bytes
+                .chunks_exact(4)
+                .all(|px| px == [0x00, 0xFF, 0x00, 0xFF]),
+            "every pixel must be the RGB565 0x07E0 backdrop the cart set, \
+             expanded to full-range BGRA -- this is the cart's own output, \
+             through the real PPU compose and the real conversion"
+        );
+
+        // ...and it really reaches the window's atlas when painted.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(320.), px(240.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.update(|window, _| window.has_image_atlas_entry(&image)),
+            "the painted frame must be resident in the sprite atlas"
+        );
+
+        // Tear down through the real Stop path, and let the (overridden)
+        // ingest land so no thread outlives the test.
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert!(!panel.is_running());
+            assert_eq!(panel.status.as_deref(), Some("stopped"));
+            assert!(
+                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                "a run with frames must have ingested: {:?}",
+                panel.ingest_status
+            );
+        });
+
+        // The run really is in the database the charts panel reads --
+        // through that panel's own query function.
+        let db_path = dir.path().join("ggo_ide.db");
+        let runs = ggo_charts_panel::loader::list_runs(&db_path).unwrap();
+        assert_eq!(runs.len(), 1, "one run row for one run");
+        assert_eq!(runs[0].cart_name, drive::fixture::GREEN_CART_TITLE);
+        assert_eq!(runs[0].label.as_deref(), Some("green.cart"));
+        let samples = ggo_charts_panel::loader::load_run_samples(&db_path, runs[0].id).unwrap();
+        assert!(
+            !samples.frames.is_empty(),
+            "the run's perf frames must be readable by the charts panel"
+        );
     }
 
     /// Stop with nothing running is a no-op that doesn't blank anything

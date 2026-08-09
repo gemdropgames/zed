@@ -13,16 +13,29 @@ path = "src/ggo_emu_panel.rs"
 
 [dependencies]
 async-channel.workspace = true
+ggo-db.workspace = true # GGO -- the ggo_ide.db schema/migrations, shared with ggo-ide + the charts panel
+ggo-emu-core.workspace = true # GGO
 gpui.workspace = true
 image.workspace = true
 keymap_editor.workspace = true
 project.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# Same pure-Rust SQLite engine ggo-db's migrate() takes a connection from.
+# Mirrors ggo_charts_panel's Cargo.toml (and ggo-ide's own): the ingest
+# binds 37 parameters via `turso::params_from_iter`, which needs the type
+# directly rather than a bespoke ggo-db method.
+turso = "0.7"
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
-ggo-emu-core.workspace = true # GGO
 
 [dev-dependencies]
+# The read side of the very schema this crate writes -- the ingest
+# round-trip test reads its rows back through the charts panel's OWN
+# `list_runs`/`load_run_samples`, so a disagreement between the two panels
+# fails a test instead of silently producing runs the picker can't see.
+ggo_charts_panel.workspace = true # GGO
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
