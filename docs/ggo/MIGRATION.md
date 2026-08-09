@@ -1,6 +1,7 @@
 # ggo-ide → fork: feature disposition audit
 
-Date: 2026-08-08 (end of F3). Fork branch `ggo`.
+Date: 2026-08-08 (end of F3), rows amended 2026-08-09 (end of F4: explorer-driven
+panel routing + the read-only tileset viewer). Fork branch `ggo`.
 
 What this is: a row for **every** user-facing ggo-ide feature, and what — if
 anything — answers it in the fork today. It exists so nobody has to guess
@@ -66,7 +67,7 @@ covered by the fork at all.
 
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
-| Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; each GGO panel has its own asset picker | partial | Generic file search, not asset-typed sections with extension badges. |
+| Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; clicking a `.spr`/`.til`/world `.toml` there routes directly into its GGO panel (F4) | partial | Generic file search, not asset-typed sections with extension badges. The in-panel pickers this row used to credit are gone — see the Assets/World picker rows and Known deferrals for what explorer-driven routing does and doesn't cover. |
 | Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | none | deferred | No CLI exists for them and no panel affordance was built; the file tree can delete but not create the `.spr`/`.til`/`.pal` trio. |
 | New tileset / new map | none | deferred | Same — no CLI, no panel. |
 | Files tree (create folder, delete file/dir, extension badges) | Zed project panel | partial | Create/delete/rename exist; the GGO extension badges do not. |
@@ -78,7 +79,7 @@ covered by the fork at all.
 | Preview panel (1:1 live frame, background picker, LCD filter) | metasprite panel centre preview | partial | Live composed frame with aspect fit shipped; checker/black/white background picker and the LCD scanline filter did not. |
 | Hardware budget meter (4 traffic-light rows + tooltips) | metasprite panel `hw_meter_line` | partial | Same four value/cap pairs from worldlib `sprites::hw`, condensed into one header line — no per-row dots or tooltips. |
 | Per-cell tile assignment from the pool | metasprite panel tile palette + preview cell click | ✓ | |
-| Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | none | dropped | Pixel editing; same scope call as the sprite editor. |
+| Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | `ggo_tileset_panel` — read-only overview grid + 16-slot palette swatch row, integer zoom 1x-8x | partial | Viewing shipped (F4): routed off a `.til` click in the project panel, no in-panel picker. Pencil/fill/eyedropper, palette slot editing, append/duplicate/delete-last and the cols setting are all still dropped — this is a viewer, not the editor ggo-ide had; do not read it as more than that. |
 | Map editor (`.map`): tileset binding, multi-tile stamp, H/V flip, palSub, brush/rect-fill/eraser/eyedropper, grid, zoom, resize | none | dropped | Same. Maps still *render* in the world panel as backgrounds/tilemaps. |
 | PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | none | deferred | T1 checked `tools/*/Cargo.toml` and the feature inventory: **there is no import CLI**, so `.zed/tasks.json` deliberately ships no import task rather than inventing one. The wizard is ggo-ide-only until a CLI exists. |
 | Legacy `.meta.json` sidecar import | none | dropped | One-shot migration aid for a format generation that is already past. |
@@ -89,7 +90,7 @@ covered by the fork at all.
 
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
-| World file picker (list + open) | world panel picker over `worlds/**.toml` | ✓ | |
+| World file picker (list + open) | Zed project panel (browse `worlds/**/*.toml`) + click-to-open, routed by `ggo_world_panel::intercept_world_open` into the docked panel | ✓ | Explorer-driven since F4 — the in-panel picker was removed; list+open is now the project panel plus the interceptor-routed open, which also runs `prepare_to_close_dirty` before switching documents. |
 | "+ New world" (snake_case validated, overwrite confirm) | none | deferred | Carried on the F2 gap list. worldlib can `write_world`; the panel has no create affordance. |
 | Delete world (confirm + rescan) | none | deferred | Same gap list entry. |
 | Canvas rendering: sprites, metasprites (per-clip), tilemaps, text, rect fills, transform markers, instance gizmos, merged backgrounds, error placeholders, selection outline | world panel `canvas` + `loader` (worldlib compose / `build_draw_list`) | ✓ | |
@@ -212,10 +213,16 @@ edit and `emd` is a command you run.
 | Status | Rows |
 |---|---|
 | ✓ | 31 |
-| partial | 28 |
+| partial | 29 |
 | deferred | 31 |
-| dropped | 13 |
+| dropped | 12 |
 | **total** | **103** |
+
+(F4 wrap: the `.til` tileset-editor row moved dropped → partial now that
+`ggo_tileset_panel` ships a read-only viewer. Before F4: ✓ 31 / partial 28 /
+deferred 31 / dropped 13. The sprite/world-picker rows also changed *text*
+(explorer-driven instead of in-panel pickers) but not *status* — both were
+already ✓/partial and stay there.)
 
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
@@ -277,3 +284,26 @@ guards and follow-ups that someone has to pick up:
 - **Glob duplicated between the fork and the repo.** `ggo_language`'s
   `PROJECT_FILE_TYPE_GLOB` and the ggo repo's `.zed/settings.json` `file_types`
   entry must agree, and nothing checks that they do across the two repos.
+- **Explorer-driven routing is project-panel-only (F4).** `cmd-p` file finder,
+  go-to-definition, drag-and-drop, the `zed <path>` CLI, and session restore
+  all call `Workspace::open_path_preview`/`open_paths` directly, bypassing
+  `Workspace::intercept_path_open` — opening a `.spr`/`.til`/world `.toml`
+  through any of them yields a dead editor tab instead of routing into its
+  panel. Named upgrade path: option 2 in
+  `.superpowers/sdd/explorer-routing-investigation.md` (hooking inside
+  `open_path_preview` itself, `workspace.rs:4713`), not taken because
+  `cx: &mut App` there forces a fake `Task` return (toast or leak) instead of
+  a clean decline.
+- **`grid_cols` clamp diverges from ggo-ide's flat 8-column tileset layout.**
+  `ggo_tileset_panel`'s fallback (`GRID_COLS_FALLBACK(8).min(tile_count.max(1))`)
+  clamps a short tileset to its own tile count instead of padding out to a
+  full 8-wide row of blanks, so a sheet under 8 tiles lays out differently
+  than ggo-ide renders the same file. Deliberate (documented on the fn); noted
+  here because it is a visible rendering difference, not just an internal one.
+- **Linux fallback-prompt race.** A second file click while a
+  `prepare_to_close_dirty` save prompt is already up silently replaces the
+  first prompt with the second; the first resolves to Cancel with no data
+  loss (the document that would have closed just stays open and dirty), but
+  it vanishes without the user explicitly dismissing it. Structurally hard to
+  test in-tree (platform prompt stacking); carried forward from X1 fix
+  round 1 rather than fixed.
