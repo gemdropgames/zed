@@ -733,13 +733,41 @@ impl MetaSpritePanel {
         }
     }
 
+    /// A preview click DURING playback pauses the transport and adopts
+    /// its shown frame as the selection FIRST, so the click edits the
+    /// frame the user actually saw -- not the stale pre-playback
+    /// selection (M6 review fix-forward). A no-op when not playing.
+    fn pause_playback_on_edit(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(playing) = open.playing.take() else {
+            return;
+        };
+        open._tick_task = None;
+        open.selected_frame = playing.frame;
+        cx.notify();
+    }
+
+    /// The preview's left-click body (the mouse listener adds only the
+    /// focus grab): pause-and-sync if playing, THEN map the click to a
+    /// cell edit -- reviewer-specified order, M6 fix-forward.
+    fn on_preview_click(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        self.pause_playback_on_edit(cx);
+        if let Some(cell) = self.preview_cell_at(position) {
+            self.set_tile_on_cell(cell, cx);
+        }
+    }
+
     /// Click a cell of the selected-frame preview with a tile active:
     /// repoint that cell at the tile (`DocOp::FrameTileSet`, M1's op)
     /// through the same `apply_doc` path as every other edit -- undo,
     /// thumbnail recompose, and error surfacing come with it. Targets the
-    /// SELECTED frame (the transport keeps playing; its shown frame isn't
-    /// what's being edited). No-tile-selected and unchanged-cell clicks
-    /// are dropped without an op (M5's undo-stack hygiene rule).
+    /// SELECTED frame -- which, on a click during playback, was just
+    /// synced to the transport's shown frame by
+    /// [`Self::pause_playback_on_edit`]. No-tile-selected and
+    /// unchanged-cell clicks are dropped without an op (M5's undo-stack
+    /// hygiene rule).
     fn set_tile_on_cell(&mut self, cell: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
@@ -1194,9 +1222,10 @@ impl MetaSpritePanel {
     /// The big center preview: the shown frame fit into a [`PREVIEW_PX`]
     /// box. An invisible overlay canvas records the image's on-screen
     /// bounds at prepaint (world_panel's `last_bounds` idiom -- gpui
-    /// mouse listeners only get window coords), and a left click with an
-    /// active tile maps through `tiles::cell_at` to a `FrameTileSet` on
-    /// the SELECTED frame.
+    /// mouse listeners only get window coords), and a left click goes
+    /// through [`Self::on_preview_click`]: pause-and-sync any running
+    /// transport, then (with an active tile) map through
+    /// `tiles::cell_at` to a `FrameTileSet` on the selected frame.
     fn render_preview(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_preview is only called in the Ready state");
@@ -1235,9 +1264,7 @@ impl MetaSpritePanel {
                             // Take focus so Escape/undo bindings apply
                             // (and any in-flight field edit blur-commits).
                             window.focus(&this.focus_handle, cx);
-                            if let Some(cell) = this.preview_cell_at(event.position) {
-                                this.set_tile_on_cell(cell, cx);
-                            }
+                            this.on_preview_click(event.position, cx);
                         }),
                     ),
             );
@@ -2249,6 +2276,72 @@ mod tests {
             );
             assert_eq!(panel.preview_cell_at(gpui::point(px(9.), px(20.))), None);
             assert_eq!(panel.preview_cell_at(gpui::point(px(250.), px(20.))), None);
+        });
+    }
+
+    /// M6 fix-forward: a preview click while the transport is running
+    /// pauses it, adopts the transport's SHOWN frame as the selection,
+    /// and only then maps the click -- so the edit lands on the frame
+    /// the user saw, not the stale pre-playback selection (which here
+    /// would have been silently dropped as a same-tile click).
+    #[gpui::test]
+    async fn test_preview_click_during_playback_pauses_and_edits_shown_frame(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Tile 0 active; frame 0 selected (map [0] -- a click on it
+            // would be a same-tile no-op); the transport is showing
+            // frame 1 (map [1]).
+            panel.select_tile(0, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selected_frame = 0;
+                open.playing = Some(Playing {
+                    started: Instant::now(),
+                    start_offset_ms: 0,
+                    frame: 1,
+                });
+            }
+            *ready(panel).preview_bounds.borrow_mut() = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(240.), px(240.)),
+            ));
+
+            panel.on_preview_click(gpui::point(px(10.), px(10.)), cx);
+            {
+                let open = ready(panel);
+                assert!(open.playing.is_none(), "the click pauses the transport");
+                assert!(open._tick_task.is_none(), "the tick loop is dropped");
+                assert_eq!(
+                    open.selected_frame, 1,
+                    "selection adopts the transport's shown frame"
+                );
+                assert_eq!(
+                    open.store.state().frames[1].map,
+                    vec![0],
+                    "the edit hit the DISPLAYED frame"
+                );
+                assert_eq!(
+                    open.store.state().frames[0].map,
+                    vec![0],
+                    "the stale pre-playback selection is untouched"
+                );
+                assert_eq!(open.shown_frame(), 1, "preview stays on the edited frame");
+            }
+
+            // Not playing: the same click path edits the selected frame
+            // directly (undo the playback edit first so the cell click
+            // isn't a same-tile drop).
+            panel.undo_impl(cx);
+            panel.select_frame(1, cx);
+            panel.on_preview_click(gpui::point(px(10.), px(10.)), cx);
+            assert_eq!(
+                ready(panel).store.state().frames[1].map,
+                vec![0],
+                "a click with no transport running still edits the selected frame"
+            );
         });
     }
 
