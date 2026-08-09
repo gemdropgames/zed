@@ -348,9 +348,11 @@ fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
 ggo-asset-formats = { path = "../ggo/sdk/ggo-asset-formats" } # GGO
 ggo-db = { path = "../ggo/tools/ggo-db" } # GGO
+ggo-emu-core = { path = "../ggo/tools/ggo-emu-core" } # GGO
 ggo-worldlib = { path = "../ggo/tools/ggo-worldlib" } # GGO
 ggo_charts_panel = { path = "crates/ggo/charts_panel" } # GGO
 ggo_common = { path = "crates/ggo/common" } # GGO
+ggo_emu_panel = { path = "crates/ggo/emu_panel" } # GGO
 ggo_hello = { path = "crates/ggo/hello" } # GGO
 ggo_metasprite_panel = { path = "crates/ggo/metasprite_panel" } # GGO
 ggo_world_panel = { path = "crates/ggo/world_panel" } # GGO

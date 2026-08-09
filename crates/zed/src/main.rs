@@ -775,6 +775,7 @@ fn main() {
         csv_preview::init(cx);
         svg_preview::init(cx);
         ggo_charts_panel::init(cx); // GGO
+        ggo_emu_panel::init(cx); // GGO
         ggo_hello::init(cx); // GGO
         ggo_metasprite_panel::init(cx); // GGO
         ggo_world_panel::init(cx); // GGO
