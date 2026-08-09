@@ -8,8 +8,8 @@
 //! `canvas::paint_scene`).
 
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Hsla, Path as GpuiPath, Pixels, Point, SharedString,
-    TextAlign, TextRun, Window, bounds, fill, outline, point, px, size,
+    App, BorderStyle, Bounds, ContentMask, Hsla, Path as GpuiPath, PathBuilder, Pixels, Point,
+    SharedString, TextAlign, TextRun, Window, bounds, fill, outline, point, px, size,
 };
 use ui::prelude::*;
 
@@ -23,6 +23,7 @@ pub struct Palette {
     pub text: Hsla,
     pub surface: Hsla,
     pub budget: Hsla,
+    pub accent: Hsla,
 }
 
 impl Palette {
@@ -32,6 +33,10 @@ impl Palette {
             grid: colors.border_variant,
             text: colors.text_muted,
             surface: colors.editor_background,
+            // Histogram bars. iced's `palette.primary.base.color` (what
+            // `histogram.rs` fills with) is the theme's primary brand
+            // accent; `text_accent` is that role here.
+            accent: colors.text_accent,
             // The dashed reference line reads as "you are over your
             // budget" -- ggo-ide uses iced's `palette.danger.base.color`
             // for it, and this is that role in Zed's theme.
@@ -75,7 +80,8 @@ fn resolve(color: ChartColor, palette: &Palette) -> Hsla {
         ChartColor::Surface => palette.surface,
         ChartColor::Budget => palette.budget,
         ChartColor::Series(rgb) => hsla_from_rgb(rgb),
-        ChartColor::SeriesAlpha(rgb, alpha) => hsla_from_rgb(rgb).opacity(alpha),
+        ChartColor::Accent => palette.accent,
+        ChartColor::AccentAlpha(alpha) => palette.accent.opacity(alpha),
         ChartColor::Band(rgb) => mix(hsla_from_rgb(rgb), palette.surface, BAND_FILL_SERIES_WEIGHT),
     }
 }
@@ -255,19 +261,39 @@ fn ribbon_path(
     path
 }
 
-/// A closed filled polygon (a stacked band) as a triangle fan from its
-/// first vertex -- what `Path::line_to` builds internally.
+/// A closed filled polygon (a stacked band), tessellated by lyon through
+/// [`PathBuilder::fill`].
+///
+/// DO NOT rewrite this as `GpuiPath::new(..)` + `line_to` (the way
+/// [`ribbon_path`]'s siblings and `ggo_world_panel::canvas` build their
+/// shapes). `Path::line_to` emits `push_triangle((start, current, to))`
+/// -- a triangle FAN anchored at the first vertex -- which is only
+/// correct for a polygon that is star-shaped from that vertex. A stacked
+/// band between two sampled curves is not: any dip in a cumulative
+/// series gets bridged by the fan, and since path rasterization blends
+/// solid vertices at alpha 1.0, those outside triangles paint fully
+/// opaque -- a concave band renders as its convex hull. Concretely, a
+/// top edge of (0,50) -> (10,90) -> (20,50) over a baseline at y=100
+/// paints the whole 50px-tall column when the true band is 10px tall at
+/// x=10. ggo-ide never hit this because iced's `frame.fill` runs a real
+/// fill rule (lyon), which is exactly what `PathBuilder::fill` restores
+/// here. Pinned by `polygon_path_fills_only_the_concave_band`.
+///
+/// `None` for a degenerate outline, or if tessellation fails (lyon
+/// rejects non-finite coordinates) -- a chart drops the band rather than
+/// panicking mid-paint.
 fn polygon_path(points: &[(f32, f32)], origin: Point<Pixels>) -> Option<GpuiPath<Pixels>> {
     let (first, rest) = points.split_first()?;
     if rest.len() < 2 {
         return None;
     }
-    let mut path = GpuiPath::new(to_point(*first, origin));
+    let mut builder = PathBuilder::fill();
+    builder.move_to(to_point(*first, origin));
     for p in rest {
-        path.line_to(to_point(*p, origin));
+        builder.line_to(to_point(*p, origin));
     }
-    path.line_to(to_point(*first, origin));
-    Some(path)
+    builder.close();
+    builder.build().ok()
 }
 
 /// `(on, off)`-patterned sub-segments of `a -> b`, for the dashed budget
@@ -394,6 +420,78 @@ mod tests {
         let (nx, ny) = normal(point(px(0.), px(0.)), point(px(10.), px(0.)), 2.0).unwrap();
         assert_eq!((nx, ny), (0.0, 1.0));
         assert!(normal(point(px(1.), px(1.)), point(px(1.), px(1.)), 2.0).is_none());
+    }
+
+    /// Total area of a built path's triangles. A proper fill tessellates
+    /// into non-overlapping triangles, so this equals the polygon's own
+    /// area; a triangle FAN over a concave polygon covers (and paints)
+    /// more than that.
+    fn painted_area(path: &GpuiPath<Pixels>) -> f32 {
+        path.vertices
+            .chunks_exact(3)
+            .map(|t| {
+                let (a, b, c) = (t[0].xy_position, t[1].xy_position, t[2].xy_position);
+                let (ax, ay) = (f32::from(a.x), f32::from(a.y));
+                let (bx, by) = (f32::from(b.x), f32::from(b.y));
+                let (cx, cy) = (f32::from(c.x), f32::from(c.y));
+                ((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)).abs() / 2.0
+            })
+            .sum()
+    }
+
+    /// The regression `polygon_path`'s doc describes: a stacked band with
+    /// a dip in it must paint only the band, not its convex hull.
+    ///
+    /// Band = top edge (0,50) -> (10,90) -> (20,50), baseline y=100
+    /// (screen coords, y down). True area = 300 + 300 = 600 px^2
+    /// (two trapezoids of mean height 30 over width 10). The convex hull
+    /// of the same six vertices is the full 20x50 = 1000 px^2 column,
+    /// which is what the old `Path::line_to` fan painted.
+    #[test]
+    fn polygon_path_fills_only_the_concave_band() {
+        let band = [
+            (0.0, 50.0),
+            (10.0, 90.0),
+            (20.0, 50.0),
+            (20.0, 100.0),
+            (10.0, 100.0),
+            (0.0, 100.0),
+        ];
+        let path = polygon_path(&band, point(px(0.), px(0.))).expect("a 6-point band must build");
+        let area = painted_area(&path);
+        assert!(
+            (area - 600.0).abs() < 1.0,
+            "expected the band's own 600px^2, painted {area}px^2 \
+             (1000 would mean the concave dip was bridged by a fan)"
+        );
+    }
+
+    /// The dip vertex itself has to reach the tessellator: a band whose
+    /// interior vertices were dropped would also measure "600-ish" for
+    /// some other shape, so pin the geometry too.
+    #[test]
+    fn polygon_path_keeps_the_interior_vertices() {
+        let band = [
+            (0.0, 50.0),
+            (10.0, 90.0),
+            (20.0, 50.0),
+            (20.0, 100.0),
+            (10.0, 100.0),
+            (0.0, 100.0),
+        ];
+        let path = polygon_path(&band, point(px(0.), px(0.))).unwrap();
+        assert!(
+            path.vertices
+                .iter()
+                .any(|v| f32::from(v.xy_position.x) == 10.0 && f32::from(v.xy_position.y) == 90.0),
+            "the dip vertex (10, 90) must survive tessellation"
+        );
+    }
+
+    #[test]
+    fn polygon_path_rejects_a_degenerate_outline() {
+        assert!(polygon_path(&[], point(px(0.), px(0.))).is_none());
+        assert!(polygon_path(&[(0.0, 0.0), (1.0, 1.0)], point(px(0.), px(0.))).is_none());
     }
 
     /// Mixing two reds must stay red -- the reason `mix` blends through

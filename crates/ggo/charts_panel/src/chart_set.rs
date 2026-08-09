@@ -133,12 +133,23 @@ fn histogram(title: &str, name: &str, frames: &[FrameRow], get: fn(&FrameRow) ->
 
 /// Drops the ignored frames (currently just frame 0) --
 /// `reports.rs`'s `ignore::apply`.
-pub fn apply_ignore(frames: &[FrameRow]) -> Vec<FrameRow> {
+fn apply_ignore(frames: &[FrameRow]) -> Vec<FrameRow> {
     frames
         .iter()
         .filter(|f| f.n != DEFAULT_IGNORED_FRAME)
         .cloned()
         .collect()
+}
+
+/// How many of `frames` the ignore filter drops -- the panel captions
+/// this ("1 frame ignored") so a user isn't left wondering why the x-axis
+/// starts at 1. ggo-ide surfaces the same fact through its chip editor,
+/// which this panel doesn't have yet.
+pub fn ignored_count(frames: &[FrameRow]) -> usize {
+    frames
+        .iter()
+        .filter(|f| f.n == DEFAULT_IGNORED_FRAME)
+        .count()
 }
 
 /// `reports.rs`'s `ignore::apply_profile`.
@@ -436,6 +447,18 @@ mod tests {
                 "Instructions per frame",
             ]
         );
+    }
+
+    #[test]
+    fn ignored_count_reports_what_the_filter_drops() {
+        assert_eq!(ignored_count(&plain_samples().frames), 1);
+        let no_frame_zero: Vec<FrameRow> = plain_samples()
+            .frames
+            .into_iter()
+            .filter(|f| f.n != 0)
+            .collect();
+        assert_eq!(ignored_count(&no_frame_zero), 0);
+        assert_eq!(ignored_count(&[]), 0);
     }
 
     #[test]

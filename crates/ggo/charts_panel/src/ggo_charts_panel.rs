@@ -123,7 +123,19 @@ enum DetailState {
     /// Charts already assembled from the loaded samples (`chart_set`), so
     /// the assembly happens once per selection rather than once per
     /// render. Empty when the run had no plottable frames.
-    Ready(Vec<ChartSpec>),
+    ///
+    /// `Rc`, not a bare `ChartSpec`: `render_chart`'s prepaint closure is
+    /// `'static` and so has to OWN whatever it reads, and a spec holds one
+    /// `Vec<f32>` per series over the whole run -- deep-cloning all
+    /// thirteen charts' worth on every render (i.e. on every hover
+    /// mouse-move) is ~8 MB of memcpy per frame at ingest's 100,000-frame
+    /// cap. Sharing the `Rc` makes that a refcount bump.
+    Ready {
+        charts: Vec<Rc<ChartSpec>>,
+        /// How many frames the default ignore filter dropped, so the
+        /// header can say so -- see `chart_set::ignored_count`.
+        ignored: usize,
+    },
     Error(String),
 }
 
@@ -214,7 +226,13 @@ impl ChartsPanel {
                     return;
                 }
                 this.detail = Some(match result {
-                    Ok(samples) => DetailState::Ready(chart_set::build_charts(&samples)),
+                    Ok(samples) => DetailState::Ready {
+                        ignored: chart_set::ignored_count(&samples.frames),
+                        charts: chart_set::build_charts(&samples)
+                            .into_iter()
+                            .map(Rc::new)
+                            .collect(),
+                    },
                     Err(e) => DetailState::Error(e),
                 });
                 cx.notify();
@@ -240,9 +258,9 @@ impl ChartsPanel {
     /// needs the other arms' messages anyway), so this exists purely so a
     /// test can assert the chart set and build scenes without a window.
     #[cfg(test)]
-    fn chart_specs(&self) -> &[ChartSpec] {
+    fn chart_specs(&self) -> &[Rc<ChartSpec>] {
         match &self.detail {
-            Some(DetailState::Ready(charts)) => charts,
+            Some(DetailState::Ready { charts, .. }) => charts,
             _ => &[],
         }
     }
@@ -350,11 +368,11 @@ impl ChartsPanel {
             // An explicit message, never a blank canvas: a run with no
             // frames (a cart that never reached vsync_wait) and a run
             // whose only frame is the ignored frame 0 both land here.
-            Some(DetailState::Ready(charts)) if charts.is_empty() => self.render_message(
+            Some(DetailState::Ready { charts, .. }) if charts.is_empty() => self.render_message(
                 "No frames recorded for this run (cart never reached vsync_wait).",
                 cx,
             ),
-            Some(DetailState::Ready(charts)) => {
+            Some(DetailState::Ready { charts, .. }) => {
                 self.chart_bounds.borrow_mut().resize(charts.len(), None);
                 v_flex()
                     .id("ggo-charts-list")
@@ -390,19 +408,42 @@ impl ChartsPanel {
                                 this.clear_selection(cx);
                             })),
                     )
-                    .child(Label::new(title).size(LabelSize::Small)),
+                    .child(Label::new(title).size(LabelSize::Small))
+                    .children(self.ignored_caption()),
             )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
 
+    /// `"1 frame ignored"` when the default ignore filter dropped
+    /// anything. ggo-ide surfaces the same fact through a chip editor
+    /// that lets a user change the set; this panel has no editor yet, so
+    /// without a caption a user just sees an x-axis that starts at 1 with
+    /// no explanation. Read-only for now -- the editor is the follow-up.
+    fn ignored_caption(&self) -> Option<Label> {
+        let Some(DetailState::Ready { ignored, .. }) = &self.detail else {
+            return None;
+        };
+        let n = *ignored;
+        if n == 0 {
+            return None;
+        }
+        let plural = if n == 1 { "frame" } else { "frames" };
+        Some(
+            Label::new(format!("{n} {plural} ignored"))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+    }
+
     fn render_chart(
         &self,
         ix: usize,
-        spec: &ChartSpec,
+        spec: &Rc<ChartSpec>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let title = SharedString::from(spec.title.clone());
+        // Refcount bump, not a deep clone -- see `DetailState::Ready`.
         let spec = spec.clone();
         let hover = self.hover.filter(|h| h.chart == ix).map(|h| (h.x, h.y));
         let palette = chart_paint::Palette::from_theme(cx);
@@ -443,11 +484,22 @@ impl ChartsPanel {
                     .rounded_sm()
                     .overflow_hidden()
                     .child(canvas)
-                    .on_mouse_move(cx.listener(
-                        move |this, event: &MouseMoveEvent, _window, cx| {
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
                             this.hover_chart(ix, event.position, cx);
-                        },
-                    )),
+                        }),
+                    )
+                    // `on_mouse_move` is hitbox-gated, so it never fires
+                    // once the cursor leaves this chart -- moving into the
+                    // gap between charts, onto the header, or off the
+                    // panel entirely would otherwise leave the crosshair
+                    // and readout pinned where the cursor last was.
+                    // `on_hover(false)` is the only signal for that.
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                        if !*hovered {
+                            this.clear_hover(ix, cx);
+                        }
+                    })),
             )
             .into_any_element()
     }
@@ -455,6 +507,16 @@ impl ChartsPanel {
     /// Window-space cursor -> canvas-local hover on chart `ix`. A move
     /// outside the recorded bounds clears the hover rather than pinning a
     /// stale readout.
+    ///
+    /// Every hover change `cx.notify()`s, which re-renders ALL of the
+    /// run's charts, each rebuilding its scene from scratch
+    /// (`accumulate`/`bins`/`envelope` over the full sample set). That is
+    /// fine at the frame counts a normal capture produces and it is what
+    /// keeps the render path stateless, but it is O(charts x frames) per
+    /// mouse-move frame and would bite at ingest's 100,000-frame cap.
+    /// The upgrade, if a real run ever makes this visible: memoize each
+    /// chart's scene keyed by `(canvas size, hover)` so a hover move only
+    /// rebuilds the chart actually under the cursor.
     fn hover_chart(&mut self, ix: usize, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let bounds = self.chart_bounds.borrow().get(ix).copied().flatten();
         let next = bounds.filter(|b| b.contains(&position)).map(|b| Hover {
@@ -464,6 +526,17 @@ impl ChartsPanel {
         });
         if self.hover != next {
             self.hover = next;
+            cx.notify();
+        }
+    }
+
+    /// Drops the hover if (and only if) chart `ix` currently owns it --
+    /// the guard matters because hover-end on the chart being left can
+    /// arrive AFTER hover-start on the chart being entered, which would
+    /// otherwise clear the new chart's fresh readout.
+    fn clear_hover(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.hover.is_some_and(|h| h.chart == ix) {
+            self.hover = None;
             cx.notify();
         }
     }
@@ -934,6 +1007,59 @@ mod tests {
         });
     }
 
+    /// `on_mouse_move` is hitbox-gated, so leaving a chart (into the gap
+    /// between charts, the header, or off the panel) fires no move event
+    /// at all -- only the hover-end signal, which must drop the readout
+    /// rather than leave the crosshair pinned. The cross-chart guard
+    /// matters too: hover-end on the chart being LEFT can arrive after
+    /// hover-start on the chart being ENTERED, and must not clear the
+    /// new chart's fresh readout.
+    #[gpui::test]
+    async fn test_hover_end_clears_only_the_chart_that_owned_the_hover(cx: &mut TestAppContext) {
+        use gpui::{point, size};
+
+        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let origin = point(px(600.), px(120.));
+        panel.update(cx, |panel, cx| {
+            let len = panel.chart_specs().len();
+            {
+                let mut slots = panel.chart_bounds.borrow_mut();
+                slots.resize(len, None);
+                slots[0] = Some(gpui::bounds(origin, size(px(344.), px(240.))));
+            }
+            panel.hover_chart(0, point(px(700.), px(220.)), cx);
+            assert!(panel.hover.is_some());
+
+            // Hover-end from a DIFFERENT chart must leave chart 0's
+            // readout alone.
+            panel.clear_hover(1, cx);
+            assert!(
+                panel.hover.is_some(),
+                "another chart's hover-end must not clear this one's readout"
+            );
+
+            // Hover-end from the owning chart drops it.
+            panel.clear_hover(0, cx);
+            assert!(panel.hover.is_none());
+        });
+    }
+
+    /// The header caption that explains why the x-axis starts at 1.
+    #[gpui::test]
+    async fn test_the_ignored_frame_count_is_captioned(cx: &mut TestAppContext) {
+        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                matches!(&panel.detail, Some(DetailState::Ready { ignored, .. }) if *ignored == 1),
+                "the fixture seeds frame 0, which the default filter drops"
+            );
+            assert!(
+                panel.ignored_caption().is_some(),
+                "a dropped frame must be captioned"
+            );
+        });
+    }
+
     /// A run whose only frame is the default-ignored frame 0 reaches
     /// `Ready` with an EMPTY chart set -- the panel's explicit
     /// "no frames recorded" message, never a blank canvas.
@@ -942,7 +1068,7 @@ mod tests {
         let (_dir, panel) = ready_detail_panel(cx, 0).await;
         panel.update(cx, |panel, _cx| {
             assert!(
-                matches!(&panel.detail, Some(DetailState::Ready(charts)) if charts.is_empty()),
+                matches!(&panel.detail, Some(DetailState::Ready { charts, .. }) if charts.is_empty()),
                 "expected Ready with no charts"
             );
         });

@@ -56,8 +56,16 @@ pub enum ChartColor {
     Budget,
     /// A series' own color, at full opacity.
     Series(Rgb),
-    /// A series' color at reduced opacity (histogram bars' resting state).
-    SeriesAlpha(Rgb, f32),
+    /// The theme's primary accent -- histogram bars. `Histogram.tsx` (and
+    /// `histogram.rs`) fill bars from `palette.primary.base.color` and the
+    /// widget takes no series color at all, unlike the line/stacked
+    /// charts, so this stays theme-derived rather than borrowing the
+    /// metric's fixed series hue.
+    Accent,
+    /// The theme's accent at reduced opacity -- a histogram bar's resting
+    /// state, so the hovered bar's full-opacity redraw reads as a "lift"
+    /// (`Histogram.tsx`'s `opacity={hover() === i() ? 1 : 0.85}`).
+    AccentAlpha(f32),
     /// A series' color softened toward the surface -- `StackedArea.tsx`'s
     /// `color-mix(in oklab, <series> 72%, var(--surface))` band fill,
     /// blended by the painter (which is the only layer that knows what
@@ -506,6 +514,15 @@ pub const MAX_PLOT_POINTS: usize = 2048;
 /// one-frame budget overrun is exactly the sample a user is looking for,
 /// and stride sampling is free to drop it. Returns `points` unchanged
 /// when it is already short enough.
+///
+/// Known, accepted imprecision: the first and last points are NOT pinned.
+/// Each bucket contributes its own extremes, and index 0 / index n-1 are
+/// only among them by luck, so a series longer than `max_points` can
+/// start and end up to one bucket short of the plot edges -- at the 2048
+/// cap that is at most ~0.05% of the x range, i.e. sub-pixel at this
+/// panel's widths. Pinning them would be two extra pushes, but it also
+/// makes the output length `max_points + 2`; not worth the special case
+/// until something visibly clips.
 pub fn envelope(points: &[(f32, f32)], max_points: usize) -> Vec<(f32, f32)> {
     let buckets = max_points / 2;
     if points.len() <= max_points || buckets == 0 {
@@ -1094,11 +1111,13 @@ fn build_histogram(
             h: (plot.bottom() - y_top).max(0.0),
         };
         // Bars rest translucent so the hovered one reads as a "lift" --
-        // `Histogram.tsx`'s `opacity={hover() === i() ? 1 : 0.85}`.
+        // `Histogram.tsx`'s `opacity={hover() === i() ? 1 : 0.85}`. The
+        // bar color is the theme accent, not `series.color`: see
+        // `ChartColor::Accent`.
         let color = if hovered == Some(i) {
-            ChartColor::Series(series.color)
+            ChartColor::Accent
         } else {
-            ChartColor::SeriesAlpha(series.color, BAR_BASE_ALPHA)
+            ChartColor::AccentAlpha(BAR_BASE_ALPHA)
         };
         scene.primitives.push(Primitive::Quad { rect, color });
     }
@@ -1680,6 +1699,60 @@ mod tests {
         assert!(bars > 0, "at least one bar must be painted");
         // A histogram has no legend band and no "frame" caption.
         assert!(!text_contents(&scene).contains(&"frame"));
+    }
+
+    /// Bars are the THEME accent, not the metric's fixed series hue --
+    /// `Histogram.tsx`/`histogram.rs` fill from
+    /// `palette.primary.base.color` and their widget takes no series
+    /// color at all. The resting bars are the translucent variant so the
+    /// hovered one lifts.
+    #[test]
+    fn histogram_bars_use_the_theme_accent_not_the_series_color() {
+        let spec = ChartSpec {
+            title: "i_misses distribution".to_string(),
+            kind: ChartKind::Histogram,
+            x: Vec::new(),
+            series: vec![SeriesSpec {
+                name: "i_misses".to_string(),
+                color: Rgb(0x4a8fe3),
+                values: vec![1.0, 1.0, 2.0, 3.0],
+            }],
+        };
+        let scene = build_chart_scene(&spec, CANVAS, None);
+        let bar_colors: Vec<ChartColor> = scene
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Quad { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert!(!bar_colors.is_empty());
+        assert!(
+            bar_colors
+                .iter()
+                .all(|c| matches!(c, ChartColor::AccentAlpha(_))),
+            "un-hovered bars must be the translucent accent, got {bar_colors:?}"
+        );
+
+        // The hovered bar lifts to the full-opacity accent.
+        let plot = plot_rect(CANVAS, HISTOGRAM_MARGINS, 0.0);
+        let slot_w = plot.w / bins(&[1.0, 1.0, 2.0, 3.0], HISTOGRAM_BIN_TARGET).len() as f32;
+        let hovered = build_chart_scene(
+            &spec,
+            CANVAS,
+            Some((plot.x + slot_w * 0.5, plot.y + plot.h / 2.0)),
+        );
+        assert!(
+            hovered.primitives.iter().any(|p| matches!(
+                p,
+                Primitive::Quad {
+                    color: ChartColor::Accent,
+                    ..
+                }
+            )),
+            "the hovered bar must paint at full accent opacity"
+        );
     }
 
     /// The empty/degenerate guards: no samples, or a canvas too small for
