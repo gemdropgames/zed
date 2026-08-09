@@ -539,6 +539,19 @@ impl WorldPanel {
         cx.notify();
     }
 
+    /// The open world's display path when it has unsaved edits, else
+    /// `None`. Drives both the close guard and (indirectly) the title's
+    /// dirty dot.
+    fn dirty_world_name(&self) -> Option<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        open.store
+            .state()
+            .dirty
+            .then(|| open.listing.rel_path.clone())
+    }
+
     /// The current camera transform, if the canvas has laid out.
     fn canvas_view(&self) -> Option<View> {
         let ViewerState::Ready(open) = &self.state else {
@@ -1448,6 +1461,22 @@ impl Panel for WorldPanel {
         8
     }
 
+    /// The open world lives in panel state, not in a workspace `Item`, so
+    /// nothing else in the close flow knows it can be dirty. Prompt with
+    /// the same Save/Don't-Save/Cancel warning a dirty buffer gets; a
+    /// failed write cancels the close rather than dropping the edits.
+    fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        ggo_common::prepare_to_close_dirty(self.dirty_world_name(), window, cx, |this, cx| {
+            this.save_impl(cx);
+            match &this.state {
+                ViewerState::Ready(open) => open.save_error.is_none(),
+                // The panel can't have gone un-Ready between the prompt and
+                // here, but if it somehow did there is nothing left to lose.
+                _ => true,
+            }
+        })
+    }
+
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         if active {
             // Deferred: `set_active` fires inside the workspace's own
@@ -2150,5 +2179,175 @@ mod tests {
                 json!(0)
             );
         });
+    }
+
+    // ------------------------------------------- unsaved-document guard
+
+    /// Dirty the open world so the close guard has something to protect,
+    /// without going through the canvas.
+    fn dirty_the_world(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) {
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [50.0, 60.0],
+                    gesture: None,
+                },
+                cx,
+            );
+            assert!(
+                panel.dirty_world_name().is_some(),
+                "op should dirty the doc"
+            );
+        });
+    }
+
+    /// A clean panel must be invisible to the close flow: no prompt, and
+    /// the guard resolves `true` immediately.
+    #[gpui::test]
+    async fn test_close_guard_lets_a_clean_panel_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        assert!(
+            !cx.has_pending_prompt(),
+            "a clean world must not prompt on close"
+        );
+        assert!(close.await, "a clean panel must not block the close");
+    }
+
+    /// Cancel aborts the close and leaves the document dirty and unwritten
+    /// -- the data-loss guard proper.
+    #[gpui::test]
+    async fn test_close_guard_cancel_aborts_the_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_world(&panel, cx);
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        assert_eq!(
+            cx.pending_prompt().map(|(msg, _)| msg),
+            Some("worlds/test.toml contains unsaved edits. Do you want to save it?".to_string()),
+        );
+        cx.simulate_prompt_answer("Cancel");
+        assert!(!close.await, "Cancel must veto the close");
+
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.dirty_world_name().is_some(),
+                "Cancel must leave the edits in place"
+            );
+        });
+        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([4, 4]),
+            "Cancel must not have written the file"
+        );
+    }
+
+    /// Save writes through the panel's own save path and then allows the
+    /// close.
+    #[gpui::test]
+    async fn test_close_guard_save_writes_then_allows_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_world(&panel, cx);
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        cx.simulate_prompt_answer("Save");
+        assert!(close.await, "a successful save must allow the close");
+
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.dirty_world_name().is_none(), "save clears dirty");
+        });
+        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([50, 60]),
+            "Save must have written the edit"
+        );
+    }
+
+    /// "Don't Save" closes and deliberately drops the edits -- the file on
+    /// disk keeps its loaded contents.
+    #[gpui::test]
+    async fn test_close_guard_discard_allows_close_without_writing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_world(&panel, cx);
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        cx.simulate_prompt_answer("Don't Save");
+        assert!(close.await, "Don't Save must allow the close");
+
+        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([4, 4]),
+            "Don't Save must not write the file"
+        );
+    }
+
+    /// The wiring test: a dirty panel docked in a REAL workspace makes
+    /// `Workspace::prepare_to_close` (the single funnel for window close,
+    /// quit and restart) prompt and, on Cancel, report `false` -- which is
+    /// what `MultiWorkspace::close_window` and `zed::quit` honour.
+    #[gpui::test]
+    async fn test_dirty_panel_vetoes_workspace_prepare_to_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+
+        // Point the docked panel at the real temp project and open a world.
+        panel.update(cx, |panel, cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.refresh_worlds(cx);
+            let ix = panel
+                .worlds
+                .iter()
+                .position(|w| w.stem == "worlds/test")
+                .unwrap();
+            panel.select_world(ix, cx);
+        });
+        cx.run_until_parked();
+        dirty_the_world(&panel, cx);
+
+        let close = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prepare_to_close(workspace::CloseIntent::CloseWindow, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.has_pending_prompt(),
+            "the docked dirty panel must be polled by Workspace::prepare_to_close"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        assert!(
+            !close.await.unwrap(),
+            "Cancel in the panel guard must cancel the whole close"
+        );
     }
 }

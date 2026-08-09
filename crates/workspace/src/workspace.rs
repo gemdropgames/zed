@@ -3366,6 +3366,27 @@ impl Workspace {
                 }
             }
 
+            // GGO: dock panels can own unsaved documents that are not
+            // workspace items (the GGO world/metasprite editors keep their
+            // doc store in panel state), so `save_all_internal` below
+            // cannot see them. Poll every panel's `Panel::prepare_to_close`
+            // first; `false` cancels the close, exactly like a cancelled
+            // item save prompt.
+            let panels = this.read_with(cx, |this, cx| {
+                this.all_docks()
+                    .iter()
+                    .flat_map(|dock| dock.read(cx).panels().cloned().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })?;
+            for panel in panels {
+                if !cx
+                    .update(|window, cx| panel.prepare_to_close(window, cx))?
+                    .await
+                {
+                    return anyhow::Ok(false);
+                }
+            }
+
             // Hot-exit silently writes dirty buffers to the DB; only allow it
             // if the workspace will be reachable again, either via session
             // restore or by reopening its folder paths. Otherwise prompt, so

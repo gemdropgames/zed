@@ -1,14 +1,16 @@
-//! Shared helpers for GGO fork panels -- currently just the RGBA->BGRA
-//! `RenderImage` bridge (gpui's `RenderImage` frames are BGRA, see
-//! `gpui/src/assets.rs`'s "A cached and processed image, in BGRA format";
-//! worldlib composes straight-alpha RGBA, so only a channel swap is
-//! needed, no alpha unpremultiply). Deliberately depends on only `gpui`
-//! and `image` -- no worldlib dependency -- so any GGO panel can use it
-//! without pulling in world-doc types.
+//! Shared helpers for GGO fork panels: the RGBA->BGRA `RenderImage`
+//! bridge (gpui's `RenderImage` frames are BGRA, see `gpui/src/assets.rs`'s
+//! "A cached and processed image, in BGRA format"; worldlib composes
+//! straight-alpha RGBA, so only a channel swap is needed, no alpha
+//! unpremultiply), and the unsaved-document close guard shared by the
+//! world and metasprite panels. Deliberately depends on only `gpui` and
+//! `image` -- no worldlib and no `workspace` dependency (the latter would
+//! be a cycle: `workspace` is what calls the guard) -- so any GGO panel
+//! can use it without pulling in world-doc types.
 
 use std::sync::Arc;
 
-use gpui::RenderImage;
+use gpui::{Context, PromptLevel, RenderImage, Task, Window};
 use image::Frame;
 
 /// In-place RGBA8 -> BGRA8 (straight alpha in, straight alpha out --
@@ -32,6 +34,76 @@ pub fn to_render_image(rgba: &[u8], w: u32, h: u32) -> Option<Arc<RenderImage>> 
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
 }
 
+// ------------------------------------------------- unsaved-document guard
+
+/// What the user picked in the unsaved-document prompt raised by
+/// [`prepare_to_close_dirty`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseChoice {
+    /// Write the document, then close if the write succeeded.
+    Save,
+    /// Close without writing.
+    Discard,
+    /// Abort the close.
+    Cancel,
+}
+
+/// Map a `Window::prompt` answer index onto a [`CloseChoice`], for the
+/// `["Save", "Don't Save", "Cancel"]` button set `workspace`'s own dirty-item
+/// prompt uses (`workspace/src/pane.rs`, `Pane::save_item`). Anything that
+/// is not an explicit Save/Don't-Save -- Cancel, a dismissed dialog, a
+/// dropped channel -- is Cancel, which is the safe answer: it keeps the
+/// window (and the unsaved doc) alive. `pane.rs`'s `_ => return Ok(false)`
+/// arm makes the same call.
+pub fn close_choice(answer: Option<usize>) -> CloseChoice {
+    match answer {
+        Some(0) => CloseChoice::Save,
+        Some(1) => CloseChoice::Discard,
+        _ => CloseChoice::Cancel,
+    }
+}
+
+/// The prompt text for a dirty document named `name`, worded like
+/// `workspace/src/pane.rs`'s `dirty_message_for`.
+pub fn dirty_message(name: &str) -> String {
+    format!("{name} contains unsaved edits. Do you want to save it?")
+}
+
+/// The body of a GGO panel's `Panel::prepare_to_close`.
+///
+/// `dirty_name` is `Some(display name)` when the panel holds an unsaved
+/// document and `None` when it has nothing to lose -- a clean panel never
+/// prompts and never blocks. Otherwise this raises the same
+/// Save/Don't-Save/Cancel warning `Pane::save_item` raises for a dirty
+/// buffer, and resolves to `false` (cancel the close) on Cancel *and* on a
+/// failed save, so a write error can't silently discard the document.
+///
+/// `save` runs on the panel and returns whether the write succeeded.
+pub fn prepare_to_close_dirty<T: 'static>(
+    dirty_name: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    save: impl FnOnce(&mut T, &mut Context<T>) -> bool + 'static,
+) -> Task<bool> {
+    let Some(name) = dirty_name else {
+        return Task::ready(true);
+    };
+    let answer = window.prompt(
+        PromptLevel::Warning,
+        &dirty_message(&name),
+        None,
+        &["Save", "Don't Save", "Cancel"],
+        cx,
+    );
+    cx.spawn(
+        async move |this, cx| match close_choice(answer.await.ok()) {
+            CloseChoice::Save => this.update(cx, save).unwrap_or(false),
+            CloseChoice::Discard => true,
+            CloseChoice::Cancel => false,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +125,27 @@ mod tests {
         assert_eq!(
             rendered.as_bytes(0).unwrap(),
             &[0, 0, 255, 255, 255, 0, 0, 255]
+        );
+    }
+
+    /// The prompt's button order is `["Save", "Don't Save", "Cancel"]`, and
+    /// every non-answer (dismissed dialog, dropped channel, an index the
+    /// button list doesn't have) must fall back to Cancel -- the only
+    /// choice that can't lose the document.
+    #[test]
+    fn close_choice_maps_button_indices_and_fails_safe() {
+        assert_eq!(close_choice(Some(0)), CloseChoice::Save);
+        assert_eq!(close_choice(Some(1)), CloseChoice::Discard);
+        assert_eq!(close_choice(Some(2)), CloseChoice::Cancel);
+        assert_eq!(close_choice(Some(99)), CloseChoice::Cancel);
+        assert_eq!(close_choice(None), CloseChoice::Cancel);
+    }
+
+    #[test]
+    fn dirty_message_names_the_document() {
+        assert_eq!(
+            dirty_message("worlds/test.toml"),
+            "worlds/test.toml contains unsaved edits. Do you want to save it?"
         );
     }
 }

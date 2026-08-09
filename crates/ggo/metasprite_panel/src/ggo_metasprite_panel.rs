@@ -574,6 +574,15 @@ impl MetaSpritePanel {
         }
     }
 
+    /// The open sprite's display path when it has unsaved edits, else
+    /// `None`.
+    fn dirty_sprite_name(&self) -> Option<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        open.store.dirty().then(|| open.rel_path.clone())
+    }
+
     /// `save_sprite` -> `set_saved_state` with its fold-back result --
     /// worldlib's own save flow (ggo-ide `editor.rs` parity: the folded
     /// state silently replaces `current` WITHOUT an undo entry, so Ctrl+Z
@@ -1668,6 +1677,20 @@ impl Panel for MetaSpritePanel {
         9
     }
 
+    /// The open sprite lives in panel state, not in a workspace `Item`, so
+    /// nothing else in the close flow knows it can be dirty. Same guard as
+    /// `ggo_world_panel`: Save/Don't-Save/Cancel, and a failed write
+    /// cancels the close rather than dropping the edits.
+    fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        ggo_common::prepare_to_close_dirty(self.dirty_sprite_name(), window, cx, |this, cx| {
+            this.save_impl(cx);
+            match &this.state {
+                ViewerState::Ready(open) => open.save_error.is_none(),
+                _ => true,
+            }
+        })
+    }
+
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         if active {
             // Deferred: `set_active` fires inside the workspace's own
@@ -1904,6 +1927,162 @@ mod tests {
             ViewerState::Ready(open) => open,
             _ => panic!("expected Ready"),
         }
+    }
+
+    // ------------------------------------------- unsaved-document guard
+
+    /// Dirty the open sprite (retime frame 0) so the close guard has
+    /// something to protect.
+    fn dirty_the_sprite(panel: &Entity<MetaSpritePanel>, cx: &mut gpui::VisualTestContext) {
+        panel.update(cx, |panel, cx| {
+            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+            assert!(
+                panel.dirty_sprite_name().is_some(),
+                "op should dirty the doc"
+            );
+        });
+    }
+
+    /// Read frame 0's duration straight off disk -- the fixture writes
+    /// 100ms, [`dirty_the_sprite`] retimes it to 500ms in memory only.
+    fn on_disk_duration(root: &std::path::Path) -> u16 {
+        open_sprite(root, "sprites/hero.spr").unwrap().state.frames[0].duration_ms
+    }
+
+    /// A clean panel must be invisible to the close flow.
+    #[gpui::test]
+    async fn test_close_guard_lets_a_clean_panel_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        assert!(
+            !cx.has_pending_prompt(),
+            "a clean sprite must not prompt on close"
+        );
+        assert!(close.await, "a clean panel must not block the close");
+    }
+
+    /// Cancel aborts the close and leaves the document dirty and unwritten.
+    #[gpui::test]
+    async fn test_close_guard_cancel_aborts_the_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_sprite(&panel, cx);
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        assert_eq!(
+            cx.pending_prompt().map(|(msg, _)| msg),
+            Some("sprites/hero.spr contains unsaved edits. Do you want to save it?".to_string()),
+        );
+        cx.simulate_prompt_answer("Cancel");
+        assert!(!close.await, "Cancel must veto the close");
+
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.dirty_sprite_name().is_some(),
+                "Cancel must leave the edits in place"
+            );
+        });
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            100,
+            "Cancel must not have written the file"
+        );
+    }
+
+    /// Save writes through the panel's own save path and then allows the
+    /// close.
+    #[gpui::test]
+    async fn test_close_guard_save_writes_then_allows_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_sprite(&panel, cx);
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        cx.simulate_prompt_answer("Save");
+        assert!(close.await, "a successful save must allow the close");
+
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.dirty_sprite_name().is_none(), "save clears dirty");
+        });
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            500,
+            "Save must have written the edit"
+        );
+    }
+
+    /// "Don't Save" closes and deliberately drops the edits.
+    #[gpui::test]
+    async fn test_close_guard_discard_allows_close_without_writing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_sprite(&panel, cx);
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        cx.simulate_prompt_answer("Don't Save");
+        assert!(close.await, "Don't Save must allow the close");
+
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            100,
+            "Don't Save must not write the file"
+        );
+    }
+
+    /// The wiring test: a dirty panel docked in a REAL workspace makes
+    /// `Workspace::prepare_to_close` (the single funnel for window close,
+    /// quit and restart) prompt and, on Cancel, report `false`.
+    #[gpui::test]
+    async fn test_dirty_panel_vetoes_workspace_prepare_to_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<MetaSpritePanel>(cx)
+                .expect("init() adds the panel")
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.refresh_sprites(cx);
+            panel.select_sprite(0, cx);
+        });
+        cx.run_until_parked();
+        dirty_the_sprite(&panel, cx);
+
+        let close = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prepare_to_close(workspace::CloseIntent::CloseWindow, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.has_pending_prompt(),
+            "the docked dirty panel must be polled by Workspace::prepare_to_close"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        assert!(
+            !close.await.unwrap(),
+            "Cancel in the panel guard must cancel the whole close"
+        );
     }
 
     /// Clip CRUD round trip through the store: add with ggo-ide's
