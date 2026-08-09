@@ -1604,7 +1604,8 @@ mod tests {
     /// `Workspace::test_new`, because `register_action` handlers (like
     /// `ToggleFocus`) are only mounted into the dispatch tree once something
     /// renders `Workspace::actions`, which in production is
-    /// `MultiWorkspace`'s render (same lesson as ggo_hello's F0 test).
+    /// `MultiWorkspace`'s render (the lesson the F0 fork-wiring smoke test
+    /// taught, carried into every GGO panel's registration test since).
     #[gpui::test]
     async fn test_toggle_focus_opens_panel(cx: &mut TestAppContext) {
         cx.update(|cx| {

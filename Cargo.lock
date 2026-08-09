@@ -7578,16 +7578,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ggo_hello"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "project",
- "ui",
- "workspace",
-]
-
-[[package]]
 name = "ggo_language"
 version = "0.1.0"
 dependencies = [
@@ -24405,7 +24395,6 @@ dependencies = [
  "futures 0.3.32",
  "ggo_charts_panel",
  "ggo_emu_panel",
- "ggo_hello",
  "ggo_language",
  "ggo_metasprite_panel",
  "ggo_tileset_panel",

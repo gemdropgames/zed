@@ -6,7 +6,9 @@ Branches: `main` = pristine upstream mirror (never commit); `ggo` = ours (defaul
 ## Update procedure
     git checkout main && git pull upstream main && git push origin main
     git checkout ggo && git merge upstream/main --no-edit
-    cargo test -p ggo_hello && cargo check -p zed   # widen -p list as ggo crates grow
+    cargo test -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel \
+              -p ggo_charts_panel -p ggo_emu_panel -p ggo_language \
+              -p ggo_tileset_panel && cargo check -p zed   # all seven ggo crates
 Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
 
 ## Conflict policy
@@ -66,6 +68,13 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
 - Cadence: merge at least per upstream stable tag (~weekly).
 
 ## Measurements
+
+Entries below are a dated log and are **not** rewritten after the fact. Several
+mention `ggo_hello`, the F0 fork-wiring smoke crate: it was deleted on
+2026-08-09 (X4) once five real panels proved the same wiring, so any `-p
+ggo_hello` in an older line is history, not a command to run today. The current
+sweep is the seven-crate one in the update procedure above.
+
 - 2026-08-07 cold `cargo build -p zed`: 7m 54s
 - 2026-08-07 incremental rebuild after touching ggo_hello: 7.58s
 - pane smoke: headless gpui test added (test_open_hello_action); human visual run still welcome
@@ -77,3 +86,4 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
 - 2026-08-08 F3 wrap (C1-C2 charts panel, E1-E2 emu pane, L1 GGO World language, T1 `.zed` task layer, cleanup landed): `cargo test -p ggo_hello -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel -p ggo_charts_panel -p ggo_emu_panel -p ggo_language` = 3+5+37+41+95+76+15 = 272 passed, 0 failed; `cargo clippy` on all seven `--all-targets -- -D warnings` clean; `cargo fmt --check` clean; merge drill #4: `git rev-list --count ggo..upstream/main` = 0 (upstream/main still `08827f9208`, unchanged since drill #3) — no merge to exercise, `reload_keymaps` invariant re-verified intact (`crates/zed/src/zed.rs:2356`). Feature disposition audit vs ggo-ide: `docs/ggo/MIGRATION.md`.
 - 2026-08-09 merge drill #5 (F4 wrap, real): `git rev-list --count ggo..upstream/main` = 2 (`371a7d4ba2` editor cmd-click references fallback, `59b2ebf103` gpui `img` aspect-ratio fix — neither touches `workspace.rs`, `dock.rs`, or `project_panel.rs`); `git checkout main && git pull upstream main && git push origin main` fast-forward `08827f9208..371a7d4ba2`; `git checkout ggo && git merge upstream/main --no-edit` clean, 0 conflicts (`ort` strategy, 4 files outside `crates/ggo/*`); `reload_keymaps` invariant re-verified intact (still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed`, `crates/zed/src/zed.rs:2356`).
 - 2026-08-09 F4 wrap (X1-X3: explorer-driven panel routing, `ggo_tileset_panel` read-only `.til` viewer, docs + sweep), post-merge: `cargo test -p ggo_hello -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel -p ggo_charts_panel -p ggo_emu_panel -p ggo_language -p ggo_tileset_panel` = 3+5+43+46+95+76+15+13 = **296 passed, 0 failed** (all EIGHT ggo crates); `cargo clippy` on all eight `--all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `script/check-licenses` exit 0; `cargo check -p zed` clean; `cargo test -p workspace --lib` = 237 passed; `cargo test -p project_panel --lib` = 116 passed (both touched by X1's interceptor hooks). Feature disposition re-tally: `docs/ggo/MIGRATION.md` Counts, dropped → partial by one row (`.til` viewer).
+- 2026-08-09 F4 X4 (`.cart` explorer routing — the last in-panel picker removed; F4 final-review doc corrections; `ggo_hello` deleted): `cargo test -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel -p ggo_charts_panel -p ggo_emu_panel -p ggo_language -p ggo_tileset_panel` = 5+43+46+95+71+15+13 = **288 passed, 0 failed** (all SEVEN remaining ggo crates; `ggo_emu_panel` 76 → 71: −9 for the deleted enumeration/dropdown tests, +4 for routing); `cargo clippy -p ggo_emu_panel -p ggo_common --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `script/check-licenses` exit 0; `cargo check -p zed` clean (the real test of the `ggo_hello` de-registration); `cargo test -p workspace --lib` = 237 passed; `cargo test -p project_panel --lib` = 116 passed. New: `ggo_emu_panel`'s `test_project_panel_opened_entry_routes_a_cart_into_the_panel` enters at the REAL `project_panel` `Event::OpenedEntry` subscription — verified red by deleting the GGO guard, green with it. Feature disposition: no status moved, `MIGRATION.md` Counts unchanged.
