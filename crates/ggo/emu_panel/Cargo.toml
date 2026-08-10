@@ -15,7 +15,9 @@ path = "src/ggo_emu_panel.rs"
 async-channel.workspace = true
 ggo-db.workspace = true # GGO -- the ggo_ide.db schema/migrations, shared with ggo-ide + the charts panel
 ggo-emu-core.workspace = true # GGO
-ggo_common.workspace = true # GGO -- shared `default_db_path`, also with the charts panel
+ggo_charts_panel.workspace = true # GGO -- S4's Re-run entry hands the run it just ingested to that panel
+ggo_common.workspace = true # GGO -- shared `default_db_path` + the child-process runner, also with the charts/emerald panels
+ggo_world_panel.workspace = true # GGO -- S4's "Emulate this world" saves that panel's doc and reuses its world-path rule
 gpui.workspace = true
 image.workspace = true
 keymap_editor.workspace = true
@@ -32,11 +34,6 @@ util.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
-# The read side of the very schema this crate writes -- the ingest
-# round-trip test reads its rows back through the charts panel's OWN
-# `list_runs`/`load_run_samples`, so a disagreement between the two panels
-# fails a test instead of silently producing runs the picker can't see.
-ggo_charts_panel.workspace = true # GGO
 gpui = { workspace = true, features = ["test-support"] }
 path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }

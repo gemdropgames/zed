@@ -549,7 +549,7 @@ impl EmeraldPanel {
             cx.notify();
             return;
         }
-        let request = EmdRequest::new(project_dir, draft.args());
+        let request = EmdRequest::emd(project_dir, draft.args());
         let kind = draft.kind;
         let name = draft.name;
         self.run_state = RunState::Running {
@@ -1308,7 +1308,7 @@ mod tests {
         );
         expected.push("--json".to_string());
         assert_eq!(calls[0].args, expected);
-        assert_eq!(calls[0].project_dir, dir.path());
+        assert_eq!(calls[0].cwd, dir.path());
         drop(calls);
 
         assert!(

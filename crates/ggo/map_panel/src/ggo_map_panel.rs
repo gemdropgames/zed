@@ -95,11 +95,10 @@ const STRIP_HEIGHT: Pixels = px(104.);
 /// The map extension this panel claims from the file explorer.
 const MAP_EXT: &str = "map";
 
-/// The emerald manifest that marks a project root, and the assets
-/// subdirectory hanging off it. Both are hardcoded upstream -- the assets
-/// dir is NOT a configurable `emerald.toml` key. Same pair
-/// `ggo_sprite_panel` resolves a `.spr`'s sidecars with.
-const EMERALD_MANIFEST: &str = "emerald.toml";
+/// The assets subdirectory hanging off an emerald project root. Hardcoded
+/// upstream -- it is NOT a configurable `emerald.toml` key. Same constant
+/// `ggo_sprite_panel` resolves a `.spr`'s sidecars with; the project-root
+/// walk itself is `ggo_common::emerald_project_root`.
 const ASSETS_DIR: &str = "assets";
 
 /// Empty-state text. The panel has no picker of its own by design: maps
@@ -294,23 +293,16 @@ fn new_map_handler(
     })
 }
 
-/// Walk up from `dir` (inclusive) to the nearest emerald project root -- the
-/// nearest ancestor holding `emerald.toml`, mirroring emerald's
-/// `Project::discover` -- returning that project's `assets/` dir.
+/// Walk up from `dir` (inclusive) to the nearest emerald project root
+/// (`ggo_common::emerald_project_root`), returning that project's `assets/`
+/// dir.
 ///
 /// The `ggo_sprite_panel` twin takes a FILE and starts at its parent;
 /// this one takes a directory and starts at the directory itself, because
 /// "New Map…" is offered on `assets/` itself as well as on subdirectories.
 fn emerald_asset_root(dir: &Path) -> Option<PathBuf> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        if d.join(EMERALD_MANIFEST).is_file() {
-            let assets = d.join(ASSETS_DIR);
-            return assets.is_dir().then_some(assets);
-        }
-        cur = d.parent();
-    }
-    None
+    let assets = ggo_common::emerald_project_root(dir)?.join(ASSETS_DIR);
+    assets.is_dir().then_some(assets)
 }
 
 /// Is `dir` the asset root of an emerald project, or a directory under it?
@@ -1970,7 +1962,7 @@ mod tests {
     /// exactly that, so a regression in the fixture itself can't quietly
     /// make the panel's own tests meaningless.
     fn write_project(root: &Path) -> PathBuf {
-        std::fs::write(root.join(EMERALD_MANIFEST), "[project]\n").unwrap();
+        std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "[project]\n").unwrap();
         let assets = root.join(ASSETS_DIR);
         std::fs::create_dir_all(assets.join("tiles")).unwrap();
         std::fs::create_dir_all(assets.join("maps")).unwrap();

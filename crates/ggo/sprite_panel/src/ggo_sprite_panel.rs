@@ -173,25 +173,17 @@ const SPRITE_EXT: &str = "spr";
 /// sprites arrive by clicking a `.spr` in the project panel.
 const EMPTY_MESSAGE: &str = "Open a .spr file from the project panel";
 
-/// The emerald manifest that marks a project root, and the assets
-/// subdirectory hanging off it. Both are hardcoded upstream -- the assets dir
-/// is NOT a configurable `emerald.toml` key.
-const EMERALD_MANIFEST: &str = "emerald.toml";
+/// The assets subdirectory hanging off an emerald project root. Hardcoded
+/// upstream -- it is NOT a configurable `emerald.toml` key. The
+/// project-root walk itself is `ggo_common::emerald_project_root`.
 const ASSETS_DIR: &str = "assets";
 
 /// Walk up from the directory `dir` (inclusive) to the nearest emerald
-/// project root -- the nearest ancestor holding `emerald.toml`, mirroring
-/// emerald's `Project::discover` -- returning that project's `assets/` dir.
+/// project root (`ggo_common::emerald_project_root`), returning that
+/// project's `assets/` dir.
 fn asset_root_of_dir(dir: &Path) -> Option<PathBuf> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        if d.join(EMERALD_MANIFEST).is_file() {
-            let assets = d.join(ASSETS_DIR);
-            return assets.is_dir().then_some(assets);
-        }
-        cur = d.parent();
-    }
-    None
+    let assets = ggo_common::emerald_project_root(dir)?.join(ASSETS_DIR);
+    assets.is_dir().then_some(assets)
 }
 
 /// [`asset_root_of_dir`] for a FILE: start the walk at its parent.

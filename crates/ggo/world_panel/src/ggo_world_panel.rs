@@ -173,6 +173,24 @@ fn split_world_path(rel: &str) -> Option<(String, WorldListing)> {
     Some((rel[..cut].trim_end_matches('/').to_string(), listing))
 }
 
+/// The assets-root-relative world STEM a worktree-relative path names --
+/// `assets/worlds/main.toml` -> `worlds/main` -- or `None` when the path
+/// is not a world file at all.
+///
+/// This is the identity emerald itself uses for a world everywhere it
+/// names one: `emerald.toml`'s `default_world`, `[[instance]] world`, and
+/// `emd build/pack/pack-ggo --world <stem>` (which is sugar for setting
+/// `EMERALD_DEFAULT_WORLD`). Exported because `ggo_emu_panel`'s "Emulate
+/// this world" entry needs BOTH halves of what this module already knows
+/// -- the "is this a world?" predicate and the stem to bake in -- and a
+/// second copy of the `worlds/`-splitting rule over there is exactly the
+/// drift the fork's single-source rule exists to stop. It hands back a
+/// `String` rather than worldlib's `WorldListing` so the emu panel does
+/// not have to depend on worldlib for it.
+pub fn world_stem(rel: &str) -> Option<String> {
+    split_world_path(rel).map(|(_, listing)| listing.stem)
+}
+
 /// `workspace::PathOpenInterceptor` for `**/worlds/**/*.toml`: claim the
 /// path, open the panel, and load it. Declines (so the normal open path
 /// runs) for any other file, for a path outside the primary worktree, and
@@ -908,6 +926,26 @@ impl WorldPanel {
             // here, but if it somehow did there is nothing left to lose.
             _ => true,
         }
+    }
+
+    /// Write the open world if -- and only if -- it IS `rel` and has
+    /// unsaved edits; returns whether `rel` is on disk in the state the
+    /// user can see, i.e. `false` only when a needed write actually
+    /// failed.
+    ///
+    /// The "save" half of the emu panel's "Emulate this world": building a
+    /// cart from a world the user has edited but not written would boot
+    /// the stale file, silently. No prompt, unlike
+    /// [`ggo_common::prepare_to_close_dirty`] -- the user asked to run
+    /// THIS world, so writing it is the thing they asked for, and a
+    /// Save/Don't-Save dialog in front of a build is a click that can only
+    /// produce a wrong answer. A clean panel, a different world, or no
+    /// world open at all is a no-op `true`.
+    pub fn save_if_open_and_dirty(&mut self, rel: &str, cx: &mut Context<Self>) -> bool {
+        if self.dirty_world_name().as_deref() != Some(rel) {
+            return true;
+        }
+        self.save_for_close(cx)
     }
 
     /// The open world's display path when it has unsaved edits, else
@@ -2588,6 +2626,58 @@ mod tests {
                 "op should dirty the doc"
             );
         });
+    }
+
+    /// `save_if_open_and_dirty` is the "save first" half of the emu
+    /// panel's "Emulate this world" (S4). It writes ONLY when the world it
+    /// is asked about is the open, dirty one -- a build must never boot a
+    /// stale file, and must never write one the user did not name.
+    #[gpui::test]
+    async fn test_save_if_open_and_dirty_writes_only_the_named_dirty_world(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let path = dir.path().join("worlds/test.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Clean: nothing to do, and nothing written.
+        panel.update(cx, |panel, cx| {
+            assert!(panel.save_if_open_and_dirty("worlds/test.toml", cx));
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [50.0, 60.0],
+                    gesture: None,
+                },
+                cx,
+            );
+            assert!(panel.dirty_world_name().is_some());
+            // A DIFFERENT world: not ours to write, even though we are dirty.
+            assert!(panel.save_if_open_and_dirty("worlds/sub.toml", cx));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "another world's build must not write this one's document"
+        );
+
+        panel.update(cx, |panel, cx| {
+            assert!(panel.save_if_open_and_dirty("worlds/test.toml", cx));
+            assert!(
+                panel.dirty_world_name().is_none(),
+                "the write clears dirty, so a second build is a no-op"
+            );
+        });
+        assert_ne!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the edit the user made must be on disk before the build reads it"
+        );
     }
 
     /// A clean panel must be invisible to the close flow: no prompt, and

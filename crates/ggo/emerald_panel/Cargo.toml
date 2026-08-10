@@ -15,7 +15,6 @@ path = "src/ggo_emerald_panel.rs"
 editor.workspace = true
 gpui.workspace = true
 keymap_editor.workspace = true
-log.workspace = true
 project.workspace = true
 serde_json.workspace = true
 smol.workspace = true

@@ -245,6 +245,44 @@ impl ChartsPanel {
         }));
     }
 
+    /// Show run `run_id`, looking its listing up off-thread first.
+    ///
+    /// The entry point `ggo_emu_panel` uses when a Re-run's perf ingest
+    /// lands: that panel knows the `run_id` its ingest wrote and nothing
+    /// else about the run, while [`Self::select_run`] needs the whole
+    /// [`RunListing`] (the picker's own click already has one). The runs
+    /// list is refreshed either way, so the row is there when the user
+    /// hits Back -- and so a run id that has somehow gone missing lands on
+    /// the picker rather than on an error.
+    pub fn open_run(&mut self, run_id: i64, cx: &mut Context<Self>) {
+        self.refresh_runs(cx);
+        let Some(db_path) = self.db_path() else {
+            return;
+        };
+        let load = cx.background_spawn(async move { loader::list_runs(&db_path) });
+        cx.spawn(async move |this, cx| {
+            let listing = load
+                .await
+                .ok()
+                .and_then(|runs| runs.into_iter().find(|run| run.id == run_id));
+            if let Some(run) = listing {
+                this.update(cx, |this, cx| this.select_run(run, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Read runs from `path` instead of `~/.ggo/ggo_ide.db`.
+    ///
+    /// Public only so `ggo_emu_panel`'s "Re-run hops to the charts panel"
+    /// test can aim BOTH panels at one temporary database -- without it
+    /// that test would either read the developer's real database or not be
+    /// writable at all. Production code never calls it; the panel resolves
+    /// its own path through [`ggo_common::default_db_path`].
+    pub fn set_db_path_override(&mut self, path: PathBuf) {
+        self.db_path_override = Some(path);
+    }
+
     /// Back to the run picker.
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         // Bump the generation so an in-flight sample load for the run

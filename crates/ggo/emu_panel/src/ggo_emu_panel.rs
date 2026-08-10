@@ -74,6 +74,7 @@
 mod drive;
 mod ingest;
 mod input;
+mod menu;
 mod stats;
 mod uart;
 
@@ -82,10 +83,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    Action, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, Pixels, Render, RenderImage,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, div, img,
-    px,
+    Action, AnyWindowHandle, App, Context, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
+    Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription, Task,
+    WeakEntity, Window, actions, div, img, px,
 };
 use project::ProjectPath;
 use ui::Tooltip;
@@ -152,6 +153,9 @@ pub fn init(cx: &mut App) {
     // selects it HERE instead of opening a (binary, unreadable) editor tab.
     // This is the panel's only way in -- there is no in-panel cart picker.
     workspace::register_path_open_interceptor(cx, intercept_cart_open);
+
+    // Right-clicking offers the three run actions (S4) -- see `menu`.
+    workspace::register_context_menu_contributor(cx, menu::contribute_run_menu);
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -290,6 +294,36 @@ pub struct EmuPanel {
     /// and become the one the pane is showing; without this, run A's late
     /// completion would stomp run B's live status.
     run_generation: u64,
+    /// How this panel spawns children -- `emd pack-ggo` for "Emulate this
+    /// world", `ggo-diag` for "Run hardware diagnostics". Injectable for
+    /// the same reason `ggo_emerald_panel`'s is: it is what lets those
+    /// paths be tested end to end without `emd`, a GGO checkout or a
+    /// board.
+    proc_runner: ggo_common::ProcRunner,
+    /// Test hook: pretend the machine has (or hasn't) a board, instead of
+    /// reading env vars and `/dev`. Load-bearing rather than convenient --
+    /// [`menu::diag_env`]'s inputs are process-global, so without this the
+    /// no-hardware path could only be asserted on a machine that happens
+    /// to have no hardware.
+    diag_env_override: Option<menu::DiagEnv>,
+    /// Bumped by every [`Self::emulate_world`]/[`Self::
+    /// run_hardware_diagnostics`] click, so a superseded child's result is
+    /// dropped instead of starting a run (or overwriting a newer status)
+    /// after the user has already asked for something else. Separate from
+    /// `run_generation`: a build is not a run, and one build produces at
+    /// most one run.
+    build_generation: u64,
+    _build_task: Option<Task<()>>,
+    /// Armed by [`Self::rerun`] and consumed by the next [`Self::run`]:
+    /// "when THIS run's perf ingest lands, hop to the charts panel". A
+    /// plain Run clears it, so the hop only ever follows the Re-run entry
+    /// that asked for it.
+    charts_after_ingest: bool,
+    /// The run generation the hop is owed to, plus the window to do it in
+    /// -- the ingest completes on a background task with no `Window` of
+    /// its own, and focusing a dock needs one.
+    charts_for_run: Option<(u64, AnyWindowHandle)>,
+
     /// The running emulator, if any. Dropping it signals the thread to
     /// stop (see [`Session::stop`]).
     session: Option<Session>,
@@ -370,6 +404,12 @@ impl EmuPanel {
             project_root: None,
             selected: None,
             run_generation: 0,
+            proc_runner: ggo_common::system_proc_runner(),
+            diag_env_override: None,
+            build_generation: 0,
+            _build_task: None,
+            charts_after_ingest: false,
+            charts_for_run: None,
             session: None,
             _pump_task: None,
             status: None,
@@ -468,6 +508,15 @@ impl EmuPanel {
         // so it must still see the pre-bump value. This is the new
         // current run from here on -- see `run_generation`'s doc.
         self.run_generation += 1;
+        // Claim (or clear) the pending "hop to the charts panel when this
+        // one's perf lands" -- the window handle has to be captured here,
+        // because the ingest completes without one. A plain Run leaves
+        // `charts_after_ingest` false, which clears any arming a
+        // superseded Re-run left behind.
+        self.charts_for_run = self
+            .charts_after_ingest
+            .then(|| (self.run_generation, window.window_handle()));
+        self.charts_after_ingest = false;
 
         let (session, rx) = drive::start(root.join(&cart), cart);
         self.console = Some(session.uart().clone());
@@ -572,21 +621,264 @@ impl EmuPanel {
         });
         cx.spawn(async move |this, cx| {
             let (reason, status) = finish.await;
-            this.update(cx, |this, cx| {
-                if this.run_generation != generation {
-                    // A later run has started (and possibly already
-                    // ended) since this one was taken -- this completion
-                    // is stale, so don't let it stomp the live run's
-                    // status.
+            let hop = this
+                .update(cx, |this, cx| {
+                    if this.run_generation != generation {
+                        // A later run has started (and possibly already
+                        // ended) since this one was taken -- this
+                        // completion is stale, so don't let it stomp the
+                        // live run's status.
+                        return None;
+                    }
+                    this.status = Some(reason);
+                    this.ingest_status = status;
+                    cx.notify();
+                    // The Re-run entry's promised hop to the charts panel.
+                    // Taken unconditionally: the run is over either way,
+                    // so an arming that didn't produce a `run` row (a cart
+                    // that never reached vsync, a failed ingest) is spent,
+                    // not left to fire after some later run.
+                    match (&this.ingest_status, this.charts_for_run.take()) {
+                        (IngestStatus::Done(run_id), Some((armed, window)))
+                            if armed == generation =>
+                        {
+                            Some((*run_id, window))
+                        }
+                        _ => None,
+                    }
+                })
+                .ok()
+                .flatten();
+            if let Some((run_id, window)) = hop {
+                let workspace = this
+                    .read_with(cx, |this, _cx| this.workspace.clone())
+                    .ok()
+                    .flatten();
+                if let Some(workspace) = workspace {
+                    window
+                        .update(cx, |_root, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    ggo_common::open_in_panel(
+                                        workspace,
+                                        window,
+                                        cx,
+                                        |charts: &mut ggo_charts_panel::ChartsPanel,
+                                         _window,
+                                         cx| {
+                                            charts.open_run(run_id, cx);
+                                        },
+                                    );
+                                })
+                                .ok();
+                        })
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    // ------------------------------------------------- the S4 menu actions
+
+    /// **"Emulate this world"**: build a cartridge whose boot world is
+    /// `world_rel`, then run it here.
+    ///
+    /// The saving half happens before this, in the menu handler
+    /// ([`menu::contribute_run_menu`]), because it belongs to a different
+    /// panel. What is left is ggo-ide's `EmuMsg::BuildAndRunWorld` reduced
+    /// to this fork's engine: one `emd pack-ggo --world <stem>` (see
+    /// [`menu::world_pack_args`] for exactly how that differs from
+    /// ggo-ide's full-system build, and why), then the panel's ORDINARY
+    /// [`Self::run`] over the artifact it produced. There is deliberately
+    /// no second run path: the cart the build writes is selected exactly
+    /// as a clicked one is, so everything downstream -- the pump, the
+    /// atlas double buffer, the end-of-run perf ingest -- is the code that
+    /// was already there.
+    ///
+    /// Runs INSIDE the workspace's own update (the entry handler focused
+    /// the dock to get here), so every step that reads the workspace back
+    /// -- `refresh_root`, which the build needs for the absolute path of
+    /// the world -- is deferred onto the spawned task, exactly as
+    /// [`Self::open_rel_path`] defers it for the interceptor.
+    pub fn emulate_world(&mut self, world_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop(window, cx);
+        self.build_generation += 1;
+        let generation = self.build_generation;
+        let world_rel = world_rel.to_string();
+        self.status = Some(format!("building {world_rel}…"));
+        self.ingest_status = IngestStatus::Idle;
+        cx.notify();
+
+        let this = cx.weak_entity();
+        self._build_task = Some(window.spawn(cx, async move |cx| {
+            this.update(cx, |this, cx| this.refresh_root(cx)).ok();
+            let prepared = this
+                .update(cx, |this, cx| this.prepare_world_build(&world_rel, cx))
+                .ok()
+                .flatten();
+            let Some((request, runner, cart)) = prepared else {
+                return;
+            };
+            let capture = cx.background_spawn(async move { runner(request) }).await;
+            this.update_in(cx, |this, window, cx| {
+                if this.build_generation != generation {
                     return;
                 }
-                this.status = Some(reason);
-                this.ingest_status = status;
+                if !capture.ok {
+                    this.status = Some(format!("build failed: {}", menu::failure_reason(&capture)));
+                    cx.notify();
+                    return;
+                }
+                this.selected = Some(cart);
+                this.frame = 0;
+                this.stats = RunStats::default();
+                this.status = None;
+                this.run(window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Assemble the `emd pack-ggo` invocation for `world_rel`, or report
+    /// on the status row why there isn't one. Runs on the UI thread, where
+    /// a problem can still be shown, and hands the background task
+    /// everything it needs by value.
+    fn prepare_world_build(
+        &mut self,
+        world_rel: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<(ggo_common::ProcRequest, ggo_common::ProcRunner, String)> {
+        let mut fail = |this: &mut Self, message: String| {
+            this.status = Some(message);
+            cx.notify();
+            None
+        };
+        let Some(root) = self.project_root.clone() else {
+            return fail(self, "no project folder is open".to_string());
+        };
+        // Re-derived rather than passed down from the menu: the same
+        // `ggo_world_panel` rule that decided the entry was offered at all.
+        let Some(stem) = ggo_world_panel::world_stem(world_rel) else {
+            return fail(self, format!("{world_rel} is not a world file"));
+        };
+        let Some(project_dir) = ggo_common::emerald_project_root(&root.join(world_rel)) else {
+            return fail(
+                self,
+                format!(
+                    "no {} above {world_rel} — emd needs an emerald project",
+                    ggo_common::EMERALD_MANIFEST
+                ),
+            );
+        };
+        let out_dir = project_dir.join(menu::PACK_OUT_DIR);
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            return fail(self, format!("{}: {e}", out_dir.display()));
+        }
+        let out = out_dir.join(menu::pack_out_name(&stem));
+        let cart = menu::cart_selection(&root, &out);
+        Some((
+            ggo_common::ProcRequest::emd(&project_dir, menu::world_pack_args(&out, &stem)),
+            self.proc_runner.clone(),
+            cart,
+        ))
+    }
+
+    /// **"Re-run (perf)"**: select `rel` and start it, then hop to the
+    /// charts panel once the run's perf ingest lands.
+    ///
+    /// Nothing about the run or the ingest is reimplemented here -- this
+    /// is [`Self::run`], which already ends in [`Self::finish_run`] ->
+    /// [`ingest`]. The only thing added is the arming of the hop, which
+    /// [`Self::run`] stamps with the run generation so a LATER run's
+    /// completion can't inherit it.
+    ///
+    /// Unlike [`Self::open_rel_path`], re-clicking the selected cart is
+    /// the whole point, so there is no already-selected early return.
+    pub fn rerun(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Before arming: `stop` finishes any run already in flight, and
+        // that run must not be the one that gets the hop.
+        self.stop(window, cx);
+        if self.selected.as_deref() != Some(rel) {
+            self.selected = Some(rel.to_string());
+            self.frame = 0;
+            self.stats = RunStats::default();
+        }
+        self.charts_after_ingest = true;
+        cx.notify();
+
+        let this = cx.weak_entity();
+        self._build_task = Some(window.spawn(cx, async move |cx| {
+            // `run` needs the project root, and re-discovering it reads
+            // the workspace that is mid-update on the way in here.
+            this.update(cx, |this, cx| this.refresh_root(cx)).ok();
+            this.update_in(cx, |this, window, cx| this.run(window, cx))
+                .ok();
+        }));
+    }
+
+    /// **"Run hardware diagnostics"**: `ggo-diag --launch`, the built-in
+    /// GGO Diagnostic Cart.
+    ///
+    /// No project is involved, and nothing is emulated -- this is the one
+    /// entry that talks to real hardware, and on a machine with no board
+    /// attached (the normal case) it CANNOT run. That case is the
+    /// interesting one: [`menu::diag_request`] returns a message naming
+    /// every missing prerequisite and the env var that supplies it, and
+    /// this puts that message on the panel's status row after focusing the
+    /// dock, so the entry is never a silent no-op. See that function's doc
+    /// for the preconditions.
+    ///
+    /// A real run's transcript lands in the panel's console, the same
+    /// place a cart's UART output goes. One-shot, not streamed: a
+    /// streaming console with a cancel button is F5.3's (`ggo-ide`'s
+    /// Device page is the model), and this pane has neither yet.
+    pub fn run_hardware_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop(window, cx);
+        self.build_generation += 1;
+        let generation = self.build_generation;
+
+        let env = self
+            .diag_env_override
+            .clone()
+            .unwrap_or_else(|| menu::diag_env(self.project_root.as_deref()));
+        let request = match menu::diag_request(&env) {
+            Ok(request) => request,
+            Err(message) => {
+                self.status = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        let console = UartLog::new();
+        console.push_line(&format!("[diag] $ {}", request.command_line()));
+        self.console = Some(console.clone());
+        self.status = Some("running hardware diagnostics…".to_string());
+        cx.notify();
+
+        let runner = self.proc_runner.clone();
+        let this = cx.weak_entity();
+        self._build_task = Some(window.spawn(cx, async move |cx| {
+            let capture = cx.background_spawn(async move { runner(request) }).await;
+            this.update(cx, |this, cx| {
+                if this.build_generation != generation {
+                    return;
+                }
+                for line in &capture.lines {
+                    console.push_line(line);
+                }
+                this.status = Some(if capture.ok {
+                    "hardware diagnostics finished".to_string()
+                } else {
+                    format!(
+                        "hardware diagnostics failed: {}",
+                        menu::failure_reason(&capture)
+                    )
+                });
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
     /// Stop the run and blank the pane: signal the thread (which drops the
@@ -2301,5 +2593,430 @@ mod tests {
             cx.update(|_, cx| cx.default_global::<Offered>().0.is_empty()),
             "the contributor is not even consulted"
         );
+    }
+    // ------------------------------------------------- S4: the run actions
+
+    /// A workspace with all three panels S4 wires together (this one, the
+    /// world panel it saves through, the charts panel it hands a finished
+    /// run to), a FakeFs worktree for the `ProjectPath`s the menu takes,
+    /// and this panel pointed at the REAL `root` -- the same split every
+    /// other GGO menu test makes: the fake tree exists so a `ProjectPath`
+    /// resolves, `root_override` is what the panel actually reads and
+    /// writes through.
+    async fn run_menu_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<EmuPanel>,
+        WorktreeId,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+            ggo_world_panel::init(cx);
+            ggo_charts_panel::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/proj",
+            serde_json::json!({
+                "emerald.toml": "",
+                "assets": { "worlds": { "main.toml": "" } },
+                "green.cart": "",
+                "notes.txt": "",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, ["/proj".as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<EmuPanel>(cx)
+                .expect("init() adds the emu panel")
+        });
+        let root = root.to_path_buf();
+        panel.update(cx, |panel, _cx| {
+            panel.root_override = Some(root.clone());
+            // Never the developer's real `~/.ggo/ggo_ide.db`: every path
+            // below can reach the end-of-run ingest.
+            panel.db_path_override = Some(root.join("ggo_ide.db"));
+        });
+        (workspace, panel, worktree_id, cx)
+    }
+
+    /// A `ProcRunner` that spawns nothing, plus the log of every request it
+    /// was handed -- the emu-panel twin of `ggo_emerald_panel`'s
+    /// `fake_runner`, and what lets both the `emd` and the `ggo-diag` paths
+    /// be asserted without either binary (or a board) present.
+    #[allow(clippy::type_complexity)]
+    fn fake_proc_runner(
+        reply: impl Fn(&ggo_common::ProcRequest) -> ggo_common::ProcCapture + Send + Sync + 'static,
+    ) -> (
+        ggo_common::ProcRunner,
+        Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>>,
+    ) {
+        let calls: Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: ggo_common::ProcRunner = Arc::new(move |request| {
+            let capture = reply(&request);
+            recorded.lock().unwrap().push(request);
+            capture
+        });
+        (runner, calls)
+    }
+
+    fn ok_capture() -> ggo_common::ProcCapture {
+        ggo_common::ProcCapture {
+            ok: true,
+            lines: vec!["packed".to_string()],
+        }
+    }
+
+    /// Each entry is offered on exactly its own paths, and nowhere else.
+    /// "Run hardware diagnostics" is on everything (it needs no project),
+    /// so the counts are 1 + whichever file-specific entry applies.
+    /// `ContextMenuEntry::label` is private, so which entry it is has to be
+    /// proven by firing the handlers -- which the tests below do.
+    #[gpui::test]
+    async fn test_the_run_menu_offers_each_entry_only_on_its_own_paths(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+
+        let contributed = |rel: &str, is_dir: bool, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace
+                    .context_menu_contributions(&project_path(worktree_id, rel), is_dir, window, cx)
+                    .len()
+            })
+        };
+
+        assert_eq!(
+            contributed("green.cart", false, cx),
+            2,
+            "a cart gets Re-run plus the always-there diagnostics entry"
+        );
+        assert_eq!(
+            contributed("assets/worlds/main.toml", false, cx),
+            3,
+            "a world gets Emulate plus diagnostics -- and `ggo_world_panel`'s \
+             own Delete World, which this harness registers too, since \
+             contributions from every panel land in one menu"
+        );
+        assert_eq!(
+            contributed("emerald.toml", false, cx),
+            1,
+            "a .toml outside worlds/ is neither a world nor a cart"
+        );
+        assert_eq!(
+            contributed("notes.txt", false, cx),
+            1,
+            "an unrelated file still offers diagnostics, and only that"
+        );
+        assert_eq!(
+            contributed("assets/worlds", true, cx),
+            1,
+            "a directory is never runnable -- diagnostics only"
+        );
+    }
+
+    /// **"Emulate this world", end to end through the entry's own
+    /// handler.** The build must run `emd pack-ggo` with THIS world as the
+    /// boot world, in the emerald project root, and hand the artifact to
+    /// the panel's ordinary run path -- with the dock brought forward, so
+    /// the user can see what they started.
+    #[gpui::test]
+    async fn test_emulate_this_world_packs_that_boot_world_and_selects_the_cart(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ok_capture());
+        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
+
+        let handler = menu::emulate_world_handler(
+            workspace.downgrade(),
+            "assets/worlds/main.toml".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one build");
+        assert_eq!(
+            calls[0].cwd,
+            dir.path(),
+            "emd discovers the project from its cwd, so it must be the project root"
+        );
+        assert_eq!(
+            calls[0].args,
+            [
+                "pack-ggo",
+                "--out",
+                dir.path()
+                    .join("target/ggo-emulate/worlds-main.ggo")
+                    .to_str()
+                    .unwrap(),
+                "--world",
+                "worlds/main",
+                "--json",
+            ],
+            "the clicked world must be baked in as the boot world"
+        );
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.selected.as_deref(),
+                Some("target/ggo-emulate/worlds-main.ggo"),
+                "the built cartridge becomes the selection, through the SAME \
+                 path a clicked cart takes"
+            );
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.right_dock().read(cx).is_open(),
+                "the emu dock must come forward"
+            );
+        });
+    }
+
+    /// A build that fails leaves the failure on the status row and starts
+    /// nothing -- the entry must never look like it worked.
+    #[gpui::test]
+    async fn test_a_failed_world_build_reports_and_runs_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, _calls) = fake_proc_runner(|_| ggo_common::ProcCapture {
+            ok: false,
+            lines: vec!["error: no world named worlds/main".to_string()],
+        });
+        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
+
+        let handler = menu::emulate_world_handler(
+            workspace.downgrade(),
+            "assets/worlds/main.toml".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.status.as_deref(),
+                Some("build failed: error: no world named worlds/main")
+            );
+            assert!(panel.selected.is_none(), "nothing was selected");
+            assert!(!panel.is_running());
+        });
+    }
+
+    /// A world outside any emerald project can't be packed, and says so
+    /// rather than spawning `emd` into a directory it will reject.
+    #[gpui::test]
+    async fn test_emulating_a_world_outside_a_project_reports_the_missing_manifest(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ok_capture());
+        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
+
+        let handler = menu::emulate_world_handler(
+            workspace.downgrade(),
+            "assets/worlds/main.toml".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        assert!(calls.lock().unwrap().is_empty(), "nothing was spawned");
+        panel.update(cx, |panel, _cx| {
+            let status = panel.status.clone().expect("a status was reported");
+            assert!(status.contains("emerald.toml"), "{status}");
+        });
+    }
+
+    /// **"Re-run (perf)", end to end.** The entry routes the cart into
+    /// this panel, runs it for real, and -- once the run's perf ingest has
+    /// landed -- hands focus to the CHARTS panel, which is the whole point
+    /// of the entry over a plain Run.
+    #[gpui::test]
+    async fn test_rerun_runs_the_cart_then_focuses_the_charts_panel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let charts = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<ggo_charts_panel::ChartsPanel>(cx)
+                .expect("ggo_charts_panel::init adds its panel")
+        });
+        // Both panels on ONE temp database, so the run this test ingests is
+        // the run the charts panel then reads back.
+        let db_path = dir.path().join("ggo_ide.db");
+        charts.update(cx, |charts, _cx| {
+            charts.set_db_path_override(db_path.clone());
+        });
+
+        let handler = menu::rerun_handler(workspace.downgrade(), "green.cart".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.selected.as_deref(), Some("green.cart"));
+            assert!(panel.is_running(), "Re-run runs it, it doesn't just select");
+        });
+        await_first_frame(&panel, cx);
+
+        // End the run the ordinary way; that is what produces the perf row.
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                "the run must have ingested: {:?}",
+                panel.ingest_status
+            );
+            assert!(
+                panel.charts_for_run.is_none(),
+                "the arming is spent once the hop has been taken"
+            );
+        });
+        assert!(
+            cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
+            "the finished ingest must hand focus to the charts panel"
+        );
+    }
+
+    /// A plain Run must NOT inherit a Re-run's hop: the charts panel is
+    /// where the Re-run entry sends you, not where every run ends.
+    #[gpui::test]
+    async fn test_a_plain_run_does_not_hop_to_the_charts_panel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.charts_for_run.is_none(),
+                "a plain Run arms no hop at all"
+            );
+        });
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
+    }
+
+    /// **The no-hardware case, which is the normal one on a dev machine.**
+    /// The entry must focus the panel and put a message naming every
+    /// missing prerequisite where the user can read it -- never spawn
+    /// anything, and never do nothing.
+    #[gpui::test]
+    async fn test_hardware_diagnostics_without_a_board_says_what_is_missing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ok_capture());
+        panel.update(cx, |panel, _cx| {
+            panel.proc_runner = runner;
+            panel.diag_env_override = Some(menu::DiagEnv {
+                bin: menu::DEFAULT_DIAG_BIN.to_string(),
+                repo: None,
+                ports: Vec::new(),
+            });
+        });
+
+        let handler = menu::diagnostics_handler(workspace.downgrade());
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "nothing may be spawned without a board"
+        );
+        panel.update(cx, |panel, _cx| {
+            let status = panel.status.clone().expect("the failure must be VISIBLE");
+            assert!(status.contains(menu::DIAG_REPO_ENV), "{status}");
+            assert!(status.contains(menu::DIAG_TTY_ENV), "{status}");
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.right_dock().read(cx).is_open(),
+                "the dock holding that message must be open"
+            );
+        });
+    }
+
+    /// With both prerequisites satisfied, the entry runs the BUILT-IN
+    /// diagnostic cart (`--launch` with no directory) against the board,
+    /// out of the repo checkout, and puts the transcript in the console.
+    #[gpui::test]
+    async fn test_hardware_diagnostics_launches_the_builtin_cart(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ggo_common::ProcCapture {
+            ok: true,
+            lines: vec!["<<<GEMOS launched>>>".to_string()],
+        });
+        panel.update(cx, |panel, _cx| {
+            panel.proc_runner = runner;
+            panel.diag_env_override = Some(menu::DiagEnv {
+                bin: "ggo-diag".to_string(),
+                repo: Some(dir.path().to_path_buf()),
+                ports: vec!["/dev/ttyFAKE".to_string()],
+            });
+        });
+
+        let handler = menu::diagnostics_handler(workspace.downgrade());
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].bin, "ggo-diag");
+        assert_eq!(calls[0].cwd, dir.path());
+        assert_eq!(calls[0].args, menu::diag_args("/dev/ttyFAKE"));
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.status.as_deref(),
+                Some("hardware diagnostics finished")
+            );
+            let console = panel.console.as_ref().expect("a console was opened");
+            assert!(
+                console.peek_tail(10).iter().any(|l| l.contains("GEMOS")),
+                "the transcript must reach the console: {:?}",
+                console.peek_tail(10)
+            );
+        });
     }
 }

@@ -124,11 +124,10 @@ const DEFAULT_WIDTH: Pixels = px(460.);
 /// The source extension this panel's context-menu entry is offered on.
 const PNG_EXT: &str = "png";
 
-/// The emerald manifest that marks a project root, and the assets
-/// subdirectory hanging off it. Both are hardcoded upstream -- the assets
-/// dir is NOT a configurable `emerald.toml` key. Same pair
-/// `ggo_sprite_panel` and `ggo_map_panel` resolve their sidecars with.
-const EMERALD_MANIFEST: &str = "emerald.toml";
+/// The assets subdirectory hanging off an emerald project root. Hardcoded
+/// upstream -- it is NOT a configurable `emerald.toml` key. Same constant
+/// `ggo_sprite_panel` and `ggo_map_panel` resolve their sidecars with; the
+/// project-root walk itself is `ggo_common::emerald_project_root`.
 const ASSETS_DIR: &str = "assets";
 
 /// Empty-state text. The panel has no picker of its own by design: sources
@@ -249,19 +248,11 @@ fn import_png_handler(
 }
 
 /// Walk up from `start`'s own directory to the nearest emerald project root
-/// (the nearest ancestor holding `emerald.toml`, mirroring emerald's
-/// `Project::discover`), returning that project's `assets/` dir. Same
-/// function `ggo_sprite_panel` uses to resolve a `.spr`'s root.
+/// (`ggo_common::emerald_project_root`), returning that project's `assets/`
+/// dir. Same shape `ggo_sprite_panel` uses to resolve a `.spr`'s root.
 fn emerald_asset_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = start.parent();
-    while let Some(dir) = cur {
-        if dir.join(EMERALD_MANIFEST).is_file() {
-            let assets = dir.join(ASSETS_DIR);
-            return assets.is_dir().then_some(assets);
-        }
-        cur = dir.parent();
-    }
-    None
+    let assets = ggo_common::emerald_project_root(start.parent()?)?.join(ASSETS_DIR);
+    assets.is_dir().then_some(assets)
 }
 
 /// The asset root an imported tileset must be written against, plus the
@@ -1660,7 +1651,7 @@ mod tests {
     /// `art/hero.til` with NO `assets/` segment (the F4 `ggo-sprfix`
     /// contract).
     fn write_project(root: &Path) -> PathBuf {
-        std::fs::write(root.join(EMERALD_MANIFEST), "[project]\n").unwrap();
+        std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "[project]\n").unwrap();
         let assets = root.join(ASSETS_DIR);
         std::fs::create_dir_all(assets.join("art")).unwrap();
         write_png_fixture(

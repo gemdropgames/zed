@@ -4,17 +4,24 @@
 //! straight-alpha RGBA, so only a channel swap is needed, no alpha
 //! unpremultiply), the unsaved-document close guard shared by the world and
 //! sprite panels, the destructive-action confirmation every GGO file op
-//! goes through, and the file-explorer glue every panel's
-//! `PathOpenInterceptor` and `ContextMenuContributor` needs. Deliberately
-//! depends on no worldlib, so any GGO panel can use it without pulling in
-//! world-doc types. It DOES depend on `workspace` (the routing helpers
-//! below take a `Workspace`); that is not a cycle -- `workspace` knows
-//! nothing about this crate, it only exposes the `Panel::prepare_to_close`,
-//! `PathOpenInterceptor` and `ContextMenuContributor` extension points
-//! these helpers plug into.
+//! goes through, the file-explorer glue every panel's
+//! `PathOpenInterceptor` and `ContextMenuContributor` needs, and the
+//! emerald-project discovery + child-process runner the panels that shell
+//! out to `emd`/`ggo-diag` share. Deliberately depends on no worldlib, so
+//! any GGO panel can use it without pulling in world-doc types -- which is
+//! why [`run_capture`] hands back raw captured lines rather than
+//! worldlib's `EmdRunOutcome`; the one caller that wants a parsed
+//! `emd-json:` trailer does that mapping on its own side
+//! (`ggo_emerald_panel::runner`). It DOES depend on `workspace` (the
+//! routing helpers below take a `Workspace`); that is not a cycle --
+//! `workspace` knows nothing about this crate, it only exposes the
+//! `Panel::prepare_to_close`, `PathOpenInterceptor` and
+//! `ContextMenuContributor` extension points these helpers plug into.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use smol::process::Command;
 
 use gpui::{
     App, AppContext as _, Context, Entity, PromptLevel, RenderImage, Task, WeakEntity, Window,
@@ -300,6 +307,226 @@ pub fn panel_entry_handler<P: Panel>(
     }
 }
 
+// -------------------------------------------------- emerald project roots
+
+/// The file that marks an emerald project root.
+pub const EMERALD_MANIFEST: &str = "emerald.toml";
+
+/// The emerald project root for `start`: the nearest ancestor directory
+/// (INCLUSIVE of `start` itself) holding [`EMERALD_MANIFEST`], mirroring
+/// emerald's own `Project::discover`.
+///
+/// This is `emd`'s working directory, and it is also the directory
+/// `manifests/` and `assets/` live under. Lives here because FOUR panels
+/// had grown their own copy of this five-line walk plus its `emerald.toml`
+/// constant (`ggo_emerald_panel::runner`, `ggo_world_panel::loader`,
+/// `ggo_import_panel`, `ggo_map_panel`) -- the shape the fork's
+/// single-source-of-truth rule exists to prevent.
+pub fn emerald_project_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(EMERALD_MANIFEST).is_file() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+// ------------------------------------------------------- child processes
+
+/// Env var naming a non-default `emd` binary.
+///
+/// Same convention as `.zed/tasks.json`'s `GGO_*` variables (which spawn
+/// `emd` by bare name against `PATH`, with every per-user value read from
+/// the environment at spawn time) and the same *variable* ggo-ide's
+/// `pages::emerald` reads (`EMD_BIN_ENV`). Deliberately NOT ggo-ide's
+/// `emd_path` DB setting: that one exists because ggo-ide has a settings
+/// page writing `~/.ggo/ggo_ide.db`, and this fork has no such surface --
+/// an env var is the whole story here, and it is documented as such.
+pub const EMD_BIN_ENV: &str = "GGO_EMD";
+
+/// Bare-name fallback for the `emd` binary, resolved against `PATH` --
+/// what `.zed/tasks.json` and ggo-ide both default to.
+pub const DEFAULT_EMD_BIN: &str = "emd";
+
+/// `emd`'s machine-readable-output flag. Implies `--quiet`, and is what
+/// makes the `emd-json:` trailer (`ggo_worldlib::emerald::EMD_JSON_PREFIX`)
+/// appear at all, so every `emd` request built here carries it.
+pub const JSON_FLAG: &str = "--json";
+
+/// The `emd` binary to spawn: [`EMD_BIN_ENV`] when set and non-blank, else
+/// [`DEFAULT_EMD_BIN`].
+pub fn emd_bin() -> String {
+    resolve_bin(std::env::var(EMD_BIN_ENV).ok(), DEFAULT_EMD_BIN)
+}
+
+/// A configured binary override, with blank treated as unset (the same
+/// filter ggo-ide's `resolve_emd_bin` applies to its stored setting), so an
+/// accidentally-empty export doesn't turn into a spawn of `""`. Split out
+/// from [`emd_bin`] so it can be tested without mutating a process-global
+/// the rest of the suite shares.
+fn resolve_bin(configured: Option<String>, default: &str) -> String {
+    configured
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// One child-process invocation, fully resolved: which binary, in which
+/// working directory, with which argv.
+///
+/// Built on the UI thread (so the env read and the project-root walk
+/// happen where the panel can still report a problem) and moved into a
+/// background task, which is why it owns everything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcRequest {
+    pub bin: String,
+    /// The child's working directory. For `emd` this is the emerald
+    /// project root (`emd` discovers the project from its cwd, so this is
+    /// what decides which project is written to); for `ggo-diag` it is the
+    /// GGO repo checkout, which that CLI's `detect_repo()` walks up from.
+    pub cwd: PathBuf,
+    pub args: Vec<String>,
+}
+
+impl ProcRequest {
+    /// An arbitrary binary's invocation, verbatim.
+    pub fn new(bin: impl Into<String>, cwd: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        Self {
+            bin: bin.into(),
+            cwd: cwd.into(),
+            args,
+        }
+    }
+
+    /// An `emd` invocation for `args` (as built by
+    /// `ggo_worldlib::emerald`'s argv builders) in `cwd`, with
+    /// [`JSON_FLAG`] appended.
+    ///
+    /// The flag is appended HERE rather than in the argv builders because
+    /// it is a property of how this host consumes the run (it wants the
+    /// trailer), not of the command being run -- the builders are shared
+    /// with ggo-ide, whose streaming console wants the same flag for the
+    /// same reason but adds it at its own call sites.
+    pub fn emd(cwd: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        let mut args = args;
+        if !args.iter().any(|a| a == JSON_FLAG) {
+            args.push(JSON_FLAG.to_string());
+        }
+        Self::new(emd_bin(), cwd, args)
+    }
+
+    /// The invocation as a human would type it -- what a panel shows
+    /// while a run is in flight, and what a spawn failure is reported
+    /// against.
+    pub fn command_line(&self) -> String {
+        let mut line = self.bin.clone();
+        for arg in &self.args {
+            line.push(' ');
+            // The one arg that can legitimately be empty is `--module ""`
+            // (`mutation_module_args`' "the shared bucket, precisely"),
+            // which would otherwise render as a trailing space.
+            if arg.is_empty() {
+                line.push_str("\"\"");
+            } else {
+                line.push_str(arg);
+            }
+        }
+        line
+    }
+}
+
+/// A finished child process: whether it succeeded, and its transcript.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcCapture {
+    pub ok: bool,
+    /// stdout's lines followed by stderr's -- see [`run_capture`] for why
+    /// that order is load-bearing.
+    pub lines: Vec<String>,
+}
+
+impl ProcCapture {
+    /// The transcript as one blob, for a status line or a console.
+    pub fn transcript(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+/// The injection seam: anything that can turn a [`ProcRequest`] into a
+/// [`ProcCapture`].
+///
+/// A boxed `Fn` rather than a trait because every implementation is a
+/// single function -- [`system_proc_runner`] below, and recording fakes in
+/// tests -- and `Arc` because a panel holds one and each spawned run needs
+/// its own handle. `Send + Sync` because the call happens on
+/// `cx.background_spawn`'s thread, never on the UI thread.
+pub type ProcRunner = Arc<dyn Fn(ProcRequest) -> ProcCapture + Send + Sync>;
+
+/// The production runner: really spawn the child.
+pub fn system_proc_runner() -> ProcRunner {
+    Arc::new(|request| run_capture(&request))
+}
+
+/// Spawn `request` and wait for it. **Blocking** -- callers run this on
+/// `cx.background_spawn`, never on the UI thread.
+///
+/// The captured transcript is stdout followed by stderr, and that order is
+/// load-bearing for `emd`: it prints its `emd-json:` trailer to **stdout on
+/// success and stderr on failure** (verified against `emd 0.2.0`), and
+/// `ggo_worldlib::emerald::parse_emd_trailer` scans for the LAST trailer
+/// line, so stderr-last is what makes a failure's trailer -- the one
+/// carrying `error` -- the one that wins.
+///
+/// A spawn failure (nothing on `PATH`, a bad binary override) is reported
+/// as a non-ok capture naming the command, not as a panic or a silent
+/// no-op: "it isn't installed" is the single most likely first-run failure
+/// and it has to reach the panel as text.
+///
+/// No timeout, deliberately: the callers are `emd generate`/`emd pack-ggo`
+/// and `ggo-diag`, whose legitimate runtimes span seconds to tens of
+/// minutes with no useful upper bound to pick. A cancel/timeout surface
+/// belongs with the streaming console F5.3 brings, not here.
+///
+/// The child is `smol::process::Command`, not `std::process::Command`:
+/// this checkout's `clippy.toml` disallows the latter's `output`/`spawn`/
+/// `status` outright ("can block the current thread for an unknown
+/// duration"). `smol::block_on` around it keeps this function's signature
+/// synchronous -- which is what lets [`ProcRunner`] stay a plain `Fn` with
+/// a one-line fake -- and blocking is correct here precisely because the
+/// only callers are inside `cx.background_spawn`.
+pub fn run_capture(request: &ProcRequest) -> ProcCapture {
+    let output = smol::block_on(
+        Command::new(&request.bin)
+            .args(&request.args)
+            .current_dir(&request.cwd)
+            .output(),
+    );
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            return ProcCapture {
+                ok: false,
+                lines: vec![format!("running `{}`: {e}", request.command_line())],
+            };
+        }
+    };
+    let mut lines = capture_lines(&output.stdout);
+    lines.extend(capture_lines(&output.stderr));
+    ProcCapture {
+        ok: output.status.success(),
+        lines,
+    }
+}
+
+/// Captured bytes as lines, lossily decoded (a child's output is not
+/// guaranteed UTF-8 and a mojibake transcript beats no transcript).
+fn capture_lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +603,135 @@ mod tests {
             dirty_message("worlds/test.toml"),
             "worlds/test.toml contains unsaved edits. Do you want to save it?"
         );
+    }
+
+    // ---------------------------------------------- emerald project roots
+
+    #[test]
+    fn emerald_project_root_walks_up_inclusively() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(EMERALD_MANIFEST), "").unwrap();
+        std::fs::create_dir_all(root.join("assets/tiles")).unwrap();
+        assert_eq!(emerald_project_root(root).as_deref(), Some(root));
+        assert_eq!(
+            emerald_project_root(&root.join("assets/tiles")).as_deref(),
+            Some(root)
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(emerald_project_root(outside.path()), None);
+    }
+
+    // --------------------------------------------------- child processes
+
+    #[test]
+    fn resolve_bin_defaults_and_treats_blank_as_unset() {
+        assert_eq!(resolve_bin(None, DEFAULT_EMD_BIN), DEFAULT_EMD_BIN);
+        assert_eq!(
+            resolve_bin(Some(String::new()), DEFAULT_EMD_BIN),
+            DEFAULT_EMD_BIN
+        );
+        assert_eq!(
+            resolve_bin(Some("   ".into()), DEFAULT_EMD_BIN),
+            DEFAULT_EMD_BIN
+        );
+        assert_eq!(
+            resolve_bin(Some("/opt/emd".into()), DEFAULT_EMD_BIN),
+            "/opt/emd"
+        );
+    }
+
+    #[test]
+    fn emd_request_appends_json_once() {
+        let req = ProcRequest::emd(
+            "/proj",
+            vec!["generate".into(), "module".into(), "x".into()],
+        );
+        assert_eq!(req.args, ["generate", "module", "x", "--json"]);
+        let already = ProcRequest::emd(
+            "/proj",
+            vec![
+                "generate".into(),
+                "module".into(),
+                "x".into(),
+                "--json".into(),
+            ],
+        );
+        assert_eq!(already.args, ["generate", "module", "x", "--json"]);
+    }
+
+    /// A non-`emd` request is passed through verbatim -- no `--json`, which
+    /// `ggo-diag` does not have.
+    #[test]
+    fn a_plain_request_is_not_given_the_json_flag() {
+        let req = ProcRequest::new("ggo-diag", "/repo", vec!["--launch".into()]);
+        assert_eq!(req.args, ["--launch"]);
+        assert_eq!(req.bin, "ggo-diag");
+    }
+
+    #[test]
+    fn command_line_renders_an_empty_arg_as_quotes() {
+        let req = ProcRequest::new(
+            "emd",
+            "/proj",
+            vec![
+                "component".into(),
+                "rm".into(),
+                "--module".into(),
+                String::new(),
+            ],
+        );
+        assert_eq!(req.command_line(), "emd component rm --module \"\"");
+    }
+
+    /// A binary that cannot be spawned must come back as a NON-OK capture
+    /// naming the command -- not a panic, and not something a panel could
+    /// mistake for success.
+    #[test]
+    fn a_missing_binary_is_a_non_ok_capture_naming_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = run_capture(&ProcRequest::new(
+            "ggo-bin-that-does-not-exist",
+            dir.path(),
+            vec!["--version".into()],
+        ));
+        assert!(!capture.ok);
+        assert!(
+            capture.transcript().contains("ggo-bin-that-does-not-exist"),
+            "{}",
+            capture.transcript()
+        );
+    }
+
+    /// stdout is captured BEFORE stderr, which is what makes a failing
+    /// `emd` run's trailer (printed to stderr) the last one
+    /// `parse_emd_trailer` finds. Exercised through a real child process,
+    /// with `sh` standing in.
+    #[test]
+    fn stderr_is_captured_after_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = run_capture(&ProcRequest::new(
+            "sh",
+            dir.path(),
+            vec![
+                "-c".into(),
+                "echo 'starting'; echo 'the failure' >&2; exit 1".into(),
+            ],
+        ));
+        assert!(!capture.ok);
+        assert_eq!(capture.lines, ["starting", "the failure"]);
+    }
+
+    #[test]
+    fn a_successful_child_is_an_ok_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = run_capture(&ProcRequest::new(
+            "sh",
+            dir.path(),
+            vec!["-c".into(), "echo done".into()],
+        ));
+        assert!(capture.ok);
+        assert_eq!(capture.transcript(), "done");
     }
 }

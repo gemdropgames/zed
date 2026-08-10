@@ -214,18 +214,20 @@ const MANIFEST_SCHEMA_VERSION: u64 = 1;
 /// builtins only, exactly like ggo-ide's `Err` arm. Adaptation noted: this
 /// reads just `components.toml` instead of enumerating every
 /// `manifests/*.toml`, since the schema feed never consumed the others.
-pub fn manifest_schemas(project_dir: &Path) -> Vec<ComponentSchema> {
+///
+/// **PRIVATE on purpose, and it is the footgun half of this pair**: it
+/// takes the emerald PROJECT root, and handing it an asset root instead
+/// silently yields builtins only (the bug S3 fixed -- see
+/// [`schemas_near`], which is what every caller outside this module
+/// should use).
+fn manifest_schemas(project_dir: &Path) -> Vec<ComponentSchema> {
     all_schemas(&read_components_manifest(project_dir).unwrap_or_default())
 }
 
-/// The file that marks an emerald project root.
-const EMERALD_MANIFEST: &str = "emerald.toml";
-
 /// [`manifest_schemas`] for a directory that may be an ASSET ROOT rather
 /// than the project root -- it walks up to the nearest ancestor holding
-/// `emerald.toml` first (emerald's own `Project::discover` rule, the same
-/// walk `ggo_map_panel`/`ggo_sprite_panel`/`ggo_import_panel` each make to
-/// find `<project>/assets`), and falls back to `dir` itself when there is
+/// `emerald.toml` first (`ggo_common::emerald_project_root`, emerald's own
+/// `Project::discover` rule), and falls back to `dir` itself when there is
 /// no such ancestor.
 ///
 /// This exists because the panel loads a world against its DERIVED asset
@@ -239,14 +241,10 @@ const EMERALD_MANIFEST: &str = "emerald.toml";
 /// worktree-rooted `worlds/main.toml` layout (and this module's own tests)
 /// working unchanged.
 pub fn schemas_near(dir: &Path) -> Vec<ComponentSchema> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        if d.join(EMERALD_MANIFEST).is_file() {
-            return manifest_schemas(d);
-        }
-        cur = d.parent();
+    match ggo_common::emerald_project_root(dir) {
+        Some(root) => manifest_schemas(&root),
+        None => manifest_schemas(dir),
     }
-    manifest_schemas(dir)
 }
 
 fn read_components_manifest(project_dir: &Path) -> Option<Vec<ManifestComponent>> {
@@ -422,7 +420,7 @@ mod tests {
     fn schemas_near_walks_up_from_an_asset_root_to_the_project_root() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join(EMERALD_MANIFEST), "").unwrap();
+        std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "").unwrap();
         std::fs::create_dir_all(root.join("manifests")).unwrap();
         std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
         std::fs::write(
@@ -453,7 +451,7 @@ mod tests {
     fn load_world_from_an_asset_root_still_finds_the_projects_components() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join(EMERALD_MANIFEST), "").unwrap();
+        std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "").unwrap();
         std::fs::create_dir_all(root.join("manifests")).unwrap();
         std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
         std::fs::write(

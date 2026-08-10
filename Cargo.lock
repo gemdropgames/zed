@@ -7548,6 +7548,8 @@ dependencies = [
  "gpui",
  "image",
  "project",
+ "smol",
+ "tempfile",
  "workspace",
 ]
 
@@ -7561,7 +7563,6 @@ dependencies = [
  "ggo_world_panel",
  "gpui",
  "keymap_editor",
- "log",
  "path",
  "project",
  "serde_json",
@@ -7581,6 +7582,7 @@ dependencies = [
  "ggo-emu-core",
  "ggo_charts_panel",
  "ggo_common",
+ "ggo_world_panel",
  "gpui",
  "image",
  "keymap_editor",
