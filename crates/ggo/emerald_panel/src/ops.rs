@@ -4,7 +4,8 @@
 //!
 //! Same split as [`crate::forms`] and for the same reason: the argv comes
 //! from [`ggo_worldlib::emerald`]'s builders verbatim
-//! (`build_rm_args`/`build_field_add_args`/`build_field_rm_args`), and the
+//! (`build_rm_args`/`build_field_add_args`/`build_field_rm_args`/
+//! `build_schedule_set_args`), and the
 //! confirm text is assembled here so "the schedules that break are named
 //! in the prompt" is a claim provable without a window.
 //!
@@ -13,7 +14,8 @@
 //! world files); this module only decides how it reads.
 
 use ggo_worldlib::emerald::{
-    ManifestKind, build_field_add_args, build_field_rm_args, build_rm_args, system_ref,
+    ManifestKind, build_field_add_args, build_field_rm_args, build_rm_args,
+    build_schedule_set_args, parse_cadenced_ref, system_ref,
 };
 
 /// What every `cargo check`-backed mutation's confirm says about the part
@@ -37,10 +39,10 @@ pub const CODE_SCAN_NOTE: &str = "Rust code that names it is not scanned.";
 /// One manifest mutation, ready to be confirmed and run.
 ///
 /// A closed enum rather than a free-form argv because every variant has a
-/// confirm, a success message and a post-run refresh that differ, and
-/// because Task E3's `schedule set` will be the fourth variant -- the
-/// panel's run path takes one of these, so adding it there is the only
-/// change that will need.
+/// confirm, a success message and a post-run refresh that differ. The
+/// panel's run path takes one of these, so a new op is one variant here
+/// plus one [`confirm_for`] arm -- which is exactly what F5.3/E3's
+/// [`ManifestOp::ScheduleSet`] cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestOp {
     /// `emd rm <kind> <name> --module <m>`.
@@ -63,6 +65,62 @@ pub enum ManifestOp {
         module: String,
         field: String,
     },
+    /// `emd schedule set <name> --module <m> --systems <a,b,c>` -- the
+    /// schedule run-list editor's one command.
+    ///
+    /// `systems` is the WHOLE new run list, because that is the only
+    /// thing `emd schedule set` accepts: it replaces the list outright
+    /// (`commands::schedule::set`), so a reorder and a removal issue the
+    /// same shape of command and differ only in the list they carry.
+    /// `edit` is this side's record of WHICH edit produced that list --
+    /// the argv cannot say, and the confirm and the success message both
+    /// need to.
+    ScheduleSet {
+        schedule: String,
+        module: String,
+        systems: Vec<String>,
+        edit: ScheduleEdit,
+    },
+}
+
+/// What a [`ManifestOp::ScheduleSet`] is doing to the run list.
+///
+/// Not derivable from the argv (a whole-list write looks the same however
+/// it was produced) and not derivable from the old and new lists either
+/// without re-deriving the edit, which is what
+/// [`ggo_worldlib::emerald::OrderEdit`] already described. So the panel
+/// carries the intent alongside the result, and it is what decides both
+/// whether a confirm is raised and what the run reports afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleEdit {
+    /// A system appended to the end of the run list.
+    Add { system_ref: String },
+    /// The entry at `index` dropped -- the one destructive schedule edit.
+    /// `system_ref` is the entry AS IT STOOD, cadence suffix included.
+    Remove { system_ref: String, index: usize },
+    /// The entry at `from` moved to `to` (a post-removal index, per
+    /// [`ggo_worldlib::emerald::OrderEdit::Move`]).
+    Move {
+        system_ref: String,
+        from: usize,
+        to: usize,
+    },
+    /// An entry's `@N` cadence changed. `system_ref` is the BASE ref, with
+    /// no suffix; `cadence` is the new one (1 = every tick, no suffix).
+    Cadence { system_ref: String, cadence: u32 },
+}
+
+impl ScheduleEdit {
+    /// The run-list entry this edit is about, without its `@N` suffix --
+    /// what the user calls the row.
+    fn base(&self) -> String {
+        match self {
+            ScheduleEdit::Add { system_ref }
+            | ScheduleEdit::Remove { system_ref, .. }
+            | ScheduleEdit::Move { system_ref, .. }
+            | ScheduleEdit::Cadence { system_ref, .. } => parse_cadenced_ref(system_ref).0,
+        }
+    }
 }
 
 impl ManifestOp {
@@ -90,6 +148,20 @@ impl ManifestOp {
         }
     }
 
+    pub fn schedule_set(
+        schedule: &str,
+        module: &str,
+        systems: Vec<String>,
+        edit: ScheduleEdit,
+    ) -> Self {
+        ManifestOp::ScheduleSet {
+            schedule: schedule.to_string(),
+            module: module.to_string(),
+            systems,
+            edit,
+        }
+    }
+
     /// The `emd` argv, minus the `--json` flag
     /// [`crate::runner::EmdRequest::emd`] appends. Every arm is a worldlib
     /// builder call and nothing else -- the `--module ""` that
@@ -108,14 +180,34 @@ impl ManifestOp {
                 module,
                 field,
             } => build_field_rm_args(component, module, field),
+            ManifestOp::ScheduleSet {
+                schedule,
+                module,
+                systems,
+                ..
+            } => build_schedule_set_args(schedule, module, systems),
         }
     }
 
     /// Does this need a confirm before it runs? Everything destructive
     /// does; adding a field is the one op that only ever ADDS, so it goes
-    /// straight through.
+    /// straight through, and three of the four schedule edits are moves of
+    /// something that stays in the list.
+    ///
+    /// **Dropping an entry from a run list IS destructive**, even though
+    /// the system itself survives in the manifest: the run list is
+    /// ordered, and `OrderEdit::Add` appends -- so putting the entry back
+    /// puts it at the END, not where it was, and its `@N` cadence is gone
+    /// too. That is a real loss, and [`confirm_for`] says so in those
+    /// words rather than warning in the abstract.
     pub fn destructive(&self) -> bool {
-        !matches!(self, ManifestOp::FieldAdd { .. })
+        match self {
+            ManifestOp::FieldAdd { .. } => false,
+            ManifestOp::ScheduleSet { edit, .. } => {
+                matches!(edit, ScheduleEdit::Remove { .. })
+            }
+            ManifestOp::Remove { .. } | ManifestOp::FieldRemove { .. } => true,
+        }
     }
 
     /// What the run state says after this succeeds.
@@ -130,7 +222,39 @@ impl ManifestOp {
             ManifestOp::FieldRemove {
                 component, field, ..
             } => format!("Removed field {field} from {component}"),
+            ManifestOp::ScheduleSet {
+                schedule,
+                module,
+                edit,
+                ..
+            } => {
+                let base = edit.base();
+                let sched = qualified(module, schedule);
+                match edit {
+                    ScheduleEdit::Add { .. } => format!("Added {base} to schedule {sched}"),
+                    ScheduleEdit::Remove { .. } => {
+                        format!("Removed {base} from schedule {sched}")
+                    }
+                    ScheduleEdit::Move { to, .. } => {
+                        format!("Moved {base} to position {} in schedule {sched}", to + 1)
+                    }
+                    ScheduleEdit::Cadence { cadence, .. } => {
+                        format!("{base} now runs {} in schedule {sched}", every(*cadence))
+                    }
+                }
+            }
         }
+    }
+}
+
+/// `"every tick"` / `"every 4 ticks"` -- how a cadence reads in prose.
+/// Cadence 1 is the no-suffix baseline
+/// ([`ggo_worldlib::emerald::with_cadence`]), so it has no number to say.
+pub fn every(cadence: u32) -> String {
+    if cadence <= 1 {
+        "every tick".to_string()
+    } else {
+        format!("every {cadence} ticks")
     }
 }
 
@@ -166,6 +290,13 @@ pub struct Confirm {
 /// [`Cascade`] gets a prompt, because "nothing this side could find" is
 /// not the same claim as "nothing depends on it" -- which is exactly what
 /// the body then says, naming what WAS checked and what was not.
+///
+/// The run-list removal is the one confirm that does NOT carry
+/// [`COMPILER_NOTE`], because it would be false: `emd schedule set`
+/// rewrites the manifest and regenerates the schedule's builder file and
+/// stops there -- no `cargo check`, no revert (emerald's
+/// `commands::schedule::set`). It is also the fast op of the four, so the
+/// "30s or more" half of that note would be wrong twice over.
 pub fn confirm_for(op: &ManifestOp, cascade: &Cascade) -> Option<Confirm> {
     if !op.destructive() {
         return None;
@@ -218,8 +349,44 @@ pub fn confirm_for(op: &ManifestOp, cascade: &Cascade) -> Option<Confirm> {
             "Remove the field {field} from {}?",
             qualified(module, component)
         ),
-        // `destructive()` already returned early for this one.
-        ManifestOp::FieldAdd { .. } => return None,
+        ManifestOp::ScheduleSet {
+            schedule,
+            module,
+            edit:
+                ScheduleEdit::Remove {
+                    system_ref: entry,
+                    index,
+                },
+            ..
+        } => {
+            let (base, cadence) = parse_cadenced_ref(entry);
+            lines.push("The system itself stays in the manifest.".to_string());
+            // The specific loss, named: this is the only op in the panel
+            // whose damage is POSITIONAL, and "add it back" is a click
+            // away, so an abstract warning would read as noise. Position
+            // is 1-based here because that is how the rows are numbered
+            // on screen.
+            lines.push(format!(
+                "Adding it back appends it to the end of the run list, not to position {}.",
+                index + 1
+            ));
+            if cadence > 1 {
+                lines.push(format!(
+                    "Its cadence ({}) is not restored either.",
+                    every(cadence)
+                ));
+            }
+            return Some(Confirm {
+                message: format!(
+                    "Remove {base} from the schedule {}?",
+                    qualified(module, schedule)
+                ),
+                cascade: lines,
+                label: "Remove",
+            });
+        }
+        // `destructive()` already returned early for these two.
+        ManifestOp::FieldAdd { .. } | ManifestOp::ScheduleSet { .. } => return None,
     };
     lines.push(COMPILER_NOTE.to_string());
     Some(Confirm {
@@ -306,6 +473,173 @@ mod tests {
         assert_eq!(
             ManifestOp::field_remove("HeroUnit", "gameplay", "hp").args(),
             build_field_rm_args("HeroUnit", "gameplay", "hp")
+        );
+        let order = vec!["tick_clock".to_string(), "gameplay/spawn@4".to_string()];
+        assert_eq!(
+            ManifestOp::schedule_set(
+                "update",
+                "",
+                order.clone(),
+                ScheduleEdit::Move {
+                    system_ref: "gameplay/spawn@4".into(),
+                    from: 0,
+                    to: 1
+                }
+            )
+            .args(),
+            build_schedule_set_args("update", "", &order)
+        );
+        assert_eq!(
+            ManifestOp::schedule_set(
+                "update",
+                "",
+                order,
+                ScheduleEdit::Add {
+                    system_ref: "tick_clock".into()
+                }
+            )
+            .args(),
+            [
+                "schedule",
+                "set",
+                "update",
+                "--module",
+                "",
+                "--systems",
+                "tick_clock,gameplay/spawn@4"
+            ],
+            "the whole list travels in one comma-joined --systems value"
+        );
+        assert_eq!(
+            ManifestOp::schedule_set(
+                "update",
+                "",
+                Vec::new(),
+                ScheduleEdit::Remove {
+                    system_ref: "tick_clock".into(),
+                    index: 0
+                }
+            )
+            .args(),
+            ["schedule", "set", "update", "--module", ""],
+            "emptying a run list omits --systems entirely (worldlib's own rule)"
+        );
+    }
+
+    /// The run-list removal is the one schedule edit that confirms, and it
+    /// names the SPECIFIC loss -- the position, and the cadence -- rather
+    /// than warning in the abstract. The other three go straight through.
+    #[test]
+    fn only_dropping_a_run_list_entry_confirms_and_it_names_what_is_lost() {
+        let removal = ManifestOp::schedule_set(
+            "update",
+            "gameplay",
+            vec!["tick_clock".to_string()],
+            ScheduleEdit::Remove {
+                system_ref: "gameplay/spawn_enemies@4".into(),
+                index: 2,
+            },
+        );
+        assert!(removal.destructive());
+        let confirm = confirm_for(&removal, &Cascade::default()).unwrap();
+        assert_eq!(
+            confirm.message,
+            "Remove gameplay/spawn_enemies from the schedule gameplay/update?"
+        );
+        assert_eq!(
+            confirm.cascade,
+            [
+                "The system itself stays in the manifest.",
+                "Adding it back appends it to the end of the run list, not to position 3.",
+                "Its cadence (every 4 ticks) is not restored either.",
+            ]
+        );
+        assert!(
+            !confirm.cascade.iter().any(|l| l == COMPILER_NOTE),
+            "`emd schedule set` runs no compiler check, so it must not promise one"
+        );
+
+        // A cadence-1 entry has no cadence to lose, and says one fewer
+        // thing rather than saying "every tick" pointlessly.
+        let plain = ManifestOp::schedule_set(
+            "update",
+            "",
+            Vec::new(),
+            ScheduleEdit::Remove {
+                system_ref: "tick_clock".into(),
+                index: 0,
+            },
+        );
+        let confirm = confirm_for(&plain, &Cascade::default()).unwrap();
+        assert_eq!(
+            confirm.message,
+            "Remove tick_clock from the schedule update?"
+        );
+        assert_eq!(confirm.cascade.len(), 2, "{:?}", confirm.cascade);
+
+        for edit in [
+            ScheduleEdit::Add {
+                system_ref: "tick_clock".into(),
+            },
+            ScheduleEdit::Move {
+                system_ref: "tick_clock".into(),
+                from: 1,
+                to: 0,
+            },
+            ScheduleEdit::Cadence {
+                system_ref: "tick_clock".into(),
+                cadence: 4,
+            },
+        ] {
+            let op = ManifestOp::schedule_set("update", "", vec!["tick_clock".into()], edit);
+            assert!(!op.destructive(), "{op:?}");
+            assert_eq!(confirm_for(&op, &Cascade::default()), None, "{op:?}");
+        }
+    }
+
+    /// Every schedule edit reports what IT did -- the argv cannot say
+    /// (all four are the same whole-list write).
+    #[test]
+    fn a_schedule_edit_reports_which_edit_it_was() {
+        let done = |edit| {
+            ManifestOp::schedule_set("update", "", vec!["tick_clock".into()], edit).done_message()
+        };
+        assert_eq!(
+            done(ScheduleEdit::Add {
+                system_ref: "gameplay/spawn".into()
+            }),
+            "Added gameplay/spawn to schedule update"
+        );
+        assert_eq!(
+            done(ScheduleEdit::Remove {
+                system_ref: "gameplay/spawn@4".into(),
+                index: 1
+            }),
+            "Removed gameplay/spawn from schedule update",
+            "the cadence suffix is not part of the system's name"
+        );
+        assert_eq!(
+            done(ScheduleEdit::Move {
+                system_ref: "gameplay/spawn".into(),
+                from: 2,
+                to: 0
+            }),
+            "Moved gameplay/spawn to position 1 in schedule update",
+            "positions read 1-based, as the rows are numbered"
+        );
+        assert_eq!(
+            done(ScheduleEdit::Cadence {
+                system_ref: "gameplay/spawn".into(),
+                cadence: 4
+            }),
+            "gameplay/spawn now runs every 4 ticks in schedule update"
+        );
+        assert_eq!(
+            done(ScheduleEdit::Cadence {
+                system_ref: "gameplay/spawn".into(),
+                cadence: 1
+            }),
+            "gameplay/spawn now runs every tick in schedule update"
         );
     }
 

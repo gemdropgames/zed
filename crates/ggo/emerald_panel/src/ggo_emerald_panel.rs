@@ -10,11 +10,12 @@
 //! "New Component…" needs a real form, and a form needs a panel (F5.2/S3).
 //! **F5.3/E2** adds the other half: a browser over the three manifests and
 //! the remove/field ops against them, each behind a confirm that names
-//! what it breaks.
+//! what it breaks. **F5.3/E3** makes the schedules tab's run list
+//! editable -- reorder, add, drop and cadence, each one `emd schedule set`
+//! carrying the whole new list, shown optimistically and rolled back
+//! visibly when `emd` refuses it.
 //!
-//! **What is NOT here yet.** The schedule run-list editor (Task E3, which
-//! `manifests`/`ops` are shaped for -- `schedule set` is the fourth
-//! [`ops::ManifestOp`]), the `emd version` lock banner and its mtime poll
+//! **What is NOT here yet.** The `emd version` lock banner and its mtime poll
 //! (Task E4; the post-run half of that enforcement, `verify_emd_result`,
 //! is already on the mutation path here), and a streaming run console with
 //! a cancel button. Runs are one-shot calls whose only interesting output
@@ -61,8 +62,9 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_world_panel::WorldPanel;
 use ggo_worldlib::emerald::{
-    EXPECTED_EMD_VERSION, ManifestKind, emd_error_message, emd_reverted, group_by_module,
-    schedules_using_system, verify_emd_result,
+    EXPECTED_EMD_VERSION, ManifestKind, OrderEdit, apply_order_edit, available_systems,
+    emd_error_message, emd_reverted, group_by_module, parse_cadenced_ref, schedules_using_system,
+    system_ref, verify_emd_result, with_cadence,
 };
 
 use forms::{ASSET_KIND, FIELD_KINDS, FieldDraft, GenDraft, GenKind};
@@ -99,6 +101,21 @@ const SHARED_MODULE_LABEL: &str = "(shared)";
 /// Mirrors ggo-ide's "Reverted -- the compiler rejected the change:", which
 /// it rendered as its own block for the same reason.
 const REVERTED_PREFIX: &str = "Rolled back — the project no longer compiles: ";
+
+/// What the run list says when an edit did not land and the panel put the
+/// saved order back. The run state line carries `emd`'s own reason; this
+/// line's job is the other half -- that the list on screen is no longer
+/// the one the user just made.
+const ORDER_ROLLBACK_NOTICE: &str = "Edit not applied — this is the saved run list again.";
+
+/// The cadences the per-row picker offers. A fixed list rather than a
+/// number field for the same reason [`FIELD_KINDS`] is one: it makes an
+/// invalid cadence unreachable instead of merely rejected (`emd` refuses
+/// `@0`, and worldlib's `parse_cadenced_ref` refuses to even split a
+/// malformed suffix). A run list that already carries some other cadence
+/// still SHOWS it -- the picker's label is the current value, whatever it
+/// is; the list is only what can be chosen.
+const CADENCES: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
 
 /// Empty-state text -- shown when there is nothing to list and no form
 /// open, i.e. an unmanaged project (or one whose manifests are still
@@ -432,6 +449,19 @@ pub struct EmeraldPanel {
     selected: Option<String>,
     /// The open "+ Field" row on the selected component, if any.
     field_form: Option<FieldRow>,
+    /// The selected SCHEDULE's run list, as the panel is showing it right
+    /// now -- which is not always what the manifest says. An edit is shown
+    /// the instant its `emd schedule set` starts (the optimistic commit),
+    /// and [`EmeraldPanel::refresh_manifests`] resyncs this from disk the
+    /// instant that run ends, whichever way it ended. Empty when the
+    /// Schedules tab has no selection.
+    schedule_order: Vec<String>,
+    /// Set when a schedule edit did NOT land and the list the user is
+    /// looking at was put back. Rendered right at the run list, because
+    /// that is where the edit visibly disappeared from -- a silent
+    /// rollback would leave the user believing an edit landed that did
+    /// not, which is worse than not being optimistic at all.
+    order_rollback: Option<&'static str>,
     run_state: RunState,
     run_generation: u64,
     _run_task: Option<Task<()>>,
@@ -453,6 +483,8 @@ impl EmeraldPanel {
             tab: BrowseTab::Components,
             selected: None,
             field_form: None,
+            schedule_order: Vec::new(),
+            order_rollback: None,
             run_state: RunState::Idle,
             run_generation: 0,
             _run_task: None,
@@ -498,12 +530,33 @@ impl EmeraldPanel {
         {
             self.clear_selection();
         }
+        // The manifest is the truth about a run list -- EXCEPT while a
+        // `schedule set` is in flight, which is the one window the
+        // optimistic order exists for. `finish_run` sets the terminal run
+        // state BEFORE it refreshes, so a finished run always resyncs
+        // here: that is what makes the rollback a re-read of what `emd`
+        // actually left on disk rather than a remembered vector that could
+        // drift from it.
+        if !self.running() {
+            self.resync_schedule_order();
+        }
         cx.notify();
+    }
+
+    /// Re-read the shown run list from the manifests.
+    fn resync_schedule_order(&mut self) {
+        self.schedule_order = self
+            .selected_schedule()
+            .and_then(|(name, _)| self.manifests.schedule(&name))
+            .map(|entry| entry.systems.clone())
+            .unwrap_or_default();
     }
 
     fn clear_selection(&mut self) {
         self.selected = None;
         self.field_form = None;
+        self.schedule_order.clear();
+        self.order_rollback = None;
     }
 
     /// The module of the named entry on the ACTIVE tab, or `None` when this
@@ -682,6 +735,8 @@ impl EmeraldPanel {
         } else {
             self.selected = Some(name.to_string());
             self.field_form = None;
+            self.order_rollback = None;
+            self.resync_schedule_order();
         }
         cx.notify();
     }
@@ -780,6 +835,161 @@ impl EmeraldPanel {
         Some((name, module))
     }
 
+    /// The selected schedule's `(name, module)` -- [`selected_component`]'s
+    /// twin for the Schedules tab.
+    ///
+    /// [`selected_component`]: EmeraldPanel::selected_component
+    fn selected_schedule(&self) -> Option<(String, String)> {
+        if self.tab != BrowseTab::Schedules {
+            return None;
+        }
+        let name = self.selected.clone()?;
+        let module = self.manifests.schedule(&name)?.module.clone();
+        Some((name, module))
+    }
+
+    // ------------------------------------------------ the schedule run list
+
+    /// Move the entry at `from` one row up or down.
+    ///
+    /// The bounds are checked HERE rather than only on the buttons'
+    /// `disabled`, for the same reason `submit_generate` re-checks the
+    /// draft: `apply_order_edit` is deliberately tolerant of an
+    /// out-of-range index (it no-ops), and a no-op edit that still spawned
+    /// `emd` would be a `cargo`-free but pointless manifest rewrite.
+    fn move_system(&mut self, from: usize, up: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if up && from == 0 || !up && from + 1 >= self.schedule_order.len() {
+            return;
+        }
+        let Some(system_ref) = self.schedule_order.get(from).cloned() else {
+            return;
+        };
+        let to = if up { from - 1 } else { from + 1 };
+        self.commit_order(
+            OrderEdit::Move { from, to },
+            ops::ScheduleEdit::Move {
+                system_ref,
+                from,
+                to,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Drop the entry at `index` from the run list -- the one schedule
+    /// edit that confirms first ([`ops::ManifestOp::destructive`]).
+    fn remove_system(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(system_ref) = self.schedule_order.get(index).cloned() else {
+            return;
+        };
+        self.commit_order(
+            OrderEdit::Remove { index },
+            ops::ScheduleEdit::Remove { system_ref, index },
+            window,
+            cx,
+        );
+    }
+
+    /// Append a system to the run list -- `system_ref` comes from
+    /// [`available_systems`], so a duplicate (or a name `emd` has never
+    /// heard of) is unreachable rather than merely rejected.
+    fn add_system(&mut self, system_ref: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_order(
+            OrderEdit::Add {
+                system_ref: system_ref.to_string(),
+            },
+            ops::ScheduleEdit::Add {
+                system_ref: system_ref.to_string(),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Set the entry at `index`'s `@N` cadence.
+    ///
+    /// **Not an [`OrderEdit`]**, and deliberately not faked as one: the
+    /// order is untouched, and worldlib's own pair for this is
+    /// [`parse_cadenced_ref`] + [`with_cadence`] (an `OrderEdit::Remove`
+    /// followed by an `Add` would move the row to the end, which is a
+    /// different edit entirely). The list mutation is still not
+    /// hand-rolled -- the ref itself is rebuilt by `with_cadence`, which
+    /// owns the "cadence 1 carries no suffix" rule.
+    fn set_cadence(
+        &mut self,
+        index: usize,
+        cadence: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.schedule_order.get(index) else {
+            return;
+        };
+        let (base, _) = parse_cadenced_ref(current);
+        let mut next = self.schedule_order.clone();
+        next[index] = with_cadence(&base, cadence);
+        self.commit_order_list(
+            next,
+            ops::ScheduleEdit::Cadence {
+                system_ref: base,
+                cadence,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Apply one [`OrderEdit`] to the shown run list and commit the result.
+    ///
+    /// The panel never splices the list itself: it hands the current order
+    /// and the edit to worldlib's [`apply_order_edit`] and commits what
+    /// comes back, so "up" at the top and "remove" past the end behave the
+    /// way the unit-tested pure function says they do rather than the way
+    /// a second implementation here would.
+    fn commit_order(
+        &mut self,
+        edit: OrderEdit,
+        kind: ops::ScheduleEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = apply_order_edit(&self.schedule_order, edit);
+        self.commit_order_list(next, kind, window, cx);
+    }
+
+    /// Commit a whole new run list: one `emd schedule set` carrying it.
+    ///
+    /// **The concurrent-edit rule is "reject while running"**, enforced by
+    /// [`request_op`]'s own `running()` guard and stated on the buttons
+    /// (they are disabled mid-run). Last-write-wins would be the wrong
+    /// choice here: the second edit is computed from the OPTIMISTIC order,
+    /// so if the first run fails, the second would commit a list derived
+    /// from a state that never existed on disk -- silently reapplying the
+    /// rejected edit. Refusing the second edit keeps every committed list
+    /// derived from a list `emd` has accepted.
+    ///
+    /// [`request_op`]: EmeraldPanel::request_op
+    fn commit_order_list(
+        &mut self,
+        next: Vec<String>,
+        kind: ops::ScheduleEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((schedule, module)) = self.selected_schedule() else {
+            return;
+        };
+        if next == self.schedule_order {
+            return;
+        }
+        self.request_op(
+            ManifestOp::schedule_set(&schedule, &module, next, kind),
+            window,
+            cx,
+        );
+    }
+
     /// **The one gate on every manifest mutation.** Gathers the blast
     /// radius, raises the confirm the op needs, and only spawns `emd` if
     /// the user says yes.
@@ -833,6 +1043,15 @@ impl EmeraldPanel {
         }));
     }
 
+    /// Start `op`. **The optimistic commit lives here**: a schedule set's
+    /// new run list becomes what the panel shows the moment the run
+    /// starts -- not when the edit was computed, so a confirm the user
+    /// cancels never moves a row, and not when the run finishes, which is
+    /// the wait this optimism exists to hide.
+    ///
+    /// Nothing needs to be remembered to undo it: on disk the run list is
+    /// either what `emd` wrote or what it was, and
+    /// [`EmeraldPanel::refresh_manifests`] re-reads it either way.
     fn run_op(
         &mut self,
         op: ManifestOp,
@@ -840,6 +1059,10 @@ impl EmeraldPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let ManifestOp::ScheduleSet { systems, .. } = &op {
+            self.schedule_order = systems.clone();
+            self.order_rollback = None;
+        }
         let args = op.args();
         self.start_run(project_dir, args, PendingRun::Manifest(op), window, cx);
     }
@@ -893,11 +1116,13 @@ impl EmeraldPanel {
     /// **The timeout is a race, not a poll**: the run future and
     /// `background_executor().timer()` go into `smol::future::or`, so
     /// whichever finishes first wins and the loser is DROPPED -- and
-    /// dropping the run future kills the child (`runner`'s doc explains
-    /// the `kill_on_drop` chain). The panel therefore comes back to a
-    /// usable state with a real message instead of sitting on "Running…"
-    /// while an abandoned `cargo check` holds the project's `target/`
-    /// lock. The executor's timer, not `smol::Timer`, because it is the
+    /// dropping the run future kills `emd` (`runner`'s doc explains the
+    /// `kill_on_drop` chain). The panel therefore comes back to a usable
+    /// state with a real message instead of sitting on "Running…" forever,
+    /// and leaves no orphaned `emd` behind. It does NOT stop a `cargo
+    /// check` that `emd` had already started -- that grandchild is outside
+    /// the kill and runs to completion, still holding the project's
+    /// `target/` lock. The executor's timer, not `smol::Timer`, because it is the
     /// one clock the gpui test executor can advance (and the one this
     /// checkout's `clippy.toml` allows).
     fn start_run(
@@ -960,10 +1185,26 @@ impl EmeraldPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Read the trailer's own `emd` version BEFORE `verify_emd_result`
+        // rewrites `result.error` into the version-drift message, and
+        // decide on it FIRST. `verify_emd_result` leaves `result.reverted`
+        // alone, so a run that both reverted and came from the wrong `emd`
+        // would otherwise render as "Rolled back — the project no longer
+        // compiles: emd version changed mid-session (…)", which is two
+        // unrelated causes in one sentence and blames the wrong one. A
+        // drifted binary is not a compiler verdict, so it is a plain
+        // failure. (E4 owns the banner; this is only which state the
+        // mutation path lands in.)
+        let version_mismatch = outcome
+            .result
+            .as_ref()
+            .and_then(|r| r.get("emd"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|got| got != EXPECTED_EMD_VERSION);
         let outcome = verify_emd_result(outcome, EXPECTED_EMD_VERSION);
         if !outcome.ok {
             let message = emd_error_message(&outcome);
-            let reverted = emd_reverted(&outcome);
+            let reverted = emd_reverted(&outcome) && !version_mismatch;
             let transcript = outcome.output;
             self.run_state = if reverted {
                 RunState::Reverted {
@@ -979,7 +1220,16 @@ impl EmeraldPanel {
             // A revert leaves the manifests exactly as they were and a
             // failure never touched them -- but re-reading is cheap and is
             // the only way the lists cannot drift from what `emd` decided.
+            // It is also the ROLLBACK: the optimistic run list goes back
+            // to what is on disk, which for both of those outcomes is the
+            // order the edit started from.
             self.refresh_manifests(cx);
+            if matches!(
+                pending,
+                PendingRun::Manifest(ManifestOp::ScheduleSet { .. })
+            ) {
+                self.order_rollback = Some(ORDER_ROLLBACK_NOTICE);
+            }
             cx.notify();
             return;
         }
@@ -1553,28 +1803,177 @@ impl EmeraldPanel {
             .into_any_element()
     }
 
-    /// The selected SCHEDULE's ordered run list. Read-only here; Task E3
-    /// turns this into the reorder/add/cadence editor.
-    fn render_schedule_detail(&self, name: &str) -> gpui::AnyElement {
-        let Some(entry) = self.manifests.schedule(name) else {
+    /// The selected SCHEDULE's ordered run list, editable: reorder, drop,
+    /// add, and set each entry's cadence.
+    ///
+    /// It renders [`EmeraldPanel::schedule_order`], NOT the manifest
+    /// entry -- that is the whole of the optimistic commit on this side:
+    /// while a `schedule set` is in flight the two differ, and this shows
+    /// the edit the user just made.
+    ///
+    /// **Up/Down buttons, not drag-and-drop** -- ggo-ide's own choice for
+    /// this list, and the same one for the same reason: worldlib's
+    /// `OrderEdit::Move` is exercised identically either way, and a drag
+    /// affordance in this dock would be a bespoke widget for a list that
+    /// is usually four rows long.
+    fn render_schedule_detail(
+        &self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if self.manifests.schedule(name).is_none() {
             return div().into_any_element();
-        };
+        }
+        let running = self.running();
+        let last = self.schedule_order.len().saturating_sub(1);
         let mut col = v_flex().gap_0p5().pl_2();
-        if entry.systems.is_empty() {
+        if self.schedule_order.is_empty() {
             col = col.child(
                 Label::new("no systems")
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             );
         }
-        for system in &entry.systems {
+        for (ix, entry_ref) in self.schedule_order.iter().enumerate() {
+            let (base, cadence) = parse_cadenced_ref(entry_ref);
+            // A ref naming a system that is not in the manifest: `emd`
+            // would reject the whole `schedule set`, so saying so here is
+            // the difference between a puzzling failure and an obvious
+            // one. (`emd rm system` leaves these behind by design -- it
+            // does not rewrite schedules.)
+            let dangling = !self
+                .manifests
+                .systems
+                .iter()
+                .any(|s| system_ref(&s.module, &s.name) == base);
             col = col.child(
-                Label::new(system.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(if dangling {
+                                format!("{}. {base} (dangling)", ix + 1)
+                            } else {
+                                format!("{}. {base}", ix + 1)
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(if dangling {
+                                Color::Error
+                            } else {
+                                Color::Muted
+                            }),
+                        ),
+                    )
+                    .child(self.render_cadence_dropdown(ix, cadence, window, cx))
+                    .child(
+                        IconButton::new(("ggo-emerald-order-up", ix), IconName::ChevronUp)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(running || ix == 0)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.move_system(ix, true, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("ggo-emerald-order-down", ix), IconName::ChevronDown)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(running || ix >= last)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.move_system(ix, false, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("ggo-emerald-order-rm", ix), IconName::Trash)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(running)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.remove_system(ix, window, cx)
+                            })),
+                    ),
             );
         }
-        col.into_any_element()
+        if let Some(notice) = self.order_rollback {
+            col = col.child(
+                Label::new(notice)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning),
+            );
+        }
+        col.child(self.render_add_system_dropdown(window, cx))
+            .into_any_element()
+    }
+
+    /// One run-list row's cadence picker. The label is the entry's CURRENT
+    /// cadence even when [`CADENCES`] does not offer it.
+    fn render_cadence_dropdown(
+        &self,
+        ix: usize,
+        cadence: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let weak = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+            for n in CADENCES {
+                let weak = weak.clone();
+                menu = menu.entry(
+                    SharedString::from(ops::every(n)),
+                    None,
+                    move |window, cx| {
+                        weak.update(cx, |this, cx| this.set_cadence(ix, n, window, cx))
+                            .ok();
+                    },
+                );
+            }
+            menu
+        });
+        DropdownMenu::new(
+            ("ggo-emerald-cadence", ix),
+            SharedString::from(ops::every(cadence)),
+            menu,
+        )
+        .disabled(self.running())
+        .into_any_element()
+    }
+
+    /// The "+ System" picker: every system NOT already in this run list
+    /// ([`available_systems`]), so adding a duplicate is unreachable
+    /// rather than merely rejected. Picking one commits immediately --
+    /// there is no second "Add" step to forget.
+    fn render_add_system_dropdown(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let available = available_systems(&self.manifests.systems, &self.schedule_order);
+        if available.is_empty() {
+            return Label::new("every system is already in this schedule")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element();
+        }
+        let weak = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            for system in &available {
+                let weak = weak.clone();
+                let sref = system_ref(&system.module, &system.name);
+                let label = sref.clone();
+                menu = menu.entry(SharedString::from(label), None, move |window, cx| {
+                    let sref = sref.clone();
+                    weak.update(cx, |this, cx| this.add_system(&sref, window, cx))
+                        .ok();
+                });
+            }
+            menu
+        });
+        DropdownMenu::new(
+            "ggo-emerald-add-system",
+            SharedString::from("+ System"),
+            menu,
+        )
+        .disabled(self.running())
+        .into_any_element()
     }
 
     /// The active tab's manifest, grouped by module (shared first, then
@@ -1626,7 +2025,7 @@ impl EmeraldPanel {
                     (self.selected.as_deref() == Some(name.as_str())).then(|| match self.tab {
                         BrowseTab::Components => self.render_component_detail(&name, window, cx),
                         BrowseTab::Systems => self.render_system_detail(&name),
-                        BrowseTab::Schedules => self.render_schedule_detail(&name),
+                        BrowseTab::Schedules => self.render_schedule_detail(&name, window, cx),
                     });
                 col = col.child(self.render_row(ix, &name, detail, cx));
                 ix += 1;
@@ -1666,6 +2065,8 @@ fn component_shaped(op: &ManifestOp) -> bool {
     match op {
         ManifestOp::Remove { kind, .. } => *kind == ManifestKind::Component,
         ManifestOp::FieldAdd { .. } | ManifestOp::FieldRemove { .. } => true,
+        // A run list says nothing about what components exist.
+        ManifestOp::ScheduleSet { .. } => false,
     }
 }
 
@@ -2698,6 +3099,451 @@ mod tests {
             "a run is in flight -- the second remove does not even confirm"
         );
         assert_eq!(calls.lock().unwrap().len(), 1, "and nothing else spawned");
+    }
+
+    // ------------------------------------------------ the schedule run list
+
+    /// A panel with `name` selected on the Schedules tab -- the state
+    /// every run-list edit starts from.
+    fn schedule_panel(
+        cx: &mut gpui::VisualTestContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+        name: &str,
+    ) -> Entity<EmeraldPanel> {
+        let panel = browsing_panel(cx, root, runner);
+        panel.update(cx, |panel, cx| {
+            panel.select_tab(BrowseTab::Schedules, cx);
+            panel.select_item(name, cx);
+        });
+        panel
+    }
+
+    fn order(panel: &Entity<EmeraldPanel>, cx: &mut gpui::VisualTestContext) -> Vec<String> {
+        panel.read_with(cx, |panel, _| panel.schedule_order.clone())
+    }
+
+    /// The run list a spawned `schedule set` actually carries -- read back
+    /// off the argv, so the assertions below compare what `emd` was told
+    /// with what `apply_order_edit` said it should be told.
+    fn spawned_systems(request: &EmdRequest) -> Vec<String> {
+        let at = request
+            .args
+            .iter()
+            .position(|a| a == "--systems")
+            .unwrap_or_else(|| panic!("no --systems in {:?}", request.args));
+        request.args[at + 1]
+            .split(',')
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `build_schedule_set_args` plus the `--json` the request appends --
+    /// what every edit's argv must equal exactly.
+    fn expected_set_argv(name: &str, module: &str, systems: &[String]) -> Vec<String> {
+        ggo_worldlib::emerald::build_schedule_set_args(name, module, systems)
+            .into_iter()
+            .chain(["--json".to_string()])
+            .collect()
+    }
+
+    /// **The task's centre.** Each of the four edits computes the list
+    /// worldlib's pure helpers say it should and spawns worldlib's own
+    /// argv for it -- no hand-rolled splice, no hand-written vector on
+    /// either side of the assertion.
+    #[gpui::test]
+    async fn test_reorder_add_remove_and_cadence_each_commit_worldlibs_list(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/update"));
+        let panel = schedule_panel(cx, dir.path(), runner, "update");
+
+        let before = order(&panel, cx);
+        assert_eq!(before, ["gameplay/spawn_enemies", "tick_clock"]);
+
+        // MOVE: "tick_clock" up one.
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.move_system(1, true, window, cx))
+        });
+        cx.run_until_parked();
+        let moved = apply_order_edit(&before, OrderEdit::Move { from: 1, to: 0 });
+        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one spawn");
+        assert_eq!(spawned_systems(&calls.lock().unwrap()[0]), moved);
+        assert_eq!(
+            calls.lock().unwrap()[0].args,
+            expected_set_argv("update", "", &moved)
+        );
+        assert_eq!(calls.lock().unwrap()[0].cwd, dir.path());
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Moved tick_clock to position 1 in schedule update"
+        );
+
+        // The fake `emd` never rewrote the manifest, so the reload puts
+        // the saved order back -- which is the contract, not an artefact:
+        // the list on screen is always what `emd` left on disk.
+        assert_eq!(order(&panel, cx), before);
+
+        // CADENCE: row 0 to every 4 ticks. Not an `OrderEdit` -- the order
+        // does not change, only the ref's `@N` suffix does.
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.set_cadence(0, 4, window, cx)));
+        cx.run_until_parked();
+        let cadenced = vec![
+            with_cadence("gameplay/spawn_enemies", 4),
+            "tick_clock".to_string(),
+        ];
+        assert_eq!(spawned_systems(&calls.lock().unwrap()[1]), cadenced);
+        assert_eq!(
+            calls.lock().unwrap()[1].args,
+            expected_set_argv("update", "", &cadenced)
+        );
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done gameplay/spawn_enemies now runs every 4 ticks in schedule update"
+        );
+
+        // REMOVE: row 1, after the confirm.
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.remove_system(1, window, cx)));
+        assert!(cx.has_pending_prompt(), "dropping an entry confirms");
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        let removed = apply_order_edit(&before, OrderEdit::Remove { index: 1 });
+        assert_eq!(spawned_systems(&calls.lock().unwrap()[2]), removed);
+        assert_eq!(
+            calls.lock().unwrap()[2].args,
+            expected_set_argv("update", "", &removed)
+        );
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Removed tick_clock from schedule update"
+        );
+
+        // ADD: `render` is the schedule with a system still available.
+        panel.update(cx, |panel, cx| panel.select_item("render", cx));
+        let render_before = order(&panel, cx);
+        assert_eq!(render_before, ["gameplay/spawn_enemies@4"]);
+        let candidates = available_systems(
+            &panel.read_with(cx, |panel, _| panel.manifests.systems.clone()),
+            &render_before,
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            ["tick_clock"],
+            "a system already in the list, cadence and all, is not offered again"
+        );
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.add_system("tick_clock", window, cx))
+        });
+        cx.run_until_parked();
+        let added = apply_order_edit(
+            &render_before,
+            OrderEdit::Add {
+                system_ref: "tick_clock".to_string(),
+            },
+        );
+        assert_eq!(spawned_systems(&calls.lock().unwrap()[3]), added);
+        assert_eq!(
+            calls.lock().unwrap()[3].args,
+            expected_set_argv("render", "", &added)
+        );
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Added tick_clock to schedule render"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 4, "four edits, four runs");
+    }
+
+    /// **The optimistic commit, and the visible rollback.** The reordered
+    /// list is on screen while `emd` is still running; when `emd` refuses
+    /// it, the list goes back AND says so -- a silent snap-back would
+    /// leave the user believing the edit landed.
+    #[gpui::test]
+    async fn test_an_edit_shows_at_once_and_rolls_back_visibly_when_emd_refuses_it(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| err_outcome("unknown system ref: tick_clock"));
+        let panel = schedule_panel(cx, dir.path(), runner, "update");
+        let saved = order(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.move_system(1, true, window, cx))
+        });
+        // Read BEFORE the run is allowed to finish: this is the whole
+        // point of the optimism.
+        assert_eq!(
+            order(&panel, cx),
+            ["tick_clock", "gameplay/spawn_enemies"],
+            "the reordered list is shown while emd is still running"
+        );
+        assert!(run_state_message(&panel, cx).starts_with("running"));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.order_rollback),
+            None,
+            "nothing has been rolled back yet"
+        );
+
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1, "it really ran");
+        assert_eq!(order(&panel, cx), saved, "the list went back");
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.order_rollback),
+            Some(ORDER_ROLLBACK_NOTICE),
+            "and the panel SAYS it went back, at the list itself"
+        );
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "failed unknown system ref: tick_clock",
+            "with emd's own reason beside it"
+        );
+
+        // The next edit clears the notice: it belongs to the edit that
+        // failed, not to the schedule.
+        let (runner, _) = fake_runner(|_| ok_outcome("/x/update"));
+        panel.update(cx, |panel, _| panel.runner = runner);
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.move_system(1, true, window, cx))
+        });
+        assert_eq!(panel.read_with(cx, |panel, _| panel.order_rollback), None);
+        cx.run_until_parked();
+    }
+
+    /// A REVERT rolls the list back just as visibly as a failure, and
+    /// still reads as a revert rather than a failure. (`emd schedule set`
+    /// runs no `cargo check` today -- this is the path that stays correct
+    /// if it ever grows one.)
+    #[gpui::test]
+    async fn test_a_reverted_schedule_set_also_rolls_the_list_back(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, _) = fake_runner(|_| {
+            emd_run_outcome(
+                false,
+                &[
+                    "emd-json: {\"emd\":\"0.2.0\",\"ok\":false,\"reverted\":true,\
+                   \"error\":\"error[E0425]: cannot find function `tick_clock`\"}"
+                        .to_string(),
+                ],
+            )
+        });
+        let panel = schedule_panel(cx, dir.path(), runner, "update");
+        let saved = order(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.move_system(0, false, window, cx))
+        });
+        assert_eq!(order(&panel, cx), ["tick_clock", "gameplay/spawn_enemies"]);
+        cx.run_until_parked();
+
+        assert_eq!(order(&panel, cx), saved);
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.order_rollback),
+            Some(ORDER_ROLLBACK_NOTICE)
+        );
+        assert!(
+            run_state_message(&panel, cx).starts_with("reverted error[E0425]"),
+            "{}",
+            run_state_message(&panel, cx)
+        );
+    }
+
+    /// A successful edit RECONCILES against what `emd` wrote rather than
+    /// keeping the optimistic list on faith: the fake writes a different
+    /// order than it was asked for, and that is what ends up on screen.
+    #[gpui::test]
+    async fn test_a_successful_edit_shows_what_emd_actually_wrote(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let manifest = dir.path().join("manifests/schedules.toml");
+        let cx = empty_window(cx);
+        let (runner, _) = fake_runner(move |_| {
+            std::fs::write(
+                &manifest,
+                "version = 1\n\
+                 [[schedule]]\nname = \"update\"\nsystems = [\"tick_clock@2\", \"gameplay/spawn_enemies\"]\n\
+                 [[schedule]]\nname = \"render\"\nsystems = [\"gameplay/spawn_enemies@4\"]\n",
+            )
+            .unwrap();
+            ok_outcome("/x/update")
+        });
+        let panel = schedule_panel(cx, dir.path(), runner, "update");
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.move_system(1, true, window, cx))
+        });
+        assert_eq!(
+            order(&panel, cx),
+            ["tick_clock", "gameplay/spawn_enemies"],
+            "optimistic"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            order(&panel, cx),
+            ["tick_clock@2", "gameplay/spawn_enemies"],
+            "reconciled against the manifest emd left behind, not the guess"
+        );
+        assert_eq!(panel.read_with(cx, |panel, _| panel.order_rollback), None);
+    }
+
+    /// **The concurrent-edit rule: reject while running.** A second edit
+    /// mid-run does not spawn, does not confirm, and -- the part that
+    /// matters -- does not disturb the list the first edit is showing, so
+    /// no committed list is ever derived from an optimistic one.
+    #[gpui::test]
+    async fn test_a_second_run_list_edit_is_refused_while_one_is_in_flight(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (hung, calls) = hung_runner();
+        let panel = schedule_panel(cx, dir.path(), hung, "update");
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.move_system(1, true, window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let in_flight = order(&panel, cx);
+        assert_eq!(in_flight, ["tick_clock", "gameplay/spawn_enemies"]);
+
+        // Every entry point, while the first run is still going.
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.move_system(1, true, window, cx);
+                panel.set_cadence(0, 4, window, cx);
+                panel.add_system("tick_clock", window, cx);
+                panel.remove_system(0, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "the removal does not even confirm mid-run"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "nothing else spawned");
+        assert_eq!(
+            order(&panel, cx),
+            in_flight,
+            "and the shown list is untouched -- a refused edit is not half-applied"
+        );
+    }
+
+    /// Cancelling the removal confirm runs nothing AND moves nothing: the
+    /// optimistic swap happens when the run starts, not when the edit is
+    /// computed, so a cancelled edit is invisible.
+    #[gpui::test]
+    async fn test_cancelling_a_run_list_removal_spawns_nothing_and_keeps_the_order(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let panel = schedule_panel(cx, dir.path(), runner, "update");
+        let saved = order(&panel, cx);
+
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.remove_system(0, window, cx)));
+        let (message, detail) = cx.pending_prompt().expect("a removal confirms");
+        assert_eq!(
+            message,
+            "Remove gameplay/spawn_enemies from the schedule update?"
+        );
+        assert!(
+            detail.contains("appends it to the end of the run list, not to position 1."),
+            "the confirm names the specific loss: {detail}"
+        );
+        assert_eq!(
+            order(&panel, cx),
+            saved,
+            "nothing moved while the prompt is up"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "Cancel must not run anything"
+        );
+        assert_eq!(order(&panel, cx), saved);
+        assert_eq!(panel.read_with(cx, |panel, _| panel.order_rollback), None);
+        assert_eq!(run_state_message(&panel, cx), "idle");
+    }
+
+    /// A no-op edit spawns nothing: "up" on the first row and "down" on
+    /// the last are the tolerant no-ops `apply_order_edit` documents, and
+    /// a pointless manifest rewrite is not what they should become.
+    #[gpui::test]
+    async fn test_a_no_op_edit_never_reaches_the_runner(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let panel = schedule_panel(cx, dir.path(), runner, "update");
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.move_system(0, true, window, cx);
+                panel.move_system(1, false, window, cx);
+                panel.move_system(9, true, window, cx);
+                panel.remove_system(9, window, cx);
+                panel.set_cadence(0, 1, window, cx);
+                panel.set_cadence(9, 4, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(run_state_message(&panel, cx), "idle");
+    }
+
+    /// **Carried E2 review fix.** A trailer from the wrong `emd` that ALSO
+    /// says `reverted` is a VERSION failure, not a compiler verdict:
+    /// `verify_emd_result` keeps `reverted`, so checking it first would
+    /// render "Rolled back — the project no longer compiles: emd version
+    /// changed mid-session (…)", which blames the compiler for a swapped
+    /// binary.
+    #[gpui::test]
+    async fn test_a_version_mismatch_that_also_reverted_is_not_read_as_a_revert(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, _) = fake_runner(|_| {
+            emd_run_outcome(
+                false,
+                &[
+                    "emd-json: {\"emd\":\"0.9.9\",\"ok\":false,\"reverted\":true,\
+                   \"error\":\"error[E0609]: no field `hp`\"}"
+                        .to_string(),
+                ],
+            )
+        });
+        let panel = browsing_panel(cx, dir.path(), runner);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_item("HeroUnit", cx);
+                panel.request_field_remove("hp", window, cx);
+            })
+        });
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+
+        let message = run_state_message(&panel, cx);
+        assert!(
+            message.starts_with("failed emd version changed mid-session (0.9.9 vs 0.2.0)"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("no longer compiles"),
+            "the version drift must not be dressed up as a compiler verdict: {message}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(&panel.run_state, RunState::Failed { .. }));
+        });
     }
 
     // ------------------------------------------------------- the menu

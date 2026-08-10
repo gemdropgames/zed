@@ -71,8 +71,12 @@ pub type EmdRun = Pin<Box<dyn Future<Output = EmdRunOutcome> + Send>>;
 /// can be given a deadline: the panel races this future against
 /// `cx.background_executor().timer(EMD_TIMEOUT)` and drops it on expiry,
 /// and `ggo_common::run_capture_async`'s `kill_on_drop` child turns that
-/// drop into a dead `cargo check` rather than an orphan that keeps holding
-/// the project's `target/` lock. A blocking `Fn` could not be interrupted
+/// drop into a dead `emd` rather than an orphan process nobody is
+/// listening to. Note what that does NOT reach: a `cargo check` `emd`
+/// itself spawned is a GRANDchild, outside the kill, and runs on holding
+/// the project's `target/` lock (see `run_capture_async`'s own doc). The
+/// timeout unsticks the PANEL; it does not cancel the build.
+/// A blocking `Fn` could not be interrupted
 /// at all -- `smol::block_on` is not an await point, so cancelling the task
 /// around it would return control to the panel while the child ran on.
 ///

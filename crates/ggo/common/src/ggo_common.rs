@@ -526,7 +526,9 @@ pub fn system_proc_runner() -> ProcRunner {
 /// child dies when the future is dropped -- so a caller that DOES have an
 /// executor (`ggo_emerald_panel`'s `cargo check`-backed mutations) can
 /// impose its own budget by racing the future against a timer and dropping
-/// it, and the child goes with it.
+/// it, and the child goes with it. Only the child, though: see
+/// [`run_capture_async`] on what a killed `emd`'s own `cargo` grandchild
+/// does next.
 ///
 /// The child is `smol::process::Command`, not `std::process::Command`:
 /// this checkout's `clippy.toml` disallows the latter's `output`/`spawn`/
@@ -545,10 +547,19 @@ pub fn run_capture(request: &ProcRequest) -> ProcCapture {
 /// That property is `Command::kill_on_drop(true)` plus how `async_process`
 /// is built -- `Command::output()`'s future owns the `Child`'s guard, so
 /// cancelling the future runs the guard's `Drop`, which sends the kill.
-/// Without the flag a dropped future would merely stop LISTENING to a
-/// `cargo check` that keeps running (and keeps holding the project's
-/// `target/` lock), which is the failure a timeout is supposed to prevent,
-/// not one it should cause.
+/// Without the flag a dropped future would not even stop the process it
+/// spawned; it would merely stop LISTENING to it.
+///
+/// **What it does NOT do: kill grandchildren.** The signal goes to the
+/// child this command spawned and to nothing else -- it is not a process
+/// group kill -- so an `emd` that has itself shelled out to `cargo check`
+/// dies while that `cargo` is reparented and runs to completion, still
+/// holding the project's `target/` lock. Dropping the future therefore
+/// buys a caller two real things (the panel stops waiting, and no orphaned
+/// `emd` is left behind) and does not buy a third one it might be assumed
+/// to: the build that run started is not cancelled. Killing the whole tree
+/// would mean putting the child in its own process group and signalling
+/// that, which nothing in this fork does today.
 ///
 /// Everything else -- the stdout-then-stderr capture order that lets a
 /// failing `emd`'s stderr trailer win, and the "a binary that cannot be
