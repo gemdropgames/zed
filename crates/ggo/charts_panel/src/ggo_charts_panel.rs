@@ -73,6 +73,16 @@ const DEFAULT_WIDTH: Pixels = px(360.);
 /// Height of one chart canvas, matching ggo-ide's `CHART_HEIGHT` (240).
 const CHART_HEIGHT: Pixels = px(240.);
 
+// `debug_selector` handles for the three run-detail sections that are not
+// canvases. gpui records a selector's painted bounds only in debug builds
+// (`div.rs:845-856` -- the release impl discards the closure unevaluated),
+// which is what lets `test_the_detail_view_paints_its_sections_in_order`
+// assert that a section was laid out, and where, without a way to read
+// text back out of a painted frame.
+const KPI_ROW_SELECTOR: &str = "ggo-charts-kpi-row";
+const FAILURES_SELECTOR: &str = "ggo-charts-failures";
+const PANICS_SELECTOR: &str = "ggo-charts-panics";
+
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
     // Same rule as `ggo_world_panel::init`/`ggo_sprite_panel::init`:
@@ -445,18 +455,23 @@ impl ChartsPanel {
                     .child(self.render_failures_table(&report.diagnostics, cx))
                     .child(self.render_panics_table(&report.diagnostics, cx))
                     .children(if charts.is_empty() {
-                        // An explicit message, never a blank canvas: a run
-                        // with no frames and a run whose only frame is the
-                        // ignored frame 0 both land here. No KPI tiles
-                        // either -- every one of them would read 0 (or
-                        // 100% hit rate) for a run that measured nothing,
-                        // and ggo-ide skips `kpi_row` in this case too.
+                        // An explicit message, never a blank canvas -- and
+                        // which message matters. A run that recorded no
+                        // frames at all and a run whose only frame is the
+                        // ignored frame 0 both land here, but only the
+                        // first never reached vsync_wait; saying so about
+                        // the second is simply false. `report.no_frames`
+                        // is what distinguishes them (ggo-ide keeps the
+                        // same two apart at `reports.rs:1015`).
+                        //
+                        // No KPI tiles either way -- every one of them
+                        // would read 0 (or a 100% hit rate) for a run that
+                        // measured nothing, and ggo-ide skips `kpi_row` on
+                        // this same condition.
                         vec![
-                            Label::new(
-                                "No frames recorded for this run (cart never reached vsync_wait).",
-                            )
-                            .color(Color::Muted)
-                            .into_any_element(),
+                            Label::new(report.no_frames.unwrap_or(report::NO_FRAMES_RECORDED))
+                                .color(Color::Muted)
+                                .into_any_element(),
                         ]
                     } else {
                         let mut out = vec![self.render_kpi_row(&report.tiles, cx)];
@@ -528,6 +543,10 @@ impl ChartsPanel {
             .w_full()
             .flex_wrap()
             .gap_2()
+            // Test-only handle (a no-op outside debug builds -- see
+            // gpui's `div.rs:855`) so a render test can assert this row
+            // was actually laid out, and where relative to the charts.
+            .debug_selector(|| KPI_ROW_SELECTOR.to_string())
             .children(tiles.iter().map(|tile| {
                 v_flex()
                     .px_2()
@@ -554,6 +573,7 @@ impl ChartsPanel {
         let rows = diagnostics.failures();
         Self::table(
             "Failed asset loads",
+            FAILURES_SELECTOR,
             diagnostics.empty_state(rows.len()),
             cx,
         )
@@ -585,26 +605,31 @@ impl ChartsPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rows = diagnostics.panics();
-        Self::table("Panics", diagnostics.empty_state(rows.len()), cx)
-            .children(rows.iter().map(|p| {
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_start()
-                    .child(
-                        Label::new(p.frame.map_or_else(|| "—".to_string(), |n| n.to_string()))
+        Self::table(
+            "Panics",
+            PANICS_SELECTOR,
+            diagnostics.empty_state(rows.len()),
+            cx,
+        )
+        .children(rows.iter().map(|p| {
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_start()
+                .child(
+                    Label::new(p.frame.map_or_else(|| "—".to_string(), |n| n.to_string()))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(p.message.clone())
                             .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(p.message.clone())
-                                .size(LabelSize::Small)
-                                .buffer_font(cx),
-                        ),
-                    )
-            }))
-            .into_any_element()
+                            .buffer_font(cx),
+                    ),
+                )
+        }))
+        .into_any_element()
     }
 
     /// A titled table section, already carrying its empty-state line when
@@ -612,12 +637,14 @@ impl ChartsPanel {
     /// heading weight and spacing.
     fn table(
         title: &'static str,
+        selector: &'static str,
         empty_state: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         v_flex()
             .w_full()
             .gap_1()
+            .debug_selector(|| selector.to_string())
             .child(
                 Label::new(title)
                     .size(LabelSize::Small)
@@ -1311,6 +1338,26 @@ mod tests {
         });
     }
 
+    /// A `run` row with no `frame` rows at all -- the cart that never
+    /// reached vsync_wait.
+    fn seed_run_without_frames(db_path: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(db_path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'demo')", ())
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO run (id, cart_id, started_at, frames, label)
+                 VALUES (1, 1, '2026-08-01T00:00:00Z', 0, 'arena')",
+                (),
+            )
+            .await
+            .unwrap();
+        });
+    }
+
     /// A run with only the always-on counters -- no PPU evictions, no
     /// tile working set, no sprite scanline peak, no VRAM uploads, no APU
     /// traffic. The fixture behind "a run that never measured those must
@@ -1533,9 +1580,17 @@ mod tests {
     }
 
     /// The two empty states, which must NOT read the same. A run that
-    /// recorded clean UART says "none recorded"; a run with no UART at all
-    /// says it predates UART capture, because "nothing failed" is a claim
-    /// its data cannot support.
+    /// recorded clean UART says "none recorded" -- a claim its data
+    /// supports. A run with zero UART rows says only that no lines were
+    /// captured, offering causes without asserting one.
+    ///
+    /// The `silent` half is deliberately seeded through the CURRENT
+    /// schema, with a run written moments ago: that is exactly
+    /// `ingest_run`'s documented "caller had no uart lines -- zero rows
+    /// written, not an error" case, and it is why this state may not be
+    /// reported as "the run predates UART capture". The fixture is the
+    /// counter-example to that claim, so it is pinned here rather than
+    /// left as a comment.
     #[gpui::test]
     async fn test_the_two_empty_states_are_distinct(cx: &mut TestAppContext) {
         let clean_dir = tempfile::tempdir().unwrap();
@@ -1550,15 +1605,56 @@ mod tests {
             assert_eq!(diagnostics.empty_state(0), Some(report::NONE_RECORDED));
         });
 
-        // `seed_run_with_samples` writes no UART at all.
+        // `seed_run_with_samples` writes a present-day run and no UART.
         let (_dir, silent) = ready_detail_panel(cx, 4).await;
         silent.update(cx, |panel, _cx| {
             let diagnostics = &panel.report().unwrap().diagnostics;
             assert_eq!(*diagnostics, report::Diagnostics::NoUart);
             assert_eq!(diagnostics.empty_state(0), Some(report::NO_UART));
+            assert!(
+                !report::NO_UART.contains("it predates"),
+                "this fixture is a present-day run, so the message must not \
+                 assert that the run is old: {}",
+                report::NO_UART
+            );
         });
 
         assert_ne!(report::NONE_RECORDED, report::NO_UART);
+    }
+
+    /// F4: the two reasons a run has no charts are different facts, and
+    /// only one of them is "never reached vsync_wait". A run whose only
+    /// frame is frame 0 reached it exactly once and then got filtered.
+    #[gpui::test]
+    async fn test_the_two_chartless_reasons_are_distinct(cx: &mut TestAppContext) {
+        // `seed_run_with_samples(.., 0)` writes frame 0 and nothing else,
+        // so the run HAS a frame and the ignore filter removes it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 0);
+        let only_frame_zero = ready_panel_for(cx, db_path).await;
+        only_frame_zero.update(cx, |panel, _cx| {
+            assert!(panel.chart_specs().is_empty());
+            assert_eq!(
+                panel.report().unwrap().no_frames,
+                Some(report::ALL_FRAMES_IGNORED),
+                "a run with a frame 0 did reach vsync_wait once"
+            );
+        });
+
+        // A run row with no `frame` rows at all is the other case.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare_path = bare_dir.path().join("ggo_ide.db");
+        seed_run_without_frames(&bare_path);
+        let never_sampled = ready_panel_for(cx, bare_path).await;
+        never_sampled.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.report().unwrap().no_frames,
+                Some(report::NO_FRAMES_RECORDED)
+            );
+        });
+
+        assert_ne!(report::ALL_FRAMES_IGNORED, report::NO_FRAMES_RECORDED);
     }
 
     /// A run that panicked before it ever reached vsync_wait has no
@@ -1581,6 +1677,147 @@ mod tests {
             );
             assert_eq!(report.diagnostics.panics().len(), 1);
         });
+    }
+
+    /// F3: the restructured render path itself, not just the view model
+    /// behind it. Every other test in this module asserts on
+    /// `report::RunReport`, which would leave `render_detail`'s actual
+    /// changes unexercised -- the header's `h_flex` -> `v_flex` with the
+    /// config line as a second child, the two diagnostic tables hoisted
+    /// ABOVE the charts-empty branch, and the `.children(if
+    /// charts.is_empty())` split.
+    ///
+    /// gpui offers no way to read text back out of a painted frame, so
+    /// this cannot assert wording (that is the view-model tests' job).
+    /// What it can do is ask the window where each section was laid out,
+    /// via the `debug_selector`/`debug_bounds` pair Zed's own tests use
+    /// for this. That pins the two things the restructure is:
+    ///
+    /// * the tables are painted for BOTH a charted and a frameless run
+    ///   (the hoist -- if a refactor moved them back inside the else-arm,
+    ///   the frameless run would paint nothing but a message);
+    /// * they are painted ABOVE the KPI row and the first chart canvas
+    ///   (the order, which is ggo-ide's `detail_view` order).
+    #[gpui::test]
+    async fn test_the_detail_view_paints_its_sections_in_order(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+
+        // A run with the full chart set, plus UART so both tables have
+        // rows rather than an empty state.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_uart(
+            &db_path,
+            &[
+                "asset: MISS \"grooble.til\"",
+                "f=3| panicked at 'boom', src/main.rs:1:1",
+            ],
+        );
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(cx);
+            panel.db_path_override = Some(db_path);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert!(!panel.chart_specs().is_empty(), "the charted branch");
+            assert!(panel.report().unwrap().config_line.is_some());
+        });
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        let failures = cx
+            .debug_bounds(FAILURES_SELECTOR)
+            .expect("the failed-asset-loads table must be painted");
+        let panics = cx
+            .debug_bounds(PANICS_SELECTOR)
+            .expect("the panics table must be painted");
+        let kpis = cx
+            .debug_bounds(KPI_ROW_SELECTOR)
+            .expect("the KPI row must be painted for a run with frames");
+        let first_chart = panel.update(cx, |panel, _cx| {
+            panel.chart_bounds.borrow()[0].expect("chart 0 must have been laid out")
+        });
+
+        assert!(
+            failures.origin.y < panics.origin.y,
+            "failed asset loads sits above panics"
+        );
+        assert!(
+            panics.origin.y < kpis.origin.y,
+            "both tables sit above the KPI row -- ggo-ide's detail_view order"
+        );
+        assert!(
+            kpis.origin.y < first_chart.origin.y,
+            "the KPI row sits above the plots"
+        );
+
+        // And the other branch: a frameless run still paints both tables
+        // (the whole point of hoisting them) but no KPI row.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare_path = bare_dir.path().join("ggo_ide.db");
+        seed_run_without_frames(&bare_path);
+        seed_uart(&bare_path, &["panicked at 'early boom', src/main.rs:1:1"]);
+
+        let (bare, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(cx);
+            panel.db_path_override = Some(bare_path);
+            panel
+        });
+        bare.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: None,
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        bare.update(cx, |panel, _cx| {
+            assert!(panel.chart_specs().is_empty(), "the frameless branch");
+        });
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(800.)),
+            |_window, _cx| bare.clone().into_any_element(),
+        );
+
+        assert!(
+            cx.debug_bounds(FAILURES_SELECTOR).is_some(),
+            "a frameless run must STILL paint its failure table -- this is \
+             the regression the hoist exists to prevent"
+        );
+        assert!(
+            cx.debug_bounds(PANICS_SELECTOR).is_some(),
+            "a frameless run must still paint its panics table"
+        );
+        assert!(
+            cx.debug_bounds(KPI_ROW_SELECTOR).is_none(),
+            "no KPI row for a run that measured nothing"
+        );
     }
 
     /// R1's concern (5): every `perf_db` call blocks and spins its own

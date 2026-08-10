@@ -21,7 +21,7 @@ use ggo_worldlib::charts::reports::kpi::{self, PCT_SCALE};
 use ggo_worldlib::charts::reports::uart_diag::{self, AssetFailure, PanicRow};
 
 use crate::chart_set::ignore_set;
-use crate::loader::{FrameRow, RunDetail, RunSamples, UartLine};
+use crate::loader::{FrameRow, RunSamples, UartLine};
 
 /// One KPI tile: a fixed label and an already-formatted value. The value
 /// is a `String` because the tiles are heterogeneous (counts, percentages,
@@ -46,21 +46,27 @@ impl KpiTile {
 /// numbers stop matching the page's for the same run). [`build`] is the
 /// only caller in this crate and it filters first.
 ///
-/// `budget` is `detail.frame_budget_cycles` -- the same column
-/// `FrameRow::frame_budget_cycles` carries, but read off the `run` row the
-/// way ggo-ide reads it, so a run whose frames somehow disagree with their
-/// own run row still shows the run's budget.
+/// `budget` is `detail.frame_budget_cycles`, read off the `run` row the
+/// way ggo-ide reads it (the same column `FrameRow::frame_budget_cycles`
+/// carries, denormalized onto every frame by `run_frames`' join).
 ///
 /// The last five tiles are conditional and each is gated by its own
 /// `kpi::*_tile` returning `Some` -- NOT by
-/// `ggo_worldlib::charts::reports::gates`. That is ggo-ide's behaviour
-/// (`kpi_row` never consults `chart_gates`; the gates are for the
-/// conditional CHARTS, which is where `chart_set` uses them), and it is
-/// what makes "no tile at all" mean "this run never measured that": each
-/// threshold is the counter's own (`> 0` for the peak/underrun/upload
-/// tiles, `> TILE_CACHE_TILES` for the two working sets, because a working
-/// set that fits in the cache is not a finding). A measured zero is
-/// therefore never rendered as a `0` tile.
+/// `ggo_worldlib::charts::reports::gates`. That is ggo-ide's behaviour:
+/// `kpi_row` never consults `chart_gates`; the gates are for the
+/// conditional CHARTS, which is where `chart_set` uses them.
+///
+/// **What an absent tile does and does not mean.** Three of the five hide
+/// at exactly zero (`peak_spr_line`, `apu_underruns`, `sc_upload`), so for
+/// those, absence does mean "this run never measured that" and a measured
+/// zero is never rendered as a `0` tile. The two working-set tiles are
+/// different: their threshold is `> kpi::TILE_CACHE_TILES` (64), not `> 0`
+/// (`RunPage.tsx:365/373` -- a working set that fits in the cache is not a
+/// finding worth a tile). So for those two, absence means "at or below the
+/// cache capacity, **or** never measured" -- a run with a real 40-tile
+/// working set renders no tile, and this surface cannot tell you which of
+/// the two it was. Faithful to ggo-ide, deliberately unchanged here; a
+/// label qualifier that distinguishes them is a later task's call.
 ///
 /// Worth knowing while reading this next to the charts: `gates::has_ppu`
 /// checks 4 columns, not the 7 `RunPage.tsx` checks -- `FrameRow` never
@@ -132,22 +138,39 @@ pub fn kpi_tiles(frames: &[FrameRow], budget: Option<i64>) -> Vec<KpiTile> {
 /// `uart_diag`'s module doc spells the distinction out: an empty
 /// `parse_asset_failures` result means "no failing lines in the UART this
 /// run recorded", which is NOT the same as "this run recorded no UART at
-/// all" (a run from before UART persistence existed, or a diag run whose
-/// serial log lives in `run_log` under a string id). The only signal that
-/// separates them is whether `perf_db::run_uart` returned any lines, so
-/// this enum is built from exactly that.
+/// all". The only signal that separates them is whether
+/// `perf_db::run_uart` returned any lines, so this enum is built from
+/// exactly that.
+///
+/// **`NoUart` names a state, never a cause.** Zero UART rows is the shared
+/// outcome of at least three unrelated situations, and nothing reachable
+/// from here can tell them apart:
+///
+/// 1. a run recorded before UART persistence existed;
+/// 2. a **present-day** run whose producer simply had no lines to hand over
+///    -- `backend::ingest::ingest_run` documents the empty-slice case
+///    explicitly ("zero rows written, not an error") and both ingest paths
+///    ship a test for it (`ingest_run_with_no_uart_lines_writes_zero_uart_rows`);
+/// 3. a diag run, whose serial log lives in `run_log` under a string id
+///    rather than in `uart` at all.
+///
+/// So the message this state prints ([`NO_UART`]) states the fact and
+/// offers its causes as examples. Asserting any single one of them would
+/// be the same error ggo-ide makes on the failure table, pointed the other
+/// way.
 ///
 /// **Deviation from ggo-ide, deliberate.** `reports.rs`'s
-/// `asset_failures_section` collapses both cases into one hedged sentence
-/// ("none — every asset_load succeeded (or the run predates UART
-/// capture)") and its `panics_section` just says "none", which reads as
-/// "this run did not panic" even for a run that recorded nothing at all --
-/// the more dangerous of the two readings. This task's brief requires them
-/// separated, so they are; see this task's report.
+/// `asset_failures_section` collapses "nothing failed" and "there was
+/// nothing to fail in" into one hedged sentence, and its `panics_section`
+/// just says "none", which reads as "this run did not panic" even for a
+/// run that recorded nothing at all -- the more dangerous of the two
+/// readings. This task's brief requires those two separated, so they are.
+/// (ggo-ide's *console* section, `reports.rs:1194`, hedges this same
+/// zero-rows signal correctly, and [`NO_UART`] follows its lead.)
 #[derive(Debug, Clone, PartialEq)]
 pub enum Diagnostics {
     /// The run persisted no UART lines, so neither table can say anything
-    /// about it either way.
+    /// about it either way. A state, not a cause -- see the enum's doc.
     NoUart,
     /// The run persisted UART; these are what parsing it found (either
     /// list may still be empty, which now honestly means "none recorded").
@@ -158,13 +181,17 @@ pub enum Diagnostics {
 }
 
 /// What both tables print instead of rows when the run recorded UART and
-/// nothing in it matched.
+/// nothing in it matched. This one IS a claim about the run, and the data
+/// supports it: there were lines, and none of them failed.
 pub const NONE_RECORDED: &str = "none recorded";
 
 /// What both tables print when there is no UART to have recorded anything
-/// in -- a different claim from [`NONE_RECORDED`], and the one ggo-ide
-/// conflates with it.
-pub const NO_UART: &str = "no UART recorded for this run — it predates UART capture";
+/// in -- a different claim from [`NONE_RECORDED`], and the one ggo-ide's
+/// failure table conflates with it.
+///
+/// The parenthetical is illustrative, not exhaustive: see [`Diagnostics`]
+/// for why no single cause may be asserted here.
+pub const NO_UART: &str = "no UART lines captured for this run (none emitted, a diag run, or a run predating UART persistence)";
 
 impl Diagnostics {
     pub fn from_uart(lines: &[UartLine]) -> Self {
@@ -221,7 +248,25 @@ pub struct RunReport {
     /// `self.detail.value()`).
     pub config_line: Option<String>,
     pub diagnostics: Diagnostics,
+    /// Why the run has nothing to plot, when it has nothing -- `None` for
+    /// a run with charts. Two different facts share the empty chart set
+    /// and ggo-ide keeps them apart (`reports.rs:1015` says "Every frame
+    /// is ignored" where the frameless case says "cart never reached
+    /// vsync_wait"), so this panel does too rather than printing the
+    /// stronger, sometimes-false claim for both.
+    pub no_frames: Option<&'static str>,
 }
+
+/// The run recorded no `frame` rows at all.
+pub const NO_FRAMES_RECORDED: &str =
+    "No frames recorded for this run (cart never reached vsync_wait).";
+
+/// The run recorded frames, but every one of them is in the ignore set.
+/// With the fixed `{0}` set this panel has, that is precisely a run whose
+/// only frame is frame 0 -- it reached vsync_wait exactly once, which is a
+/// different (and much less alarming) fact than never reaching it.
+pub const ALL_FRAMES_IGNORED: &str =
+    "This run's only frame is frame 0, which is ignored by default.";
 
 /// Build the report for one loaded run.
 ///
@@ -231,30 +276,33 @@ pub struct RunReport {
 pub fn build(samples: &RunSamples) -> RunReport {
     let frames = ggo_worldlib::charts::reports::ignore::apply(&samples.frames, &ignore_set());
     RunReport {
+        // The budget comes off the `run` row, exactly as ggo-ide reads it.
+        // No fallback to the copy `run_frames` denormalizes onto each
+        // frame: that query is `frame f JOIN run r`, so a run with no
+        // `run` row has no frames either, and this branch is unreachable
+        // without one.
         tiles: if frames.is_empty() {
             Vec::new()
         } else {
-            kpi_tiles(&frames, budget_of(samples.detail.as_ref(), &frames))
+            kpi_tiles(
+                &frames,
+                samples.detail.as_ref().and_then(|d| d.frame_budget_cycles),
+            )
         },
         config_line: samples.detail.as_ref().map(kpi::run_config_line),
         diagnostics: Diagnostics::from_uart(&samples.uart),
+        no_frames: match (samples.frames.is_empty(), frames.is_empty()) {
+            (true, _) => Some(NO_FRAMES_RECORDED),
+            (false, true) => Some(ALL_FRAMES_IGNORED),
+            (false, false) => None,
+        },
     }
-}
-
-/// The budget the "Avg wire vs budget" tile measures against: the `run`
-/// row's, exactly as ggo-ide reads it -- falling back to the copy the
-/// frame rows carry (the same column, denormalized by `run_frames`' join)
-/// when there is no `run` row, so a run whose listing outlived its row
-/// still shows a percentage rather than a dash.
-fn budget_of(detail: Option<&RunDetail>, frames: &[FrameRow]) -> Option<i64> {
-    detail
-        .and_then(|d| d.frame_budget_cycles)
-        .or_else(|| frames.first().and_then(|f| f.frame_budget_cycles))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loader::RunDetail;
 
     /// R1's own `kpi::tests::sample_frames` fixture, field for field --
     /// so the assertions below are literally against the numbers that
@@ -592,6 +640,29 @@ mod tests {
         assert!(diag.panics().is_empty());
         assert_eq!(diag.empty_state(0), Some(NO_UART));
         assert_ne!(NO_UART, NONE_RECORDED);
+    }
+
+    /// And it must not swap one false claim for another. Zero UART rows is
+    /// the shared outcome of at least three situations -- a pre-persistence
+    /// run, a present-day run whose producer had no lines (`ingest_run`'s
+    /// documented empty-slice case, which both ingest paths test), and a
+    /// diag run whose log lives in `run_log` -- and `from_uart` sees none
+    /// of that, only the emptiness. So the message may name causes as
+    /// examples but may not assert one: an earlier draft of this constant
+    /// read "it predates UART capture", which is flatly wrong for the
+    /// commonest of the three.
+    #[test]
+    fn the_no_uart_message_states_the_fact_and_asserts_no_single_cause() {
+        assert!(
+            NO_UART.starts_with("no UART lines captured for this run"),
+            "the fact comes first: {NO_UART}"
+        );
+        assert!(
+            NO_UART.contains("none emitted")
+                && NO_UART.contains("diag run")
+                && NO_UART.contains("predating UART persistence"),
+            "all three causes are offered, none asserted: {NO_UART}"
+        );
     }
 
     #[test]

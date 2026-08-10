@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ggo_worldlib::charts::reports::{gates, ignore};
+use ggo_worldlib::charts::reports::{gates, ignore, kpi};
 
 use crate::chart_geom::{ChartKind, ChartSpec, Rgb, SeriesSpec};
 use crate::loader::{FrameRow, ProfileRow, RunSamples};
@@ -46,13 +46,30 @@ const C6: Rgb = Rgb(0xe34948);
 const PROF_COLORS: [Rgb; 6] = [C1, C2, C3, C4, C5, C6];
 /// `reports.rs`'s `TOP_FUNCTIONS_TAKE` (`PROF_COLORS.len() - 1`).
 const TOP_FUNCTIONS_TAKE: usize = PROF_COLORS.len() - 1;
-const OTHER_FUNCTION_NAME: &str = "other";
 
-/// `reports.rs`'s `kpi::TILE_CACHE_TILES`: the 8 KB / 128 B-per-tile cache
-/// capacity the tile-working-set chart draws as its reference line. It is
-/// a CAPACITY, not a budget, but ggo-ide draws it with the same dashed
-/// danger-colored line, so this port does too.
-const TILE_CACHE_TILES: f32 = 64.0;
+/// The `"other"` fold's bucket name. **Derived from worldlib's, not
+/// re-spelled** -- `profile::top_function_series` emits that exact string,
+/// `PROF_COLORS`' dedicated last slot is reserved for it, and a private
+/// copy that drifted would silently stop matching the row it is supposed
+/// to colour. (This panel still has its own `top_functions`; R4 collapses
+/// that onto `profile::top_function_series`. Routing the constant now
+/// means that collapse cannot introduce a mismatch on its way through.)
+const OTHER_FUNCTION_NAME: &str = ggo_worldlib::charts::reports::profile::OTHER_FUNCTION_NAME;
+
+/// The 8 KB / 128 B-per-tile cache capacity the tile-working-set chart
+/// draws as its reference line. It is a CAPACITY, not a budget, but
+/// ggo-ide draws it with the same dashed danger-colored line, so this port
+/// does too.
+///
+/// **Derived from `kpi::TILE_CACHE_TILES`, never re-spelled.** The same
+/// number is the `> 64` threshold behind the two working-set KPI tiles
+/// (`kpi::{spr,bg}_working_set_tile`), and those tiles sit directly above
+/// this chart. A hand-copied literal here would let the chart draw its
+/// capacity line at one value while the tile above it hid at another, with
+/// nothing in either crate's tests noticing -- the exact drift the
+/// single-source rule exists to stop, and the last hand-copied cross-layer
+/// constant this module had.
+const TILE_CACHE_TILES: f32 = kpi::TILE_CACHE_TILES as f32;
 
 /// The one ignore set this panel has. `ignore::default_set()` is `{0}`:
 /// a cold-cache first frame (every tile a miss, every asset a fresh
@@ -472,6 +489,34 @@ mod tests {
     #[test]
     fn a_run_with_no_frames_has_no_charts() {
         assert!(build_charts(&RunSamples::default()).is_empty());
+    }
+
+    /// The anti-drift guard for the last cross-layer constant this module
+    /// hand-copied. The tile-working-set chart's reference line and the
+    /// two working-set KPI tiles' hide-below threshold
+    /// (`kpi::{spr,bg}_working_set_tile`) are the SAME cache capacity, and
+    /// the tiles render directly above the chart. Before this was derived
+    /// from `kpi::TILE_CACHE_TILES`, setting the local literal to 80.0
+    /// left the chart drawing its line at 80 while the tiles still hid at
+    /// 64, and the whole suite passed. Now the two cannot disagree, and
+    /// this test is what fails if anyone re-spells the number.
+    #[test]
+    fn the_cache_capacity_line_is_worldlibs_constant_not_a_local_copy() {
+        let mut samples = plain_samples();
+        samples.frames[1].bg_tiles_distinct = 12;
+        let charts = build_charts(&samples);
+        let chart = charts
+            .iter()
+            .find(|c| c.title == "Tile working set vs cache capacity")
+            .expect("the gate is tripped");
+        assert_eq!(
+            chart.kind,
+            ChartKind::Line {
+                budget: Some(kpi::TILE_CACHE_TILES as f32)
+            },
+            "the chart's capacity line must BE kpi::TILE_CACHE_TILES, so it \
+             cannot drift from the KPI tiles' threshold"
+        );
     }
 
     /// Each gate, one at a time, on top of the always-on set.

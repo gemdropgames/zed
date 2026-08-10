@@ -354,13 +354,31 @@ mod tests {
 
     // -------------------------------------------------- per-run samples
 
-    // Column-order/decoding tests for `FrameRow`/`ProfileRow` are NOT
-    // duplicated here any more: those rows are decoded by
-    // `ggo_worldlib::charts::reports::perf_db`, whose own tests pin the
-    // select-list order, the NULL-budget case and the short-row case.
-    // What is still this crate's business is the fan-out below --
-    // that `load_run_samples` asks for all four pieces, against the real
-    // migrated schema, and that a missing db is empty rather than an error.
+    // The three tests that used to live here decoded hand-built
+    // `turso::Value` rows through this module's own `row_to_frame`, which
+    // no longer exists -- `perf_db` decodes those rows now. What each of
+    // them was pinning, and where that landed, exactly:
+    //
+    // * **Select-list order.** Pinned by worldlib
+    //   (`perf_db::tests::run_frames_returns_rows_in_frame_order_with_budget`
+    //   asserts a whole `FrameRow` field for field against a seeded db).
+    //   Genuinely relocated; not repeated here.
+    // * **The NULL budget -> `None` case.** NOT pinned by worldlib -- no
+    //   test there asserts `frame_budget_cycles: None`. It is pinned by
+    //   this module's own
+    //   `load_run_samples_of_a_run_without_profile_rows_is_not_an_error`
+    //   below, which seeds a run with no `frame_budget_cycles` and asserts
+    //   the `None`. Keep that assertion: it is the only one anywhere, and
+    //   a budget line drawn at 0 instead of omitted is the regression.
+    // * **The short-row case.** Gone, not relocated. `run_frames_async`
+    //   indexes `row.get_value(0..=25)?` unguarded rather than skipping a
+    //   short row, so there is no behaviour left to test. Harmless: the
+    //   select list is a literal in the same function, so a row can only
+    //   be short if the query and the decoder are edited apart.
+    //
+    // What remains this crate's business is the fan-out below -- that
+    // `load_run_samples` asks for all four pieces against the real
+    // migrated schema, and that a missing db reads as empty, not an error.
 
     #[test]
     fn load_run_samples_returns_nothing_for_a_missing_db_file() {
