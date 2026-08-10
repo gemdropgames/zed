@@ -1,23 +1,26 @@
-//! GGO Emerald panel (F5.2 task S3): the surface that CREATES engine
+//! GGO Emerald panel: the surface that creates AND removes engine
 //! artifacts -- components, systems, resources, modules, worlds and
-//! schedules -- by running `emd generate` and reporting what it did.
+//! schedules -- by running `emd` and reporting what it did.
 //!
 //! **Why the panel exists at this point in the migration.** The spec's
 //! rule is that forms live in the panel that owns the domain and the
 //! context menu only routes to them, and the project panel's only prompt
 //! primitive (`window.prompt`) is button-choice: it cannot collect a name,
 //! let alone a module and a repeatable list of `name:kind` fields. So
-//! "New Component…" needs a real form, and a form needs a panel. This one
-//! arrives with exactly that responsibility. **F5.3** adds the manifest
-//! ops (rename/delete/field add/remove), the schedule run-list editor and
-//! the version-lock banner; the [`runner`] seam and the argv/validation
-//! split in [`forms`] are shaped for them.
+//! "New Component…" needs a real form, and a form needs a panel (F5.2/S3).
+//! **F5.3/E2** adds the other half: a browser over the three manifests and
+//! the remove/field ops against them, each behind a confirm that names
+//! what it breaks.
 //!
-//! **What is NOT here, deliberately.** No manifest browser, no schedule
-//! order editor, no `emd version` polling, no run console with a cancel
-//! button. ggo-ide has all of those (`pages/emerald/mod.rs`) and they are
-//! F5.3's; a `generate` is a short one-shot call whose only interesting
-//! output is its JSON trailer.
+//! **What is NOT here yet.** The schedule run-list editor (Task E3, which
+//! `manifests`/`ops` are shaped for -- `schedule set` is the fourth
+//! [`ops::ManifestOp`]), the `emd version` lock banner and its mtime poll
+//! (Task E4; the post-run half of that enforcement, `verify_emd_result`,
+//! is already on the mutation path here), and a streaming run console with
+//! a cancel button. Runs are one-shot calls whose only interesting output
+//! is a JSON trailer -- but, unlike F5.2's generates, the mutations are
+//! `cargo check`-backed and slow, which is why they run under
+//! [`runner::EMD_TIMEOUT`].
 //!
 //! Structural mirror of the recent siblings (`ggo_map_panel`,
 //! `ggo_sprite_panel`): `Panel` impl, `ToggleFocus`, `observe_new`
@@ -28,12 +31,18 @@
 //! superseded result is dropped rather than applied.
 //!
 //! Module split: [`forms`] is the pure "what would we run, and is it
-//! submittable" half (no gpui), [`runner`] is the "how do we run it" half
-//! (no gpui either, and injectable so tests never need `emd` on `PATH`),
-//! [`tileset`] is the one artifact this panel writes itself rather than
-//! delegating to `emd`. This module is the gpui glue.
+//! submittable" half of the generate forms (no gpui), [`ops`] is the same
+//! for the manifest mutations -- including the confirm text, so "the
+//! schedules that break are named in the prompt" is testable without a
+//! window -- [`manifests`] reads the manifests and gathers the blast
+//! radius, [`runner`] is the "how do we run it" half (no gpui either, and
+//! injectable so tests never need `emd` on `PATH`), and [`tileset`] is the
+//! one artifact this panel writes itself rather than delegating to `emd`.
+//! This module is the gpui glue.
 
 mod forms;
+mod manifests;
+mod ops;
 mod runner;
 mod tileset;
 
@@ -51,10 +60,17 @@ use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_world_panel::WorldPanel;
-use ggo_worldlib::emerald::emd_error_message;
+use ggo_worldlib::emerald::{
+    EXPECTED_EMD_VERSION, ManifestKind, emd_error_message, emd_reverted, group_by_module,
+    schedules_using_system, verify_emd_result,
+};
 
 use forms::{ASSET_KIND, FIELD_KINDS, FieldDraft, GenDraft, GenKind};
-use runner::{EMERALD_MANIFEST, EmdRequest, EmdRunner, emerald_project_root, system_runner};
+use manifests::{ASSETS_DIR, MANIFESTS_DIR, Manifests};
+use ops::ManifestOp;
+use runner::{
+    EMD_TIMEOUT, EMERALD_MANIFEST, EmdRequest, EmdRunner, emerald_project_root, system_runner,
+};
 
 actions!(
     ggo_emerald,
@@ -75,15 +91,18 @@ const KEY_CONTEXT: &str = "GgoEmeraldPanel";
 /// (same call every other GGO panel made at this stage).
 const DEFAULT_WIDTH: Pixels = px(420.);
 
-/// The directory `emd` keeps `components.toml`/`systems.toml`/
-/// `schedules.toml` in, under the project root.
-const MANIFESTS_DIR: &str = "manifests";
+/// Group header for the shared (module-less) bucket -- `group_by_module`
+/// keys it on `""`, which is not a heading.
+const SHARED_MODULE_LABEL: &str = "(shared)";
 
-/// The `assets/` directory name under an emerald project root.
-const ASSETS_DIR: &str = "assets";
+/// What a rolled-back mutation says before `emd`'s own compiler message.
+/// Mirrors ggo-ide's "Reverted -- the compiler rejected the change:", which
+/// it rendered as its own block for the same reason.
+const REVERTED_PREFIX: &str = "Rolled back — the project no longer compiles: ";
 
-/// Empty-state text. The panel has no browser of its own by design: work
-/// arrives by right-clicking a directory in the project panel.
+/// Empty-state text -- shown when there is nothing to list and no form
+/// open, i.e. an unmanaged project (or one whose manifests are still
+/// empty), where work can only arrive by right-clicking a directory.
 const EMPTY_MESSAGE: &str = "Right-click the project root or manifests/ → New Component…, or an assets directory → New World…";
 
 pub fn init(cx: &mut App) {
@@ -321,9 +340,69 @@ enum PanelForm {
 /// What the panel is showing about the most recent `emd` run.
 enum RunState {
     Idle,
-    Running { command: String },
-    Done { message: String, transcript: String },
-    Failed { message: String, transcript: String },
+    Running {
+        command: String,
+    },
+    Done {
+        message: String,
+        transcript: String,
+    },
+    Failed {
+        message: String,
+        transcript: String,
+    },
+    /// **Not a failure.** `emd` applied the change, its `cargo check`
+    /// rejected the result, and it put everything back
+    /// (`ggo_worldlib::emerald::emd_reverted`). The project is exactly as
+    /// it was, which is the opposite of what a red "failed" implies about
+    /// a half-applied mutation -- so it renders as its own state, with
+    /// `emd`'s compiler message beneath it.
+    Reverted {
+        message: String,
+        transcript: String,
+    },
+}
+
+/// Which manifest the browser is listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowseTab {
+    Components,
+    Systems,
+    Schedules,
+}
+
+impl BrowseTab {
+    const ALL: [BrowseTab; 3] = [
+        BrowseTab::Components,
+        BrowseTab::Systems,
+        BrowseTab::Schedules,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            BrowseTab::Components => "Components",
+            BrowseTab::Systems => "Systems",
+            BrowseTab::Schedules => "Schedules",
+        }
+    }
+
+    /// The manifest kind a row on this tab removes.
+    fn kind(self) -> ManifestKind {
+        match self {
+            BrowseTab::Components => ManifestKind::Component,
+            BrowseTab::Systems => ManifestKind::System,
+            BrowseTab::Schedules => ManifestKind::Schedule,
+        }
+    }
+}
+
+/// Which run's result is coming back, and what to do with it. Carried
+/// through the spawn rather than parked in a field so a superseded run
+/// cannot apply the current one's effect (the generation guard drops it
+/// first, but the data never gets confused either).
+enum PendingRun {
+    Generate { kind: GenKind, name: String },
+    Manifest(ManifestOp),
 }
 
 pub struct EmeraldPanel {
@@ -339,9 +418,24 @@ pub struct EmeraldPanel {
     /// about a call COUNT rather than about a message.
     runner: EmdRunner,
     form: Option<PanelForm>,
+    /// The emerald project root the BROWSER reads its manifests from (and
+    /// the cwd its mutations run in). Not the same thing as
+    /// `project_root`, which is the worktree: an emerald project can sit
+    /// below the worktree root, and `emd` discovers a project from its cwd.
+    emerald_dir: Option<PathBuf>,
+    manifests: Manifests,
+    tab: BrowseTab,
+    /// The selected row on the ACTIVE tab, by manifest name. Cleared when
+    /// the tab changes or the row stops existing -- a stale selection is
+    /// how a detail pane ends up offering to remove a field from a
+    /// component that is already gone.
+    selected: Option<String>,
+    /// The open "+ Field" row on the selected component, if any.
+    field_form: Option<FieldRow>,
     run_state: RunState,
     run_generation: u64,
     _run_task: Option<Task<()>>,
+    _confirm_task: Option<Task<()>>,
 }
 
 impl EmeraldPanel {
@@ -354,9 +448,15 @@ impl EmeraldPanel {
             project_root: None,
             runner: system_runner(),
             form: None,
+            emerald_dir: None,
+            manifests: Manifests::default(),
+            tab: BrowseTab::Components,
+            selected: None,
+            field_form: None,
             run_state: RunState::Idle,
             run_generation: 0,
             _run_task: None,
+            _confirm_task: None,
         }
     }
 
@@ -370,7 +470,51 @@ impl EmeraldPanel {
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
+        // The worktree root is not necessarily the emerald project root;
+        // walk up (inclusively) the way emerald's own `Project::discover`
+        // does, and fall back to the worktree itself so a checkout with no
+        // `emerald.toml` simply lists nothing rather than reading some
+        // ancestor's manifests.
+        self.emerald_dir = self
+            .project_root
+            .as_deref()
+            .and_then(emerald_project_root)
+            .or_else(|| self.project_root.clone());
+        self.refresh_manifests(cx);
+    }
+
+    /// Re-read the three manifests, and drop a selection that no longer
+    /// names anything (the row it points at was just removed).
+    fn refresh_manifests(&mut self, cx: &mut Context<Self>) {
+        self.manifests = self
+            .emerald_dir
+            .as_deref()
+            .map(manifests::read_manifests)
+            .unwrap_or_default();
+        if self
+            .selected
+            .as_deref()
+            .is_some_and(|name| self.entry_module(name).is_none())
+        {
+            self.clear_selection();
+        }
         cx.notify();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.field_form = None;
+    }
+
+    /// The module of the named entry on the ACTIVE tab, or `None` when this
+    /// tab has no such entry. `Some("")` is a real answer -- the shared
+    /// module -- which is why this is not a `contains`.
+    fn entry_module(&self, name: &str) -> Option<String> {
+        match self.tab {
+            BrowseTab::Components => self.manifests.component(name).map(|c| c.module.clone()),
+            BrowseTab::Systems => self.manifests.system(name).map(|s| s.module.clone()),
+            BrowseTab::Schedules => self.manifests.schedule(name).map(|s| s.module.clone()),
+        }
     }
 
     // ------------------------------------------------------------- forms
@@ -404,6 +548,12 @@ impl EmeraldPanel {
             cx.notify();
             return;
         };
+        // The clicked directory decides which project the browser lists
+        // too, not just which one the form writes to -- otherwise a
+        // right-click in a nested emerald project would open a form aimed
+        // at it while the lists below still showed the worktree's.
+        self.emerald_dir = Some(project_dir.clone());
+        self.refresh_manifests(cx);
         self.form = Some(PanelForm::Generate(GenerateForm {
             kind,
             project_dir,
@@ -513,6 +663,187 @@ impl EmeraldPanel {
         matches!(self.run_state, RunState::Running { .. })
     }
 
+    // ------------------------------------------------------ browsing
+
+    fn select_tab(&mut self, tab: BrowseTab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            // Names are only unique WITHIN a manifest, so a selection can
+            // never survive a tab change.
+            self.clear_selection();
+            cx.notify();
+        }
+    }
+
+    /// Select (or, on a second click, deselect) a row on the active tab.
+    fn select_item(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(name) {
+            self.clear_selection();
+        } else {
+            self.selected = Some(name.to_string());
+            self.field_form = None;
+        }
+        cx.notify();
+    }
+
+    /// Open (or close) the "+ Field" row on the selected component.
+    fn toggle_field_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.field_form = match self.field_form {
+            Some(_) => None,
+            None => Some(FieldRow {
+                name: single_line(window, cx),
+                kind: FieldDraft::default().kind,
+                ext: single_line(window, cx),
+            }),
+        };
+        cx.notify();
+    }
+
+    fn select_new_field_kind(&mut self, kind: &str, cx: &mut Context<Self>) {
+        if let Some(row) = &mut self.field_form {
+            row.kind = kind.to_string();
+            cx.notify();
+        }
+    }
+
+    /// The "+ Field" row as the pure draft its validation and spec come
+    /// from -- the same [`FieldDraft`] the generate form uses, so the two
+    /// paths cannot disagree about what `emd` accepts.
+    fn field_draft(&self, cx: &App) -> Option<FieldDraft> {
+        let row = self.field_form.as_ref()?;
+        Some(FieldDraft {
+            name: row.name.read(cx).text(cx).trim().to_string(),
+            kind: row.kind.clone(),
+            ext: row.ext.read(cx).text(cx).trim().to_string(),
+        })
+    }
+
+    // ------------------------------------------------- manifest mutations
+
+    /// Remove the named entry from the ACTIVE tab's manifest, after a
+    /// confirm that names what it breaks. The body of every row's trash
+    /// button.
+    fn request_remove(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(module) = self.entry_module(name) else {
+            return;
+        };
+        self.request_op(
+            ManifestOp::remove(self.tab.kind(), name, &module),
+            window,
+            cx,
+        );
+    }
+
+    /// Remove `field` from the selected component, after a confirm.
+    fn request_field_remove(&mut self, field: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((component, module)) = self.selected_component() else {
+            return;
+        };
+        self.request_op(
+            ManifestOp::field_remove(&component, &module, field),
+            window,
+            cx,
+        );
+    }
+
+    /// Add the "+ Field" row's field to the selected component. No
+    /// confirm -- it is the one manifest op that only ever adds -- but the
+    /// same validation gate as the generate form: an invalid spec never
+    /// reaches the runner.
+    fn submit_field_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((component, module)) = self.selected_component() else {
+            return;
+        };
+        let Some(draft) = self.field_draft(cx) else {
+            return;
+        };
+        let spec = draft.spec();
+        if !ggo_worldlib::emerald::valid_field_spec(&draft.name, &spec) {
+            cx.notify();
+            return;
+        }
+        self.request_op(
+            ManifestOp::field_add(&component, &module, &format!("{}:{spec}", draft.name)),
+            window,
+            cx,
+        );
+    }
+
+    /// The selected component's `(name, module)`, or `None` when the
+    /// Components tab has no live selection.
+    fn selected_component(&self) -> Option<(String, String)> {
+        if self.tab != BrowseTab::Components {
+            return None;
+        }
+        let name = self.selected.clone()?;
+        let module = self.manifests.component(&name)?.module.clone();
+        Some((name, module))
+    }
+
+    /// **The one gate on every manifest mutation.** Gathers the blast
+    /// radius, raises the confirm the op needs, and only spawns `emd` if
+    /// the user says yes.
+    ///
+    /// `ops::confirm_for` returning `None` is the only way to skip the
+    /// prompt, and it does that for exactly one op (adding a field), so a
+    /// new destructive op cannot be added later that silently runs -- it
+    /// would have to opt out in `ManifestOp::destructive` to do so, in
+    /// plain sight.
+    fn request_op(&mut self, op: ManifestOp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running() {
+            return;
+        }
+        let Some(project_dir) = self.emerald_dir.clone() else {
+            return;
+        };
+        let cascade = manifests::cascade_for(&op, &self.manifests, &project_dir);
+        let Some(confirm) = ops::confirm_for(&op, &cascade) else {
+            self.run_op(op, project_dir, window, cx);
+            return;
+        };
+        // `unsaved: false` always: this panel holds no document, so there
+        // is never an unsaved edit of its own to warn about (its
+        // `Panel::prepare_to_close` says the same thing). The cascade
+        // lines carry what IS at stake.
+        let answer = ggo_common::confirm_destructive_cascade(
+            &confirm.message,
+            &confirm.cascade,
+            confirm.label,
+            false,
+            window,
+            cx,
+        );
+        self._confirm_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if !answer.await {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                // Re-checked on THIS side of the await: the dialog was
+                // open for a while, and a run may have started (or the
+                // project moved) since it went up.
+                if this.running() {
+                    return;
+                }
+                let Some(project_dir) = this.emerald_dir.clone() else {
+                    return;
+                };
+                this.run_op(op, project_dir, window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn run_op(
+        &mut self,
+        op: ManifestOp,
+        project_dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let args = op.args();
+        self.start_run(project_dir, args, PendingRun::Manifest(op), window, cx);
+    }
+
     // --------------------------------------------------------- submitting
 
     /// Submit whichever form is open. Bound to Enter and to the form's
@@ -549,23 +880,57 @@ impl EmeraldPanel {
             cx.notify();
             return;
         }
-        let request = EmdRequest::emd(project_dir, draft.args());
-        let kind = draft.kind;
-        let name = draft.name;
+        let pending = PendingRun::Generate {
+            kind: draft.kind,
+            name: draft.name.clone(),
+        };
+        self.start_run(project_dir, draft.args(), pending, window, cx);
+    }
+
+    /// Spawn one `emd` invocation, under [`EMD_TIMEOUT`], and apply its
+    /// result unless a newer run has superseded it.
+    ///
+    /// **The timeout is a race, not a poll**: the run future and
+    /// `background_executor().timer()` go into `smol::future::or`, so
+    /// whichever finishes first wins and the loser is DROPPED -- and
+    /// dropping the run future kills the child (`runner`'s doc explains
+    /// the `kill_on_drop` chain). The panel therefore comes back to a
+    /// usable state with a real message instead of sitting on "Running…"
+    /// while an abandoned `cargo check` holds the project's `target/`
+    /// lock. The executor's timer, not `smol::Timer`, because it is the
+    /// one clock the gpui test executor can advance (and the one this
+    /// checkout's `clippy.toml` allows).
+    fn start_run(
+        &mut self,
+        project_dir: PathBuf,
+        args: Vec<String>,
+        pending: PendingRun,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request = EmdRequest::emd(project_dir, args);
         self.run_state = RunState::Running {
             command: request.command_line(),
         };
         self.run_generation += 1;
         let generation = self.run_generation;
         let runner = self.runner.clone();
-        let run = cx.background_spawn(async move { runner(request) });
+        let timer = cx.background_executor().timer(EMD_TIMEOUT);
+        let timed_out = runner::timed_out(&request);
+        let run = cx.background_spawn(async move {
+            smol::future::or(runner(request), async move {
+                timer.await;
+                timed_out
+            })
+            .await
+        });
         self._run_task = Some(cx.spawn_in(window, async move |this, cx| {
             let outcome = run.await;
             this.update_in(cx, |this, window, cx| {
                 if this.run_generation != generation {
                     return;
                 }
-                this.finish_run(kind, &name, outcome, window, cx);
+                this.finish_run(pending, outcome, window, cx);
             })
             .ok();
         }));
@@ -575,28 +940,77 @@ impl EmeraldPanel {
     /// Apply a finished run: on success clear the form and refresh
     /// whatever the new artifact affects; on failure keep the form open,
     /// with `emd`'s own message, so the name can be fixed and resubmitted.
+    ///
+    /// Three outcomes, not two. A non-ok run is either a REVERT -- `emd`
+    /// made the change, its `cargo check` rejected it, and it put
+    /// everything back -- or a plain failure, where nothing was ever
+    /// written. `emd_reverted` reads that off the trailer, and the two
+    /// render differently because they mean opposite things about the
+    /// state of the project on disk.
+    ///
+    /// `verify_emd_result` runs first, on every outcome: a trailer whose
+    /// own `emd` version is not the one this build negotiated downgrades
+    /// the run to a failure rather than being trusted (Task E4 turns the
+    /// same observation into the lock banner; this is the enforcement half
+    /// and it belongs on the mutation path, which is what it protects).
     fn finish_run(
         &mut self,
-        kind: GenKind,
-        name: &str,
+        pending: PendingRun,
         outcome: ggo_worldlib::emerald::EmdRunOutcome,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let outcome = verify_emd_result(outcome, EXPECTED_EMD_VERSION);
         if !outcome.ok {
-            self.run_state = RunState::Failed {
-                message: emd_error_message(&outcome),
-                transcript: outcome.output,
+            let message = emd_error_message(&outcome);
+            let reverted = emd_reverted(&outcome);
+            let transcript = outcome.output;
+            self.run_state = if reverted {
+                RunState::Reverted {
+                    message,
+                    transcript,
+                }
+            } else {
+                RunState::Failed {
+                    message,
+                    transcript,
+                }
             };
+            // A revert leaves the manifests exactly as they were and a
+            // failure never touched them -- but re-reading is cheap and is
+            // the only way the lists cannot drift from what `emd` decided.
+            self.refresh_manifests(cx);
             cx.notify();
             return;
         }
-        self.form = None;
-        self.run_state = RunState::Done {
-            message: format!("Created {} {name}", kind.noun().to_lowercase()),
-            transcript: outcome.output,
-        };
-        self.after_success(kind, outcome.result.as_ref(), window, cx);
+        match pending {
+            PendingRun::Generate { kind, name } => {
+                self.form = None;
+                self.run_state = RunState::Done {
+                    message: format!("Created {} {name}", kind.noun().to_lowercase()),
+                    transcript: outcome.output,
+                };
+                self.refresh_manifests(cx);
+                self.after_success(kind, outcome.result.as_ref(), window, cx);
+            }
+            PendingRun::Manifest(op) => {
+                self.run_state = RunState::Done {
+                    message: op.done_message(),
+                    transcript: outcome.output,
+                };
+                if matches!(op, ManifestOp::Remove { .. }) {
+                    self.clear_selection();
+                }
+                self.refresh_manifests(cx);
+                // Every component-shaped op changes the inspector's schema
+                // set, exactly as a `generate component` does -- a removed
+                // component (or field) must stop being offerable on an
+                // entity without reopening the world.
+                if component_shaped(&op) {
+                    self.after_success(GenKind::Component, None, window, cx);
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -928,6 +1342,12 @@ impl EmeraldPanel {
     }
 
     /// The last run's outcome: one status line plus `emd`'s transcript.
+    ///
+    /// A REVERT is worded and coloured differently from a failure on
+    /// purpose. "failed" invites the user to wonder what state the project
+    /// was left in; the revert line answers that in its first clause --
+    /// the change was rolled back, nothing is half-applied, and what
+    /// follows is the compiler's complaint, not `emd`'s.
     fn render_run_state(&self) -> Option<gpui::AnyElement> {
         let (message, color, transcript) = match &self.run_state {
             RunState::Idle => return None,
@@ -940,6 +1360,14 @@ impl EmeraldPanel {
                 message,
                 transcript,
             } => (message.clone(), Color::Error, transcript.as_str()),
+            RunState::Reverted {
+                message,
+                transcript,
+            } => (
+                format!("{REVERTED_PREFIX}{message}"),
+                Color::Warning,
+                transcript.as_str(),
+            ),
         };
         Some(
             v_flex()
@@ -957,19 +1385,271 @@ impl EmeraldPanel {
         )
     }
 
+    // ------------------------------------------------- the manifest browser
+
+    /// The three-way tab row.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut row = h_flex().gap_1().p_1();
+        for tab in BrowseTab::ALL {
+            row = row.child(
+                Button::new(("ggo-emerald-tab", tab as usize), tab.label())
+                    .toggle_state(self.tab == tab)
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx))),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// One manifest row: the name (click to select), and the trash button
+    /// that starts a confirmed remove.
+    fn render_row(
+        &self,
+        ix: usize,
+        name: &str,
+        detail: Option<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let selected = self.selected.as_deref() == Some(name);
+        let for_click = name.to_string();
+        let for_remove = name.to_string();
+        let running = self.running();
+        v_flex()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(("ggo-emerald-row", ix))
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(name.to_string()).size(LabelSize::Small).color(
+                                if selected {
+                                    Color::Accent
+                                } else {
+                                    Color::Default
+                                },
+                            ))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.select_item(&for_click, cx)),
+                            ),
+                    )
+                    .child(
+                        IconButton::new(("ggo-emerald-rm", ix), IconName::Trash)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(running)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.request_remove(&for_remove, window, cx)
+                            })),
+                    ),
+            )
+            .children(detail)
+            .into_any_element()
+    }
+
+    /// The selected COMPONENT's fields, each removable, plus the "+ Field"
+    /// row that adds one.
+    fn render_component_detail(
+        &self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(entry) = self.manifests.component(name) else {
+            return div().into_any_element();
+        };
+        let running = self.running();
+        let mut col = v_flex().gap_0p5().pl_2();
+        for (ix, field) in entry.fields.iter().enumerate() {
+            let field_name = field.name.clone();
+            col = col.child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(format!("{}: {}", field.name, field.kind))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        IconButton::new(("ggo-emerald-field-remove", ix), IconName::Trash)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(running)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.request_field_remove(&field_name, window, cx)
+                            })),
+                    ),
+            );
+        }
+        if let Some(row) = &self.field_form {
+            let mut form = h_flex()
+                .gap_1()
+                .items_center()
+                .child(Self::editor_input(row.name.clone(), cx))
+                .child(self.render_new_field_kind_dropdown(&row.kind, window, cx));
+            if row.kind == ASSET_KIND {
+                form = form.child(Self::editor_input(row.ext.clone(), cx));
+            }
+            col = col.child(
+                form.child(
+                    Button::new("ggo-emerald-field-commit", "Add")
+                        .disabled(running)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.submit_field_add(window, cx)),
+                        ),
+                ),
+            );
+        }
+        col.child(
+            Button::new("ggo-emerald-field-open", "+ Field")
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_field_form(window, cx))),
+        )
+        .into_any_element()
+    }
+
+    fn render_new_field_kind_dropdown(
+        &self,
+        selected: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let weak = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+            for kind in FIELD_KINDS {
+                let weak = weak.clone();
+                menu = menu.entry(SharedString::from(kind), None, move |_window, cx| {
+                    weak.update(cx, |this, cx| this.select_new_field_kind(kind, cx))
+                        .ok();
+                });
+            }
+            menu
+        });
+        DropdownMenu::new(
+            "ggo-emerald-new-field-kind",
+            SharedString::from(selected.to_string()),
+            menu,
+        )
+        .into_any_element()
+    }
+
+    /// The selected SYSTEM's schedules -- the same
+    /// `schedules_using_system` answer the remove confirm quotes, shown
+    /// before the user reaches for the trash button rather than only after.
+    fn render_system_detail(&self, name: &str) -> gpui::AnyElement {
+        let Some(entry) = self.manifests.system(name) else {
+            return div().into_any_element();
+        };
+        let used_by = schedules_using_system(&self.manifests.schedules, &entry.module, &entry.name);
+        let text = if used_by.is_empty() {
+            "in no schedule".to_string()
+        } else {
+            format!("in {}", used_by.join(", "))
+        };
+        div()
+            .pl_2()
+            .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
+            .into_any_element()
+    }
+
+    /// The selected SCHEDULE's ordered run list. Read-only here; Task E3
+    /// turns this into the reorder/add/cadence editor.
+    fn render_schedule_detail(&self, name: &str) -> gpui::AnyElement {
+        let Some(entry) = self.manifests.schedule(name) else {
+            return div().into_any_element();
+        };
+        let mut col = v_flex().gap_0p5().pl_2();
+        if entry.systems.is_empty() {
+            col = col.child(
+                Label::new("no systems")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+        }
+        for system in &entry.systems {
+            col = col.child(
+                Label::new(system.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+        }
+        col.into_any_element()
+    }
+
+    /// The active tab's manifest, grouped by module (shared first, then
+    /// alphabetical -- `group_by_module`'s own order), with the selected
+    /// row's detail inline.
+    fn render_browser(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if self.manifests.is_empty() {
+            return None;
+        }
+        let mut col = v_flex()
+            .id("ggo-emerald-browser")
+            .gap_0p5()
+            .p_1()
+            .overflow_scroll()
+            .child(self.render_tabs(cx));
+        // One counter across the whole tab so every row's element id is
+        // unique even when two modules hold a same-named entry.
+        let mut ix = 0;
+        let groups: Vec<(String, Vec<String>)> = match self.tab {
+            BrowseTab::Components => group_by_module(self.manifests.components.clone())
+                .into_iter()
+                .map(|g| (g.module, g.items.into_iter().map(|c| c.name).collect()))
+                .collect(),
+            BrowseTab::Systems => group_by_module(self.manifests.systems.clone())
+                .into_iter()
+                .map(|g| (g.module, g.items.into_iter().map(|s| s.name).collect()))
+                .collect(),
+            BrowseTab::Schedules => group_by_module(self.manifests.schedules.clone())
+                .into_iter()
+                .map(|g| (g.module, g.items.into_iter().map(|s| s.name).collect()))
+                .collect(),
+        };
+        for (module, names) in groups {
+            col = col.child(
+                Label::new(if module.is_empty() {
+                    SHARED_MODULE_LABEL.to_string()
+                } else {
+                    module
+                })
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            );
+            for name in names {
+                let detail =
+                    (self.selected.as_deref() == Some(name.as_str())).then(|| match self.tab {
+                        BrowseTab::Components => self.render_component_detail(&name, window, cx),
+                        BrowseTab::Systems => self.render_system_detail(&name),
+                        BrowseTab::Schedules => self.render_schedule_detail(&name),
+                    });
+                col = col.child(self.render_row(ix, &name, detail, cx));
+                ix += 1;
+            }
+        }
+        Some(col.into_any_element())
+    }
+
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let form = match &self.form {
             Some(PanelForm::Generate(_)) => Some(self.render_generate_form(window, cx)),
             Some(PanelForm::Tileset(_)) => Some(self.render_tileset_form(cx)),
             None => None,
         };
+        let browser = self.render_browser(window, cx);
         let run_state = self.render_run_state();
-        if form.is_none() && run_state.is_none() {
+        if form.is_none() && browser.is_none() && run_state.is_none() {
             return self.render_message(EMPTY_MESSAGE.to_string(), cx);
         }
         v_flex()
             .size_full()
             .children(form)
+            .children(browser)
             .children(run_state)
             .into_any_element()
     }
@@ -978,6 +1658,15 @@ impl EmeraldPanel {
 /// A fresh empty single-line editor.
 fn single_line(window: &mut Window, cx: &mut Context<EmeraldPanel>) -> Entity<Editor> {
     cx.new(|cx| Editor::single_line(window, cx))
+}
+
+/// Does `op` change what components (or their fields) exist -- i.e. does
+/// `ggo_world_panel`'s inspector schema set need re-reading afterwards?
+fn component_shaped(op: &ManifestOp) -> bool {
+    match op {
+        ManifestOp::Remove { kind, .. } => *kind == ManifestKind::Component,
+        ManifestOp::FieldAdd { .. } | ManifestOp::FieldRemove { .. } => true,
+    }
 }
 
 impl Render for EmeraldPanel {
@@ -1157,7 +1846,21 @@ mod tests {
         let recorded = calls.clone();
         let runner: EmdRunner = Arc::new(move |request: EmdRequest| {
             recorded.lock().unwrap().push(request.clone());
-            reply(&request)
+            let outcome = reply(&request);
+            Box::pin(async move { outcome })
+        });
+        (runner, calls)
+    }
+
+    /// A runner whose run NEVER finishes -- the stand-in for a `cargo
+    /// check` that has wedged. Only [`EMD_TIMEOUT`] can end a run started
+    /// with this.
+    fn hung_runner() -> (EmdRunner, Arc<Mutex<Vec<EmdRequest>>>) {
+        let calls: Arc<Mutex<Vec<EmdRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: EmdRunner = Arc::new(move |request: EmdRequest| {
+            recorded.lock().unwrap().push(request);
+            Box::pin(std::future::pending())
         });
         (runner, calls)
     }
@@ -1198,6 +1901,47 @@ mod tests {
         std::fs::create_dir_all(root.join("assets/tiles")).unwrap();
         std::fs::create_dir_all(root.join("crates/game-core/src")).unwrap();
         std::fs::write(root.join("manifests/components.toml"), "version = 1\n").unwrap();
+        dir
+    }
+
+    /// [`emerald_project`] with all three manifests populated and two
+    /// worlds placing components -- the fixture every browse/remove test
+    /// works from.
+    fn populated_project() -> tempfile::TempDir {
+        let dir = emerald_project();
+        let root = dir.path();
+        std::fs::write(
+            root.join("manifests/components.toml"),
+            "version = 1\n\
+             [[component]]\nname = \"HeroUnit\"\nmodule = \"gameplay\"\n\
+             [[component.field]]\nname = \"hp\"\nkind = \"int\"\n\
+             [[component]]\nname = \"Marker\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("manifests/systems.toml"),
+            "version = 1\n\
+             [[system]]\nname = \"spawn_enemies\"\nmodule = \"gameplay\"\n\
+             [[system]]\nname = \"tick_clock\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("manifests/schedules.toml"),
+            "version = 1\n\
+             [[schedule]]\nname = \"update\"\nsystems = [\"gameplay/spawn_enemies\", \"tick_clock\"]\n\
+             [[schedule]]\nname = \"render\"\nsystems = [\"gameplay/spawn_enemies@4\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("assets/worlds/arena.toml"),
+            "[[entity]]\nHeroUnit = { hp = 3 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("assets/worlds/empty.toml"),
+            "[[entity]]\nMarker = {}\n",
+        )
+        .unwrap();
         dir
     }
 
@@ -1248,6 +1992,7 @@ mod tests {
             RunState::Running { command } => format!("running {command}"),
             RunState::Done { message, .. } => format!("done {message}"),
             RunState::Failed { message, .. } => format!("failed {message}"),
+            RunState::Reverted { message, .. } => format!("reverted {message}"),
         })
     }
 
@@ -1538,6 +2283,421 @@ mod tests {
             "a stale result must not overwrite the run state: {}",
             run_state_message(&panel, cx)
         );
+    }
+
+    // ----------------------------------------------- the manifest browser
+
+    /// A panel pointed at `root` with its manifests loaded, as a browse
+    /// test needs it (production reaches `refresh_root` via panel
+    /// activation or a context-menu click).
+    fn browsing_panel(
+        cx: &mut gpui::VisualTestContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+    ) -> Entity<EmeraldPanel> {
+        let panel = lone_panel(cx, root, runner);
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        panel
+    }
+
+    /// The three lists, read from the manifests and grouped by module --
+    /// shared bucket first, then alphabetically (`group_by_module`'s own
+    /// order).
+    #[gpui::test]
+    async fn test_the_browser_lists_all_three_manifests_grouped_by_module(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let panel = browsing_panel(cx, dir.path(), runner);
+
+        panel.read_with(cx, |panel, _| {
+            let components = group_by_module(panel.manifests.components.clone());
+            assert_eq!(components.len(), 2);
+            assert_eq!(components[0].module, "", "the shared bucket sorts first");
+            assert_eq!(components[0].items[0].name, "Marker");
+            assert_eq!(components[1].module, "gameplay");
+            assert_eq!(components[1].items[0].name, "HeroUnit");
+            assert_eq!(panel.manifests.systems.len(), 2);
+            assert_eq!(panel.manifests.schedules.len(), 2);
+        });
+
+        // Selection is per-tab: names are only unique within a manifest,
+        // so switching tabs drops it.
+        panel.update(cx, |panel, cx| {
+            panel.select_item("HeroUnit", cx);
+            assert_eq!(panel.selected_component().unwrap().1, "gameplay");
+            panel.select_tab(BrowseTab::Systems, cx);
+            assert_eq!(panel.selected, None);
+            assert_eq!(
+                panel.entry_module("spawn_enemies").as_deref(),
+                Some("gameplay")
+            );
+            assert_eq!(
+                panel.entry_module("tick_clock").as_deref(),
+                Some(""),
+                "a shared item has a module, and it is the empty one"
+            );
+            assert_eq!(panel.entry_module("HeroUnit"), None, "wrong tab");
+        });
+        assert!(calls.lock().unwrap().is_empty(), "browsing runs nothing");
+    }
+
+    // -------------------------------------------------- cascade + removes
+
+    /// **The task's centre.** Removing a system names the schedules that
+    /// reference it -- in the prompt, before anything runs -- and then
+    /// spawns exactly worldlib's `build_rm_args` argv.
+    #[gpui::test]
+    async fn test_removing_a_system_names_its_schedules_then_spawns_worldlibs_argv(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let panel = browsing_panel(cx, dir.path(), runner);
+
+        panel.update(cx, |panel, cx| panel.select_tab(BrowseTab::Systems, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_item("spawn_enemies", cx);
+                panel.request_remove("spawn_enemies", window, cx);
+            })
+        });
+
+        let (message, detail) = cx.pending_prompt().expect("a remove always confirms");
+        assert_eq!(message, "Remove the system gameplay/spawn_enemies?");
+        assert!(
+            detail.contains("Also removed from 2 schedules: update, render."),
+            "the cascade must be in the confirm body: {detail}"
+        );
+        assert!(
+            detail.contains("This cannot be undone."),
+            "and the cascade must not have displaced the standard warning: {detail}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "nothing runs while the prompt is up"
+        );
+
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one spawn");
+        let mut expected =
+            ggo_worldlib::emerald::build_rm_args(ManifestKind::System, "spawn_enemies", "gameplay");
+        expected.push("--json".to_string());
+        assert_eq!(calls[0].args, expected);
+        assert_eq!(calls[0].cwd, dir.path());
+        drop(calls);
+
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Removed system gameplay/spawn_enemies"
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.selected.clone()),
+            None,
+            "the removed row's selection goes with it"
+        );
+    }
+
+    /// Cancel is asserted as a call COUNT, which is the only assertion that
+    /// can prove nothing was run -- no message check could.
+    #[gpui::test]
+    async fn test_cancelling_a_remove_spawns_nothing(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let panel = browsing_panel(cx, dir.path(), runner);
+
+        for (tab, name) in [
+            (BrowseTab::Systems, "spawn_enemies"),
+            (BrowseTab::Components, "HeroUnit"),
+            (BrowseTab::Schedules, "update"),
+        ] {
+            panel.update(cx, |panel, cx| panel.select_tab(tab, cx));
+            cx.update(|window, cx| {
+                panel.update(cx, |panel, cx| panel.request_remove(name, window, cx))
+            });
+            assert!(cx.has_pending_prompt(), "{name} must confirm");
+            cx.simulate_prompt_answer("Cancel");
+            cx.run_until_parked();
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "Cancel must not run anything ({name})"
+            );
+            assert_eq!(run_state_message(&panel, cx), "idle");
+        }
+    }
+
+    /// The component blast radius: the worlds that still place it, named in
+    /// the prompt, together with the plain statement of what the scan does
+    /// NOT cover.
+    #[gpui::test]
+    async fn test_removing_a_component_names_the_worlds_that_place_it(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let panel = browsing_panel(cx, dir.path(), runner);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.request_remove("HeroUnit", window, cx))
+        });
+        let (message, detail) = cx.pending_prompt().unwrap();
+        assert_eq!(message, "Remove the component gameplay/HeroUnit?");
+        assert!(
+            detail.contains("Still placed in 1 world: worlds/arena.toml."),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(ops::CODE_SCAN_NOTE),
+            "the limit of the scan is stated, not implied: {detail}"
+        );
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls[0].args,
+            [
+                "rm",
+                "component",
+                "HeroUnit",
+                "--module",
+                "gameplay",
+                "--json"
+            ]
+        );
+    }
+
+    /// Adding a field is the one manifest op with no confirm (it only ever
+    /// adds); removing one confirms like everything else. Both spawn
+    /// worldlib's builder argv verbatim.
+    #[gpui::test]
+    async fn test_field_add_and_remove_spawn_worldlibs_argv(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/field"));
+        let panel = browsing_panel(cx, dir.path(), runner);
+
+        // Add: type into the "+ Field" row and commit.
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_item("HeroUnit", cx);
+                panel.toggle_field_form(window, cx);
+            })
+        });
+        let field = panel.read_with(cx, |panel, _| {
+            panel.field_form.as_ref().unwrap().name.clone()
+        });
+        type_into(&field, "armor", cx);
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.submit_field_add(window, cx)));
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "adding a field is not destructive, so it does not confirm"
+        );
+        assert_eq!(
+            calls.lock().unwrap()[0].args,
+            ggo_worldlib::emerald::build_field_add_args("HeroUnit", "gameplay", "armor:int")
+                .into_iter()
+                .chain(["--json".to_string()])
+                .collect::<Vec<_>>()
+        );
+
+        // An invalid spec never reaches the runner (an asset field with no
+        // extension -- the same gate the generate form applies).
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_new_field_kind(ASSET_KIND, cx);
+                panel.submit_field_add(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1, "still just the good one");
+
+        // Remove: confirms, then runs `component field rm`.
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.request_field_remove("hp", window, cx))
+        });
+        let (message, detail) = cx.pending_prompt().unwrap();
+        assert_eq!(message, "Remove the field hp from gameplay/HeroUnit?");
+        assert!(detail.contains("compiler check"), "{detail}");
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap()[1].args,
+            ggo_worldlib::emerald::build_field_rm_args("HeroUnit", "gameplay", "hp")
+                .into_iter()
+                .chain(["--json".to_string()])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Removed field hp from HeroUnit"
+        );
+    }
+
+    // ------------------------------------------------- revert vs failure
+
+    /// A REVERT is not a failure, and must not read like one: `emd` applied
+    /// the change, its `cargo check` rejected it, and it put everything
+    /// back. The two states are distinct and the revert says what happened
+    /// to the project on disk.
+    #[gpui::test]
+    async fn test_a_reverted_run_reads_differently_from_a_plain_failure(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, _) = fake_runner(|req| {
+            // `emd component field rm` reverts; `emd rm system` here just
+            // fails outright.
+            if req.args.contains(&"field".to_string()) {
+                emd_run_outcome(
+                    false,
+                    &[
+                        "emd-json: {\"emd\":\"0.2.0\",\"ok\":false,\"reverted\":true,\
+                       \"error\":\"error[E0609]: no field `hp`\"}"
+                            .to_string(),
+                    ],
+                )
+            } else {
+                err_outcome("no such system")
+            }
+        });
+        let panel = browsing_panel(cx, dir.path(), runner);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_item("HeroUnit", cx);
+                panel.request_field_remove("hp", window, cx);
+            })
+        });
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+
+        let reverted = run_state_message(&panel, cx);
+        assert!(
+            reverted.starts_with("reverted error[E0609]"),
+            "a rolled-back run is its own state: {reverted}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(&panel.run_state, RunState::Reverted { .. }),
+                "not Failed"
+            );
+        });
+
+        // The same panel, a genuine failure: a different state, and the
+        // rolled-back wording is nowhere near it.
+        panel.update(cx, |panel, cx| panel.select_tab(BrowseTab::Systems, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.request_remove("tick_clock", window, cx)
+            })
+        });
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        assert_eq!(run_state_message(&panel, cx), "failed no such system");
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(&panel.run_state, RunState::Failed { .. }));
+            // The rendered line, not just the variant: the revert leads
+            // with what happened to the project, the failure does not.
+            assert!(REVERTED_PREFIX.contains("Rolled back"));
+        });
+    }
+
+    // ------------------------------------------------------------ timeout
+
+    /// A run that never finishes must not strand the panel on "Running…".
+    /// At [`EMD_TIMEOUT`] the race's timer arm wins, the run future (and
+    /// with it the child) is dropped, and the panel reports it and accepts
+    /// work again.
+    #[gpui::test]
+    async fn test_a_hung_run_times_out_and_leaves_the_panel_usable(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (hung, hung_calls) = hung_runner();
+        let panel = browsing_panel(cx, dir.path(), hung);
+
+        panel.update(cx, |panel, cx| panel.select_tab(BrowseTab::Schedules, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.request_remove("render", window, cx))
+        });
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        assert_eq!(hung_calls.lock().unwrap().len(), 1, "it really started");
+        assert!(
+            run_state_message(&panel, cx).starts_with("running"),
+            "still in flight just before the deadline"
+        );
+
+        // One second short of the budget: still running, so the timeout is
+        // a real deadline rather than "the next tick".
+        cx.executor()
+            .advance_clock(EMD_TIMEOUT - std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(run_state_message(&panel, cx).starts_with("running"));
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        let message = run_state_message(&panel, cx);
+        assert!(
+            message.starts_with("failed timed out after 10 minutes and was killed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("rm schedule render"),
+            "the report names the command that was killed: {message}"
+        );
+
+        // And the panel takes work again -- the whole point of not being
+        // stuck on "Running…".
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        panel.update(cx, |panel, _| panel.runner = runner);
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.request_remove("update", window, cx))
+        });
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Removed schedule update"
+        );
+    }
+
+    /// A mutation cannot be started while one is in flight -- including
+    /// from a confirm that was already on screen when the other run began.
+    #[gpui::test]
+    async fn test_a_second_mutation_cannot_start_mid_run(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (hung, calls) = hung_runner();
+        let panel = browsing_panel(cx, dir.path(), hung);
+
+        panel.update(cx, |panel, cx| panel.select_tab(BrowseTab::Systems, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.request_remove("tick_clock", window, cx)
+            })
+        });
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.request_remove("spawn_enemies", window, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "a run is in flight -- the second remove does not even confirm"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "and nothing else spawned");
     }
 
     // ------------------------------------------------------- the menu

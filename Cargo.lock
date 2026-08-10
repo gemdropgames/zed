@@ -7568,6 +7568,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tempfile",
+ "toml 0.8.23",
  "ui",
  "workspace",
 ]

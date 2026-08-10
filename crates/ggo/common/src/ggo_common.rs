@@ -182,6 +182,22 @@ pub fn destructive_detail(unsaved: bool) -> String {
     }
 }
 
+/// [`destructive_detail`] with a CASCADE list folded in ahead of it: the
+/// other things that break if the user says yes, one per line.
+///
+/// Separate lines rather than a sentence because the list is open-ended (a
+/// system can be in every schedule; a component can be in every world) and
+/// a prompt that runs the names into prose stops being readable at three
+/// of them. Empty `cascade` reduces to exactly [`destructive_detail`], so
+/// the two prompts stay one prompt with one detail convention rather than
+/// drifting into two.
+pub fn cascade_detail(cascade: &[String], unsaved: bool) -> String {
+    if cascade.is_empty() {
+        return destructive_detail(unsaved);
+    }
+    format!("{}\n\n{}", cascade.join("\n"), destructive_detail(unsaved))
+}
+
 /// Does a `Window::prompt` answer over `[confirm_label, "Cancel"]` mean
 /// "go ahead"?
 ///
@@ -213,10 +229,29 @@ pub fn confirm_destructive(
     window: &mut Window,
     cx: &mut App,
 ) -> Task<bool> {
+    confirm_destructive_cascade(message, &[], confirm_label, unsaved, window, cx)
+}
+
+/// [`confirm_destructive`] for an action with a CASCADE -- the other things
+/// that break if it goes ahead (the schedules that reference the system
+/// being removed, the worlds that place the component being removed).
+///
+/// One prompt path, not two: `confirm_destructive` delegates here with an
+/// empty list, so a caller can never reach a destructive confirm that
+/// forgot the "this cannot be undone" half, and the cascade lands in the
+/// prompt's DETAIL rather than its title (see [`cascade_detail`]).
+pub fn confirm_destructive_cascade(
+    message: &str,
+    cascade: &[String],
+    confirm_label: &str,
+    unsaved: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<bool> {
     let answer = window.prompt(
         PromptLevel::Info,
         message,
-        Some(&destructive_detail(unsaved)),
+        Some(&cascade_detail(cascade, unsaved)),
         &[confirm_label, "Cancel"],
         cx,
     );
@@ -482,10 +517,16 @@ pub fn system_proc_runner() -> ProcRunner {
 /// no-op: "it isn't installed" is the single most likely first-run failure
 /// and it has to reach the panel as text.
 ///
-/// No timeout, deliberately: the callers are `emd generate`/`emd pack-ggo`
-/// and `ggo-diag`, whose legitimate runtimes span seconds to tens of
-/// minutes with no useful upper bound to pick. A cancel/timeout surface
-/// belongs with the streaming console F5.3 brings, not here.
+/// No timeout of its OWN, deliberately: this function cannot pick one,
+/// because the only clock a GGO panel is allowed to race against is
+/// `gpui::BackgroundExecutor::timer` (this checkout's `clippy.toml`
+/// disallows `smol::Timer::after` outright -- "introduces non-determinism
+/// in tests"), and an executor is exactly what a plain synchronous helper
+/// does not have. What it provides instead is [`run_capture_async`], whose
+/// child dies when the future is dropped -- so a caller that DOES have an
+/// executor (`ggo_emerald_panel`'s `cargo check`-backed mutations) can
+/// impose its own budget by racing the future against a timer and dropping
+/// it, and the child goes with it.
 ///
 /// The child is `smol::process::Command`, not `std::process::Command`:
 /// this checkout's `clippy.toml` disallows the latter's `output`/`spawn`/
@@ -495,12 +536,32 @@ pub fn system_proc_runner() -> ProcRunner {
 /// a one-line fake -- and blocking is correct here precisely because the
 /// only callers are inside `cx.background_spawn`.
 pub fn run_capture(request: &ProcRequest) -> ProcCapture {
-    let output = smol::block_on(
-        Command::new(&request.bin)
-            .args(&request.args)
-            .current_dir(&request.cwd)
-            .output(),
-    );
+    smol::block_on(run_capture_async(request))
+}
+
+/// [`run_capture`]'s async twin, and the only version that can be given a
+/// deadline: **dropping this future kills the child**.
+///
+/// That property is `Command::kill_on_drop(true)` plus how `async_process`
+/// is built -- `Command::output()`'s future owns the `Child`'s guard, so
+/// cancelling the future runs the guard's `Drop`, which sends the kill.
+/// Without the flag a dropped future would merely stop LISTENING to a
+/// `cargo check` that keeps running (and keeps holding the project's
+/// `target/` lock), which is the failure a timeout is supposed to prevent,
+/// not one it should cause.
+///
+/// Everything else -- the stdout-then-stderr capture order that lets a
+/// failing `emd`'s stderr trailer win, and the "a binary that cannot be
+/// spawned is a non-ok capture naming the command" rule -- is
+/// [`run_capture`]'s contract, unchanged; this is where both are actually
+/// implemented.
+pub async fn run_capture_async(request: &ProcRequest) -> ProcCapture {
+    let output = Command::new(&request.bin)
+        .args(&request.args)
+        .current_dir(&request.cwd)
+        .kill_on_drop(true)
+        .output()
+        .await;
     let output = match output {
         Ok(output) => output,
         Err(e) => {
@@ -586,6 +647,36 @@ mod tests {
             destructive_detail(true),
             "This cannot be undone. Unsaved edits to it will be lost."
         );
+    }
+
+    /// An empty cascade must reduce to EXACTLY `destructive_detail` -- that
+    /// equivalence is what lets `confirm_destructive` delegate to
+    /// `confirm_destructive_cascade` instead of being a second prompt path
+    /// that could drift.
+    #[test]
+    fn an_empty_cascade_is_just_the_destructive_detail() {
+        assert_eq!(cascade_detail(&[], false), destructive_detail(false));
+        assert_eq!(cascade_detail(&[], true), destructive_detail(true));
+    }
+
+    /// A cascade goes ABOVE the "cannot be undone" line, one entry per
+    /// line, and never replaces it.
+    #[test]
+    fn a_cascade_is_listed_above_the_undone_warning() {
+        let detail = cascade_detail(
+            &[
+                "Used by 2 schedules: tick, render.".to_string(),
+                "Placed in 1 world: worlds/arena.toml.".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(
+            detail,
+            "Used by 2 schedules: tick, render.\n\
+             Placed in 1 world: worlds/arena.toml.\n\n\
+             This cannot be undone."
+        );
+        assert!(cascade_detail(&["a".to_string()], true).ends_with(&destructive_detail(true)));
     }
 
     /// `default_db_path` must land on `~/.ggo/ggo_ide.db` -- the file both
@@ -733,5 +824,38 @@ mod tests {
         ));
         assert!(capture.ok);
         assert_eq!(capture.transcript(), "done");
+    }
+
+    /// **The property a timeout is built on**: dropping a
+    /// [`run_capture_async`] future KILLS the child, it does not merely
+    /// stop reading it.
+    ///
+    /// Proved against a real process rather than by inspecting the flag: a
+    /// child that would create a marker file one second in is spawned (one
+    /// poll is enough -- `Command::output()` spawns on first poll), the
+    /// future is dropped immediately, and the marker must still be absent
+    /// well past the moment it was due. The same script awaited to
+    /// completion is the control, so "the marker never appears" cannot
+    /// silently mean "the script was wrong".
+    #[test]
+    fn dropping_a_capture_future_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let script = format!("sleep 1; touch {}", marker.display());
+        let request = ProcRequest::new("sh", dir.path(), vec!["-c".into(), script]);
+
+        let mut fut = Box::pin(run_capture_async(&request));
+        smol::block_on(smol::future::poll_once(&mut fut));
+        drop(fut);
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(
+            !marker.exists(),
+            "the child outlived the dropped future -- a timeout would leak a \
+             running `cargo check`"
+        );
+
+        // Control: the very same script, awaited, does create the marker.
+        assert!(run_capture(&request).ok);
+        assert!(marker.exists(), "the script itself works");
     }
 }

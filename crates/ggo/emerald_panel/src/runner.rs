@@ -24,7 +24,10 @@
 //! A `generate` is one short one-shot call whose only output that matters
 //! is its trailer.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ggo_worldlib::emerald::{EmdRunOutcome, emd_run_outcome};
 
@@ -35,6 +38,26 @@ use ggo_worldlib::emerald::{EmdRunOutcome, emd_run_outcome};
 pub use ggo_common::ProcRequest as EmdRequest;
 pub use ggo_common::{EMERALD_MANIFEST, emerald_project_root};
 
+/// How long one `emd` invocation may run before the panel kills it.
+///
+/// **Ten minutes, ggo-ide's own `EMD_TIMEOUT` to the second**
+/// (`backend/emerald.rs`), and for its stated reason: the mutation
+/// commands this panel now issues -- `emd rm`, `component field rm` --
+/// shell out to `cargo` themselves, and a cold `target/` dir makes the
+/// difference between "slow" and "hung" a matter of minutes, not seconds.
+/// A budget tight enough to be a useful progress signal would kill honest
+/// work; this one only ever fires on something genuinely stuck (a
+/// `cargo` waiting on a lock another process holds, say), which is exactly
+/// when the panel must come back rather than sit on "Running…" forever.
+///
+/// F5.2 shipped no timeout at all because `emd generate` measures ~2 ms.
+/// That was defensible for generate and is not defensible here.
+pub const EMD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// One in-flight `emd` run. Boxed because [`EmdRunner`] is a trait object;
+/// `Send` because it is polled on `cx.background_spawn`'s thread.
+pub type EmdRun = Pin<Box<dyn Future<Output = EmdRunOutcome> + Send>>;
+
 /// The injection seam: anything that can turn an [`EmdRequest`] into an
 /// [`EmdRunOutcome`].
 ///
@@ -44,28 +67,58 @@ pub use ggo_common::{EMERALD_MANIFEST, emerald_project_root};
 /// own handle. `Send + Sync` because the call happens on
 /// `cx.background_spawn`'s thread, never on the UI thread.
 ///
+/// It hands back a FUTURE rather than a finished outcome (F5.3) so the run
+/// can be given a deadline: the panel races this future against
+/// `cx.background_executor().timer(EMD_TIMEOUT)` and drops it on expiry,
+/// and `ggo_common::run_capture_async`'s `kill_on_drop` child turns that
+/// drop into a dead `cargo check` rather than an orphan that keeps holding
+/// the project's `target/` lock. A blocking `Fn` could not be interrupted
+/// at all -- `smol::block_on` is not an await point, so cancelling the task
+/// around it would return control to the panel while the child ran on.
+///
 /// Deliberately narrower than `ggo_common::ProcRunner`, which it wraps: a
 /// panel that only ever runs `emd` wants the parsed trailer, not a raw
 /// transcript, and pushing that mapping into every call site would be the
 /// same duplication one level up.
-pub type EmdRunner = Arc<dyn Fn(EmdRequest) -> EmdRunOutcome + Send + Sync>;
+pub type EmdRunner = Arc<dyn Fn(EmdRequest) -> EmdRun + Send + Sync>;
 
 /// The production runner: really spawn `emd`.
 pub fn system_runner() -> EmdRunner {
-    Arc::new(|request| run_emd(&request))
+    Arc::new(|request| Box::pin(run_emd(request)))
 }
 
-/// Spawn `emd` and turn the capture into an outcome. **Blocking** --
-/// callers run this on `cx.background_spawn`, never on the UI thread.
+/// Spawn `emd` and turn the capture into an outcome. Dropping the returned
+/// future kills the child (`ggo_common::run_capture_async`).
 ///
 /// The capture's stdout-then-stderr line order is what makes a FAILING
 /// run's trailer (which `emd` prints to stderr) the one
 /// [`ggo_worldlib::emerald::parse_emd_trailer`] finds; see
-/// `ggo_common::run_capture` for the rest of the contract, including how a
-/// binary that cannot be spawned is reported.
-pub fn run_emd(request: &EmdRequest) -> EmdRunOutcome {
-    let capture = ggo_common::run_capture(request);
+/// `ggo_common::run_capture_async` for the rest of the contract, including
+/// how a binary that cannot be spawned is reported.
+pub async fn run_emd(request: EmdRequest) -> EmdRunOutcome {
+    let capture = ggo_common::run_capture_async(&request).await;
     emd_run_outcome(capture.ok, &capture.lines)
+}
+
+/// The outcome the panel applies when [`EMD_TIMEOUT`] expires and the child
+/// is killed.
+///
+/// A synthesized non-ok [`EmdRunOutcome`] rather than a fourth run state:
+/// a killed run IS a failed run, it just has no trailer of its own to
+/// explain itself, and going through the same path means it inherits the
+/// transcript rendering, the generation guard and the "the form stays
+/// open" behaviour for free. `emd_error_message` falls back to `output`
+/// when there is no trailer, so this text is what the user reads.
+pub fn timed_out(request: &EmdRequest) -> EmdRunOutcome {
+    EmdRunOutcome {
+        ok: false,
+        output: format!(
+            "timed out after {} minutes and was killed: {}",
+            EMD_TIMEOUT.as_secs() / 60,
+            request.command_line()
+        ),
+        result: None,
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +151,7 @@ mod tests {
                 "--json".into(),
             ],
         );
-        let outcome = run_emd(&request);
+        let outcome = smol::block_on(run_emd(request));
         assert!(!outcome.ok);
         assert!(outcome.result.is_none());
         assert!(
@@ -133,7 +186,7 @@ mod tests {
             dir.path(),
             vec!["new".to_string(), "demo".to_string()],
         );
-        if !run_emd(&scaffold).ok {
+        if !smol::block_on(run_emd(scaffold)).ok {
             assert!(
                 allow_no_emd(),
                 "`{} new demo` did not succeed -- no emerald toolchain on PATH \
@@ -146,7 +199,7 @@ mod tests {
         }
         let project = dir.path().join("demo");
 
-        let outcome = run_emd(&EmdRequest::emd(
+        let outcome = smol::block_on(run_emd(EmdRequest::emd(
             &project,
             vec![
                 "generate".to_string(),
@@ -155,7 +208,7 @@ mod tests {
                 "--field".to_string(),
                 "hp:int".to_string(),
             ],
-        ));
+        )));
         assert!(outcome.ok, "{}", outcome.output);
         let result = outcome.result.expect("a real run prints a trailer");
         assert_eq!(result["ok"], serde_json::json!(true));
@@ -168,14 +221,14 @@ mod tests {
 
         // The same command again fails -- and its trailer, which `emd`
         // prints to STDERR, is what has to reach the panel.
-        let again = run_emd(&EmdRequest::emd(
+        let again = smol::block_on(run_emd(EmdRequest::emd(
             &project,
             vec![
                 "generate".to_string(),
                 "component".to_string(),
                 "hero_unit".to_string(),
             ],
-        ));
+        )));
         assert!(!again.ok);
         assert!(
             ggo_worldlib::emerald::emd_error_message(&again).contains("already exists"),
@@ -202,7 +255,7 @@ mod tests {
                     .into(),
             ],
         );
-        let outcome = run_emd(&request);
+        let outcome = smol::block_on(run_emd(request));
         assert!(!outcome.ok);
         assert_eq!(
             outcome.result.as_ref().unwrap()["error"],
