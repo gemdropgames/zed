@@ -496,6 +496,56 @@ impl WorldPanel {
         cx.notify();
     }
 
+    /// The world currently open, as the worktree-relative path it was
+    /// opened WITH -- `None` unless a world is loaded.
+    ///
+    /// Public purely as an observation point for the panels that hand a
+    /// world OFF to this one: `ggo_emerald_panel` opens the world
+    /// `emd generate world` just wrote, and the rel it passes has to be
+    /// the worktree-relative one. Without this, that hand-off could only
+    /// be asserted from inside this crate, which is not where the bug
+    /// would be. (Same reason `ggo_tileset_panel::open_rel_path_now`
+    /// exists.)
+    pub fn open_rel_path_now(&self) -> Option<&str> {
+        match &self.state {
+            ViewerState::Ready(open) => Some(open.source_rel.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The inspector's current component-schema names. An observation
+    /// point for the same reason as [`Self::open_rel_path_now`]:
+    /// `ggo_emerald_panel` CHANGES this set from outside (via
+    /// [`Self::refresh_schemas`]) and has to be able to prove it.
+    pub fn schema_names(&self) -> Vec<String> {
+        match &self.state {
+            ViewerState::Ready(open) => open.schemas.iter().map(|s| s.name.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Re-read `manifests/components.toml` into the OPEN world's inspector
+    /// schema set, without reloading the document.
+    ///
+    /// The schema set is otherwise built exactly once, at load time
+    /// ([`loader::load_world`]), so a component created outside this panel
+    /// -- `ggo_emerald_panel`'s `emd generate component`, which calls this
+    /// -- would not be offerable on an entity until the world was closed
+    /// and reopened. A no-op when nothing is loaded: the next load reads
+    /// the manifest fresh anyway.
+    ///
+    /// Reads against the OPEN document's own asset root (via
+    /// [`loader::schemas_near`], which walks up to the project root), not
+    /// the panel's live `project_root` -- same stale-root reasoning as
+    /// save's.
+    pub fn refresh_schemas(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.schemas = loader::schemas_near(&open.root);
+        cx.notify();
+    }
+
     /// The root world stems are enumerated and resolved against: the open
     /// document's derived asset root while one is loaded, else the
     /// worktree root (nothing better is known before the first open).

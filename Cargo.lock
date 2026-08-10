@@ -7552,6 +7552,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_emerald_panel"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "ggo-worldlib",
+ "ggo_common",
+ "ggo_world_panel",
+ "gpui",
+ "keymap_editor",
+ "log",
+ "path",
+ "project",
+ "serde_json",
+ "smol",
+ "tempfile",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "ggo_emu_panel"
 version = "0.1.0"
 dependencies = [
@@ -24440,6 +24460,7 @@ dependencies = [
  "fs",
  "futures 0.3.32",
  "ggo_charts_panel",
+ "ggo_emerald_panel",
  "ggo_emu_panel",
  "ggo_import_panel",
  "ggo_language",

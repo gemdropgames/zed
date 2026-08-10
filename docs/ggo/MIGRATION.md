@@ -113,18 +113,20 @@ covered by the fork at all.
 
 ## 5. Emerald page (ECS manifests)
 
-The pure-extension spec expected "full for ops; no dashboard view". The fork
-landed neither the dashboard nor the ops surface: manifests are text files you
-edit and `emd` is a command you run.
+The pure-extension spec expected "full for ops; no dashboard view". F5.2/S3
+landed the *creation* half of the ops surface as `ggo_emerald_panel` (right
+dock, "GGO Emerald"); browsing manifests is still editing text files, and the
+mutation/reorder ops are F5.3's.
 
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | Project tab: structured `emerald.toml` viewer | Open `emerald.toml` in the editor | partial | Text, not a structured section/entry view. |
 | Components / Systems / Schedules browsing (module groups, list → detail) | Open `manifests/*.toml` in the editor | partial | Text only. No list/detail dashboard, no field counts, no "used by schedules". |
-| Create component/system/schedule (validated forms → `emd generate …`) | `emd` in the terminal | deferred | T1 shipped build/pack/run/flash/monitor/new tasks only; the generate/rm/field/schedule verbs have no task and no panel. |
+| Create component/system/schedule (validated forms → `emd generate …`) | emerald panel forms, opened from the project panel's context menu | ✓ | Right-click the project root or `manifests/` → New Component… / New System… / New Schedule…; the form also generates resources, modules and worlds via its kind selector. Validated with worldlib's own `valid_item_name`/`valid_field_spec` before spawning, so an invalid name never reaches `emd`, and a component's PascalCase "stored as" preview is shown exactly where ggo-ide showed it. A new component refreshes the world panel's inspector schemas in place; a new world opens in the world panel. |
+| New tileset (blank `.til`/`.pal` pair) | emerald panel form, on any assets directory | ✓ | Not a ggo-ide feature and not an `emd` verb — added here because a `.til` is a prerequisite for New Sprite / a bound `.map`, and the import panel needs a source PNG. The palette is worldlib's own `.pal`-less fallback, read back rather than restated. |
 | Remove component/system/schedule, add/remove field (with cascade-aware and compiler-check confirms) | `emd` in the terminal | deferred | Same. The "Reverted" compiler-rollback surfacing is lost with it. |
 | Schedule ordered run-list editor (reorder, cadence, add/remove, optimistic commit) | `emd schedule set` by hand | deferred | Richest interaction in ggo-ide; nothing ported. |
-| emd version-lock banner + gating + mtime poll + mid-run drift check | none | deferred | Nothing gates `emd` invocations in the fork; a version-skewed `emd` fails at the terminal instead of being pre-empted. |
+| emd version-lock banner + gating + mtime poll + mid-run drift check | none | deferred | Nothing gates `emd` invocations in the fork yet; the emerald panel runs `emd generate` unguarded (F5.3). The binary itself is `GGO_EMD`, defaulting to `emd` on `PATH`. |
 | emd run console panel (live merged stdout/stderr, Cancel) | Zed terminal panel | ✓ | |
 
 ## 6. Emulator page
@@ -213,17 +215,22 @@ edit and `emd` is a command you run.
 
 | Status | Rows |
 |---|---|
-| ✓ | 33 |
+| ✓ | 35 |
 | partial | 31 |
-| deferred | 28 |
+| deferred | 27 |
 | dropped | 11 |
-| **total** | **103** |
+| **total** | **104** |
 
 (F4 wrap: the `.til` tileset-editor row moved dropped → partial now that
 `ggo_tileset_panel` ships a read-only viewer. Before F4: ✓ 31 / partial 28 /
 deferred 31 / dropped 13. The sprite/world-picker rows also changed *text*
 (explorer-driven instead of in-panel pickers) but not *status* — both were
 already ✓/partial and stay there.)
+
+(F5.2/S3: the "create component/system/schedule" row moved deferred → ✓ with
+`ggo_emerald_panel`, and a new "New tileset" row lands at ✓ (a fork-only
+affordance, so the total grows by one). Before S3: ✓ 33 / partial 31 /
+deferred 28 / dropped 11, total 103.)
 
 (X4: **no status moved, so these counts are unchanged** — ✓ 31 / partial 29 /
 deferred 31 / dropped 12 both before and after. The cart-library row was

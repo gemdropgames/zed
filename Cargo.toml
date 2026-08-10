@@ -352,6 +352,7 @@ ggo-emu-core = { path = "../ggo/tools/ggo-emu-core" } # GGO
 ggo-worldlib = { path = "../ggo/tools/ggo-worldlib" } # GGO
 ggo_charts_panel = { path = "crates/ggo/charts_panel" } # GGO
 ggo_common = { path = "crates/ggo/common" } # GGO
+ggo_emerald_panel = { path = "crates/ggo/emerald_panel" } # GGO
 ggo_emu_panel = { path = "crates/ggo/emu_panel" } # GGO
 ggo_import_panel = { path = "crates/ggo/import_panel" } # GGO
 ggo_language = { path = "crates/ggo/language" } # GGO

@@ -153,7 +153,7 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
         map_loads,
         meta_sprite_loads,
         merged,
-        schemas: manifest_schemas(project_dir),
+        schemas: schemas_near(project_dir),
     })
 }
 
@@ -216,6 +216,37 @@ const MANIFEST_SCHEMA_VERSION: u64 = 1;
 /// `manifests/*.toml`, since the schema feed never consumed the others.
 pub fn manifest_schemas(project_dir: &Path) -> Vec<ComponentSchema> {
     all_schemas(&read_components_manifest(project_dir).unwrap_or_default())
+}
+
+/// The file that marks an emerald project root.
+const EMERALD_MANIFEST: &str = "emerald.toml";
+
+/// [`manifest_schemas`] for a directory that may be an ASSET ROOT rather
+/// than the project root -- it walks up to the nearest ancestor holding
+/// `emerald.toml` first (emerald's own `Project::discover` rule, the same
+/// walk `ggo_map_panel`/`ggo_sprite_panel`/`ggo_import_panel` each make to
+/// find `<project>/assets`), and falls back to `dir` itself when there is
+/// no such ancestor.
+///
+/// This exists because the panel loads a world against its DERIVED asset
+/// root -- `<worktree>/assets` for `assets/worlds/main.toml`, see
+/// `split_world_path` -- and `manifests/` is NOT under that root, it is
+/// its sibling. Calling `manifest_schemas` with the asset root looked for
+/// `<worktree>/assets/manifests/components.toml`, which no emerald project
+/// has, so an asset-rooted world silently got builtins only. Found while
+/// wiring F5.2/S3's "a component created in the emerald panel becomes
+/// available here without a restart"; the fallback is what keeps the
+/// worktree-rooted `worlds/main.toml` layout (and this module's own tests)
+/// working unchanged.
+pub fn schemas_near(dir: &Path) -> Vec<ComponentSchema> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join(EMERALD_MANIFEST).is_file() {
+            return manifest_schemas(d);
+        }
+        cur = d.parent();
+    }
+    manifest_schemas(dir)
 }
 
 fn read_components_manifest(project_dir: &Path) -> Option<Vec<ManifestComponent>> {
@@ -383,5 +414,76 @@ mod tests {
             manifest_schemas(dir.path()),
             ggo_worldlib::schemas::builtin_schemas()
         );
+    }
+
+    /// `manifests/` is the project root's child, NOT the asset root's, so
+    /// a world loaded against `<project>/assets` must still find it.
+    #[test]
+    fn schemas_near_walks_up_from_an_asset_root_to_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(EMERALD_MANIFEST), "").unwrap();
+        std::fs::create_dir_all(root.join("manifests")).unwrap();
+        std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
+        std::fs::write(
+            root.join("manifests/components.toml"),
+            "version = 1\n\n[[component]]\nname = \"Health\"\n\n[[component.field]]\nname = \"hp\"\nkind = \"int\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            manifest_schemas(&root.join("assets"))
+                .iter()
+                .all(|s| s.name != "Health"),
+            "the asset root itself has no manifests/ -- this is the bug"
+        );
+        assert!(
+            schemas_near(&root.join("assets"))
+                .iter()
+                .any(|s| s.name == "Health")
+        );
+        assert!(schemas_near(root).iter().any(|s| s.name == "Health"));
+    }
+
+    /// The load path itself, not just the helper: a world loaded against
+    /// its DERIVED asset root (`<project>/assets`, which is what
+    /// `split_world_path` hands `load_world`) must still carry the
+    /// project's manifest components.
+    #[test]
+    fn load_world_from_an_asset_root_still_finds_the_projects_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(EMERALD_MANIFEST), "").unwrap();
+        std::fs::create_dir_all(root.join("manifests")).unwrap();
+        std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
+        std::fs::write(
+            root.join("manifests/components.toml"),
+            "version = 1\n\n[[component]]\nname = \"Health\"\n\n[[component.field]]\nname = \"hp\"\nkind = \"int\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("assets/worlds/main.toml"), "version = 1\n").unwrap();
+
+        let loaded = load_world(&root.join("assets"), "worlds/main.toml").unwrap();
+        assert!(
+            loaded.schemas.iter().any(|s| s.name == "Health"),
+            "an asset-rooted load must see <project>/manifests, not <project>/assets/manifests"
+        );
+    }
+
+    /// No `emerald.toml` anywhere: `schemas_near` is exactly
+    /// `manifest_schemas` of the directory it was handed, which is what
+    /// keeps the worktree-rooted `worlds/main.toml` layout working.
+    #[test]
+    fn schemas_near_falls_back_to_the_directory_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(
+            manifests.join("components.toml"),
+            "version = 1\n\n[[component]]\nname = \"Health\"\n",
+        )
+        .unwrap();
+        assert_eq!(schemas_near(dir.path()), manifest_schemas(dir.path()));
+        assert!(schemas_near(dir.path()).iter().any(|s| s.name == "Health"));
     }
 }
