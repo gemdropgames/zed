@@ -82,7 +82,7 @@ covered by the fork at all.
 | Per-cell tile assignment from the pool | metasprite panel tile palette + preview cell click | ✓ | |
 | Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | `ggo_tileset_panel` — read-only overview grid + 16-slot palette swatch row, integer zoom 1x-8x | partial | Viewing shipped (F4): routed off a `.til` click in the project panel, no in-panel picker. The **magnified tile canvas**, pencil/fill/eyedropper, palette slot editing, append/duplicate/delete-last and the cols setting are all still dropped — the fork's zoom magnifies the whole sheet, not one selected tile, so there is no per-tile editing surface at all. This is a viewer, not the editor ggo-ide had; do not read it as more than that. |
 | Map editor (`.map`): tileset binding, multi-tile stamp, H/V flip, palSub, brush/rect-fill/eraser/eyedropper, grid, zoom, resize | `ggo_map_panel` (F5.1 M2) — the fork's one editing surface | partial | Maps are **authored here, never imported** (user's call). Ported: tileset binding (`MapOp::BindTileset`, with the bound tileset's tiles as a rect-selectable stamp strip), multi-tile stamp placement, H/V flip and palSub on the stamp, rect-fill, eraser, eyedropper, grid toggle, pan, resize, undo/redo/save with the dirty guard. Opened by clicking a `.map` in the explorer, or created by "New Map…" on an assets directory (blank + **unbound**: cells are pool indices, so a guessed binding is worse than none — you bind from the panel). Not ported: the float zoom slider (integer 1x–8x ladder here, so 16px tiles never resample) and the palSub slider (a stepper over the same 0–15). **The real loss is the per-tileset `cols` setting.** ggo-ide resolves the tile-strip column count through the shared `resolve_and_migrate_cols`, keyed on the `.til` in `~/.ggo/ggo_ide.db`, so its map and tileset editors lay a given tileset out identically and the user can set that width. The fork has no db-backed cols and falls back to 8 columns (clamped) in both `ggo_map_panel` and `ggo_tileset_panel` — they still agree with each other, but not with a tileset authored at some other width. Because `cols` **is** the stamp coordinate system (`build_stamp` indexes `row * cols + col`), a tileset whose metatiles were laid out spatially contiguous at, say, 6 or 12 wide has them scattered across the fork's 8-wide reflow: those metatiles are no longer rect-selectable as one stamp, and have to be placed tile by tile. Defensible while the fork has no settings store, but it is a workflow regression for any non-8-wide tileset, not just a cosmetic relayout. Maps also still *render* in the world panel as backgrounds/tilemaps. |
-| PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | none | deferred | T1 checked `tools/*/Cargo.toml` and the feature inventory: **there is no import CLI**, so `.zed/tasks.json` deliberately ships no import task rather than inventing one. The wizard is ggo-ide-only until a CLI exists. |
+| PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | `ggo_import_panel` (F5.1 Task I2) — tileset-only | partial | Ported: crop rect + cell-grid overlay, quantized preview, commit to `.til`/`.pal` (assets-root-relative sidecars, overwrite-collision confirm), source-PNG cleanup confirm, "Import as tileset…" on a `.png` in the explorer, opening the result in `ggo_tileset_panel` on commit. **Sprite and Metasprite import modes are NOT ported, by design** — the domain model changed: a sprite is one frame and a metasprite is clips over frames, both assembled from tiles in `ggo_metasprite_panel`, not decoded straight from a PNG, so there is no destination for a `.spr` import to land in. `WizardState::sprite_import`/`Mode::{Sprite,Metasprite}` moved into worldlib verbatim (Task I1, dependency-light so splitting the file wasn't worth it) but the panel never calls them. |
 | Legacy `.meta.json` sidecar import | none | dropped | One-shot migration aid for a format generation that is already past. |
 | Save / dirty marker / save-status / discard guards | Per-panel Save button + dirty dot + `ctrl-s`/`cmd-s` + inline `save failed:` | partial | Per-document save and dirty state shipped; the cross-page discard confirms and the "doc changed during save" race message did not. |
 | Draggable splitters (rail / right column) persisted | Zed dock resize | ✓ | |
@@ -214,9 +214,9 @@ edit and `emd` is a command you run.
 | Status | Rows |
 |---|---|
 | ✓ | 32 |
-| partial | 30 |
-| deferred | 29 |
-| dropped | 12 |
+| partial | 32 |
+| deferred | 28 |
+| dropped | 11 |
 | **total** | **103** |
 
 (F4 wrap: the `.til` tileset-editor row moved dropped → partial now that
@@ -237,6 +237,17 @@ deferral's.)
 and "Sprite rail ops" deferred → partial, both on the project-panel context-menu
 contributor hook. Before G2: ✓ 31 / partial 29 / deferred 31 / dropped 12.
 After: ✓ 32 / partial 30 / deferred 29 / dropped 12.)
+
+(F5.1 wrap: **two more rows moved**, plus a table correction. "Map editor"
+went dropped → partial when M2 shipped `ggo_map_panel` (fix-round commit
+`811a84d872`, ahead of this wrap — that commit updated the row's own text but
+never re-tallied the table below it, so the printed counts had already
+drifted one partial/one dropped out of step with the actual rows; folded in
+here rather than left to compound). "PNG import wizard" went deferred →
+partial when `ggo_import_panel` shipped (Task I2), tileset-only. Before F5.1
+(the last *tallied* snapshot, i.e. G2's numbers above, which by the time of
+this wrap no longer matched the table): ✓ 32 / partial 30 / deferred 29 /
+dropped 12. After: ✓ 32 / partial 32 / deferred 28 / dropped 11.)
 
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its

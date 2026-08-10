@@ -205,11 +205,12 @@ fn is_map_path(path: &ProjectPath) -> bool {
 /// other file, for a path outside the primary worktree of a LOCAL project,
 /// and when no panel is docked.
 ///
-/// The FIFTH such predicate. The full set, in registration order:
-/// `**/worlds/**/*.toml` (`ggo_world_panel`), `*.cart` (`ggo_emu_panel`),
-/// `*.spr` (`ggo_metasprite_panel`), `*.til` (`ggo_tileset_panel`), and
-/// now `*.map`. All five key off disjoint paths, so registration order
-/// between them doesn't matter. (The `.cart` one was missed in this
+/// One of five such predicates: `**/worlds/**/*.toml` (`ggo_world_panel`),
+/// `*.cart` (`ggo_emu_panel`), `*.spr` (`ggo_metasprite_panel`),
+/// `*.til` (`ggo_tileset_panel`), and `*.map`. All five key off disjoint
+/// paths, so registration order between them doesn't matter -- and it
+/// isn't documented here because it drifts with alphabetical crate init
+/// order in `crates/zed/src/main.rs`. (The `.cart` one was missed in this
 /// module's first count -- fix round 1, FOLD IN 4.)
 fn intercept_map_open(
     workspace: &mut Workspace,

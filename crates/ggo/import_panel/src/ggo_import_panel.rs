@@ -1907,7 +1907,7 @@ mod tests {
             assert_eq!(open.wizard.dest_dir, "art");
             assert_eq!(open.wizard.dest_stem, "hero");
             assert_eq!(
-                open.wizard.targets(),
+                open.dest_targets(),
                 vec!["art/hero.til".to_string(), "art/hero.pal".to_string()],
                 "targets are asset-root-relative"
             );
@@ -2185,9 +2185,13 @@ mod tests {
                 "source root is the worktree"
             );
             open.wizard.set_dest_dir("assets/tiles".to_string());
+            // Deliberately calling the raw, disallowed `WizardState::targets`
+            // to demonstrate the `assets/`-prefixed-rel bug `dest_targets()`
+            // exists to avoid -- see clippy.toml's disallowed-methods entry.
+            #[allow(clippy::disallowed_methods)]
+            let raw_targets = open.wizard.targets();
             assert_eq!(
-                open.wizard.targets()[0],
-                "assets/tiles/outside.til",
+                raw_targets[0], "assets/tiles/outside.til",
                 "the wizard's RAW targets still carry the segment..."
             );
             assert_eq!(
