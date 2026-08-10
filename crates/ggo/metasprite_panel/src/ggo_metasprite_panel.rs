@@ -46,7 +46,7 @@ use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::sprites::cow::{ClipEdit, SpriteState};
-use ggo_worldlib::sprites::io::save_sprite;
+use ggo_worldlib::sprites::io::{open_sprite, save_sprite};
 use ggo_worldlib::sprites::sprite_doc::{DocOp, SpriteDocStore, clamp_clip_name_bytes};
 use ggo_worldlib::sprites::timeline_ops::{playback_frame_at, playback_total_ms};
 
@@ -122,6 +122,11 @@ pub fn init(cx: &mut App) {
     // it HERE instead of opening a (binary, unreadable) editor tab. This is
     // the panel's only way in -- there is no in-panel file picker.
     workspace::register_path_open_interceptor(cx, intercept_sprite_open);
+
+    // Right-clicking that same `.spr` offers the sprite file ops upstream's
+    // menu can't: Duplicate (which has to rewrite the copy's sidecar rels,
+    // not just copy bytes) and Delete.
+    workspace::register_context_menu_contributor(cx, contribute_sprite_menu);
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -203,6 +208,15 @@ fn split_sprite_path(project_root: &Path, rel: &str) -> (PathBuf, String) {
     (project_root.to_path_buf(), rel.to_string())
 }
 
+/// Does `path` name a sprite? The one rule, shared by the open interceptor
+/// and the context-menu contributor so a file that routes into this panel
+/// is exactly a file whose menu offers this panel's ops.
+fn is_sprite_path(path: &ProjectPath) -> bool {
+    path.path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(SPRITE_EXT))
+}
+
 /// `workspace::PathOpenInterceptor` for `*.spr`: claim the path, open the
 /// panel, and load it. Declines (so the normal open path runs) for any other
 /// file, for a path outside the primary worktree, and when no panel is
@@ -213,11 +227,7 @@ fn intercept_sprite_open(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
-    if !path
-        .path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case(SPRITE_EXT))
-    {
+    if !is_sprite_path(path) {
         return false;
     }
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
@@ -229,6 +239,106 @@ fn intercept_sprite_open(
         cx,
         move |panel: &mut MetaSpritePanel, window, cx| panel.open_rel_path(&rel, window, cx),
     )
+}
+
+/// `workspace::ContextMenuContributor` for `*.spr`: the sprite file ops the
+/// project panel's own menu can't offer.
+///
+/// **Duplicate** is here rather than upstream's generic "Duplicate" because
+/// a `.spr` is not a self-contained file: it stores the asset-root-relative
+/// rels of its `.til` tileset and `.pal` palette (spec Domain model -- the
+/// `.spr` is the container, the pixels live in the sidecars). Copying the
+/// bytes alone would produce a second sprite pointing at the FIRST one's
+/// sidecars, which silently flips the original into `pool_shared` mode and
+/// makes either sprite's save rewrite the other's tiles. See
+/// [`MetaSpritePanel::duplicate_sprite`].
+///
+/// **Rename is not offered.** It needs text entry, and `window.prompt` has
+/// no text field; the spec's rule is that forms live in panels and the menu
+/// only routes. Deferred to F5.2 with the rest of the panel forms, rather
+/// than shipped as a disabled entry that looks broken.
+///
+/// MUST NOT touch any panel: contributors run while `ProjectPanel` is
+/// leased (see `Workspace::context_menu_contributions`). All panel work is
+/// deferred into the handlers, which run after the lease is released.
+fn contribute_sprite_menu(
+    workspace: &mut Workspace,
+    path: &ProjectPath,
+    is_dir: bool,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Vec<ui::ContextMenuItem> {
+    if is_dir || !is_sprite_path(path) {
+        return Vec::new();
+    }
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return Vec::new();
+    };
+    vec![
+        ui::ContextMenuEntry::new("Duplicate Sprite")
+            .icon(ui::IconName::Copy)
+            .handler(duplicate_sprite_handler(cx.weak_entity(), rel.clone()))
+            .into(),
+        ui::ContextMenuEntry::new("Delete Sprite")
+            .icon(ui::IconName::Trash)
+            .handler(delete_sprite_handler(cx.weak_entity(), rel))
+            .into(),
+    ]
+}
+
+/// The "Duplicate Sprite" entry's handler. Split out from
+/// [`contribute_sprite_menu`] so a test can invoke exactly what the menu
+/// invokes -- `ContextMenuEntry` keeps its handler private, so a
+/// contributed entry cannot be fired from a test any other way.
+fn duplicate_sprite_handler(
+    workspace: WeakEntity<Workspace>,
+    rel: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(
+        workspace,
+        move |panel: &Entity<MetaSpritePanel>, _window, cx| {
+            let rel = rel.clone();
+            panel.update(cx, |panel, cx| panel.duplicate_sprite(&rel, cx));
+        },
+    )
+}
+
+/// The "Delete Sprite" entry's handler -- see [`duplicate_sprite_handler`]
+/// for why it is a named function.
+fn delete_sprite_handler(
+    workspace: WeakEntity<Workspace>,
+    rel: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(
+        workspace,
+        move |panel: &Entity<MetaSpritePanel>, window, cx| {
+            let rel = rel.clone();
+            panel
+                .update(cx, |panel, cx| panel.delete_sprite(rel, window, cx))
+                .detach();
+        },
+    )
+}
+
+/// The extensions a duplicated sprite claims: the `.spr` itself and the two
+/// sidecars [`save_sprite`] writes beside it. A candidate name is free only
+/// when ALL THREE are, so a duplicate can never land on a name whose
+/// `.til`/`.pal` would clobber another sprite's.
+const SPRITE_TRIO_EXTS: [&str; 3] = [SPRITE_EXT, "til", "pal"];
+
+/// The first free `-copy` name for `base` (an extension-less rel):
+/// `hero` -> `hero-copy`, then `hero-copy-2`, `hero-copy-3`, ... `taken`
+/// answers whether a candidate is already in use. Pure, so the naming rule
+/// is testable without a filesystem.
+fn free_copy_base(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    let first = format!("{base}-copy");
+    if !taken(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|n| format!("{base}-copy-{n}"))
+        .find(|candidate| !taken(candidate))
+        .expect("a free -copy-N name exists long before N overflows")
 }
 
 fn bind_panel_keys(cx: &mut App) {
@@ -501,6 +611,100 @@ impl MetaSpritePanel {
             .ok();
         })
         .detach();
+    }
+
+    /// Copy the sprite at worktree-relative `rel` to the first free
+    /// `-copy` name, returning that copy's asset-root-relative rel (`None`
+    /// if anything failed). The body of the project panel's "Duplicate
+    /// Sprite" entry ([`contribute_sprite_menu`]).
+    ///
+    /// Goes through worldlib's own `open_sprite` -> `save_sprite` rather
+    /// than `fs::copy`, because a `.spr` stores the rels of its `.til` and
+    /// `.pal`: a byte copy would point the duplicate at the ORIGINAL's
+    /// sidecars, which (a) flips the original into `pool_shared` the next
+    /// time it is opened, changing how tile edits behave in a file the user
+    /// only asked to copy FROM, and (b) makes a save of either sprite
+    /// rewrite the other's tileset. Re-saving instead gives the copy its
+    /// own `-copy.til`/`-copy.pal`, so the original is untouched in every
+    /// observable way, and the copy is a real `.spr` by construction (it
+    /// came out of the same encoder every save uses).
+    ///
+    /// No prompt: nothing is overwritten and nothing is lost. Synchronous:
+    /// this is one small read and three small writes, without the frame
+    /// composition that makes an actual open worth backgrounding.
+    fn duplicate_sprite(&mut self, rel: &str, cx: &mut Context<Self>) -> Option<String> {
+        // `project_root` is only re-discovered on panel activation, and a
+        // right-click can reach a panel that was never activated.
+        self.refresh_root(cx);
+        let project_root = self.project_root.clone()?;
+        let (root, rel_in_root) = split_sprite_path(&project_root, rel);
+        let opened = open_sprite(&root, &rel_in_root).ok()?;
+        let base = rel_in_root
+            .rsplit_once('.')
+            .map_or(rel_in_root.as_str(), |(base, _)| base);
+        let copy_base = free_copy_base(base, |candidate| {
+            SPRITE_TRIO_EXTS
+                .iter()
+                .any(|ext| root.join(format!("{candidate}.{ext}")).exists())
+        });
+        let copy_rel = format!("{copy_base}.{SPRITE_EXT}");
+        save_sprite(
+            &root,
+            &copy_rel,
+            &opened.state,
+            &format!("{copy_base}.til"),
+            &format!("{copy_base}.pal"),
+        )
+        .ok()?;
+        Some(copy_rel)
+    }
+
+    /// Confirm, then delete the sprite at worktree-relative `rel` -- the
+    /// body of the project panel's "Delete Sprite" entry
+    /// ([`contribute_sprite_menu`]).
+    ///
+    /// Deletes the `.spr` ONLY. Its `.til`/`.pal` are shareable by design
+    /// (worldlib's `scan_til_sharers`/`pool_shared` exist for exactly
+    /// that), so removing them on the strength of one sprite's deletion
+    /// could break sprites the user never touched; an orphaned sidecar is
+    /// the recoverable half of that trade. A failed unlink leaves the panel
+    /// exactly as it was rather than half-clearing it.
+    ///
+    /// Returns the `Task` so tests can await the whole prompt->delete round
+    /// trip; the menu handler detaches it.
+    fn delete_sprite(
+        &mut self,
+        rel: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        self.refresh_root(cx);
+        let Some(project_root) = self.project_root.clone() else {
+            return Task::ready(());
+        };
+        let confirm = ggo_common::confirm_destructive(
+            &format!("Delete the sprite {rel}?"),
+            "Delete",
+            window,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !confirm.await {
+                return;
+            }
+            if std::fs::remove_file(project_root.join(&rel)).is_err() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                // The open document's file is gone: keeping it on screen
+                // would offer edits, undo and a save that target nothing.
+                if matches!(&this.state, ViewerState::Ready(open) if open.source_rel == rel) {
+                    this.state = ViewerState::Empty;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
     }
 
     /// Kick off the off-thread load of `rel`. A stale result (superseded by
@@ -2276,7 +2480,10 @@ mod tests {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             "/proj",
-            serde_json::json!({ "sprites": { "hero.spr": "", "other.spr": "" }, "notes.txt": "" }),
+            serde_json::json!({
+                "sprites": { "hero.spr": "", "other.spr": "", "hero.til": "" },
+                "notes.txt": "",
+            }),
         )
         .await;
         Project::test(fs, ["/proj".as_ref()], cx).await
@@ -3159,6 +3366,247 @@ mod tests {
             let open = ready(panel);
             assert_eq!(open.til_path, "hh.til");
             assert_eq!(open.rel_path, "hh.spr");
+        });
+    }
+
+    // ----------------------------------------- context-menu file ops (G2)
+
+    /// The `-copy` naming rule, without a filesystem: first free name
+    /// wins, and the counter starts at 2 (there is no `-copy-1`).
+    #[gpui::test]
+    fn test_free_copy_base_finds_the_first_unused_name(_cx: &mut gpui::App) {
+        assert_eq!(
+            free_copy_base("sprites/hero", |_| false),
+            "sprites/hero-copy"
+        );
+        assert_eq!(
+            free_copy_base("hero", |c| c == "hero-copy"),
+            "hero-copy-2",
+            "a taken -copy must step to -copy-2"
+        );
+        assert_eq!(
+            free_copy_base("hero", |c| c == "hero-copy" || c == "hero-copy-2"),
+            "hero-copy-3"
+        );
+    }
+
+    /// A workspace with `init()` run -- so the REAL contributor is in the
+    /// registry -- and the panel pointed at the real-fs `root` fixture.
+    /// Same division of labour as [`routed_project`]: the fake-fs worktree
+    /// supplies a worktree id and rel paths for the menu's predicate, while
+    /// the panel does its actual file work under `root`.
+    async fn menu_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<MetaSpritePanel>,
+        WorktreeId,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let project = routed_project(cx, root, true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<MetaSpritePanel>(cx)
+                .expect("init() adds the panel")
+        });
+        let root = root.to_path_buf();
+        panel.update(cx, |panel, _| panel.root_override = Some(root));
+        (workspace, panel, worktree_id, cx)
+    }
+
+    /// Load `rel` into the workspace's own panel and leave it Ready.
+    fn open_in_menu_panel(
+        panel: &Entity<MetaSpritePanel>,
+        cx: &mut gpui::VisualTestContext,
+        rel: &str,
+    ) {
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path(rel, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// The two entries are offered for a `.spr` and for NOTHING else --
+    /// the same extension rule the open interceptor uses
+    /// ([`is_sprite_path`]), so a `.til` sidecar, a plain text file, and
+    /// the containing DIRECTORY all leave upstream's menu as it was.
+    #[gpui::test]
+    async fn test_context_menu_offers_sprite_ops_only_for_spr_files(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+
+        let contributed = |rel: &str, is_dir: bool, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace
+                    .context_menu_contributions(&project_path(worktree_id, rel), is_dir, window, cx)
+                    .len()
+            })
+        };
+
+        assert_eq!(
+            contributed("sprites/hero.spr", false, cx),
+            2,
+            "a .spr must get Duplicate + Delete"
+        );
+        assert_eq!(
+            contributed("sprites/hero.til", false, cx),
+            0,
+            "a tileset sidecar is not a sprite"
+        );
+        assert_eq!(contributed("notes.txt", false, cx), 0);
+        assert_eq!(
+            contributed("sprites", true, cx),
+            0,
+            "the containing directory is not a sprite"
+        );
+    }
+
+    /// Duplicate writes a real sprite: the copy round-trips through
+    /// worldlib's own `open_sprite` with the SAME document the original
+    /// has, and it points at its OWN `.til`/`.pal` -- which is the whole
+    /// reason this isn't `fs::copy`. The original is left pointing at its
+    /// own sidecars and un-shared, so nothing about editing it changed.
+    /// A second duplicate steps to `-copy-2` instead of clobbering the
+    /// first.
+    #[gpui::test]
+    async fn test_duplicate_sprite_writes_a_copy_that_round_trips(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        let root = dir.path().to_path_buf();
+        let original = open_sprite(&root, "sprites/hero.spr").expect("the fixture opens");
+
+        let handler =
+            duplicate_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        assert!(
+            !cx.has_pending_prompt(),
+            "duplicating destroys nothing, so it must not prompt"
+        );
+
+        let copy = open_sprite(&root, "sprites/hero-copy.spr").expect("the copy is a real .spr");
+        assert_eq!(
+            copy.state, original.state,
+            "the copy must carry the same document"
+        );
+        assert_eq!(copy.til_path, "sprites/hero-copy.til");
+        assert_eq!(copy.pal_path, "sprites/hero-copy.pal");
+
+        let reread = open_sprite(&root, "sprites/hero.spr").expect("the original still opens");
+        assert_eq!(
+            (reread.til_path.as_str(), reread.pal_path.as_str()),
+            ("sprites/hero.til", "sprites/hero.pal"),
+            "the original must keep its own sidecars"
+        );
+        assert!(
+            !reread.state.pool_shared,
+            "duplicating must not flip the original into shared-pool mode"
+        );
+
+        cx.update(|window, cx| handler(window, cx));
+        assert!(
+            root.join("sprites/hero-copy-2.spr").is_file(),
+            "a second duplicate must take the next free name"
+        );
+        assert_eq!(
+            copy.state,
+            open_sprite(&root, "sprites/hero-copy.spr").unwrap().state,
+            "and must not have touched the first copy"
+        );
+    }
+
+    /// Cancel is the fail-safe answer: the file survives and the panel is
+    /// untouched. Driven through the entry's OWN handler
+    /// ([`delete_sprite_handler`]), which is what the contributed
+    /// `ContextMenuEntry` runs -- `ContextMenuEntry::handler` is private,
+    /// so this is the only way to fire the real thing.
+    #[gpui::test]
+    async fn test_delete_sprite_cancel_keeps_the_file_and_the_panel(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+
+        let handler = delete_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Delete the sprite sprites/hero.spr?".to_string(),
+                "This cannot be undone.".to_string(),
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(
+            dir.path().join("sprites/hero.spr").is_file(),
+            "Cancel must leave the file on disk"
+        );
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("Cancel must leave the panel Ready");
+            };
+            assert_eq!(open.source_rel, "sprites/hero.spr");
+        });
+    }
+
+    /// Confirm unlinks the `.spr`, and because that file was the OPEN
+    /// document the panel drops back to Empty -- it must not keep showing
+    /// a sprite you can still edit, undo and "save" into nothing. The
+    /// sidecars deliberately survive: they are shareable, so one sprite's
+    /// deletion must not break another's tiles.
+    #[gpui::test]
+    async fn test_delete_sprite_confirm_removes_the_file_and_clears_the_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+
+        let handler = delete_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(
+            !dir.path().join("sprites/hero.spr").exists(),
+            "Delete must unlink the .spr"
+        );
+        assert!(
+            dir.path().join("sprites/hero.til").is_file(),
+            "a shareable sidecar must survive its sprite"
+        );
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.state, ViewerState::Empty),
+                "the open document's file is gone, so the panel must clear"
+            );
+        });
+    }
+
+    /// Deleting a DIFFERENT sprite leaves the open document alone.
+    #[gpui::test]
+    async fn test_delete_sprite_leaves_another_open_document_alone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+
+        let handler = delete_sprite_handler(workspace.downgrade(), "sprites/other.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(!dir.path().join("sprites/other.spr").exists());
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("deleting another sprite must not disturb the open one");
+            };
+            assert_eq!(open.source_rel, "sprites/hero.spr");
         });
     }
 }

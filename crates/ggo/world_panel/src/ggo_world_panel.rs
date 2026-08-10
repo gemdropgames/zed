@@ -105,6 +105,10 @@ pub fn init(cx: &mut App) {
     // panel's only way in -- there is no in-panel world picker.
     workspace::register_path_open_interceptor(cx, intercept_world_open);
 
+    // Right-clicking that same `**/worlds/**/*.toml` offers the file ops
+    // that need to know it IS a world -- currently just "Delete World".
+    workspace::register_context_menu_contributor(cx, contribute_world_menu);
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -191,6 +195,64 @@ fn intercept_world_open(
         cx,
         move |panel: &mut WorldPanel, window, cx| panel.open_rel_path(&rel, window, cx),
     )
+}
+
+/// `workspace::ContextMenuContributor` for `**/worlds/**/*.toml`: the world
+/// file ops the project panel's own menu can't offer, because upstream has
+/// no idea a world is anything but a `.toml`.
+///
+/// Gated on exactly the predicate [`intercept_world_open`] uses --
+/// [`rel_in_primary_worktree`] then [`split_world_path`], no second copy of
+/// the rule -- so the menu and the click agree on what a world is by
+/// construction. Contributes nothing for a directory, for a non-world file,
+/// or for a path outside the primary worktree of a local project.
+///
+/// MUST NOT touch the project panel or any GGO panel: contributors run
+/// while `ProjectPanel` is leased (see
+/// `Workspace::context_menu_contributions`). Everything panel-shaped is
+/// deferred into the entry's handler via [`ggo_common::panel_entry_handler`],
+/// which runs after the lease is released.
+///
+/// [`rel_in_primary_worktree`]: ggo_common::rel_in_primary_worktree
+fn contribute_world_menu(
+    workspace: &mut Workspace,
+    path: &ProjectPath,
+    is_dir: bool,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Vec<ui::ContextMenuItem> {
+    if is_dir {
+        return Vec::new();
+    }
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return Vec::new();
+    };
+    if split_world_path(&rel).is_none() {
+        return Vec::new();
+    }
+    vec![
+        ui::ContextMenuEntry::new("Delete World")
+            .icon(ui::IconName::Trash)
+            .handler(delete_world_handler(cx.weak_entity(), rel))
+            .into(),
+    ]
+}
+
+/// The "Delete World" entry's handler: reach the panel, hand it the
+/// worktree-relative path, and let it prompt. Split out from
+/// [`contribute_world_menu`] so a test can invoke exactly what the menu
+/// invokes -- `ContextMenuEntry` keeps its handler private, so a
+/// contributed entry cannot be fired from a test any other way.
+fn delete_world_handler(
+    workspace: WeakEntity<Workspace>,
+    rel: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<WorldPanel>, window, cx| {
+        let rel = rel.clone();
+        panel
+            .update(cx, |panel, cx| panel.delete_world(rel, window, cx))
+            .detach();
+    })
 }
 
 fn bind_panel_keys(cx: &mut App) {
@@ -484,6 +546,67 @@ impl WorldPanel {
             .ok();
         })
         .detach();
+    }
+
+    /// Confirm, then delete the world file at worktree-relative `rel` --
+    /// the body of the project panel's "Delete World" entry
+    /// ([`contribute_world_menu`]).
+    ///
+    /// The prompt names the world by its STEM (`worlds/main`, the name
+    /// every `[[instance]]` and `default_world` refers to it by) as well as
+    /// by the file, because those differ under an asset root and only the
+    /// stem tells you what will break elsewhere.
+    ///
+    /// Refreshes FIRST because `project_root` is only re-discovered on
+    /// panel activation, and a right-click in the explorer can reach a
+    /// panel that has never been activated. Safe here: the caller is a
+    /// context-menu entry handler, which runs outside both the project
+    /// panel's lease and any `Workspace` update (see
+    /// [`ggo_common::panel_entry_handler`]).
+    ///
+    /// Deliberately scoped to one file: a world referenced by another
+    /// world's `[[instance]]` is NOT chased down and unlinked, and a failed
+    /// unlink leaves the panel exactly as it was rather than half-clearing
+    /// it. Returns the `Task` so tests can await the whole prompt->delete
+    /// round trip; the menu handler detaches it.
+    fn delete_world(
+        &mut self,
+        rel: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        self.refresh_worlds(cx);
+        let Some(project_root) = self.project_root.clone() else {
+            return Task::ready(());
+        };
+        let Some((_, listing)) = split_world_path(&rel) else {
+            return Task::ready(());
+        };
+        let confirm = ggo_common::confirm_destructive(
+            &format!("Delete the world \"{}\" ({rel})?", listing.stem),
+            "Delete",
+            window,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !confirm.await {
+                return;
+            }
+            if std::fs::remove_file(project_root.join(&rel)).is_err() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                // The open document's file is gone: showing it would offer
+                // edits, undo and a save that all target nothing.
+                if matches!(&this.state, ViewerState::Ready(open) if open.source_rel == rel) {
+                    this.state = ViewerState::Empty;
+                }
+                // Re-enumerate so `+ Instance` stops offering the world
+                // that no longer exists.
+                this.refresh_worlds(cx);
+            })
+            .ok();
+        })
     }
 
     /// Kick off the off-thread load of the worktree-relative path `rel`,
@@ -2681,6 +2804,7 @@ mod tests {
             json!({
                 "worlds": { "test.toml": "", "sub.toml": "" },
                 "Cargo.toml": "",
+                "hero.til": "",
             }),
         )
         .await;
@@ -2896,5 +3020,191 @@ mod tests {
             json!([4, 4]),
             "Cancel must not have written the file"
         );
+    }
+
+    // ----------------------------------------- context-menu file ops (G2)
+
+    /// A workspace with `init()` run -- so the REAL contributor is in the
+    /// registry -- and the panel pointed at the real-fs `root` fixture.
+    /// Same division of labour as [`routed_project`]: the fake-fs worktree
+    /// supplies a worktree id and rel paths for the menu's predicate, while
+    /// the panel does its actual file work under `root`.
+    async fn menu_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<WorldPanel>,
+        WorktreeId,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let project = routed_project(cx, root, true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+        let root = root.to_path_buf();
+        panel.update(cx, |panel, _| panel.root_override = Some(root));
+        (workspace, panel, worktree_id, cx)
+    }
+
+    /// Load `rel` into the workspace's own panel and leave it Ready.
+    fn open_in_menu_panel(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext, rel: &str) {
+        panel.update(cx, |panel, cx| {
+            panel.refresh_worlds(cx);
+            panel.load_rel_path(rel, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// The menu entry is offered for a world file and for NOTHING else --
+    /// the same `**/worlds/**/*.toml` rule the open interceptor uses, so a
+    /// root `Cargo.toml`, a `.til`, and the `worlds` DIRECTORY itself all
+    /// leave upstream's menu exactly as it was.
+    #[gpui::test]
+    async fn test_context_menu_offers_delete_world_only_for_world_files(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+
+        let contributed = |rel: &str, is_dir: bool, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace
+                    .context_menu_contributions(&project_path(worktree_id, rel), is_dir, window, cx)
+                    .len()
+            })
+        };
+
+        assert_eq!(
+            contributed("worlds/test.toml", false, cx),
+            1,
+            "a world file must get its Delete World entry"
+        );
+        assert_eq!(
+            contributed("Cargo.toml", false, cx),
+            0,
+            "a .toml outside worlds/ is not a world"
+        );
+        assert_eq!(
+            contributed("hero.til", false, cx),
+            0,
+            "another panel's file type is not a world"
+        );
+        assert_eq!(
+            contributed("worlds", true, cx),
+            0,
+            "the worlds DIRECTORY is not a world file"
+        );
+    }
+
+    /// Cancel is the fail-safe answer: the file survives and the panel is
+    /// untouched. Driven through the entry's OWN handler
+    /// ([`delete_world_handler`]), which is what the contributed
+    /// `ContextMenuEntry` runs -- `ContextMenuEntry::handler` is private,
+    /// so this is the only way to fire the real thing.
+    #[gpui::test]
+    async fn test_delete_world_cancel_keeps_the_file_and_the_panel(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+
+        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Delete the world \"worlds/test\" (worlds/test.toml)?".to_string(),
+                "This cannot be undone.".to_string(),
+            )),
+            "the prompt must name the world AND the file it will unlink"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(
+            dir.path().join("worlds/test.toml").is_file(),
+            "Cancel must leave the file on disk"
+        );
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("Cancel must leave the panel Ready");
+            };
+            assert_eq!(open.source_rel, "worlds/test.toml");
+        });
+    }
+
+    /// Confirm unlinks the file, and because that file was the OPEN
+    /// document the panel drops back to Empty -- it must not keep showing
+    /// a world you can still edit, undo and "save" into nothing.
+    #[gpui::test]
+    async fn test_delete_world_confirm_removes_the_file_and_clears_the_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+
+        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(
+            !dir.path().join("worlds/test.toml").exists(),
+            "Delete must unlink the file"
+        );
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.state, ViewerState::Empty),
+                "the open document's file is gone, so the panel must clear"
+            );
+            let stems: Vec<&str> = panel.worlds.iter().map(|w| w.stem.as_str()).collect();
+            assert_eq!(
+                stems,
+                ["worlds/sub"],
+                "the listing must lose the deleted world"
+            );
+        });
+    }
+
+    /// Deleting a DIFFERENT world leaves the open document alone but still
+    /// re-enumerates, so `+ Instance` stops offering a world that no longer
+    /// exists (an instance stem that resolves to nothing renders a
+    /// placeholder, silently).
+    #[gpui::test]
+    async fn test_delete_world_refreshes_instance_candidates(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel
+                    .instance_candidates()
+                    .contains(&"worlds/sub".to_string()),
+                "worlds/sub starts out offered"
+            );
+        });
+
+        let handler = delete_world_handler(workspace.downgrade(), "worlds/sub.toml".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("deleting another world must not disturb the open one");
+            };
+            assert_eq!(open.source_rel, "worlds/test.toml");
+            assert!(
+                !panel
+                    .instance_candidates()
+                    .contains(&"worlds/sub".to_string()),
+                "a deleted world must stop being an + Instance candidate"
+            );
+        });
     }
 }

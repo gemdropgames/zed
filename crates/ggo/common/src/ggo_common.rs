@@ -3,18 +3,22 @@
 //! "A cached and processed image, in BGRA format"; worldlib composes
 //! straight-alpha RGBA, so only a channel swap is needed, no alpha
 //! unpremultiply), the unsaved-document close guard shared by the world and
-//! metasprite panels, and the file-explorer routing glue every panel's
-//! `PathOpenInterceptor` needs. Deliberately depends on no worldlib, so any
-//! GGO panel can use it without pulling in world-doc types. It DOES depend
-//! on `workspace` (the routing helpers below take a `Workspace`); that is
-//! not a cycle -- `workspace` knows nothing about this crate, it only
-//! exposes the `Panel::prepare_to_close` and `PathOpenInterceptor`
-//! extension points these helpers plug into.
+//! metasprite panels, the destructive-action confirmation every GGO file op
+//! goes through, and the file-explorer glue every panel's
+//! `PathOpenInterceptor` and `ContextMenuContributor` needs. Deliberately
+//! depends on no worldlib, so any GGO panel can use it without pulling in
+//! world-doc types. It DOES depend on `workspace` (the routing helpers
+//! below take a `Workspace`); that is not a cycle -- `workspace` knows
+//! nothing about this crate, it only exposes the `Panel::prepare_to_close`,
+//! `PathOpenInterceptor` and `ContextMenuContributor` extension points
+//! these helpers plug into.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{App, Context, PromptLevel, RenderImage, Task, Window};
+use gpui::{
+    App, AppContext as _, Context, Entity, PromptLevel, RenderImage, Task, WeakEntity, Window,
+};
 use image::Frame;
 use project::ProjectPath;
 use workspace::Workspace;
@@ -135,6 +139,53 @@ pub fn prepare_to_close_dirty<T: 'static>(
     )
 }
 
+// ------------------------------------------------- destructive confirmation
+
+/// The `detail` line every destructive GGO prompt carries. Upstream's own
+/// permanent-delete prompt words it exactly this way -- `project_panel.rs`'s
+/// `let detail = (!trash).then_some("This cannot be undone.")` -- and the
+/// GGO file ops all go through `std::fs::remove_file`/overwrite rather than
+/// a trash can, so the caveat always applies and is not worth a parameter.
+const DESTRUCTIVE_DETAIL: &str = "This cannot be undone.";
+
+/// Does a `Window::prompt` answer over `[confirm_label, "Cancel"]` mean
+/// "go ahead"?
+///
+/// Only an explicit click on the FIRST button does. Cancel, a dismissed
+/// dialog, a dropped channel (the window went away mid-prompt) and an index
+/// the button list does not have are all "do NOT proceed" -- the same
+/// fail-safe direction [`close_choice`] takes, and the same test upstream's
+/// own delete makes (`if answer.await != Ok(0) { return }`,
+/// `project_panel.rs`). Getting this backwards deletes a file nobody asked
+/// to delete, which is why it is a named function with its own test rather
+/// than an inline `== Some(0)`.
+pub fn confirm_choice(answer: Option<usize>) -> bool {
+    answer == Some(0)
+}
+
+/// Raise the confirmation a destructive action needs, resolving to whether
+/// the user confirmed. `message` should name the thing being destroyed;
+/// `confirm_label` is the verb on the go-ahead button ("Delete").
+///
+/// Takes `&mut App` rather than a `Context<T>` so a project-panel
+/// context-menu entry handler -- which is handed only `(&mut Window,
+/// &mut App)` -- can call it directly.
+pub fn confirm_destructive(
+    message: &str,
+    confirm_label: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<bool> {
+    let answer = window.prompt(
+        PromptLevel::Info,
+        message,
+        Some(DESTRUCTIVE_DETAIL),
+        &[confirm_label, "Cancel"],
+        cx,
+    );
+    cx.background_spawn(async move { confirm_choice(answer.await.ok()) })
+}
+
 // -------------------------------------------------- explorer-driven routing
 
 /// The project-relative, `/`-separated path `path` names -- but only when it
@@ -181,6 +232,44 @@ pub fn open_in_panel<P: Panel>(
     true
 }
 
+/// Wrap `action` into the `Fn(&mut Window, &mut App)` a
+/// `ui::ContextMenuEntry::handler` takes, resolving GGO panel `P` out of
+/// the workspace first.
+///
+/// A `workspace::ContextMenuContributor` is a bare `fn` pointer (it cannot
+/// capture) and the entry handlers it builds are handed only `(&mut Window,
+/// &mut App)` -- no workspace, no panel. The one bridge is a
+/// `WeakEntity<Workspace>` taken with `cx.weak_entity()` while the
+/// contributor runs; this turns that handle into the panel every GGO
+/// file-op entry actually wants to act on. Weak on purpose: a menu entry
+/// outlives nothing in particular, and a closed window must not keep a
+/// workspace alive.
+///
+/// Doing nothing when the workspace is gone or `P` is not docked is the
+/// right answer for all of them: the entry only exists because the panel's
+/// contributor put it there, so its absence means the action has no target.
+///
+/// SAFE TO CALL HERE, unlike from a contributor: contributors run while
+/// `ProjectPanel` is leased (see `Workspace::context_menu_contributions`)
+/// and panic if they touch a panel; handlers run after the lease is
+/// released. `action` is also not inside a `Workspace` update, so a panel
+/// method that reads the workspace back (`refresh_worlds`, `refresh_root`)
+/// is fine from here.
+pub fn panel_entry_handler<P: Panel>(
+    workspace: WeakEntity<Workspace>,
+    action: impl Fn(&Entity<P>, &mut Window, &mut App) + 'static,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    move |window, cx| {
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+        let Some(panel) = workspace.read(cx).panel::<P>(cx) else {
+            return;
+        };
+        action(&panel, window, cx);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +305,18 @@ mod tests {
         assert_eq!(close_choice(Some(2)), CloseChoice::Cancel);
         assert_eq!(close_choice(Some(99)), CloseChoice::Cancel);
         assert_eq!(close_choice(None), CloseChoice::Cancel);
+    }
+
+    /// The destructive prompt's button order is `[<verb>, "Cancel"]`, and
+    /// every non-answer (Cancel, a dismissed dialog, a dropped channel, an
+    /// index the button list doesn't have) must fall back to "don't" --
+    /// the only choice that can't delete a file nobody asked to delete.
+    #[test]
+    fn confirm_choice_only_proceeds_on_the_first_button() {
+        assert!(confirm_choice(Some(0)));
+        assert!(!confirm_choice(Some(1)));
+        assert!(!confirm_choice(Some(99)));
+        assert!(!confirm_choice(None));
     }
 
     /// `default_db_path` must land on `~/.ggo/ggo_ide.db` -- the file both
