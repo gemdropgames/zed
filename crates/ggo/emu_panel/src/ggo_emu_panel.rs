@@ -39,8 +39,12 @@
 //! *run's* off-thread completion against a later run stomping it (see
 //! `run_generation` below).
 //!
-//! Audio is explicitly out of scope for F3 (constraints.md) -- see
-//! [`drive`]'s module doc for exactly what else is not ported.
+//! Audio (F5.4 R6) is the pane's own: [`drive`] opens a `cpal` output
+//! stream on the per-run emulator thread and drops it when the run ends,
+//! so no device is ever held across an idle session. The transport carries
+//! a mute toggle and the stats row carries the underrun counter -- see
+//! [`audio`]'s module doc for why the pane owns a stream at all, and
+//! [`drive`]'s for what else is still not ported.
 //!
 //! # The atlas-release contract (the load-bearing part)
 //!
@@ -71,6 +75,7 @@
 //! covers the two teardown paths (Stop, and panel release) where no
 //! further render will come.
 
+mod audio;
 mod drive;
 mod ingest;
 mod input;
@@ -108,7 +113,9 @@ actions!(
         /// Runs the selected cart in the emulator pane.
         Run,
         /// Stops the running cart.
-        Stop
+        Stop,
+        /// Mutes or unmutes the emulator's audio output.
+        ToggleMute
     ]
 );
 
@@ -230,6 +237,7 @@ fn bind_panel_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-alt-r", Run, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-alt-s", Stop, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-m", ToggleMute, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -349,6 +357,14 @@ pub struct EmuPanel {
 
     /// fps / dropped frames / step cost for the current run.
     stats: RunStats,
+    /// Mute, device availability and the underrun counter. Owned by the
+    /// PANEL rather than by a [`Session`], for two reasons: mute is a user
+    /// preference that has to survive across runs (and be settable before
+    /// one starts), and the last run's underrun count is exactly the thing
+    /// a user wants to still be reading after the run that produced it
+    /// ended. A clone goes to [`drive::start`], which is what connects it
+    /// to a real device for the life of that run.
+    audio: audio::AudioStatus,
     /// When the current FPS window opened. Lives here rather than in
     /// [`RunStats`] so all of that module's math stays pure.
     fps_window_started: Instant,
@@ -425,6 +441,7 @@ impl EmuPanel {
             frame: 0,
             input: InputState::default(),
             stats: RunStats::default(),
+            audio: audio::AudioStatus::new(),
             fps_window_started: Instant::now(),
             console: None,
             console_expanded: false,
@@ -526,7 +543,11 @@ impl EmuPanel {
             .then(|| (self.run_generation, window.window_handle()));
         self.charts_after_ingest = false;
 
-        let (session, rx) = drive::start(root.join(&cart), cart);
+        // Clear the previous run's underrun count and device verdict
+        // BEFORE the thread starts, so the pane never shows the last run's
+        // "no output device" against this one. Mute is deliberately kept.
+        self.audio.reset_for_run();
+        let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()));
         self.console = Some(session.uart().clone());
         self.session = Some(session);
         self.status = None;
@@ -971,6 +992,25 @@ impl EmuPanel {
         self.session.is_some()
     }
 
+    // ----------------------------------------------------------- audio
+
+    /// Mute/unmute. Takes effect on the live run within one cpal callback
+    /// (both ends of the ring read the same flag every buffer/frame), and
+    /// persists to the NEXT run: the pane never silently un-mutes itself
+    /// because a run ended.
+    ///
+    /// Available with nothing running -- muting before pressing Run is the
+    /// obvious way to start a cart quietly, and it costs nothing to allow.
+    /// A run whose device never opened has nothing to toggle, so the
+    /// button is disabled there (see [`audio::AudioState::is_toggleable`]).
+    fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        if !self.audio.state().is_toggleable() {
+            return;
+        }
+        self.audio.toggle_mute();
+        cx.notify();
+    }
+
     // ----------------------------------------------------------- input
 
     /// Publish the latched mask into the running session. A no-op when
@@ -1066,6 +1106,7 @@ impl EmuPanel {
                     .tooltip(Tooltip::text("Stop"))
                     .on_click(cx.listener(|this, _event, window, cx| this.stop(window, cx))),
             )
+            .child(self.render_mute_button(cx))
             // The selected cart, as plain text: the file explorer is the
             // picker now, so there is nothing here to click.
             .child(
@@ -1086,6 +1127,38 @@ impl EmuPanel {
                     .color(Color::Muted)
             }))
             .into_any_element()
+    }
+
+    /// Mute/unmute, sitting with Run and Stop because it is transport, not
+    /// a setting. The icon shows the CURRENT state (speaker crossed out
+    /// when silent) rather than the action, which is the convention the
+    /// rest of Zed's audio controls follow.
+    ///
+    /// A machine with no output device gets a disabled button whose
+    /// tooltip is cpal's own reason -- "muted with a legible reason", which
+    /// is the whole degraded contract. The stats row carries the same
+    /// reason as text, so it is readable without hovering.
+    fn render_mute_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let state = self.audio.state();
+        let silent = self.audio.is_muted() || !state.is_toggleable();
+        let tooltip: SharedString = match &state {
+            audio::AudioState::Unavailable(reason) => format!("No audio output: {reason}").into(),
+            _ if self.audio.is_muted() => "Unmute".into(),
+            _ => "Mute".into(),
+        };
+        IconButton::new(
+            "ggo-emu-mute",
+            if silent {
+                IconName::AudioOff
+            } else {
+                IconName::AudioOn
+            },
+        )
+        .icon_size(IconSize::Small)
+        .disabled(!state.is_toggleable())
+        .tooltip(Tooltip::text(tooltip))
+        .on_click(cx.listener(|this, _event, _window, cx| this.toggle_mute(cx)))
+        .into_any_element()
     }
 
     /// The pane itself: the framebuffer at whatever size the dock gives
@@ -1119,13 +1192,37 @@ impl EmuPanel {
     }
 
     /// The live counters row -- `ggo-ide`'s `State::status_text` fps /
-    /// drops / step-time triple. Only shown once a run has produced a
-    /// frame; an all-zero row before that is noise.
+    /// drops / step-time triple, plus the audio segment ggo-ide keeps in
+    /// the same string. Each half appears on its own terms: the frame
+    /// counters once a run has produced a frame (an all-zero row before
+    /// that is noise), the audio segment once a run has opened -- or
+    /// failed to open -- a device.
+    ///
+    /// The underrun count is not decoration. It is the only signal that
+    /// distinguishes "audio is working" from "audio is technically
+    /// playing, from a ring the emulator cannot fill fast enough", which
+    /// is what a dropped frame sounds like; a run whose count climbs is a
+    /// run whose pacing is losing.
     fn render_stats(&self) -> Option<gpui::AnyElement> {
-        (self.frame > 0 || self.stats.dropped > 0).then(|| {
-            Label::new(self.stats.label())
+        // Once, not once per use: this runs on every render (up to 60 Hz
+        // while a cart is going), and `state()` takes a lock and clones a
+        // string.
+        let audio = self.audio.state();
+        let mut parts = Vec::new();
+        if self.frame > 0 || self.stats.dropped > 0 {
+            parts.push(self.stats.label());
+        }
+        parts.extend(audio.label());
+        (!parts.is_empty()).then(|| {
+            Label::new(parts.join(" · "))
                 .size(LabelSize::XSmall)
-                .color(Color::Muted)
+                // A run that lost its audio is worth noticing but is not a
+                // failure -- Warning, not Error, which the status line
+                // below reserves for things the user has to act on.
+                .color(match audio {
+                    audio::AudioState::Unavailable(_) => Color::Warning,
+                    _ => Color::Muted,
+                })
                 .into_any_element()
         })
     }
@@ -1202,6 +1299,7 @@ impl Render for EmuPanel {
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(|this, _: &Run, window, cx| this.run(window, cx)))
             .on_action(cx.listener(|this, _: &Stop, window, cx| this.stop(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleMute, _window, cx| this.toggle_mute(cx)))
             // The pad. Scoped by focus, not by keymap: these fire only
             // while the pane's focus handle owns the keyboard, so typing
             // `z` anywhere else never reaches a cart.
@@ -1454,7 +1552,8 @@ mod tests {
     async fn test_an_ended_run_reports_and_clears_the_session(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let (panel, cx) = windowed_panel(cx);
-        let (session, rx) = drive::start("/definitely/not/here.cart".into(), "gone.cart".into());
+        let (session, rx) =
+            drive::start("/definitely/not/here.cart".into(), "gone.cart".into(), None);
         drop(rx);
         panel.update(cx, |panel, cx| {
             panel.session = Some(session);
@@ -1493,8 +1592,11 @@ mod tests {
     async fn test_a_stale_runs_late_completion_does_not_stomp_a_live_run(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let (panel, cx) = windowed_panel(cx);
-        let (session_a, rx_a) =
-            drive::start("/definitely/not/here.cart".into(), "run-a.cart".into());
+        let (session_a, rx_a) = drive::start(
+            "/definitely/not/here.cart".into(),
+            "run-a.cart".into(),
+            None,
+        );
         drop(rx_a);
 
         panel.update(cx, |panel, cx| {
@@ -1510,7 +1612,8 @@ mod tests {
             // Run B starts before A's completion has landed: a new
             // generation, a live session, and a status of its own.
             panel.run_generation = 2;
-            panel.session = Some(drive::start("/also/not/here.cart".into(), "run-b.cart".into()).0);
+            panel.session =
+                Some(drive::start("/also/not/here.cart".into(), "run-b.cart".into(), None).0);
             panel.status = Some("run B is live".to_string());
             panel.ingest_status = IngestStatus::Idle;
         });
@@ -1594,6 +1697,162 @@ mod tests {
             panel.console_expanded = true;
             assert!(panel.render_console(cx).is_some(), "expanded also renders");
         });
+    }
+
+    // ------------------------------------------------------------ audio
+
+    /// Mute toggles, is reflected in the state the transport renders from,
+    /// and -- the part that matters -- survives a run ending. The pane must
+    /// never quietly un-mute itself between runs.
+    #[gpui::test]
+    async fn test_mute_toggles_and_survives_the_run_that_set_it(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, cx| {
+            assert!(!panel.audio.is_muted(), "runs start unmuted");
+
+            panel.toggle_mute(cx);
+            assert!(panel.audio.is_muted());
+            assert_eq!(
+                panel.audio.state(),
+                audio::AudioState::Idle,
+                "muting before a run does not invent a device"
+            );
+
+            // What `run` does to the status at the top of a new run.
+            panel.audio.reset_for_run();
+            assert!(
+                panel.audio.is_muted(),
+                "a new run must not silently un-mute the pane"
+            );
+
+            panel.toggle_mute(cx);
+            assert!(!panel.audio.is_muted());
+        });
+    }
+
+    /// The underrun counter is surfaced, not merely counted. It rides the
+    /// stats row alongside fps/drops, and it shows even before the first
+    /// frame -- a device that opened is worth saying so.
+    #[gpui::test]
+    async fn test_the_stats_row_surfaces_the_underrun_counter(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.render_stats().is_none(),
+                "nothing to say before a run opens a device or delivers a frame"
+            );
+            panel.audio.mark_unavailable("no default output device");
+            assert!(
+                panel.render_stats().is_some(),
+                "an audio verdict alone is worth a row"
+            );
+        });
+
+        push_frame_and_draw(&panel, cx, 1);
+        panel.update(cx, |panel, _cx| {
+            // What the emulator thread does once cpal hands back a stream.
+            panel.audio.reset_for_run();
+            panel.audio.mark_available();
+            for _ in 0..3 {
+                panel.audio.record_underrun();
+            }
+            assert_eq!(
+                panel.audio.state().label().as_deref(),
+                Some("audio on · underruns 3")
+            );
+            assert!(
+                panel.render_stats().is_some(),
+                "the row carries the frame counters AND the audio segment"
+            );
+
+            panel.audio.set_muted(true);
+            assert_eq!(
+                panel.audio.state().label().as_deref(),
+                Some("audio muted · underruns 3"),
+                "muting must not hide (or reset) the diagnostic"
+            );
+        });
+    }
+
+    /// A machine with no audio device: the pane reads muted-with-a-reason,
+    /// the reason is the one cpal gave, the mute button has nothing to
+    /// toggle, and none of it touches the run.
+    #[gpui::test]
+    async fn test_an_absent_audio_device_degrades_to_a_legible_reason(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        panel.update_in(cx, |panel, _window, cx| {
+            panel.audio.mark_unavailable("no default output device");
+
+            assert_eq!(
+                panel.audio.state(),
+                audio::AudioState::Unavailable("no default output device".into())
+            );
+            assert!(
+                !panel.audio.state().is_toggleable(),
+                "there is no device for the mute button to act on"
+            );
+
+            // The toggle is inert rather than misleading: clicking it must
+            // not flip a mute flag that changes nothing audible.
+            panel.toggle_mute(cx);
+            assert!(
+                !panel.audio.is_muted(),
+                "toggling with no device must not pretend to have muted something"
+            );
+            assert!(
+                matches!(panel.audio.state(), audio::AudioState::Unavailable(_)),
+                "and the reason stands"
+            );
+
+            // Both surfaces render rather than panicking.
+            assert!(panel.render_stats().is_some());
+            let _ = panel.render_mute_button(cx);
+        });
+    }
+
+    /// The whole robustness claim, at the panel's own boundary: a Run on a
+    /// machine that may or may not have an output device must produce a
+    /// pane state that renders either way, and must not fail the run.
+    /// Nothing here asserts sound -- only that the degraded path is a
+    /// state, not an error.
+    #[gpui::test]
+    async fn test_a_run_reports_an_audio_verdict_without_failing(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let (panel, cx) = windowed_panel(cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+            panel.refresh_root(cx);
+            panel.open_rel_path("green.cart", window, cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        // The device is opened before the run loop's first frame, so a
+        // delivered frame is proof the verdict has landed -- no sleeping
+        // on a "has the thread got there yet" guess.
+        await_first_frame(&panel, cx);
+
+        panel.update_in(cx, |panel, window, cx| {
+            // Either verdict is correct; what must hold is that the pane is
+            // in a renderable state and the run is alive.
+            match panel.audio.state() {
+                audio::AudioState::Live { .. } | audio::AudioState::Unavailable(_) => {}
+                audio::AudioState::Idle => {
+                    panic!("a started run must reach a verdict about its audio device")
+                }
+            }
+            assert!(panel.is_running(), "the audio verdict must not end the run");
+            assert!(panel.render_stats().is_some());
+            panel.stop(window, cx);
+        });
+        cx.executor().run_until_parked();
     }
 
     // ------------------------------------------------- atlas retention

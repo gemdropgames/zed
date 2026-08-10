@@ -13,6 +13,11 @@ path = "src/ggo_emu_panel.rs"
 
 [dependencies]
 async-channel.workspace = true
+# GGO -- R6's audio output. Already a workspace dependency (`crates/audio`,
+# `livekit_client`, `settings_ui` all take it), and the same crate ggo-ide's
+# `emu/audio.rs` and the standalone `ggo-emu` binary use, so the pane's
+# stream is the one this project already knows how to reason about.
+cpal.workspace = true
 ggo-db.workspace = true # GGO -- the ggo_ide.db schema/migrations, shared with ggo-ide + the charts panel
 ggo-emu-core.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO -- S4's Re-run entry hands the run it just ingested to that panel
@@ -21,6 +26,7 @@ ggo_world_panel.workspace = true # GGO -- S4's "Emulate this world" saves that p
 gpui.workspace = true
 image.workspace = true
 keymap_editor.workspace = true
+log.workspace = true # GGO -- R6: the cpal stream-error callback runs on a realtime audio thread, so it reports rather than panics
 project.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

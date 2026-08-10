@@ -7578,6 +7578,7 @@ name = "ggo_emu_panel"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "cpal",
  "editor",
  "ggo-db",
  "ggo-emu-core",
@@ -7587,6 +7588,7 @@ dependencies = [
  "gpui",
  "image",
  "keymap_editor",
+ "log",
  "path",
  "project",
  "project_panel",

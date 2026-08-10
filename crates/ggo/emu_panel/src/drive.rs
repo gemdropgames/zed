@@ -38,12 +38,19 @@
 //! raceless: there is exactly one snapshot per thread, produced by the
 //! only stepper that thread ever had.
 //!
+//! ## Audio (F5.4 R6)
+//!
+//! F3 deferred audio; this loop now drains it. [`run`] opens the default
+//! output device AFTER the cart has parsed and immediately before the run
+//! loop, holds it in a local, and drops it on the way out -- so the device
+//! is open exactly while a run is live and never a moment longer. See
+//! [`crate::audio`]'s module doc for why the pane owns the stream at all
+//! rather than leaving it to the standalone binary. Passing `None` for
+//! `audio` (what every test here does) skips the device entirely and never
+//! touches cpal.
+//!
 //! ## What is deliberately not ported
 //!
-//! - **Audio.** F3 defers it (constraints.md); the standalone binary
-//!   stays the with-audio path. The APU still *runs* (`vsync_wait`
-//!   advances the mixer inside `ggo_emu_core`), so cart timing and perf
-//!   behaviour are unchanged -- nothing drains its sample ring.
 //! - **`run_cart`'s wire-stall frame stretch** (`stall_realtime`). The
 //!   perf sim's cycle model is recorded, but the pane paces every frame
 //!   at [`FRAME_TIME`] rather than stretching a frame that blew its wire
@@ -60,12 +67,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ggo_emu_core::apu::Apu;
 use ggo_emu_core::cart::Cart;
 use ggo_emu_core::cpu::Cpu;
 use ggo_emu_core::mmu::{CART_XIP_BASE, DEFAULT_MAIN_RAM_BYTES, DEFAULT_VRAM_BYTES, Mmu};
 use ggo_emu_core::peripherals::{Peripherals, SCREEN_HEIGHT, SCREEN_WIDTH};
 use ggo_emu_core::run::{FrameEvent, run_until_event};
 
+use crate::audio::{AudioStatus, RingWriter};
 use crate::uart::UartLog;
 
 /// One 60 Hz vsync period -- `ggo_emu::FRAME_TIME`, redeclared because it
@@ -232,7 +241,16 @@ impl Drop for Session {
 /// The receiver closing is also how the panel learns a run ended on its
 /// own: the thread drops the sender as it returns, which ends the panel's
 /// pump loop. There is no terminal message on the wire.
-pub fn start(cart_path: PathBuf, cart: String) -> (Session, async_channel::Receiver<Frame>) {
+///
+/// `audio` is the panel's own [`AudioStatus`] (mute survives runs, so the
+/// panel owns it, not a run). `None` means this run makes no sound and
+/// never opens a device -- what the tests here use, so `cargo test` never
+/// touches the machine's audio hardware.
+pub fn start(
+    cart_path: PathBuf,
+    cart: String,
+    audio: Option<AudioStatus>,
+) -> (Session, async_channel::Receiver<Frame>) {
     let (tx, rx) = async_channel::bounded(1);
     let input = Arc::new(AtomicU32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -247,7 +265,7 @@ pub fn start(cart_path: PathBuf, cart: String) -> (Session, async_channel::Recei
         std::thread::Builder::new()
             .name("ggo-emu-panel".into())
             .spawn(move || {
-                let result = run(&cart_path, &tx, &input, &stop, &uart);
+                let result = run(&cart_path, &tx, &input, &stop, &uart, audio.as_ref());
                 uart.push_line(format!("[run ended] {}", result.reason));
                 *outcome.lock().unwrap() = Some(result);
             })
@@ -265,14 +283,15 @@ pub fn start(cart_path: PathBuf, cart: String) -> (Session, async_channel::Recei
     (session, rx)
 }
 
-/// The drive loop itself -- `run_cart`'s body minus the window, the
-/// audio device and the save flush.
+/// The drive loop itself -- `run_cart`'s body minus the window and the
+/// save flush.
 fn run(
     cart_path: &Path,
     tx: &async_channel::Sender<Frame>,
     input: &AtomicU32,
     stop: &AtomicBool,
     uart: &UartLog,
+    audio: Option<&AudioStatus>,
 ) -> RunOutcome {
     let bytes = match std::fs::read(cart_path) {
         Ok(bytes) => bytes,
@@ -329,6 +348,35 @@ fn run(
         p.assets.set_card_dir(dir.to_path_buf());
     }
 
+    // Audio, last of the setup: AFTER the cart has parsed, so a cart that
+    // never loads never opens a device at all, and immediately before the
+    // loop, so `_audio_out`'s drop -- which stops the stream and releases
+    // the device -- lands on the way out of this function, on this same
+    // thread. Device lifetime == run lifetime, by construction.
+    let mut audio_cursor: u64 = 0;
+    let mut audio_scratch: Vec<i16> = Vec::new();
+    let (audio_writer, _audio_out) = match audio {
+        Some(status) => {
+            status.set_running(true);
+            let (writer, reader) = crate::audio::channel(status.clone());
+            // Infallible: no device is a normal machine, not a failed run.
+            let out = crate::audio::start_output(status, reader, ggo_emu_core::apu::MIX_RATE);
+            match &out {
+                Some(out) => uart.push_line(format!("[audio] {} Hz", out.device_rate)),
+                None => uart.push_line(format!(
+                    "[audio unavailable] {}",
+                    match status.state() {
+                        crate::audio::AudioState::Unavailable(reason) => reason,
+                        // `start_output` always records a reason on failure.
+                        _ => "unknown".to_string(),
+                    }
+                )),
+            }
+            (Some(writer), out)
+        }
+        None => (None, None),
+    };
+
     let start = Instant::now();
     let mut last_present = Instant::now();
 
@@ -364,6 +412,13 @@ fn run(
                 {
                     break "stopped".to_string();
                 }
+                // BEFORE the pacing hold, so the ring is fed as early in
+                // the period as it can be. `handle_vsync_wait` advanced
+                // the APU exactly one frame on the way to this event, so
+                // there is precisely one frame of samples waiting.
+                if let Some(writer) = &audio_writer {
+                    audio_cursor = pump_audio(&p.apu, audio_cursor, &mut audio_scratch, writer);
+                }
                 if let Some(hold) = pace_sleep(last_present.elapsed(), FRAME_TIME) {
                     std::thread::sleep(hold);
                 }
@@ -395,6 +450,15 @@ fn run(
         }
     };
 
+    // Nothing is feeding the ring from here on. Clearing this BEFORE
+    // `_audio_out` drops (which happens at the end of this function) is
+    // what keeps the last few callbacks before teardown from counting
+    // underruns against a queue that has simply stopped being written --
+    // see `audio::fill`.
+    if let Some(status) = audio {
+        status.set_running(false);
+    }
+
     RunOutcome {
         reason,
         perf: Some(PerfSnapshot {
@@ -418,6 +482,25 @@ fn run(
             frames: p.perf.frames.len() as u64,
         }),
     }
+}
+
+/// Move every APU sample mixed since `cursor` into `writer`, returning the
+/// new cursor -- the whole audio contribution of one presented frame.
+///
+/// Factored out of [`run`] rather than inlined so it can be driven against
+/// a real `Apu` with no output device anywhere in sight (see this module's
+/// tests): everything about whether the emulated APU's samples actually
+/// reach the ring is here, and nothing about it needs cpal.
+///
+/// `scratch` is reused across frames to avoid a per-frame allocation, and
+/// is cleared here rather than by `Apu::copy_since` -- that method
+/// *appends* (`out.reserve` + `out.push`), so a caller that forgets would
+/// re-push every previous frame's samples on top of the new ones.
+fn pump_audio(apu: &Apu, cursor: u64, scratch: &mut Vec<i16>, writer: &RingWriter) -> u64 {
+    scratch.clear();
+    let next = apu.copy_since(cursor, scratch);
+    writer.push(scratch);
+    next
 }
 
 /// How long to hold a just-published frame, given `elapsed` since the
@@ -667,7 +750,7 @@ pub mod tests_support {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, fixture::green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string());
+        let (session, rx) = start(path, "green.cart".to_string(), None);
         for _ in 0..frames {
             rx.recv_blocking().expect("the emulator thread must run");
         }
@@ -744,6 +827,121 @@ mod tests {
         assert!(out.chunks_exact(4).all(|px| px[3] == 0xFF));
     }
 
+    // ------------------------------------------------------- the audio tap
+    //
+    // These drive a REAL `ggo_emu_core::apu::Apu` -- the same type a cart
+    // run mixes into -- straight into a real `RingWriter`, with no output
+    // device anywhere. That is the whole point: every machine can run
+    // them, including one with no sound card, and they still prove the
+    // emulated APU's samples reach the ring the cpal callback drains.
+
+    /// Sound one PSG square at full volume and advance the APU one frame,
+    /// exactly as `runtime::handle_vsync_wait` does on every presented
+    /// frame. `(ch=8, step=1.0x, vol=full both, ctrl=enable|duty50)` is
+    /// `ggo-emu-core`'s own `audio_psg_note_on_off_via_syscalls` fixture.
+    fn apu_with_one_mixed_frame() -> Apu {
+        let mut apu = Apu::new();
+        apu.set_channel(8, 0x1000, 0xFFFF, 0b101);
+        apu.run_frame();
+        assert!(
+            apu.ring().iter().any(|&s| s != 0),
+            "sanity: the fixture note must actually be audible"
+        );
+        apu
+    }
+
+    #[test]
+    fn pump_audio_moves_a_frames_mixed_samples_into_the_ring() {
+        let apu = apu_with_one_mixed_frame();
+        let status = crate::audio::AudioStatus::new();
+        status.set_running(true);
+        let (writer, reader) = crate::audio::channel(status);
+
+        let mut scratch = Vec::new();
+        let cursor = pump_audio(&apu, 0, &mut scratch, &writer);
+
+        assert_eq!(
+            cursor,
+            apu.write_cursor(),
+            "the returned cursor must be caught up to the APU's writer"
+        );
+        assert!(
+            !scratch.is_empty(),
+            "one advanced frame mixes a frame's worth of samples"
+        );
+        assert!(
+            scratch.iter().any(|&s| s != 0),
+            "the note must survive the copy, not arrive as silence"
+        );
+        assert_eq!(
+            reader.queued_len(),
+            scratch.len(),
+            "everything drained from the APU was submitted to the ring"
+        );
+    }
+
+    /// The cursor is what keeps one frame's samples from being submitted
+    /// twice -- and `scratch` being reused across frames is exactly why
+    /// [`pump_audio`] has to clear it (`Apu::copy_since` appends).
+    #[test]
+    fn pump_audio_submits_each_frame_once_across_a_reused_scratch_buffer() {
+        let mut apu = apu_with_one_mixed_frame();
+        let status = crate::audio::AudioStatus::new();
+        status.set_running(true);
+        let (writer, reader) = crate::audio::channel(status);
+
+        let mut scratch = Vec::new();
+        let cursor = pump_audio(&apu, 0, &mut scratch, &writer);
+        let first_frame = reader.queued_len();
+
+        // Nothing new mixed: a second pump at the same cursor submits
+        // nothing, rather than re-submitting the frame just sent.
+        let cursor = pump_audio(&apu, cursor, &mut scratch, &writer);
+        assert_eq!(
+            reader.queued_len(),
+            first_frame,
+            "a caught-up cursor must submit nothing"
+        );
+
+        // One more mixed frame: exactly that frame's samples are added.
+        // Not `first_frame * 2` -- the APU's mix rate is not an exact
+        // multiple of 60, so consecutive frames differ by a sample.
+        apu.run_frame();
+        let mixed = (apu.write_cursor() - cursor) as usize;
+        pump_audio(&apu, cursor, &mut scratch, &writer);
+        assert_eq!(
+            reader.queued_len(),
+            first_frame + mixed,
+            "the second frame adds exactly its own samples and no copy of the first"
+        );
+    }
+
+    /// Mute reaches all the way down here: the emulated APU keeps mixing
+    /// (its perf counters must not change just because the user muted),
+    /// but nothing is submitted.
+    #[test]
+    fn pump_audio_submits_nothing_while_muted() {
+        let apu = apu_with_one_mixed_frame();
+        let status = crate::audio::AudioStatus::new();
+        status.set_running(true);
+        status.set_muted(true);
+        let (writer, reader) = crate::audio::channel(status.clone());
+
+        let mut scratch = Vec::new();
+        let cursor = pump_audio(&apu, 0, &mut scratch, &writer);
+        assert_eq!(reader.queued_len(), 0, "a muted run submits no frames");
+        assert_eq!(
+            cursor,
+            apu.write_cursor(),
+            "the cursor still advances, so unmuting resumes from live \
+             audio rather than replaying what was mixed while silent"
+        );
+
+        status.set_muted(false);
+        pump_audio(&apu, 0, &mut scratch, &writer);
+        assert!(reader.queued_len() > 0, "unmuting resumes submission");
+    }
+
     // ------------------------------------------------------ the run loop
 
     /// The port, end to end: `start` boots the synthetic cart on the
@@ -756,7 +954,7 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string());
+        let (session, rx) = start(path, "green.cart".to_string(), None);
 
         let mut frames = Vec::new();
         // Five frames at 60 Hz is ~83 ms of pacing; the recv itself
@@ -849,7 +1047,7 @@ mod tests {
         let path = dir.path().join("junk.cart");
         std::fs::write(&path, b"not a cart at all").unwrap();
 
-        let (session, rx) = start(path, "junk.cart".to_string());
+        let (session, rx) = start(path, "junk.cart".to_string(), None);
         assert!(
             rx.recv_blocking().is_err(),
             "junk must not produce a frame; the channel just closes"
@@ -872,7 +1070,11 @@ mod tests {
 
     #[test]
     fn a_missing_cart_file_ends_with_a_reason() {
-        let (session, rx) = start("/definitely/not/here.cart".into(), "here.cart".to_string());
+        let (session, rx) = start(
+            "/definitely/not/here.cart".into(),
+            "here.cart".to_string(),
+            None,
+        );
         assert!(rx.recv_blocking().is_err());
         let finished = session.wait();
         assert!(finished.reason.contains("here.cart"), "{}", finished.reason);
@@ -902,7 +1104,7 @@ mod tests {
         let path = dir.path().join("quit.cart");
         std::fs::write(&path, image).unwrap();
 
-        let (session, rx) = start(path, "quit.cart".to_string());
+        let (session, rx) = start(path, "quit.cart".to_string(), None);
         // Let the run reach its own terminus first. `wait` sets the stop
         // flag before it joins (it is the "finish this run" call, not a
         // passive read), so racing it against the cart would report
@@ -937,7 +1139,7 @@ mod tests {
         let path = dir.path().join("logging.cart");
         std::fs::write(&path, logging_cart()).unwrap();
 
-        let (session, rx) = start(path, "logging.cart".to_string());
+        let (session, rx) = start(path, "logging.cart".to_string(), None);
         // The cart's single `log()` call runs on the very first turn,
         // before its first `vsync_wait` -- so by the time the first frame
         // arrives, that turn's drain has already moved it into the
@@ -962,7 +1164,7 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string());
+        let (session, rx) = start(path, "green.cart".to_string(), None);
         // Wait for the run to be genuinely under way before publishing,
         // so the store can't race the thread's construction.
         rx.recv_blocking().unwrap();
