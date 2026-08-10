@@ -629,16 +629,25 @@ impl MetaSpritePanel {
     /// observable way, and the copy is a real `.spr` by construction (it
     /// came out of the same encoder every save uses).
     ///
-    /// No prompt: nothing is overwritten and nothing is lost. Synchronous:
-    /// this is one small read and three small writes, without the frame
-    /// composition that makes an actual open worth backgrounding.
+    /// Copies what the panel SHOWS, not what is on disk, when `rel` is the
+    /// open document: duplicating a dirty sprite off its last-saved bytes
+    /// would silently drop the edits the user is looking at. ggo-ide put a
+    /// "Discard unsaved changes?" prompt in front of exactly this case; the
+    /// live-state copy answers it without asking, and skips a read besides.
+    ///
+    /// No prompt: no existing file is written and no state is lost.
+    /// Synchronous: at most one small read and three small writes, without
+    /// the frame composition that makes an actual open worth backgrounding.
     fn duplicate_sprite(&mut self, rel: &str, cx: &mut Context<Self>) -> Option<String> {
         // `project_root` is only re-discovered on panel activation, and a
         // right-click can reach a panel that was never activated.
         self.refresh_root(cx);
         let project_root = self.project_root.clone()?;
         let (root, rel_in_root) = split_sprite_path(&project_root, rel);
-        let opened = open_sprite(&root, &rel_in_root).ok()?;
+        let state = match &self.state {
+            ViewerState::Ready(open) if open.source_rel == rel => open.store.state().clone(),
+            _ => open_sprite(&root, &rel_in_root).ok()?.state,
+        };
         let base = rel_in_root
             .rsplit_once('.')
             .map_or(rel_in_root.as_str(), |(base, _)| base);
@@ -651,7 +660,7 @@ impl MetaSpritePanel {
         save_sprite(
             &root,
             &copy_rel,
-            &opened.state,
+            &state,
             &format!("{copy_base}.til"),
             &format!("{copy_base}.pal"),
         )
@@ -682,9 +691,15 @@ impl MetaSpritePanel {
         let Some(project_root) = self.project_root.clone() else {
             return Task::ready(());
         };
+        // Named, not offered a save: deleting the file makes an unsaved edit
+        // to it moot, so this warns instead of routing through
+        // `prepare_to_close_dirty` (which would offer to write bytes that
+        // are about to be unlinked). ggo-ide's delete made the same call.
+        let unsaved = self.dirty_sprite_name().is_some_and(|name| name == rel);
         let confirm = ggo_common::confirm_destructive(
             &format!("Delete the sprite {rel}?"),
             "Delete",
+            unsaved,
             window,
             cx,
         );
@@ -692,7 +707,11 @@ impl MetaSpritePanel {
             if !confirm.await {
                 return;
             }
-            if std::fs::remove_file(project_root.join(&rel)).is_err() {
+            if let Err(e) = std::fs::remove_file(project_root.join(&rel)) {
+                // No toast yet (F5.2 owns the notification surface), but a
+                // silent no-op would be indistinguishable from a bug.
+                // Upstream logs AND toasts at the same point.
+                log::error!("GGO: failed to delete sprite {rel}: {e}");
                 return;
             }
             this.update(cx, |this, cx| {
@@ -3585,6 +3604,77 @@ mod tests {
             assert!(
                 matches!(panel.state, ViewerState::Empty),
                 "the open document's file is gone, so the panel must clear"
+            );
+        });
+    }
+
+    /// The prompt must SAY when the file being deleted is the open
+    /// document and it has unsaved edits -- and only then. It deliberately
+    /// does NOT offer to save: deleting the file makes the edit moot, and a
+    /// "Save" here would write bytes about to be unlinked (ggo-ide's delete
+    /// never dirty-guarded either).
+    #[gpui::test]
+    async fn test_delete_sprite_prompt_names_unsaved_edits(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+        dirty_the_sprite(&panel, cx);
+
+        // A different sprite, while the OPEN one is dirty: those edits are
+        // not at stake, so the detail must not claim they are.
+        let other = delete_sprite_handler(workspace.downgrade(), "sprites/other.spr".to_string());
+        cx.update(|window, cx| other(window, cx));
+        assert_eq!(
+            cx.pending_prompt().map(|(_, detail)| detail),
+            Some("This cannot be undone.".to_string()),
+            "another sprite's deletion must not warn about THIS one's edits"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        let handler = delete_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        assert_eq!(
+            cx.pending_prompt().map(|(_, detail)| detail),
+            Some("This cannot be undone. Unsaved edits to it will be lost.".to_string()),
+        );
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(!dir.path().join("sprites/hero.spr").exists());
+    }
+
+    /// Duplicating the OPEN document copies what the panel SHOWS, not the
+    /// last-saved bytes: the fixture is 100ms on disk, `dirty_the_sprite`
+    /// retimes frame 0 to 500ms in memory only, and the copy must carry the
+    /// 500. Reading from disk here would silently produce a "duplicate"
+    /// that is missing the user's visible edits -- the case ggo-ide put a
+    /// "Discard unsaved changes?" prompt in front of.
+    #[gpui::test]
+    async fn test_duplicate_sprite_copies_the_live_document_not_the_disk(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+        dirty_the_sprite(&panel, cx);
+        assert_eq!(on_disk_duration(dir.path()), 100, "the edit is unsaved");
+
+        let handler =
+            duplicate_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+
+        let copy = open_sprite(dir.path(), "sprites/hero-copy.spr").expect("the copy is a .spr");
+        assert_eq!(
+            copy.state.frames[0].duration_ms, 500,
+            "the copy must carry the unsaved edit the panel is showing"
+        );
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            100,
+            "and duplicating must not have saved the original"
+        );
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.dirty_sprite_name().is_some(),
+                "nor cleared the original's dirty state"
             );
         });
     }

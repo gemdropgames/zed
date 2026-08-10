@@ -17,6 +17,7 @@ ggo-worldlib.workspace = true # GGO
 ggo_common.workspace = true
 gpui.workspace = true
 keymap_editor.workspace = true
+log.workspace = true
 project.workspace = true
 ui.workspace = true
 workspace.workspace = true

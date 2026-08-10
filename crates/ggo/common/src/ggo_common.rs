@@ -148,6 +148,33 @@ pub fn prepare_to_close_dirty<T: 'static>(
 /// a trash can, so the caveat always applies and is not worth a parameter.
 const DESTRUCTIVE_DETAIL: &str = "This cannot be undone.";
 
+/// Appended to [`DESTRUCTIVE_DETAIL`] when the file being destroyed is the
+/// panel's OPEN document and that document has unsaved edits. Worded after
+/// upstream's own multi-file delete warning ("N of these have unsaved
+/// changes, which will be lost.", `project_panel.rs`).
+const UNSAVED_DETAIL: &str = "Unsaved edits to it will be lost.";
+
+/// The `detail` line for a destructive prompt, with the unsaved-edits
+/// warning folded in when `unsaved`.
+///
+/// It is a `bool` and an APPEND rather than a free-form detail parameter on
+/// purpose: the "this cannot be undone" half can then never be dropped by a
+/// caller that only wanted to say something about dirty state, which is the
+/// property that makes the helper worth having at all.
+///
+/// Note what the `true` case does NOT do: it does not offer to save. Deleting
+/// a file makes an unsaved edit to it moot, so routing through
+/// [`prepare_to_close_dirty`] would offer a "Save" that writes bytes about to
+/// be unlinked. ggo-ide made the same call (`pages/assets/mod.rs`'s delete
+/// path never dirty-guards). The user is told, not asked twice.
+pub fn destructive_detail(unsaved: bool) -> String {
+    if unsaved {
+        format!("{DESTRUCTIVE_DETAIL} {UNSAVED_DETAIL}")
+    } else {
+        DESTRUCTIVE_DETAIL.to_string()
+    }
+}
+
 /// Does a `Window::prompt` answer over `[confirm_label, "Cancel"]` mean
 /// "go ahead"?
 ///
@@ -165,7 +192,9 @@ pub fn confirm_choice(answer: Option<usize>) -> bool {
 
 /// Raise the confirmation a destructive action needs, resolving to whether
 /// the user confirmed. `message` should name the thing being destroyed;
-/// `confirm_label` is the verb on the go-ahead button ("Delete").
+/// `confirm_label` is the verb on the go-ahead button ("Delete");
+/// `unsaved` is whether the caller's OPEN document is the thing being
+/// destroyed AND is dirty (see [`destructive_detail`]).
 ///
 /// Takes `&mut App` rather than a `Context<T>` so a project-panel
 /// context-menu entry handler -- which is handed only `(&mut Window,
@@ -173,13 +202,14 @@ pub fn confirm_choice(answer: Option<usize>) -> bool {
 pub fn confirm_destructive(
     message: &str,
     confirm_label: &str,
+    unsaved: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> Task<bool> {
     let answer = window.prompt(
         PromptLevel::Info,
         message,
-        Some(DESTRUCTIVE_DETAIL),
+        Some(&destructive_detail(unsaved)),
         &[confirm_label, "Cancel"],
         cx,
     );
@@ -317,6 +347,18 @@ mod tests {
         assert!(!confirm_choice(Some(1)));
         assert!(!confirm_choice(Some(99)));
         assert!(!confirm_choice(None));
+    }
+
+    /// The unsaved warning is an APPEND: the "cannot be undone" half is
+    /// there either way, and the dirty case adds to it rather than
+    /// replacing it.
+    #[test]
+    fn destructive_detail_appends_the_unsaved_warning() {
+        assert_eq!(destructive_detail(false), "This cannot be undone.");
+        assert_eq!(
+            destructive_detail(true),
+            "This cannot be undone. Unsaved edits to it will be lost."
+        );
     }
 
     /// `default_db_path` must land on `~/.ggo/ggo_ide.db` -- the file both

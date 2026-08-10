@@ -582,9 +582,15 @@ impl WorldPanel {
         let Some((_, listing)) = split_world_path(&rel) else {
             return Task::ready(());
         };
+        // Named, not offered a save: deleting the file makes an unsaved edit
+        // to it moot, so this warns instead of routing through
+        // `prepare_to_close_dirty` (which would offer to write bytes that
+        // are about to be unlinked). ggo-ide's delete made the same call.
+        let unsaved = self.dirty_world_name().is_some_and(|name| name == rel);
         let confirm = ggo_common::confirm_destructive(
             &format!("Delete the world \"{}\" ({rel})?", listing.stem),
             "Delete",
+            unsaved,
             window,
             cx,
         );
@@ -592,7 +598,11 @@ impl WorldPanel {
             if !confirm.await {
                 return;
             }
-            if std::fs::remove_file(project_root.join(&rel)).is_err() {
+            if let Err(e) = std::fs::remove_file(project_root.join(&rel)) {
+                // No toast yet (F5.2 owns the notification surface), but a
+                // silent no-op would be indistinguishable from a bug.
+                // Upstream logs AND toasts at the same point.
+                log::error!("GGO: failed to delete world {rel}: {e}");
                 return;
             }
             this.update(cx, |this, cx| {
@@ -3169,6 +3179,47 @@ mod tests {
                 "the listing must lose the deleted world"
             );
         });
+    }
+
+    /// The prompt must SAY when the file being deleted is the open
+    /// document and it has unsaved edits -- and must say it only then, not
+    /// whenever the panel happens to be dirty. It deliberately does NOT
+    /// offer to save: deleting the file makes the edit moot, and a "Save"
+    /// here would write bytes about to be unlinked (ggo-ide's delete never
+    /// dirty-guarded either).
+    #[gpui::test]
+    async fn test_delete_world_prompt_names_unsaved_edits(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        dirty_the_world(&panel, cx);
+
+        // A different world, while the OPEN one is dirty: those edits are
+        // not at stake, so the detail must not claim they are.
+        let other = delete_world_handler(workspace.downgrade(), "worlds/sub.toml".to_string());
+        cx.update(|window, cx| other(window, cx));
+        assert_eq!(
+            cx.pending_prompt().map(|(_, detail)| detail),
+            Some("This cannot be undone.".to_string()),
+            "another world's deletion must not warn about THIS one's edits"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        assert_eq!(
+            cx.pending_prompt().map(|(_, detail)| detail),
+            Some("This cannot be undone. Unsaved edits to it will be lost.".to_string()),
+        );
+        assert!(
+            !cx.pending_prompt()
+                .is_some_and(|(msg, _)| msg.contains("save")),
+            "the prompt must warn, not offer a save into a file it is about to unlink"
+        );
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(!dir.path().join("worlds/test.toml").exists());
     }
 
     /// Deleting a DIFFERENT world leaves the open document alone but still

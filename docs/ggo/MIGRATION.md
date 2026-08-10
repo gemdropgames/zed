@@ -69,7 +69,7 @@ covered by the fork at all.
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; clicking a `.spr`/`.til`/`.cart`/world `.toml` there routes directly into its GGO panel (F4) | partial | Generic file search, not asset-typed sections with extension badges. The in-panel pickers this row used to credit are all gone as of X4 — see the Assets/World/cart-library rows and Known deferrals for what explorer-driven routing does and doesn't cover. |
-| Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | none | deferred | No CLI exists for them and no panel affordance was built; the file tree can delete but not create the `.spr`/`.til`/`.pal` trio. |
+| Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | Project-panel context menu: **Duplicate Sprite** + **Delete Sprite**, contributed by `ggo_metasprite_panel` (F5.0) | partial | Two of four. Duplicate goes through worldlib `open_sprite`->`save_sprite` from the LIVE document, so the copy gets its own `.til`/`.pal` and carries unsaved edits; Delete confirms, names unsaved edits, and unlinks the `.spr` only (the sidecars are shareable). **New** is still deferred — no CLI and no create affordance for the trio. **Rename** is deferred to F5.2: it needs text entry, `window.prompt` has none, and the spec rule is that forms live in panels. Divergence to note: ggo-ide's duplicate was a raw byte copy that made the two sprites pool-sharing siblings (`pages/assets/sprite.rs:626-631`); ours un-shares, because a shared pool makes `DocOp::Dedup`/`DocOp::PaletteRemap` return `DocError::PoolShared` on BOTH sprites (`sprite_doc.rs:627,:677`) — private sidecars are the only variant where either stays dedupable. The cost is real: `save_sprite` writes the full pool to the copy's `.til`, so duplicating out of a large shared tileset gives the copy a complete private pool, a cart-size multiplier per duplicate. |
 | New tileset / new map | none | deferred | Same — no CLI, no panel. |
 | Files tree (create folder, delete file/dir, extension badges) | Zed project panel | partial | Create/delete/rename exist; the GGO extension badges do not. |
 | **Pixel editor**: 14 tools, brush sizes, mirror, pixel-perfect, shapes, marquee/lasso/wand, floating-selection move/flip/rotate, eyedropper, zoom/pan, per-editor undo | none | dropped | Explicit spec scope call. Pixel authoring is an external editor plus an import path. |
@@ -93,7 +93,7 @@ covered by the fork at all.
 |---|---|---|---|
 | World file picker (list + open) | Zed project panel (browse `worlds/**/*.toml`) + click-to-open, routed by `ggo_world_panel::intercept_world_open` into the docked panel | ✓ | Explorer-driven since F4 — the in-panel picker was removed; list+open is now the project panel plus the interceptor-routed open, which also runs `prepare_to_close_dirty` before switching documents. |
 | "+ New world" (snake_case validated, overwrite confirm) | none | deferred | Carried on the F2 gap list. worldlib can `write_world`; the panel has no create affordance. |
-| Delete world (confirm + rescan) | none | deferred | Same gap list entry. |
+| Delete world (confirm + rescan) | Project-panel context menu: **Delete World**, contributed by `ggo_world_panel` (F5.0) | ✓ | Confirms (naming the world by stem AND file, and saying so when the open document has unsaved edits), unlinks, clears the panel if that world was open, and re-enumerates so `+ Instance` stops offering it. One thing ggo-ide didn't do either: `[[instance]]` references to the deleted world are not chased down, so they now dangle — see the Known-deferrals note about `loader.rs`'s unrendered `node["error"]`. |
 | Canvas rendering: sprites, metasprites (per-clip), tilemaps, text, rect fills, transform markers, instance gizmos, merged backgrounds, error placeholders, selection outline | world panel `canvas` + `loader` (worldlib compose / `build_draw_list`) | ✓ | |
 | Click-select + drag-move with one undo entry per gesture | ✓ | ✓ | One deliberate divergence: empty-space left-drag deselects instead of panning; pan is middle-drag. |
 | Wheel zoom / pan | ✓ (cursor-anchored zoom, middle-drag pan) | ✓ | Zoom is cursor-anchored here, which ggo-ide's is not. |
@@ -213,9 +213,9 @@ edit and `emd` is a command you run.
 
 | Status | Rows |
 |---|---|
-| ✓ | 31 |
-| partial | 29 |
-| deferred | 31 |
+| ✓ | 32 |
+| partial | 30 |
+| deferred | 29 |
 | dropped | 12 |
 | **total** | **103** |
 
@@ -232,6 +232,11 @@ explorer-driven selection: browsing is still materially smaller than ggo-ide's
 managed library with upload, delete and magic-header validation. What changed
 is that row's *text*, plus the Assets browser-rail row's and the routing
 deferral's.)
+
+(F5.0/G2: **two rows moved.** "Delete world (confirm + rescan)" deferred → ✓
+and "Sprite rail ops" deferred → partial, both on the project-panel context-menu
+contributor hook. Before G2: ✓ 31 / partial 29 / deferred 31 / dropped 12.
+After: ✓ 32 / partial 30 / deferred 29 / dropped 12.)
 
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
@@ -312,6 +317,24 @@ guards and follow-ups that someone has to pick up:
   full 8-wide row of blanks, so a sheet under 8 tiles lays out differently
   than ggo-ide renders the same file. Deliberate (documented on the fn); noted
   here because it is a visible rendering difference, not just an internal one.
+- **Upstream's generic "Duplicate" is still in the menu for a `.spr` (F5.0).**
+  `project_panel.rs`'s own "Duplicate" (`:1182`) sits three separator groups
+  above `ggo_metasprite_panel`'s "Duplicate Sprite", and it performs precisely
+  the raw byte copy the sprite entry exists to avoid: the resulting file points
+  at the ORIGINAL's `.til`/`.pal`, which flips both sprites into `pool_shared`
+  and makes `DocOp::Dedup`/`DocOp::PaletteRemap` fail on the source. Two
+  near-identically-labelled entries, one of which quietly damages the file you
+  copied from. Not fixable in F5.0: G1's contributor hook only APPENDS a
+  `Vec<ContextMenuItem>` and has no way to suppress or replace an upstream
+  entry. **F5.2 input**: the registry may need a suppress/replace capability,
+  not just append.
+- **Dangling `[[instance]]` refs are invisible (pre-existing F1 gap, now
+  reachable).** `ggo_world_panel::loader` populates `node["error"]` for an
+  instance whose world does not resolve (`loader.rs:339`), but `inspector.rs`
+  never renders it — ggo-ide did (`world/inspector.rs:410-412`). The canvas
+  shows a placeholder and nothing says why. Latent until F5.0: "Delete World"
+  is the first fork action that MANUFACTURES dangling refs, so it is worth
+  surfacing in F5.2.
 - **Linux fallback-prompt race.** A second file click while a
   `prepare_to_close_dirty` save prompt is already up silently replaces the
   first prompt with the second; the first resolves to Cancel with no data
