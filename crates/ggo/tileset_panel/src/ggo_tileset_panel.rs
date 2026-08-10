@@ -301,6 +301,22 @@ impl TilesetPanel {
         }));
     }
 
+    /// The `.til` currently open, as the worktree-relative path it was opened
+    /// WITH -- `None` unless the viewer is Ready.
+    ///
+    /// Public purely as an observation point for the panels that hand a
+    /// tileset OFF to this one: `ggo_import_panel` opens the sheet it just
+    /// wrote here, and the rel it passes has to be the worktree-relative one
+    /// (an asset-root-relative rel names no file in the worktree -- the F4
+    /// `ggo-sprfix` distinction). Without this, that hand-off could only be
+    /// asserted from inside this crate, which is not where the bug would be.
+    pub fn open_rel_path_now(&self) -> Option<&str> {
+        match &self.state {
+            ViewerState::Ready(open) => Some(open.rel_path.as_str()),
+            _ => None,
+        }
+    }
+
     /// Step the zoom by `delta` steps, clamped to [`MIN_ZOOM`]..=[`MAX_ZOOM`].
     fn zoom_by(&mut self, delta: isize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {

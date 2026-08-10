@@ -114,6 +114,7 @@ fs.workspace = true
 futures.workspace = true
 ggo_charts_panel.workspace = true # GGO
 ggo_emu_panel.workspace = true # GGO
+ggo_import_panel.workspace = true # GGO
 ggo_language.workspace = true # GGO
 ggo_map_panel.workspace = true # GGO
 ggo_metasprite_panel.workspace = true # GGO

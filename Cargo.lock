@@ -7582,6 +7582,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_import_panel"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "ggo-asset-formats",
+ "ggo-worldlib",
+ "ggo_common",
+ "ggo_tileset_panel",
+ "gpui",
+ "image",
+ "keymap_editor",
+ "log",
+ "path",
+ "project",
+ "serde_json",
+ "tempfile",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "ggo_language"
 version = "0.1.0"
 dependencies = [
@@ -24420,6 +24441,7 @@ dependencies = [
  "futures 0.3.32",
  "ggo_charts_panel",
  "ggo_emu_panel",
+ "ggo_import_panel",
  "ggo_language",
  "ggo_map_panel",
  "ggo_metasprite_panel",
