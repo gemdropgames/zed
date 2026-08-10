@@ -948,6 +948,40 @@ impl WorldPanel {
         self.save_for_close(cx)
     }
 
+    /// Read this panel's documents from `root` instead of the workspace's
+    /// first visible worktree.
+    ///
+    /// `test-support` only. `ggo_emu_panel`'s "Emulate this world saves
+    /// first" tests need this panel loading from a REAL directory (its
+    /// FakeFs worktree is only there to make `ProjectPath`s resolve), and
+    /// `root_override` is crate-private -- the same shape the panel's own
+    /// tests use, exported the way `project`/`workspace` export theirs.
+    #[cfg(feature = "test-support")]
+    pub fn test_root_override(&mut self, root: std::path::PathBuf) {
+        self.root_override = Some(root);
+    }
+
+    /// Make the open document dirty, and report whether it now is.
+    ///
+    /// `test-support` only, and deliberately op-free: the caller
+    /// (`ggo_emu_panel`) does not depend on worldlib and has no business
+    /// naming a `WorldOp`. It only needs "a document with unsaved edits",
+    /// which is the precondition `save_if_open_and_dirty` acts on. The
+    /// edit itself is the same `MoveEntity` this module's own
+    /// `dirty_the_world` helper uses.
+    #[cfg(feature = "test-support")]
+    pub fn test_dirty_open_world(&mut self, cx: &mut Context<Self>) -> bool {
+        self.apply_op(
+            WorldOp::MoveEntity {
+                entity: 0,
+                pos: [50.0, 60.0],
+                gesture: None,
+            },
+            cx,
+        );
+        self.dirty_world_name().is_some()
+    }
+
     /// The open world's display path when it has unsaved edits, else
     /// `None`. Drives both the close guard and (indirectly) the title's
     /// dirty dot.

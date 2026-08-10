@@ -73,6 +73,15 @@ mod tests {
     use super::*;
     use ggo_common::{EMD_BIN_ENV, emd_bin};
 
+    /// Opt-out for the one non-hermetic test below: `GGO_ALLOW_NO_EMD=1`
+    /// turns "no emerald toolchain" from a failure into a skip. Not a
+    /// bare `is_ok()` -- an accidental empty export must not silence it.
+    const ALLOW_NO_EMD_ENV: &str = "GGO_ALLOW_NO_EMD";
+
+    fn allow_no_emd() -> bool {
+        std::env::var(ALLOW_NO_EMD_ENV).is_ok_and(|v| v.trim() == "1")
+    }
+
     /// A binary that cannot be spawned must come back as a NON-OK outcome
     /// naming the command -- not a panic, and not something the panel
     /// could mistake for success.
@@ -105,12 +114,17 @@ mod tests {
     ///
     /// This is the one test that exercises the invocation SHAPE -- the
     /// working directory, the appended `--json`, the stdout/stderr
-    /// capture -- against the actual CLI rather than against `sh`. It
-    /// **skips** (rather than fails) when `emd new` doesn't succeed, so a
-    /// checkout without the emerald toolchain stays green; every other
-    /// test in this crate is hermetic by construction. The skip prints,
-    /// so a green run that never actually reached `emd` is visible in the
-    /// test output instead of being indistinguishable from a real pass.
+    /// capture -- against the actual CLI rather than against `sh`; every
+    /// other test in this crate is hermetic by construction.
+    ///
+    /// **It FAILS, rather than skipping, when `emd new` doesn't succeed**,
+    /// unless [`ALLOW_NO_EMD_ENV`] is explicitly set. It used to `return`
+    /// (and, briefly, `eprintln!` first) -- but libtest CAPTURES stdout and
+    /// stderr for passing tests, so `GGO_EMD=/nonexistent/emd cargo test`
+    /// printed nothing anywhere and reported `ok`. A silently-green
+    /// integration test is precisely the failure mode the skip was
+    /// supposed to make visible, so the default is now the loud one and
+    /// opting out is a deliberate act.
     #[test]
     fn run_emd_drives_a_real_emd_generate() {
         let dir = tempfile::tempdir().unwrap();
@@ -120,12 +134,14 @@ mod tests {
             vec!["new".to_string(), "demo".to_string()],
         );
         if !run_emd(&scaffold).ok {
-            eprintln!(
-                "skip: `{} new demo` did not succeed -- no emerald toolchain on PATH \
-                 (set {EMD_BIN_ENV} to point at one); the real-emd integration \
-                 assertions below did NOT run",
+            assert!(
+                allow_no_emd(),
+                "`{} new demo` did not succeed -- no emerald toolchain on PATH \
+                 (point {EMD_BIN_ENV} at one, or set {ALLOW_NO_EMD_ENV}=1 to \
+                 accept a checkout that cannot run this integration test)",
                 emd_bin()
             );
+            eprintln!("skip: no emerald toolchain, and {ALLOW_NO_EMD_ENV}=1 allows it");
             return;
         }
         let project = dir.path().join("demo");

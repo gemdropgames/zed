@@ -11,6 +11,14 @@ workspace = true
 [lib]
 path = "src/ggo_world_panel.rs"
 
+[features]
+# Cross-crate test hooks (`WorldPanel::test_root_override` /
+# `test_dirty_open_world`). `ggo_emu_panel`'s "Emulate this world saves
+# first" tests need a genuinely dirty document in a REAL directory, and
+# both the root override and the edit path are crate-private -- the same
+# reason `project`/`workspace` carry a `test-support` feature upstream.
+test-support = []
+
 [dependencies]
 editor.workspace = true
 gpui.workspace = true

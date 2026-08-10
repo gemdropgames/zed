@@ -362,3 +362,38 @@ guards and follow-ups that someone has to pick up:
   it vanishes without the user explicitly dismissing it. Structurally hard to
   test in-tree (platform prompt stacking); carried forward from X1 fix
   round 1 rather than fixed.
+- **"Emulate this world" is CART mode, not ggo-ide's full-system boot
+  (F5.2/S4).** ggo-ide's world-page Emulate builds a whole system —
+  `backend::emubuild::build_full_system_with_world` stages the project with
+  `emd pack-ggo`, builds a GemOS image out of `firmware/system`, packs a FAT
+  card, and boots the SoC. The fork's `ggo_emu_panel::drive` is `ggo-emu`'s
+  cart-mode loop, so the entry (labelled **"Emulate this world (cart)"** for
+  exactly this reason) builds `emd pack-ggo --world <stem>` and runs the
+  cartridge. `ggo_emu_core::fullsystem::run` DOES exist, so this is a scope
+  decision, not an impossibility — but three things are genuinely lost until
+  it is revisited:
+  1. **The game never boots through GemOS.** The OS→cart handoff, the syscall
+     surface, card/FAT asset streaming and the save flush are all unexercised,
+     so the entry no longer answers "does this world boot on the device" — only
+     "does this world run".
+  2. **Different perf profile.** Cart mode keeps `PerfSim`'s `CART_XIP_BASE`
+     cache base (`emu_panel/src/drive.rs`), so OS code is absent from the I$
+     model and from frame cost. Numbers from this entry are not comparable
+     with ggo-ide's.
+  3. **Both kinds land in the same `runs` table, with no mode column**
+     (`emu_panel/src/ingest.rs` keys on the cart path; the `label` column is
+     the rel path). The charts panel's historic overlay will happily overlay a
+     cart-mode run on a full-system one for the same game. Until a mode column
+     exists, the only discriminator is the `label`: `None` = ggo-ide,
+     `target/ggo-emulate/*.ggo` = this entry, anything else = a cart clicked in
+     the fork's explorer. **F5.3 input**: add an explicit run-kind column
+     rather than leaning on that convention.
+- **Hardware diagnostics is one-shot, with no streaming, cancel or options
+  (F5.2/S4).** The "Run hardware diagnostics" entry spawns
+  `ggo-diag --tty <port> --skip-pnr --launch` and shows the transcript when it
+  finishes. ggo-ide's Device page streams lines live, can cancel the child,
+  offers baud / collect-seconds / port pickers and clones `diag.db` rows back
+  into `ggo_ide.db` afterwards; none of that is here. The repo checkout must
+  also be pointed at with `GGO_REPO` — ggo-ide lives inside the repo and
+  auto-detects from `CARGO_MANIFEST_DIR`, which a fork whose worktree is the
+  user's game project cannot do.

@@ -317,11 +317,11 @@ pub const EMERALD_MANIFEST: &str = "emerald.toml";
 /// emerald's own `Project::discover`.
 ///
 /// This is `emd`'s working directory, and it is also the directory
-/// `manifests/` and `assets/` live under. Lives here because FOUR panels
+/// `manifests/` and `assets/` live under. Lives here because FIVE panels
 /// had grown their own copy of this five-line walk plus its `emerald.toml`
 /// constant (`ggo_emerald_panel::runner`, `ggo_world_panel::loader`,
-/// `ggo_import_panel`, `ggo_map_panel`) -- the shape the fork's
-/// single-source-of-truth rule exists to prevent.
+/// `ggo_import_panel`, `ggo_map_panel`, `ggo_sprite_panel`) -- the shape
+/// the fork's single-source-of-truth rule exists to prevent.
 pub fn emerald_project_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(dir) = cur {

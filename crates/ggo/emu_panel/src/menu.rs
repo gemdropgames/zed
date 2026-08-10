@@ -36,6 +36,18 @@ use crate::EmuPanel;
 /// reads with the same code path.
 pub const RUNNABLE_EXTS: [&str; 2] = ["cart", "ggo"];
 
+/// The "Emulate this world" entry's label.
+///
+/// **"(cart)" is load-bearing, not decoration.** ggo-ide's Emulate boots
+/// the world through a full system image -- GemOS, the OS->cart handoff,
+/// the syscall surface, FAT card asset streaming -- and this one runs the
+/// world as a bare cartridge (see [`world_pack_args`]). The two answer
+/// different questions, and the perf runs they produce land in the SAME
+/// `runs` table with no mode column, so the name is the only place a user
+/// is told which one they pressed. `MIGRATION.md`'s "Emulate this world is
+/// cart mode" entry has the full list of what differs.
+pub const EMULATE_LABEL: &str = "Emulate this world (cart)";
+
 /// Where a world's built cartridge is written, relative to the emerald
 /// project root. Under `target/` because that is the directory every
 /// emerald project already gitignores (`emd new`'s scaffold) and the one
@@ -159,8 +171,19 @@ pub const SERIAL_BY_ID_DIR: &str = "/dev/serial/by-id";
 /// Fallback raw-device directory, scanned only when [`SERIAL_BY_ID_DIR`]
 /// has nothing.
 pub const DEV_DIR: &str = "/dev";
-const TTY_USB_PREFIX: &str = "ttyUSB";
-const TTY_ACM_PREFIX: &str = "ttyACM";
+/// Serial-device name prefixes, in the order a scan reports them.
+///
+/// The first two are Linux (`ttyUSB` for the ULX3S's FT231X, `ttyACM` for
+/// CDC-ACM boards) and are what ggo-ide scanned for -- it ran on a Linux
+/// box. Zed is a first-class macOS app, where the same board enumerates as
+/// `/dev/cu.usbserial-*` (or `tty.usbmodem*` for CDC), so a Mac user WITH a
+/// board plugged in would otherwise be told there is no board.
+///
+/// Both macOS spellings are listed because both exist and either can be
+/// opened; `cu.` (call-out, no DCD wait) is the right one to talk to a dev
+/// board through, and the scan's `sort` puts `cu.` before `tty.` so it is
+/// the one [`diag_request`] picks.
+const TTY_PREFIXES: [&str; 4] = ["ttyUSB", "ttyACM", "cu.usb", "tty.usb"];
 
 /// Scan for candidate serial devices: every entry under `by_id_dir` if it
 /// has any, else every entry under `dev_dir` whose name starts with
@@ -183,7 +206,7 @@ pub fn scan_serial_ports_at(by_id_dir: &Path, dev_dir: &Path) -> Vec<String> {
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(TTY_USB_PREFIX) || name.starts_with(TTY_ACM_PREFIX) {
+            if TTY_PREFIXES.iter().any(|p| name.starts_with(p)) {
                 ports.push(dev_dir.join(name.as_ref()).to_string_lossy().into_owned());
             }
         }
@@ -244,8 +267,12 @@ pub fn diag_request(env: &DiagEnv) -> Result<ProcRequest, String> {
     if env.ports.is_empty() {
         missing.push(format!(
             "no serial device (looked in {SERIAL_BY_ID_DIR}, then {DEV_DIR} for \
-             {TTY_USB_PREFIX}*/{TTY_ACM_PREFIX}*) -- connect the board, or set \
-             {DIAG_TTY_ENV}"
+             {}) -- connect the board, or set {DIAG_TTY_ENV}",
+            TTY_PREFIXES
+                .iter()
+                .map(|p| format!("{p}*"))
+                .collect::<Vec<_>>()
+                .join("/")
         ));
     }
     if !missing.is_empty() {
@@ -332,19 +359,21 @@ pub fn contribute_run_menu(
             );
         } else if ggo_world_panel::world_stem(&rel).is_some() {
             items.push(
-                ui::ContextMenuEntry::new("Emulate this world")
+                ui::ContextMenuEntry::new(EMULATE_LABEL)
                     .icon(ui::IconName::PlayFilled)
                     .handler(emulate_world_handler(cx.weak_entity(), rel))
                     .into(),
             );
         }
     }
-    items.push(
-        ui::ContextMenuEntry::new("Run hardware diagnostics")
-            .icon(ui::IconName::Debug)
-            .handler(diagnostics_handler(cx.weak_entity()))
-            .into(),
-    );
+    if is_dir {
+        items.push(
+            ui::ContextMenuEntry::new("Run hardware diagnostics")
+                .icon(ui::IconName::Debug)
+                .handler(diagnostics_handler(cx.weak_entity()))
+                .into(),
+        );
+    }
     items
 }
 
@@ -379,10 +408,23 @@ fn emu_panel_handler(
     }
 }
 
+/// The message shown when the world could not be written, and the build
+/// is therefore refused.
+pub const SAVE_FAILED_MESSAGE: &str =
+    "could not save this world — refusing to build, a run would boot the stale file on disk";
+
 /// "Emulate this world". Saves the world panel's document first, OUTSIDE
 /// the workspace update below -- the world panel is a different entity and
 /// reaching it needs only a read, so it must happen before the emu panel's
 /// update takes the workspace, not inside it.
+///
+/// **A failed save cancels the build.** `emd pack-ggo` stages worlds from
+/// DISK, so building after a write that did not land would silently boot
+/// the previous version of the world -- the exact bug ggo-ide names in
+/// `pages/world/mod.rs`'s `emulate_after_save` ("Dropped on a failed save:
+/// never boot a stale world"). The refusal is reported on the emu panel's
+/// status row rather than swallowed, so it is as visible as the build it
+/// replaced.
 pub(crate) fn emulate_world_handler(
     workspace: gpui::WeakEntity<Workspace>,
     rel: String,
@@ -391,15 +433,28 @@ pub(crate) fn emulate_world_handler(
         let rel = rel.clone();
         move |panel, window, cx| panel.emulate_world(&rel, window, cx)
     });
+    let blocked = emu_panel_handler(workspace.clone(), |panel, _window, cx| {
+        panel.report_blocked(SAVE_FAILED_MESSAGE.to_string(), cx)
+    });
     move |window, cx| {
-        if let Some(workspace) = workspace.upgrade()
-            && let Some(world_panel) = workspace.read(cx).panel::<ggo_world_panel::WorldPanel>(cx)
-        {
-            world_panel.update(cx, |world_panel, cx| {
-                world_panel.save_if_open_and_dirty(&rel, cx);
-            });
+        let saved = match workspace.upgrade() {
+            // No world panel docked means no unsaved copy of this world
+            // anywhere, so the file on disk IS the current one.
+            Some(workspace) => workspace
+                .read(cx)
+                .panel::<ggo_world_panel::WorldPanel>(cx)
+                .is_none_or(|world_panel| {
+                    world_panel.update(cx, |world_panel, cx| {
+                        world_panel.save_if_open_and_dirty(&rel, cx)
+                    })
+                }),
+            None => return,
+        };
+        if saved {
+            route(window, cx)
+        } else {
+            blocked(window, cx)
         }
-        route(window, cx);
     }
 }
 

@@ -333,6 +333,14 @@ pub struct EmuPanel {
     _pump_task: Option<Task<()>>,
     /// Last run's exit/error line, shown under the transport.
     status: Option<String>,
+    /// Whether [`Self::status`] is a FAILURE rather than a report. A run
+    /// ending is normal and reads muted; a build that failed, a `ggo-diag`
+    /// that failed, and the no-board message are all things the user has
+    /// to act on, and the ingest row beside them already uses
+    /// `Color::Error` for exactly that -- a failure whispered in the same
+    /// grey as "stopped" is a failure that gets missed. Set through
+    /// [`Self::report_failure`]; every ordinary status write clears it.
+    status_is_error: bool,
     /// The cart-visible frame number of the last frame received -- the
     /// pane's "is it actually running" readout.
     frame: u32,
@@ -413,6 +421,7 @@ impl EmuPanel {
             session: None,
             _pump_task: None,
             status: None,
+            status_is_error: false,
             frame: 0,
             input: InputState::default(),
             stats: RunStats::default(),
@@ -498,8 +507,7 @@ impl EmuPanel {
     /// with two emulator threads fighting over one pane.
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(root), Some(cart)) = (self.project_root.clone(), self.selected.clone()) else {
-            self.status = Some("no cart selected".to_string());
-            cx.notify();
+            self.report_failure("no cart selected".to_string(), cx);
             return;
         };
         self.stop(window, cx);
@@ -522,6 +530,7 @@ impl EmuPanel {
         self.console = Some(session.uart().clone());
         self.session = Some(session);
         self.status = None;
+        self.status_is_error = false;
         self.frame = 0;
         self.stats = RunStats::default();
         self.fps_window_started = Instant::now();
@@ -584,6 +593,20 @@ impl EmuPanel {
         // `run_generation` points at by the time the background task
         // below actually resolves. See `run_generation`'s doc.
         let generation = self.run_generation;
+        // ...and which build/diagnostics click owns the STATUS ROW right
+        // now. `emulate_world`/`run_hardware_diagnostics` both begin by
+        // stopping whatever is running and then write their own message
+        // there, and they bump `build_generation`, never `run_generation`
+        // -- so without this second stamp, this completion (which lands
+        // later, off-thread) overwrites that message with the stopped
+        // run's exit reason. For "Emulate this world" that merely flickers
+        // "building …" away; for the no-board diagnostics message, whose
+        // whole job is to be READ, it was fatal: the entry looked like a
+        // silent no-op. Only the status write is skipped -- the ingest
+        // result below is this run's own data and nothing else claims that
+        // row, which is also why bumping `run_generation` here would be
+        // the wrong fix (it would discard a legitimate ingest).
+        let owns_status = self.build_generation;
         self.input.clear();
         self.ingest_status = IngestStatus::Uploading;
         cx.notify();
@@ -630,7 +653,10 @@ impl EmuPanel {
                         // live run's status.
                         return None;
                     }
-                    this.status = Some(reason);
+                    if this.build_generation == owns_status {
+                        this.status = Some(reason);
+                        this.status_is_error = false;
+                    }
                     this.ingest_status = status;
                     cx.notify();
                     // The Re-run entry's promised hop to the charts panel.
@@ -681,6 +707,30 @@ impl EmuPanel {
 
     // ------------------------------------------------- the S4 menu actions
 
+    /// Put a FAILURE on the status row: shown in `Color::Error` rather
+    /// than the muted grey a run's exit reason gets (see
+    /// [`Self::status_is_error`]).
+    fn report_failure(&mut self, message: String, cx: &mut Context<Self>) {
+        self.status = Some(message);
+        self.status_is_error = true;
+        cx.notify();
+    }
+
+    /// Report a precondition the MENU checked and this panel could not --
+    /// today, exactly one: "Emulate this world" could not write the world
+    /// panel's unsaved edits, so there is nothing safe to build.
+    ///
+    /// Deliberately does NOT `stop`: the user's build never started, and
+    /// killing a cart they are already running as a side effect of a
+    /// refused one would be its own bug. It DOES bump `build_generation`,
+    /// which is what stops a still-in-flight `finish_run` completion from
+    /// overwriting this message with a run's exit reason (see
+    /// [`Self::finish_run`]).
+    pub fn report_blocked(&mut self, message: String, cx: &mut Context<Self>) {
+        self.build_generation += 1;
+        self.report_failure(message, cx);
+    }
+
     /// **"Emulate this world"**: build a cartridge whose boot world is
     /// `world_rel`, then run it here.
     ///
@@ -704,9 +754,14 @@ impl EmuPanel {
     pub fn emulate_world(&mut self, world_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(window, cx);
         self.build_generation += 1;
+        // A Re-run whose `run` never happened (this click replaced its
+        // task) must not leave its charts hop behind for THIS run to
+        // inherit -- see `charts_after_ingest`.
+        self.charts_after_ingest = false;
         let generation = self.build_generation;
         let world_rel = world_rel.to_string();
         self.status = Some(format!("building {world_rel}…"));
+        self.status_is_error = false;
         self.ingest_status = IngestStatus::Idle;
         cx.notify();
 
@@ -726,14 +781,17 @@ impl EmuPanel {
                     return;
                 }
                 if !capture.ok {
-                    this.status = Some(format!("build failed: {}", menu::failure_reason(&capture)));
-                    cx.notify();
+                    this.report_failure(
+                        format!("build failed: {}", menu::failure_reason(&capture)),
+                        cx,
+                    );
                     return;
                 }
                 this.selected = Some(cart);
                 this.frame = 0;
                 this.stats = RunStats::default();
                 this.status = None;
+                this.status_is_error = false;
                 this.run(window, cx);
             })
             .ok();
@@ -750,8 +808,7 @@ impl EmuPanel {
         cx: &mut Context<Self>,
     ) -> Option<(ggo_common::ProcRequest, ggo_common::ProcRunner, String)> {
         let mut fail = |this: &mut Self, message: String| {
-            this.status = Some(message);
-            cx.notify();
+            this.report_failure(message, cx);
             None
         };
         let Some(root) = self.project_root.clone() else {
@@ -836,6 +893,7 @@ impl EmuPanel {
     pub fn run_hardware_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(window, cx);
         self.build_generation += 1;
+        self.charts_after_ingest = false;
         let generation = self.build_generation;
 
         let env = self
@@ -845,8 +903,7 @@ impl EmuPanel {
         let request = match menu::diag_request(&env) {
             Ok(request) => request,
             Err(message) => {
-                self.status = Some(message);
-                cx.notify();
+                self.report_failure(message, cx);
                 return;
             }
         };
@@ -854,6 +911,7 @@ impl EmuPanel {
         console.push_line(&format!("[diag] $ {}", request.command_line()));
         self.console = Some(console.clone());
         self.status = Some("running hardware diagnostics…".to_string());
+        self.status_is_error = false;
         cx.notify();
 
         let runner = self.proc_runner.clone();
@@ -867,15 +925,19 @@ impl EmuPanel {
                 for line in &capture.lines {
                     console.push_line(line);
                 }
-                this.status = Some(if capture.ok {
-                    "hardware diagnostics finished".to_string()
+                if capture.ok {
+                    this.status = Some("hardware diagnostics finished".to_string());
+                    this.status_is_error = false;
+                    cx.notify();
                 } else {
-                    format!(
-                        "hardware diagnostics failed: {}",
-                        menu::failure_reason(&capture)
-                    )
-                });
-                cx.notify();
+                    this.report_failure(
+                        format!(
+                            "hardware diagnostics failed: {}",
+                            menu::failure_reason(&capture)
+                        ),
+                        cx,
+                    );
+                }
             })
             .ok();
         }));
@@ -1163,7 +1225,11 @@ impl Render for EmuPanel {
             .children(self.status.as_ref().map(|status| {
                 Label::new(status.clone())
                     .size(LabelSize::Small)
-                    .color(Color::Muted)
+                    .color(if self.status_is_error {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    })
             }))
             .children(self.ingest_status.label().map(|label| {
                 Label::new(label).size(LabelSize::XSmall).color(
@@ -2698,30 +2764,32 @@ mod tests {
 
         assert_eq!(
             contributed("green.cart", false, cx),
-            2,
-            "a cart gets Re-run plus the always-there diagnostics entry"
+            1,
+            "a cart gets Re-run"
         );
         assert_eq!(
             contributed("assets/worlds/main.toml", false, cx),
-            3,
-            "a world gets Emulate plus diagnostics -- and `ggo_world_panel`'s \
-             own Delete World, which this harness registers too, since \
-             contributions from every panel land in one menu"
+            2,
+            "a world gets Emulate -- and `ggo_world_panel`'s own Delete World, \
+             which this harness registers too, since contributions from every \
+             panel land in one menu"
         );
         assert_eq!(
             contributed("emerald.toml", false, cx),
-            1,
+            0,
             "a .toml outside worlds/ is neither a world nor a cart"
         );
         assert_eq!(
             contributed("notes.txt", false, cx),
-            1,
-            "an unrelated file still offers diagnostics, and only that"
+            0,
+            "an unrelated FILE gets nothing -- upstream's own menu is left alone"
         );
         assert_eq!(
             contributed("assets/worlds", true, cx),
             1,
-            "a directory is never runnable -- diagnostics only"
+            "diagnostics hangs off directories: it needs no project, but a \
+             permanent extra line on every file's menu is not what \"anywhere\" \
+             is worth"
         );
     }
 
@@ -2933,6 +3001,216 @@ mod tests {
         });
         panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
         cx.run_until_parked();
+    }
+
+    // ------------------------------------ fix round 1: the two red drills
+
+    /// A world file the world panel can load and edit: one entity with a
+    /// Transform, in the canonical shape `ggo_worldlib::write_world`
+    /// emits.
+    fn write_world_fixture(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
+        std::fs::write(root.join("emerald.toml"), "[project]\n").unwrap();
+        std::fs::write(
+            root.join("assets/worlds/main.toml"),
+            "[[entity]]\n\
+             Transform = { pos = [4.0, 4.0], z = 0.0 }\n\
+             RectFill = { w = 16.0, h = 12.0, color = 63488.0 }\n",
+        )
+        .unwrap();
+    }
+
+    /// Load `assets/worlds/main.toml` into the workspace's world panel,
+    /// off the REAL `root`, and dirty it. Returns the panel.
+    fn dirty_world_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        root: &std::path::Path,
+    ) -> Entity<ggo_world_panel::WorldPanel> {
+        let world_panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<ggo_world_panel::WorldPanel>(cx)
+                .expect("ggo_world_panel::init adds its panel")
+        });
+        let root = root.to_path_buf();
+        world_panel.update(cx, |panel, _cx| panel.test_root_override(root));
+        world_panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("assets/worlds/main.toml", window, cx)
+        });
+        cx.run_until_parked();
+        world_panel.update(cx, |panel, cx| {
+            assert!(
+                panel.test_dirty_open_world(cx),
+                "the fixture world must have loaded, and the edit must have \
+                 dirtied it -- otherwise the save this test is about never runs"
+            );
+        });
+        world_panel
+    }
+
+    /// **RED DRILL 1.** The no-board diagnostics message is the entry's
+    /// entire output, so anything that can overwrite it turns the entry
+    /// back into the silent no-op it was written to avoid.
+    ///
+    /// `run_hardware_diagnostics` begins by stopping whatever is running,
+    /// and `stop` -> `finish_run` writes the stopped run's exit reason
+    /// ("stopped") from a background completion that lands AFTER the
+    /// message is on the row. Guarded only by `run_generation` -- which
+    /// this entry never bumps -- it won. This drives a real cart, fires
+    /// the entry over the top of it, and checks the message survives.
+    #[gpui::test]
+    async fn test_the_no_board_message_survives_stopping_a_running_cart(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ok_capture());
+        panel.update(cx, |panel, _cx| {
+            panel.proc_runner = runner;
+            panel.diag_env_override = Some(menu::DiagEnv {
+                bin: menu::DEFAULT_DIAG_BIN.to_string(),
+                repo: None,
+                ports: Vec::new(),
+            });
+        });
+
+        // A cart really running, so `stop` really has a run to finish.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+
+        let handler = menu::diagnostics_handler(workspace.downgrade());
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no board, nothing spawned"
+        );
+        panel.update(cx, |panel, _cx| {
+            let status = panel.status.clone().expect("a status");
+            assert!(
+                status.contains(menu::DIAG_REPO_ENV) && status.contains(menu::DIAG_TTY_ENV),
+                "the stopped run's exit reason overwrote the message: {status}"
+            );
+            assert!(panel.status_is_error, "and it must read as a failure");
+            assert!(
+                matches!(
+                    panel.ingest_status,
+                    IngestStatus::NoFrames | IngestStatus::Done(_)
+                ),
+                "the stopped run's INGEST result is still its own and must \
+                 still land: {:?}",
+                panel.ingest_status
+            );
+        });
+    }
+
+    /// **RED DRILL 2.** `emd pack-ggo` stages worlds from DISK, so a build
+    /// that runs after a failed save boots the previous version of the
+    /// world -- silently, with the user looking at their edit on screen.
+    /// ggo-ide refuses this explicitly ("Dropped on a failed save: never
+    /// boot a stale world"); so does this.
+    ///
+    /// The save is made to fail by taking write permission off the
+    /// directory the world lives in -- worldlib writes atomically (temp
+    /// file + rename), so a read-only FILE would not stop it.
+    #[gpui::test]
+    async fn test_a_failed_save_refuses_to_build_rather_than_booting_a_stale_world(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_world_fixture(dir.path());
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ok_capture());
+        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
+        let _world_panel = dirty_world_panel(&workspace, cx, dir.path());
+
+        let worlds_dir = dir.path().join("assets/worlds");
+        let restore = std::fs::metadata(&worlds_dir).unwrap().permissions();
+        let mut locked = restore.clone();
+        locked.set_mode(0o555);
+        std::fs::set_permissions(&worlds_dir, locked).unwrap();
+        // Running as root would defeat the setup and the test would pass
+        // for the wrong reason -- say so instead.
+        assert!(
+            std::fs::write(worlds_dir.join("probe"), b"").is_err(),
+            "the fixture directory is still writable, so this test cannot \
+             provoke a failed save (running as root?)"
+        );
+
+        let handler = menu::emulate_world_handler(
+            workspace.downgrade(),
+            "assets/worlds/main.toml".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        std::fs::set_permissions(&worlds_dir, restore).unwrap();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "NOTHING may be built from a world whose edits are not on disk"
+        );
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.status.as_deref(), Some(menu::SAVE_FAILED_MESSAGE));
+            assert!(panel.status_is_error);
+            assert!(panel.selected.is_none(), "and nothing was selected to run");
+        });
+    }
+
+    /// The happy half of the same wiring: a dirty world is on disk, with
+    /// the user's edit in it, BEFORE `emd pack-ggo` is spawned to read it.
+    /// Checked by having the fake runner read the file at the moment it is
+    /// invoked, which is the only ordering that matters.
+    #[gpui::test]
+    async fn test_emulate_saves_the_dirty_world_before_the_build_reads_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        write_world_fixture(dir.path());
+        let world_path = dir.path().join("assets/worlds/main.toml");
+        assert!(
+            !std::fs::read_to_string(&world_path).unwrap().contains("50"),
+            "the fixture must not already contain the edit"
+        );
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let recorder = seen.clone();
+        let world_path_for_runner = world_path.clone();
+        let (runner, calls) = fake_proc_runner(move |_request| {
+            *recorder.lock().unwrap() = std::fs::read_to_string(&world_path_for_runner).ok();
+            ok_capture()
+        });
+        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
+        let _world_panel = dirty_world_panel(&workspace, cx, dir.path());
+
+        let handler = menu::emulate_world_handler(
+            workspace.downgrade(),
+            "assets/worlds/main.toml".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().len(), 1, "the build ran");
+        let on_disk = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the runner read the world file");
+        assert!(
+            on_disk.contains("50") && on_disk.contains("60"),
+            "the user's edit must be on disk BEFORE pack-ggo reads it, or the \
+             build bakes the stale world: {on_disk}"
+        );
     }
 
     /// **The no-hardware case, which is the normal one on a dev machine.**

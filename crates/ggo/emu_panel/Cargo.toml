@@ -34,6 +34,10 @@ util.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+# The save-first half of "Emulate this world" can only be exercised with a
+# genuinely dirty world document in a real directory -- see that feature's
+# comment in ggo_world_panel/Cargo.toml.
+ggo_world_panel = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
