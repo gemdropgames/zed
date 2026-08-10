@@ -8,7 +8,9 @@
 //! sampled `FrameRow`/`ProfileRow`s to [`ChartSpec`]s, and is pure, so
 //! the whole chart set is unit-testable without a window or a database.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use ggo_worldlib::charts::reports::{gates, ignore};
 
 use crate::chart_geom::{ChartKind, ChartSpec, Rgb, SeriesSpec};
 use crate::loader::{FrameRow, ProfileRow, RunSamples};
@@ -52,45 +54,26 @@ const OTHER_FUNCTION_NAME: &str = "other";
 /// danger-colored line, so this port does too.
 const TILE_CACHE_TILES: f32 = 64.0;
 
-/// `reports.rs`'s `DEFAULT_IGNORED_FRAME`: frame 0 is dropped from every
-/// chart, because a cold-cache first frame (every tile a miss, every
-/// asset a fresh upload) is an outlier that flattens the rest of the run.
-/// ggo-ide lets a user edit this set with a chip editor; this panel has no
-/// such editor yet, so the default is all there is -- see this task's
-/// report.
-const DEFAULT_IGNORED_FRAME: i64 = 0;
-
-// ------------------------------------------------------------------ gates
-
-/// `reports.rs`'s `chart_gates`, verbatim -- a chart whose columns are
-/// zero across every frame is hidden rather than drawn flat.
-mod gates {
-    use crate::loader::FrameRow;
-
-    pub fn has_syscalls(frames: &[FrameRow]) -> bool {
-        frames
-            .iter()
-            .any(|f| f.sc_upload + f.sc_oam + f.sc_layer + f.sc_audio + f.sc_other > 0)
-    }
-
-    pub fn has_tile_working_set(frames: &[FrameRow]) -> bool {
-        frames
-            .iter()
-            .any(|f| f.peak_spr_line + f.bg_tiles_distinct + f.spr_tiles_distinct > 0)
-    }
-
-    pub fn has_ppu(frames: &[FrameRow]) -> bool {
-        frames
-            .iter()
-            .any(|f| f.bg_evictions + f.fg_evictions + f.spr_evictions + f.tile_load_wire > 0)
-    }
-
-    pub fn has_apu(frames: &[FrameRow]) -> bool {
-        frames
-            .iter()
-            .any(|f| f.apu_fetch_wire > 0 || f.apu_underruns > 0)
-    }
+/// The one ignore set this panel has. `ignore::default_set()` is `{0}`:
+/// a cold-cache first frame (every tile a miss, every asset a fresh
+/// upload) is an outlier that flattens the rest of the run. ggo-ide lets
+/// a user edit this set with a chip editor; this panel has no such editor
+/// yet, so the default is all there is.
+///
+/// Shared with `report::build` on purpose -- the KPI tiles and the charts
+/// beneath them must be summarising the SAME frames, and R1's concern (1)
+/// is that no derivation in worldlib applies the filter for you.
+pub fn ignore_set() -> HashSet<i64> {
+    ignore::default_set()
 }
+
+// The chart gates are `ggo_worldlib::charts::reports::gates` (F5.4 Task
+// R1) rather than a copy: a chart whose columns are zero across every
+// frame is hidden rather than drawn flat, and which columns count is
+// ggo-ide's decision, not this panel's. Note `gates::has_ppu` checks 4
+// columns, not `RunPage.tsx`'s 7 -- `FrameRow` never carried
+// `bg_loads`/`fg_loads`/`spr_loads`. Pre-existing and documented on that
+// fn (R1's concern (3)); matched here rather than "fixed".
 
 // ------------------------------------------------------------- assembly
 
@@ -131,33 +114,13 @@ fn histogram(title: &str, name: &str, frames: &[FrameRow], get: fn(&FrameRow) ->
     }
 }
 
-/// Drops the ignored frames (currently just frame 0) --
-/// `reports.rs`'s `ignore::apply`.
-fn apply_ignore(frames: &[FrameRow]) -> Vec<FrameRow> {
-    frames
-        .iter()
-        .filter(|f| f.n != DEFAULT_IGNORED_FRAME)
-        .cloned()
-        .collect()
-}
-
 /// How many of `frames` the ignore filter drops -- the panel captions
 /// this ("1 frame ignored") so a user isn't left wondering why the x-axis
 /// starts at 1. ggo-ide surfaces the same fact through its chip editor,
 /// which this panel doesn't have yet.
 pub fn ignored_count(frames: &[FrameRow]) -> usize {
-    frames
-        .iter()
-        .filter(|f| f.n == DEFAULT_IGNORED_FRAME)
-        .count()
-}
-
-/// `reports.rs`'s `ignore::apply_profile`.
-fn apply_ignore_profile(rows: &[ProfileRow]) -> Vec<ProfileRow> {
-    rows.iter()
-        .filter(|r| r.frame != DEFAULT_IGNORED_FRAME)
-        .cloned()
-        .collect()
+    let ignored = ignore_set();
+    frames.iter().filter(|f| ignored.contains(&f.n)).count()
 }
 
 /// Every chart a selected run shows, in ggo-ide's exact top-to-bottom
@@ -170,11 +133,12 @@ fn apply_ignore_profile(rows: &[ProfileRow]) -> Vec<ProfileRow> {
 /// tile-working-set, PPU and APU charts each have their own
 /// zero-columns gate ([`gates`]). Everything else is unconditional.
 pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
-    let frames = apply_ignore(&samples.frames);
+    let ignored = ignore_set();
+    let frames = ignore::apply(&samples.frames, &ignored);
     if frames.is_empty() {
         return Vec::new();
     }
-    let profile = apply_ignore_profile(&samples.profile);
+    let profile = ignore::apply_profile(&samples.profile, &ignored);
 
     let x: Vec<f32> = frames.iter().map(|f| f.n as f32).collect();
     let frame_axis: Vec<i64> = frames.iter().map(|f| f.n).collect();
@@ -425,7 +389,7 @@ mod tests {
                     ..FrameRow::default()
                 })
                 .collect(),
-            profile: Vec::new(),
+            ..RunSamples::default()
         }
     }
 
@@ -500,7 +464,7 @@ mod tests {
                 n: 0,
                 ..FrameRow::default()
             }],
-            profile: Vec::new(),
+            ..RunSamples::default()
         };
         assert!(build_charts(&samples).is_empty());
     }
@@ -566,6 +530,7 @@ mod tests {
 
         samples.profile = vec![ProfileRow {
             frame: 1,
+            caller: String::new(),
             func: "update".to_string(),
             misses: 4,
             evicted: 1,
@@ -593,6 +558,7 @@ mod tests {
         let mut samples = plain_samples();
         samples.profile = vec![ProfileRow {
             frame: 0,
+            caller: String::new(),
             func: "boot".to_string(),
             misses: 4,
             evicted: 1,
@@ -608,6 +574,7 @@ mod tests {
             .enumerate()
             .map(|(i, name)| ProfileRow {
                 frame: 1,
+                caller: String::new(),
                 func: name.to_string(),
                 // Descending totals, so rank == declaration order.
                 misses: (10 - i) as i64,
@@ -629,6 +596,7 @@ mod tests {
         let axis = [1i64, 2, 3];
         let rows = vec![ProfileRow {
             frame: 2,
+            caller: String::new(),
             func: "a".to_string(),
             misses: 7,
             evicted: 3,
@@ -645,6 +613,7 @@ mod tests {
             .iter()
             .map(|n| ProfileRow {
                 frame: 1,
+                caller: String::new(),
                 func: n.to_string(),
                 misses: 5,
                 evicted: 0,
@@ -661,12 +630,14 @@ mod tests {
         let rows = vec![
             ProfileRow {
                 frame: 1,
+                caller: String::new(),
                 func: "a".to_string(),
                 misses: 9,
                 evicted: 2,
             },
             ProfileRow {
                 frame: 2,
+                caller: String::new(),
                 func: "a".to_string(),
                 misses: 1,
                 evicted: 5,
@@ -697,6 +668,7 @@ mod tests {
         samples.frames[1].apu_fetch_wire = 8;
         samples.profile = vec![ProfileRow {
             frame: 1,
+            caller: String::new(),
             func: "update".to_string(),
             misses: 4,
             evicted: 1,

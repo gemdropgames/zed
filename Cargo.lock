@@ -7518,10 +7518,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ggo-asset-formats",
+ "ggo-db",
  "ggo-emu-core",
  "image",
  "serde_json",
+ "tokio",
  "toml 1.1.4+spec-1.1.0",
+ "turso",
 ]
 
 [[package]]

@@ -1,26 +1,43 @@
 //! Off-thread perf-run listing: reads `~/.ggo/ggo_ide.db`'s `run`/`cart`
 //! tables directly -- the charts-panel analog of `ggo_world_panel::loader`
-//! / `ggo_sprite_panel::loader` (same one-shot background-pass
-//! framing), reading the SAME database ggo-ide's `backend/db.rs` opens
-//! and `backend/perf.rs::carts`/`cart_runs` query (read those two files
-//! before touching this one -- this is a deliberately narrower port: one
-//! flat "every run, newest first" query across all carts, id/date/cart
-//! label, for the panel's run picker), plus (C2) the per-run sample
-//! queries [`load_run_samples`] wraps -- faithful ports of that same
-//! file's `run_frames_async`/`run_profile_async`.
+//! / `ggo_sprite_panel::loader` (same one-shot background-pass framing),
+//! reading the SAME database ggo-ide's `backend/db.rs` opens.
 //!
-//! Unlike those loaders (a filesystem walk), this one opens a `turso`
-//! connection, which needs an async runtime underneath. `ggo-ide`'s own
-//! `backend/db.rs`/`backend/perf.rs` solve this by spinning up a private
-//! single-threaded tokio runtime per call and blocking on it; [`list_runs`]
-//! does the exact same thing. That block is safe here because it only
-//! ever runs inside `cx.background_spawn` -- a background-executor
-//! thread, not the UI thread (same rule `ggo_world_panel::loader::load_world`
-//! leans on for its own synchronous fs walk).
+//! **Per-run reads go through worldlib, not through this module.** F5.4
+//! Task R1 moved ggo-ide's whole `backend/perf.rs` into
+//! [`ggo_worldlib::charts::reports::perf_db`], so [`load_run_samples`] is
+//! now a thin fan-out over that module's `run_frames`/`run_profile`/
+//! `run_detail`/`run_uart` rather than the hand-copied SQL and
+//! `FrameRow`/`ProfileRow` shadows this file carried through C2. Those
+//! shadows are gone: [`FrameRow`]/[`ProfileRow`]/[`RunDetail`]/
+//! [`UartLine`] are re-exports of worldlib's own types, so the panel and
+//! ggo-ide are now decoding the same columns through the same code.
+//!
+//! [`list_runs`] is the one query that stays local, because worldlib has
+//! no equivalent: `perf_db` exposes `carts` + `cart_runs` (ggo-ide's
+//! two-level cart -> run drill-down), while this panel's picker is one
+//! flat "every run, newest first" list across all carts.
+//!
+//! Unlike the other panels' loaders (a filesystem walk), everything here
+//! opens a `turso` connection, which needs an async runtime underneath.
+//! `perf_db` (and [`list_runs`] below, matching it) spins up a private
+//! current-thread tokio runtime per call and BLOCKS on it. That block is
+//! only safe off the UI thread, so every call site in this crate must be
+//! inside `cx.background_spawn` -- the same rule
+//! `ggo_world_panel::loader::load_world` leans on for its own synchronous
+//! fs walk, and R1's concern (5) restated.
 
 use std::path::Path;
 
+use ggo_worldlib::charts::reports::perf_db;
 use turso::Value;
+
+// Worldlib owns these now (F5.4 Task R1). Re-exported rather than
+// re-declared so `chart_set`'s specs, the KPI derivations in
+// `ggo_worldlib::charts::reports::kpi`, and `ggo_emu_panel`'s ingest
+// round-trip test all name one type -- a private copy is exactly how a
+// panel's numbers drift from the page it mirrors.
+pub use ggo_worldlib::charts::reports::perf_db::{FrameRow, ProfileRow, RunDetail, UartLine};
 
 /// One row of the runs list: enough to identify a run in the picker.
 /// Selecting one loads its samples through [`load_run_samples`].
@@ -131,230 +148,74 @@ async fn list_runs_async(db_path: &Path) -> Result<Vec<RunListing>, String> {
 
 // ------------------------------------------------------- per-run samples
 
-/// One frame's sampled counters -- the ONLY feed for every chart, exactly
-/// as in ggo-ide (`backend/perf.rs::FrameRow`). Field set is that struct's,
-/// minus the columns no chart reads: `i_hits`/`d_hits`/`over_budget` (KPI
-/// tiles only, and this panel has no KPI row) are dropped, everything the
-/// 13 charts plot is kept.
+/// Everything one run's detail view needs, fetched in a single
+/// background pass: the frames every chart plots, the I$ profile rows the
+/// per-function charts need, the `run` row the header's config line and
+/// KPI budget come off, and the persisted guest UART the failure/panic
+/// tables parse.
 ///
-/// Units, per `ggo-emu-core/src/perfsim.rs`: every `*_wire`/budget value
-/// is a raw 33.3 MHz **wire cycle** count (a 60 fps frame budget is
-/// 555,549 of them); everything else is a raw per-frame **count** (or, for
-/// `peak_spr_line`, a per-frame max). Nothing is milliseconds or bytes,
-/// which is why the charts label no units -- same as ggo-ide's, which
-/// renders raw cycles and a percent-of-budget rather than converting.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct FrameRow {
-    pub n: i64,
-    pub instrs: i64,
-    pub i_misses: i64,
-    pub d_misses: i64,
-    pub scanout_wire: i64,
-    pub blit_wire: i64,
-    pub miss_wire: i64,
-    pub wire_total: i64,
-    pub apu_underruns: i64,
-    pub bg_evictions: i64,
-    pub fg_evictions: i64,
-    pub spr_evictions: i64,
-    pub tile_load_wire: i64,
-    pub apu_fetch_wire: i64,
-    pub sc_upload: i64,
-    pub sc_oam: i64,
-    pub sc_layer: i64,
-    pub sc_audio: i64,
-    pub sc_other: i64,
-    pub peak_spr_line: i64,
-    pub bg_tiles_distinct: i64,
-    pub spr_tiles_distinct: i64,
-    /// From the joined `run` row, so it repeats on every frame. `None` for
-    /// a device run (no wire model) -- the budget reference line is simply
-    /// not drawn then.
-    pub frame_budget_cycles: Option<i64>,
-}
-
-/// One per-frame I$ attribution sample (`backend/perf.rs::ProfileRow`).
-/// Only native `ggo-emu --profile <elf>` runs write these; every other
-/// run has none, which is exactly the gate ggo-ide uses to hide the two
-/// per-function charts.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProfileRow {
-    pub frame: i64,
-    pub func: String,
-    pub misses: i64,
-    pub evicted: i64,
-}
-
-/// Everything one run's charts need, fetched in a single background pass.
+/// All four are UNFILTERED, exactly as worldlib hands them over: the
+/// ignore filter is a view-level recalibration applied by whoever derives
+/// from them (`ggo_worldlib::charts::reports::ignore::apply` /
+/// `apply_profile`), never inside a query and never here. See
+/// `charts::reports`'s module doc -- skipping it folds frame 0's
+/// cold-cache burst into every KPI.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunSamples {
     pub frames: Vec<FrameRow>,
     pub profile: Vec<ProfileRow>,
+    /// `None` when the run id has no `run` row (deleted mid-session, or
+    /// an id that never existed) -- the header falls back to the picker's
+    /// own listing rather than erroring.
+    pub detail: Option<RunDetail>,
+    /// Empty for a run recorded before UART persistence, and for a diag
+    /// run whose serial log lives in `run_log` under a string id. That is
+    /// NOT the same as "the run recorded UART with no failures in it" --
+    /// `report::Diagnostics` is where the panel separates the two, and
+    /// this emptiness is the only signal that can.
+    pub uart: Vec<UartLine>,
 }
 
-/// `perf.rs`'s `as_i64`: a `Real` column reads as its truncated integer,
-/// anything else (including `Null`) as 0. Ported rather than using
-/// `unwrap_or(0)` on a typed getter so a column written as a float by an
-/// older ingest still decodes the same way ggo-ide decodes it.
-fn as_i64(v: &Value) -> i64 {
-    match v {
-        Value::Integer(i) => *i,
-        Value::Real(f) => *f as i64,
-        _ => 0,
-    }
-}
-
-/// `perf.rs`'s `as_opt_i64`: `Null` -> `None` (the device-run case for
-/// `frame_budget_cycles`), numeric -> `Some`.
-fn as_opt_i64(v: &Value) -> Option<i64> {
-    match v {
-        Value::Null => None,
-        Value::Integer(i) => Some(*i),
-        Value::Real(f) => Some(*f as i64),
-        _ => None,
-    }
-}
-
-/// `perf.rs`'s `as_string`.
-fn as_string(v: &Value) -> String {
-    match v {
-        Value::Text(s) => s.clone(),
-        _ => String::new(),
-    }
-}
-
-/// Column count of [`FRAME_SQL`]'s select list -- a row shorter than this
-/// is dropped rather than panicking on an index (`perf.rs` indexes
-/// `row.get_value(0..=22)` unguarded, which is safe there only because it
-/// owns the same literal).
-const FRAME_COLUMNS: usize = 23;
-
-/// A `frame`-table row in [`FRAME_SQL`]'s column order -> a [`FrameRow`].
-/// Pure -- unit-tested below against hand-built `turso::Value` rows.
-fn row_to_frame(row: &[Value]) -> Option<FrameRow> {
-    if row.len() < FRAME_COLUMNS {
-        return None;
-    }
-    Some(FrameRow {
-        n: as_i64(&row[0]),
-        instrs: as_i64(&row[1]),
-        i_misses: as_i64(&row[2]),
-        d_misses: as_i64(&row[3]),
-        scanout_wire: as_i64(&row[4]),
-        blit_wire: as_i64(&row[5]),
-        miss_wire: as_i64(&row[6]),
-        wire_total: as_i64(&row[7]),
-        apu_underruns: as_i64(&row[8]),
-        bg_evictions: as_i64(&row[9]),
-        fg_evictions: as_i64(&row[10]),
-        spr_evictions: as_i64(&row[11]),
-        tile_load_wire: as_i64(&row[12]),
-        apu_fetch_wire: as_i64(&row[13]),
-        sc_upload: as_i64(&row[14]),
-        sc_oam: as_i64(&row[15]),
-        sc_layer: as_i64(&row[16]),
-        sc_audio: as_i64(&row[17]),
-        sc_other: as_i64(&row[18]),
-        peak_spr_line: as_i64(&row[19]),
-        bg_tiles_distinct: as_i64(&row[20]),
-        spr_tiles_distinct: as_i64(&row[21]),
-        frame_budget_cycles: as_opt_i64(&row[22]),
-    })
-}
-
-fn row_to_profile(row: &[Value]) -> Option<ProfileRow> {
-    let [frame, func, misses, evicted] = row else {
-        return None;
-    };
-    Some(ProfileRow {
-        frame: as_i64(frame),
-        func: as_string(func),
-        misses: as_i64(misses),
-        evicted: as_i64(evicted),
-    })
-}
-
-/// `perf.rs::run_frames_async`'s query, minus the three columns this
-/// panel's charts never plot (`i_hits`/`d_hits`/`over_budget`). Same
-/// join, same `WHERE`, same `ORDER BY f.n` -- the frame axis every chart
-/// shares is that ordering, so it is NOT optional.
-const FRAME_SQL: &str = "SELECT f.n, f.instrs, f.i_misses, f.d_misses,
-                                f.scanout_wire, f.blit_wire, f.miss_wire, f.wire_total,
-                                f.apu_underruns,
-                                f.bg_evictions, f.fg_evictions, f.spr_evictions,
-                                f.tile_load_wire, f.apu_fetch_wire,
-                                f.sc_upload, f.sc_oam, f.sc_layer, f.sc_audio, f.sc_other,
-                                f.peak_spr_line, f.bg_tiles_distinct, f.spr_tiles_distinct,
-                                r.frame_budget_cycles
-                         FROM frame f JOIN run r ON r.id = f.run_id
-                         WHERE f.run_id = ?1
-                         ORDER BY f.n";
-
-/// `perf.rs::run_profile_async`'s query, minus `caller` (this panel has no
-/// click-to-inspect caller breakdown -- the two per-function CHARTS only
-/// ever group by `func`).
-const PROFILE_SQL: &str =
-    "SELECT frame, func, misses, evicted FROM profile WHERE run_id = ?1 ORDER BY frame";
-
-/// One run's frames + I$ profile rows. Same blocking-runtime shape (and
-/// same "must only be called from `cx.background_spawn`" rule) as
-/// [`list_runs`]; a missing db reads as no samples rather than an error,
-/// for the same reason.
+/// One run's frames, profile rows, `run` row and UART.
 ///
-/// Both queries return EVERY row -- no `LIMIT`, no SQL-side bucketing --
-/// which is ggo-ide's behavior too (`perf.rs` has neither, and the
-/// histogram binning happens in Rust). Ingest caps a run at 100,000
-/// frames, and there is no index on `frame(run_id)`, so this is a full
-/// scan; acceptable here because it runs off-thread and once per
-/// selection, but see this task's report for the caveat.
+/// Blocking, and it spins one short-lived tokio runtime per underlying
+/// `perf_db` call (four of them), so it must only ever be called from
+/// `cx.background_spawn` -- see this module's doc.
+///
+/// A missing db file reads as an empty result rather than an error, for
+/// the same reason [`list_runs`] does, and the check MUST stay in front
+/// of the `perf_db` calls: `turso::Builder::new_local` creates an empty,
+/// tableless file on open, which would then fail every `SELECT` with
+/// "no such table" instead of reading as "nothing ingested yet".
+/// `perf_db` has no such guard of its own (ggo-ide only ever points it at
+/// a db its own `backend::db::Db` has already created and migrated).
+///
+/// Every query returns EVERY row -- no `LIMIT`, no SQL-side bucketing --
+/// which is ggo-ide's behavior too. Ingest caps a run at 100,000 frames
+/// and there is no index on `frame(run_id)`, so this is a full scan;
+/// acceptable because it runs off-thread, once per selection.
+///
+/// Errors are stringified with `{e:#}`, not `{e}`: `perf_db` builds its
+/// `anyhow::Error`s out of `.context(..)`, whose plain `Display` shows
+/// only the outermost context -- the alternate form appends the chain,
+/// which is where the actual turso failure is.
 pub fn load_run_samples(db_path: &Path, run_id: i64) -> Result<RunSamples, String> {
     if !db_path.exists() {
         return Ok(RunSamples::default());
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(load_run_samples_async(db_path, run_id))
-}
-
-async fn load_run_samples_async(db_path: &Path, run_id: i64) -> Result<RunSamples, String> {
-    let db = turso::Builder::new_local(&db_path.to_string_lossy())
-        .build()
-        .await
-        .map_err(|e| e.to_string())?;
-    let conn = db.connect().map_err(|e| e.to_string())?;
-    conn.busy_timeout(ggo_db::BUSY_TIMEOUT)
-        .map_err(|e| e.to_string())?;
-
-    let frames = query_rows(&conn, FRAME_SQL, run_id, row_to_frame).await?;
-    // A run with no profile rows is the norm (only native `--profile`
-    // runs write them), so this must not fail the whole load.
-    let profile = query_rows(&conn, PROFILE_SQL, run_id, row_to_profile).await?;
-    Ok(RunSamples { frames, profile })
-}
-
-/// `perf.rs::all_rows` + a row decoder in one pass: every row's column
-/// values collected positionally, undecodable rows skipped.
-async fn query_rows<T>(
-    conn: &turso::Connection,
-    sql: &str,
-    run_id: i64,
-    decode: fn(&[Value]) -> Option<T>,
-) -> Result<Vec<T>, String> {
-    let mut rows = conn.query(sql, [run_id]).await.map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
-        let n = row.column_count();
-        let mut vals = Vec::with_capacity(n);
-        for i in 0..n {
-            vals.push(row.get_value(i).map_err(|e| e.to_string())?);
-        }
-        if let Some(decoded) = decode(&vals) {
-            out.push(decoded);
-        }
-    }
-    Ok(out)
+    // `{e:#}` (not `{e}`): `perf_db` returns `anyhow::Error`s built from
+    // `.context(..)`, and the plain `Display` shows only the outermost
+    // context -- the alternate form appends the chain, which is where the
+    // actual turso failure is.
+    Ok(RunSamples {
+        frames: perf_db::run_frames(db_path, run_id).map_err(|e| format!("{e:#}"))?,
+        // A run with no profile rows is the norm (only a native
+        // `--profile` capture writes them), so an empty result here is
+        // not an error -- `perf_db` already answers list queries that way.
+        profile: perf_db::run_profile(db_path, run_id).map_err(|e| format!("{e:#}"))?,
+        detail: perf_db::run_detail(db_path, run_id).map_err(|e| format!("{e:#}"))?,
+        uart: perf_db::run_uart(db_path, run_id).map_err(|e| format!("{e:#}"))?,
+    })
 }
 
 #[cfg(test)]
@@ -493,74 +354,13 @@ mod tests {
 
     // -------------------------------------------------- per-run samples
 
-    #[test]
-    fn row_to_frame_maps_every_column_in_select_order() {
-        // 23 columns in FRAME_SQL's order, each a distinct value so a
-        // transposed mapping would fail loudly.
-        let mut row: Vec<Value> = (0..22).map(|i| Value::Integer(i as i64 + 1)).collect();
-        row.push(Value::Integer(555_549));
-        let f = row_to_frame(&row).expect("a full row must decode");
-        assert_eq!(f.n, 1);
-        assert_eq!(f.instrs, 2);
-        assert_eq!(f.i_misses, 3);
-        assert_eq!(f.d_misses, 4);
-        assert_eq!(f.scanout_wire, 5);
-        assert_eq!(f.blit_wire, 6);
-        assert_eq!(f.miss_wire, 7);
-        assert_eq!(f.wire_total, 8);
-        assert_eq!(f.apu_underruns, 9);
-        assert_eq!(f.bg_evictions, 10);
-        assert_eq!(f.fg_evictions, 11);
-        assert_eq!(f.spr_evictions, 12);
-        assert_eq!(f.tile_load_wire, 13);
-        assert_eq!(f.apu_fetch_wire, 14);
-        assert_eq!(f.sc_upload, 15);
-        assert_eq!(f.sc_oam, 16);
-        assert_eq!(f.sc_layer, 17);
-        assert_eq!(f.sc_audio, 18);
-        assert_eq!(f.sc_other, 19);
-        assert_eq!(f.peak_spr_line, 20);
-        assert_eq!(f.bg_tiles_distinct, 21);
-        assert_eq!(f.spr_tiles_distinct, 22);
-        assert_eq!(f.frame_budget_cycles, Some(555_549));
-    }
-
-    /// A device run has no wire model, so `run.frame_budget_cycles` is
-    /// NULL -- that must read as `None` (no budget line drawn), not 0
-    /// (a budget line at zero).
-    #[test]
-    fn row_to_frame_reads_a_null_budget_as_none() {
-        let mut row: Vec<Value> = (0..22).map(|_| Value::Integer(0)).collect();
-        row.push(Value::Null);
-        assert_eq!(row_to_frame(&row).unwrap().frame_budget_cycles, None);
-    }
-
-    #[test]
-    fn row_to_frame_rejects_a_short_row() {
-        assert_eq!(row_to_frame(&[]), None);
-        let short: Vec<Value> = (0..FRAME_COLUMNS - 1).map(|_| Value::Integer(0)).collect();
-        assert_eq!(row_to_frame(&short), None);
-    }
-
-    #[test]
-    fn row_to_profile_parses_and_rejects() {
-        let row = vec![
-            Value::Integer(3),
-            Value::Text("update_entities".to_string()),
-            Value::Integer(12),
-            Value::Integer(4),
-        ];
-        assert_eq!(
-            row_to_profile(&row),
-            Some(ProfileRow {
-                frame: 3,
-                func: "update_entities".to_string(),
-                misses: 12,
-                evicted: 4,
-            })
-        );
-        assert_eq!(row_to_profile(&[]), None);
-    }
+    // Column-order/decoding tests for `FrameRow`/`ProfileRow` are NOT
+    // duplicated here any more: those rows are decoded by
+    // `ggo_worldlib::charts::reports::perf_db`, whose own tests pin the
+    // select-list order, the NULL-budget case and the short-row case.
+    // What is still this crate's business is the fan-out below --
+    // that `load_run_samples` asks for all four pieces, against the real
+    // migrated schema, and that a missing db is empty rather than an error.
 
     #[test]
     fn load_run_samples_returns_nothing_for_a_missing_db_file() {
@@ -574,9 +374,9 @@ mod tests {
     }
 
     /// A fixture db through the real `ggo_db::migrate` schema, seeded with
-    /// two frames (inserted out of order, to pin `ORDER BY f.n`) and one
-    /// profile row -- proves both queries decode against the ACTUAL
-    /// column names/types, not just hand-built `Value` rows.
+    /// two frames (inserted out of order, to pin `ORDER BY f.n`), one
+    /// profile row and two UART lines -- proves all four queries decode
+    /// against the ACTUAL column names/types.
     #[test]
     fn load_run_samples_reads_frames_in_frame_number_order_with_profile_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -614,6 +414,14 @@ mod tests {
             )
             .await
             .unwrap();
+            for (seq, text) in [(0i64, "== GGO OS booted =="), (1, "asset: MISS \"x.til\"")] {
+                conn.execute(
+                    "INSERT INTO uart (run_id, seq, text) VALUES (1, ?1, ?2)",
+                    (seq, text),
+                )
+                .await
+                .unwrap();
+            }
         });
 
         let samples = load_run_samples(&path, 1).unwrap();
@@ -630,6 +438,22 @@ mod tests {
         assert_eq!(samples.profile.len(), 1);
         assert_eq!(samples.profile[0].func, "update_entities");
         assert_eq!(samples.profile[0].evicted, 4);
+
+        // The three columns the panel's own `FrameRow` shadow used to
+        // drop, and which every KPI tile needs -- the reason that shadow
+        // is gone.
+        assert_eq!(samples.frames[0].i_hits, 0);
+        assert_eq!(samples.frames[0].d_hits, 0);
+        assert!(!samples.frames[0].over_budget);
+
+        // The `run` row (config line + KPI budget) and the UART the
+        // failure tables parse, both fetched in this same pass.
+        let detail = samples.detail.as_ref().expect("the run row exists");
+        assert_eq!(detail.id, 1);
+        assert_eq!(detail.cart_name, "demo");
+        assert_eq!(detail.frame_budget_cycles, Some(555_549));
+        assert_eq!(samples.uart.len(), 2, "UART comes back in `seq` order");
+        assert_eq!(samples.uart[1], "asset: MISS \"x.til\"");
     }
 
     /// The overwhelmingly common case: a run with frames but no profile
