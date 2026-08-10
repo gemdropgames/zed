@@ -1907,6 +1907,9 @@ mod tests {
     /// entry: these tests guard the HOOK, not any particular menu item.
     const GGO_ENTRY: &str = "Re-run (perf)";
     const GGO_ITEM: &str = "MENU_ITEM-Re-run (perf)";
+    /// A second contributor's label, for the registration-order test.
+    const SECOND_ENTRY: &str = "Emulate this world";
+    const SECOND_ITEM: &str = "MENU_ITEM-Emulate this world";
     /// Upstream entries every writable project-panel menu carries. Their
     /// presence proves a menu really deployed, and that the fork APPENDED to
     /// upstream's menu rather than replacing it.
@@ -1939,6 +1942,22 @@ mod tests {
         cx.default_global::<Offered>().0.push((rel.clone(), is_dir));
         if rel.ends_with(".cart") {
             vec![ui::ContextMenuEntry::new(GGO_ENTRY).into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A second contributor, registered after `cart_contributor`, claiming
+    /// the same paths so both land in one menu.
+    fn world_contributor(
+        _workspace: &mut Workspace,
+        path: &ProjectPath,
+        _is_dir: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Workspace>,
+    ) -> Vec<ui::ContextMenuItem> {
+        if path.path.as_unix_str().ends_with(".cart") {
+            vec![ui::ContextMenuEntry::new(SECOND_ENTRY).into()]
         } else {
             Vec::new()
         }
@@ -2077,7 +2096,11 @@ mod tests {
             y += px(4.);
         }
         let seen = cx.update(|_, cx| cx.default_global::<Offered>().0.clone());
-        panic!("no row for {rel:?} was right-clickable; the scan saw {seen:?}");
+        panic!(
+            "no row for {rel:?} was right-clickable, or the GGO block in \
+             project_panel.rs's deploy_context_menu is gone (nothing was \
+             offered to the contributor at all); the scan saw {seen:?}"
+        );
     }
 
     /// **The `deploy_context_menu` hook itself, end to end.** Everything else
@@ -2098,16 +2121,29 @@ mod tests {
 
         right_click_row(cx, column_x, "hero.cart");
 
-        assert!(
-            cx.debug_bounds(GGO_ITEM).is_some(),
-            "the contributed entry must be in the deployed menu -- if this \
-             fails, the GGO block in project_panel.rs's deploy_context_menu \
-             is gone"
-        );
+        let ggo_y = cx
+            .debug_bounds(GGO_ITEM)
+            .expect(
+                "the contributed entry must be in the deployed menu -- if this \
+                 fails, the GGO block in project_panel.rs's deploy_context_menu \
+                 is gone",
+            )
+            .origin
+            .y;
+        // Present AND last: "the fork's entries go last" is load-bearing (see
+        // docs/ggo/UPSTREAM.md), and an entry spliced in ahead of upstream's
+        // would still be "present".
         for item in UPSTREAM_ITEMS {
+            let upstream_y = cx
+                .debug_bounds(item)
+                .unwrap_or_else(|| {
+                    panic!("{item} must still be there: the fork APPENDS to upstream's menu")
+                })
+                .origin
+                .y;
             assert!(
-                cx.debug_bounds(item).is_some(),
-                "{item} must still be there: the fork APPENDS to upstream's menu"
+                ggo_y > upstream_y,
+                "the contributed entry must render BELOW {item}"
             );
         }
         assert_eq!(
@@ -2133,6 +2169,44 @@ mod tests {
             Some(("worlds".to_string(), true)),
             "a directory is offered with is_dir = true"
         );
+    }
+
+    /// Two contributors' entries are concatenated in REGISTRATION order --
+    /// the order GGO crates' `init`s run in, which is the only order an
+    /// author can reason about when placing their entries.
+    #[gpui::test]
+    async fn test_project_panel_context_menu_appends_in_registration_order(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, column_x, cx) = context_menu_panel(cx).await;
+        cx.update(|_, cx| {
+            workspace::register_context_menu_contributor(cx, cart_contributor);
+            workspace::register_context_menu_contributor(cx, world_contributor);
+        });
+
+        right_click_row(cx, column_x, "hero.cart");
+
+        let first = cx
+            .debug_bounds(GGO_ITEM)
+            .expect("the first contributor's entry")
+            .origin
+            .y;
+        let second = cx
+            .debug_bounds(SECOND_ITEM)
+            .expect("the second contributor's entry")
+            .origin
+            .y;
+        assert!(
+            first < second,
+            "entries follow the order their contributors were registered in"
+        );
+        for item in UPSTREAM_ITEMS {
+            let upstream_y = cx.debug_bounds(item).expect("upstream entry").origin.y;
+            assert!(
+                first > upstream_y,
+                "both contributed entries still come after {item}"
+            );
+        }
     }
 
     /// The empty-registry case: upstream's menu, untouched. The separator

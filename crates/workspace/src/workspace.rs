@@ -1056,7 +1056,16 @@ impl Workspace {
     /// path interceptors already follow: GGO panels read their documents with
     /// `std::fs` against the worktree's `abs_path`, which on an SSH remote or
     /// a collab guest names a directory that does not exist on this machine.
-    /// GGO.
+    ///
+    /// Contributors run with the project panel LEASED -- the only caller is
+    /// `ProjectPanel::deploy_context_menu`, which upstream reaches through
+    /// `cx.listener` -- so a contributor that reaches back for
+    /// `workspace.panel::<ProjectPanel>(cx)` and reads or updates it panics
+    /// ("cannot read/update ProjectPanel while it is already being updated").
+    /// Anything a contributor needs about the clicked entry beyond
+    /// `(path, is_dir)` should become a parameter here, computed at the call
+    /// site where those values are already locals. Entry *handlers* run after
+    /// the lease is released and are unrestricted. GGO.
     pub fn context_menu_contributions(
         &mut self,
         path: &ProjectPath,

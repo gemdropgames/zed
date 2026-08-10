@@ -50,7 +50,8 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
     twice — once by the interceptor, once by the open). That hoist is the
     8 deleted lines in the F4 diff; everything else inside the guard is the
     original statement, unmoved (`cargo fmt --check` clean before and after).
-    Verify with `cargo test -p workspace --lib -p project_panel --lib` plus
+    Verify with `cargo test -p workspace -p project_panel --lib` (one `--lib`
+    for both packages — cargo rejects the flag twice) plus
     `cargo test -p ggo_world_panel -p ggo_metasprite_panel -p ggo_tileset_panel`
     (interceptor-routing + already-open-fast-path tests) and, above all, the
     two tests in the fork that each enter at one of the real
@@ -66,7 +67,7 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
   - `crates/workspace/src/workspace.rs`: the `ContextMenuContributor` registry
     (`register_context_menu_contributor` + `Workspace::context_menu_contributions`)
     — the fork's **third** behavioural hook (F5.0/G1), one GGO-marked block of
-    71 lines with opening AND closing markers, placed immediately after the
+    80 lines (`:1014-1092`) with opening AND closing markers, placed after the
     `PathOpenInterceptor` block above. Same `try_global` gate: an absent or
     empty registry returns an empty `Vec` and the menu is byte-identical to
     upstream's. A contributor returns `Vec<ui::ContextMenuItem>` rather than
@@ -75,24 +76,50 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
     and the separator the call site emits ahead of the fork's block would be
     stray whenever every contributor declined. Non-local projects (SSH remote,
     collab guest) contribute nothing, mirroring
-    `ggo_common::rel_in_primary_worktree`'s rule.
+    `ggo_common::rel_in_primary_worktree`'s rule. **Contributors run while
+    `ProjectPanel` is leased** (`deploy_context_menu` is reached through
+    `cx.listener`), so one that reaches back for
+    `workspace.panel::<ProjectPanel>(cx)` and reads or updates it panics
+    ("cannot read/update ProjectPanel while it is already being updated").
+    Entry *handlers* run later, after the lease is released, and are free of
+    this. If a contributor needs more predicate context than
+    `(path, is_dir)` — `is_read_only`, `is_root`, `marked_entries` — add it as
+    a PARAMETER: all three are already locals in scope at the call site, so it
+    is a one-line change inside the same GGO chunk, and it keeps contributors
+    out of the leased entity.
   - `crates/project_panel/src/project_panel.rs`: a THIRD guarded call site
     (F5.0/G1), and the **second** hook in this file — inside
-    `deploy_context_menu` (currently `:1122-1261`): a `ggo_items` local
-    computed just before `ContextMenu::build`, and a trailing `.map(…)` chained
-    onto the builder closure's existing `.map(…)`. 26 added lines, **0
-    deleted** — unlike the F4 sites, nothing upstream is wrapped, re-indented
-    or moved, so a conflict here should always resolve as "take upstream's
-    region, paste both GGO chunks back in". Order is load-bearing: the fork's
-    entries go last, after everything upstream builds, and the `separator()`
-    is inside the `else` branch so an empty registry adds no divider.
-    Verify with `cargo test -p workspace --lib -p project_panel --lib`
-    (237 + 116) plus, above all, `cargo test -p ggo_emu_panel context_menu`
-    (3 tests) — `test_project_panel_context_menu_shows_a_contributed_entry`
-    builds a REAL `ProjectPanel`, docks it, right-clicks a real row and looks
-    for the contributed entry in the RENDERED menu, so a dropped hook fails it
-    rather than merging in silently (verified red twice: with the trailing
-    `.map` neutered, and with both GGO chunks deleted).
+    `deploy_context_menu` (`:1061`), two GGO-marked chunks at `:1122-1136` and
+    `:1138`/`:1251-1259`:
+      1. `:1122-1136` — a `ggo_project_path` + `ggo_items` local computed just
+         before `ContextMenu::build`. Purely additive.
+      2. `:1138` and `:1251-1259` — the builder closure's body becomes a
+         statement: upstream's `menu.context(self.focus_handle.clone()).map(…)`
+         gains a `let menu = ` prefix, its closing `})` gains a `;`, and the
+         closure then ends with the fork's
+         `if ggo_items.is_empty() { menu } else { menu.separator().extend(ggo_items) }`.
+    29 added lines, **2 deleted** — and the 2 deletions are those same 2 lines
+    re-emitted, nothing else. Why not chain a second `.map(…)` onto upstream's
+    (which would have been additive-only): rustfmt then re-indents the entire
+    ~120-line builder chain, turning every future merge conflict here into the
+    whole menu. `cargo fmt --check` is clean before and after the `let` form.
+    **Merge recovery**, when this conflicts: take upstream's `deploy_context_menu`
+    wholesale, paste chunk 1 back in verbatim after
+    `let has_pasteable_content = …;`, then re-apply chunk 2 by hand — add
+    `let menu = ` to the `menu.context(…)` line, a `;` to the `})` that closes
+    it, and paste the `if/else` before the closure's final `}`. Dropping the
+    `let`/`;` half does not compile, so a half-applied merge fails loudly.
+    Order is load-bearing: the fork's entries go last, after everything
+    upstream builds, and the `separator()` is inside the `else` branch so an
+    empty registry adds no divider.
+    Verify with `cargo test -p workspace -p project_panel --lib` (237 + 116;
+    one `--lib` for both packages) plus, above all,
+    `cargo test -p ggo_emu_panel context_menu` (4 tests) —
+    `test_project_panel_context_menu_shows_a_contributed_entry` builds a REAL
+    `ProjectPanel`, docks it, right-clicks a real row and looks for the
+    contributed entry in the RENDERED menu (below every upstream entry), so a
+    dropped hook fails it rather than merging in silently (verified red twice:
+    with the `if/else` neutered to `menu`, and with both GGO chunks deleted).
 - Anything else conflicting means upstream moved a registration site: relocate the marker line, never keep a stale copy of upstream code.
 - After each merge: verify `reload_keymaps` (crates/zed/src/zed.rs) still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed` — ggo_world_panel's, ggo_metasprite_panel's, ggo_charts_panel's, and ggo_emu_panel's keybindings all silently die if that call disappears.
 
@@ -122,3 +149,4 @@ sweep is the seven-crate one in the update procedure above.
 - 2026-08-09 F4 wrap (X1-X3: explorer-driven panel routing, `ggo_tileset_panel` read-only `.til` viewer, docs + sweep), post-merge: `cargo test -p ggo_hello -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel -p ggo_charts_panel -p ggo_emu_panel -p ggo_language -p ggo_tileset_panel` = 3+5+43+46+95+76+15+13 = **296 passed, 0 failed** (all EIGHT ggo crates); `cargo clippy` on all eight `--all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `script/check-licenses` exit 0; `cargo check -p zed` clean; `cargo test -p workspace --lib` = 237 passed; `cargo test -p project_panel --lib` = 116 passed (both touched by X1's interceptor hooks). Feature disposition re-tally: `docs/ggo/MIGRATION.md` Counts, dropped → partial by one row (`.til` viewer).
 - 2026-08-09 F4 X4 (`.cart` explorer routing — the last in-panel picker removed; F4 final-review doc corrections; `ggo_hello` deleted): `cargo test -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel -p ggo_charts_panel -p ggo_emu_panel -p ggo_language -p ggo_tileset_panel` = 5+43+46+95+71+15+13 = **288 passed, 0 failed** (all SEVEN remaining ggo crates; `ggo_emu_panel` 76 → 71: −9 for the deleted enumeration/dropdown tests, +4 for routing); `cargo clippy -p ggo_emu_panel -p ggo_common --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `script/check-licenses` exit 0; `cargo check -p zed` clean (the real test of the `ggo_hello` de-registration); `cargo test -p workspace --lib` = 237 passed; `cargo test -p project_panel --lib` = 116 passed. New: `ggo_emu_panel`'s `test_project_panel_opened_entry_routes_a_cart_into_the_panel` enters at the REAL `project_panel` `Event::OpenedEntry` subscription — verified red by deleting the GGO guard, green with it. Feature disposition: no status moved, `MIGRATION.md` Counts unchanged.
 - 2026-08-09 F4 X4 review follow-up (closes the review's remaining items): added `ggo_emu_panel::test_project_panel_split_entry_routes_a_cart_into_the_panel`, the `Event::SplitEntry` sibling of the `OpenedEntry` test above — same real-`ProjectPanel` shape, verified red by neutralizing the `:955` `split_path_preview` guard and green again with it restored (`git diff crates/project_panel/` empty after). Both project_panel.rs call sites are now covered. Also fixed three stale comments in `ggo_emu_panel.rs` (module doc, `run_generation` field doc, completion-closure comment) left over from `refresh_carts`/`load_generation`'s deletion in 51f351a9c3, and dated the `UPSTREAM.md` pane-smoke line as `ggo_hello`-era history. `cargo test -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel -p ggo_charts_panel -p ggo_emu_panel -p ggo_language -p ggo_tileset_panel` = 5+43+46+95+72+15+13 = **289 passed, 0 failed**; `cargo clippy -p ggo_emu_panel --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `script/check-licenses` exit 0; `cargo check -p zed` clean; `cargo test -p project_panel --lib` = 116 passed.
+- 2026-08-09 F5.0 G1 (project-panel context-menu contributor hook — the fork's THIRD behavioural hook and SECOND site in `project_panel.rs`): registry `crates/workspace/src/workspace.rs` +80/−0 (one GGO-marked block, `:1014-1092`, right after the `PathOpenInterceptor` block), call site `crates/project_panel/src/project_panel.rs` +29/−2 (two GGO chunks in `deploy_context_menu`; the 2 deletions are the same 2 lines re-emitted with `let menu = ` / `;` — chaining a second `.map(…)` instead would have been additive-only but made rustfmt re-indent the whole ~120-line builder chain). Contributor signature returns `Vec<ui::ContextMenuItem>` rather than taking/returning the half-built `ContextMenu`: `ContextMenu::items` is private with no length accessor, so "did anything get added?" would be unanswerable and the separator would render stray whenever every contributor declined. `cargo test -p ggo_emu_panel` = **76 passed** (72 baseline + 4: rendered-menu canary incl. below-upstream ordering, registration order, empty registry, non-local decline); `cargo test -p workspace -p project_panel --lib` = 237 + 116 passed; `cargo clippy -p ggo_emu_panel --all-targets -- -D warnings` and `-p workspace -p project_panel --lib` clean; `cargo fmt --all --check` clean; `script/check-licenses` exit 0; `cargo check -p zed` clean. Red drill: canary verified red twice (the `if/else` neutered to `menu`; both GGO chunks deleted — the latter still compiles, which is exactly the silent-merge case) and green again with `git diff crates/project_panel/` back to the intended hook.
