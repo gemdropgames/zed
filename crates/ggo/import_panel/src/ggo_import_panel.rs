@@ -38,12 +38,20 @@
 //! will be quantized and sliced); middle-drag pans and the wheel zooms, both
 //! at integer scale. The crop settles on pointer-up, which is when the
 //! quantized **preview** is recomputed -- the same "don't quantize every
-//! pointer-move" rule `WizardState::commit_region` documents. A **cell grid**
-//! is drawn INSIDE the crop at the current cell size (default one
-//! [`ggo_asset_formats::TILE_PX`] tile) showing where `slice_to_tiles` will
-//! cut; the footer reports both the tile count that will be written and how
-//! many WHOLE cells the crop covers, so a crop that will be zero-padded on
-//! its right/bottom edge is visible before the commit rather than after.
+//! pointer-move" rule `WizardState::commit_region` documents. A **tile grid**
+//! is drawn INSIDE the crop at [`ggo_asset_formats::TILE_PX`], which is the
+//! step -- the ONLY step -- `slice_to_tiles` cuts at; the footer reports the
+//! tile count that will be written and how many of those tiles are WHOLE, so
+//! a crop that will be zero-padded on its right/bottom edge is visible before
+//! the commit rather than after.
+//!
+//! There is deliberately **no cell-size control**. ggo-ide had Cell W/H
+//! inputs and a live grid at that size, but they lived inside
+//! `<Show when={mode() === 'metasprite'}>` -- they sized METASPRITE FRAMES
+//! and never existed in Tileset mode. Porting them here (fix round 1,
+//! BLOCKING 1) drew dividers where nothing is cut and mis-flagged a
+//! tile-aligned crop as ragged, because `slice_to_tiles` is hard-wired to
+//! `TILE_PX`.
 //!
 //! ## Not ported from ggo-ide's wizard (deliberate, not oversight)
 //!
@@ -74,10 +82,9 @@ use std::sync::Arc;
 use editor::Editor;
 use gpui::{
     Action, App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent,
-    Styled, Task, WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb,
-    rgba, size,
+    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Task,
+    WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb, rgba, size,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -98,8 +105,6 @@ actions!(
     [
         /// Toggles focus on the GGO import panel.
         ToggleFocus,
-        /// Applies the cell-size fields to the import's grid overlay.
-        ApplyGrid,
         /// Writes the pending import to its `.til`/`.pal`.
         Import
     ]
@@ -169,16 +174,15 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// No panel-specific keybinds: the two destination fields are read straight
+/// off their editors on every render (`sync_dest_fields`), so there is
+/// nothing for Enter to "apply", and Import is button-only (it writes files;
+/// a stray keystroke should not). Kept as its own fn -- rather than inlined
+/// into `init` -- so it matches the other GGO panels' shape exactly: `init`
+/// calls it once at startup AND the `KeymapEventChannel` observer calls it
+/// again on every reload.
 fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([
-        // Single-line editors don't bind Enter themselves (the default
-        // keymap's `enter -> editor::Newline` is `mode == full` only), so
-        // this fires while any of the four form fields is focused. Enter in
-        // a DEST field applies the grid too, which is a no-op re-read rather
-        // than a surprise: the dest fields are read straight off the editors
-        // on every render (see `sync_dest_fields`).
-        KeyBinding::new("enter", ApplyGrid, Some(&format!("{KEY_CONTEXT} > Editor"))),
-    ]);
+    cx.bind_keys([]);
 }
 
 /// Does `path` name a PNG? One rule, so the menu predicate and the tests
@@ -291,6 +295,41 @@ fn split_png_path(project_root: &Path, rel: &str) -> (PathBuf, String) {
     (project_root.to_path_buf(), rel.to_string())
 }
 
+/// The root a commit actually writes against, and the destination's rel
+/// relative to THAT root -- [`split_png_path`]'s rule re-applied to the
+/// RESOLVED DESTINATION instead of to the source.
+///
+/// **Fix round 1, BLOCKING 2.** The destination directory is user-editable,
+/// so it can move the write out of the frame the SOURCE was resolved in: a
+/// PNG in `art/` has no `assets/` ancestor, so `split_png_path` falls back to
+/// the worktree root -- and typing `assets/tiles` into Dir then aimed the
+/// write INTO the asset tree while still naming it `assets/tiles/x.til`,
+/// which is exactly the `ggo-sprfix` shape. Re-deriving from where the bytes
+/// are actually going is what keeps the contract true for a retargeted
+/// import; deriving once, from the source, is what made it false.
+///
+/// Idempotent for a destination already in the source's own frame, and a
+/// no-op (worktree root passes through) when the destination is outside any
+/// emerald `assets/` tree.
+///
+/// This is also what makes an out-of-assets PNG importable INTO the assets
+/// tree at all: worldlib's `safe_join` rejects `..`, so a `../assets/tiles`
+/// dir could never have worked.
+fn resolve_dest(root: &Path, rel_stem: &str) -> (PathBuf, String) {
+    let abs = root.join(rel_stem);
+    if let Some(assets) = emerald_asset_root(&abs)
+        && let Ok(under) = abs.strip_prefix(&assets)
+    {
+        return (
+            assets,
+            under
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+        );
+    }
+    (root.to_path_buf(), rel_stem.to_string())
+}
+
 /// The directory part of a `/`-separated rel (`"art/hero.png"` -> `"art"`,
 /// a bare `"hero.png"` -> `""`) -- the destination directory an import
 /// defaults to, which is wherever the source PNG already lives.
@@ -368,13 +407,10 @@ struct PanDrag {
     start_pan: [f32; 2],
 }
 
-/// The four form fields: destination directory + stem, and the grid's cell
-/// size.
+/// The two form fields: destination directory + stem.
 struct Fields {
     dir: Entity<Editor>,
     stem: Entity<Editor>,
-    cell_w: Entity<Editor>,
-    cell_h: Entity<Editor>,
 }
 
 /// What a committed import wrote and what to do next with it.
@@ -477,8 +513,22 @@ impl OpenImport {
         geom::effective_region(self.wizard.region, self.wizard.src_w, self.wizard.src_h)
     }
 
-    fn cell(&self) -> (usize, usize) {
-        (self.wizard.cell_w as usize, self.wizard.cell_h as usize)
+    /// The root a commit writes against and the destination's rel relative
+    /// to THAT root -- re-derived from the resolved DESTINATION, not
+    /// inherited from the source (see [`resolve_dest`]).
+    fn dest(&self) -> (PathBuf, String) {
+        resolve_dest(&self.root, &self.wizard.dest_rel_stem())
+    }
+
+    /// Every file a commit at the current destination would (over)write.
+    ///
+    /// `WizardState::targets` computes the same pair, but off the wizard's
+    /// RAW stem -- i.e. in the source's frame, before [`resolve_dest`] has
+    /// had its say. Using it here would re-introduce the `assets/`-prefixed
+    /// rel that re-rooting exists to remove.
+    fn dest_targets(&self) -> Vec<String> {
+        let (_, stem) = self.dest();
+        vec![format!("{stem}.til"), format!("{stem}.pal")]
     }
 }
 
@@ -571,7 +621,11 @@ impl ImportPanel {
         };
         let source_rel = rel.to_string();
         let source_abs = project_root.join(&source_rel);
-        let (root, _) = split_png_path(&project_root, &source_rel);
+        // ONE walk, destructured once: the two halves are the same answer to
+        // the same question, and re-asking it after the decode could have
+        // returned a different one (fix round 1, FOLD IN 3).
+        let (root, under) = split_png_path(&project_root, &source_rel);
+        let dest_dir = parent_dir(&under);
         self.load_generation += 1;
         let generation = self.load_generation;
         self.state = ViewerState::Loading {
@@ -596,8 +650,7 @@ impl ImportPanel {
                             OpenImport::new(source_rel.clone(), source_abs, root.clone(), loaded);
                         // Default the destination to wherever the source
                         // already lives, ASSET-ROOT-relative.
-                        let (_, under) = split_png_path(&project_root, &source_rel);
-                        open.wizard.set_dest_dir(parent_dir(&under));
+                        open.wizard.set_dest_dir(dest_dir);
                         Self::rebuild_preview(&mut open);
                         ViewerState::Ready(Box::new(open))
                     }
@@ -755,12 +808,11 @@ impl ImportPanel {
 
     // ------------------------------------------------------------- fields
 
-    /// Create the four form fields on the first Ready render, seeded from the
+    /// Create the two form fields on the first Ready render, seeded from the
     /// wizard. They are never re-synced afterwards: unlike the map panel's
     /// resize fields (which mirror a document that undo/redo can change under
     /// them), these fields ARE the state -- nothing else writes the
-    /// destination, and the cell size only changes when [`Self::apply_grid`]
-    /// reads it back out of them.
+    /// destination.
     fn ensure_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
@@ -769,12 +821,9 @@ impl ImportPanel {
             return;
         }
         let (dir, stem) = (open.wizard.dest_dir.clone(), open.wizard.dest_stem.clone());
-        let (cell_w, cell_h) = (open.wizard.cell_w, open.wizard.cell_h);
         let fields = Fields {
             dir: Self::new_field(&dir, window, cx),
             stem: Self::new_field(&stem, window, cx),
-            cell_w: Self::new_field(&cell_w.to_string(), window, cx),
-            cell_h: Self::new_field(&cell_h.to_string(), window, cx),
         };
         if let ViewerState::Ready(open) = &mut self.state {
             open.fields = Some(fields);
@@ -812,36 +861,6 @@ impl ImportPanel {
         }
     }
 
-    /// Apply the cell-size fields to the grid overlay. Explicit (the button,
-    /// or Enter in a field), never on blur. Unparsable text keeps the current
-    /// value; a parsed one is clamped by worldlib's `clamp_cell_dim` and the
-    /// clamped value is written back into the field, so what is displayed is
-    /// always what is drawn.
-    fn apply_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((w_editor, h_editor)) = self
-            .ready()
-            .and_then(|open| open.fields.as_ref())
-            .map(|fields| (fields.cell_w.clone(), fields.cell_h.clone()))
-        else {
-            return;
-        };
-        let (w_text, h_text) = (w_editor.read(cx).text(cx), h_editor.read(cx).text(cx));
-        let ViewerState::Ready(open) = &mut self.state else {
-            return;
-        };
-        let raw_w = w_text.trim().parse::<u32>().unwrap_or(open.wizard.cell_w);
-        let raw_h = h_text.trim().parse::<u32>().unwrap_or(open.wizard.cell_h);
-        open.wizard.set_cell_w(raw_w);
-        open.wizard.set_cell_h(raw_h);
-        let (cell_w, cell_h) = (open.wizard.cell_w, open.wizard.cell_h);
-        for (editor, value) in [(w_editor, cell_w), (h_editor, cell_h)] {
-            editor.update(cx, |editor, cx| {
-                editor.set_text(value.to_string(), window, cx)
-            });
-        }
-        cx.notify();
-    }
-
     // ------------------------------------------------------------- commit
 
     /// The Import button / action: confirm any overwrite FIRST, then write,
@@ -862,12 +881,16 @@ impl ImportPanel {
             cx.notify();
             return;
         }
-        let (root, targets, dir) = (
-            open.root.clone(),
-            open.wizard.targets(),
-            open.wizard.dest_dir.trim_end_matches('/').to_string(),
+        // The collision scan runs in the SAME frame the write will use --
+        // `OpenImport::dest`, re-derived from the destination (see
+        // `resolve_dest`) -- so a retargeted import can't check one directory
+        // and clobber another.
+        let (dest_root, dest_stem) = open.dest();
+        let targets = open.dest_targets();
+        let collisions = existing_collisions(
+            &existing_rels(&dest_root, &parent_dir(&dest_stem)),
+            &targets,
         );
-        let collisions = existing_collisions(&existing_rels(&root, &dir), &targets);
         let confirm = if collisions.is_empty() {
             Task::ready(true)
         } else {
@@ -933,11 +956,15 @@ impl ImportPanel {
             return None;
         };
         let preview = open.wizard.preview.as_ref()?;
-        let stem = open.wizard.dest_rel_stem();
-        let til_rel = format!("{stem}.til");
+        // The root the bytes go under is re-derived from the DESTINATION, not
+        // inherited from the source -- see `resolve_dest`. `til_rel` is
+        // therefore asset-root-relative even when the source was not in an
+        // `assets/` tree at all.
+        let (dest_root, dest_stem) = open.dest();
+        let til_rel = format!("{dest_stem}.til");
         let (indices, tile_count) = slice_to_tiles(&preview.indices, preview.w, preview.h);
         if let Err(e) =
-            io::save_tileset(&open.root, &til_rel, &indices, tile_count, &preview.palette)
+            io::save_tileset(&dest_root, &til_rel, &indices, tile_count, &preview.palette)
         {
             self.status = Some(format!("Import failed: {e}"));
             self.last_import = None;
@@ -959,7 +986,7 @@ impl ImportPanel {
             .map(|rel| (open.source_abs.clone(), rel));
         let worktree_rel = project_root
             .as_deref()
-            .and_then(|project_root| worktree_rel_for(project_root, &open.root, &til_rel));
+            .and_then(|project_root| worktree_rel_for(project_root, &dest_root, &til_rel));
         let imported = Imported {
             asset_rel: til_rel,
             worktree_rel,
@@ -1105,14 +1132,13 @@ impl ImportPanel {
             .into_any_element()
     }
 
-    /// The source image with the crop rect and the cell grid over it.
+    /// The source image with the crop rect and the tile grid over it.
     /// Left-drag crops; middle-drag pans; the wheel zooms on the cursor.
     fn render_canvas(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_canvas is only called in the Ready state");
         };
         let crop = open.crop();
-        let (cell_w, cell_h) = open.cell();
         let scene = CropScene {
             image: Some(open.source_image.clone()),
             w: open.wizard.src_w,
@@ -1120,7 +1146,7 @@ impl ImportPanel {
             pan: open.pan,
             zoom: open.zoom,
             crop,
-            grid: geom::crop_grid_lines(crop, cell_w, cell_h),
+            grid: geom::crop_grid_lines(crop),
             background: cx.theme().colors().editor_background,
             border: cx.theme().colors().border,
             accent: rgb(0xebcb8b).into(),
@@ -1270,8 +1296,8 @@ impl ImportPanel {
             .into_any_element()
     }
 
-    /// Destination, grid cell size, the transparent-slot toggle, the
-    /// slice readout and Import.
+    /// Destination, the transparent-slot toggle, the slice readout and
+    /// Import.
     fn render_footer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_footer is only called in the Ready state");
@@ -1280,12 +1306,13 @@ impl ImportPanel {
             return div().into_any_element();
         };
         let crop = open.crop();
-        let (cell_w, cell_h) = open.cell();
         let (cols, rows, tiles) = geom::tiles_for(crop);
-        let cells = geom::whole_cells(crop, cell_w, cell_h);
-        let ragged = cells != tiles;
-        let readout = format!("{tiles} tiles ({cols}x{rows}) · {cells} whole cells");
-        let targets = open.wizard.targets().join(", ");
+        let whole = geom::whole_tiles(crop);
+        let ragged = geom::is_ragged(crop);
+        let readout = format!("{tiles} tiles ({cols}x{rows}) · {whole} whole");
+        // The RESOLVED targets, so what is shown is what is written -- see
+        // `OpenImport::dest_targets`.
+        let targets = open.dest_targets().join(", ");
         let can_commit = open.wizard.can_commit();
         let reserve = open.wizard.reserve_transparent;
         let weak = cx.weak_entity();
@@ -1303,26 +1330,15 @@ impl ImportPanel {
                     .child(Self::field("Name", 96., &fields.stem, cx)),
             )
             .child(
-                h_flex()
-                    .gap_1()
-                    .flex_wrap()
-                    .items_center()
-                    .child(Self::field("Cell W", 44., &fields.cell_w, cx))
-                    .child(Self::field("Cell H", 44., &fields.cell_h, cx))
-                    .child(
-                        Button::new("ggo-import-apply-grid", "Apply grid").on_click(
-                            cx.listener(|this, _, window, cx| this.apply_grid(window, cx)),
-                        ),
-                    )
-                    .child(
-                        Checkbox::new("ggo-import-reserve", ToggleState::from(reserve))
-                            .label("Slot 0 transparent")
-                            .on_click(move |toggle, _window, cx| {
-                                let on = matches!(toggle, ToggleState::Selected);
-                                weak.update(cx, |this, cx| this.set_reserve_transparent(on, cx))
-                                    .ok();
-                            }),
-                    ),
+                h_flex().gap_1().flex_wrap().items_center().child(
+                    Checkbox::new("ggo-import-reserve", ToggleState::from(reserve))
+                        .label("Slot 0 transparent")
+                        .on_click(move |toggle, _window, cx| {
+                            let on = matches!(toggle, ToggleState::Selected);
+                            weak.update(cx, |this, cx| this.set_reserve_transparent(on, cx))
+                                .ok();
+                        }),
+                ),
             )
             .child(
                 Label::new(readout)
@@ -1332,7 +1348,7 @@ impl ImportPanel {
             .when(ragged, |el| {
                 el.child(
                     Label::new(
-                        "the crop isn't a whole number of cells — edge tiles are zero-padded",
+                        "the crop isn't a whole number of tiles — edge tiles are zero-padded",
                     )
                     .size(LabelSize::XSmall)
                     .color(Color::Warning),
@@ -1424,7 +1440,7 @@ struct CropScene {
     pan: [f32; 2],
     zoom: usize,
     crop: Region,
-    /// Interior cell-divider offsets INSIDE the crop, relative to its own
+    /// Interior tile-divider offsets INSIDE the crop, relative to its own
     /// origin ([`geom::crop_grid_lines`]).
     grid: (Vec<usize>, Vec<usize>),
     background: Hsla,
@@ -1480,7 +1496,7 @@ fn paint_crop(scene: &CropScene, canvas: Bounds<Pixels>, window: &mut Window) {
         let crop_bounds = image_rect(
             canvas, scene.pan, scene.zoom, crop.x, crop.y, crop.w, crop.h,
         );
-        // The cell grid, drawn INSIDE the crop: these are the cuts
+        // The tile grid, drawn INSIDE the crop: these are the cuts
         // `slice_to_tiles` will make, so they are anchored on the crop's own
         // origin, not the image's.
         let z = scene.zoom.max(1) as f32;
@@ -1528,7 +1544,6 @@ impl Render for ImportPanel {
             .key_context(KEY_CONTEXT)
             .size_full()
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &ApplyGrid, window, cx| this.apply_grid(window, cx)))
             .on_action(cx.listener(|this, _: &Import, window, cx| this.import_impl(window, cx)))
             .bg(cx.theme().colors().panel_background)
             .child(div().flex_1().min_h_0().child(body))
@@ -1750,6 +1765,40 @@ mod tests {
         // Unrelated roots simply don't hand off.
         let other = tempfile::tempdir().unwrap();
         assert_eq!(worktree_rel_for(other.path(), &assets, "a.til"), None);
+    }
+
+    /// **Fix round 1, BLOCKING 2.** The destination is user-editable, so the
+    /// asset root is re-derived from where the bytes are ACTUALLY going. A
+    /// source outside `assets/` retargeted into it must yield the asset root
+    /// and a rel with no `assets/` segment -- the `ggo-sprfix` shape is
+    /// precisely what the old source-only derivation produced.
+    #[test]
+    fn resolve_dest_re_derives_the_asset_root_from_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let assets = write_project(root);
+
+        // Worktree-rooted (an out-of-assets source), retargeted INTO assets.
+        assert_eq!(
+            resolve_dest(root, "assets/tiles/outside"),
+            (assets.clone(), "tiles/outside".to_string())
+        );
+        // Already in the source's own frame: idempotent.
+        assert_eq!(
+            resolve_dest(&assets, "art/hero"),
+            (assets.clone(), "art/hero".to_string())
+        );
+        assert_eq!(resolve_dest(&assets, "hero"), (assets, "hero".to_string()));
+        // Destination outside any assets/ tree: the root passes through.
+        assert_eq!(
+            resolve_dest(root, "art/outside"),
+            (root.to_path_buf(), "art/outside".to_string())
+        );
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_dest(bare.path(), "a/b"),
+            (bare.path().to_path_buf(), "a/b".to_string())
+        );
     }
 
     #[test]
@@ -2101,6 +2150,91 @@ mod tests {
         });
     }
 
+    /// **Fix round 1, BLOCKING 2, end to end.** A PNG outside `assets/`,
+    /// retargeted by the user into the assets tree, must still be NAMED
+    /// asset-root-relative. Before the destination was re-derived this wrote
+    /// the file correctly but reported `assets/tiles/outside.til` -- the
+    /// exact rel `ggo-sprfix` exists to repair, waiting for the first
+    /// downstream consumer to persist it.
+    ///
+    /// It is also the only way an out-of-assets PNG can reach the assets tree
+    /// at all: worldlib's `safe_join` rejects `..`, so no `../assets/...`
+    /// destination could ever have worked.
+    #[gpui::test]
+    async fn test_retargeting_an_outside_source_into_assets_keeps_the_rel_asset_root_relative(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+        let assets = dir.path().join(ASSETS_DIR);
+        let panel = new_panel(cx, dir.path());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("art/outside.png", cx);
+        });
+        cx.executor().run_until_parked();
+        let cx = cx.add_empty_window();
+
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready")
+            };
+            assert_eq!(
+                open.root.as_path(),
+                dir.path(),
+                "source root is the worktree"
+            );
+            open.wizard.set_dest_dir("assets/tiles".to_string());
+            assert_eq!(
+                open.wizard.targets()[0],
+                "assets/tiles/outside.til",
+                "the wizard's RAW targets still carry the segment..."
+            );
+            assert_eq!(
+                open.dest_targets(),
+                vec![
+                    "tiles/outside.til".to_string(),
+                    "tiles/outside.pal".to_string()
+                ],
+                "...and the resolved ones, which are what the panel uses, do not"
+            );
+        });
+
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "the source is outside assets/, so no delete offer"
+        );
+
+        let imported = panel
+            .read_with(cx, |panel, _| panel.last_import.clone())
+            .expect("a successful import");
+        assert_eq!(imported.asset_rel, "tiles/outside.til");
+        assert!(
+            !imported.asset_rel.contains(ASSETS_DIR),
+            "a retargeted import must not name itself assets/..."
+        );
+        assert_eq!(
+            imported.worktree_rel.as_deref(),
+            Some("assets/tiles/outside.til")
+        );
+        assert!(assets.join("tiles/outside.til").is_file());
+        assert!(assets.join("tiles/outside.pal").is_file());
+        assert!(
+            !dir.path().join("assets/assets").exists(),
+            "and nothing lands under a doubled assets/ path"
+        );
+        // The rel is right FROM THE ASSET ROOT, which is the frame every
+        // downstream binder resolves in.
+        assert_eq!(
+            io::open_tileset(&assets, "tiles/outside.til")
+                .unwrap()
+                .tile_count,
+            imported.tile_count
+        );
+    }
+
     /// A source OUTSIDE the asset root is never offered for deletion -- it
     /// was never going to collide with the packer, which is the only reason
     /// the offer exists (ggo-ide's `assetsPrefix` guard).
@@ -2140,24 +2274,50 @@ mod tests {
     /// A blank destination name can't commit -- the button is disabled and
     /// the action is inert, so nothing lands at a bare `.til`.
     #[gpui::test]
-    async fn test_an_empty_destination_name_cannot_commit(cx: &mut TestAppContext) {
+    async fn test_blanking_the_name_field_refuses_the_commit(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
+        // The form fields are real `Editor`s, which need the settings store.
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
         let panel = ready_panel(cx, dir.path()).await;
         let cx = cx.add_empty_window();
 
-        panel.update(cx, |panel, _| {
-            let ViewerState::Ready(open) = &mut panel.state else {
-                panic!("expected Ready")
-            };
-            open.wizard.set_dest_stem("   ".to_string());
-            assert!(!open.wizard.can_commit());
+        // Through the REAL field path: build the form fields, blank the name
+        // editor, and let `import_impl`'s own `sync_dest_fields` read it back
+        // (fix round 1, FOLD IN 6 -- this used to poke the wizard directly
+        // while `fields` was None, so the editor->wizard sync it claimed to
+        // cover never ran).
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.ensure_fields(window, cx)));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let stem = ready(panel)
+                    .fields
+                    .as_ref()
+                    .expect("fields built")
+                    .stem
+                    .clone();
+                stem.update(cx, |editor, cx| editor.set_text("   ", window, cx));
+            })
         });
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
         cx.run_until_parked();
+
+        assert!(
+            !cx.has_pending_prompt(),
+            "a refused commit prompts about nothing"
+        );
         panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).wizard.dest_stem,
+                "   ",
+                "the blanked field reached the wizard"
+            );
+            assert!(!ready(panel).wizard.can_commit());
             assert!(panel.last_import.is_none());
-            assert!(!dir.path().join("assets/art/.til").exists());
+            assert!(panel.status.is_some(), "and the refusal is said out loud");
         });
+        assert!(!dir.path().join("assets/art/.til").exists());
     }
 
     // ---------------------------------------------- explorer-driven entry

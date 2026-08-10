@@ -92,27 +92,44 @@ pub fn effective_region(region: Option<Region>, w: usize, h: usize) -> Region {
     region.unwrap_or(Region { x: 0, y: 0, w, h })
 }
 
-/// Interior cell-divider offsets INSIDE `crop`, in image px relative to the
+/// Interior tile-divider offsets INSIDE `crop`, in image px relative to the
 /// crop's own top-left.
 ///
-/// Relative to the CROP, not the image: `slice_to_tiles` cuts the quantized
-/// crop starting at its own origin, so a grid anchored anywhere else would
-/// draw lines where no cut happens. Straight through worldlib's
-/// [`grid_lines`]; this wrapper exists to name the anchoring rule (and to be
-/// the thing the test pins).
-pub fn crop_grid_lines(crop: Region, cell_w: usize, cell_h: usize) -> (Vec<usize>, Vec<usize>) {
-    grid_lines(crop.w, crop.h, cell_w, cell_h)
+/// **Pinned to [`TILE_PX`], with no cell-size parameter, deliberately.**
+/// `slice_to_tiles` is hard-wired to `TILE_PX` (`worldlib`'s
+/// `sprites::import::slice_to_tiles`), so a grid drawn at any other step
+/// would draw lines where no cut happens -- which is exactly the mis-port
+/// fix round 1 caught: ggo-ide's Cell W/H inputs and their live overlay were
+/// inside `<Show when={mode() === 'metasprite'}>` and never existed in
+/// Tileset mode, where the cut is always one tile.
+///
+/// Relative to the CROP, not the image: the slice starts at the crop's own
+/// origin, so a grid anchored anywhere else would be off by the crop offset.
+/// Straight through worldlib's [`grid_lines`]; this wrapper exists to name
+/// the anchoring rule and to pin the step.
+pub fn crop_grid_lines(crop: Region) -> (Vec<usize>, Vec<usize>) {
+    grid_lines(crop.w, crop.h, TILE_PX, TILE_PX)
 }
 
-/// How many WHOLE `cell_w` x `cell_h` cells fit inside `crop`.
+/// How many WHOLE tiles fit inside `crop` -- `uniform_rects` only emits
+/// fully in-bounds cells, so this is the count that does NOT need padding.
 ///
-/// The honest-feedback readout beside the tile count: `uniform_rects` only
-/// emits fully in-bounds cells, so a crop that is not a multiple of the cell
-/// size reports fewer cells than [`tiles_for`] reports tiles -- which is
-/// exactly the "your right/bottom edge will be zero-padded" condition, made
-/// visible before the commit rather than discovered in the sheet afterwards.
-pub fn whole_cells(crop: Region, cell_w: usize, cell_h: usize) -> usize {
-    uniform_rects(crop.w, crop.h, cell_w, cell_h).len()
+/// Compared against [`tiles_for`]'s count (which rounds UP) it is the
+/// "your right/bottom edge will be zero-padded" signal, in the same unit at
+/// last: both are tiles.
+pub fn whole_tiles(crop: Region) -> usize {
+    uniform_rects(crop.w, crop.h, TILE_PX, TILE_PX).len()
+}
+
+/// Will `crop` produce zero-padded edge tiles? True when either side is not a
+/// whole number of [`TILE_PX`] tiles.
+///
+/// Stated as the modulo rather than as `whole_tiles != tiles_for`, even
+/// though the two now agree: the comparison form is what silently went wrong
+/// when the two sides were measured in different units (cells vs tiles), and
+/// `whole_tiles_and_is_ragged_agree` pins that they say the same thing.
+pub fn is_ragged(crop: Region) -> bool {
+    !crop.w.is_multiple_of(TILE_PX) || !crop.h.is_multiple_of(TILE_PX)
 }
 
 /// The `(cols, rows, count)` of `TILE_PX` tiles a commit of `crop` will
@@ -131,7 +148,7 @@ pub fn tiles_for(crop: Region) -> (usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggo_worldlib::sprites::import::{clamp_cell_dim, slice_to_tiles};
+    use ggo_worldlib::sprites::import::slice_to_tiles;
 
     /// At 1x with no pan, one source pixel is one CSS px, and a point past
     /// any edge clamps onto the nearest in-image pixel rather than missing.
@@ -234,31 +251,52 @@ mod tests {
             w: 48,
             h: 32,
         };
-        assert_eq!(
-            crop_grid_lines(at_origin, TILE_PX, TILE_PX),
-            (vec![16, 32], vec![16])
-        );
-        assert_eq!(
-            crop_grid_lines(offset, TILE_PX, TILE_PX),
-            crop_grid_lines(at_origin, TILE_PX, TILE_PX)
-        );
-        // Degenerate cell sizes never reach the loop (worldlib's guard).
-        assert_eq!(crop_grid_lines(at_origin, 0, 16), (vec![], vec![]));
+        assert_eq!(crop_grid_lines(at_origin), (vec![16, 32], vec![16]));
+        assert_eq!(crop_grid_lines(offset), crop_grid_lines(at_origin));
     }
 
-    /// A crop that is an exact multiple of the cell reports the same number
-    /// of whole cells as tiles; a ragged one reports FEWER, which is the
-    /// zero-padding warning the footer surfaces.
+    /// **Fix round 1, BLOCKING 1.** Every divider the overlay draws must sit
+    /// on a `TILE_PX` boundary, because that is the ONLY step
+    /// `slice_to_tiles` cuts at. The panel used to take a user-editable cell
+    /// size here, which drew lines at (say) 8px on a 32x16 crop -- three
+    /// vertical dividers where the slicer makes one cut. There is no cell
+    /// parameter to get wrong any more; this pins that it stays that way.
     #[test]
-    fn whole_cells_falls_short_of_the_tile_count_on_a_ragged_crop() {
+    fn the_overlay_step_is_always_the_tile_size() {
+        for (w, h) in [(48usize, 32usize), (32, 16), (20, 40), (8, 8), (33, 17)] {
+            let crop = Region { x: 3, y: 5, w, h };
+            let (xs, ys) = crop_grid_lines(crop);
+            assert!(
+                xs.iter()
+                    .chain(ys.iter())
+                    .all(|n| n.is_multiple_of(TILE_PX)),
+                "{w}x{h}: every divider must land on a tile boundary, got {xs:?}/{ys:?}"
+            );
+            // ...and there is exactly one divider per interior tile boundary.
+            assert_eq!(xs.len(), w.saturating_sub(1) / TILE_PX, "{w}x{h} verticals");
+            assert_eq!(
+                ys.len(),
+                h.saturating_sub(1) / TILE_PX,
+                "{w}x{h} horizontals"
+            );
+        }
+    }
+
+    /// A crop that is an exact multiple of the tile reports the same number
+    /// of whole tiles as tiles written; a ragged one reports FEWER, which is
+    /// the zero-padding warning the footer surfaces. Both counts are TILES --
+    /// the unit mismatch between them is what fix round 1 removed.
+    #[test]
+    fn whole_tiles_and_is_ragged_agree() {
         let exact = Region {
             x: 0,
             y: 0,
             w: 32,
             h: 32,
         };
-        assert_eq!(whole_cells(exact, TILE_PX, TILE_PX), 4);
+        assert_eq!(whole_tiles(exact), 4);
         assert_eq!(tiles_for(exact).2, 4);
+        assert!(!is_ragged(exact));
 
         let ragged = Region {
             x: 0,
@@ -266,8 +304,19 @@ mod tests {
             w: 20,
             h: 16,
         };
-        assert_eq!(whole_cells(ragged, TILE_PX, TILE_PX), 1);
+        assert_eq!(whole_tiles(ragged), 1);
         assert_eq!(tiles_for(ragged).2, 2, "the ragged edge still costs a tile");
+        assert!(is_ragged(ragged));
+
+        // The two formulations must never disagree.
+        for (w, h) in [(16usize, 16usize), (32, 16), (1, 1), (33, 17), (48, 32)] {
+            let crop = Region { x: 0, y: 0, w, h };
+            assert_eq!(
+                is_ragged(crop),
+                whole_tiles(crop) != tiles_for(crop).2,
+                "{w}x{h}"
+            );
+        }
     }
 
     /// The readout is pinned against `slice_to_tiles` ITSELF, so a drift in
@@ -281,24 +330,5 @@ mod tests {
             assert_eq!(count, sliced, "{w}x{h}");
             assert_eq!(cols * rows, sliced, "{w}x{h}");
         }
-    }
-
-    /// The cell-size clamp the two grid fields apply is worldlib's, and its
-    /// edges are what keep `uniform_rects`'s `+= cell` loop finite and its
-    /// output non-empty. Pinned here because this panel is the only caller
-    /// in the fork.
-    #[test]
-    fn clamp_cell_dim_pins_the_grid_fields_to_a_usable_range() {
-        assert_eq!(clamp_cell_dim(0, 64), 1, "zero would loop forever");
-        assert_eq!(clamp_cell_dim(1, 64), 1);
-        assert_eq!(clamp_cell_dim(16, 64), 16);
-        assert_eq!(clamp_cell_dim(64, 64), 64);
-        assert_eq!(
-            clamp_cell_dim(65, 64),
-            64,
-            "bigger than the image yields 0 cells"
-        );
-        assert_eq!(clamp_cell_dim(0, 0), 1, "no image loaded: lower bound only");
-        assert_eq!(clamp_cell_dim(9999, 0), 9999);
     }
 }
