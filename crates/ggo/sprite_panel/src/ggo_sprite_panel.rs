@@ -42,6 +42,7 @@ mod playback;
 mod tiles;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -506,6 +507,122 @@ fn free_new_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
         .expect("a free base-N name exists long before N overflows")
 }
 
+/// One row of the new-sprite form's tileset dropdown: a `.til` under the
+/// asset root, plus **the other sprites that already bind it**
+/// (`io::scan_til_sharers`).
+///
+/// The sharer list is not decoration. A sprite's pool IS its `.til`, and
+/// `io::save_sprite` writes BOTH sidecars back unconditionally
+/// (`io.rs:537-540`), so binding a new sprite to a tileset another sprite
+/// owns means every later save of either one rewrites the other's tiles
+/// AND palette -- and `pool_shared` then blocks `DocOp::Dedup` and
+/// `DocOp::PaletteRemap` on both. That is exactly the hazard
+/// [`contribute_sprite_menu`] cites as the reason Duplicate un-shares, so
+/// it cannot be something a New entry falls into by DEFAULT.
+///
+/// Sharing is still legitimate and deliberately offered -- worldlib models
+/// it on purpose -- so sprite-owned tilesets stay in the list. What
+/// changes is that the default skips them
+/// ([`default_tileset_choice`]) and picking one is labelled and warned
+/// about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TilesetChoice {
+    /// Asset-root-relative `.til` rel -- what gets stored in the `.spr`.
+    rel: String,
+    /// Other `.spr` files already bound to it, asset-root-relative.
+    sharers: Vec<String>,
+}
+
+impl TilesetChoice {
+    /// The dropdown row's text: the rel, plus who already uses it.
+    fn label(&self) -> String {
+        match self.sharers.split_first() {
+            None => self.rel.clone(),
+            Some((first, [])) => format!("{} (used by {first})", self.rel),
+            Some((first, rest)) => {
+                format!("{} (used by {first} +{} more)", self.rel, rest.len())
+            }
+        }
+    }
+
+    /// The inline warning shown while this row is the selection, or `None`
+    /// when binding it shares nothing.
+    fn share_warning(&self) -> Option<String> {
+        let first = self.sharers.first()?;
+        let others = match self.sharers.len() {
+            1 => String::new(),
+            n => format!(" (+{} more)", n - 1),
+        };
+        Some(format!(
+            "{} is already used by {first}{others} — saving either sprite \
+             rewrites the other's tiles and palette, and Dedup / Palette \
+             remap are blocked on both",
+            self.rel
+        ))
+    }
+}
+
+/// Which sprites already bind which tileset, in one pass over the asset
+/// root: resolved `til_rel` -> the `.spr` rels bound to it.
+///
+/// **Deliberately not `io::scan_til_sharers`.** That function answers a
+/// different question: it gates on `MIN_SHARERS = 2` and returns EMPTY
+/// below it (`io.rs:230-242`), because from an already-open sprite's point
+/// of view a sole referrer -- itself -- isn't "sharing" with anyone. Here
+/// the sprite doing the binding does not exist yet, so the case that
+/// matters is exactly the one that function suppresses: a tileset with
+/// ONE owner reads back as unshared, and binding to it is precisely what
+/// would make it two. Asking it directly was this fix's first attempt and
+/// it left the BLOCKING-1 default in place; the test
+/// `test_new_sprite_form_defaults_to_an_unshared_tileset` is what caught it.
+///
+/// Best-effort, like worldlib's own scans: a `.spr` that fails to open
+/// (missing or unreadable sidecars -- the `ggo-sprfix` corruption, say) is
+/// skipped rather than failing the whole listing. `til_path` comes back
+/// RESOLVED, so it is directly comparable to `io::list_tilesets`' rels.
+///
+/// Cost: one `io::open_sprite` per sprite, run ONCE when the form opens (a
+/// menu action), never per render.
+fn tileset_owners(root: &Path) -> HashMap<String, Vec<String>> {
+    let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+    for spr_rel in io::list_sprites(root) {
+        if let Ok(opened) = io::open_sprite(root, &spr_rel) {
+            owners.entry(opened.til_path).or_default().push(spr_rel);
+        }
+    }
+    owners
+}
+
+/// Every `.til` under `root`, each with the sprites already bound to it.
+fn tileset_choices(root: &Path) -> Vec<TilesetChoice> {
+    let owners = tileset_owners(root);
+    io::list_tilesets(root)
+        .into_iter()
+        .map(|rel| {
+            let sharers = owners.get(&rel).cloned().unwrap_or_default();
+            TilesetChoice { rel, sharers }
+        })
+        .collect()
+}
+
+/// Which row a freshly opened form starts on: **the first tileset nobody
+/// is using yet**, falling back to the first row when every tileset is
+/// already bound by some sprite (or there are none).
+///
+/// The fallback is deliberately not "no selection": a user who only has
+/// shared tilesets must still be able to create a sprite, and the warning
+/// plus the labelled dropdown make the consequence visible. What must
+/// never happen is silently defaulting onto a sprite-owned tileset -- with
+/// a plain `selected: 0` over `list_tilesets`' SORTED walk, the default
+/// was whichever `.til` sorted first, which in a real project is very
+/// likely one a sprite already owns.
+fn default_tileset_choice(choices: &[TilesetChoice]) -> usize {
+    choices
+        .iter()
+        .position(|choice| choice.sharers.is_empty())
+        .unwrap_or(0)
+}
+
 /// Write a blank `.spr` of `kind` into the worktree-relative directory
 /// `dir_rel`, bound to the asset-root-relative tileset `til_rel`,
 /// returning the new file's worktree-relative path.
@@ -532,10 +649,31 @@ fn free_new_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
 /// live in the panel, the menu only routes), and this function is only
 /// reached once it has been.
 ///
+/// **Divergence from ggo-ide**, worth stating rather than leaving silent:
+/// its own New Sprite (`pages/assets/sprite.rs:125-171`) wrote a PRIVATE
+/// trio -- `{stem}.spr`/`.til`/`.pal` straight out of `blank_sprite_state`
+/// -- which is a third option, also bound and also unguessed, and it is
+/// the one this panel CANNOT take. There, a one-blank-tile private pool is
+/// a starting point because ggo-ide has a pixel editor to grow it with.
+/// Here there is none by design (spec: import-only art), `ggo_tileset_panel`
+/// is read-only, and `DocOp` has no pool-grow op -- so a private `.til`
+/// would be one blank tile with no way to ever get a second, i.e. a sprite
+/// that cannot be authored.
+///
 /// The pool is the tileset's own bytes, so the `save_sprite` write-back
 /// to `til_rel` is byte-identical to what was read (pinned by
 /// `test_new_sprite_leaves_the_bound_tileset_byte_identical`); `pal_rel`
 /// comes from `open_tileset`, which derives it from the `.til` stem.
+///
+/// One deliberate side effect: binding to a `.til` with no readable
+/// companion `.pal` adopts `open_tileset`'s synthesized 16-gray fallback
+/// (`missing_pal`), and `save_sprite` then WRITES it -- so creating the
+/// sprite also creates the `.pal` the tileset was missing. That is the
+/// wanted outcome (a sprite must have a palette on disk, and the grays are
+/// what the tileset panel already shows for that file), but it means a
+/// "New Sprite" can add a file next to a tileset it did not otherwise
+/// touch. Pinned by
+/// `test_new_sprite_binding_a_pal_less_tileset_writes_the_fallback_palette`.
 fn create_sprite(
     project_root: &Path,
     dir_rel: &str,
@@ -835,10 +973,10 @@ enum PanelForm {
         kind: NewKind,
         /// The clicked directory, worktree-relative.
         dir_rel: String,
-        /// Every `.til` under the asset root, asset-root-relative
-        /// (`io::list_tilesets`). Empty means the project has no tileset
+        /// Every `.til` under the asset root with its existing sharers
+        /// ([`tileset_choices`]). Empty means the project has no tileset
         /// yet and the form can only be cancelled.
-        tilesets: Vec<String>,
+        tilesets: Vec<TilesetChoice>,
         selected: usize,
         error: Option<String>,
     },
@@ -1099,11 +1237,12 @@ impl SpritePanel {
                 // the frame a `.spr` stores its `til_path` in.
                 let root = asset_root_of_dir(&project_root.join(&dir_rel))
                     .unwrap_or_else(|| project_root.clone());
+                let tilesets = tileset_choices(&root);
                 this.form = Some(PanelForm::New {
                     kind,
                     dir_rel,
-                    tilesets: io::list_tilesets(&root),
-                    selected: 0,
+                    selected: default_tileset_choice(&tilesets),
+                    tilesets,
                     error: None,
                 });
                 cx.notify();
@@ -1125,10 +1264,26 @@ impl SpritePanel {
         }
     }
 
-    /// Create the pending new sprite and open it. The dirty guard already
-    /// ran in [`Self::new_sprite`], so this loads directly rather than
-    /// going through `open_rel_path` and prompting twice.
-    fn confirm_new(&mut self, cx: &mut Context<Self>) {
+    /// Create the pending new sprite and open it.
+    ///
+    /// **The unsaved-edits guard is RE-RUN here** (fix round 1, BLOCKING
+    /// 2), not just at [`Self::new_sprite`]. The form bar renders ABOVE a
+    /// fully live viewer, so the open document stays editable the whole
+    /// time it is up -- an edit made after the form opened sat between the
+    /// old guard and this replacement and was discarded without a prompt.
+    /// Deferring the write out of the menu handler bought structure but
+    /// also separated the guard from the thing it guards; the guard has to
+    /// sit where the document is actually replaced, which is here.
+    ///
+    /// It costs a second prompt only when the answer to the first one was
+    /// "Don't Save" -- that leaves the document dirty by design, so
+    /// `dirty_sprite_name` is still `Some` and the question is genuinely
+    /// live again. A "Save" answer leaves it clean and
+    /// `prepare_to_close_dirty` returns ready-true without prompting.
+    ///
+    /// Cancel leaves the form open (nothing was written, so the user can
+    /// still pick a tileset or dismiss it).
+    fn confirm_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(PanelForm::New {
             kind,
             dir_rel,
@@ -1140,13 +1295,40 @@ impl SpritePanel {
             return;
         };
         let (kind, dir_rel) = (*kind, dir_rel.clone());
-        let Some(til_rel) = tilesets.get(*selected).cloned() else {
+        let Some(til_rel) = tilesets.get(*selected).map(|choice| choice.rel.clone()) else {
             return; // no tileset in the project: the form only cancels
         };
+        let proceed = ggo_common::prepare_to_close_dirty(
+            self.dirty_sprite_name(),
+            window,
+            cx,
+            Self::save_for_close,
+        );
+        cx.spawn(async move |this, cx| {
+            if !proceed.await {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.create_and_open(kind, &dir_rel, &til_rel, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// [`Self::confirm_new`]'s body, once the unsaved-edits guard has
+    /// resolved: the one place a new `.spr` is written.
+    fn create_and_open(
+        &mut self,
+        kind: NewKind,
+        dir_rel: &str,
+        til_rel: &str,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        match create_sprite(&project_root, &dir_rel, kind, &til_rel) {
+        match create_sprite(&project_root, dir_rel, kind, til_rel) {
             Ok(source_rel) => {
                 self.form = None;
                 self.load_rel_path(&source_rel, cx);
@@ -2318,15 +2500,15 @@ impl SpritePanel {
             } => {
                 let label = format!("{} in {}", kind.label(), dir_rel);
                 let has_tilesets = !tilesets.is_empty();
-                let picked: SharedString = tilesets
-                    .get(*selected)
-                    .cloned()
+                let choice = tilesets.get(*selected);
+                let picked: SharedString = choice
+                    .map(TilesetChoice::label)
                     .unwrap_or_else(|| "no tilesets".to_string())
                     .into();
                 let weak = cx.weak_entity();
-                let names = tilesets.clone();
+                let rows: Vec<String> = tilesets.iter().map(TilesetChoice::label).collect();
                 let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-                    for (ix, name) in names.into_iter().enumerate() {
+                    for (ix, name) in rows.into_iter().enumerate() {
                         let weak = weak.clone();
                         menu = menu.entry(SharedString::from(name), None, move |_window, cx| {
                             weak.update(cx, |this, cx| this.select_new_tileset(ix, cx))
@@ -2345,7 +2527,9 @@ impl SpritePanel {
                     .child(
                         Button::new("ggo-sprite-new-create", "Create")
                             .disabled(!has_tilesets)
-                            .on_click(cx.listener(|this, _, _, cx| this.confirm_new(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.confirm_new(window, cx)),
+                            ),
                     )
                     .child(
                         Button::new("ggo-sprite-new-cancel", "Cancel").on_click(cx.listener(
@@ -2353,6 +2537,14 @@ impl SpritePanel {
                                 this.cancel_form(cx);
                             },
                         )),
+                    )
+                    // The sharing warning is a WARNING, not an error: the
+                    // binding is legal and sometimes wanted, it just has
+                    // consequences for a file the user did not open.
+                    .children(
+                        choice
+                            .and_then(TilesetChoice::share_warning)
+                            .map(|w| Label::new(w).size(LabelSize::Small).color(Color::Warning)),
                     )
                     .children(
                         error
@@ -4585,7 +4777,11 @@ mod tests {
         );
     }
 
-    /// Fire the real menu handler and answer the tileset form's Create.
+    /// Fire the real menu handler and accept the form's DEFAULT binding
+    /// with Create -- i.e. exactly the path a user who never touches the
+    /// dropdown takes. Deliberate: that default is the thing fix round 1
+    /// BLOCKING 1 was about, so every caller of this helper is asserting
+    /// what an untouched dropdown binds to.
     fn new_via_menu(
         workspace: &Entity<Workspace>,
         panel: &Entity<SpritePanel>,
@@ -4596,7 +4792,7 @@ mod tests {
         let handler = new_sprite_handler(workspace.downgrade(), kind, dir_rel.to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
-        panel.update(cx, |panel, cx| panel.confirm_new(cx));
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
     }
 
@@ -4622,17 +4818,24 @@ mod tests {
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
         panel.update(cx, |panel, _| {
-            let Some(PanelForm::New { kind, tilesets, .. }) = &panel.form else {
+            let Some(PanelForm::New {
+                kind,
+                tilesets,
+                selected,
+                ..
+            }) = &panel.form
+            else {
                 panic!("New Sprite… must open the binding form");
             };
             assert_eq!(*kind, NewKind::Sprite);
             assert_eq!(
-                tilesets,
-                &vec![
-                    "sprites/hero.til".to_string(),
-                    "tiles/world.til".to_string()
-                ],
+                tilesets.iter().map(|c| c.rel.as_str()).collect::<Vec<_>>(),
+                vec!["sprites/hero.til", "tiles/world.til"],
                 "every .til under the asset root, asset-root-relative"
+            );
+            assert_eq!(
+                *selected, 1,
+                "the default skips the sprite-owned tileset (BLOCKING 1)"
             );
         });
         assert!(
@@ -4640,8 +4843,7 @@ mod tests {
             "opening the form must not write anything yet"
         );
 
-        panel.update(cx, |panel, cx| panel.select_new_tileset(1, cx));
-        panel.update(cx, |panel, cx| panel.confirm_new(cx));
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
 
         let opened = open_sprite(&assets, "sprites/sprite.spr").expect("round-trips");
@@ -4712,8 +4914,16 @@ mod tests {
             "a metasprite is clip definitions over its frames"
         );
         assert_eq!(
-            opened.til_path, "sprites/hero.til",
-            "first tileset by default"
+            opened.til_path, "tiles/world.til",
+            "an untouched dropdown binds the first UNSHARED tileset, never \
+             `sprites/hero.til` -- which sorts first but is hero.spr's own"
+        );
+        assert!(
+            !open_sprite(&assets, "sprites/hero.spr")
+                .unwrap()
+                .state
+                .pool_shared,
+            "and the unrelated sprite is not dragged into pool sharing"
         );
         panel.update(cx, |panel, _| {
             assert_eq!(ready(panel).source_rel, "assets/metasprite.spr");
@@ -4739,8 +4949,7 @@ mod tests {
         );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
-        panel.update(cx, |panel, cx| panel.select_new_tileset(1, cx));
-        panel.update(cx, |panel, cx| panel.confirm_new(cx));
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
 
         assert_eq!(
@@ -4803,6 +5012,207 @@ mod tests {
                 .duration_ms,
             100,
             "and nothing was written for them either"
+        );
+    }
+
+    // ------------------------------------- fix round 1: shared tilesets
+
+    fn choice(rel: &str, sharers: &[&str]) -> TilesetChoice {
+        TilesetChoice {
+            rel: rel.to_string(),
+            sharers: sharers.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The default binding, without a filesystem: the first tileset
+    /// NOBODY is using, whatever the sort order; the first row only when
+    /// every tileset is already owned (creating a sprite must stay
+    /// possible), and the labels/warning say so either way.
+    #[gpui::test]
+    fn test_default_tileset_choice_skips_tilesets_a_sprite_already_owns(_cx: &mut gpui::App) {
+        let owned = choice("sprites/hero.til", &["sprites/hero.spr"]);
+        let free = choice("tiles/world.til", &[]);
+        assert_eq!(
+            default_tileset_choice(&[owned.clone(), free.clone()]),
+            1,
+            "sorts first but is owned -- the default must step past it"
+        );
+        assert_eq!(default_tileset_choice(&[free.clone(), owned.clone()]), 0);
+        assert_eq!(
+            default_tileset_choice(&[owned.clone(), choice("b.til", &["b.spr"])]),
+            0,
+            "every tileset shared: fall back to the first, don't block creation"
+        );
+        assert_eq!(default_tileset_choice(&[]), 0);
+
+        assert_eq!(free.label(), "tiles/world.til");
+        assert_eq!(owned.label(), "sprites/hero.til (used by sprites/hero.spr)");
+        assert_eq!(
+            choice("a.til", &["x.spr", "y.spr"]).label(),
+            "a.til (used by x.spr +1 more)"
+        );
+        assert_eq!(free.share_warning(), None);
+        let warning = owned.share_warning().expect("an owned tileset warns");
+        assert!(warning.contains("sprites/hero.spr"), "{warning}");
+        assert!(warning.contains("rewrites"), "{warning}");
+        assert!(warning.contains("Dedup"), "{warning}");
+    }
+
+    /// **Fix round 1, BLOCKING 1.** The form's default must not silently
+    /// pool-share an unrelated sprite's tileset -- and when the user picks
+    /// one deliberately, the sharers are known so the UI can say so.
+    #[gpui::test]
+    async fn test_new_sprite_form_defaults_to_an_unshared_tileset(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let handler = new_sprite_handler(
+            workspace.downgrade(),
+            NewKind::Sprite,
+            "assets/sprites".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            let Some(PanelForm::New {
+                tilesets, selected, ..
+            }) = &panel.form
+            else {
+                panic!("expected the binding form");
+            };
+            assert_eq!(
+                tilesets[0],
+                choice("sprites/hero.til", &["sprites/hero.spr"]),
+                "a sprite-owned tileset stays OFFERED -- deliberate sharing is legal"
+            );
+            assert_eq!(tilesets[1], choice("tiles/world.til", &[]));
+            assert_eq!(*selected, 1, "but it is never the default");
+            assert_eq!(
+                tilesets[*selected].share_warning(),
+                None,
+                "so the default raises no warning"
+            );
+        });
+
+        // Deliberately choosing the shared one warns, then binds.
+        panel.update(cx, |panel, cx| panel.select_new_tileset(0, cx));
+        panel.update(cx, |panel, _| {
+            let Some(PanelForm::New {
+                tilesets, selected, ..
+            }) = &panel.form
+            else {
+                unreachable!()
+            };
+            assert!(
+                tilesets[*selected].share_warning().is_some(),
+                "picking a sprite-owned tileset must warn before Create"
+            );
+        });
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            open_sprite(&assets, "sprites/sprite.spr").unwrap().til_path,
+            "sprites/hero.til",
+            "the deliberate choice is honoured"
+        );
+    }
+
+    /// **Fix round 1, BLOCKING 2.** The viewer stays live under the form
+    /// bar, so an edit made AFTER the form opened must still be guarded --
+    /// the form-open guard is too early to see it. Cancelling keeps the
+    /// edit, the old document, and the form; Don't-Save discards it and
+    /// goes through.
+    #[gpui::test]
+    async fn test_edits_made_while_the_new_form_is_open_are_guarded(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "assets/sprites/hero.spr");
+
+        // Open the form CLEAN -- no prompt at this point by construction.
+        let handler = new_sprite_handler(
+            workspace.downgrade(),
+            NewKind::Sprite,
+            "assets/sprites".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt(), "a clean document must not prompt");
+
+        // ...then edit the still-live document under the form.
+        panel.update(cx, |panel, cx| {
+            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+        });
+
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
+        assert_eq!(
+            cx.pending_prompt().map(|(msg, _)| msg),
+            Some(
+                "assets/sprites/hero.spr contains unsaved edits. Do you want to save it?"
+                    .to_string()
+            ),
+            "Create must not replace the document without asking"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(
+            !assets.join("sprites/sprite.spr").exists(),
+            "Cancel writes nothing"
+        );
+        panel.update(cx, |panel, _| {
+            assert!(panel.form.is_some(), "the form stays open to retry");
+            let open = ready(panel);
+            assert_eq!(open.source_rel, "assets/sprites/hero.spr");
+            assert!(open.store.dirty(), "and the edit is still there");
+        });
+
+        // Going through with Save writes the edit before replacing.
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        assert_eq!(
+            open_sprite(&assets, "sprites/hero.spr")
+                .unwrap()
+                .state
+                .frames[0]
+                .duration_ms,
+            500,
+            "the edit made under the form was saved, not discarded"
+        );
+        panel.update(cx, |panel, _| {
+            assert_eq!(ready(panel).source_rel, "assets/sprites/sprite.spr");
+        });
+    }
+
+    /// Binding to a `.til` with no readable `.pal` adopts worldlib's
+    /// 16-gray fallback and `save_sprite` writes it -- so creating the
+    /// sprite also creates the missing `.pal`. Wanted (a sprite needs a
+    /// palette on disk, and the grays are what `ggo_tileset_panel` already
+    /// shows for that file), but it is a write next to a tileset the user
+    /// only pointed at, so it is pinned rather than left implicit.
+    #[gpui::test]
+    async fn test_new_sprite_binding_a_pal_less_tileset_writes_the_fallback_palette(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        std::fs::remove_file(assets.join("tiles/world.pal")).unwrap();
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        new_via_menu(&workspace, &panel, NewKind::Sprite, "assets/sprites", cx);
+
+        assert!(
+            assets.join("tiles/world.pal").is_file(),
+            "the missing .pal is created as a side effect of creating the sprite"
+        );
+        let opened = open_sprite(&assets, "sprites/sprite.spr").unwrap();
+        assert_eq!(opened.pal_path, "tiles/world.pal");
+        assert_eq!(
+            opened.state.palette[1],
+            0x1082, // rgb565(17, 17, 17) -- GRAYSCALE_STEP * 1
+            "worldlib's 17-per-step gray ramp, not the sprite default"
         );
     }
 
