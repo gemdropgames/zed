@@ -1212,7 +1212,11 @@ impl EmuPanel {
         if self.frame > 0 || self.stats.dropped > 0 {
             parts.push(self.stats.label());
         }
-        parts.extend(audio.label());
+        // The panel is the one authority on whether a run is live -- the
+        // status deliberately does not track it (that is run-scoped state,
+        // and keeping it there is what broke restarts). Without this an
+        // idle pane would keep advertising "audio on" with no device open.
+        parts.extend(audio.label(self.is_running()));
         (!parts.is_empty()).then(|| {
             Label::new(parts.join(" · "))
                 .size(LabelSize::XSmall)
@@ -1754,11 +1758,11 @@ mod tests {
             panel.audio.reset_for_run();
             panel.audio.mark_available();
             for _ in 0..3 {
-                panel.audio.record_underrun();
+                panel.audio.record_dropout();
             }
             assert_eq!(
-                panel.audio.state().label().as_deref(),
-                Some("audio on · underruns 3")
+                panel.audio.state().label(true).as_deref(),
+                Some("audio on · 3 dropouts")
             );
             assert!(
                 panel.render_stats().is_some(),
@@ -1767,9 +1771,17 @@ mod tests {
 
             panel.audio.set_muted(true);
             assert_eq!(
-                panel.audio.state().label().as_deref(),
-                Some("audio muted · underruns 3"),
+                panel.audio.state().label(true).as_deref(),
+                Some("audio muted · 3 dropouts"),
                 "muting must not hide (or reset) the diagnostic"
+            );
+
+            // Finding 6: with no session live, the pane must not claim a
+            // device is open -- the count belongs to the run that ended.
+            assert!(!panel.is_running());
+            assert_eq!(
+                panel.audio.state().label(panel.is_running()).as_deref(),
+                Some("audio idle · 3 dropouts last run")
             );
         });
     }
@@ -1850,6 +1862,74 @@ mod tests {
             }
             assert!(panel.is_running(), "the audio verdict must not end the run");
             assert!(panel.render_stats().is_some());
+            panel.stop(window, cx);
+        });
+        cx.executor().run_until_parked();
+    }
+
+    /// **BLOCKER 1 at the panel's own boundary.** Restarting a cart is
+    /// `stop` -> `finish_run` (which backgrounds the join, so run A's
+    /// teardown lands *after* run B is already going) -> `reset_for_run` ->
+    /// `drive::start` with the SAME `AudioStatus`. The mechanism that made
+    /// this safe -- a run-scoped priming flag -- is unit-tested in
+    /// `audio::tests::ending_one_run_does_not_silence_another_started_from_
+    /// the_same_status`; what this covers is that the real restart path
+    /// still leaves the pane coherent: run B reaches its own verdict, and
+    /// the row reads as a LIVE run rather than "idle ... last run".
+    #[gpui::test]
+    async fn test_restarting_a_cart_leaves_the_new_run_with_its_own_audio_state(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let (panel, cx) = windowed_panel(cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+            panel.refresh_root(cx);
+            panel.open_rel_path("green.cart", window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        // Run A.
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+        let first_generation = panel.read_with(cx, |panel, _| panel.run_generation);
+
+        // Run B, over the top of A -- the restart path, with A's join still
+        // in flight.
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+        // Let A's background completion land, which is precisely when the
+        // old design clobbered B.
+        cx.executor().run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(
+                panel.run_generation > first_generation,
+                "sanity: this really was a restart"
+            );
+            assert!(panel.is_running(), "run B must still be going");
+            assert_ne!(
+                panel.audio.state(),
+                audio::AudioState::Idle,
+                "run B must reach its own audio verdict, not inherit A's cleared one"
+            );
+            let label = panel
+                .audio
+                .state()
+                .label(panel.is_running())
+                .expect("a run that reached a verdict has something to say");
+            assert!(
+                !label.contains("last run"),
+                "a live run must not be reported as an ended one: {label}"
+            );
             panel.stop(window, cx);
         });
         cx.executor().run_until_parked();

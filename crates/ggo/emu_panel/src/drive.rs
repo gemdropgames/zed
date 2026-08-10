@@ -46,8 +46,11 @@
 //! is open exactly while a run is live and never a moment longer. See
 //! [`crate::audio`]'s module doc for why the pane owns the stream at all
 //! rather than leaving it to the standalone binary. Passing `None` for
-//! `audio` (what every test here does) skips the device entirely and never
-//! touches cpal.
+//! `audio` skips the device entirely and never touches cpal, which is what
+//! every test in THIS module does -- note that is not true of the crate as
+//! a whole: `crate::audio`'s own smoke test opens the real device, and any
+//! panel test that calls `EmuPanel::run` goes through the production path
+//! and therefore opens one too.
 //!
 //! ## What is deliberately not ported
 //!
@@ -357,7 +360,10 @@ fn run(
     let mut audio_scratch: Vec<i16> = Vec::new();
     let (audio_writer, _audio_out) = match audio {
         Some(status) => {
-            status.set_running(true);
+            // The ring's "audio is flowing" flag is created HERE, per run,
+            // and dies with `writer` below -- it is deliberately not on the
+            // panel-scoped `status`, or a restart's outgoing run would
+            // silence the incoming one. See `crate::audio`'s module doc.
             let (writer, reader) = crate::audio::channel(status.clone());
             // Infallible: no device is a normal machine, not a failed run.
             let out = crate::audio::start_output(status, reader, ggo_emu_core::apu::MIX_RATE);
@@ -450,14 +456,14 @@ fn run(
         }
     };
 
-    // Nothing is feeding the ring from here on. Clearing this BEFORE
-    // `_audio_out` drops (which happens at the end of this function) is
-    // what keeps the last few callbacks before teardown from counting
-    // underruns against a queue that has simply stopped being written --
-    // see `audio::fill`.
-    if let Some(status) = audio {
-        status.set_running(false);
-    }
+    // Nothing will feed the ring from here on, so unprime it NOW rather
+    // than letting the binding fall out of scope at the end of the
+    // function: `perf_json` below serialises every recorded frame and can
+    // take milliseconds, which at ~10 ms a cpal buffer is long enough to
+    // charge a handful of dropouts against a run that has already stopped.
+    // (`RingWriter::drop` is still what covers the panic path -- see its
+    // doc; this is only about making the clean path prompt.)
+    drop(audio_writer);
 
     RunOutcome {
         reason,
@@ -854,7 +860,6 @@ mod tests {
     fn pump_audio_moves_a_frames_mixed_samples_into_the_ring() {
         let apu = apu_with_one_mixed_frame();
         let status = crate::audio::AudioStatus::new();
-        status.set_running(true);
         let (writer, reader) = crate::audio::channel(status);
 
         let mut scratch = Vec::new();
@@ -887,7 +892,6 @@ mod tests {
     fn pump_audio_submits_each_frame_once_across_a_reused_scratch_buffer() {
         let mut apu = apu_with_one_mixed_frame();
         let status = crate::audio::AudioStatus::new();
-        status.set_running(true);
         let (writer, reader) = crate::audio::channel(status);
 
         let mut scratch = Vec::new();
@@ -923,7 +927,6 @@ mod tests {
     fn pump_audio_submits_nothing_while_muted() {
         let apu = apu_with_one_mixed_frame();
         let status = crate::audio::AudioStatus::new();
-        status.set_running(true);
         status.set_muted(true);
         let (writer, reader) = crate::audio::channel(status.clone());
 
