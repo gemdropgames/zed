@@ -38,6 +38,7 @@
 
 mod edits;
 mod loader;
+mod onion;
 mod playback;
 mod tiles;
 
@@ -873,6 +874,8 @@ struct OpenSprite {
     selected_frame: usize,
     /// Index into the doc's clips; `None` = whole-sprite range.
     active_clip: Option<usize>,
+    /// Onion-skin controls (off by default) -- see [`onion`].
+    onion: onion::OnionState,
     playing: Option<Playing>,
     /// The transport's timer loop -- dropping it (new sprite selected,
     /// panel dropped) cancels playback; a finished loop leaves a spent
@@ -911,6 +914,7 @@ impl OpenSprite {
             preview_bounds: Rc::new(RefCell::new(None)),
             selected_frame: 0,
             active_clip: None,
+            onion: onion::OnionState::default(),
             playing: None,
             _tick_task: None,
             editors: Vec::new(),
@@ -936,6 +940,21 @@ impl OpenSprite {
             .iter()
             .map(|f| f.duration_ms)
             .collect()
+    }
+
+    /// The onion-skin ghosts for the frame currently on screen, farthest
+    /// first. Empty while the toggle is off -- and while PLAYING, which
+    /// ggo-ide does not special-case but which is meaningless here: the
+    /// transport already shows the neighbouring frames in sequence, and
+    /// stacking ghosts under a moving image only smears it.
+    fn ghosts(&self) -> Vec<onion::Ghost> {
+        if self.playing.is_some() {
+            return Vec::new();
+        }
+        let state = self.store.state();
+        let clip = self.active_clip.and_then(|i| state.clips.get(i));
+        self.onion
+            .ghosts(self.shown_frame(), state.frames.len(), clip)
     }
 }
 
@@ -1489,6 +1508,16 @@ impl SpritePanel {
     fn select_clip(&mut self, clip: Option<usize>, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state {
             open.active_clip = clip;
+            cx.notify();
+        }
+    }
+
+    /// Mutate the onion-skin controls and repaint. One entry point for all
+    /// four (toggle, back, forward, opacity) so every control shares the
+    /// Ready guard and the notify.
+    fn update_onion(&mut self, edit: impl FnOnce(&mut onion::OnionState), cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            edit(&mut open.onion);
             cx.notify();
         }
     }
@@ -2340,6 +2369,84 @@ impl SpritePanel {
             .into_any_element()
     }
 
+    /// The onion-skin control row: the toggle, a `-`/`+` stepper for the
+    /// back and forward ghost counts, and one for the opacity -- ggo-ide's
+    /// `timeline::State::transport_row` onion group, minus its slider (see
+    /// [`onion`]'s module doc). The steppers are disabled once the counts
+    /// hit their clamp so the row shows its own limits, matching the
+    /// import panel's zoom stepper.
+    fn render_onion(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_onion is only called in the Ready state");
+        };
+        let o = open.onion;
+        let stepper =
+            |id: &'static str,
+             label: String,
+             can_dec: bool,
+             can_inc: bool,
+             tooltip: &'static str,
+             step: fn(&mut SpritePanel, i32, &mut Context<SpritePanel>)| {
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        IconButton::new(SharedString::from(format!("{id}-minus")), IconName::Dash)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(ui::Tooltip::text(tooltip))
+                            .disabled(!can_dec)
+                            .on_click(cx.listener(move |this, _, _, cx| step(this, -1, cx))),
+                    )
+                    .child(
+                        Label::new(SharedString::from(label))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("{id}-plus")), IconName::Plus)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(ui::Tooltip::text(tooltip))
+                            .disabled(!can_inc)
+                            .on_click(cx.listener(move |this, _, _, cx| step(this, 1, cx))),
+                    )
+            };
+        h_flex()
+            .gap_1()
+            .px_1()
+            .pb_1()
+            .child(
+                Checkbox::new("ggo-sprite-onion", ToggleState::from(o.on))
+                    .label("Onion")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update_onion(onion::OnionState::toggle, cx)
+                    })),
+            )
+            .child(stepper(
+                "ggo-sprite-onion-back",
+                format!("back {}", o.back),
+                o.can_step_back(-1),
+                o.can_step_back(1),
+                "Ghost frames behind",
+                |this, d, cx| this.update_onion(|s| s.step_back(d), cx),
+            ))
+            .child(stepper(
+                "ggo-sprite-onion-fwd",
+                format!("fwd {}", o.fwd),
+                o.can_step_fwd(-1),
+                o.can_step_fwd(1),
+                "Ghost frames ahead",
+                |this, d, cx| this.update_onion(|s| s.step_fwd(d), cx),
+            ))
+            .child(stepper(
+                "ggo-sprite-onion-opacity",
+                format!("{}%", (o.opacity * 100.0).round() as i32),
+                o.can_step_opacity(-1),
+                o.can_step_opacity(1),
+                "Ghost opacity",
+                |this, d, cx| this.update_onion(|s| s.step_opacity(d), cx),
+            ))
+            .into_any_element()
+    }
+
     /// The big center preview: the shown frame fit into a [`PREVIEW_PX`]
     /// box. An invisible overlay canvas records the image's on-screen
     /// bounds at prepaint (world_panel's `last_bounds` idiom -- gpui
@@ -2372,11 +2479,31 @@ impl SpritePanel {
             )
             .absolute()
             .size_full();
+            // Onion ghosts, farthest first, each absolutely positioned over
+            // the same box as the real frame and drawn BEFORE it (so the
+            // current frame is on top). Frames all share the sprite's
+            // dimensions, so one fit box serves them all.
+            let ghosts: Vec<gpui::AnyElement> = open
+                .ghosts()
+                .into_iter()
+                .filter_map(|ghost| {
+                    let image = open.frames.get(ghost.idx)?;
+                    Some(
+                        img(image.clone())
+                            .absolute()
+                            .w(px(fit_w))
+                            .h(px(fit_h))
+                            .opacity(ghost.alpha)
+                            .into_any_element(),
+                    )
+                })
+                .collect();
             preview = preview.child(
                 div()
                     .relative()
                     .w(px(fit_w))
                     .h(px(fit_h))
+                    .children(ghosts)
                     .child(img(image.clone()).w(px(fit_w)).h(px(fit_h)))
                     .child(overlay)
                     .on_mouse_down(
@@ -2819,6 +2946,7 @@ impl SpritePanel {
         v_flex()
             .size_full()
             .child(self.render_transport(window, cx))
+            .child(self.render_onion(cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -3213,6 +3341,56 @@ mod tests {
             ViewerState::Ready(open) => open,
             _ => panic!("expected Ready"),
         }
+    }
+
+    /// The onion controls reach the open document's state, and the ghost
+    /// list the preview draws follows them. The frame SELECTION rule is
+    /// worldlib's and is tested in `onion`; this is the wiring.
+    #[gpui::test]
+    async fn test_onion_controls_drive_the_preview_ghosts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Off by default: no ghosts, whatever the counts say.
+            assert!(!ready(panel).onion.on);
+            assert!(ready(panel).ghosts().is_empty());
+
+            panel.update_onion(onion::OnionState::toggle, cx);
+            assert!(ready(panel).onion.on);
+            // Fixture: 2 frames, selected 0 -> the one frame ahead ghosts.
+            let ghosts = ready(panel).ghosts();
+            assert_eq!(ghosts.len(), 1);
+            assert_eq!(ghosts[0].idx, 1);
+            assert!((ghosts[0].alpha - onion::DEFAULT_OPACITY).abs() < 1e-6);
+
+            // The opacity stepper moves the alpha the preview draws at.
+            panel.update_onion(|s| s.step_opacity(2), cx);
+            let ghosts = ready(panel).ghosts();
+            assert!(
+                (ghosts[0].alpha - (onion::DEFAULT_OPACITY + 2.0 * onion::OPACITY_STEP)).abs()
+                    < 1e-6
+            );
+
+            // Zeroing the forward count empties the list even while on.
+            panel.update_onion(|s| s.step_fwd(-1), cx);
+            assert_eq!(ready(panel).onion.fwd, 0);
+            assert!(ready(panel).ghosts().is_empty());
+
+            // Selecting frame 1 brings the BACK ghost in instead.
+            panel.update_onion(|s| s.step_back(1), cx);
+            panel.select_frame(1, cx);
+            let ghosts = ready(panel).ghosts();
+            assert_eq!(ghosts.iter().map(|g| g.idx).collect::<Vec<_>>(), vec![0]);
+
+            // An active clip confines the walk: clip 0 is the single frame
+            // 1, so nothing neighbours it inside the clip.
+            panel.select_clip(Some(0), cx);
+            assert!(
+                ready(panel).ghosts().is_empty(),
+                "a one-frame clip has no neighbours to ghost"
+            );
+        });
     }
 
     // ------------------------------------------- unsaved-document guard

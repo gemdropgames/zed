@@ -32,6 +32,9 @@ workspace.workspace = true
 ggo-worldlib.workspace = true # GGO
 ggo-asset-formats.workspace = true # GGO
 ggo_common.workspace = true
+# The "open this MetaSprite's sprite" handoff needs the sprite panel's own
+# `open_rel_path`. One-way: the sprite panel does not know about worlds.
+ggo_sprite_panel.workspace = true # GGO
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

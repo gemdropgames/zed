@@ -7701,6 +7701,7 @@ dependencies = [
  "ggo-asset-formats",
  "ggo-worldlib",
  "ggo_common",
+ "ggo_sprite_panel",
  "gpui",
  "keymap_editor",
  "log",

@@ -28,6 +28,52 @@ pub const ZOOM_MAX: f64 = 8.0;
 /// factor.
 pub const ZOOM_LEVELS: &[f64] = &[0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0];
 
+/// The zoom a freshly-loaded world -- and the "Reset" button -- frames at.
+/// Paired with [`reset_camera`]; see there for why reset does not compute
+/// a pan.
+pub const ZOOM_DEFAULT: f64 = 1.0;
+
+/// The camera "Reset" restores: default zoom and NO pan. A `None` pan is
+/// how `render_canvas`'s prepaint recognizes "never laid out", so the very
+/// next paint re-runs the initial centering
+/// (`centering_pan(bounds, camera_center(active_camera_origin(...)))`).
+/// That is deliberately the whole of it: recomputing a pan here would need
+/// canvas bounds the reset click does not have, and would be a SECOND copy
+/// of the framing rule that could drift from the one that opens a world.
+///
+/// ggo-ide's own `ResetView` instead assigns a fixed `ZOOM_INITIAL` plus
+/// `initial_pan(CANVAS_DEFAULT_W, CANVAS_DEFAULT_H)` -- a hardcoded canvas
+/// size, because its canvas was a fixed-size widget. This panel's canvas
+/// fills a resizable dock, so "re-center on the real bounds" is the same
+/// intent expressed against a variable-size canvas.
+pub fn reset_camera() -> (f64, Option<[f64; 2]>) {
+    (ZOOM_DEFAULT, None)
+}
+
+/// Grid line spacing, world px -- one tile, so the grid reads as a tile
+/// guide at 1x. ggo-ide `pages::world::canvas::GRID_STEP_PX`.
+pub const GRID_STEP_PX: f64 = 16.0;
+
+/// Preview-size stepper bounds -- ggo-ide's `PREVIEW_SCALE_*`. The world
+/// canvas WIDGET renders at an exact integer multiple of the real device
+/// screen (`DEVICE_SCREEN_W` x `DEVICE_SCREEN_H`); the in-canvas pan/zoom
+/// above is a separate, unaffected axis.
+pub const PREVIEW_SCALE_MIN: u32 = 1;
+pub const PREVIEW_SCALE_MAX: u32 = 4;
+pub const PREVIEW_SCALE_DEFAULT: u32 = 2;
+
+/// One step of the preview-size stepper toward `dir` (`>= 0` up), clamped
+/// to `[PREVIEW_SCALE_MIN, PREVIEW_SCALE_MAX]` -- ggo-ide's `step_scale`,
+/// ported verbatim so the `-`/`+` buttons are unit-testable.
+pub fn step_scale(current: u32, dir: i32) -> u32 {
+    let next = if dir >= 0 {
+        current.saturating_add(1)
+    } else {
+        current.saturating_sub(1)
+    };
+    next.clamp(PREVIEW_SCALE_MIN, PREVIEW_SCALE_MAX)
+}
+
 /// Next ladder step above (`dir > 0`) or below (`dir < 0`) `zoom`,
 /// saturating at the ladder ends.
 pub fn zoom_step(zoom: f64, dir: i32) -> f64 {
@@ -155,6 +201,8 @@ pub struct Scene {
     pub pan: [f64; 2],
     /// `active_camera_origin` -- the device-screen outline's top-left.
     pub screen_origin: [f64; 2],
+    /// Draw the tile grid under the items ([`paint_grid`]).
+    pub grid: bool,
     pub background: Hsla,
     pub text_color: Hsla,
 }
@@ -177,6 +225,9 @@ pub fn paint_scene(
                 pan_y: scene.pan[1],
                 dpr: None,
             };
+            if scene.grid {
+                paint_grid(&view, canvas_bounds, window);
+            }
             for item in &scene.items {
                 paint_item(scene, item, &view, canvas_bounds, window, cx);
             }
@@ -281,6 +332,65 @@ fn paint_item(
         DrawKind::SelectionOutline => {
             window.paint_quad(outline(b, color(0xebcb8b), BorderStyle::default()));
         }
+    }
+}
+
+/// Defensive ceiling on grid lines per axis: a very low zoom over a very
+/// wide canvas is a legitimate (if dense) case, but a degenerate `view`
+/// must not spin the loop.
+const GRID_MAX_LINES: usize = 4096;
+
+const GRID_LINE_COLOR: u32 = 0x80808040;
+
+/// World-space coordinates of the grid lines a `w` x `h` px canvas shows
+/// at `view`, as `(xs, ys)` -- ggo-ide's `draw_grid` walk, split out from
+/// the painting so "which lines" is testable without a window.
+pub fn grid_lines(view: &View, w: f64, h: f64) -> (Vec<f64>, Vec<f64>) {
+    let top_left = drag_ops::screen_to_world(0.0, 0.0, view);
+    let bottom_right = drag_ops::screen_to_world(w, h, view);
+    (
+        axis_lines(top_left[0], bottom_right[0]),
+        axis_lines(top_left[1], bottom_right[1]),
+    )
+}
+
+fn axis_lines(lo: f64, hi: f64) -> Vec<f64> {
+    if !lo.is_finite() || !hi.is_finite() || hi < lo {
+        return Vec::new();
+    }
+    let mut v = (lo / GRID_STEP_PX).floor() * GRID_STEP_PX;
+    let mut out = Vec::new();
+    while v <= hi && out.len() < GRID_MAX_LINES {
+        out.push(v);
+        v += GRID_STEP_PX;
+    }
+    out
+}
+
+/// The tile grid, under everything else. 1px quads rather than paths: the
+/// lines are axis-aligned, which is exactly what `paint_quad` draws
+/// cheapest (the `InstanceOrigin` crosshair does the same).
+fn paint_grid(view: &View, canvas_bounds: Bounds<Pixels>, window: &mut Window) {
+    let origin = canvas_bounds.origin;
+    let (xs, ys) = grid_lines(
+        view,
+        f64::from(canvas_bounds.size.width),
+        f64::from(canvas_bounds.size.height),
+    );
+    let stroke: Hsla = gpui::rgba(GRID_LINE_COLOR).into();
+    for x in xs {
+        let sx = to_screen(view, origin, x, 0.0).x;
+        window.paint_quad(fill(
+            bounds(point(sx, origin.y), size(px(1.), canvas_bounds.size.height)),
+            stroke,
+        ));
+    }
+    for y in ys {
+        let sy = to_screen(view, origin, 0.0, y).y;
+        window.paint_quad(fill(
+            bounds(point(origin.x, sy), size(canvas_bounds.size.width, px(1.))),
+            stroke,
+        ));
     }
 }
 
@@ -444,6 +554,85 @@ mod tests {
             dragged_pos([4.0, 4.0], [10.0, 10.0], [27.0, 10.0], true),
             [16.0, 0.0]
         );
+    }
+
+    fn view_at(zoom: f64, pan: [f64; 2]) -> View {
+        View {
+            zoom,
+            pan_x: pan[0],
+            pan_y: pan[1],
+            dpr: None,
+        }
+    }
+
+    #[test]
+    fn step_scale_walks_one_unit_and_clamps_to_the_preview_range() {
+        assert_eq!(step_scale(PREVIEW_SCALE_DEFAULT, 1), 3);
+        assert_eq!(step_scale(PREVIEW_SCALE_DEFAULT, -1), 1);
+        assert_eq!(step_scale(PREVIEW_SCALE_MAX, 1), PREVIEW_SCALE_MAX);
+        assert_eq!(step_scale(PREVIEW_SCALE_MIN, -1), PREVIEW_SCALE_MIN);
+        // 0 is not a reachable state even from a corrupt starting value.
+        assert_eq!(step_scale(0, -1), PREVIEW_SCALE_MIN);
+        assert_eq!(step_scale(99, 1), PREVIEW_SCALE_MAX);
+    }
+
+    /// Reset hands back the default zoom and NO pan, and that pair is
+    /// exactly what the first-layout path consumes -- so a reset frames
+    /// the world the same way opening it does, by construction.
+    #[test]
+    fn reset_camera_reproduces_the_initial_framing() {
+        let (zoom, pan) = reset_camera();
+        assert_eq!(zoom, ZOOM_DEFAULT);
+        assert_eq!(pan, None, "None pan is what re-triggers the centering");
+
+        // What prepaint then computes, for a world whose camera sits at
+        // the origin-centering screen rect.
+        let world_center = camera_center([-DEVICE_SCREEN_W / 2.0, -DEVICE_SCREEN_H / 2.0]);
+        let pan = centering_pan(400.0, 300.0, zoom, world_center);
+        let screen = drag_ops::world_to_screen(0.0, 0.0, &view_at(zoom, pan));
+        assert_eq!(screen, [200.0, 150.0], "the camera lands on canvas center");
+    }
+
+    #[test]
+    fn grid_lines_cover_the_visible_world_rect_on_tile_boundaries() {
+        // Identity view, 64x32 canvas: world [0, 64] x [0, 32].
+        let (xs, ys) = grid_lines(&view_at(1.0, [0.0, 0.0]), 64.0, 32.0);
+        assert_eq!(xs, vec![0.0, 16.0, 32.0, 48.0, 64.0]);
+        assert_eq!(ys, vec![0.0, 16.0, 32.0]);
+        assert!(
+            xs.iter().chain(ys.iter()).all(|v| v % GRID_STEP_PX == 0.0),
+            "every line is on a tile boundary"
+        );
+    }
+
+    #[test]
+    fn grid_lines_start_at_or_before_the_visible_edge_when_panned_off_grid() {
+        // Pan by 4px: the world edge is at -4, so the first line is -16
+        // (floor to the tile below), never inside the visible rect.
+        let (xs, _) = grid_lines(&view_at(1.0, [4.0, 0.0]), 32.0, 32.0);
+        assert_eq!(xs, vec![-16.0, 0.0, 16.0]);
+        assert!(
+            *xs.first().unwrap() <= -4.0,
+            "the first line is at or before the visible edge"
+        );
+        assert!(
+            *xs.last().unwrap() > 28.0 - GRID_STEP_PX,
+            "and the last is within a tile of the far edge"
+        );
+    }
+
+    #[test]
+    fn grid_lines_scale_with_zoom_and_survive_degenerate_views() {
+        // Zoomed 4x: the same canvas shows a quarter of the world, so a
+        // quarter of the lines.
+        let (xs, _) = grid_lines(&view_at(4.0, [0.0, 0.0]), 64.0, 64.0);
+        assert_eq!(xs, vec![0.0, 16.0]);
+        // Zero zoom would divide by zero -- no lines, no panic, no spin.
+        let (xs, ys) = grid_lines(&view_at(0.0, [0.0, 0.0]), 64.0, 64.0);
+        assert!(xs.is_empty() && ys.is_empty());
+        // And a pathologically low zoom is capped rather than unbounded.
+        let (xs, _) = grid_lines(&view_at(1e-9, [0.0, 0.0]), 4096.0, 4096.0);
+        assert_eq!(xs.len(), GRID_MAX_LINES);
     }
 
     #[test]

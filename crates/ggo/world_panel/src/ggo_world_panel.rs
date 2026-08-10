@@ -29,7 +29,7 @@ mod loader;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -50,7 +50,8 @@ use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::merge_candidates::merge_candidates;
 use ggo_worldlib::render::{
-    AssetLoads, DrawItem, Selection, active_camera_origin, build_draw_list, hit_test, world_label,
+    AssetLoads, DEVICE_SCREEN_H, DEVICE_SCREEN_W, DrawItem, Selection, active_camera_origin,
+    build_draw_list, hit_test, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, defaults_for};
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
@@ -73,7 +74,25 @@ actions!(
         /// panel's field editors).
         CommitField,
         /// Deletes the selected entity or instance from the open world.
-        DeleteSelected
+        DeleteSelected,
+        /// Resets the canvas camera to the default framing.
+        ResetView,
+        /// Nudges the selection one pixel left.
+        NudgeLeft,
+        /// Nudges the selection one pixel right.
+        NudgeRight,
+        /// Nudges the selection one pixel up.
+        NudgeUp,
+        /// Nudges the selection one pixel down.
+        NudgeDown,
+        /// Nudges the selection one tile left.
+        NudgeLeftTile,
+        /// Nudges the selection one tile right.
+        NudgeRightTile,
+        /// Nudges the selection one tile up.
+        NudgeUpTile,
+        /// Nudges the selection one tile down.
+        NudgeDownTile
     ]
 );
 
@@ -171,6 +190,42 @@ fn split_world_path(rel: &str) -> Option<(String, WorldListing)> {
         .into_iter()
         .next()?;
     Some((rel[..cut].trim_end_matches('/').to_string(), listing))
+}
+
+/// The component whose `stem` the inspector offers a "go to sprite" jump
+/// for, and the extension that stem resolves with. A `MetaSprite`'s stem is
+/// ASSET-ROOT-relative and extensionless (`sprites/hero`), the same frame
+/// `loader::compose_meta_sprite_rgba` opens it in (`{stem}.spr`).
+const META_SPRITE: &str = "MetaSprite";
+const SPRITE_EXT: &str = "spr";
+
+/// The WORKTREE-relative `.spr` path an asset-root-relative `stem` names,
+/// or `None` when it does not resolve to a file that exists.
+///
+/// Two frames are in play and they are not the same one (the F4 asset-root
+/// split): the stem resolves under `asset_root` (`<worktree>/assets` for an
+/// `assets/worlds/main.toml`), while `SpritePanel::open_rel_path` -- like
+/// every explorer-driven open -- takes a path relative to the WORKTREE.
+/// So this joins in the first frame and re-relativizes into the second.
+///
+/// Declines rather than guessing when: the stem names nothing on disk (a
+/// world may legitimately reference a sprite that has not been authored
+/// yet, and handing the sprite panel a missing path would only park it in
+/// an error state), or the asset root is not inside the worktree at all
+/// (nothing worktree-relative to hand over).
+fn sprite_rel_for_stem(project_root: &Path, asset_root: &Path, stem: &str) -> Option<String> {
+    if stem.is_empty() {
+        return None;
+    }
+    let abs = asset_root.join(format!("{stem}.{SPRITE_EXT}"));
+    if !abs.is_file() {
+        return None;
+    }
+    let rel = abs.strip_prefix(project_root).ok()?;
+    Some(
+        rel.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+    )
 }
 
 /// The assets-root-relative world STEM a worktree-relative path names --
@@ -285,6 +340,17 @@ fn bind_panel_keys(cx: &mut App) {
         // Editor-context bindings win while typing.
         KeyBinding::new("delete", DeleteSelected, Some(KEY_CONTEXT)),
         KeyBinding::new("backspace", DeleteSelected, Some(KEY_CONTEXT)),
+        // Arrow-key nudge, same panel-focused-only rule: the arrows keep
+        // moving the cursor while an inspector field editor has focus,
+        // because `Editor` is the deeper context.
+        KeyBinding::new("left", NudgeLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("right", NudgeRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", NudgeUp, Some(KEY_CONTEXT)),
+        KeyBinding::new("down", NudgeDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-left", NudgeLeftTile, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-right", NudgeRightTile, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-up", NudgeUpTile, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-down", NudgeDownTile, Some(KEY_CONTEXT)),
         // Single-line editors don't bind Enter themselves (the default
         // keymap's `enter -> editor::Newline` is `mode == full` only), so
         // this fires while an inspector field editor is focused.
@@ -368,7 +434,17 @@ struct OpenWorld {
     view: Rc<RefCell<ViewShared>>,
     selected: Option<Selection>,
     snap: bool,
+    /// Tile-grid overlay under the draw list -- ggo-ide `open.grid`, which
+    /// also defaults ON.
+    grid: bool,
+    /// Canvas widget size as a multiple of the device screen -- ggo-ide
+    /// `open.preview_scale` (see `canvas::step_scale`).
+    preview_scale: u32,
     edit_drag: Option<EditDrag>,
+    /// The gesture id an in-flight RUN of arrow-key nudges shares, so the
+    /// store coalesces the run into one undo entry the way it coalesces a
+    /// drag. `None` between runs; see [`WorldPanel::nudge_impl`].
+    nudge_gesture: Option<String>,
     gesture_counter: u64,
     inspector: Vec<InspectorEntry>,
     save_error: Option<String>,
@@ -394,14 +470,17 @@ impl OpenWorld {
             schemas: loaded.schemas,
             images: Arc::new(images),
             view: Rc::new(RefCell::new(ViewShared {
-                zoom: 1.0,
+                zoom: canvas::ZOOM_DEFAULT,
                 pan: None,
                 last_bounds: None,
                 drag: None,
             })),
             selected: None,
             snap: false,
+            grid: true,
+            preview_scale: canvas::PREVIEW_SCALE_DEFAULT,
             edit_drag: None,
+            nudge_gesture: None,
             gesture_counter: 0,
             inspector: Vec::new(),
             save_error: None,
@@ -786,6 +865,7 @@ impl WorldPanel {
         open.store.apply(WorldOp::AddEntity { components });
         open.selected = Some(Selection::Entity(open.store.state().entities.len() - 1));
         open.edit_drag = None;
+        open.nudge_gesture = None;
         cx.notify();
     }
 
@@ -827,6 +907,7 @@ impl WorldPanel {
         });
         open.selected = Some(Selection::Instance(index));
         open.edit_drag = None;
+        open.nudge_gesture = None;
 
         // Resolve the new stem's subtree and stamp it NOW -- ggo-ide
         // re-resolves after every message (`dispatch_new_asset_loads`),
@@ -874,10 +955,160 @@ impl WorldPanel {
         }
         open.selected = None;
         open.edit_drag = None;
+        open.nudge_gesture = None;
         cx.notify();
     }
 
+    /// Move the selected entity/instance by one nudge step and repaint --
+    /// the arrow keys (`key` is the JS-style name worldlib's
+    /// [`drag_ops::nudge_delta`] takes; `tile` is the Shift modifier, one
+    /// tile instead of one pixel). Snap applies to the RESULT, exactly as
+    /// it does for a drag.
+    ///
+    /// Goes through the SAME `MoveEntity`/`MoveInstance` ops the drag path
+    /// applies, WITH a gesture id: a run of nudges shares one id, so the
+    /// store amends its top undo entry instead of pushing one per
+    /// keypress, and a single undo puts the item back where the run
+    /// started. That id is minted lazily here and torn down by
+    /// [`Self::end_nudge_run`] at every event that means "the run is over"
+    /// -- a new selection, a drag, a delete, an undo/redo.
+    ///
+    /// **Deviation from ggo-ide**, which passes `gesture: None` and gets
+    /// one undo entry per keypress; holding an arrow key there buries the
+    /// pre-nudge position under dozens of entries.
+    fn nudge_impl(&mut self, key: &str, tile: bool, cx: &mut Context<Self>) {
+        let Some(delta) = drag_ops::nudge_delta(key, tile) else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(selection) = open.selected else {
+            return;
+        };
+        let state = open.store.state();
+        let pos = match selection {
+            Selection::Entity(index) => inspector::entity_pos(&state, index),
+            Selection::Instance(index) => state.instances.get(index).map(|inst| inst.pos),
+        };
+        // A selection gone stale against an undo/redo restructure, or an
+        // entity with no Transform, has nothing to move.
+        let Some(pos) = pos else {
+            return;
+        };
+        let mut next = [pos[0] + delta[0], pos[1] + delta[1]];
+        if open.snap {
+            next = drag_ops::snap_to_tile(next);
+        }
+        let gesture = match &open.nudge_gesture {
+            Some(id) => id.clone(),
+            None => {
+                open.gesture_counter += 1;
+                let id = format!("nudge-{}", open.gesture_counter);
+                open.nudge_gesture = Some(id.clone());
+                id
+            }
+        };
+        match selection {
+            Selection::Entity(entity) => open.store.apply(WorldOp::MoveEntity {
+                entity,
+                pos: next,
+                gesture: Some(gesture),
+            }),
+            Selection::Instance(index) => open.store.apply(WorldOp::MoveInstance {
+                index,
+                pos: next,
+                gesture: Some(gesture),
+            }),
+        }
+        cx.notify();
+    }
+
+    /// The worktree-relative `.spr` path entity `entity_ix`'s `MetaSprite`
+    /// component points at, or `None` when the entity has no `MetaSprite`,
+    /// its `stem` is missing/blank, or the stem doesn't resolve to a file
+    /// ([`sprite_rel_for_stem`]). Drives BOTH whether the inspector offers
+    /// the jump and where it goes, so the button can't exist without a
+    /// destination.
+    fn goto_sprite_target(&self, entity_ix: usize) -> Option<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let project_root = self.project_root.as_ref()?;
+        let stem = open
+            .store
+            .state()
+            .entities
+            .get(entity_ix)?
+            .components
+            .get(META_SPRITE)?
+            .get("stem")?
+            .as_str()?
+            .to_string();
+        sprite_rel_for_stem(project_root, &open.root, &stem)
+    }
+
+    /// Open `rel` in the sprite panel -- the `MetaSprite` inspector's
+    /// "go to sprite" jump. A workspace with no sprite panel docked is a
+    /// no-op, the same graceful degradation every other GGO panel handoff
+    /// makes; the `bool` (did a panel claim it?) is `open_in_panel`'s own
+    /// return, surfaced so a test can tell the two apart.
+    fn goto_sprite(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
+            return false;
+        };
+        workspace.update(cx, |workspace, cx| {
+            ggo_common::open_in_panel(
+                workspace,
+                window,
+                cx,
+                move |panel: &mut ggo_sprite_panel::SpritePanel, window, cx| {
+                    panel.open_rel_path(&rel, window, cx);
+                },
+            )
+        })
+    }
+
+    /// Seal any in-flight nudge run, so the NEXT nudge starts a fresh undo
+    /// entry rather than amending the last one. Called from every path
+    /// that changes what a nudge would even be moving.
+    fn end_nudge_run(&mut self) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.nudge_gesture = None;
+        }
+    }
+
+    /// Restore the default camera framing -- `canvas::reset_camera`'s pair,
+    /// with the `None` pan letting the next prepaint re-center on the
+    /// active camera (see that function's doc).
+    fn reset_view_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let (zoom, pan) = canvas::reset_camera();
+        let mut view = open.view.borrow_mut();
+        view.zoom = zoom;
+        view.pan = pan;
+        drop(view);
+        cx.notify();
+    }
+
+    fn set_grid(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.grid = on;
+            cx.notify();
+        }
+    }
+
+    fn step_preview_scale(&mut self, dir: i32, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.preview_scale = canvas::step_scale(open.preview_scale, dir);
+            cx.notify();
+        }
+    }
+
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        self.end_nudge_run();
         if let ViewerState::Ready(open) = &mut self.state
             && open.store.undo()
         {
@@ -886,6 +1117,7 @@ impl WorldPanel {
     }
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
+        self.end_nudge_run();
         if let ViewerState::Ready(open) = &mut self.state
             && open.store.redo()
         {
@@ -1024,6 +1256,10 @@ impl WorldPanel {
         let items = draw_items(open);
         let hit = hit_test(&items, world[0], world[1]);
         open.selected = hit;
+        // A click ends whatever nudge run was in flight, whether or not it
+        // lands on the same item: the next arrow key starts a fresh undo
+        // entry, not an amendment of one from before the click.
+        open.nudge_gesture = None;
         let start_pos = match hit {
             Some(Selection::Entity(i)) => inspector::entity_pos(&open.store.state(), i),
             Some(Selection::Instance(i)) => {
@@ -1238,7 +1474,6 @@ impl WorldPanel {
             unreachable!("render_toolbar is only called in the Ready state");
         };
         let dirty = open.store.state().dirty;
-        let snap = open.snap;
         let has_selection = open.selected.is_some();
         let candidates = self.instance_candidates();
         let weak = cx.weak_entity();
@@ -1257,7 +1492,6 @@ impl WorldPanel {
             menu
         });
 
-        let weak = cx.weak_entity();
         let title = format!(
             "{}{}",
             world_label(&open.listing.stem),
@@ -1293,20 +1527,6 @@ impl WorldPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.delete_selected_impl(cx))),
             )
             .child(
-                Checkbox::new("ggo-world-snap", ToggleState::from(snap))
-                    .label("Snap")
-                    .on_click(move |toggle, _window, cx| {
-                        let on = matches!(toggle, ToggleState::Selected);
-                        weak.update(cx, |this, cx| {
-                            if let ViewerState::Ready(open) = &mut this.state {
-                                open.snap = on;
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                    }),
-            )
-            .child(
                 IconButton::new("ggo-world-undo", IconName::Undo)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Undo"))
@@ -1331,6 +1551,81 @@ impl WorldPanel {
             .into_any_element()
     }
 
+    /// The view-control row under the toolbar: grid + snap toggles, the
+    /// live zoom readout, "Reset", and the `- Preview Nx +` stepper --
+    /// ggo-ide's `controls` and `stepper` rows, merged into one (this
+    /// panel's dock is narrower than ggo-ide's page but the row still fits,
+    /// and two half-empty rows would cost canvas height for nothing).
+    fn render_view_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_view_controls is only called in the Ready state");
+        };
+        let grid = open.grid;
+        let snap = open.snap;
+        let zoom = open.view.borrow().zoom;
+        let scale = open.preview_scale;
+        let grid_weak = cx.weak_entity();
+        let snap_weak = cx.weak_entity();
+        h_flex()
+            .gap_1()
+            .px_1()
+            .pb_1()
+            .child(
+                Checkbox::new("ggo-world-grid", ToggleState::from(grid))
+                    .label("Grid")
+                    .on_click(move |toggle, _window, cx| {
+                        let on = matches!(toggle, ToggleState::Selected);
+                        grid_weak.update(cx, |this, cx| this.set_grid(on, cx)).ok();
+                    }),
+            )
+            .child(
+                Checkbox::new("ggo-world-snap", ToggleState::from(snap))
+                    .label("Snap")
+                    .on_click(move |toggle, _window, cx| {
+                        let on = matches!(toggle, ToggleState::Selected);
+                        snap_weak
+                            .update(cx, |this, cx| {
+                                if let ViewerState::Ready(open) = &mut this.state {
+                                    open.snap = on;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    }),
+            )
+            .child(
+                Label::new(format!("{:.0}%", zoom * 100.0))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Button::new("ggo-world-reset-view", "Reset")
+                    .tooltip(ui::Tooltip::text("Reset the camera to the active camera"))
+                    .on_click(cx.listener(|this, _, _, cx| this.reset_view_impl(cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                IconButton::new("ggo-world-preview-minus", IconName::Dash)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Smaller preview"))
+                    .disabled(scale <= canvas::PREVIEW_SCALE_MIN)
+                    .on_click(cx.listener(|this, _, _, cx| this.step_preview_scale(-1, cx))),
+            )
+            .child(
+                Label::new(format!("Preview {scale}x"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                IconButton::new("ggo-world-preview-plus", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Larger preview"))
+                    .disabled(scale >= canvas::PREVIEW_SCALE_MAX)
+                    .on_click(cx.listener(|this, _, _, cx| this.step_preview_scale(1, cx))),
+            )
+            .into_any_element()
+    }
+
     fn render_canvas(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_canvas is only called in the Ready state");
@@ -1346,6 +1641,14 @@ impl WorldPanel {
         let world_center = canvas::camera_center(screen_origin);
         let images = open.images.clone();
         let view = open.view.clone();
+        let grid = open.grid;
+        // The canvas WIDGET is an exact multiple of the device screen
+        // (ggo-ide's preview stepper). `max_*_full` keeps it inside a dock
+        // narrower than the chosen multiple instead of overflowing it --
+        // ggo-ide's own page had no such constraint because its canvas was
+        // laid out in a resizable page, not a dock.
+        let preview_w = px((open.preview_scale as f64 * DEVICE_SCREEN_W) as f32);
+        let preview_h = px((open.preview_scale as f64 * DEVICE_SCREEN_H) as f32);
         let background = cx.theme().colors().editor_background;
         let text_color = cx.theme().colors().text;
 
@@ -1368,6 +1671,7 @@ impl WorldPanel {
                     zoom: v.zoom,
                     pan: v.pan.expect("initialized above"),
                     screen_origin,
+                    grid,
                     background,
                     text_color,
                 }
@@ -1378,102 +1682,116 @@ impl WorldPanel {
         )
         .size_full();
 
+        // Centering wrapper; the interactive element below is the canvas
+        // BOX itself, so a click in the letterboxing around a small
+        // preview is not a canvas click at all.
         div()
-            .id("ggo-world-canvas")
             .size_full()
             .overflow_hidden()
-            .child(element)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    // Take focus so the panel's Undo/Redo/Save bindings
-                    // apply (and any in-progress field edit blur-commits).
-                    window.focus(&this.focus_handle, cx);
-                    let local = {
+            .flex()
+            .justify_center()
+            .items_center()
+            .child(
+                div()
+                    .id("ggo-world-canvas")
+                    .w(preview_w)
+                    .h(preview_h)
+                    .max_w_full()
+                    .max_h_full()
+                    .overflow_hidden()
+                    .child(element)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // Take focus so the panel's Undo/Redo/Save bindings
+                            // apply (and any in-progress field edit blur-commits).
+                            window.focus(&this.focus_handle, cx);
+                            let local = {
+                                let ViewerState::Ready(open) = &this.state else {
+                                    return;
+                                };
+                                let v = open.view.borrow();
+                                let Some(bounds) = v.last_bounds else {
+                                    return;
+                                };
+                                [
+                                    f64::from(event.position.x - bounds.origin.x),
+                                    f64::from(event.position.y - bounds.origin.y),
+                                ]
+                            };
+                            this.canvas_primary_down(local, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                            if let ViewerState::Ready(open) = &mut this.state {
+                                open.edit_drag = None;
+                            }
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                            let ViewerState::Ready(open) = &this.state else {
+                                return;
+                            };
+                            let mut v = open.view.borrow_mut();
+                            if let Some(pan) = v.pan {
+                                v.drag = Some(Drag {
+                                    start_cursor: [
+                                        f64::from(event.position.x),
+                                        f64::from(event.position.y),
+                                    ],
+                                    start_pan: pan,
+                                });
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                        if this.handle_pan_move(event, cx) {
+                            return;
+                        }
+                        let Some(local) = this.edit_drag_local(event) else {
+                            return;
+                        };
+                        this.canvas_drag_to(local, cx);
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                            if let ViewerState::Ready(open) = &this.state {
+                                open.view.borrow_mut().drag = None;
+                            }
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                         let ViewerState::Ready(open) = &this.state else {
                             return;
                         };
-                        let v = open.view.borrow();
-                        let Some(bounds) = v.last_bounds else {
+                        let mut v = open.view.borrow_mut();
+                        let (Some(pan), Some(canvas_bounds)) = (v.pan, v.last_bounds) else {
                             return;
                         };
-                        [
-                            f64::from(event.position.x - bounds.origin.x),
-                            f64::from(event.position.y - bounds.origin.y),
-                        ]
-                    };
-                    this.canvas_primary_down(local, cx);
-                }),
+                        let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
+                        if dy == 0.0 {
+                            return;
+                        }
+                        let dir = if dy > 0.0 { 1 } else { -1 };
+                        let new_zoom = canvas::zoom_step(v.zoom, dir);
+                        if new_zoom == v.zoom {
+                            return;
+                        }
+                        let cursor = [
+                            f64::from(event.position.x - canvas_bounds.origin.x),
+                            f64::from(event.position.y - canvas_bounds.origin.y),
+                        ];
+                        v.pan = Some(canvas::zoom_at(pan, v.zoom, cursor, new_zoom));
+                        v.zoom = new_zoom;
+                        drop(v);
+                        cx.notify();
+                    })),
             )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                    if let ViewerState::Ready(open) = &mut this.state {
-                        open.edit_drag = None;
-                    }
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
-                    let ViewerState::Ready(open) = &this.state else {
-                        return;
-                    };
-                    let mut v = open.view.borrow_mut();
-                    if let Some(pan) = v.pan {
-                        v.drag = Some(Drag {
-                            start_cursor: [
-                                f64::from(event.position.x),
-                                f64::from(event.position.y),
-                            ],
-                            start_pan: pan,
-                        });
-                    }
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                if this.handle_pan_move(event, cx) {
-                    return;
-                }
-                let Some(local) = this.edit_drag_local(event) else {
-                    return;
-                };
-                this.canvas_drag_to(local, cx);
-            }))
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                    if let ViewerState::Ready(open) = &this.state {
-                        open.view.borrow_mut().drag = None;
-                    }
-                }),
-            )
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                let ViewerState::Ready(open) = &this.state else {
-                    return;
-                };
-                let mut v = open.view.borrow_mut();
-                let (Some(pan), Some(canvas_bounds)) = (v.pan, v.last_bounds) else {
-                    return;
-                };
-                let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
-                if dy == 0.0 {
-                    return;
-                }
-                let dir = if dy > 0.0 { 1 } else { -1 };
-                let new_zoom = canvas::zoom_step(v.zoom, dir);
-                if new_zoom == v.zoom {
-                    return;
-                }
-                let cursor = [
-                    f64::from(event.position.x - canvas_bounds.origin.x),
-                    f64::from(event.position.y - canvas_bounds.origin.y),
-                ];
-                v.pan = Some(canvas::zoom_at(pan, v.zoom, cursor, new_zoom));
-                v.zoom = new_zoom;
-                drop(v);
-                cx.notify();
-            }))
             .into_any_element()
     }
 
@@ -1522,28 +1840,48 @@ impl WorldPanel {
 
         for (component, value) in &entity.components {
             let name = component.clone();
+            // "Go to sprite" for a MetaSprite whose stem resolves to a real
+            // `.spr` -- absent (not disabled) otherwise, since an unresolved
+            // stem has nowhere to go.
+            let goto = (component == META_SPRITE)
+                .then(|| self.goto_sprite_target(entity_ix))
+                .flatten();
             let mut panel = v_flex().gap_1().child(
                 h_flex()
                     .justify_between()
                     .child(Label::new(SharedString::from(component.clone())))
                     .child(
-                        IconButton::new(
-                            SharedString::from(format!("ggo-remove-{component}")),
-                            IconName::Trash,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Direct undoable removal (ggo-ide's
-                            // Transform-with-visual confirm modal is not
-                            // ported; undo covers it).
-                            this.apply_op(
-                                WorldOp::RemoveComponent {
-                                    entity: entity_ix,
-                                    name: name.clone(),
-                                },
-                                cx,
-                            );
-                        })),
+                        h_flex()
+                            .gap_1()
+                            .children(goto.map(|rel| {
+                                IconButton::new("ggo-goto-sprite", IconName::ArrowUpRight)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(ui::Tooltip::text(format!("Open {rel}")))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let _ = this.goto_sprite(rel.clone(), window, cx);
+                                    }))
+                            }))
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("ggo-remove-{component}")),
+                                    IconName::Trash,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        // Direct undoable removal (ggo-ide's
+                                        // Transform-with-visual confirm modal is
+                                        // not ported; undo covers it).
+                                        this.apply_op(
+                                            WorldOp::RemoveComponent {
+                                                entity: entity_ix,
+                                                name: name.clone(),
+                                            },
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            ),
                     ),
             );
 
@@ -1774,6 +2112,7 @@ impl WorldPanel {
         v_flex()
             .size_full()
             .child(toolbar)
+            .child(self.render_view_controls(cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -1811,6 +2150,31 @@ impl Render for WorldPanel {
             .on_action(
                 cx.listener(|this, _: &DeleteSelected, _window, cx| this.delete_selected_impl(cx)),
             )
+            .on_action(cx.listener(|this, _: &ResetView, _window, cx| this.reset_view_impl(cx)))
+            .on_action(cx.listener(|this, _: &NudgeLeft, _window, cx| {
+                this.nudge_impl("ArrowLeft", false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NudgeRight, _window, cx| {
+                this.nudge_impl("ArrowRight", false, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &NudgeUp, _window, cx| this.nudge_impl("ArrowUp", false, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NudgeDown, _window, cx| {
+                this.nudge_impl("ArrowDown", false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NudgeLeftTile, _window, cx| {
+                this.nudge_impl("ArrowLeft", true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NudgeRightTile, _window, cx| {
+                this.nudge_impl("ArrowRight", true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NudgeUpTile, _window, cx| {
+                this.nudge_impl("ArrowUp", true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NudgeDownTile, _window, cx| {
+                this.nudge_impl("ArrowDown", true, cx)
+            }))
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
             .child(div().flex_1().min_h_0().child(body))
@@ -2642,6 +3006,394 @@ mod tests {
     }
 
     // ------------------------------------------- unsaved-document guard
+
+    // ------------------------------------------------- view controls
+
+    fn open_of(panel: &WorldPanel) -> &OpenWorld {
+        match &panel.state {
+            ViewerState::Ready(open) => open,
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    /// Grid toggle, preview-size stepper and "Reset" -- the three view
+    /// controls carried over from ggo-ide, at panel level (the pure math
+    /// each one leans on is tested in `canvas`).
+    #[gpui::test]
+    async fn test_view_controls_grid_stepper_and_reset(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Defaults match ggo-ide: grid on, preview at 2x.
+            assert!(open_of(panel).grid, "grid defaults on, as in ggo-ide");
+            assert_eq!(open_of(panel).preview_scale, canvas::PREVIEW_SCALE_DEFAULT);
+
+            panel.set_grid(false, cx);
+            assert!(!open_of(panel).grid);
+            panel.set_grid(true, cx);
+            assert!(open_of(panel).grid);
+
+            // The stepper walks and stops at both ends.
+            panel.step_preview_scale(-1, cx);
+            assert_eq!(open_of(panel).preview_scale, 1);
+            for _ in 0..10 {
+                panel.step_preview_scale(1, cx);
+            }
+            assert_eq!(open_of(panel).preview_scale, canvas::PREVIEW_SCALE_MAX);
+            for _ in 0..10 {
+                panel.step_preview_scale(-1, cx);
+            }
+            assert_eq!(open_of(panel).preview_scale, canvas::PREVIEW_SCALE_MIN);
+
+            // Reset: a camera moved by wheel-zoom and pan goes back to the
+            // default zoom and to "not laid out", which is what re-runs the
+            // initial centering on the next paint.
+            {
+                let mut v = open_of(panel).view.borrow_mut();
+                v.zoom = 4.0;
+                v.pan = Some([123.0, -45.0]);
+            }
+            panel.reset_view_impl(cx);
+            let v = open_of(panel).view.borrow();
+            assert_eq!(v.zoom, canvas::ZOOM_DEFAULT);
+            assert_eq!(v.pan, None, "reset re-arms the initial centering");
+        });
+    }
+
+    // ------------------------------------------------- arrow-key nudge
+
+    fn entity_pos_of(panel: &WorldPanel, index: usize) -> [f64; 2] {
+        inspector::entity_pos(&open_of(panel).store.state(), index).expect("entity has a Transform")
+    }
+
+    /// Nudge moves the selection through the drag's own `WorldOp` path (1px,
+    /// one tile with Shift), and a RUN of nudges collapses into a single
+    /// undo entry -- asserted by depth, not just by position: after one
+    /// undo the stack is empty, so there was exactly one entry for the
+    /// whole run.
+    #[gpui::test]
+    async fn test_arrow_nudge_moves_the_selection_and_coalesces_one_undo_entry(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let start = entity_pos_of(panel, 0);
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                _ => panic!("expected Ready"),
+            }
+
+            // Three 1px steps right, one 1px up.
+            panel.nudge_impl("ArrowRight", false, cx);
+            panel.nudge_impl("ArrowRight", false, cx);
+            panel.nudge_impl("ArrowRight", false, cx);
+            panel.nudge_impl("ArrowUp", false, cx);
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                [start[0] + 3.0, start[1] - 1.0],
+                "one pixel per press, up is -y"
+            );
+
+            // Shift is a whole tile, and stays inside the same run.
+            panel.nudge_impl("ArrowDown", true, cx);
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                [start[0] + 3.0, start[1] - 1.0 + 16.0],
+                "Shift moves by one tile"
+            );
+
+            // ONE undo takes the whole run back...
+            panel.undo_impl(cx);
+            assert_eq!(entity_pos_of(panel, 0), start);
+            // ...and there is nothing left underneath it: five keypresses
+            // produced exactly one undo entry.
+            match &mut panel.state {
+                ViewerState::Ready(open) => assert!(
+                    !open.store.undo(),
+                    "the run must be ONE undo entry, not one per keypress"
+                ),
+                _ => panic!("expected Ready"),
+            }
+        });
+    }
+
+    /// The run has to END somewhere, or every nudge for the rest of the
+    /// session would amend one entry. A canvas click (i.e. a new selection
+    /// or a drag) seals it, so the next run is its own undo entry.
+    #[gpui::test]
+    async fn test_a_click_seals_the_nudge_run_so_the_next_one_undoes_separately(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let start = entity_pos_of(panel, 0);
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                _ => panic!("expected Ready"),
+            }
+            panel.nudge_impl("ArrowRight", false, cx);
+            panel.nudge_impl("ArrowRight", false, cx);
+            let after_first_run = entity_pos_of(panel, 0);
+
+            // A canvas click on empty space: deselects, and ends the run.
+            panel.canvas_primary_down([-9999.0, -9999.0], cx);
+            assert!(open_of(panel).nudge_gesture.is_none());
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                _ => panic!("expected Ready"),
+            }
+
+            panel.nudge_impl("ArrowRight", false, cx);
+            panel.nudge_impl("ArrowRight", false, cx);
+            assert_eq!(entity_pos_of(panel, 0), [start[0] + 4.0, start[1]]);
+
+            panel.undo_impl(cx);
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                after_first_run,
+                "the second run undoes on its own"
+            );
+            panel.undo_impl(cx);
+            assert_eq!(entity_pos_of(panel, 0), start);
+        });
+    }
+
+    /// Nothing selected, or a selection with nothing to move, must be a
+    /// no-op -- not a panic and not a spurious undo entry.
+    #[gpui::test]
+    async fn test_nudge_without_a_movable_selection_does_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            assert!(open_of(panel).selected.is_none());
+            panel.nudge_impl("ArrowRight", false, cx);
+            assert!(!open_of(panel).store.state().dirty, "no selection, no op");
+
+            // A stale selection index (undo/redo restructure) is guarded the
+            // same way `delete_selected_impl` guards its own.
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(999)),
+                _ => panic!("expected Ready"),
+            }
+            panel.nudge_impl("ArrowRight", false, cx);
+            assert!(!open_of(panel).store.state().dirty);
+
+            // A key that isn't an arrow resolves to no delta.
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                _ => panic!("expected Ready"),
+            }
+            panel.nudge_impl("Home", false, cx);
+            assert!(!open_of(panel).store.state().dirty);
+        });
+    }
+
+    /// An instance nudges through `MoveInstance`, the same op its drag
+    /// applies, and coalesces the same way.
+    #[gpui::test]
+    async fn test_nudge_moves_an_instance_through_the_same_op(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let start = open_of(panel).store.state().instances[0].pos;
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = Some(Selection::Instance(0)),
+                _ => panic!("expected Ready"),
+            }
+            panel.nudge_impl("ArrowLeft", false, cx);
+            panel.nudge_impl("ArrowLeft", true, cx);
+            assert_eq!(
+                open_of(panel).store.state().instances[0].pos,
+                [start[0] - 17.0, start[1]]
+            );
+            panel.undo_impl(cx);
+            assert_eq!(open_of(panel).store.state().instances[0].pos, start);
+        });
+    }
+
+    /// Snap applies to the nudged RESULT, exactly as it does for a drag
+    /// (ggo-ide's rule).
+    #[gpui::test]
+    async fn test_nudge_snaps_the_result_when_snap_is_on(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            match &mut panel.state {
+                ViewerState::Ready(open) => {
+                    open.selected = Some(Selection::Entity(0));
+                    open.snap = true;
+                }
+                _ => panic!("expected Ready"),
+            }
+            // The fixture's entity 0 sits at [4, 4]: a 1px step right lands
+            // on [5, 4], which snaps back to the nearest tile line, [0, 0].
+            panel.nudge_impl("ArrowRight", false, cx);
+            assert_eq!(entity_pos_of(panel, 0), [0.0, 0.0]);
+        });
+    }
+
+    // ------------------------------------------------- goto sprite
+
+    /// The `MetaSprite` -> sprite-panel jump resolves the component's
+    /// ASSET-ROOT-relative stem into the WORKTREE-relative path the sprite
+    /// panel opens, and declines when the stem names no file.
+    #[gpui::test]
+    async fn test_goto_sprite_target_resolves_the_stem_and_declines_when_missing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // No MetaSprite on the fixture's entity 0 yet.
+            assert_eq!(panel.goto_sprite_target(0), None);
+
+            let mut defaults = serde_json::Map::new();
+            defaults.insert("stem".to_string(), json!("sprites/hero"));
+            panel.apply_op(
+                WorldOp::AddComponent {
+                    entity: 0,
+                    name: META_SPRITE.to_string(),
+                    defaults,
+                },
+                cx,
+            );
+            // The stem is there, but nothing is on disk: decline rather
+            // than park the sprite panel in an error state.
+            assert_eq!(
+                panel.goto_sprite_target(0),
+                None,
+                "an unauthored sprite offers no jump"
+            );
+        });
+
+        std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
+        std::fs::write(dir.path().join("sprites/hero.spr"), b"not really a sprite").unwrap();
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.goto_sprite_target(0),
+                Some("sprites/hero.spr".to_string()),
+                "worktree-relative, with the .spr extension the stem omits"
+            );
+
+            // A blank stem, and a stem that walks nowhere, both decline.
+            panel.apply_op(
+                WorldOp::SetField {
+                    entity: 0,
+                    component: META_SPRITE.to_string(),
+                    field: "stem".to_string(),
+                    value: json!(""),
+                },
+                cx,
+            );
+            assert_eq!(panel.goto_sprite_target(0), None);
+            panel.apply_op(
+                WorldOp::SetField {
+                    entity: 0,
+                    component: META_SPRITE.to_string(),
+                    field: "stem".to_string(),
+                    value: json!("sprites/nobody"),
+                },
+                cx,
+            );
+            assert_eq!(panel.goto_sprite_target(0), None);
+        });
+    }
+
+    /// `sprite_rel_for_stem` is the asset-root/worktree bridge; the panel
+    /// test above exercises it through a worktree-rooted world, this pins
+    /// the ASSET-ROOTED layout (`<worktree>/assets/...`) the F4 split
+    /// introduced, where the two frames genuinely differ.
+    #[gpui::test]
+    fn test_sprite_rel_for_stem_bridges_the_asset_root_and_the_worktree(_cx: &mut gpui::App) {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        let assets = worktree.join("assets");
+        std::fs::create_dir_all(assets.join("sprites")).unwrap();
+        std::fs::write(assets.join("sprites/hero.spr"), b"x").unwrap();
+
+        assert_eq!(
+            sprite_rel_for_stem(worktree, &assets, "sprites/hero"),
+            Some("assets/sprites/hero.spr".to_string()),
+            "the stem resolves under the ASSET root but is handed over worktree-relative"
+        );
+        assert_eq!(
+            sprite_rel_for_stem(worktree, &assets, "sprites/ghost"),
+            None
+        );
+        assert_eq!(sprite_rel_for_stem(worktree, &assets, ""), None);
+        // An asset root outside the worktree has nothing to relativize.
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(elsewhere.path().join("sprites")).unwrap();
+        std::fs::write(elsewhere.path().join("sprites/hero.spr"), b"x").unwrap();
+        assert_eq!(
+            sprite_rel_for_stem(worktree, elsewhere.path(), "sprites/hero"),
+            None
+        );
+    }
+
+    /// The jump itself, on a real workspace: with a sprite panel docked
+    /// the handoff is claimed and the sprite panel is revealed; with none
+    /// docked it declines instead of swallowing the click.
+    #[gpui::test]
+    async fn test_goto_sprite_hands_the_path_to_a_docked_sprite_panel(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
+        std::fs::write(dir.path().join("sprites/hero.spr"), b"x").unwrap();
+
+        let rel = panel.update(cx, |panel, cx| {
+            let mut defaults = serde_json::Map::new();
+            defaults.insert("stem".to_string(), json!("sprites/hero"));
+            panel.apply_op(
+                WorldOp::AddComponent {
+                    entity: 0,
+                    name: META_SPRITE.to_string(),
+                    defaults,
+                },
+                cx,
+            );
+            panel.goto_sprite_target(0).expect("the stem resolves")
+        });
+        assert_eq!(rel, "sprites/hero.spr");
+
+        // No sprite panel in this workspace yet: decline, don't panic.
+        let claimed = panel.update_in(cx, |panel, window, cx| {
+            panel.goto_sprite(rel.clone(), window, cx)
+        });
+        assert!(!claimed, "no sprite panel docked => not claimed");
+        assert!(
+            !workspace.read_with(cx, |workspace, cx| workspace
+                .panel::<ggo_sprite_panel::SpritePanel>(cx)
+                .is_some()),
+            "precondition: the sprite panel really was absent"
+        );
+
+        // Dock one (its own `init` is what does that in production) and the
+        // same jump is claimed.
+        cx.update(|_window, cx| ggo_sprite_panel::init(cx));
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let sprite = cx.new(|cx| {
+                    ggo_sprite_panel::SpritePanel::new(Some(workspace.weak_handle()), cx)
+                });
+                workspace.add_panel(sprite, window, cx);
+            });
+        });
+        let claimed = panel.update_in(cx, |panel, window, cx| panel.goto_sprite(rel, window, cx));
+        cx.run_until_parked();
+        assert!(claimed, "a docked sprite panel claims the jump");
+    }
 
     /// Dirty the open world so the close guard has something to protect,
     /// without going through the canvas.
