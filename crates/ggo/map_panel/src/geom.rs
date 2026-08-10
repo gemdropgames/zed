@@ -131,6 +131,7 @@ pub fn pal_sub_by(pal_sub: u16, delta: i32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_worldlib::sprites::map_doc::{build_stamp, pack_cell};
 
     /// At 1x with no pan, cell boundaries land exactly on `TILE_PX`
     /// multiples, and anything past the last cell -- or left/above the
@@ -182,14 +183,31 @@ mod tests {
         );
     }
 
-    /// The eyedropper's inverse of `build_stamp`'s indexing: round-trip
-    /// every tile index through `(col, row)` and back.
+    /// The eyedropper's inverse of `build_stamp`'s indexing -- checked
+    /// against `build_stamp` ITSELF, not against a restatement of its
+    /// formula.
+    ///
+    /// (Fix round 1, FOLD IN 5: the first version asserted
+    /// `r * cols + c == tile`, which is the same expression `tile_cell`
+    /// inverts, and ran on a 4-tile/4-column/1-row fixture where a
+    /// `row * cols` error can't show up at all. This one picks a stamp of
+    /// exactly the eyedropped tile out of a genuinely 2-D sheet -- 5
+    /// columns, 5 rows, 23 tiles, so both a transposed `(c, r)` and a
+    /// wrong stride land on the wrong tile.)
     #[test]
-    fn tile_cell_inverts_the_row_major_sheet_index() {
-        let cols = 5usize;
-        for tile in 0u16..23 {
-            let (c, r) = tile_cell(tile, cols);
-            assert_eq!(r as usize * cols + c as usize, tile as usize);
+    fn tile_cell_selects_the_same_tile_build_stamp_would() {
+        const COLS: usize = 5;
+        const TILES: usize = 23; // 5 rows, the last one partial
+        for tile in 0u16..TILES as u16 {
+            let (c, r) = tile_cell(tile, COLS);
+            assert!(r >= 1 || tile < COLS as u16, "tile {tile} must leave row 0");
+            let stamp = build_stamp((c, r, c, r), COLS, TILES, 0, false, false);
+            assert_eq!((stamp.w, stamp.h), (1, 1));
+            assert_eq!(
+                stamp.cells,
+                vec![pack_cell(tile, 0, false, false)],
+                "tile {tile} at ({c}, {r})"
+            );
         }
         assert_eq!(tile_cell(0, 0), (0, 0), "a zero-column sheet can't divide");
     }

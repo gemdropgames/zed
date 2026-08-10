@@ -24,7 +24,7 @@
 //! the discipline `ggo_world_panel::canvas` set.
 //!
 //! Which map is open is driven ENTIRELY by the file explorer: clicking a
-//! `.map` routes here through [`intercept_map_open`] (the fork's FOURTH
+//! `.map` routes here through [`intercept_map_open`] (the fork's FIFTH
 //! `register_path_open_interceptor` predicate), and "New Map…" on an
 //! assets directory creates one and opens it here. There is no in-panel
 //! file picker.
@@ -146,6 +146,33 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Write a blank, unbound `.map` into the worktree-relative directory
+/// `dir_rel`, returning the new file's worktree-relative path.
+///
+/// Split out of [`MapPanel::new_map`] so the write is one step that either
+/// happens or doesn't: the caller runs it only after the unsaved-edits
+/// guard has resolved, and a failed write leaves nothing behind to open.
+/// `None` on a write failure (already logged).
+fn create_blank_map(project_root: &Path, dir_rel: &str) -> Option<String> {
+    let dir_abs = project_root.join(dir_rel);
+    let name = free_map_name(|candidate| dir_abs.join(format!("{candidate}.{MAP_EXT}")).exists());
+    let file = format!("{name}.{MAP_EXT}");
+    let source_rel = if dir_rel.is_empty() {
+        file
+    } else {
+        format!("{dir_rel}/{file}")
+    };
+    let (root, rel_path) = split_map_path(project_root, &source_rel);
+    if let Err(e) = io::save_new_map(&root, &rel_path, geom::NEW_MAP_DIM, geom::NEW_MAP_DIM) {
+        // No toast surface yet (F5.2 owns notifications), but a silent
+        // no-op would be indistinguishable from a bug. Upstream logs AND
+        // toasts at the same point.
+        log::error!("GGO: failed to create map {source_rel}: {e}");
+        return None;
+    }
+    Some(source_rel)
+}
+
 fn bind_panel_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
@@ -178,9 +205,12 @@ fn is_map_path(path: &ProjectPath) -> bool {
 /// other file, for a path outside the primary worktree of a LOCAL project,
 /// and when no panel is docked.
 ///
-/// The fourth such predicate (`**/worlds/**/*.toml`, `*.spr`, `*.til`, and
-/// now `*.map`). All four key off disjoint paths, so registration order
-/// between them doesn't matter.
+/// The FIFTH such predicate. The full set, in registration order:
+/// `**/worlds/**/*.toml` (`ggo_world_panel`), `*.cart` (`ggo_emu_panel`),
+/// `*.spr` (`ggo_metasprite_panel`), `*.til` (`ggo_tileset_panel`), and
+/// now `*.map`. All five key off disjoint paths, so registration order
+/// between them doesn't matter. (The `.cart` one was missed in this
+/// module's first count -- fix round 1, FOLD IN 4.)
 fn intercept_map_open(
     workspace: &mut Workspace,
     path: &ProjectPath,
@@ -701,34 +731,52 @@ impl MapPanel {
     /// in this task's scope), so the follow-up bind step costs no extra
     /// surface -- it IS the surface.
     ///
-    /// Refreshes FIRST because `project_root` is only re-discovered on
-    /// panel activation, and a right-click in the explorer can reach a
-    /// panel that has never been activated. Safe here: the caller is a
-    /// context-menu entry handler, which runs outside both the project
-    /// panel's lease and any `Workspace` update.
+    /// **The unsaved-edits guard runs BEFORE anything is written** (fix
+    /// round 1, BLOCKING 2). Creating first and prompting afterwards --
+    /// which is what routing straight into [`Self::open_rel_path`] did --
+    /// meant a Cancel left a `map.map` orphaned on disk while the old
+    /// document stayed on screen, and the next attempt then created
+    /// `map-2.map` beside it. ggo-ide guards first too
+    /// (`pages/assets/mod.rs`'s `OpenNewMapClicked` -> `confirm_task` ->
+    /// `PendingAction::OpenNewMap`). The continuation calls
+    /// [`Self::load_rel_path`] rather than [`Self::open_rel_path`], since
+    /// the guard has already been satisfied and prompting twice would be
+    /// worse than not prompting at all.
+    ///
+    /// Refreshes the root FIRST because `project_root` is only
+    /// re-discovered on panel activation, and a right-click in the
+    /// explorer can reach a panel that has never been activated. Safe
+    /// here: the caller is a context-menu entry handler, which runs
+    /// outside both the project panel's lease and any `Workspace` update.
     pub fn new_map(&mut self, dir_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_root(cx);
-        let Some(project_root) = self.project_root.clone() else {
-            return;
-        };
-        let dir_abs = project_root.join(dir_rel);
-        let name =
-            free_map_name(|candidate| dir_abs.join(format!("{candidate}.{MAP_EXT}")).exists());
-        let file = format!("{name}.{MAP_EXT}");
-        let source_rel = if dir_rel.is_empty() {
-            file
-        } else {
-            format!("{dir_rel}/{file}")
-        };
-        let (root, rel_path) = split_map_path(&project_root, &source_rel);
-        if let Err(e) = io::save_new_map(&root, &rel_path, geom::NEW_MAP_DIM, geom::NEW_MAP_DIM) {
-            // No toast surface yet (F5.2 owns notifications), but a silent
-            // no-op would be indistinguishable from a bug. Upstream logs
-            // AND toasts at the same point.
-            log::error!("GGO: failed to create map {source_rel}: {e}");
+        if self.project_root.is_none() {
             return;
         }
-        self.open_rel_path(&source_rel, window, cx);
+        let dir_rel = dir_rel.to_string();
+        let proceed = ggo_common::prepare_to_close_dirty(
+            self.dirty_map_name(),
+            window,
+            cx,
+            Self::save_for_close,
+        );
+        cx.spawn(async move |this, cx| {
+            if !proceed.await {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.refresh_root(cx);
+                let Some(project_root) = this.project_root.clone() else {
+                    return;
+                };
+                let Some(source_rel) = create_blank_map(&project_root, &dir_rel) else {
+                    return;
+                };
+                this.load_rel_path(&source_rel, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ------------------------------------------------------------ editing
@@ -756,21 +804,80 @@ impl MapPanel {
     }
 
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state
-            && open.store.undo()
-        {
-            Self::rebuild_image(open);
-            cx.notify();
-        }
+        self.step_history(MapDocStore::undo, cx);
     }
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state
-            && open.store.redo()
-        {
-            Self::rebuild_image(open);
-            cx.notify();
+        self.step_history(MapDocStore::redo, cx);
+    }
+
+    /// Undo or redo, then put the panel's CACHED tileset back in step with
+    /// whatever the store now says is bound.
+    ///
+    /// The resync is the whole point of routing both through one function
+    /// (fix round 1, BLOCKING 1). `MapOp::BindTileset` is an undoable op
+    /// like any other, but `open.tileset`/`open.strip` are a display cache
+    /// OUTSIDE the store -- so an undo across a bind used to leave the
+    /// panel drawing, stamp-indexing and gating against a tileset the
+    /// document is no longer bound to. Two ways that bit:
+    ///
+    /// - bind, then undo: the store's `til_path` goes back to `""` while
+    ///   the cache stays populated, so `paint_at`'s `tileset.is_none()`
+    ///   gate PASSES and you can paint an unbound map and save a file full
+    ///   of tile indices with nothing to resolve them against -- exactly
+    ///   the artifact [`MapPanel::new_map`]'s unbound-by-design rationale
+    ///   exists to prevent;
+    /// - rebind A -> B, then undo: the canvas, the strip AND
+    ///   `build_stamp`'s `row * cols + col` are all computed against B's
+    ///   tile count and column layout while the document is bound to A.
+    ///
+    /// (ggo-ide has the same gap. Inherited, not a regression -- but it
+    /// defeats an invariant this panel states in its own module doc, so it
+    /// is fixed here rather than ported.)
+    fn step_history(&mut self, step: fn(&mut MapDocStore) -> bool, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let before = open.store.state().til_path;
+        if !step(&mut open.store) {
+            return;
         }
+        let after = open.store.state().til_path;
+        if before != after {
+            let resolved = loader::load_tileset(&open.root, &after);
+            Self::set_tileset(open, resolved);
+        }
+        Self::rebuild_image(open);
+        cx.notify();
+    }
+
+    /// Install an already-resolved tileset as the panel's display cache --
+    /// shared by [`Self::bind_tileset`] and [`Self::step_history`], so
+    /// "what the panel holds for the bound tileset" has ONE definition.
+    /// An `Err` (an empty binding, or a `.til` that won't open) clears the
+    /// cache to `None` rather than leaving the previous tileset in place;
+    /// that clearing is what re-arms `paint_at`'s unbound gate. The stamp
+    /// selection resets either way: a `(col, row)` means a different tile
+    /// -- or no tile -- under a different sheet.
+    ///
+    /// Takes the `Result` rather than the path so the caller keeps the one
+    /// disk read it already did ([`Self::bind_tileset`] has to resolve
+    /// first to decide whether to apply the op at all).
+    fn set_tileset(open: &mut OpenMap, resolved: Result<loader::Tileset, String>) {
+        match resolved {
+            Ok(tileset) => {
+                open.strip = loader::compose_strip(&tileset);
+                open.tileset = Some(tileset);
+                open.tileset_error = None;
+            }
+            Err(e) => {
+                open.tileset = None;
+                open.strip = None;
+                open.tileset_error = Some(e);
+            }
+        }
+        open.pal_anchor = (0, 0);
+        open.pal_far = (0, 0);
     }
 
     /// `state()` -> `save_map` -> `mark_saved`. Synchronous by choice, same
@@ -836,19 +943,18 @@ impl MapPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        // Resolve FIRST: a binding the editor can't open must not reach
+        // the document (see this fn's doc). The resolved tileset then goes
+        // straight into the cache via `set_tileset`, so bind and
+        // undo-across-a-bind install it exactly the same way.
         match loader::load_tileset(&open.root, &til_rel) {
             Ok(tileset) => {
                 let pal_path = tileset.pal_path.clone();
-                open.strip = loader::compose_strip(&tileset);
-                open.tileset = Some(tileset);
-                open.tileset_error = None;
-                // Clamp the stamp selection into the new tileset.
-                open.pal_anchor = (0, 0);
-                open.pal_far = (0, 0);
                 open.store.apply(MapOp::BindTileset {
                     til_path: til_rel,
                     pal_path,
                 });
+                Self::set_tileset(open, Ok(tileset));
                 Self::rebuild_image(open);
             }
             Err(e) => open.tileset_error = Some(e),
@@ -1244,18 +1350,7 @@ impl MapPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    // Take focus so the panel's Undo/Redo/Save bindings
-                    // apply (and any in-progress resize edit stops winning
-                    // the key context).
-                    window.focus(&this.focus_handle, cx);
-                    let Some(cell) = this.ready_map().and_then(|o| o.cell_at(event.position))
-                    else {
-                        return;
-                    };
-                    if let ViewerState::Ready(open) = &mut this.state {
-                        open.painting = true;
-                    }
-                    this.paint_at(cell, cx);
+                    this.canvas_primary_down(event.position, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
@@ -1337,6 +1432,40 @@ impl MapPanel {
         open.pan = geom::zoom_at(open.pan, open.zoom, cursor, next);
         open.zoom = next;
         cx.notify();
+    }
+
+    /// Left-mouse down on the canvas at window-space `position`: start a
+    /// gesture and dispatch it to the active tool. Its own method (rather
+    /// than an inline listener body) so the gesture-start rules below are
+    /// reachable from a test -- an element's `on_mouse_down` closure is
+    /// not.
+    fn canvas_primary_down(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Take focus so the panel's Undo/Redo/Save bindings apply (and any
+        // in-progress resize edit stops winning the key context).
+        window.focus(&self.focus_handle, cx);
+        let Some(cell) = self.ready_map().and_then(|open| open.cell_at(position)) else {
+            return;
+        };
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.painting = true;
+            // A NEW gesture starts from no pending rect (fix round 1,
+            // BLOCKING 3). `paint_at`'s RectFill arm EXTENDS an existing
+            // pending rect, so a rect whose release never reached this
+            // element -- the button came up outside the canvas, or the
+            // window lost focus mid-drag -- would otherwise survive and
+            // turn the next single click into a fill from the abandoned
+            // anchor to wherever you clicked. (ggo-ide's
+            // cursor-leaves-canvas arm commits the pending rect instead;
+            // committing a gesture the user walked away from would be its
+            // own surprise, so this discards.)
+            open.rect_pending = None;
+        }
+        self.paint_at(cell, cx);
     }
 
     fn ready_map(&self) -> Option<&OpenMap> {
@@ -1823,6 +1952,10 @@ mod tests {
     /// fallback, so the strip lays out at exactly 4x1 and the stamp
     /// indexing is unambiguous in the assertions below.
     const FIXTURE_TILES: usize = 4;
+    /// The second fixture tileset: 9 tiles, so `grid_cols` gives it the
+    /// 8-column fallback across 2 rows -- a different shape from
+    /// `world.til`'s 4x1.
+    const WIDE_TILES: usize = 9;
     const FIXTURE_W: u16 = 4;
     const FIXTURE_H: u16 = 3;
 
@@ -1856,6 +1989,19 @@ mod tests {
             "tiles/world.til",
             &indices,
             FIXTURE_TILES,
+            &palette,
+        )
+        .unwrap();
+
+        // A SECOND tileset with a different tile count AND a different
+        // column count (9 tiles -> the 8-wide fallback, 2 rows), so a
+        // rebind changes the stamp coordinate system and not just the
+        // pixels -- which is what makes the bind-undo resync observable.
+        io::save_tileset(
+            &assets,
+            "tiles/wide.til",
+            &vec![1u8; WIDE_TILES * TILE_PIXELS],
+            WIDE_TILES,
             &palette,
         )
         .unwrap();
@@ -2056,7 +2202,11 @@ mod tests {
             assert!(open.tileset_error.is_none());
             assert!(open.image.is_some(), "the map must compose");
             assert!(open.strip.is_some(), "the strip must compose");
-            assert_eq!(open.tilesets, vec!["tiles/world.til".to_string()]);
+            assert_eq!(
+                open.tilesets,
+                vec!["tiles/wide.til".to_string(), "tiles/world.til".to_string()],
+                "the bind picker offers every .til under the asset root"
+            );
             assert_eq!(open.zoom, geom::DEFAULT_ZOOM);
             assert_eq!(open.tool, MapTool::Brush);
         });
@@ -2327,10 +2477,197 @@ mod tests {
                 "the .pal rel comes from worldlib's own pairing rule"
             );
             assert!(open.store.dirty(), "a successful bind is an edit");
+            assert_eq!(
+                open.tileset.as_ref().map(|ts| ts.tile_count),
+                Some(FIXTURE_TILES),
+                "the cache holds the tileset that was just bound"
+            );
             assert!(open.strip.is_some(), "and recomposes the strip");
 
             panel.undo_impl(cx);
-            assert_eq!(ready(panel).store.state().til_path, "");
+            let open = ready(panel);
+            assert_eq!(open.store.state().til_path, "");
+            assert!(
+                open.tileset.is_none() && open.strip.is_none(),
+                "the CACHE must unbind with the store too"
+            );
+        });
+    }
+
+    /// **Regression, fix round 1 BLOCKING 1a.** Undoing a bind must clear
+    /// the panel's cached tileset, not just the store's `til_path`.
+    ///
+    /// With the cache left behind, `paint_at`'s `tileset.is_none()` gate
+    /// PASSED on an unbound document -- so you could paint cell indices
+    /// into a map with nothing to resolve them against and save it, the
+    /// exact artifact `new_map`'s unbound-by-design rationale exists to
+    /// prevent. Painting after the undo is the load-bearing assertion; the
+    /// cache assertions say why.
+    #[gpui::test]
+    async fn test_undo_of_a_bind_unbinds_the_panel_too(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+        let assets = dir.path().join(ASSETS_DIR);
+        io::save_new_map(&assets, "maps/fresh.map", 8, 8).unwrap();
+        let panel = new_panel(cx, dir.path());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("assets/maps/fresh.map", cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            panel.bind_tileset("tiles/world.til".to_string(), cx);
+            assert!(ready(panel).tileset.is_some());
+            assert!(ready(panel).strip.is_some());
+            assert!(ready(panel).image.is_some());
+
+            panel.undo_impl(cx);
+            let open = ready(panel);
+            assert_eq!(open.store.state().til_path, "", "the store unbinds");
+            assert!(
+                open.tileset.is_none(),
+                "and the panel's cached tileset must unbind WITH it"
+            );
+            assert!(open.strip.is_none(), "the strip is gone too");
+            assert!(open.image.is_none(), "and there is nothing to compose");
+            assert!(open.tileset_error.is_some(), "with a reason shown");
+
+            let before = cells(panel);
+            panel.paint_at((0, 0), cx);
+            assert_eq!(
+                cells(panel),
+                before,
+                "painting an unbound map must be inert again after the undo"
+            );
+            assert!(!ready(panel).store.dirty());
+        });
+    }
+
+    /// **Regression, fix round 1 BLOCKING 1b.** Undoing a REBIND must put
+    /// the previous tileset back, not leave the newer one cached.
+    ///
+    /// The two fixtures differ in tile count AND column count (4 tiles/4
+    /// cols vs 9 tiles/8 cols), so a stale cache would leave the canvas,
+    /// the strip and `build_stamp`'s `row * cols + col` all computed
+    /// against the wrong sheet. The stamp assertion is the load-bearing
+    /// one: strip cell (0,1) is tile 8 under an 8-wide sheet and does not
+    /// exist at all under a 4-wide, 4-tile one.
+    #[gpui::test]
+    async fn test_undo_of_a_rebind_restores_the_previous_tileset(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // The fixture opens bound to world.til (4 tiles, 4 cols).
+            assert_eq!(ready(panel).tileset.as_ref().unwrap().cols, FIXTURE_TILES);
+
+            panel.bind_tileset("tiles/wide.til".to_string(), cx);
+            let open = ready(panel);
+            assert_eq!(open.store.state().til_path, "tiles/wide.til");
+            assert_eq!(open.tileset.as_ref().unwrap().tile_count, WIDE_TILES);
+            assert_eq!(open.tileset.as_ref().unwrap().cols, 8);
+            assert_eq!(open.tileset.as_ref().unwrap().rows(), 2);
+
+            panel.undo_impl(cx);
+            let open = ready(panel);
+            assert_eq!(open.store.state().til_path, "tiles/world.til");
+            let tileset = open
+                .tileset
+                .as_ref()
+                .expect("undoing a rebind rebinds the previous tileset");
+            assert_eq!(
+                (tileset.tile_count, tileset.cols),
+                (FIXTURE_TILES, FIXTURE_TILES),
+                "the cached tileset must follow the store back"
+            );
+            assert!(open.strip.is_some(), "and the strip recomposes for it");
+
+            // The stamp coordinate system followed too: a selection is
+            // resolved against 4 tiles at 4 cols, so row 1 is off the end
+            // of the sheet and packs blank rather than naming tile 8.
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready")
+            };
+            open.pal_anchor = (0, 1);
+            open.pal_far = (0, 1);
+            assert_eq!(
+                open.current_stamp().cells,
+                vec![CELL_BLANK],
+                "row 1 does not exist in a 4-tile, 4-column sheet"
+            );
+
+            // Redo puts the wide sheet back, cache included.
+            panel.redo_impl(cx);
+            let open = ready(panel);
+            assert_eq!(open.store.state().til_path, "tiles/wide.til");
+            assert_eq!(open.tileset.as_ref().unwrap().tile_count, WIDE_TILES);
+        });
+    }
+
+    /// **Regression, fix round 1 BLOCKING 3.** An abandoned rect-fill must
+    /// not arm the NEXT click.
+    ///
+    /// `paint_at`'s RectFill arm extends an existing pending rect, so a
+    /// gesture whose release never reached the canvas left `rect_pending`
+    /// alive: a subsequent one-cell click became a fill from the stale
+    /// anchor. Probed shape -- press at (0,0), gesture abandoned, click at
+    /// (3,2) -- filled 12 cells instead of 1. Driven through the REAL
+    /// mouse-down entry point, which is where the fix lives.
+    #[gpui::test]
+    async fn test_an_abandoned_rect_fill_does_not_arm_the_next_click(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready")
+            };
+            open.tool = MapTool::RectFill;
+            open.zoom = 1;
+            open.pan = [0.0, 0.0];
+            *open.canvas_bounds.borrow_mut() =
+                Some(bounds(point(px(0.), px(0.)), size(px(400.), px(300.))));
+        });
+
+        let step = ggo_worldlib::sprites::tileset_doc::TILE_PX as f32;
+        let press = |x: i32, y: i32, cx: &mut gpui::VisualTestContext| {
+            let position = point(
+                px(x as f32 * step + step / 2.0),
+                px(y as f32 * step + step / 2.0),
+            );
+            cx.update(|window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.canvas_primary_down(position, window, cx)
+                })
+            });
+        };
+
+        // Gesture 1: press at (0,0), then abandoned -- no mouse-up ever
+        // reaches the canvas, so `rect_pending` stays armed.
+        press(0, 0, cx);
+        panel.update(cx, |panel, _| {
+            assert_eq!(ready(panel).rect_pending, Some((0, 0, 0, 0)));
+        });
+
+        // Gesture 2: a fresh one-cell click at (3,2), then its release.
+        press(3, 2, cx);
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                ready(panel).rect_pending,
+                Some((3, 2, 3, 2)),
+                "a new press must start a NEW rect, not extend the abandoned one"
+            );
+            panel.end_paint(cx);
+            let filled = pack_cell(0, 0, false, false);
+            let after = cells(panel);
+            assert_eq!(
+                after.iter().filter(|&&c| c == filled).count(),
+                1,
+                "a one-cell click must fill exactly one cell"
+            );
+            assert_eq!(after[2 * FIXTURE_W as usize + 3], filled);
+            assert_eq!(after[0], CELL_BLANK, "the abandoned anchor stays blank");
         });
     }
 
@@ -2585,6 +2922,58 @@ mod tests {
         );
     }
 
+    /// **Regression, fix round 1 BLOCKING 2.** "New Map…" must run the
+    /// unsaved-edits guard BEFORE it writes anything.
+    ///
+    /// Creating first and prompting afterwards left a `map.map` orphaned
+    /// on disk when the user cancelled -- with the old document still on
+    /// screen, and the next attempt creating `map-2.map` beside the
+    /// orphan.
+    #[gpui::test]
+    async fn test_new_map_cancel_creates_no_file(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+        let cx = cx.add_empty_window();
+        dirty_the_map(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.new_map("assets/maps", window, cx))
+        });
+        assert_eq!(
+            cx.pending_prompt().map(|(msg, _)| msg),
+            Some(
+                "assets/maps/level.map contains unsaved edits. Do you want to save it?".to_string()
+            ),
+            "creating a map while the open one is dirty must prompt FIRST"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(
+            !assets.join("maps/map.map").exists(),
+            "Cancel must not leave a file behind"
+        );
+        panel.update(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.source_rel, "assets/maps/level.map");
+            assert!(open.store.dirty(), "and the edits stay put");
+        });
+
+        // Going through with it now creates `map.map` -- NOT `map-2.map`,
+        // which is what a leftover orphan would have forced.
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.new_map("assets/maps", window, cx))
+        });
+        cx.simulate_prompt_answer("Don't Save");
+        cx.run_until_parked();
+        assert!(assets.join("maps/map.map").is_file());
+        assert!(!assets.join("maps/map-2.map").exists());
+        panel.update(cx, |panel, _| {
+            assert_eq!(ready(panel).source_rel, "assets/maps/map.map");
+        });
+    }
+
     /// Clicking the file that is ALREADY open must be a pure focus/reveal:
     /// no prompt and no reload. The undo assertion is the load-bearing one
     /// -- a reload would rebuild `OpenMap` and leave nothing to undo -- and
@@ -2784,7 +3173,7 @@ mod tests {
             assert!(open.tileset.is_none());
             assert_eq!(
                 open.tilesets,
-                vec!["tiles/world.til".to_string()],
+                vec!["tiles/wide.til".to_string(), "tiles/world.til".to_string()],
                 "the bind picker must offer the project's tilesets"
             );
         });

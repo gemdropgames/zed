@@ -8,16 +8,19 @@
 //! **The live one is [`compose_live_rgba`]**, and it has to exist: the
 //! shared compose takes a `(project_dir, stem)` and re-reads both files off
 //! disk, so it can only ever show the SAVED map. This panel edits, so every
-//! applied `MapOp` has to be composed out of the in-memory
-//! `MapDocStore` instead. It is not a second composer in the sense the task
-//! forbids -- the actual per-cell work is worldlib's
-//! `map_doc::compose_map_indices` in both paths, and the only thing
-//! [`compose_live_rgba`] adds is the indexed->RGBA palette expansion the
-//! shared function performs inline on its own output. The two agreeing is
-//! not left to inspection: `live_compose_matches_the_shared_disk_compose`
-//! runs both over the same fixture and compares every byte, so a drift in
-//! either fails a test (the mechanically-verified-mirror discipline this
-//! repo applies to cross-layer constants).
+//! applied `MapOp` has to be composed out of the in-memory `MapDocStore`
+//! instead.
+//!
+//! It is not a second COMPOSER, though, and (since fix round 1) not a
+//! second expansion either: both halves are worldlib's --
+//! `map_doc::compose_map_indices` for the per-cell work and
+//! `palette565::indices_to_rgba` for the indexed->RGBA8888 step. That
+//! second one used to be a local copy here, guarded by a fork-side
+//! byte-equality test against `compose_map_rgba`; the guard was the wrong
+//! shape (it could not fail for a ggo developer editing worldlib) and the
+//! copy is gone -- ggo PR #80 moved the rule into `palette565` and
+//! collapsed every call site, this one included. There is nothing left for
+//! a drift check to compare.
 //!
 //! Loading a map resolves its bound tileset too -- the panel needs that
 //! tileset's pixels for the strip and for [`compose_live_rgba`] anyway, and
@@ -32,7 +35,7 @@ use ggo_asset_formats::MapData;
 use ggo_common::to_render_image;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::map_doc::{MapState, compose_map_indices};
-use ggo_worldlib::sprites::palette565::{PAL_SLOTS, Pal, TRANSPARENT_SLOT};
+use ggo_worldlib::sprites::palette565::{Pal, indices_to_rgba};
 use ggo_worldlib::sprites::tileset_doc::{compose_tile_grid, resolve_cols};
 use gpui::RenderImage;
 
@@ -95,25 +98,11 @@ pub fn grid_cols(tile_count: usize) -> usize {
     resolve_cols(None, None, tile_count, fallback)
 }
 
-/// Expand an indexed pixel buffer through `palette` into straight-alpha
-/// RGBA8, index [`TRANSPARENT_SLOT`] fully transparent -- the exact
-/// per-pixel rule `io::compose_map_rgba` and
-/// `sprites::preview::compose_frame_rgba` apply.
-pub fn indices_to_rgba(indices: &[u8], palette: &Pal) -> Vec<u8> {
-    let mut out = Vec::with_capacity(indices.len() * 4);
-    for &idx in indices {
-        let slot = idx as usize % PAL_SLOTS;
-        let (r, g, b) = ggo_asset_formats::pixel::rgb888(palette[slot]);
-        let a = if slot == TRANSPARENT_SLOT { 0 } else { 255 };
-        out.extend_from_slice(&[r, g, b, a]);
-    }
-    out
-}
-
 /// Compose the LIVE document (not the file on disk) into straight-alpha
-/// RGBA8 plus its pixel size. See the module doc for why this exists
-/// alongside the shared disk compose, and for the test that pins them
-/// equal.
+/// RGBA8 plus its pixel size -- worldlib's `compose_map_indices` followed
+/// by worldlib's `indices_to_rgba`, i.e. exactly what
+/// `io::compose_map_rgba` does to the SAVED bytes. See the module doc for
+/// why the live twin exists.
 pub fn compose_live_rgba(state: &MapState, tileset: &Tileset) -> (Vec<u8>, u32, u32) {
     let (indices, w, h) = compose_map_indices(
         &state.cells,
@@ -204,6 +193,7 @@ pub fn load_map(root: &Path, rel: &str) -> Result<LoadedMap, String> {
 mod tests {
     use super::*;
     use ggo_worldlib::sprites::map_doc::{CELL_BLANK, MapDocStore, pack_cell};
+    use ggo_worldlib::sprites::palette565::PAL_SLOTS;
     use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
 
     fn write_tileset(root: &Path, stem: &str, tiles: usize) {
@@ -236,66 +226,6 @@ mod tests {
         assert_eq!(grid_cols(64), GRID_COLS_FALLBACK);
         assert_eq!(grid_cols(3), 3);
         assert_eq!(grid_cols(0), 1);
-    }
-
-    #[test]
-    fn indices_to_rgba_makes_slot_zero_transparent() {
-        let mut palette = [0u16; PAL_SLOTS];
-        palette[0] = 0xFFFF; // an opaque-looking white the rule must ignore
-        palette[1] = 0xF800;
-        let rgba = indices_to_rgba(&[0, 1], &palette);
-        assert_eq!(rgba[..4], [255, 255, 255, 0]);
-        assert_eq!(rgba[4..], [255, 0, 0, 255]);
-    }
-
-    /// **The drift check** (see the module doc): the live in-memory
-    /// compose and worldlib's shared disk compose must produce
-    /// byte-identical RGBA for the same, unmodified document. If either
-    /// side's palette expansion or transparency rule ever moves, this
-    /// fails instead of the two panels quietly drawing the same map
-    /// differently.
-    #[test]
-    fn live_compose_matches_the_shared_disk_compose() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write_tileset(root, "world", 4);
-        // A map exercising every branch that could diverge: blank cells,
-        // an in-range tile, an OUT-of-range tile (drawn transparent), and
-        // both flips.
-        let cells = vec![
-            CELL_BLANK,
-            pack_cell(1, 0, false, false),
-            pack_cell(2, 3, true, true),
-            pack_cell(99, 0, false, false),
-            pack_cell(3, 0, true, false),
-            CELL_BLANK,
-        ];
-        let state = MapState {
-            w: 3,
-            h: 2,
-            cells,
-            til_path: "tiles/world.til".to_string(),
-            pal_path: "tiles/world.pal".to_string(),
-            dirty: false,
-        };
-        io::save_map(root, "maps/level.map", &state).unwrap();
-
-        let loaded = load_map(root, "maps/level.map").unwrap();
-        let tileset = loaded.tileset.expect("the fixture binds a real tileset");
-        let (live, lw, lh) = compose_live_rgba(&state, &tileset);
-        let shared = io::compose_map_rgba(root, "maps/level").unwrap();
-        assert_eq!((lw, lh), (shared.w, shared.h));
-        assert_eq!(
-            live,
-            shared.rgba.to_vec(),
-            "the live compose must match worldlib's shared disk compose byte for byte"
-        );
-        assert!(
-            loaded.image.is_some(),
-            "the initial image comes from shared"
-        );
-        assert!(loaded.strip.is_some());
-        assert_eq!(loaded.tilesets, vec!["tiles/world.til".to_string()]);
     }
 
     /// An unbound map (`til_path` empty -- what "New Map…" writes) still

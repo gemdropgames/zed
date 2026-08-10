@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use ggo_common::to_render_image;
 use ggo_worldlib::sprites::io;
-use ggo_worldlib::sprites::palette565::{PAL_SLOTS, Pal, TRANSPARENT_SLOT};
+use ggo_worldlib::sprites::palette565::{Pal, indices_to_rgba, slot_rgba};
 use ggo_worldlib::sprites::tileset_doc::{
     TILE_PX, compose_tile_grid, resolve_cols, tile_grid_layout,
 };
@@ -72,26 +72,20 @@ pub fn grid_pixel_size(tile_count: usize, cols: usize) -> (u32, u32) {
 }
 
 /// One palette slot as straight-alpha RGBA8, for the swatch row.
-/// Slot 0 is the locked transparent entry (PPU contract §1), so it reads
-/// back alpha-0 no matter what color the `.pal` stored in it -- the same
-/// rule `sprites::preview::compose_frame_rgba` applies to pixels.
+///
+/// Thin wrapper over worldlib's [`slot_rgba`] purely to keep the swatch
+/// row's `usize` slot index (it iterates `0..PAL_SLOTS`) from having to
+/// cast at every call site. The RULE -- 565->888, with slot 0 forced
+/// alpha-0 whatever colour the `.pal` stored there (PPU contract §1) --
+/// is worldlib's, not this crate's, as of ggo PR #80.
+///
+/// This module used to own that rule AND its buffer-wide twin
+/// `indices_to_rgba`; the doc here said worldlib "has no
+/// indexed-buffer->RGBA entry point for a bare tile sheet", which was
+/// true and is the gap PR #80 closed (after `ggo_map_panel` grew a third
+/// copy of the same loop).
 pub fn swatch_rgba(palette: &Pal, slot: usize) -> [u8; 4] {
-    let (r, g, b) = ggo_asset_formats::pixel::rgb888(palette[slot]);
-    let a = if slot == TRANSPARENT_SLOT { 0 } else { 255 };
-    [r, g, b, a]
-}
-
-/// Expand an indexed pixel buffer through `palette` into straight-alpha
-/// RGBA8. worldlib composes SPRITE frames (`preview::compose_frame_rgba`)
-/// but has no indexed-buffer->RGBA entry point for a bare tile sheet, so
-/// this applies that function's exact rules -- 565->888 per slot, index 0
-/// fully transparent -- to `compose_tile_grid`'s output.
-pub fn indices_to_rgba(indices: &[u8], palette: &Pal) -> Vec<u8> {
-    let mut out = Vec::with_capacity(indices.len() * 4);
-    for &idx in indices {
-        out.extend_from_slice(&swatch_rgba(palette, (idx as usize) % PAL_SLOTS));
-    }
-    out
+    slot_rgba(palette, slot as u8)
 }
 
 /// Open `rel` (a project-relative `.til`) and compose its whole sheet.
@@ -122,6 +116,7 @@ pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_worldlib::sprites::palette565::PAL_SLOTS;
 
     /// The fallback clamp: a full-or-larger sheet gets the standard 8
     /// columns, a short one gets exactly its own tile count (no padded
@@ -157,15 +152,16 @@ mod tests {
         );
     }
 
-    /// Index 0 is transparent regardless of the color stored in slot 0;
-    /// every other index is opaque with its 565->888 color.
+    /// The swatch wrapper still hands slot 0 back transparent regardless
+    /// of the colour stored in it -- the rule now lives in worldlib
+    /// (which tests it directly), so this only pins that the `usize`
+    /// wrapper doesn't lose it on the way through.
     #[test]
-    fn indices_to_rgba_makes_slot_zero_transparent() {
+    fn swatch_rgba_keeps_slot_zero_transparent() {
         let mut palette = [0u16; PAL_SLOTS];
         palette[0] = 0xFFFF; // an opaque-looking white the rule must ignore
         palette[1] = 0xF800; // pure 565 red
-        let rgba = indices_to_rgba(&[0, 1], &palette);
-        assert_eq!(rgba[..4], [255, 255, 255, 0]);
-        assert_eq!(rgba[4..], [255, 0, 0, 255]);
+        assert_eq!(swatch_rgba(&palette, 0), [255, 255, 255, 0]);
+        assert_eq!(swatch_rgba(&palette, 1), [255, 0, 0, 255]);
     }
 }
