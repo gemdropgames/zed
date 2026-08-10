@@ -164,6 +164,21 @@ pub fn init(cx: &mut App) {
     // Right-clicking offers the three run actions (S4) -- see `menu`.
     workspace::register_context_menu_contributor(cx, menu::contribute_run_menu);
 
+    // The charts panel's Re-run entry (F5.4 R3) lands here. It cannot call
+    // this crate directly -- `ggo_emu_panel` already depends on
+    // `ggo_charts_panel` for S4's finished-run hop, so the reverse edge
+    // would be a cycle -- so the handoff goes through `ggo_common`'s
+    // registry, exactly as the `.cart` explorer routing above goes through
+    // `workspace`'s. What it routes to is [`EmuPanel::rerun`]: the SAME
+    // entry S4's context menu uses, arming the same hop back, so a Re-run
+    // started from the charts panel ends where a Re-run started from the
+    // explorer does.
+    ggo_common::register_cart_runner(cx, |workspace, rel, window, cx| {
+        ggo_common::open_in_panel(workspace, window, cx, |emu: &mut EmuPanel, window, cx| {
+            emu.rerun(rel, window, cx);
+        })
+    });
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -3312,6 +3327,56 @@ mod tests {
             cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
             "the finished ingest must hand focus to the charts panel"
         );
+    }
+
+    /// **The charts panel's Re-run entry lands here** (F5.4 R3). That panel
+    /// cannot call this crate -- this crate depends on IT, for the hop the
+    /// test above asserts -- so the handoff arrives through
+    /// `ggo_common::run_cart`'s registry, which `init` populates. What is
+    /// asserted here is this PANEL's state after the hook fires: the cart
+    /// selected, the run live, and the return hop armed, exactly as if the
+    /// explorer's own "Re-run (perf)" entry had been used. (The charts side
+    /// asserts the other half -- that the run's `label` is what reaches the
+    /// registry -- in `test_rerun_hands_the_runs_cart_path_to_the_cart_runner`.)
+    #[gpui::test]
+    async fn test_the_registered_cart_runner_runs_the_cart_in_this_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.selected.is_none(), "nothing is selected yet");
+        });
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::run_cart(workspace, "green.cart", window, cx)
+        });
+        assert!(claimed, "init() must have registered a cart runner");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.selected.as_deref(), Some("green.cart"));
+            assert!(
+                panel.is_running(),
+                "the hook goes through `rerun`, which RUNS the cart"
+            );
+            assert!(
+                panel.charts_for_run.is_some(),
+                "and arms the hop back to the charts panel, like any Re-run"
+            );
+        });
+        assert!(
+            cx.update(|window, cx| panel.read(cx).focus_handle(cx).is_focused(window)),
+            "the pane the cart went to must have been focused"
+        );
+
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
     }
 
     /// A plain Run must NOT inherit a Re-run's hop: the charts panel is

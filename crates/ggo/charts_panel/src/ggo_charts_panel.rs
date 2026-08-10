@@ -9,6 +9,19 @@
 //! renders the same chart set ggo-ide's run-detail page shows for it, with
 //! a hover readout over the nearest sample.
 //!
+//! The picker also carries the DEVICE-run history rail (R3): `ggo-diag`'s
+//! `~/.ggo/diag.db` cloned into our own database and listed newest first,
+//! with a per-run log viewer. Those are a different table in a different id
+//! space from the perf runs above them and nothing converts between the two
+//! -- see [`history`]'s module doc for that, and for why the rail clones
+//! rather than reading `diag.db` live. The run detail gained the stored
+//! guest-UART console (R3) and a Re-run entry that hands the run's cart back
+//! to the emulator pane through `ggo_common`'s cart-runner registry.
+//!
+//! **Everything a selection needs is queried AND derived off-thread**, in
+//! one background spawn per selection -- see [`detail`]'s module doc, which
+//! is also where the guard that keeps it that way lives.
+//!
 //! The chart work splits three ways, so only the last of them needs a
 //! window to test: `chart_set` decides WHICH charts a run gets (mirroring
 //! `reports.rs::charts_section`), `chart_geom` decides WHERE everything
@@ -25,6 +38,8 @@
 mod chart_geom;
 mod chart_paint;
 mod chart_set;
+mod detail;
+mod history;
 // `pub`: `ggo_emu_panel`'s ingest round-trip test reads its own writes back
 // through THESE query functions (as a dev-dependency), which is what proves
 // the two panels agree on `ggo_ide.db`'s schema rather than each having its
@@ -35,10 +50,12 @@ mod report;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     Action, App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
-    MouseMoveEvent, Pixels, Render, Styled, Task, Window, actions, div, px,
+    MouseMoveEvent, Pixels, Render, Styled, Task, WeakEntity, Window, actions, div, px,
+    uniform_list,
 };
 use ui::Tooltip;
 use ui::prelude::*;
@@ -46,6 +63,7 @@ use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use chart_geom::{ChartSpec, build_chart_scene};
+use history::RunSummary;
 use loader::RunListing;
 
 actions!(
@@ -82,6 +100,38 @@ const CHART_HEIGHT: Pixels = px(240.);
 const KPI_ROW_SELECTOR: &str = "ggo-charts-kpi-row";
 const FAILURES_SELECTOR: &str = "ggo-charts-failures";
 const PANICS_SELECTOR: &str = "ggo-charts-panics";
+const CONSOLE_SELECTOR: &str = "ggo-charts-console";
+const HISTORY_RAIL_SELECTOR: &str = "ggo-charts-history-rail";
+const DEVICE_LOG_SELECTOR: &str = "ggo-charts-device-log";
+
+/// Height of a log/console scroll region -- ggo-ide's `UART_HEIGHT` (220),
+/// which is also what its history log viewer uses.
+const LOG_HEIGHT: Pixels = px(220.);
+
+/// Heading of the stored-run console. ggo-ide's `uart_section` heading
+/// verbatim, so a reader who knows that page knows this pane.
+const CONSOLE_TITLE: &str = "Console — guest UART";
+
+/// Heading of a device run's log viewer. `run_log` is the pipeline's own
+/// narration (see `history`'s doc), not guest UART, and the two must not
+/// read as the same thing.
+const DEVICE_LOG_TITLE: &str = "Log — ggo-diag pipeline";
+
+/// A device run that cloned no `run_log` rows. Like `report::NO_UART` this
+/// names a STATE, not a cause: a run can reach `runs` with no narration
+/// because it died before its first log write, because only its `uart`
+/// rows were populated, or because the clone caught it mid-run.
+const NO_DEVICE_LOG: &str = "no log lines recorded for this run";
+
+/// Re-run refused: the run carries no cart path to hand the emulator.
+/// Only runs the emulator pane itself ingested do -- `ggo_emu_panel`
+/// writes the rel path into `run.label`, while `ggo-emu`/`ggo-server`
+/// captures arrive with none.
+const NO_RERUN_PATH: &str = "no cart path recorded for this run, so it cannot be re-run from here";
+
+/// Re-run refused: nothing in this build claims carts. `run_cart`'s
+/// registry is empty when `ggo_emu_panel::init` never ran.
+const NO_CART_RUNNER: &str = "no emulator pane is available to run this cart";
 
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
@@ -101,7 +151,12 @@ pub fn init(cx: &mut App) {
             return;
         };
 
-        let panel = cx.new(|cx| ChartsPanel::new(cx));
+        // The weak handle is what the Re-run entry routes through -- see
+        // `ChartsPanel::rerun_selected`. Taken here, the way
+        // `ggo_emu_panel::init` takes its own, because a panel cannot
+        // recover its workspace from a `Context<Self>`.
+        let weak_workspace = workspace.weak_handle();
+        let panel = cx.new(|cx| ChartsPanel::new(Some(weak_workspace), cx));
         workspace.add_panel(panel, window, cx);
 
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -132,32 +187,41 @@ enum LoadState {
 }
 
 /// The selected run's own load, independent of the runs list's: picking a
-/// run kicks off a second background pass for its samples.
+/// run kicks off a second background pass for it.
 enum DetailState {
     Loading,
-    /// Charts already assembled from the loaded samples (`chart_set`), so
-    /// the assembly happens once per selection rather than once per
-    /// render. Empty when the run had no plottable frames.
-    ///
-    /// `Rc`, not a bare `ChartSpec`: `render_chart`'s prepaint closure is
-    /// `'static` and so has to OWN whatever it reads, and a spec holds one
-    /// `Vec<f32>` per series over the whole run -- deep-cloning all
-    /// thirteen charts' worth on every render (i.e. on every hover
-    /// mouse-move) is ~8 MB of memcpy per frame at ingest's 100,000-frame
-    /// cap. Sharing the `Rc` makes that a refcount bump.
-    Ready {
-        charts: Vec<Rc<ChartSpec>>,
-        /// How many frames the default ignore filter dropped, so the
-        /// header can say so -- see `chart_set::ignored_count`.
-        ignored: usize,
-        /// The non-chart half of the run detail: KPI tiles, the header's
-        /// run-config line, and the two diagnostic tables. Assembled once
-        /// per selection alongside `charts`, for the same reason -- and
-        /// over the same ignore-filtered frames, which is what keeps a
-        /// tile and the chart under it talking about one frame set.
-        report: report::RunReport,
-    },
+    /// The finished view model, queried AND derived on the background
+    /// thread -- see [`detail`]'s module doc for why the derivation moved
+    /// there in F5.4 R3. Nothing in the update closure that receives this
+    /// does any work beyond storing it.
+    Ready(detail::Detail),
     Error(String),
+}
+
+/// A device run's `run_log`, loaded on the same background/generation
+/// machinery a perf run's detail is.
+enum DeviceLogState {
+    Loading,
+    Ready(Arc<Vec<String>>),
+    Error(String),
+}
+
+/// The device-run history rail's own load.
+enum HistoryState {
+    /// Nothing loaded yet -- before the panel's first activation.
+    Empty,
+    Loading,
+    Ready(history::History),
+}
+
+/// What the panel is showing, when it is showing a run rather than the
+/// picker. The two kinds come from two DIFFERENT tables in two different
+/// id spaces -- `run` (INTEGER `id`, this app's own perf captures) and
+/// `runs` (TEXT `id`, device runs cloned out of `ggo-diag`'s `diag.db`) --
+/// and nothing here ever converts one into the other (R1/R2's trap (3)).
+enum Selection {
+    Perf(RunListing),
+    Device(RunSummary),
 }
 
 /// Which chart the cursor is over, and where inside it (canvas-local px).
@@ -171,20 +235,38 @@ struct Hover {
 pub struct ChartsPanel {
     focus_handle: FocusHandle,
     position: DockPosition,
+    /// The workspace this panel was added to, for the Re-run handoff --
+    /// `None` in the unit tests that build a bare panel with no workspace
+    /// at all, which is exactly when Re-run has nowhere to go anyway.
+    workspace: Option<WeakEntity<Workspace>>,
     /// Test hook: bypass `~/.ggo` resolution and point straight at a
     /// fixture db (`ggo_world_panel::root_override`'s analog).
     db_path_override: Option<PathBuf>,
+    /// Test hook for the OTHER file the panel reads -- `ggo-diag`'s own
+    /// `~/.ggo/diag.db`, which the history rail clones out of. Separate
+    /// from `db_path_override` because they are separate files owned by
+    /// separate tools; see `history`'s module doc.
+    diag_db_path_override: Option<PathBuf>,
     state: LoadState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
-    /// The run whose charts are showing, `None` for the picker view.
-    selected: Option<RunListing>,
+    /// The run being shown, `None` for the picker view.
+    selected: Option<Selection>,
     detail: Option<DetailState>,
+    /// Set instead of `detail` when the selection is a device run.
+    device_log: Option<DeviceLogState>,
+    /// Why the last Re-run click went nowhere, if it did.
+    rerun_note: Option<&'static str>,
     /// Separate from `load_generation`: a run selection and a runs-list
     /// refresh are independent loads, and a stale one of either must not
-    /// clobber the other's result.
+    /// clobber the other's result. Shared by BOTH selection kinds, which is
+    /// what makes switching from a perf run to a device run (or back)
+    /// discard the one being left.
     detail_generation: u64,
     _detail_task: Option<Task<()>>,
+    history: HistoryState,
+    history_generation: u64,
+    _history_task: Option<Task<()>>,
     hover: Option<Hover>,
     /// Each chart canvas's last painted bounds, recorded in its prepaint
     /// (the only place an element learns where it landed) so a mouse-move
@@ -196,18 +278,25 @@ pub struct ChartsPanel {
 }
 
 impl ChartsPanel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             position: DockPosition::Right,
+            workspace,
             db_path_override: None,
+            diag_db_path_override: None,
             state: LoadState::Empty,
             load_generation: 0,
             _load_task: None,
             selected: None,
             detail: None,
+            device_log: None,
+            rerun_note: None,
             detail_generation: 0,
             _detail_task: None,
+            history: HistoryState::Empty,
+            history_generation: 0,
+            _history_task: None,
             hover: None,
             chart_bounds: Rc::new(RefCell::new(Vec::new())),
         }
@@ -219,9 +308,27 @@ impl ChartsPanel {
             .or_else(ggo_common::default_db_path)
     }
 
-    /// Select a run and kick off its sample load -- same off-thread
-    /// shape and same load-generation staleness guard as
-    /// [`Self::refresh_runs`], on its own generation counter.
+    /// `ggo-diag`'s `~/.ggo/diag.db` -- a DIFFERENT file, owned by a
+    /// different tool, which this panel only ever clones out of.
+    fn diag_db_path(&self) -> Option<PathBuf> {
+        self.diag_db_path_override
+            .clone()
+            .or_else(ggo_common::default_diag_db_path)
+    }
+
+    /// Select a perf run and kick off its load -- same off-thread shape and
+    /// same load-generation staleness guard as [`Self::refresh_runs`], on
+    /// its own generation counter.
+    ///
+    /// **The whole pass is off-thread**, queries and derivations both:
+    /// `detail::load` is the single background call, and the closure below
+    /// only stores what it hands back. That is F5.4 R3's inherited fix --
+    /// C2/R2 built the charts and the report in this closure, i.e. on the
+    /// UI thread, which R2's review measured at 327 ms for a 100,000-line
+    /// UART. No second load path was invented for it: the four queries R2
+    /// added still ride this same spawn and this same generation guard, and
+    /// R3's console rides it too. `detail::no_build_here` is the tripwire
+    /// that keeps it that way -- see that fn's doc.
     fn select_run(&mut self, run: RunListing, cx: &mut Context<Self>) {
         let Some(db_path) = self.db_path() else {
             self.detail = Some(DetailState::Error(
@@ -231,36 +338,75 @@ impl ChartsPanel {
             return;
         };
         let run_id = run.id;
-        self.selected = Some(run);
-        self.hover = None;
-        self.chart_bounds.borrow_mut().clear();
-        self.detail_generation += 1;
+        self.begin_selection(Selection::Perf(run));
         let generation = self.detail_generation;
         self.detail = Some(DetailState::Loading);
         cx.notify();
 
-        let load = cx.background_spawn(async move { loader::load_run_samples(&db_path, run_id) });
+        let load = cx.background_spawn(async move { detail::load(&db_path, run_id) });
         self._detail_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
+                let _no_build_here = detail::no_build_here();
                 if this.detail_generation != generation {
                     return;
                 }
                 this.detail = Some(match result {
-                    Ok(samples) => DetailState::Ready {
-                        ignored: chart_set::ignored_count(&samples.frames),
-                        report: report::build(&samples),
-                        charts: chart_set::build_charts(&samples)
-                            .into_iter()
-                            .map(Rc::new)
-                            .collect(),
-                    },
+                    Ok(detail) => DetailState::Ready(detail),
                     Err(e) => DetailState::Error(e),
                 });
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// Select a DEVICE run (a `runs` row cloned out of `diag.db`) and load
+    /// its pipeline log. Same background spawn, same generation counter as
+    /// [`Self::select_run`] -- sharing the counter is what makes switching
+    /// between the two kinds discard the load being left behind.
+    fn select_device_run(&mut self, run: RunSummary, cx: &mut Context<Self>) {
+        let Some(db_path) = self.db_path() else {
+            self.device_log = Some(DeviceLogState::Error(
+                "could not resolve a home directory".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let run_id = run.id.clone();
+        self.begin_selection(Selection::Device(run));
+        let generation = self.detail_generation;
+        self.device_log = Some(DeviceLogState::Loading);
+        cx.notify();
+
+        let load = cx.background_spawn(async move { history::log(&db_path, &run_id) });
+        self._detail_task = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                if this.detail_generation != generation {
+                    return;
+                }
+                this.device_log = Some(match result {
+                    Ok(lines) => DeviceLogState::Ready(Arc::new(lines)),
+                    Err(e) => DeviceLogState::Error(e),
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The bookkeeping both selection paths share: adopt `next`, drop
+    /// whatever the previous selection left behind, and bump the generation
+    /// so an in-flight load for the run being replaced cannot land on top.
+    fn begin_selection(&mut self, next: Selection) {
+        self.selected = Some(next);
+        self.detail = None;
+        self.device_log = None;
+        self.rerun_note = None;
+        self.hover = None;
+        self.chart_bounds.borrow_mut().clear();
+        self.detail_generation += 1;
     }
 
     /// Show run `run_id`, looking its listing up off-thread first.
@@ -303,13 +449,59 @@ impl ChartsPanel {
 
     /// Back to the run picker.
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        // Bump the generation so an in-flight sample load for the run
-        // being dismissed can't land afterwards and re-show its charts.
+        // Bump the generation so an in-flight load for the run being
+        // dismissed can't land afterwards and re-show it.
         self.detail_generation += 1;
         self.selected = None;
         self.detail = None;
+        self.device_log = None;
+        self.rerun_note = None;
         self.hover = None;
         self.chart_bounds.borrow_mut().clear();
+        cx.notify();
+    }
+
+    /// **Re-run**: hand the selected run's cart back to the emulator pane.
+    ///
+    /// The reverse hop (a finished emulator run opening HERE) ships from
+    /// F5.2/S4 as a direct call, because `ggo_emu_panel` depends on this
+    /// crate. This direction cannot be a direct call for exactly that
+    /// reason, so it goes through `ggo_common`'s `CartRunner` registry --
+    /// see that type's doc. The emulator pane's registered runner ends in
+    /// its ORDINARY `EmuPanel::rerun`, the same entry S4's context menu
+    /// uses; no second run path exists on either side.
+    ///
+    /// The cart's identity is the run's `label` column, which
+    /// `ggo_emu_panel::finish_run` writes as the project-relative path it
+    /// ran. A run ingested by `ggo-emu`/`ggo-server` (or by ggo-ide) has no
+    /// label, and this says so rather than guessing: matching a perf-db
+    /// cart NAME back onto a stored `.cart` is ggo-ide's
+    /// `rerun::matches_stored`, which reaches into that app's own cart
+    /// library and deliberately did not travel in R1.
+    fn rerun_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rerun_note = None;
+        let Some(Selection::Perf(run)) = &self.selected else {
+            return;
+        };
+        let Some(rel) = run.label.clone().filter(|l| !l.is_empty()) else {
+            self.rerun_note = Some(NO_RERUN_PATH);
+            cx.notify();
+            return;
+        };
+        let claimed = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        ggo_common::run_cart(workspace, &rel, window, cx)
+                    })
+                    .ok()
+            })
+            .unwrap_or(false);
+        if !claimed {
+            self.rerun_note = Some(NO_CART_RUNNER);
+        }
         cx.notify();
     }
 
@@ -318,9 +510,9 @@ impl ChartsPanel {
     /// needs the other arms' messages anyway), so this exists purely so a
     /// test can assert the chart set and build scenes without a window.
     #[cfg(test)]
-    fn chart_specs(&self) -> &[Rc<ChartSpec>] {
+    fn chart_specs(&self) -> &[Arc<ChartSpec>] {
         match &self.detail {
-            Some(DetailState::Ready { charts, .. }) => charts,
+            Some(DetailState::Ready(detail)) => &detail.charts,
             _ => &[],
         }
     }
@@ -331,8 +523,17 @@ impl ChartsPanel {
     #[cfg(test)]
     fn report(&self) -> Option<&report::RunReport> {
         match &self.detail {
-            Some(DetailState::Ready { report, .. }) => Some(report),
+            Some(DetailState::Ready(detail)) => Some(&detail.report),
             _ => None,
+        }
+    }
+
+    /// The selected run's stored console lines, `&[]` in any other state.
+    #[cfg(test)]
+    fn console(&self) -> &[String] {
+        match &self.detail {
+            Some(DetailState::Ready(detail)) => &detail.console,
+            _ => &[],
         }
     }
 
@@ -386,21 +587,87 @@ impl ChartsPanel {
         }));
     }
 
+    /// Clone whatever `~/.ggo/diag.db` has that we do not, then list the
+    /// device runs. Its own generation counter, for the same reason
+    /// [`Self::select_run`] has one: this refresh and the perf-run listing
+    /// are independent loads on independent tables.
+    ///
+    /// Runs on every panel activation alongside [`Self::refresh_runs`]. The
+    /// clone is idempotent (`diag_db::clone_runs` skips a run whose `runs`
+    /// row already exists), so re-running it is a `SELECT id FROM runs`
+    /// against a small local file, and a diag run that finished while the
+    /// panel sat open shows up the next time it is focused.
+    ///
+    /// A panel with no resolvable home directory shows an EMPTY rail rather
+    /// than an error: with no `~/.ggo` there is no `diag.db` either, which
+    /// is the state `history::NO_DIAG_DB` already describes.
+    fn refresh_history(&mut self, cx: &mut Context<Self>) {
+        let (Some(db_path), Some(diag_db_path)) = (self.db_path(), self.diag_db_path()) else {
+            self.history = HistoryState::Ready(history::History {
+                runs: Vec::new(),
+                note: Some(history::NO_DIAG_DB.to_string()),
+            });
+            cx.notify();
+            return;
+        };
+
+        self.history_generation += 1;
+        let generation = self.history_generation;
+        self.history = HistoryState::Loading;
+        cx.notify();
+
+        let load = cx.background_spawn(async move {
+            history::load(&diag_db_path, &db_path, history::HISTORY_LIMIT)
+        });
+        self._history_task = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                if this.history_generation != generation {
+                    return;
+                }
+                this.history = HistoryState::Ready(result);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn render_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        if self.selected.is_some() {
-            return self.render_detail(cx);
+        match &self.selected {
+            Some(Selection::Perf(_)) => self.render_detail(cx),
+            Some(Selection::Device(run)) => self.render_device_detail(run, cx),
+            None => self.render_picker(cx),
         }
-        match &self.state {
-            LoadState::Empty => self.render_message("Select the panel to load runs", cx),
-            LoadState::Loading => self.render_message("Loading runs…", cx),
-            LoadState::Error(e) => self.render_message(format!("Failed to load runs: {e}"), cx),
+    }
+
+    /// The picker: this app's own perf runs, then the device-run history
+    /// rail. One scroll region, because at the dock's width a side-by-side
+    /// rail (ggo-ide's `history_section` layout) would leave neither column
+    /// readable.
+    fn render_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        v_flex()
+            .id("ggo-charts-picker")
+            .size_full()
+            .overflow_y_scroll()
+            .p_2()
+            .gap_3()
+            .child(self.render_runs_section(cx))
+            .child(self.render_history_rail(cx))
+            .into_any_element()
+    }
+
+    fn render_runs_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let body = match &self.state {
+            LoadState::Empty => Self::note("Select the panel to load runs").into_any_element(),
+            LoadState::Loading => Self::note("Loading runs…").into_any_element(),
+            LoadState::Error(e) => {
+                Self::note(format!("Failed to load runs: {e}")).into_any_element()
+            }
             LoadState::Ready(runs) if runs.is_empty() => {
-                self.render_message("No perf runs recorded yet", cx)
+                Self::note("No perf runs recorded yet").into_any_element()
             }
             LoadState::Ready(runs) => v_flex()
-                .id("ggo-charts-runs-list")
-                .size_full()
-                .overflow_y_scroll()
+                .w_full()
                 .children(runs.iter().enumerate().map(|(ix, run)| {
                     let run = run.clone();
                     h_flex()
@@ -419,33 +686,166 @@ impl ChartsPanel {
                         }))
                 }))
                 .into_any_element(),
-        }
+        };
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(Label::new("Perf runs").size(LabelSize::Small))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The device-run history rail: every run cloned out of `~/.ggo/diag.db`,
+    /// newest first, capped at `history::HISTORY_LIMIT`.
+    ///
+    /// **Undifferentiated by run kind, deliberately.** The `runs` table has
+    /// no run-kind column and cart vs full-system is a path convention at
+    /// ingest time, so this rail groups nothing and labels nothing by kind
+    /// -- it shows `started_at`, `state` and `verdict`, which are columns
+    /// that exist. See `history`'s module doc.
+    fn render_history_rail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let body = match &self.history {
+            HistoryState::Empty => {
+                vec![Self::note("Select the panel to load device runs").into_any_element()]
+            }
+            HistoryState::Loading => vec![Self::note("Loading device runs…").into_any_element()],
+            HistoryState::Ready(history) => {
+                let mut rows: Vec<AnyElement> = history
+                    .runs
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, run)| {
+                        let summary = run.clone();
+                        v_flex()
+                            .id(("ggo-charts-device-run", ix))
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .hover(|s| s.bg(cx.theme().colors().element_hover))
+                            .cursor_pointer()
+                            .child(Label::new(run.started_at.clone()).size(LabelSize::Small))
+                            .child(
+                                Label::new(format!(
+                                    "{}  {}",
+                                    run.state,
+                                    run.verdict.as_deref().unwrap_or("—")
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.select_device_run(summary.clone(), cx);
+                            }))
+                            .into_any_element()
+                    })
+                    .collect();
+                // The reason goes UNDER the rows, not instead of them: a
+                // clone that failed against rows cloned earlier means "these
+                // may be stale, here is why", which is worth both halves.
+                if let Some(note) = &history.note {
+                    rows.push(Self::note(note.clone()).into_any_element());
+                }
+                rows
+            }
+        };
+        v_flex()
+            .w_full()
+            .gap_1()
+            .debug_selector(|| HISTORY_RAIL_SELECTOR.to_string())
+            .child(Label::new("Device runs").size(LabelSize::Small))
+            .children(body)
+            .into_any_element()
+    }
+
+    /// A device run: the same header shape a perf run gets, over its
+    /// `ggo-diag` pipeline log. There are no charts, no KPIs and no
+    /// diagnostic tables here -- a `runs` row carries none of the perf
+    /// columns those are derived from.
+    fn render_device_detail(&self, run: &RunSummary, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let body = match &self.device_log {
+            None | Some(DeviceLogState::Loading) => self.render_message("Loading log…", cx),
+            Some(DeviceLogState::Error(e)) => {
+                self.render_message(format!("Failed to load log: {e}"), cx)
+            }
+            Some(DeviceLogState::Ready(lines)) => v_flex()
+                .id("ggo-charts-device-body")
+                .size_full()
+                .overflow_y_scroll()
+                .p_2()
+                .child(Self::render_log(
+                    DEVICE_LOG_TITLE,
+                    DEVICE_LOG_SELECTOR,
+                    lines,
+                    NO_DEVICE_LOG,
+                    cx,
+                ))
+                .into_any_element(),
+        };
+
+        v_flex()
+            .size_full()
+            .child(
+                v_flex()
+                    .id("ggo-charts-device-header")
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(
+                                IconButton::new("ggo-charts-device-back", IconName::ArrowLeft)
+                                    .tooltip(Tooltip::text("Back to runs"))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.clear_selection(cx);
+                                    })),
+                            )
+                            .child(Label::new(run.started_at.clone()).size(LabelSize::Small)),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "{} · {} · {}",
+                            run.id,
+                            run.state,
+                            run.verdict.as_deref().unwrap_or("no verdict")
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 
     /// The selected run's view: a back row, then one titled canvas per
     /// chart in [`chart_set::build_charts`]'s order.
     fn render_detail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let title = self
-            .selected
-            .as_ref()
-            .map(RunListing::display_title)
-            .unwrap_or_default();
+        let title = match &self.selected {
+            Some(Selection::Perf(run)) => run.display_title(),
+            _ => String::new(),
+        };
 
         let body = match &self.detail {
             None | Some(DetailState::Loading) => self.render_message("Loading samples…", cx),
             Some(DetailState::Error(e)) => {
                 self.render_message(format!("Failed to load samples: {e}"), cx)
             }
-            Some(DetailState::Ready { charts, report, .. }) => {
+            Some(DetailState::Ready(detail)) => {
+                let (charts, report) = (&detail.charts, &detail.report);
                 self.chart_bounds.borrow_mut().resize(charts.len(), None);
                 // ggo-ide's `detail_view` order, top to bottom: the two
-                // diagnostic tables, then the KPI row, then the charts.
-                // The tables come FIRST there and here for a reason worth
-                // not "tidying" away: the run most in need of them is a
-                // cart that panicked before it ever reached vsync_wait,
-                // which has no frames, no KPIs and no charts at all --
-                // burying the panic under the empty-charts message would
-                // hide the only thing that run has to say.
+                // diagnostic tables, the stored console, then the KPI row,
+                // then the charts. The tables come FIRST there and here for
+                // a reason worth not "tidying" away: the run most in need of
+                // them is a cart that panicked before it ever reached
+                // vsync_wait, which has no frames, no KPIs and no charts at
+                // all -- burying the panic under the empty-charts message
+                // would hide the only thing that run has to say. The
+                // console sits with them, above the same branch, for
+                // exactly the same reason.
                 v_flex()
                     .id("ggo-charts-list")
                     .size_full()
@@ -454,6 +854,13 @@ impl ChartsPanel {
                     .gap_3()
                     .child(self.render_failures_table(&report.diagnostics, cx))
                     .child(self.render_panics_table(&report.diagnostics, cx))
+                    .child(Self::render_log(
+                        CONSOLE_TITLE,
+                        CONSOLE_SELECTOR,
+                        &detail.console,
+                        report::NO_UART,
+                        cx,
+                    ))
                     .children(if charts.is_empty() {
                         // An explicit message, never a blank canvas -- and
                         // which message matters. A run that recorded no
@@ -488,7 +895,7 @@ impl ChartsPanel {
         };
 
         let config_line = match &self.detail {
-            Some(DetailState::Ready { report, .. }) => report.config_line.clone(),
+            Some(DetailState::Ready(detail)) => detail.report.config_line.clone(),
             _ => None,
         };
 
@@ -513,8 +920,14 @@ impl ChartsPanel {
                                         this.clear_selection(cx);
                                     })),
                             )
+                            .child(self.render_rerun_button(cx))
                             .child(Label::new(title).size(LabelSize::Small))
                             .children(self.ignored_caption()),
+                    )
+                    .children(
+                        self.rerun_note.map(|note| {
+                            Label::new(note).size(LabelSize::XSmall).color(Color::Muted)
+                        }),
                     )
                     // The run-config line (frame budget, wire-model
                     // constants, wire-wait tag) -- `kpi::run_config_line`
@@ -532,6 +945,96 @@ impl ChartsPanel {
             )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+
+    /// The Re-run entry -- see [`Self::rerun_selected`] for where it goes.
+    ///
+    /// Disabled, with the reason in its tooltip, for a run with no cart
+    /// path: an enabled button that reports a refusal only after the click
+    /// is a worse affordance than one that says so up front. It stays
+    /// visible either way so the entry is discoverable on the runs that
+    /// cannot use it as well as the ones that can.
+    fn render_rerun_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rel = match &self.selected {
+            Some(Selection::Perf(run)) => run.label.clone().filter(|l| !l.is_empty()),
+            _ => None,
+        };
+        let tooltip = match &rel {
+            Some(rel) => format!("Re-run {rel} in the emulator"),
+            None => NO_RERUN_PATH.to_string(),
+        };
+        IconButton::new("ggo-charts-rerun", IconName::RotateCcw)
+            .disabled(rel.is_none())
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.rerun_selected(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// A titled, scrollable, monospace log region -- the stored run's guest
+    /// UART and a device run's pipeline log, which differ in what they hold
+    /// but not at all in how they are read.
+    ///
+    /// `uniform_list`, not a `Vec` of labels: a run's `uart` table is
+    /// unbounded from this side. The fork's own emulator caps what it
+    /// PERSISTS at `UART_LOG_CAP` (2000), but that is a producer-side
+    /// promise -- `ggo-emu`, `ggo-server` and `ggo_fixture` all write this
+    /// table too -- and the console must not fall over on a run that
+    /// ignored it. `uniform_list` lays out only the rows actually on
+    /// screen, so a 100,000-line run costs the same as a 10-line one.
+    ///
+    /// The emulator pane's LIVE console is deliberately not shared with
+    /// this one. It reads a `UartLog` (an `Arc<Mutex<..>>` the emulator
+    /// thread is still writing) rather than a finished `Vec`, it shows a
+    /// fixed 100-line tail because it re-renders at 60 Hz, it carries a
+    /// collapse toggle stored in that panel's state, and it is not
+    /// monospace. Sharing would mean moving an element builder into
+    /// `ggo_common` (which has no `ui` dependency today) and
+    /// parameterising all four differences -- more coupling than the
+    /// ~20 lines it would save, between two crates that already share the
+    /// `uart` TABLE, which is the part that actually has to agree.
+    fn render_log(
+        title: &'static str,
+        selector: &'static str,
+        lines: &Arc<Vec<String>>,
+        empty_state: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let section = v_flex()
+            .w_full()
+            .gap_1()
+            .debug_selector(|| selector.to_string())
+            .child(Label::new(title).size(LabelSize::Small));
+        if lines.is_empty() {
+            return section.child(Self::note(empty_state)).into_any_element();
+        }
+        // Refcount bump, not a deep clone: `uniform_list`'s renderer is
+        // `'static` and has to own what it reads, and this is the whole
+        // run's log.
+        let lines = lines.clone();
+        section
+            .child(
+                uniform_list(selector, lines.len(), move |range, _window, cx| {
+                    range
+                        .map(|ix| {
+                            Label::new(lines[ix].clone())
+                                .size(LabelSize::XSmall)
+                                .buffer_font(cx)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .h(LOG_HEIGHT)
+                .w_full()
+                .rounded_sm()
+                .bg(cx.theme().colors().editor_background),
+            )
+            .into_any_element()
+    }
+
+    /// A muted caption -- an empty state, a reason, a hint.
+    fn note(text: impl Into<SharedString>) -> Label {
+        Label::new(text).size(LabelSize::XSmall).color(Color::Muted)
     }
 
     /// The KPI tile row above the plots -- ggo-ide's `kpi_row`, wrapped
@@ -663,10 +1166,10 @@ impl ChartsPanel {
     /// without a caption a user just sees an x-axis that starts at 1 with
     /// no explanation. Read-only for now -- the editor is the follow-up.
     fn ignored_caption(&self) -> Option<Label> {
-        let Some(DetailState::Ready { ignored, .. }) = &self.detail else {
+        let Some(DetailState::Ready(detail)) = &self.detail else {
             return None;
         };
-        let n = *ignored;
+        let n = detail.ignored;
         if n == 0 {
             return None;
         }
@@ -681,7 +1184,7 @@ impl ChartsPanel {
     fn render_chart(
         &self,
         ix: usize,
-        spec: &Rc<ChartSpec>,
+        spec: &Arc<ChartSpec>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let title = SharedString::from(spec.title.clone());
@@ -889,7 +1392,11 @@ impl Panel for ChartsPanel {
             // in case a later task adds a project-relative read.
             let this = cx.weak_entity();
             cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_runs(cx)).ok();
+                this.update(cx, |this, cx| {
+                    this.refresh_runs(cx);
+                    this.refresh_history(cx);
+                })
+                .ok();
             });
         }
     }
@@ -986,7 +1493,7 @@ mod tests {
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut panel = ChartsPanel::new(cx);
+                let mut panel = ChartsPanel::new(None, cx);
                 panel.db_path_override = Some(db_path.clone());
                 panel
             })
@@ -1064,7 +1571,7 @@ mod tests {
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut panel = ChartsPanel::new(cx);
+                let mut panel = ChartsPanel::new(None, cx);
                 panel.db_path_override = Some(db_path.clone());
                 panel
             })
@@ -1292,7 +1799,7 @@ mod tests {
         let (_dir, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, _cx| {
             assert!(
-                matches!(&panel.detail, Some(DetailState::Ready { ignored, .. }) if *ignored == 1),
+                matches!(&panel.detail, Some(DetailState::Ready(detail)) if detail.ignored == 1),
                 "the fixture seeds frame 0, which the default filter drops"
             );
             assert!(
@@ -1310,7 +1817,7 @@ mod tests {
         let (_dir, panel) = ready_detail_panel(cx, 0).await;
         panel.update(cx, |panel, _cx| {
             assert!(
-                matches!(&panel.detail, Some(DetailState::Ready { charts, .. }) if charts.is_empty()),
+                matches!(&panel.detail, Some(DetailState::Ready(detail)) if detail.charts.is_empty()),
                 "expected Ready with no charts"
             );
         });
@@ -1401,7 +1908,7 @@ mod tests {
     ) -> gpui::Entity<ChartsPanel> {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut panel = ChartsPanel::new(cx);
+                let mut panel = ChartsPanel::new(None, cx);
                 panel.db_path_override = Some(db_path);
                 panel
             })
@@ -1718,7 +2225,7 @@ mod tests {
         );
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
-            let mut panel = ChartsPanel::new(cx);
+            let mut panel = ChartsPanel::new(None, cx);
             panel.db_path_override = Some(db_path);
             panel
         });
@@ -1751,6 +2258,9 @@ mod tests {
         let panics = cx
             .debug_bounds(PANICS_SELECTOR)
             .expect("the panics table must be painted");
+        let console = cx
+            .debug_bounds(CONSOLE_SELECTOR)
+            .expect("the stored console must be painted");
         let kpis = cx
             .debug_bounds(KPI_ROW_SELECTOR)
             .expect("the KPI row must be painted for a run with frames");
@@ -1763,9 +2273,11 @@ mod tests {
             "failed asset loads sits above panics"
         );
         assert!(
-            panics.origin.y < kpis.origin.y,
-            "both tables sit above the KPI row -- ggo-ide's detail_view order"
+            panics.origin.y < console.origin.y,
+            "the stored console sits under the two tables -- ggo-ide's \
+             detail_view order is loads, panics, console, KPIs, charts"
         );
+        assert!(console.origin.y < kpis.origin.y, "and above the KPI row");
         assert!(
             kpis.origin.y < first_chart.origin.y,
             "the KPI row sits above the plots"
@@ -1779,7 +2291,7 @@ mod tests {
         seed_uart(&bare_path, &["panicked at 'early boom', src/main.rs:1:1"]);
 
         let (bare, cx) = cx.add_window_view(|_window, cx| {
-            let mut panel = ChartsPanel::new(cx);
+            let mut panel = ChartsPanel::new(None, cx);
             panel.db_path_override = Some(bare_path);
             panel
         });
@@ -1815,6 +2327,11 @@ mod tests {
             "a frameless run must still paint its panics table"
         );
         assert!(
+            cx.debug_bounds(CONSOLE_SELECTOR).is_some(),
+            "and its console -- the frameless run is exactly the one whose \
+             last few UART lines say what went wrong"
+        );
+        assert!(
             cx.debug_bounds(KPI_ROW_SELECTOR).is_none(),
             "no KPI row for a run that measured nothing"
         );
@@ -1836,7 +2353,7 @@ mod tests {
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut panel = ChartsPanel::new(cx);
+                let mut panel = ChartsPanel::new(None, cx);
                 panel.db_path_override = Some(db_path.clone());
                 panel
             })
@@ -1881,6 +2398,457 @@ mod tests {
             assert!(panel.detail.is_none());
             assert!(panel.hover.is_none());
             assert!(panel.detail_generation > before);
+        });
+    }
+
+    // ------------------------------------------ R3: the stored console
+
+    /// The console shows the run's persisted UART, in `seq` order and
+    /// verbatim -- the table `perf_db::run_uart` reads and that nothing in
+    /// the fork rendered back until now.
+    #[gpui::test]
+    async fn test_the_stored_console_renders_the_runs_uart(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_uart(
+            &db_path,
+            &[
+                "== GGO OS booted ==",
+                "[audio] output opened",
+                "wave 1 start",
+            ],
+        );
+        let panel = ready_panel_for(cx, db_path).await;
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.console(),
+                [
+                    "== GGO OS booted ==",
+                    // R6 added the `[audio]` / `[audio unavailable]`
+                    // markers to the run console, so they land in `uart`
+                    // and therefore here too. Nothing filters them: this
+                    // console is the run's log as recorded.
+                    "[audio] output opened",
+                    "wave 1 start",
+                ]
+            );
+        });
+    }
+
+    /// A run with no UART at all gets the console's empty state, which is
+    /// `report::NO_UART` -- the same hedged sentence the two diagnostic
+    /// tables use, single-sourced rather than re-spelled here. Zero rows is
+    /// a STATE (see `report::Diagnostics`' doc); this surface may not turn
+    /// it into a cause.
+    #[gpui::test]
+    async fn test_a_run_with_no_stored_uart_gets_the_hedged_empty_state(cx: &mut TestAppContext) {
+        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.console().is_empty(), "the fixture seeds no UART");
+            assert_eq!(
+                panel.report().unwrap().diagnostics.empty_state(0),
+                Some(report::NO_UART),
+                "the console's empty state IS the tables', not a second copy"
+            );
+        });
+        // And the device log's empty state is a different sentence about a
+        // different table -- `run_log` is pipeline narration, not guest
+        // UART, so borrowing NO_UART's wording for it would be wrong.
+        assert_ne!(NO_DEVICE_LOG, report::NO_UART);
+    }
+
+    // ------------------------------ R3: the load is entirely off-thread
+
+    /// Seed `n` UART lines for run 1, in batched multi-row inserts (one
+    /// `execute` per line is minutes, not seconds, at these counts).
+    fn seed_many_uart_lines(db_path: &std::path::Path, n: usize) {
+        const BATCH: usize = 250;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(db_path).await.unwrap();
+            let conn = db.conn().unwrap();
+            for chunk in (0..n).collect::<Vec<_>>().chunks(BATCH) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|seq| format!("(1, {seq}, 'line {seq}')"))
+                    .collect();
+                conn.execute(
+                    &format!(
+                        "INSERT INTO uart (run_id, seq, text) VALUES {}",
+                        values.join(", ")
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+            }
+        });
+    }
+
+    /// **The inherited defect (R2's carried concern (1)), fixed and
+    /// pinned.** `report::build` and `chart_set::build_charts` used to run
+    /// in `select_run`'s UPDATE closure -- on the UI thread, including the
+    /// UART parse, measured at 327 ms per 100,000 lines. They now run
+    /// inside the same `cx.background_spawn` the queries always did.
+    ///
+    /// Two independent assertions, because neither alone is enough:
+    ///
+    /// * **Nothing happens inline.** `select_run` returns with the panel
+    ///   `Loading`, and the panel PAINTS a real frame in that state, with a
+    ///   6,000-line load outstanding -- i.e. the UI thread is free while it
+    ///   runs. (6,000 is deliberately 3x `UART_LOG_CAP`: the producer's cap
+    ///   is a promise this reader must not depend on.)
+    /// * **Nothing is built afterwards either.** `select_run`'s closure
+    ///   holds a `detail::no_build_here` guard, which panics if any
+    ///   derivation runs while it is held. That guard is what actually
+    ///   pins the fix -- gpui's test scheduler runs background and
+    ///   foreground runnables on one thread, so no test here can tell them
+    ///   apart by thread id. `detail::tests::the_tripwire_fires_when_
+    ///   something_is_built_inside_the_guarded_scope` proves the guard
+    ///   catches what it claims to.
+    #[gpui::test]
+    async fn test_a_large_uart_load_leaves_the_panel_responsive(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_many_uart_lines(&db_path, 6_000);
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: None,
+                },
+                cx,
+            );
+            assert!(
+                matches!(panel.detail, Some(DetailState::Loading)),
+                "select_run must hand back a Loading panel, not a finished load"
+            );
+        });
+
+        // A whole frame, painted with the load still outstanding.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(CONSOLE_SELECTOR).is_none(),
+            "nothing of the run is painted yet -- the load has not landed"
+        );
+
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.console().len(),
+                6_000,
+                "every stored line comes back -- the reader imposes no cap"
+            );
+            assert_eq!(panel.console()[5_999], "line 5999");
+            assert!(!panel.chart_specs().is_empty(), "and the charts are built");
+        });
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(CONSOLE_SELECTOR).is_some(),
+            "the console paints once the run has landed"
+        );
+    }
+
+    // ------------------------------------------- R3: the history rail
+
+    /// Seed `ggo-diag`'s OWN database (a separate file, per the
+    /// no-shared-dbs rule `history`'s module doc explains) with one run and
+    /// a couple of `run_log` lines.
+    fn seed_device_run(diag_path: &std::path::Path, id: &str, started_at: &str, verdict: &str) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(diag_path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
+                 hostname, state, verdict) \
+                 VALUES (?1, ?2, 'main', 'abc123', 'v1.2.3', 'test-host', 'done', ?3)",
+                (id, started_at, verdict),
+            )
+            .await
+            .unwrap();
+            for (seq, text) in ["==> compile", "RESULT: PASS"].iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO run_log (run_id, seq, text) VALUES (?1, ?2, ?3)",
+                    (id, seq as i64, *text),
+                )
+                .await
+                .unwrap();
+            }
+        });
+    }
+
+    /// A panel pointed at both files, with its history rail loaded.
+    async fn history_panel(
+        cx: &mut TestAppContext,
+        db_path: PathBuf,
+        diag_path: PathBuf,
+    ) -> gpui::Entity<ChartsPanel> {
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = ChartsPanel::new(None, cx);
+                panel.db_path_override = Some(db_path);
+                panel.diag_db_path_override = Some(diag_path);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| panel.refresh_history(cx));
+        cx.executor().run_until_parked();
+        panel
+    }
+
+    fn history_of(panel: &ChartsPanel) -> &history::History {
+        match &panel.history {
+            HistoryState::Ready(history) => history,
+            HistoryState::Empty => panic!("expected Ready, got Empty"),
+            HistoryState::Loading => panic!("expected Ready, got Loading"),
+        }
+    }
+
+    /// The rail lists the cloned device runs, newest first, off-thread.
+    #[gpui::test]
+    async fn test_the_history_rail_lists_seeded_runs_newest_first(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let diag_path = dir.path().join("diag.db");
+        seed_device_run(&diag_path, "run-older", "2026-08-01T00:00:00Z", "PASS");
+        seed_device_run(&diag_path, "run-newer", "2026-08-02T00:00:00Z", "FAIL");
+
+        let panel = history_panel(cx, db_path, diag_path).await;
+        panel.update(cx, |panel, _cx| {
+            let history = history_of(panel);
+            let ids: Vec<&str> = history.runs.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["run-newer", "run-older"]);
+            assert_eq!(history.runs[0].verdict.as_deref(), Some("FAIL"));
+            assert_eq!(history.note, None, "a rail with rows carries no reason");
+        });
+    }
+
+    /// Selecting a rail row swaps what the panel is showing -- from the
+    /// picker (or from a perf run) to that device run and its pipeline log.
+    /// The two selections are different id spaces and neither leaks into
+    /// the other: the perf detail is dropped, not reinterpreted.
+    #[gpui::test]
+    async fn test_selecting_a_device_run_swaps_the_panels_run(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let diag_path = dir.path().join("diag.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_device_run(&diag_path, "run-1", "2026-08-02T00:00:00Z", "PASS");
+
+        let panel = history_panel(cx, db_path, diag_path).await;
+
+        // Start on a PERF run, so the swap has something to displace.
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert!(!panel.chart_specs().is_empty());
+        });
+
+        let summary = panel.update(cx, |panel, _cx| history_of(panel).runs[0].clone());
+        panel.update(cx, |panel, cx| panel.select_device_run(summary, cx));
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            match &panel.selected {
+                Some(Selection::Device(run)) => assert_eq!(run.id, "run-1"),
+                _ => panic!("the selection must now be the device run"),
+            }
+            assert!(
+                panel.detail.is_none(),
+                "the perf run's detail is dropped, not carried over"
+            );
+            match &panel.device_log {
+                Some(DeviceLogState::Ready(lines)) => {
+                    assert_eq!(**lines, vec!["==> compile", "RESULT: PASS"]);
+                }
+                _ => panic!("the device run's log must have loaded"),
+            }
+        });
+
+        // ...and Back returns to the picker from this kind too.
+        panel.update(cx, |panel, cx| panel.clear_selection(cx));
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.selected.is_none());
+            assert!(panel.device_log.is_none());
+        });
+    }
+
+    /// **The fresh-machine case.** No `~/.ggo/diag.db` is the norm, and it
+    /// must produce an empty rail with a legible reason -- never a panic,
+    /// never a silent blank, and never a database file created as a side
+    /// effect of a read (`turso::Builder::new_local` creates an empty,
+    /// tableless file on open, which is why the `exists()` guards are in
+    /// front of everything).
+    #[gpui::test]
+    async fn test_an_absent_diag_db_yields_the_reason_state_and_creates_no_file(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let diag_path = dir.path().join("diag.db");
+
+        let panel = history_panel(cx, db_path.clone(), diag_path.clone()).await;
+        panel.update(cx, |panel, _cx| {
+            let history = history_of(panel);
+            assert!(history.runs.is_empty());
+            assert_eq!(history.note.as_deref(), Some(history::NO_DIAG_DB));
+        });
+        assert!(
+            !diag_path.exists(),
+            "a read must not create ggo-diag's file"
+        );
+        assert!(!db_path.exists(), "nor ours");
+    }
+
+    // ----------------------------------------------- R3: the Re-run hop
+
+    /// Records what the charts panel handed to `ggo_common::run_cart`.
+    /// The panel cannot name `EmuPanel` (that crate depends on THIS one),
+    /// so what this side can assert is that the run's cart path reaches the
+    /// registry with the right value; `ggo_emu_panel`'s own
+    /// `test_the_registered_cart_runner_runs_the_cart_in_the_pane` asserts
+    /// what the registered runner then does to that panel's state.
+    #[derive(Default)]
+    struct Reran(Vec<String>);
+    impl gpui::Global for Reran {}
+
+    fn recording_cart_runner(
+        _workspace: &mut Workspace,
+        rel: &str,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        cx.default_global::<Reran>().0.push(rel.to_string());
+        true
+    }
+
+    /// A panel inside a real workspace (which is where the Re-run entry
+    /// gets its `WeakEntity<Workspace>` from), showing the seeded run.
+    async fn rerun_panel<'a>(
+        cx: &'a mut TestAppContext,
+        label: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        gpui::Entity<ChartsPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<ChartsPanel>(cx)
+                .expect("init() adds the charts panel")
+        });
+        panel.update(cx, |panel, cx| {
+            panel.db_path_override = Some(db_path);
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: label.map(str::to_string),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        (dir, panel, cx)
+    }
+
+    /// **Re-run routes to the emulator.** The run's `label` is the rel path
+    /// `ggo_emu_panel::finish_run` recorded for it, and that is what
+    /// reaches the cart-runner registry -- no name matching, no second run
+    /// path.
+    #[gpui::test]
+    async fn test_rerun_hands_the_runs_cart_path_to_the_cart_runner(cx: &mut TestAppContext) {
+        let (_dir, panel, cx) = rerun_panel(cx, Some("carts/green.cart")).await;
+        cx.update(|_window, cx| ggo_common::register_cart_runner(cx, recording_cart_runner));
+
+        panel.update_in(cx, |panel, window, cx| panel.rerun_selected(window, cx));
+
+        assert_eq!(
+            cx.update(|_window, cx| cx.default_global::<Reran>().0.clone()),
+            vec!["carts/green.cart".to_string()],
+        );
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.rerun_note, None, "a claimed Re-run reports nothing");
+        });
+    }
+
+    /// A run with no cart path cannot be re-run, and says which of the two
+    /// refusals it is rather than doing nothing. (`ggo-emu`/`ggo-server`
+    /// captures arrive with no `label`; only the emulator pane's own runs
+    /// carry one.)
+    #[gpui::test]
+    async fn test_rerun_is_refused_for_a_run_with_no_cart_path(cx: &mut TestAppContext) {
+        let (_dir, panel, cx) = rerun_panel(cx, None).await;
+        cx.update(|_window, cx| ggo_common::register_cart_runner(cx, recording_cart_runner));
+
+        panel.update_in(cx, |panel, window, cx| panel.rerun_selected(window, cx));
+
+        assert!(
+            cx.update(|_window, cx| cx.default_global::<Reran>().0.is_empty()),
+            "nothing may be handed to the runner"
+        );
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.rerun_note, Some(NO_RERUN_PATH));
+        });
+        assert_ne!(NO_RERUN_PATH, NO_CART_RUNNER);
+    }
+
+    /// With nothing registered -- a build without the emulator pane --
+    /// Re-run says so instead of silently doing nothing.
+    #[gpui::test]
+    async fn test_rerun_with_no_registered_runner_says_so(cx: &mut TestAppContext) {
+        let (_dir, panel, cx) = rerun_panel(cx, Some("carts/green.cart")).await;
+        panel.update_in(cx, |panel, window, cx| panel.rerun_selected(window, cx));
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.rerun_note, Some(NO_CART_RUNNER));
         });
     }
 }

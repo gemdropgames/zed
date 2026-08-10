@@ -58,6 +58,10 @@ pub fn to_render_image(rgba: &[u8], w: u32, h: u32) -> Option<Arc<RenderImage>> 
 /// `backend/db.rs::DB_FILE`.
 const DB_FILE: &str = "ggo_ide.db";
 const DOT_GGO: &str = ".ggo";
+/// `ggo-diag`'s own file under the same directory -- see
+/// [`default_diag_db_path`]. Matches ggo-ide's
+/// `pages/device.rs::DIAG_DB_FILE` and `ggo-diag`'s own `diag::db::DB_FILE`.
+const DIAG_DB_FILE: &str = "diag.db";
 
 /// `~/.ggo/ggo_ide.db`, matching `ggo-ide`'s `backend/db.rs::default_db_path`.
 /// `None` only if neither `HOME` nor `USERPROFILE` resolves (mirrors that
@@ -74,6 +78,22 @@ const DOT_GGO: &str = ".ggo";
 pub fn default_db_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(PathBuf::from(home).join(DOT_GGO).join(DB_FILE))
+}
+
+/// `ggo-diag`'s OWN database file, `~/.ggo/diag.db` -- mirrors ggo-ide's
+/// `pages::device::default_diag_db_path`, and deliberately resolved from the
+/// same `DOT_GGO` constant [`default_db_path`] uses so the two can never
+/// disagree about which directory `~/.ggo` is.
+///
+/// This is a DIFFERENT file from [`default_db_path`]'s, owned by a
+/// DIFFERENT tool, and the distinction is the whole no-shared-dbs rule (see
+/// `ggo-db`'s `open_existing`): a reader may open this file read-only and
+/// copy rows out of it into its own database
+/// (`ggo_worldlib::charts::reports::diag_db::clone_runs` is the only thing
+/// in the fork that touches it), and may never migrate or write it.
+pub fn default_diag_db_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(DOT_GGO).join(DIAG_DB_FILE))
 }
 
 // ------------------------------------------------- unsaved-document guard
@@ -302,6 +322,60 @@ pub fn open_in_panel<P: Panel>(
     workspace.reveal_panel::<P>(window, cx);
     panel.update(cx, |panel, cx| open(panel, window, cx));
     true
+}
+
+// ------------------------------------------------------- the cart-run hook
+
+/// "Run this project-relative `.cart`", as a registered hook rather than a
+/// direct call. Returns `true` when something claimed it.
+///
+/// It exists for exactly one reason: **the dependency edge only goes one
+/// way.** `ggo_emu_panel` already depends on `ggo_charts_panel` (F5.2/S4's
+/// "Re-run (perf)" hands the run it just ingested to that panel via
+/// `ChartsPanel::open_run`), so `ggo_charts_panel` cannot name `EmuPanel`
+/// to send a run back the other way -- that would be a crate cycle. This is
+/// the same shape upstream's own fork-local extension points use
+/// (`workspace::register_path_open_interceptor` /
+/// `register_context_menu_contributor`): a plain `fn` pointer in a global,
+/// registered by the provider's `init`, called by name-less consumers.
+///
+/// The hook takes the run's *rel path*, which is the identity the emu pane
+/// already runs carts by (`EmuPanel::rerun`) and the identity the charts
+/// panel already has (`ggo_emu_panel::ingest` writes it into `run.label`).
+/// No perf-db-name -> stored-`.cart` matching is involved, so ggo-ide's
+/// `rerun::matches_stored` (which reaches into that app's own cart library)
+/// stays where F5.4 R1 left it.
+pub type CartRunner = fn(&mut Workspace, &str, &mut Window, &mut Context<Workspace>) -> bool;
+
+#[derive(Default)]
+struct CartRunners(Vec<CartRunner>);
+
+impl gpui::Global for CartRunners {}
+
+/// Register a [`CartRunner`]. Called once by `ggo_emu_panel::init`.
+pub fn register_cart_runner(cx: &mut App, runner: CartRunner) {
+    cx.default_global::<CartRunners>().0.push(runner);
+}
+
+/// Offer `rel` to every registered [`CartRunner`], stopping at the first
+/// that claims it. `false` -- always, with an empty registry -- means
+/// nothing can run a cart in this app, which is the honest answer for a
+/// caller to surface rather than a silent no-op: a charts panel opened in a
+/// build without the emulator pane has nowhere to send a Re-run.
+pub fn run_cart(
+    workspace: &mut Workspace,
+    rel: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    // Copied out first, for the same reason `Workspace::intercept_path_open`
+    // does it: the runners take `&mut Workspace`, which cannot be held
+    // across a borrow of the global.
+    let runners = match cx.try_global::<CartRunners>() {
+        Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+        _ => return false,
+    };
+    runners.iter().any(|run| run(workspace, rel, window, cx))
 }
 
 /// Wrap `action` into the `Fn(&mut Window, &mut App)` a
