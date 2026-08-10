@@ -13,15 +13,15 @@
 //! what it breaks. **F5.3/E3** makes the schedules tab's run list
 //! editable -- reorder, add, drop and cadence, each one `emd schedule set`
 //! carrying the whole new list, shown optimistically and rolled back
-//! visibly when `emd` refuses it.
+//! visibly when `emd` refuses it. **F5.3/E4** closes the loop with the
+//! version lock: a banner naming the drift, a gate that keeps every
+//! mutation off a mismatched CLI, and an mtime-gated poll so a re-installed
+//! `emd` is noticed without a restart ([`lock`]).
 //!
-//! **What is NOT here yet.** The `emd version` lock banner and its mtime poll
-//! (Task E4; the post-run half of that enforcement, `verify_emd_result`,
-//! is already on the mutation path here), and a streaming run console with
-//! a cancel button. Runs are one-shot calls whose only interesting output
-//! is a JSON trailer -- but, unlike F5.2's generates, the mutations are
-//! `cargo check`-backed and slow, which is why they run under
-//! [`runner::EMD_TIMEOUT`].
+//! **What is NOT here yet.** A streaming run console with a cancel button.
+//! Runs are one-shot calls whose only interesting output is a JSON trailer
+//! -- but, unlike F5.2's generates, the mutations are `cargo check`-backed
+//! and slow, which is why they run under [`runner::EMD_TIMEOUT`].
 //!
 //! Structural mirror of the recent siblings (`ggo_map_panel`,
 //! `ggo_sprite_panel`): `Panel` impl, `ToggleFocus`, `observe_new`
@@ -37,11 +37,14 @@
 //! schedules that break are named in the prompt" is testable without a
 //! window -- [`manifests`] reads the manifests and gathers the blast
 //! radius, [`runner`] is the "how do we run it" half (no gpui either, and
-//! injectable so tests never need `emd` on `PATH`), and [`tileset`] is the
-//! one artifact this panel writes itself rather than delegating to `emd`.
-//! This module is the gpui glue.
+//! injectable so tests never need `emd` on `PATH`), [`lock`] is the version
+//! lock's banner text and gating rule (pure, and it is where the
+//! pre-release asymmetry between worldlib's two version comparisons is
+//! resolved), and [`tileset`] is the one artifact this panel writes itself
+//! rather than delegating to `emd`. This module is the gpui glue.
 
 mod forms;
+mod lock;
 mod manifests;
 mod ops;
 mod runner;
@@ -68,6 +71,7 @@ use ggo_worldlib::emerald::{
 };
 
 use forms::{ASSET_KIND, FIELD_KINDS, FieldDraft, GenDraft, GenKind};
+use lock::{BinProbe, EMD_LOCK_POLL_INTERVAL, LockCheck, LockProbe};
 use manifests::{ASSETS_DIR, MANIFESTS_DIR, Manifests};
 use ops::ManifestOp;
 use runner::{
@@ -462,10 +466,26 @@ pub struct EmeraldPanel {
     /// rollback would leave the user believing an edit landed that did
     /// not, which is worse than not being optimistic at all.
     order_rollback: Option<&'static str>,
+    /// What the panel last learned about the installed `emd`'s version.
+    /// **Every mutation is gated on this** (`lock::mutations_enabled`), and
+    /// it is what the banner renders. Updated by the poll below, and
+    /// immediately by a finished run whose own trailer disagrees with
+    /// [`EXPECTED_EMD_VERSION`] -- that trailer is a first-hand sighting of
+    /// the binary, so it does not wait for the next tick.
+    lock: LockCheck,
+    /// The last stat of the `emd` binary. The poll spends an `emd version`
+    /// child process only when this CHANGES, so a steady-state install
+    /// costs one `fs::metadata` per tick and nothing else.
+    emd_probe: BinProbe,
+    /// How that stat is taken -- injected for the same reason [`runner`]
+    /// is, and additionally so "the poll is not on the render path" can be
+    /// asserted as a call count.
+    probe: LockProbe,
     run_state: RunState,
     run_generation: u64,
     _run_task: Option<Task<()>>,
     _confirm_task: Option<Task<()>>,
+    _lock_task: Option<Task<()>>,
 }
 
 impl EmeraldPanel {
@@ -485,10 +505,14 @@ impl EmeraldPanel {
             field_form: None,
             schedule_order: Vec::new(),
             order_rollback: None,
+            lock: LockCheck::Unchecked,
+            emd_probe: BinProbe::Unprobed,
+            probe: lock::system_probe(),
             run_state: RunState::Idle,
             run_generation: 0,
             _run_task: None,
             _confirm_task: None,
+            _lock_task: None,
         }
     }
 
@@ -507,12 +531,99 @@ impl EmeraldPanel {
         // does, and fall back to the worktree itself so a checkout with no
         // `emerald.toml` simply lists nothing rather than reading some
         // ancestor's manifests.
-        self.emerald_dir = self
-            .project_root
-            .as_deref()
-            .and_then(emerald_project_root)
-            .or_else(|| self.project_root.clone());
+        let managed = self.project_root.as_deref().and_then(emerald_project_root);
+        self.emerald_dir = managed.clone().or_else(|| self.project_root.clone());
+        // Only a checkout that actually HAS an emerald project is worth
+        // watching `emd` for -- `emerald_dir` falls back to the worktree
+        // root, so it is `Some` everywhere and cannot stand in for this.
+        if managed.is_some() {
+            self.start_lock_poll(cx);
+        }
         self.refresh_manifests(cx);
+    }
+
+    /// Start the `emd` version-lock poll, once.
+    ///
+    /// **Here, not in [`EmeraldPanel::new`]**: `new` runs for every
+    /// workspace the moment it opens (`init`'s `observe_new`), including
+    /// every checkout that has no emerald project and every session where
+    /// this dock is never touched. `refresh_root` is the panel being USED
+    /// -- the dock activating, or a context-menu entry opening a form --
+    /// which is the first moment the answer can matter. It is also the
+    /// reason the gate's `Unchecked` window is narrow in practice: the poll
+    /// has been running since before the first form could be filled in.
+    ///
+    /// **Not on the render path, and it cannot drift onto it**: the only
+    /// caller is `refresh_root`, the loop lives in a spawned task, and the
+    /// stat itself is handed to the background executor. A render reads
+    /// `self.lock` and nothing else.
+    ///
+    /// **Why a poll at all.** Nothing in Zed reports "a binary on PATH was
+    /// replaced"; the honest alternatives are a filesystem watch on a path
+    /// that may not exist yet, or re-running `emd version` before every
+    /// mutation (a child process per click, which is exactly the smell E2's
+    /// review flagged). A tick is one `fs::metadata` and it only spends a
+    /// child process when the mtime actually moved --
+    /// [`EMD_LOCK_POLL_INTERVAL`] explains the interval.
+    ///
+    /// **A project switch does NOT force a re-check**, unlike ggo-ide's
+    /// version of this: the `emd` binary is resolved from `GGO_EMD`/`PATH`,
+    /// never from the project, so which project is open cannot change the
+    /// answer. The binary's identity is fully captured by the probe, and
+    /// the probe is what triggers a re-query.
+    fn start_lock_poll(&mut self, cx: &mut Context<Self>) {
+        if self._lock_task.is_some() {
+            return;
+        }
+        self._lock_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let Ok((probe, known, dir, runner)) = this.read_with(cx, |this, _| {
+                    (
+                        this.probe.clone(),
+                        this.emd_probe,
+                        this.emerald_dir.clone(),
+                        this.runner.clone(),
+                    )
+                }) else {
+                    return;
+                };
+                let seen = cx.background_executor().spawn(async move { probe() }).await;
+                if seen != known {
+                    // `emd version` needs a cwd, but not a project one: it
+                    // reports the binary's own semver wherever it runs.
+                    let request = EmdRequest::emd(
+                        dir.unwrap_or_else(|| PathBuf::from(".")),
+                        lock::version_args(),
+                    );
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move { runner(request).await })
+                        .await;
+                    let check = lock::check_from_outcome(&outcome);
+                    if this
+                        .update(cx, |this, cx| {
+                            this.emd_probe = seen;
+                            this.lock = check;
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                cx.background_executor().timer(EMD_LOCK_POLL_INTERVAL).await;
+            }
+        }));
+    }
+
+    /// Whether an `emd` mutation may start right now: the version lock
+    /// allows it and no run is already in flight.
+    ///
+    /// The one predicate behind every `disabled(...)` on a mutating control
+    /// AND behind the guards on the spawn path, so a button that looks
+    /// clickable and an action that actually runs cannot disagree.
+    fn mutations_blocked(&self) -> bool {
+        self.running() || !lock::mutations_enabled(&self.lock)
     }
 
     /// Re-read the three manifests, and drop a selection that no longer
@@ -1000,7 +1111,11 @@ impl EmeraldPanel {
     /// would have to opt out in `ManifestOp::destructive` to do so, in
     /// plain sight.
     fn request_op(&mut self, op: ManifestOp, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running() {
+        // The version lock is consulted BEFORE the confirm, not only at the
+        // spawn: raising "this will break two schedules, are you sure?" for
+        // a mutation that cannot run either way is a prompt whose only
+        // possible outcome is nothing happening.
+        if self.mutations_blocked() {
             return;
         }
         let Some(project_dir) = self.emerald_dir.clone() else {
@@ -1029,9 +1144,10 @@ impl EmeraldPanel {
             }
             this.update_in(cx, |this, window, cx| {
                 // Re-checked on THIS side of the await: the dialog was
-                // open for a while, and a run may have started (or the
-                // project moved) since it went up.
-                if this.running() {
+                // open for a while, and a run may have started, the
+                // project moved, or the lock poll noticed a swapped `emd`
+                // since it went up.
+                if this.mutations_blocked() {
                     return;
                 }
                 let Some(project_dir) = this.emerald_dir.clone() else {
@@ -1059,6 +1175,13 @@ impl EmeraldPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Before the optimistic commit, not only at the spawn: a blocked
+        // run must not leave a run list on screen that was never written
+        // and that nothing is going to roll back (the rollback rides on a
+        // finished run, and there will not be one).
+        if self.mutations_blocked() {
+            return;
+        }
         if let ManifestOp::ScheduleSet { systems, .. } = &op {
             self.schedule_order = systems.clone();
             self.order_rollback = None;
@@ -1133,6 +1256,17 @@ impl EmeraldPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // **The version lock's one guarantee.** The two callers check it
+        // too, each for its own reason (no pointless confirm, no orphaned
+        // optimistic list), but this is the check that makes "a mutation
+        // never runs against a mismatched CLI" true rather than merely
+        // likely: every `emd` this panel spawns passes through here, so a
+        // future op cannot be added that bypasses the gate. Same rule the
+        // draft validation follows -- the gate is on the path to the
+        // spawn, not only on the button.
+        if self.mutations_blocked() {
+            return;
+        }
         let request = EmdRequest::emd(project_dir, args);
         self.run_state = RunState::Running {
             command: request.command_line(),
@@ -1175,9 +1309,17 @@ impl EmeraldPanel {
     ///
     /// `verify_emd_result` runs first, on every outcome: a trailer whose
     /// own `emd` version is not the one this build negotiated downgrades
-    /// the run to a failure rather than being trusted (Task E4 turns the
-    /// same observation into the lock banner; this is the enforcement half
-    /// and it belongs on the mutation path, which is what it protects).
+    /// the run to a failure rather than being trusted. That same
+    /// observation also updates [`EmeraldPanel::lock`], which raises the
+    /// banner and gates every further mutation -- the pre-flight and
+    /// post-run halves of the lock, meeting here.
+    ///
+    /// **The two halves compare versions the same way**, which they do not
+    /// do by default: `verify_emd_result` is exact string equality while
+    /// worldlib's `compare_lock` is prefix-tolerant, and [`lock::lock_error`]
+    /// exists to reconcile them (see [`lock`]'s module doc). Without that,
+    /// a `0.2.0-rc1` build would sail through the gate and then land here
+    /// on every single run.
     fn finish_run(
         &mut self,
         pending: PendingRun,
@@ -1195,12 +1337,25 @@ impl EmeraldPanel {
         // drifted binary is not a compiler verdict, so it is a plain
         // failure. (E4 owns the banner; this is only which state the
         // mutation path lands in.)
-        let version_mismatch = outcome
+        let drifted = outcome
             .result
             .as_ref()
             .and_then(|r| r.get("emd"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|got| got != EXPECTED_EMD_VERSION);
+            .filter(|got| *got != EXPECTED_EMD_VERSION)
+            .map(str::to_string);
+        let version_mismatch = drifted.is_some();
+        // **The mid-run drift check.** The trailer is a first-hand sighting
+        // of the binary that just ran, so it updates the lock immediately
+        // rather than waiting for the next poll tick: the banner is up, and
+        // every further mutation is gated, by the time the user reads why
+        // this one failed. No second `emd version` round trip is needed --
+        // the version is right there in the trailer. (The poll still
+        // re-checks on its own schedule; a swapped binary has a new mtime,
+        // so the probe will confirm or correct this within one interval.)
+        if let Some(actual) = drifted {
+            self.lock = LockCheck::Reached(actual);
+        }
         let outcome = verify_emd_result(outcome, EXPECTED_EMD_VERSION);
         if !outcome.ok {
             let message = emd_error_message(&outcome);
@@ -1470,7 +1625,7 @@ impl EmeraldPanel {
         };
         let draft = self.draft(cx).unwrap_or_else(|| GenDraft::new(form.kind));
         let error = draft.error();
-        let submittable = error.is_none() && !self.running();
+        let submittable = error.is_none() && !self.mutations_blocked();
 
         let mut col = v_flex()
             .gap_1()
@@ -1635,6 +1790,51 @@ impl EmeraldPanel {
         )
     }
 
+    /// The version-lock banner: nothing at all when the installed `emd` is
+    /// the expected one, and otherwise the line
+    /// [`ggo_worldlib::emerald::EmdError`] wrote for this exact drift, plus
+    /// (when there is one) the raw spawn error under it and this fork's
+    /// `GGO_EMD` hint.
+    ///
+    /// Rendered ABOVE the form and the browser rather than beside the run
+    /// state, because it is not about a run: it explains why the controls
+    /// below it are disabled, so it has to be readable before anything is
+    /// clicked. Muted while the first check is in flight, `Warning`
+    /// once there is a real mismatch to report -- amber, not red, for the
+    /// same reason a revert is: nothing is broken, something is out of
+    /// step, and the line says which way.
+    fn render_lock_banner(&self) -> Option<gpui::AnyElement> {
+        let message = lock::lock_message(&self.lock)?;
+        let checking = self.lock == LockCheck::Unchecked;
+        let mut col =
+            v_flex()
+                .gap_0p5()
+                .p_1()
+                .child(
+                    Label::new(message)
+                        .size(LabelSize::Small)
+                        .color(if checking {
+                            Color::Muted
+                        } else {
+                            Color::Warning
+                        }),
+                );
+        if !checking {
+            col = col
+                .children(lock::lock_detail(&self.lock).map(|detail| {
+                    Label::new(detail)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                }))
+                .child(
+                    Label::new(lock::emd_bin_hint())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+        }
+        Some(col.into_any_element())
+    }
+
     // ------------------------------------------------- the manifest browser
 
     /// The three-way tab row.
@@ -1662,7 +1862,7 @@ impl EmeraldPanel {
         let selected = self.selected.as_deref() == Some(name);
         let for_click = name.to_string();
         let for_remove = name.to_string();
-        let running = self.running();
+        let blocked = self.mutations_blocked();
         v_flex()
             .child(
                 h_flex()
@@ -1687,7 +1887,7 @@ impl EmeraldPanel {
                     .child(
                         IconButton::new(("ggo-emerald-rm", ix), IconName::Trash)
                             .icon_size(IconSize::XSmall)
-                            .disabled(running)
+                            .disabled(blocked)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.request_remove(&for_remove, window, cx)
                             })),
@@ -1708,7 +1908,7 @@ impl EmeraldPanel {
         let Some(entry) = self.manifests.component(name) else {
             return div().into_any_element();
         };
-        let running = self.running();
+        let blocked = self.mutations_blocked();
         let mut col = v_flex().gap_0p5().pl_2();
         for (ix, field) in entry.fields.iter().enumerate() {
             let field_name = field.name.clone();
@@ -1726,7 +1926,7 @@ impl EmeraldPanel {
                     .child(
                         IconButton::new(("ggo-emerald-field-remove", ix), IconName::Trash)
                             .icon_size(IconSize::XSmall)
-                            .disabled(running)
+                            .disabled(blocked)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.request_field_remove(&field_name, window, cx)
                             })),
@@ -1745,7 +1945,7 @@ impl EmeraldPanel {
             col = col.child(
                 form.child(
                     Button::new("ggo-emerald-field-commit", "Add")
-                        .disabled(running)
+                        .disabled(blocked)
                         .on_click(
                             cx.listener(|this, _, window, cx| this.submit_field_add(window, cx)),
                         ),
@@ -1825,7 +2025,7 @@ impl EmeraldPanel {
         if self.manifests.schedule(name).is_none() {
             return div().into_any_element();
         }
-        let running = self.running();
+        let blocked = self.mutations_blocked();
         let last = self.schedule_order.len().saturating_sub(1);
         let mut col = v_flex().gap_0p5().pl_2();
         if self.schedule_order.is_empty() {
@@ -1870,7 +2070,7 @@ impl EmeraldPanel {
                     .child(
                         IconButton::new(("ggo-emerald-order-up", ix), IconName::ChevronUp)
                             .icon_size(IconSize::XSmall)
-                            .disabled(running || ix == 0)
+                            .disabled(blocked || ix == 0)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.move_system(ix, true, window, cx)
                             })),
@@ -1878,7 +2078,7 @@ impl EmeraldPanel {
                     .child(
                         IconButton::new(("ggo-emerald-order-down", ix), IconName::ChevronDown)
                             .icon_size(IconSize::XSmall)
-                            .disabled(running || ix >= last)
+                            .disabled(blocked || ix >= last)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.move_system(ix, false, window, cx)
                             })),
@@ -1886,7 +2086,7 @@ impl EmeraldPanel {
                     .child(
                         IconButton::new(("ggo-emerald-order-rm", ix), IconName::Trash)
                             .icon_size(IconSize::XSmall)
-                            .disabled(running)
+                            .disabled(blocked)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.remove_system(ix, window, cx)
                             })),
@@ -1933,7 +2133,7 @@ impl EmeraldPanel {
             SharedString::from(ops::every(cadence)),
             menu,
         )
-        .disabled(self.running())
+        .disabled(self.mutations_blocked())
         .into_any_element()
     }
 
@@ -1972,7 +2172,7 @@ impl EmeraldPanel {
             SharedString::from("+ System"),
             menu,
         )
-        .disabled(self.running())
+        .disabled(self.mutations_blocked())
         .into_any_element()
     }
 
@@ -2035,6 +2235,7 @@ impl EmeraldPanel {
     }
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let banner = self.render_lock_banner();
         let form = match &self.form {
             Some(PanelForm::Generate(_)) => Some(self.render_generate_form(window, cx)),
             Some(PanelForm::Tileset(_)) => Some(self.render_tileset_form(cx)),
@@ -2042,11 +2243,20 @@ impl EmeraldPanel {
         };
         let browser = self.render_browser(window, cx);
         let run_state = self.render_run_state();
+        // The banner is deliberately NOT part of this emptiness test: an
+        // unmanaged project still needs the "right-click a directory" text,
+        // and a lock banner is never a substitute for it -- they answer
+        // different questions and both can be true at once.
         if form.is_none() && browser.is_none() && run_state.is_none() {
-            return self.render_message(EMPTY_MESSAGE.to_string(), cx);
+            return v_flex()
+                .size_full()
+                .children(banner)
+                .child(self.render_message(EMPTY_MESSAGE.to_string(), cx))
+                .into_any_element();
         }
         v_flex()
             .size_full()
+            .children(banner)
             .children(form)
             .children(browser)
             .children(run_state)
@@ -2356,11 +2566,42 @@ mod tests {
         cx.add_empty_window()
     }
 
-    /// The panel alone, pointed at `root` with no workspace.
+    /// A [`BinProbe`] that stands in for "the `emd` binary, unchanged" --
+    /// an arbitrary fixed instant, so a probe of it never differs from
+    /// itself.
+    fn settled_probe() -> BinProbe {
+        BinProbe::At(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+    }
+
+    /// The panel alone, pointed at `root` with no workspace, with a landed
+    /// version-lock check that matches.
+    ///
+    /// **The lock is seeded, not driven.** Every mutation is gated on it
+    /// (`lock::mutations_enabled`), so a fixture that left it `Unchecked`
+    /// would turn every test in this module into a test of the gate. The
+    /// probe is frozen to match `emd_probe`, so the poll loop's first tick
+    /// sees no change and never spends a runner call -- which is what keeps
+    /// the `calls` log in every other test a log of MUTATIONS only.
+    /// [`locked_panel`] is the constructor for the lock's own tests.
     fn lone_panel(
         cx: &mut gpui::VisualTestContext,
         root: &std::path::Path,
         runner: EmdRunner,
+    ) -> Entity<EmeraldPanel> {
+        locked_panel(
+            cx,
+            root,
+            runner,
+            LockCheck::Reached(EXPECTED_EMD_VERSION.to_string()),
+        )
+    }
+
+    /// [`lone_panel`] with the version lock in a chosen state.
+    fn locked_panel(
+        cx: &mut gpui::VisualTestContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+        lock: LockCheck,
     ) -> Entity<EmeraldPanel> {
         let root = root.to_path_buf();
         cx.update(|_window, cx| {
@@ -2368,6 +2609,9 @@ mod tests {
                 let mut panel = EmeraldPanel::new(None, cx);
                 panel.root_override = Some(root);
                 panel.runner = runner;
+                panel.lock = lock;
+                panel.emd_probe = settled_probe();
+                panel.probe = Arc::new(settled_probe);
                 panel
             })
         })
@@ -3604,6 +3848,17 @@ mod tests {
                 .panel::<EmeraldPanel>(cx)
                 .expect("init() adds the panel")
         });
+        // The same seeding [`locked_panel`] does, and here it is not just
+        // tidiness: this panel came from `init()`, so it holds the
+        // PRODUCTION probe and runner, and the first `refresh_root` would
+        // stat `PATH` and spawn a real `emd version` child -- which the
+        // deterministic test scheduler rejects outright ("Detected activity
+        // on thread async-process").
+        panel.update(cx, |panel, _| {
+            panel.lock = LockCheck::Reached(EXPECTED_EMD_VERSION.to_string());
+            panel.emd_probe = settled_probe();
+            panel.probe = Arc::new(settled_probe);
+        });
         (workspace, panel, worktree_id, cx)
     }
 
@@ -3768,6 +4023,437 @@ mod tests {
             ),
             _ => panic!("the form stays open on a refused name"),
         });
+    }
+
+    // ---------------------------------------------------- the version lock
+
+    /// An `emd version` run's transcript, shaped like the real binary's
+    /// (`emd version --json` prints BOTH fields, verified against 0.2.0).
+    fn version_outcome(v: &str) -> EmdRunOutcome {
+        emd_run_outcome(
+            true,
+            &[format!(
+                "emd-json: {{\"emd\":\"{v}\",\"ok\":true,\"version\":\"{v}\"}}"
+            )],
+        )
+    }
+
+    /// A runner that answers `emd version` from a cell the test can change
+    /// mid-flight, and every other call with a plain success.
+    #[allow(clippy::type_complexity)]
+    fn version_runner(
+        initial: &str,
+    ) -> (
+        EmdRunner,
+        Arc<Mutex<Vec<EmdRequest>>>,
+        Arc<Mutex<String>>,
+        Arc<Mutex<String>>,
+    ) {
+        let reported = Arc::new(Mutex::new(initial.to_string()));
+        let trailer = Arc::new(Mutex::new(EXPECTED_EMD_VERSION.to_string()));
+        let (cell, stamp) = (reported.clone(), trailer.clone());
+        let (runner, calls) = fake_runner(move |req| {
+            if req.args.first().is_some_and(|a| a == "version") {
+                version_outcome(&cell.lock().unwrap())
+            } else {
+                emd_run_outcome(
+                    true,
+                    &[format!(
+                        "emd-json: {{\"emd\":\"{}\",\"ok\":true,\"path\":\"/x/done\"}}",
+                        stamp.lock().unwrap()
+                    )],
+                )
+            }
+        });
+        (runner, calls, reported, trailer)
+    }
+
+    /// A [`LockProbe`] whose answer the test controls, counting how often
+    /// it is asked.
+    fn scripted_probe() -> (LockProbe, Arc<Mutex<BinProbe>>, Arc<Mutex<usize>>) {
+        let value = Arc::new(Mutex::new(settled_probe()));
+        let count = Arc::new(Mutex::new(0usize));
+        let (v, c) = (value.clone(), count.clone());
+        let probe: LockProbe = Arc::new(move || {
+            *c.lock().unwrap() += 1;
+            *v.lock().unwrap()
+        });
+        (probe, value, count)
+    }
+
+    /// Fire one of each mutation the panel offers that runs WITHOUT a
+    /// confirm -- a field add, a run-list reorder and a generate -- against
+    /// a panel sitting on `populated_project`, running each to completion
+    /// before the next (the panel refuses a second run mid-flight, which
+    /// would otherwise hide the gate behind that rule instead).
+    ///
+    /// The confirming ops are deliberately left out: an unanswered prompt
+    /// in the allowed case would be the only thing under test, and their
+    /// gate is asserted separately (via `_confirm_task`, which stays `None`
+    /// when the version lock refuses before the prompt).
+    fn fire_every_mutation(panel: &Entity<EmeraldPanel>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_tab(BrowseTab::Components, cx);
+                panel.select_item("HeroUnit", cx);
+                panel.toggle_field_form(window, cx);
+            })
+        });
+        if let Some(field) = panel.read_with(cx, |panel, _| {
+            panel.field_form.as_ref().map(|row| row.name.clone())
+        }) {
+            type_into(&field, "armour", cx);
+        }
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.submit_field_add(window, cx)));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_tab(BrowseTab::Schedules, cx);
+                panel.select_item("update", cx);
+                panel.move_system(1, true, window, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.new_item(GenKind::Component, "manifests", window, cx)
+            })
+        });
+        if let Some(name) = panel.read_with(cx, |panel, _| match &panel.form {
+            Some(PanelForm::Generate(form)) => Some(form.name.clone()),
+            _ => None,
+        }) {
+            type_into(&name, "shield", cx);
+        }
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.submit(window, cx)));
+        cx.run_until_parked();
+    }
+
+    fn banner(panel: &Entity<EmeraldPanel>, cx: &mut gpui::VisualTestContext) -> Option<String> {
+        panel.read_with(cx, |panel, _| {
+            let message = lock::lock_message(&panel.lock);
+            assert_eq!(
+                message.is_some(),
+                panel.render_lock_banner().is_some(),
+                "the rendered banner must appear exactly when there is a line for it"
+            );
+            message
+        })
+    }
+
+    /// The leading arg of every request the fake runner was handed -- the
+    /// `emd` subcommand, which is enough to say WHICH mutations ran.
+    fn subcommands(calls: &Arc<Mutex<Vec<EmdRequest>>>) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.args.first().cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// **Every mismatched lock state gates every mutation, and each one
+    /// says something different about why.** The four `LockStatus` cases
+    /// plus the state that is not a `LockStatus` at all (`Unchecked`), each
+    /// driven through a real panel: the runner is never called, the
+    /// optimistic run list never moves, and a destructive op does not even
+    /// raise its confirm.
+    #[gpui::test]
+    async fn test_a_mismatched_emd_gates_every_mutation_and_says_why(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let mut lines: Vec<String> = Vec::new();
+
+        for lock in [
+            LockCheck::Unchecked,
+            LockCheck::Unreachable("no such file or directory".into()),
+            LockCheck::Reached("0.1.9".into()),
+            LockCheck::Reached("0.3.0".into()),
+            LockCheck::Reached("not-a-version".into()),
+        ] {
+            let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+            let panel = locked_panel(cx, dir.path(), runner, lock.clone());
+            panel.update(cx, |panel, cx| panel.refresh_root(cx));
+            let before = order(&panel, cx);
+
+            fire_every_mutation(&panel, cx);
+            cx.update(|window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.select_tab(BrowseTab::Components, cx);
+                    panel.request_remove("Marker", window, cx);
+                })
+            });
+            cx.run_until_parked();
+
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "{lock:?} must not spawn emd: {:?}",
+                subcommands(&calls)
+            );
+            assert_eq!(
+                order(&panel, cx),
+                before,
+                "{lock:?} must not leave an optimistic run list behind"
+            );
+            assert_eq!(
+                run_state_message(&panel, cx),
+                "idle",
+                "{lock:?} left a run state behind"
+            );
+            panel.read_with(cx, |panel, _| {
+                assert!(
+                    panel._confirm_task.is_none(),
+                    "{lock:?} raised a confirm whose only possible outcome is nothing happening"
+                );
+            });
+
+            let line = banner(&panel, cx).expect("every gated state explains itself");
+            assert!(
+                !lines.contains(&line),
+                "{lock:?} reuses another state's line"
+            );
+            lines.push(line);
+        }
+    }
+
+    /// The other half: an exactly-matching `emd` shows NO banner and lets
+    /// every one of those same mutations through.
+    #[gpui::test]
+    async fn test_a_matching_emd_clears_the_banner_and_allows_mutations(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls, _, _) = version_runner(EXPECTED_EMD_VERSION);
+        let panel = locked_panel(
+            cx,
+            dir.path(),
+            runner,
+            LockCheck::Reached(EXPECTED_EMD_VERSION.to_string()),
+        );
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        assert_eq!(banner(&panel, cx), None, "a matching emd says nothing");
+
+        fire_every_mutation(&panel, cx);
+
+        let spawned = subcommands(&calls);
+        for expected in ["component", "schedule", "generate"] {
+            assert!(
+                spawned.iter().any(|a| a == expected),
+                "a matching lock must let `emd {expected}` run: {spawned:?}"
+            );
+        }
+        assert!(
+            !spawned.iter().any(|a| a == "version"),
+            "a settled probe must not spend a version query: {spawned:?}"
+        );
+    }
+
+    /// **Mid-run drift.** The run's own trailer names an `emd` this build
+    /// did not negotiate: the run is downgraded, the banner goes up
+    /// immediately (no extra `emd version` round trip -- the version was in
+    /// the trailer), and every further mutation is gated from that moment.
+    ///
+    /// The message must read as NEITHER of the other two non-ok outcomes:
+    /// not a revert (nothing was rolled back, and nothing about the
+    /// compiler is true here) and not a plain failure (`emd` did not
+    /// complain about anything).
+    #[gpui::test]
+    async fn test_a_version_change_mid_run_is_caught_and_gates_what_follows(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls, _, trailer) = version_runner(EXPECTED_EMD_VERSION);
+        *trailer.lock().unwrap() = "0.3.0".to_string();
+        let panel = locked_panel(
+            cx,
+            dir.path(),
+            runner,
+            LockCheck::Reached(EXPECTED_EMD_VERSION.to_string()),
+        );
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        assert_eq!(banner(&panel, cx), None);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.select_tab(BrowseTab::Schedules, cx);
+                panel.select_item("update", cx);
+                panel.move_system(1, true, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1, "the edit really ran");
+
+        let message = run_state_message(&panel, cx);
+        assert_eq!(
+            message,
+            "failed emd version changed mid-session (0.3.0 vs 0.2.0) — re-check in Settings"
+        );
+        // Distinct from the other two non-ok outcomes, in state and in
+        // wording -- a swapped binary is not a compiler verdict.
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(&panel.run_state, RunState::Failed { .. }),
+                "not Reverted"
+            );
+        });
+        assert!(!message.contains(REVERTED_PREFIX));
+        assert!(!message.contains("no longer compiles"));
+        assert_ne!(message, "failed no such system", "not a plain emd error");
+
+        // The banner is up NOW, naming the drift the way a pre-flight
+        // CliNew would have, and it did not cost a second `emd version`.
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.lock.clone()),
+            LockCheck::Reached("0.3.0".to_string())
+        );
+        let line = banner(&panel, cx).expect("a drift raises the banner");
+        assert!(
+            line.contains("this IDE build is too old for emd 0.3.0"),
+            "{line}"
+        );
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.args.first().is_some_and(|a| a == "version")),
+            "the trailer already named the version"
+        );
+
+        // ...and from here nothing else runs.
+        let before = calls.lock().unwrap().len();
+        fire_every_mutation(&panel, cx);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            before,
+            "a drifted lock gates every mutation that follows"
+        );
+    }
+
+    /// **The poll is a timer, not a render effect.** The stat count is the
+    /// assertion: rendering the panel any number of times must not move it,
+    /// and a tick that finds the same mtime must not spend an `emd version`
+    /// child either. Only a genuinely changed binary re-queries.
+    #[gpui::test]
+    async fn test_the_lock_poll_stats_on_a_timer_and_never_on_render(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls, reported, _) = version_runner("0.1.9");
+        let (probe, mtime, stats) = scripted_probe();
+        let panel = locked_panel(cx, dir.path(), runner, LockCheck::Unchecked);
+        panel.update(cx, |panel, _| {
+            panel.emd_probe = BinProbe::Unprobed;
+            panel.probe = probe;
+        });
+
+        let versions = |calls: &Arc<Mutex<Vec<EmdRequest>>>| {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.args.first().is_some_and(|a| a == "version"))
+                .count()
+        };
+
+        // The first tick fires as soon as the panel is used, and it does
+        // spend a query -- nothing has been probed yet.
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        cx.run_until_parked();
+        assert_eq!(*stats.lock().unwrap(), 1);
+        assert_eq!(versions(&calls), 1);
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.lock.clone()),
+            LockCheck::Reached("0.1.9".to_string())
+        );
+
+        // Rendering does not poll. Five renders, no stat.
+        for _ in 0..5 {
+            panel.update_in(cx, |panel, window, cx| {
+                let _ = panel.render_body(window, cx);
+            });
+        }
+        cx.run_until_parked();
+        assert_eq!(*stats.lock().unwrap(), 1, "a render must not stat emd");
+        assert_eq!(versions(&calls), 1);
+
+        // A tick with the binary unchanged stats, and stops there.
+        cx.executor().advance_clock(EMD_LOCK_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(*stats.lock().unwrap(), 2, "the timer did fire");
+        assert_eq!(
+            versions(&calls),
+            1,
+            "an unchanged mtime must not spend a child process"
+        );
+
+        // Replace the binary: the next tick re-queries, and the banner
+        // follows the new answer.
+        *mtime.lock().unwrap() = BinProbe::At(std::time::UNIX_EPOCH);
+        *reported.lock().unwrap() = EXPECTED_EMD_VERSION.to_string();
+        cx.executor().advance_clock(EMD_LOCK_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(*stats.lock().unwrap(), 3);
+        assert_eq!(versions(&calls), 2, "a changed mtime re-queries");
+        assert_eq!(banner(&panel, cx), None, "the reinstall cleared the banner");
+
+        // A binary that vanishes is a CHANGE too, and it is queried once
+        // and then left alone -- not re-spawned on every tick forever.
+        *mtime.lock().unwrap() = BinProbe::Unresolved;
+        *reported.lock().unwrap() = "0.3.0".to_string();
+        cx.executor().advance_clock(EMD_LOCK_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(versions(&calls), 3);
+        cx.executor().advance_clock(EMD_LOCK_POLL_INTERVAL * 4);
+        cx.run_until_parked();
+        assert_eq!(
+            versions(&calls),
+            3,
+            "an unresolvable emd is asked once, not once a tick"
+        );
+    }
+
+    /// **The pre-release asymmetry, end to end.** `compare_lock` calls
+    /// `0.2.0-rc1` a match; `verify_emd_result` calls it a drift. This
+    /// panel takes the strict side, so the build is refused BEFORE the run
+    /// -- the alternative being a panel with every control enabled whose
+    /// every run comes back "changed mid-session".
+    #[gpui::test]
+    async fn test_a_pre_release_emd_is_refused_up_front_not_after_every_run(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let cx = empty_window(cx);
+        let (runner, calls, _, trailer) = version_runner("0.2.0-rc1");
+        *trailer.lock().unwrap() = "0.2.0-rc1".to_string();
+        let (probe, mtime, _) = scripted_probe();
+        *mtime.lock().unwrap() = BinProbe::At(std::time::UNIX_EPOCH);
+        let panel = locked_panel(cx, dir.path(), runner, LockCheck::Unchecked);
+        panel.update(cx, |panel, _| {
+            panel.emd_probe = BinProbe::Unprobed;
+            panel.probe = probe;
+        });
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.lock.clone()),
+            LockCheck::Reached("0.2.0-rc1".to_string())
+        );
+        let line = banner(&panel, cx).expect("a suffixed build is refused, and says so");
+        assert!(
+            line.contains("unrecognized version \"0.2.0-rc1\""),
+            "{line}"
+        );
+
+        let before = calls.lock().unwrap().len();
+        fire_every_mutation(&panel, cx);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            before,
+            "nothing may run against a binary whose every result would be downgraded"
+        );
     }
 
     // ------------------------------------------------- cross-panel effects
