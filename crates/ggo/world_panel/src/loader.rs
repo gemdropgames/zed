@@ -1,17 +1,19 @@
 //! Off-thread world loading: enumerate `worlds/**.toml`, read + resolve a
 //! world, and compose every referenced asset into `render::AssetLoads`.
 //!
-//! The compose functions (`compose_sprite_rgba`/`compose_meta_sprite_rgba`/
-//! `compose_map_rgba`) and `resolve_world_value` are ports of ggo-ide's
-//! `pages/world/mod.rs` driver (same stems, same per-target
-//! `Loadable::Error` fallback -- a failed stem renders as a placeholder,
-//! never fails the whole load). The orchestration differs deliberately:
-//! ggo-ide dispatches one iced task per target and re-runs
-//! `dispatch_new_asset_loads` after every message because its doc is
-//! live-editable; this viewer loads a world exactly once per selection, so
-//! [`load_world`] runs the whole pipeline in one background pass (the
-//! panel guards staleness with a load-generation counter instead of
-//! ggo-ide's project epoch).
+//! The compose functions (`compose_sprite_rgba`/`compose_meta_sprite_rgba`
+//! here, `ggo_worldlib::sprites::io::compose_map_rgba` for maps) and
+//! `resolve_world_value` are ports of ggo-ide's `pages/world/mod.rs`
+//! driver (same stems, same per-target `Loadable::Error` fallback -- a
+//! failed stem renders as a placeholder, never fails the whole load). The
+//! orchestration differs deliberately: ggo-ide dispatches one iced task
+//! per target and re-runs `dispatch_new_asset_loads` after every message
+//! because its doc is live-editable; this viewer loads a world exactly
+//! once per selection, so [`load_world`] runs the whole pipeline in one
+//! background pass (the panel guards staleness with a load-generation
+//! counter instead of ggo-ide's project epoch). `compose_map_rgba` itself
+//! lives in `ggo-worldlib` (F5.1 Task M1), not ported here a second time
+//! -- `ggo_map_panel` (M2) shares the exact same fn.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +21,7 @@ use std::path::{Path, PathBuf};
 use ggo_worldlib::backgrounds::{MergedBackground, merge_backgrounds};
 use ggo_worldlib::render::{self, AssetLoads, Loadable, collect_load_targets};
 use ggo_worldlib::schemas::{ComponentSchema, ManifestComponent, all_schemas, manifest_components};
-use ggo_worldlib::sprites::{io, map_doc, palette565, preview};
+use ggo_worldlib::sprites::{io, preview};
 use ggo_worldlib::world_doc::{Background, WorldDocStore, WorldDocWire, WorldState};
 use ggo_worldlib::world_file::read_world;
 use ggo_worldlib::world_files::{self, WORLD_EXT, WorldListing};
@@ -128,12 +130,13 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
     }
     let mut map_loads = AssetLoads::new();
     for stem in map_stems {
-        let load = settle(compose_map_rgba(project_dir, &stem));
+        let load = settle(io::compose_map_rgba(project_dir, &stem).map_err(|e| e.to_string()));
         map_loads.insert(stem, load);
     }
     for bg in &merged {
         if !map_loads.contains_key(&bg.stem) {
-            let load = settle(compose_map_rgba(project_dir, &bg.stem));
+            let load =
+                settle(io::compose_map_rgba(project_dir, &bg.stem).map_err(|e| e.to_string()));
             map_loads.insert(bg.stem.clone(), load);
         }
     }
@@ -184,9 +187,9 @@ pub fn fill_missing_asset_loads(
             .or_insert_with(|| settle(compose_sprite_rgba(project_dir, &stem)));
     }
     for stem in map_stems {
-        map_loads
-            .entry(stem.clone())
-            .or_insert_with(|| settle(compose_map_rgba(project_dir, &stem)));
+        map_loads.entry(stem.clone()).or_insert_with(|| {
+            settle(io::compose_map_rgba(project_dir, &stem).map_err(|e| e.to_string()))
+        });
     }
     for (stem, clip) in meta_targets {
         let key = render::meta_sprite_load_key(&stem, &clip);
@@ -273,34 +276,6 @@ fn compose_meta_sprite_rgba(
         rgba: rgba.into_raw().into(),
         w,
         h,
-    })
-}
-
-/// A map entry's composed image (Tilemap entities and `[[background]]`s
-/// alike) -- ggo-ide's `compose_map_rgba`, verbatim: `open_map` for cells +
-/// tileset binding, `open_tileset` for palette-resolved pixel data,
-/// `compose_map_indices` -> RGBA with `TRANSPARENT_SLOT` drawn transparent.
-fn compose_map_rgba(project_dir: &Path, stem: &str) -> Result<render::RgbaImage, String> {
-    let rel = format!("{stem}.map");
-    let map = io::open_map(project_dir, &rel).map_err(|e| e.to_string())?;
-    let til = io::open_tileset(project_dir, &map.til_path).map_err(|e| e.to_string())?;
-    let (indices, px_w, px_h) =
-        map_doc::compose_map_indices(&map.cells, map.w, map.h, &til.indices, til.tile_count);
-
-    let mut rgba = Vec::with_capacity(indices.len() * 4);
-    for idx in indices {
-        let (r, g, b) = ggo_asset_formats::pixel::rgb888(til.palette[idx as usize]);
-        let alpha = if idx as usize == palette565::TRANSPARENT_SLOT {
-            0
-        } else {
-            255
-        };
-        rgba.extend_from_slice(&[r, g, b, alpha]);
-    }
-    Ok(render::RgbaImage {
-        rgba: rgba.into(),
-        w: px_w as u32,
-        h: px_h as u32,
     })
 }
 
