@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | Emulate this world | a world `.toml` | save if dirty, `emd pack-ggo --world <stem>`, run the result |
 //! | Re-run (perf) | a `.cart` | run it again; when the perf ingest lands, focus the charts panel |
-//! | Run hardware diagnostics | anywhere | `ggo-diag --launch` -- the built-in GGO Diagnostic Cart |
+//! | Run hardware diagnostics | any directory | `ggo-diag --launch` -- the built-in GGO Diagnostic Cart |
 //!
 //! Everything in this module is either a pure function (argv, predicates,
 //! prerequisite checks -- all unit-tested without spawning anything) or a
@@ -334,10 +334,15 @@ pub fn diag_env(near: Option<&Path>) -> DiagEnv {
 /// runs carts off the primary worktree's `abs_path` with `std::fs` and
 /// spawns children on this machine.
 ///
-/// "Run hardware diagnostics" is contributed for EVERY path in that
-/// worktree -- file or directory, project or not -- because it needs no
-/// project and the fork has no other surface to hang it on (the panel's
-/// own toolbar is the cart transport). That is the spec's "anywhere".
+/// "Run hardware diagnostics" is gated to directories (`is_dir`), not to a
+/// project: it needs no `emerald.toml` above the click, only a GGO repo
+/// checkout and a board, both checked inside the handler (see
+/// [`diag_env`]). That "no project needed" is the spec's "anywhere" --
+/// it is not offered on every individual path, which would put a second
+/// always-present line on every file's menu; a right-click on a directory
+/// (including the worktree root) is the fork's stand-in surface, since the
+/// panel's own toolbar is the cart transport, not a project-wide action
+/// bar.
 pub fn contribute_run_menu(
     workspace: &mut Workspace,
     path: &ProjectPath,

@@ -43,7 +43,7 @@ ggo-ide is still in-tree and still the only place the "dropped" and several
 | Single window, settings DB opened before first paint | Zed window; `~/.ggo/ggo_ide.db` opened lazily and only by the charts/emu panels | ✓ | |
 | App-wide active project + persistence + fan-out | Workspace's first visible worktree root | partial | Panels read the open folder. No in-app project switch, no persisted "active project", no per-panel project guard view. |
 | Nav side-effects (leave Assets → pause timeline; leave Emulator → pause; enter World → rescan) | Panels re-enumerate on `set_active`; the sprite panel pauses playback on edit | partial | Docks have no page-crossing event. A cart keeps running when the emu dock is collapsed; only focus loss stops input reaching it. |
-| Cross-page handoffs (Reports Re-run, World Emulate, inspector "→" sprite, Emulator View in Reports) | emu → charts "View in Reports" only | partial | Only that one hop shipped; the other three are listed separately below. |
+| Cross-page handoffs (Reports Re-run, World Emulate, inspector "→" sprite, Emulator View in Reports) | emu → charts "View in Reports"; World → Emulator on "Emulate this world" (F5.2/S4); emu → charts on Re-run's ingest-complete (F5.2/S4) | partial | Three of the four hops now ship. Only inspector "→" sprite (MetaSprite `stem` goto) is still unwired — see §4. |
 | Native OS confirm dialogs with per-dialog action binding | none | dropped | The destructive operations that used them (world delete, sprite delete, file delete, project remove) are not in the fork. |
 | Window-close unsaved-changes guard naming dirty pages | `ggo_common::prepare_to_close_dirty`, wired through each panel's `Panel::prepare_to_close` | ✓ | |
 | Typing guard (single-letter hotkeys suppressed while a text field is live) | gpui focus contexts (`not_editing` predicate on the sprite panel; emu pad keys are focus-scoped) | ✓ | Real focus/blur exists here, so the Iced workaround is unnecessary. |
@@ -70,7 +70,7 @@ covered by the fork at all.
 |---|---|---|---|
 | Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; clicking a `.spr`/`.til`/`.cart`/world `.toml` there routes directly into its GGO panel (F4) | partial | Generic file search, not asset-typed sections with extension badges. The in-panel pickers this row used to credit are all gone as of X4 — see the Assets/World/cart-library rows and Known deferrals for what explorer-driven routing does and doesn't cover. |
 | Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | Project-panel context menu: **New Sprite…** / **New Metasprite…** on an assets dir, **Duplicate Sprite** + **Rename Sprite…** + **Delete Sprite** on a `.spr`, contributed by `ggo_sprite_panel` (F5.0 + F5.2) | ✓ | All four. Duplicate goes through worldlib `open_sprite`->`save_sprite` from the LIVE document, so the copy gets its own `.til`/`.pal` and carries unsaved edits; Delete confirms, names unsaved edits, and unlinks the `.spr` only (the sidecars are shareable). **New** creates a blank `.spr` bound to a tileset picked in the panel (Sprite seeds one frame, Metasprite seeds frames plus a first clip); the binding is chosen rather than guessed, because a `.spr` — unlike a `.map` — has no legal unbound form (`open_sprite` hard-errors on an unreadable `.til`/`.pal`) and its pool IS that `.til`. That makes New subject to the same pool-sharing hazard Duplicate un-shares to avoid, so the form **defaults to a tileset no sprite owns yet**, labels the ones that are owned (`tiles/x.til (used by y.spr)`) and warns inline when one is picked deliberately — binding to a sprite-owned `.til` is legal and offered, but it makes every later save of either sprite rewrite the other's tiles *and* palette and blocks Dedup / Palette-remap on both. Divergence from ggo-ide, whose New Sprite wrote a PRIVATE trio: that needs a pixel editor to grow the one blank tile it starts with, and the fork has none by design. **Rename** moves the `.spr` only, within its directory: the `.til`/`.pal` rels are assets-root-relative, so they survive untouched, and the sidecars stay shareable. Divergence to note: ggo-ide's duplicate was a raw byte copy that made the two sprites pool-sharing siblings (`pages/assets/sprite.rs:626-631`); ours un-shares, because a shared pool makes `DocOp::Dedup`/`DocOp::PaletteRemap` return `DocError::PoolShared` on BOTH sprites (`sprite_doc.rs:627,:677`) — private sidecars are the only variant where either stays dedupable. The cost is real: `save_sprite` writes the full pool to the copy's `.til`, so duplicating out of a large shared tileset gives the copy a complete private pool, a cart-size multiplier per duplicate. |
-| New tileset / new map | none | deferred | Same — no CLI, no panel. |
+| New tileset / new map | `ggo_map_panel`'s **New Map…** (F5.1/M2, on an assets dir) and `ggo_emerald_panel`'s **New Tileset…** (F5.2/S3, see §5) | ✓ | Two different panels/entries, not one — New Tileset is an emerald-panel form (blank `.til`/`.pal`), so it is also listed in §5's table; New Map is `ggo_map_panel`'s own affordance (blank, unbound `.map`). Both create blank assets rather than importing. |
 | Files tree (create folder, delete file/dir, extension badges) | Zed project panel | partial | Create/delete/rename exist; the GGO extension badges do not. |
 | **Pixel editor**: 14 tools, brush sizes, mirror, pixel-perfect, shapes, marquee/lasso/wand, floating-selection move/flip/rotate, eyedropper, zoom/pan, per-editor undo | none | dropped | Explicit spec scope call. Pixel authoring is an external editor plus an import path. |
 | **Palette panel**: RGB565 16-slot editor, draft picker (5/6/5 sliders, 565 + 888 hex, quantized preview), swap / sort / ramp, shared-palette warnings | none | dropped | Part of the pixel-editor scope not taken. |
@@ -92,7 +92,7 @@ covered by the fork at all.
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | World file picker (list + open) | Zed project panel (browse `worlds/**/*.toml`) + click-to-open, routed by `ggo_world_panel::intercept_world_open` into the docked panel | ✓ | Explorer-driven since F4 — the in-panel picker was removed; list+open is now the project panel plus the interceptor-routed open, which also runs `prepare_to_close_dirty` before switching documents. |
-| "+ New world" (snake_case validated, overwrite confirm) | none | deferred | Carried on the F2 gap list. worldlib can `write_world`; the panel has no create affordance. |
+| "+ New world" (snake_case validated, overwrite confirm) | Project-panel context menu: **New World…**, contributed by `ggo_emerald_panel` (F5.2/S3) | ✓ | Right-click the project's `assets/` (or anything under it) → New World…; name validated snake_case with the same `valid_item_name` the component/system forms use, written through `emd generate world`. One divergence: a name collision REFUSES ("already exists") rather than offering to overwrite — `emd generate` has no overwrite flag, so there is nothing to confirm into. |
 | Delete world (confirm + rescan) | Project-panel context menu: **Delete World**, contributed by `ggo_world_panel` (F5.0) | ✓ | Confirms (naming the world by stem AND file, and saying so when the open document has unsaved edits), unlinks, clears the panel if that world was open, and re-enumerates so `+ Instance` stops offering it. One thing ggo-ide didn't do either: `[[instance]]` references to the deleted world are not chased down, so they now dangle — see the Known-deferrals note about `loader.rs`'s unrendered `node["error"]`. |
 | Canvas rendering: sprites, metasprites (per-clip), tilemaps, text, rect fills, transform markers, instance gizmos, merged backgrounds, error placeholders, selection outline | world panel `canvas` + `loader` (worldlib compose / `build_draw_list`) | ✓ | |
 | Click-select + drag-move with one undo entry per gesture | ✓ | ✓ | One deliberate divergence: empty-space left-drag deselects instead of panning; pan is middle-drag. |
@@ -107,7 +107,7 @@ covered by the fork at all.
 | MetaSprite `stem` "→" goto sprite on Assets | none | deferred | Cross-panel navigation (world → sprite panel) is unwired; on the F2 gap list. |
 | Background merging from instances (priority, first-claimant, drawn at origin) | ✓ (worldlib `backgrounds::MergedBackground`) | ✓ | |
 | Undo / redo / dirty / Save (`WorldDocStore` + `write_world`) | ✓ | ✓ | |
-| "Emulate" (save, full-system build with this boot world, jump to Emulator) | `emd: run` task, or the emu panel on an already-packed `.cart` | deferred | On the F2 gap list. The panel cannot bake a boot world, and no task takes one. |
+| "Emulate" (save, full-system build with this boot world, jump to Emulator) | Project-panel context menu: **Emulate this world (cart)**, contributed by `ggo_emu_panel` (F5.2/S4) | partial | Save-if-dirty → `emd pack-ggo --world <stem>` → run in the emu panel, reusing its existing run path (dock focused). CART mode, not ggo-ide's full-system boot (`emubuild::build_full_system_with_world`, GemOS image, FAT card) — see the Known-deferrals entry below for the three concrete losses (no OS boot, different perf profile, no run-kind column yet). |
 | Arrow-key nudge (1 px / 16 px with Shift) | none | deferred | Not ported; drag + snap is the only placement path. |
 | Confirm dialogs (delete world, overwrite, remove instance, remove Transform from a visual entity) | none | dropped | See §1 — no confirm system in the fork. |
 
@@ -122,7 +122,7 @@ mutation/reorder ops are F5.3's.
 |---|---|---|---|
 | Project tab: structured `emerald.toml` viewer | Open `emerald.toml` in the editor | partial | Text, not a structured section/entry view. |
 | Components / Systems / Schedules browsing (module groups, list → detail) | Open `manifests/*.toml` in the editor | partial | Text only. No list/detail dashboard, no field counts, no "used by schedules". |
-| Create component/system/schedule (validated forms → `emd generate …`) | emerald panel forms, opened from the project panel's context menu | ✓ | Right-click the project root or `manifests/` → New Component… / New System… / New Schedule…; the form also generates resources, modules and worlds via its kind selector. Validated with worldlib's own `valid_item_name`/`valid_field_spec` before spawning, so an invalid name never reaches `emd`, and a component's PascalCase "stored as" preview is shown exactly where ggo-ide showed it. A new component refreshes the world panel's inspector schemas in place; a new world opens in the world panel. |
+| Create component/system/schedule (validated forms → `emd generate …`) | emerald panel forms, opened from the project panel's context menu | ✓ | Right-click the project root or `manifests/` → New Component… / New System… / New Schedule…; the form also generates resources, modules and worlds via its kind selector. Validated with worldlib's own `valid_item_name`/`valid_field_spec` before spawning, so an invalid name never reaches `emd`, and a component's PascalCase "stored as" preview is shown exactly where ggo-ide showed it. A new component refreshes the world panel's inspector schemas in place; a new world opens in the world panel. **Resource and Module have the same form** (reachable via the kind selector inside any of the three menu entries) **but no menu entry of their own** — a six-entry directory menu appended to upstream's own Duplicate/Rename/Delete was judged worse than a selector (see the contributor's own doc comment). |
 | New tileset (blank `.til`/`.pal` pair) | emerald panel form, on any assets directory | ✓ | Not a ggo-ide feature and not an `emd` verb — added here because a `.til` is a prerequisite for New Sprite / a bound `.map`, and the import panel needs a source PNG. The palette is worldlib's own `.pal`-less fallback, read back rather than restated. |
 | Remove component/system/schedule, add/remove field (with cascade-aware and compiler-check confirms) | `emd` in the terminal | deferred | Same. The "Reverted" compiler-rollback surfacing is lost with it. |
 | Schedule ordered run-list editor (reorder, cadence, add/remove, optimistic commit) | `emd schedule set` by hand | deferred | Richest interaction in ggo-ide; nothing ported. |
@@ -151,7 +151,7 @@ mutation/reorder ops are F5.3's.
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | Carts → Runs → Detail drill-down with slim back headers | `ggo_charts_panel`: flat run picker (cart · label · started_at) → detail with a Back button | partial | The cart level is collapsed away; there is no per-cart grouping or last-run relative time. |
-| Per-cart "Re-run" | none | deferred | Needs the charts → emu handoff (see §6). |
+| Per-cart "Re-run" | Project-panel context menu: **Re-run (perf)** on a `.cart`, contributed by `ggo_emu_panel` (F5.2/S4) | ✓ | Different surface than ggo-ide's (a context-menu entry on the cart file, not a button inside the Reports page), but the capability is complete end to end: re-runs the cart through the panel's own run path and, once perf ingest lands, focuses the charts panel and opens that run — the reverse hop of the "View in Reports" one §1's cross-page-handoffs row already credited. |
 | Run detail header + config line (budget, wire-model constants, wire-wait tag) | Run title only | deferred | C2's not-ported list. |
 | "Copy for agent" text export | none | deferred | Same list. |
 | Failed-asset-loads table, Panics table | none | deferred | Same list. |
@@ -170,7 +170,7 @@ mutation/reorder ops are F5.3's.
 |---|---|---|---|
 | Serial port picker (scan `/dev/serial/by-id`, auto-select a lone port, refresh) | `GGO_TTY` env var read by the tasks | partial | No discovery UI; you set the variable or accept `/dev/ttyUSB0`. |
 | Flash `.ggo` via `ggo-diag --provision --launch` (file picker + magic check, Full-run/Skip-PnR toggle, collect seconds, baud) | `ulx3s: flash bitstream (fujprog)` task | partial | The task flashes a **bitstream** with `fujprog`, which is the canonical `scripts/fpga-test` invocation — it is not the `ggo-diag` provision+launch flow with its options. |
-| "Run hardware diagnostics" (built-in diagnostic cart, no project needed) | none | deferred | No task wraps `ggo-diag`; T1 stayed inside verbs it could verify. |
+| "Run hardware diagnostics" (built-in diagnostic cart, no project needed) | Project-panel context menu: **Run hardware diagnostics**, contributed by `ggo_emu_panel` (F5.2/S4) | partial | `ggo-diag --tty <port> --skip-pnr --launch`, gated to a right-click on a directory (any directory, not tied to an emerald project — the spec's "no project needed"). Needs a GGO repo checkout (`GGO_REPO`) and a board; missing either names exactly what's missing on the status row and spawns nothing. One-shot, not streamed, no cancel, no baud/collect-seconds/port picker — ggo-ide's Device page is the model for all three, unbuilt here. |
 | Live run log with stick-to-bottom autoscroll, Cancel, PASS/FAIL/TIMEOUT verdict | Terminal panel output; Ctrl-C | partial | Raw stdout with no verdict parsing and no state machine. |
 | History rail (clone `~/.ggo/diag.db`, 50 recent runs, per-run log viewer) | none | deferred | Nothing clones or reads `diag.db` in the fork. |
 | UART monitor | `ulx3s: UART monitor` task (mirrors `fpga-test`'s `configure_tty`, documents the FT231X re-enum gap) | ✓ | |
@@ -215,9 +215,9 @@ mutation/reorder ops are F5.3's.
 
 | Status | Rows |
 |---|---|
-| ✓ | 35 |
-| partial | 31 |
-| deferred | 27 |
+| ✓ | 38 |
+| partial | 33 |
+| deferred | 22 |
 | dropped | 11 |
 | **total** | **104** |
 
@@ -257,6 +257,21 @@ partial when `ggo_import_panel` shipped (Task I2), tileset-only. Before F5.1
 (the last *tallied* snapshot, i.e. G2's numbers above, which by the time of
 this wrap no longer matched the table): ✓ 32 / partial 30 / deferred 29 /
 dropped 12. After: ✓ 32 / partial 32 / deferred 28 / dropped 11.)
+
+(F5.2 wrap/S5: **five rows moved**, closing out the phase. "New tileset / new
+map" (§3) deferred → ✓, now that both New Tileset… (S3) and New Map… (F5.1)
+exist. "+ New world" (§4) deferred → ✓ via `ggo_emerald_panel`'s New World…
+(S3). "Emulate" (§4) deferred → partial via "Emulate this world (cart)"
+(S4) — cart mode, not full-system boot. Per-cart "Re-run" (§7) deferred → ✓
+via the "Re-run (perf)" context-menu entry (S4) — a different surface
+(context menu, not a Reports-page button) but the same capability end to
+end. "Run hardware diagnostics" (§8) deferred → partial via the S4 context-menu
+entry — one-shot, no streaming/cancel/options. "Create component/system/
+schedule" (§5) and "Sprite rail ops" (§3) were already ✓ from S2/S3 and are
+unchanged here; their honesty notes (Resource/Module have forms but no menu
+entry) were tightened without a status change. Before this wrap: ✓ 35 /
+partial 31 / deferred 27 / dropped 11, total 104. After: ✓ 38 / partial 33 /
+deferred 22 / dropped 11, total 104.)
 
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
@@ -382,12 +397,20 @@ guards and follow-ups that someone has to pick up:
      with ggo-ide's.
   3. **Both kinds land in the same `runs` table, with no mode column**
      (`emu_panel/src/ingest.rs` keys on the cart path; the `label` column is
-     the rel path). The charts panel's historic overlay will happily overlay a
-     cart-mode run on a full-system one for the same game. Until a mode column
-     exists, the only discriminator is the `label`: `None` = ggo-ide,
-     `target/ggo-emulate/*.ggo` = this entry, anything else = a cart clicked in
-     the fork's explorer. **F5.3 input**: add an explicit run-kind column
-     rather than leaning on that convention.
+     the rel path). There is no historic overlay yet to conflate them on one
+     chart (`chart_geom.rs`'s own doc: "no historic overlay ... the panel has
+     no prior-run picker yet") — the real risk today is in the run **picker
+     list** (C1): a cart-mode run and a full-system run of the same game
+     share one `cart_name`, so two rows can read as just `"demo"` next to
+     each other with nothing marking which is which except an opaque
+     free-text `label`, and ggo-ide's own runs leave `label` unset entirely.
+     Until a mode column exists, the only discriminator is `label`: `None` =
+     ggo-ide, `target/ggo-emulate/*.ggo` = this entry, anything else = a cart
+     clicked in the fork's explorer — none of that is surfaced in the picker
+     UI today. **F5.3 input**: add an explicit run-kind column (and show it
+     in the picker) rather than leaning on that convention; the same column
+     would also be what a future historic overlay needs to avoid mixing
+     modes once a prior-run picker exists.
 - **Hardware diagnostics is one-shot, with no streaming, cancel or options
   (F5.2/S4).** The "Run hardware diagnostics" entry spawns
   `ggo-diag --tty <port> --skip-pnr --launch` and shows the transcript when it
