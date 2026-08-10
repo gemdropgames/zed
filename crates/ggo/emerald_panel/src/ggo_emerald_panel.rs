@@ -1793,8 +1793,9 @@ impl EmeraldPanel {
     /// The version-lock banner: nothing at all when the installed `emd` is
     /// the expected one, and otherwise the line
     /// [`ggo_worldlib::emerald::EmdError`] wrote for this exact drift, plus
-    /// (when there is one) the raw spawn error under it and this fork's
-    /// `GGO_EMD` hint.
+    /// (when there is one) the raw spawn error under it, plus this fork's
+    /// `GGO_EMD` hint when the drift is about WHERE `emd` was looked for
+    /// rather than which version answered.
     ///
     /// Rendered ABOVE the form and the browser rather than beside the run
     /// state, because it is not about a run: it explains why the controls
@@ -1819,19 +1820,19 @@ impl EmeraldPanel {
                             Color::Warning
                         }),
                 );
-        if !checking {
-            col = col
-                .children(lock::lock_detail(&self.lock).map(|detail| {
-                    Label::new(detail)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                }))
-                .child(
-                    Label::new(lock::emd_bin_hint())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
-        }
+        // Both are already `None` while the first check is in flight, and
+        // the hint is `None` for a CLI-version drift too -- see
+        // [`lock::lock_hint`]. `checking` only decides the colour.
+        col = col
+            .children(lock::lock_detail(&self.lock).map(|detail| {
+                Label::new(detail)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+            }))
+            .children(
+                lock::lock_hint(&self.lock)
+                    .map(|hint| Label::new(hint).size(LabelSize::XSmall).color(Color::Muted)),
+            );
         Some(col.into_any_element())
     }
 

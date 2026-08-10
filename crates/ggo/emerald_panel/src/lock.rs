@@ -13,10 +13,9 @@
 //! `CliNew` and both halves of `Missing` (`emd was not found` vs `emd
 //! reported an unrecognized version "X"`, off the `actual: Option<String>`
 //! it carries), and those phrasings are pinned by that crate's own tests.
-//! This module decides WHICH of them applies and adds exactly one sentence
-//! of its own, [`emd_bin_hint`], because worldlib's text ends in "set
-//! emd_path in Settings" and this fork has no Settings page -- see that
-//! constant's doc.
+//! This module decides WHICH of them applies and adds at most one sentence
+//! of its own, [`emd_bin_hint`], naming the override this fork actually has
+//! -- and only where "where emd is found" is the remedy ([`lock_hint`]).
 //!
 //! ## The one asymmetry, and what this module does about it
 //!
@@ -91,20 +90,48 @@ pub fn version_args() -> Vec<String> {
     vec!["version".to_string()]
 }
 
-/// The fork-local addendum to worldlib's mismatch text.
+/// The fork-local addendum to worldlib's mismatch text: where THIS host
+/// looks for `emd`.
 ///
-/// Every `Missing` phrasing from `EmdError::Display` ends in "set emd_path
-/// in Settings, or install emd." -- correct in ggo-ide, which has a
-/// Settings page with exactly that field, and wrong here. Rather than fork
-/// four phrasings to fix one clause, the worldlib text is shown verbatim
-/// and this single sentence is appended beneath it, naming the override
-/// this fork actually has (`ggo_common::EMD_BIN_ENV`).
+/// Worldlib's `Missing` phrasing points at "your emd path override or
+/// PATH" and deliberately names no host's UI (it used to end "set emd_path
+/// in Settings", ggo-ide's page, which this fork does not have -- fixed in
+/// worldlib rather than papered over here, so the banner no longer reads as
+/// an instruction followed by its own retraction). Naming the override is
+/// this host's job, and this is it: `ggo_common::EMD_BIN_ENV`.
 pub fn emd_bin_hint() -> String {
     format!(
-        "This fork has no Settings page: point {} at an emd {EXPECTED_EMD_VERSION} binary, \
-         or put one on PATH.",
+        "Point {} at an emd {EXPECTED_EMD_VERSION} binary, or put one on PATH.",
         ggo_common::EMD_BIN_ENV
     )
+}
+
+/// [`emd_bin_hint`], but only for the states it actually answers.
+///
+/// It was once appended to every non-`Unchecked` state, which made it a non
+/// sequitur under `CliOld`/`CliNew`: those are not lookup failures, the
+/// installed binary was found and identified, and worldlib's line for them
+/// already names the remedy (update the CLI / update the IDE). Telling a
+/// user with a working `emd 0.1.0` to put one on PATH answers a question
+/// they did not ask.
+///
+/// So: the two states where the binary in hand is the wrong one or is not
+/// there at all -- `Unreachable`, and a `Reached` that resolved to
+/// `Missing` (no parseable version, including this module's strict
+/// pre-release rejection).
+pub fn lock_hint(check: &LockCheck) -> Option<String> {
+    let names_the_binary = match check {
+        LockCheck::Unchecked => false,
+        LockCheck::Unreachable(_) => true,
+        LockCheck::Reached(actual) => matches!(
+            lock_error(Some(actual)),
+            Some(EmdError::VersionMismatch {
+                status: LockStatus::Missing,
+                ..
+            })
+        ),
+    };
+    names_the_binary.then(emd_bin_hint)
 }
 
 /// The panel's record of the last `emd version` probe.
@@ -516,6 +543,41 @@ mod tests {
         let hint = emd_bin_hint();
         assert!(hint.contains(ggo_common::EMD_BIN_ENV), "{hint}");
         assert!(hint.contains(EXPECTED_EMD_VERSION), "{hint}");
+        assert!(!hint.contains("Settings"), "{hint}");
+        // ...and worldlib no longer names one either, so the banner is one
+        // instruction, not an instruction and its retraction.
+        for actual in [None, Some("nope"), Some("0.1.9"), Some("0.3.0")] {
+            let msg = check_version(actual).unwrap_err().to_string();
+            assert!(!msg.contains("Settings"), "{msg}");
+        }
+    }
+
+    /// The hint answers "where is emd", so it appears only where that is
+    /// the question: a binary that could not be run, or one that ran and
+    /// reported no usable version. A `CliOld`/`CliNew` drift found the
+    /// binary fine and its own line already says what to update.
+    #[test]
+    fn the_bin_hint_is_attached_to_lookup_failures_only() {
+        for check in [
+            LockCheck::Unreachable("no such file".into()),
+            LockCheck::Reached("not-a-version".into()),
+            LockCheck::Reached(String::new()),
+            LockCheck::Reached("0.2.0-rc1".into()),
+        ] {
+            assert_eq!(
+                lock_hint(&check).as_deref(),
+                Some(emd_bin_hint().as_str()),
+                "{check:?} must carry the hint"
+            );
+        }
+        for check in [
+            LockCheck::Unchecked,
+            LockCheck::Reached("0.1.9".into()),
+            LockCheck::Reached("0.3.0".into()),
+            LockCheck::Reached(EXPECTED_EMD_VERSION.to_string()),
+        ] {
+            assert_eq!(lock_hint(&check), None, "{check:?} must not carry the hint");
+        }
     }
 
     #[test]

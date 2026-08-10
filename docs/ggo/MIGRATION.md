@@ -2,7 +2,10 @@
 
 Date: 2026-08-08 (end of F3), rows amended 2026-08-09 (end of F4: explorer-driven
 panel routing + the read-only tileset viewer; then X4, which removed the last
-in-panel file picker — the emulator's `.cart` dropdown). Fork branch `ggo`.
+in-panel file picker — the emulator's `.cart` dropdown), and 2026-08-10 (end of
+F5.3: the emerald mutation/reorder ops, the emd version lock, and the four
+carried panel deferrals — onion skin, world view controls, arrow nudge, goto
+sprite). Fork branch `ggo`.
 
 What this is: a row for **every** user-facing ggo-ide feature, and what — if
 anything — answers it in the fork today. It exists so nobody has to guess
@@ -43,7 +46,7 @@ ggo-ide is still in-tree and still the only place the "dropped" and several
 | Single window, settings DB opened before first paint | Zed window; `~/.ggo/ggo_ide.db` opened lazily and only by the charts/emu panels | ✓ | |
 | App-wide active project + persistence + fan-out | Workspace's first visible worktree root | partial | Panels read the open folder. No in-app project switch, no persisted "active project", no per-panel project guard view. |
 | Nav side-effects (leave Assets → pause timeline; leave Emulator → pause; enter World → rescan) | Panels re-enumerate on `set_active`; the sprite panel pauses playback on edit | partial | Docks have no page-crossing event. A cart keeps running when the emu dock is collapsed; only focus loss stops input reaching it. |
-| Cross-page handoffs (Reports Re-run, World Emulate, inspector "→" sprite, Emulator View in Reports) | emu → charts "View in Reports"; World → Emulator on "Emulate this world" (F5.2/S4); emu → charts on Re-run's ingest-complete (F5.2/S4) | partial | Three of the four hops now ship. Only inspector "→" sprite (MetaSprite `stem` goto) is still unwired — see §4. |
+| Cross-page handoffs (Reports Re-run, World Emulate, inspector "→" sprite, Emulator View in Reports) | emu → charts "View in Reports"; World → Emulator on "Emulate this world" (F5.2/S4); emu → charts on Re-run's ingest-complete (F5.2/S4); world → sprite on the MetaSprite `stem` jump (F5.3/E5) | partial | **All four hops now ship.** Still `partial` for one residual: the World → Emulator hop lands in CART mode, not ggo-ide's full-system boot — see §4's Emulate row and the Known-deferrals entry. |
 | Native OS confirm dialogs with per-dialog action binding | none | dropped | The destructive operations that used them (world delete, sprite delete, file delete, project remove) are not in the fork. |
 | Window-close unsaved-changes guard naming dirty pages | `ggo_common::prepare_to_close_dirty`, wired through each panel's `Panel::prepare_to_close` | ✓ | |
 | Typing guard (single-letter hotkeys suppressed while a text field is live) | gpui focus contexts (`not_editing` predicate on the sprite panel; emu pad keys are focus-scoped) | ✓ | Real focus/blur exists here, so the Iced workaround is unnecessary. |
@@ -76,7 +79,7 @@ covered by the fork at all.
 | **Palette panel**: RGB565 16-slot editor, draft picker (5/6/5 sliders, 565 + 888 hex, quantized preview), swap / sort / ramp, shared-palette warnings | none | dropped | Part of the pixel-editor scope not taken. |
 | **Tile-pool panel** + dedup preview/apply | none | dropped | Same. Dedup still happens implicitly on metasprite save (worldlib's fold-back). |
 | Animation timeline: transport, clip lanes (name/from/to/loop/delete/add), frame strip (select, add, duplicate, delete, move, per-frame ms), playback honouring durations + clip range + loop | `ggo_sprite_panel` | ✓ | |
-| Onion skin (toggle, back/fwd ghost counts, opacity) | none | deferred | The timeline was ported without ghost compositing; no blocker beyond effort. |
+| Onion skin (toggle, back/fwd ghost counts, opacity) | `ggo_sprite_panel` `onion.rs` + a control row under the transport (F5.3/E5) | ✓ | Toggle, back/fwd counts (clamped 0–3), opacity and the `opacity * (1 - (|dist|-1) * 0.3)` falloff are ggo-ide's values; frame selection is worldlib's own `timeline_ops::onion_frames`, not a second copy. Ghosts carry ggo-ide's directional red/blue tint (E5 fast-follow) and paint farthest-first under the live frame. Two deliberate divergences: opacity is a `-`/`+` stepper rather than a slider (`ui` has no slider; same range, same 0.05 step, so the reachable values are identical), and ghosts are suppressed while the transport is playing (ggo-ide stacks them under a moving image, which only smears it). |
 | Preview panel (1:1 live frame, background picker, LCD filter) | sprite panel centre preview | partial | Live composed frame with aspect fit shipped; checker/black/white background picker and the LCD scanline filter did not. |
 | Hardware budget meter (4 traffic-light rows + tooltips) | sprite panel `hw_meter_line` | partial | Same four value/cap pairs from worldlib `sprites::hw`, condensed into one header line — no per-row dots or tooltips. |
 | Per-cell tile assignment from the pool | sprite panel tile picker + preview cell click | ✓ | F5.2 gave the picker a real source: it composes the BOUND TILESET (the sprite's pool is that `.til` byte for byte) as one sheet via worldlib `unpack_til_to_indices` → `compose_tile_grid` → `indices_to_rgba`, the same three calls `ggo_tileset_panel` makes. |
@@ -98,35 +101,38 @@ covered by the fork at all.
 | Click-select + drag-move with one undo entry per gesture | ✓ | ✓ | One deliberate divergence: empty-space left-drag deselects instead of panning; pan is middle-drag. |
 | Wheel zoom / pan | ✓ (cursor-anchored zoom, middle-drag pan) | ✓ | Zoom is cursor-anchored here, which ggo-ide's is not. |
 | Snap-to-tile checkbox | ✓ | ✓ | |
-| Grid checkbox, "Reset" view, preview-size stepper (`- Preview Nx +`) | none | deferred | F2 final-review gap list; the canvas chrome row shipped with Snap only. |
+| Grid checkbox, "Reset" view, preview-size stepper (`- Preview Nx +`) | world panel `render_view_controls` (F5.3/E5) | ✓ | ggo-ide's two rows merged into one (the dock is narrower), with `Snap` moved next to `Grid` as it sits there. Grid defaults on and draws on 16 world-px lines in ggo-ide's own grey; the stepper is ggo-ide's `step_scale` verbatim (1–4, default 2). One divergence in **Reset**: ggo-ide re-frames against a hardcoded canvas size, this sets pan to "never laid out" so the next paint re-runs the same initial centering a world-open does — same intent, one copy of the framing rule instead of two. At 2× the exact multiple only shows once the dock is widened (the canvas is capped to the dock). |
 | Sidebar entity/instance lists | none (selection is canvas-driven; inspector shows the selection) | partial | No list-based selection or navigation; a hard-to-click entity has no list fallback. |
 | "+ Entity" (default Transform at view centre) | Add-entity toolbar button | ✓ | |
 | "+ Merge" fuzzy world search → add instance | "+ Instance" dropdown over cycle-guarded `merge_candidates` | partial | Instance add shipped, including the cycle guard and immediate subtree resolve; the fuzzy-search picker UI became a plain dropdown. |
 | Delete entity / remove instance | `Delete selected` button + `delete`/`backspace` | partial | ggo-ide confirms before removing an instance; the fork does not confirm anything. |
 | Inspector: schema-driven typed fields (int/fixed/str/bool/vec2), asset dropdowns, MetaSprite clip dropdown, per-component Remove, "+ Add component…" | world panel `inspector` | ✓ | Commit on Enter **and** on blur — strictly better than ggo-ide's Enter-only. |
-| MetaSprite `stem` "→" goto sprite on Assets | none | deferred | Cross-panel navigation (world → sprite panel) is unwired; on the F2 gap list. |
+| MetaSprite `stem` "→" goto sprite on Assets | Inspector jump button beside the MetaSprite component's Remove, into `ggo_sprite_panel` (F5.3/E5) | ✓ | Resolves `{stem}.spr` under the OPEN DOCUMENT's asset root and re-relativizes into the worktree, since every explorer-driven open takes a worktree-relative path. The button exists only when a destination does: an unauthored stem gets no button rather than a disabled one or a sprite panel parked in an error state. |
 | Background merging from instances (priority, first-claimant, drawn at origin) | ✓ (worldlib `backgrounds::MergedBackground`) | ✓ | |
 | Undo / redo / dirty / Save (`WorldDocStore` + `write_world`) | ✓ | ✓ | |
 | "Emulate" (save, full-system build with this boot world, jump to Emulator) | Project-panel context menu: **Emulate this world (cart)**, contributed by `ggo_emu_panel` (F5.2/S4) | partial | Save-if-dirty → `emd pack-ggo --world <stem>` → run in the emu panel, reusing its existing run path (dock focused). CART mode, not ggo-ide's full-system boot (`emubuild::build_full_system_with_world`, GemOS image, FAT card) — see the Known-deferrals entry below for the three concrete losses (no OS boot, different perf profile, no run-kind column yet). |
-| Arrow-key nudge (1 px / 16 px with Shift) | none | deferred | Not ported; drag + snap is the only placement path. |
+| Arrow-key nudge (1 px / 16 px with Shift) | Eight panel-scoped actions on `left/right/up/down` + `shift-…` (F5.3/E5) | ✓ | Delta comes from worldlib's `drag_ops::nudge_delta` (the same function ggo-ide routes its key names through), snap applies to the result exactly as the drag applies it, and the move is the same `WorldOp`. Panel-focused only, so an inspector field editor keeps the arrows for cursor movement. **Better than ggo-ide here**: a run of nudges shares one gesture id, so it coalesces into a single undo entry — ggo-ide pushes one per keypress and buries the pre-nudge position. |
 | Confirm dialogs (delete world, overwrite, remove instance, remove Transform from a visual entity) | none | dropped | See §1 — no confirm system in the fork. |
 
 ## 5. Emerald page (ECS manifests)
 
 The pure-extension spec expected "full for ops; no dashboard view". F5.2/S3
 landed the *creation* half of the ops surface as `ggo_emerald_panel` (right
-dock, "GGO Emerald"); browsing manifests is still editing text files, and the
-mutation/reorder ops are F5.3's.
+dock, "GGO Emerald"); F5.3 landed the rest of the ops — remove, field
+add/remove, the schedule run-list editor and the version lock — plus a
+three-tab browser of the manifests the ops act on. What is still missing is
+the *dashboard*: the browser lists names, fields and each system's schedules,
+but `emerald.toml` itself is still read as text.
 
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | Project tab: structured `emerald.toml` viewer | Open `emerald.toml` in the editor | partial | Text, not a structured section/entry view. |
-| Components / Systems / Schedules browsing (module groups, list → detail) | Open `manifests/*.toml` in the editor | partial | Text only. No list/detail dashboard, no field counts, no "used by schedules". |
+| Components / Systems / Schedules browsing (module groups, list → detail) | emerald panel three-tab browser (F5.3/E2): rows grouped by module (shared bucket first), a detail pane per selection — a component's field list, a system's "in update, render" line, a schedule's ordered run list | partial | The dashboard shipped, but smaller than ggo-ide's: no `[scene]` tag, no per-row field/system counts, and **no distinct load states** — `read_manifest` treats an unreadable or malformed manifest as an ABSENT one, where ggo-ide shows a red "Failed to load: …" naming the file (see Known deferrals). `emerald.toml` itself is still read as text in the editor (row above). |
 | Create component/system/schedule (validated forms → `emd generate …`) | emerald panel forms, opened from the project panel's context menu | ✓ | Right-click the project root or `manifests/` → New Component… / New System… / New Schedule…; the form also generates resources, modules and worlds via its kind selector. Validated with worldlib's own `valid_item_name`/`valid_field_spec` before spawning, so an invalid name never reaches `emd`, and a component's PascalCase "stored as" preview is shown exactly where ggo-ide showed it. A new component refreshes the world panel's inspector schemas in place; a new world opens in the world panel. **Resource and Module have the same form** (reachable via the kind selector inside any of the three menu entries) **but no menu entry of their own** — a six-entry directory menu appended to upstream's own Duplicate/Rename/Delete was judged worse than a selector (see the contributor's own doc comment). |
 | New tileset (blank `.til`/`.pal` pair) | emerald panel form, on any assets directory | ✓ | Not a ggo-ide feature and not an `emd` verb — added here because a `.til` is a prerequisite for New Sprite / a bound `.map`, and the import panel needs a source PNG. The palette is worldlib's own `.pal`-less fallback, read back rather than restated. |
-| Remove component/system/schedule, add/remove field (with cascade-aware and compiler-check confirms) | `emd` in the terminal | deferred | Same. The "Reverted" compiler-rollback surfacing is lost with it. |
-| Schedule ordered run-list editor (reorder, cadence, add/remove, optimistic commit) | `emd schedule set` by hand | deferred | Richest interaction in ggo-ide; nothing ported. |
-| emd version-lock banner + gating + mtime poll + mid-run drift check | none | deferred | Nothing gates `emd` invocations in the fork yet; the emerald panel runs `emd generate` unguarded (F5.3). The binary itself is `GGO_EMD`, defaulting to `emd` on `PATH`. |
+| Remove component/system/schedule, add/remove field (with cascade-aware and compiler-check confirms) | emerald panel: per-row trash + per-field trash + "+ Field" row, each through a confirm, then worldlib's own argv (F5.3/E2) | ✓ | All four ops, and the "Reverted" compiler-rollback case is surfaced as its own run state — a revert reads differently from a failure, because nothing changed on disk. Confirms: a **system** remove names every schedule that references it (exact — `schedules_using_system`, cadence suffixes included, and a run list is the only place a system is named). A **component** remove names the worlds that still place it — **more than ggo-ide, which confirmed a component remove with no cascade at all** — but with a stated limit that is printed in the prompt, not just documented: **Rust code that names the component is not scanned**, and neither is any world outside `<assets>/worlds`. Finding code references properly means compiling (which `emd rm` then does), and a grep-shaped guess that says "3 files" where the compiler says 11 is worse than admitting the limit. Field removal carries ggo-ide's "this runs a compiler check and can take 30 s or more" warning, and every run is bounded by a 600 s `EMD_TIMEOUT` ggo-ide had too. |
+| Schedule ordered run-list editor (reorder, cadence, add/remove, optimistic commit) | emerald panel Schedules detail pane (F5.3/E3): numbered rows, Up/Down, trash, "+ System" picker, per-row cadence, optimistic commit through `emd schedule set` | partial | Everything but the cadence input. **Cadence is a fixed picker (1, 2, 3, 4, 6, 8, 12, 16), not ggo-ide's free numeric field**, so a run list that already carries `@5` DISPLAYS it (the picker's label is the current value) but cannot have it re-selected once changed — the trade is that an invalid cadence is unreachable rather than merely rejected. Dangling refs to deleted systems are marked and still removable, as in ggo-ide. The rollback is a **re-read of the manifest**, not a remembered vector, so it shows what `emd` actually left on disk, with a visible "Edit not applied" notice ggo-ide's silent revert never had. One honesty note on the confirms: `emd schedule set` runs **no compiler check**, so this editor's prompts don't promise one — only the removes and field ops do, because only they compile. |
+| emd version-lock banner + gating + mtime poll + mid-run drift check | emerald panel `lock.rs` (F5.3/E4): banner above the form, every mutating control gated, background mtime poll, post-run trailer re-verify | ✓ | All four mismatch phrasings come from `ggo_worldlib::emerald`'s `EmdError` verbatim (asserted by equality, not by copied literals), with one fork-local sentence appended where the remedy is "where is emd" — `GGO_EMD` or `PATH` — and not on a CLI-version drift, whose own line already says what to update. The gate lives on `start_run`, so every `emd` this panel spawns passes it, and `CliNew`/`Unchecked` gate exactly as hard as `CliOld` (ggo-ide's rule, kept). Divergences: the poll is **30 s, not 5** (the post-run trailer check is the real safety net; the poll only decides how fast the banner catches up), there is no **Re-check button** (the poll plus the panel's own refresh cover it), and `Unchecked` is not silent — ggo-ide disabled the buttons and explained nothing, this says "Checking the emd version…". |
 | emd run console panel (live merged stdout/stderr, Cancel) | Zed terminal panel | ✓ | |
 
 ## 6. Emulator page
@@ -215,9 +221,9 @@ mutation/reorder ops are F5.3's.
 
 | Status | Rows |
 |---|---|
-| ✓ | 38 |
-| partial | 33 |
-| deferred | 22 |
+| ✓ | 44 |
+| partial | 34 |
+| deferred | 15 |
 | dropped | 11 |
 | **total** | **104** |
 
@@ -273,15 +279,32 @@ entry) were tightened without a status change. Before this wrap: ✓ 35 /
 partial 31 / deferred 27 / dropped 11, total 104. After: ✓ 38 / partial 33 /
 deferred 22 / dropped 11, total 104.)
 
+(F5.3 wrap: **seven rows moved**, the largest single-phase movement so far and
+the last of the emerald ops. Six deferred → ✓: "Remove component/system/
+schedule, add/remove field" (§5, E2), "emd version-lock banner + gating + mtime
+poll + mid-run drift" (§5, E4), "Onion skin" (§3, E5), "Grid checkbox / Reset /
+preview stepper" (§4, E5), "Arrow-key nudge" (§4, E5) and "MetaSprite `stem` →
+goto sprite" (§4, E5). One deferred → partial: "Schedule ordered run-list
+editor" (§5, E3) — everything ported except a free cadence field, which is a
+fixed picker here. Two rows changed *text* without changing status:
+"Components/Systems/Schedules browsing" (§5) stays `partial` — the three-tab
+browser shipped, but with no `[scene]` tag, no per-row counts and no distinct
+load-failure state — and "Cross-page handoffs" (§1) stays `partial` now that
+all four hops ship, on the one residual that its Emulate hop is cart mode.
+Before this wrap: ✓ 38 / partial 33 / deferred 22 / dropped 11, total 104.
+After: ✓ 44 / partial 34 / deferred 15 / dropped 11, total 104.)
+
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
 own right.)
 
 Read that shape honestly: the panels the fork set out to build (world,
-sprite, charts, emulator) are largely ✓; the *ancillary* pages — Emerald
-ops, Device, Settings, Reports' non-chart furniture — are mostly "partial via a
-task or a text file"; and the pixel-art half of Assets is a deliberate drop
-with no replacement in this repo.
+sprite, charts, emulator) are largely ✓, and as of F5.3 so is Emerald ops —
+the mutations run in-panel, gated on the version lock, rather than in a
+terminal. The remaining *ancillary* pages — Device, Settings, Reports'
+non-chart furniture, and Emerald's `emerald.toml` viewer — are still mostly
+"partial via a task or a text file"; and the pixel-art half of Assets is a
+deliberate drop with no replacement in this repo.
 
 ---
 
@@ -411,6 +434,45 @@ guards and follow-ups that someone has to pick up:
      in the picker) rather than leaning on that convention; the same column
      would also be what a future historic overlay needs to avoid mixing
      modes once a prior-run picker exists.
+- **An unreadable manifest reads as an absent one (F5.3/E2).**
+  `manifests::read_manifest` maps any read/parse failure to "no such manifest",
+  where ggo-ide shows a red "Failed to load: …" naming the file and fails the
+  whole load. Two consequences: a malformed `manifests/systems.toml` presents
+  as an empty Systems tab rather than a broken one, and — worse — a schedule
+  ROLLBACK that happens to land in that moment collapses the schedule's row
+  list to empty instead of showing the saved list plus the "Edit not applied"
+  notice, because the rollback is a re-read. Needs a third state
+  (`absent` / `loaded` / `failed`) threaded through the browser.
+- **`worlds_using_component` scans the whole assets tree on the UI thread
+  (F5.3/E2).** Every trash click on a component walks `assets/worlds/**` and
+  TOML-parses each world before the confirm can be shown. Fine for the world
+  counts in play today, synchronous and unbounded in principle; the same work
+  belongs on the background executor with the confirm awaiting it.
+- **A second trash click while a confirm is up drops the first continuation
+  (F5.3/E2).** The pending-confirm slot is single-valued, so opening a second
+  destructive confirm silently discards the first one's continuation. No data
+  is lost (the discarded op never ran), but the first dialog's answer goes
+  nowhere. Same shape as the Linux fallback-prompt race above, one layer up.
+- **`emerald_dir` falls back to the worktree root (F5.3/E2).** A project whose
+  emerald checkout is NESTED (worktree root is not itself the emerald project)
+  lists nothing until the user right-clicks into the nested directory, because
+  the panel's default root is the worktree root and only a context-menu action
+  re-points it. Discoverability, not correctness: the panel is empty and its
+  empty-state text is the only hint.
+- **Onion `ghost_cache` grows with the strip, not with the live ghost count
+  (F5.3/E5).** It reads as a small cache — at most six ghosts are on screen at
+  once — but the key is `(dist, frame idx)` and the only eviction is the
+  wholesale clear on a doc mutation, so scrubbing a long clip with onion on
+  accumulates up to `6 × frame_count` composed images between edits. Same
+  family as the atlas-retention entry above: bounded by session length and by
+  the next edit, not by a loop.
+- **`kill_on_drop` does not reach `emd`'s `cargo` grandchild (F5.3/E2).** The
+  600 s `EMD_TIMEOUT` drops the child, which kills `emd` — but the `cargo
+  check` it spawned keeps running to completion, still holding the build lock.
+  The comments now say so rather than implying the timeout reclaims the
+  machine; a real group kill needs the child put in its own process group
+  (`setsid` / `process_group(0)`) and a signal to the negated pgid, which is
+  platform work this phase did not take.
 - **Hardware diagnostics is one-shot, with no streaming, cancel or options
   (F5.2/S4).** The "Run hardware diagnostics" entry spawns
   `ggo-diag --tty <port> --skip-pnr --launch` and shows the transcript when it
