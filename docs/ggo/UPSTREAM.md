@@ -6,7 +6,7 @@ Branches: `main` = pristine upstream mirror (never commit); `ggo` = ours (defaul
 ## Update procedure
     git checkout main && git pull upstream main && git push origin main
     git checkout ggo && git merge upstream/main --no-edit
-    cargo test -p ggo_common -p ggo_world_panel -p ggo_metasprite_panel \
+    cargo test -p ggo_common -p ggo_world_panel -p ggo_sprite_panel \
               -p ggo_charts_panel -p ggo_emu_panel -p ggo_language \
               -p ggo_tileset_panel -p ggo_map_panel -p ggo_import_panel \
               && cargo check -p zed   # all nine ggo crates
@@ -29,7 +29,7 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
     `Workspace::prepare_to_close` — 2 `GGO` markers, 21 lines. Ordering is
     load-bearing: it must sit AFTER the active-call prompt and BEFORE
     `save_all_internal`.
-  Verify with `cargo test -p ggo_world_panel -p ggo_metasprite_panel close_guard`
+  Verify with `cargo test -p ggo_world_panel -p ggo_sprite_panel close_guard`
   (8 tests) plus `test_dirty_panel_vetoes_workspace_prepare_to_close`.
   - `crates/workspace/src/workspace.rs`: the `PathOpenInterceptor` registry
     (`register_path_open_interceptor` + `Workspace::intercept_path_open`) — one
@@ -53,7 +53,7 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
     original statement, unmoved (`cargo fmt --check` clean before and after).
     Verify with `cargo test -p workspace -p project_panel --lib` (one `--lib`
     for both packages — cargo rejects the flag twice) plus
-    `cargo test -p ggo_world_panel -p ggo_metasprite_panel -p ggo_tileset_panel`
+    `cargo test -p ggo_world_panel -p ggo_sprite_panel -p ggo_tileset_panel`
     (interceptor-routing + already-open-fast-path tests) and, above all, the
     two tests in the fork that each enter at one of the real
     `project_panel::Event` subscriptions, so a dropped guard fails the
@@ -122,7 +122,7 @@ Then fix any ggo_* compile breaks (gpui churn) immediately — drift compounds.
     dropped hook fails it rather than merging in silently (verified red twice:
     with the `if/else` neutered to `menu`, and with both GGO chunks deleted).
 - Anything else conflicting means upstream moved a registration site: relocate the marker line, never keep a stale copy of upstream code.
-- After each merge: verify `reload_keymaps` (crates/zed/src/zed.rs) still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed` — ggo_world_panel's, ggo_metasprite_panel's, ggo_charts_panel's, and ggo_emu_panel's keybindings all silently die if that call disappears.
+- After each merge: verify `reload_keymaps` (crates/zed/src/zed.rs) still ends with `keymap_editor::KeymapEventChannel::trigger_keymap_changed` — ggo_world_panel's, ggo_sprite_panel's, ggo_charts_panel's, and ggo_emu_panel's keybindings all silently die if that call disappears.
 
 ## Rules
 - All GGO code lives in `crates/ggo/*`. Upstream files get registration lines only.

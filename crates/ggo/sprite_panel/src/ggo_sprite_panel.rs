@@ -1,16 +1,25 @@
-//! GGO MetaSprite panel (F2 tasks M4-M6): frame strip,
-//! playback preview, animation EDITING -- clip CRUD, frame ops,
-//! undo/redo/save over worldlib's `SpriteDocStore` -- and per-cell tile
-//! assignment from a pool-tile palette, with the hardware budget line.
+//! GGO Sprite panel: authoring for BOTH usages of the one `.spr` format
+//! -- a *sprite* (a single frame) and a *metasprite* (clip definitions
+//! over several frames). Hence the crate's name; it was
+//! `ggo_metasprite_panel` through F5.1, which understated half of what it
+//! does (spec Naming, F5.2 task S2).
+//!
+//! Frame strip, playback preview, animation EDITING (clip CRUD, frame
+//! ops, undo/redo/save over worldlib's `SpriteDocStore`), per-cell tile
+//! assignment, and the hardware budget line (F2 tasks M4-M6); the tile
+//! PICKER those assignments draw from, from-scratch creation of either
+//! usage, and rename (F5.2 task S2 -- together, the step that ends the
+//! pipeline's dependence on ggo-ide for sprite creation).
+//!
 //! Structural mirror of `ggo_world_panel` -- `Panel` impl,
 //! keybinding-reload observer, off-thread loading with a load-generation
 //! guard, blur/Enter-committed single-line editors -- with the
 //! sprite-specific pieces split out: `loader` owns everything off the UI
-//! thread (`.spr` open + per-frame/per-tile compose),
+//! thread (`.spr` open + per-frame compose + the picker sheet),
 //! `playback` owns the pure range/loop/offset/fit math, `edits` owns the
 //! pure edit rules (new-clip defaults, range validation, duration
-//! parsing, post-op selection bookkeeping), `tiles` owns the preview
-//! cell-hit math and the hw meter line; this module owns the panel
+//! parsing, post-op selection bookkeeping), `tiles` owns the preview and
+//! picker hit math and the hw meter line; this module owns the panel
 //! entity, the store wiring, the transport timer loop, and all gpui
 //! glue. Op semantics mirror ggo-ide's `sprites/timeline.rs` message
 //! handlers; guards are still re-checked here BEFORE apply -- the store
@@ -19,8 +28,13 @@
 //! click is a UI race to swallow silently, not an error to surface.
 //!
 //! Which sprite is open is driven ENTIRELY by the file explorer (F4 X1):
-//! clicking a `.spr` there routes here through [`intercept_sprite_open`];
-//! the panel has no picker of its own.
+//! clicking a `.spr` there routes here through [`intercept_sprite_open`],
+//! and the project panel's context menu routes the file ops and the two
+//! "New …" entries here as well ([`contribute_sprite_menu`]); the panel
+//! has no picker of its own. The two entries that need input a
+//! `window.prompt` cannot collect -- which tileset to bind, and the typed
+//! new name -- raise a [`PanelForm`] here rather than a dialog, per the
+//! spec's rule that forms live in the panel that owns the domain.
 
 mod edits;
 mod loader;
@@ -46,14 +60,17 @@ use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::sprites::cow::{ClipEdit, SpriteState};
-use ggo_worldlib::sprites::io::{open_sprite, save_sprite};
-use ggo_worldlib::sprites::sprite_doc::{DocOp, SpriteDocStore, clamp_clip_name_bytes};
+use ggo_worldlib::sprites::io::{self, open_sprite, save_sprite};
+use ggo_worldlib::sprites::sprite_doc::{
+    DocOp, SpriteDocStore, blank_sprite_state, clamp_clip_name_bytes,
+};
+use ggo_worldlib::sprites::tileset_doc::pack_indices_to_til;
 use ggo_worldlib::sprites::timeline_ops::{playback_frame_at, playback_total_ms};
 
 actions!(
-    ggo_metasprite,
+    ggo_sprite,
     [
-        /// Toggles focus on the GGO metasprite panel.
+        /// Toggles focus on the GGO sprite panel.
         ToggleFocus,
         /// Toggles playback of the open sprite's active clip range.
         PlayPause,
@@ -71,18 +88,20 @@ actions!(
     ]
 );
 
-const GGO_METASPRITE_PANEL_KEY: &str = "GGOMetaSpritePanel";
+const GGO_SPRITE_PANEL_KEY: &str = "GGOSpritePanel";
 
 /// The panel's key-dispatch context identifier. [`dispatch_context`]
 /// additionally stamps `editing`/`not_editing` (project_panel's pattern)
 /// so plain-key bindings (space) can be scoped away from focused text
 /// editors -- see [`bind_panel_keys`].
 ///
-/// [`dispatch_context`]: MetaSpritePanel::dispatch_context
-const KEY_CONTEXT: &str = "GgoMetaSpritePanel";
+/// [`dispatch_context`]: SpritePanel::dispatch_context
+const KEY_CONTEXT: &str = "GgoSpritePanel";
 
 /// Fixed default width until the panel grows real settings persistence.
-const DEFAULT_WIDTH: Pixels = px(360.);
+/// Wider than the other panels' 360px since F5.2: the middle row now
+/// carries three columns -- preview, tile picker, clips.
+const DEFAULT_WIDTH: Pixels = px(480.);
 
 /// Frame-strip thumbnail box (px, square -- frames fit inside it via
 /// `playback::fit_size`).
@@ -91,12 +110,14 @@ const THUMB_PX: f32 = 48.0;
 /// Large center preview box (px, square).
 const PREVIEW_PX: f32 = 240.0;
 
-/// Tile-palette thumbnail box (px, square -- pool tiles are always
-/// `TILE_PX` square, so no fit math needed).
-const TILE_THUMB_PX: f32 = 24.0;
+/// One tile-picker cell's on-screen edge (px, square -- pool tiles are
+/// always `TILE_PX` square, so the sheet only needs a uniform scale, no
+/// fit math). Also the unit `tiles::picker_tile_at` divides a click by.
+const PICKER_CELL_PX: f32 = 24.0;
 
-/// The tile-palette grid's max height before it scrolls.
-const TILES_MAX_H: Pixels = px(92.);
+/// The tile picker column's width: [`loader::PICKER_COLS`] cells plus the
+/// column's own padding.
+const PICKER_WIDTH: Pixels = px(PICKER_CELL_PX * loader::PICKER_COLS as f32 + 12.);
 
 /// The clip-CRUD side column's width.
 const CLIPS_WIDTH: Pixels = px(148.);
@@ -134,11 +155,11 @@ pub fn init(cx: &mut App) {
         };
 
         let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| MetaSpritePanel::new(Some(weak_workspace), cx));
+        let panel = cx.new(|cx| SpritePanel::new(Some(weak_workspace), cx));
         workspace.add_panel(panel, window, cx);
 
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<MetaSpritePanel>(window, cx);
+            workspace.toggle_panel_focus::<SpritePanel>(window, cx);
         });
     })
     .detach();
@@ -157,19 +178,34 @@ const EMPTY_MESSAGE: &str = "Open a .spr file from the project panel";
 const EMERALD_MANIFEST: &str = "emerald.toml";
 const ASSETS_DIR: &str = "assets";
 
-/// Walk up from `start`'s own directory to the nearest emerald project root
-/// (the nearest ancestor holding `emerald.toml`, mirroring emerald's
-/// `Project::discover`), returning that project's `assets/` dir.
-fn emerald_asset_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = start.parent();
-    while let Some(dir) = cur {
-        if dir.join(EMERALD_MANIFEST).is_file() {
-            let assets = dir.join(ASSETS_DIR);
+/// Walk up from the directory `dir` (inclusive) to the nearest emerald
+/// project root -- the nearest ancestor holding `emerald.toml`, mirroring
+/// emerald's `Project::discover` -- returning that project's `assets/` dir.
+fn asset_root_of_dir(dir: &Path) -> Option<PathBuf> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join(EMERALD_MANIFEST).is_file() {
+            let assets = d.join(ASSETS_DIR);
             return assets.is_dir().then_some(assets);
         }
-        cur = dir.parent();
+        cur = d.parent();
     }
     None
+}
+
+/// [`asset_root_of_dir`] for a FILE: start the walk at its parent.
+fn emerald_asset_root(start: &Path) -> Option<PathBuf> {
+    asset_root_of_dir(start.parent()?)
+}
+
+/// Is `dir` the asset root of an emerald project, or a directory under it?
+/// The gate on "New Sprite…"/"New Metasprite…", for the same reason
+/// `ggo_map_panel` gates "New Map…" on it: the asset root is the frame a
+/// `.spr`'s `til_path`/`pal_path` resolve in, so a sprite written outside
+/// that tree could not name its tileset correctly (the F4 `ggo-sprfix`
+/// contract).
+fn is_assets_dir(dir: &Path) -> bool {
+    asset_root_of_dir(dir).is_some_and(|assets| dir.starts_with(&assets))
 }
 
 /// The asset root a `.spr` resolves its `til_path`/`pal_path` against, plus
@@ -237,7 +273,7 @@ fn intercept_sprite_open(
         workspace,
         window,
         cx,
-        move |panel: &mut MetaSpritePanel, window, cx| panel.open_rel_path(&rel, window, cx),
+        move |panel: &mut SpritePanel, window, cx| panel.open_rel_path(&rel, window, cx),
     )
 }
 
@@ -251,16 +287,24 @@ fn intercept_sprite_open(
 /// bytes alone would produce a second sprite pointing at the FIRST one's
 /// sidecars, which silently flips the original into `pool_shared` mode and
 /// makes either sprite's save rewrite the other's tiles. See
-/// [`MetaSpritePanel::duplicate_sprite`].
+/// [`SpritePanel::duplicate_sprite`].
 ///
-/// **Rename is not offered.** It needs text entry, and `window.prompt` has
-/// no text field; the spec's rule is that forms live in panels and the menu
-/// only routes. Deferred to F5.2 with the rest of the panel forms, rather
-/// than shipped as a disabled entry that looks broken.
+/// **Rename** routes to the panel rather than doing the work here: it
+/// needs text entry and `window.prompt` has no text field, so the typed
+/// name is collected by [`SpritePanel::begin_rename`]'s form (the spec's
+/// rule -- forms live in panels, the menu only routes). It was deferred
+/// out of F5.0/G2 for exactly that missing surface.
+///
+/// On an assets DIRECTORY the menu instead offers **New Sprite…** and
+/// **New Metasprite…** -- the same one-format-two-usages split the spec's
+/// domain model draws (a sprite is one frame; a metasprite is clip
+/// definitions over several).
 ///
 /// MUST NOT touch any panel: contributors run while `ProjectPanel` is
 /// leased (see `Workspace::context_menu_contributions`). All panel work is
 /// deferred into the handlers, which run after the lease is released.
+/// (The `is_file`/`is_dir` stats [`is_assets_dir`] makes are not panel
+/// work and are legal here, same as in `ggo_map_panel`.)
 fn contribute_sprite_menu(
     workspace: &mut Workspace,
     path: &ProjectPath,
@@ -268,22 +312,82 @@ fn contribute_sprite_menu(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Vec<ui::ContextMenuItem> {
-    if is_dir || !is_sprite_path(path) {
-        return Vec::new();
-    }
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return Vec::new();
     };
+    if is_dir {
+        let Some(worktree_root) = workspace
+            .project()
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        else {
+            return Vec::new();
+        };
+        if !is_assets_dir(&worktree_root.join(&rel)) {
+            return Vec::new();
+        }
+        return vec![
+            ui::ContextMenuEntry::new("New Sprite…")
+                .icon(ui::IconName::Plus)
+                .handler(new_sprite_handler(
+                    cx.weak_entity(),
+                    NewKind::Sprite,
+                    rel.clone(),
+                ))
+                .into(),
+            ui::ContextMenuEntry::new("New Metasprite…")
+                .icon(ui::IconName::Plus)
+                .handler(new_sprite_handler(
+                    cx.weak_entity(),
+                    NewKind::Metasprite,
+                    rel,
+                ))
+                .into(),
+        ];
+    }
+    if !is_sprite_path(path) {
+        return Vec::new();
+    }
     vec![
         ui::ContextMenuEntry::new("Duplicate Sprite")
             .icon(ui::IconName::Copy)
             .handler(duplicate_sprite_handler(cx.weak_entity(), rel.clone()))
+            .into(),
+        ui::ContextMenuEntry::new("Rename Sprite…")
+            .icon(ui::IconName::Pencil)
+            .handler(rename_sprite_handler(cx.weak_entity(), rel.clone()))
             .into(),
         ui::ContextMenuEntry::new("Delete Sprite")
             .icon(ui::IconName::Trash)
             .handler(delete_sprite_handler(cx.weak_entity(), rel))
             .into(),
     ]
+}
+
+/// The "New Sprite…"/"New Metasprite…" entries' handler -- named for the
+/// same reason as [`duplicate_sprite_handler`].
+fn new_sprite_handler(
+    workspace: WeakEntity<Workspace>,
+    kind: NewKind,
+    dir_rel: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<SpritePanel>, window, cx| {
+        let dir_rel = dir_rel.clone();
+        panel.update(cx, |panel, cx| panel.new_sprite(kind, &dir_rel, window, cx));
+    })
+}
+
+/// The "Rename Sprite…" entry's handler -- see [`duplicate_sprite_handler`].
+fn rename_sprite_handler(
+    workspace: WeakEntity<Workspace>,
+    rel: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<SpritePanel>, window, cx| {
+        let rel = rel.clone();
+        panel.update(cx, |panel, cx| panel.begin_rename(rel, window, cx));
+    })
 }
 
 /// The "Duplicate Sprite" entry's handler. Split out from
@@ -296,7 +400,7 @@ fn duplicate_sprite_handler(
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     ggo_common::panel_entry_handler(
         workspace,
-        move |panel: &Entity<MetaSpritePanel>, _window, cx| {
+        move |panel: &Entity<SpritePanel>, _window, cx| {
             let rel = rel.clone();
             panel.update(cx, |panel, cx| panel.duplicate_sprite(&rel, cx));
         },
@@ -309,15 +413,12 @@ fn delete_sprite_handler(
     workspace: WeakEntity<Workspace>,
     rel: String,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(
-        workspace,
-        move |panel: &Entity<MetaSpritePanel>, window, cx| {
-            let rel = rel.clone();
-            panel
-                .update(cx, |panel, cx| panel.delete_sprite(rel, window, cx))
-                .detach();
-        },
-    )
+    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<SpritePanel>, window, cx| {
+        let rel = rel.clone();
+        panel
+            .update(cx, |panel, cx| panel.delete_sprite(rel, window, cx))
+            .detach();
+    })
 }
 
 /// The extensions a duplicated sprite claims: the `.spr` itself and the two
@@ -339,6 +440,190 @@ fn free_copy_base(base: &str, taken: impl Fn(&str) -> bool) -> String {
         .map(|n| format!("{base}-copy-{n}"))
         .find(|candidate| !taken(candidate))
         .expect("a free -copy-N name exists long before N overflows")
+}
+
+// ------------------------------------------------------- creating a `.spr`
+
+/// Which usage of the ONE `.spr` format a "New …" entry seeds. Not two
+/// file types (spec Domain model): a sprite is a single frame, a
+/// metasprite is clip definitions over several frames, and both are
+/// `SpriteState` in a `.spr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewKind {
+    Sprite,
+    Metasprite,
+}
+
+impl NewKind {
+    /// The stem a new document is named after -- "sprite"/"sprite-2"...,
+    /// "metasprite"/"metasprite-2"... (see [`free_new_name`]). No text
+    /// prompt at creation time: `window.prompt` is button-choice only, and
+    /// renaming afterwards is now a panel form
+    /// ([`SpritePanel::begin_rename`]).
+    fn name_base(self) -> &'static str {
+        match self {
+            NewKind::Sprite => "sprite",
+            NewKind::Metasprite => "metasprite",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            NewKind::Sprite => "New Sprite",
+            NewKind::Metasprite => "New Metasprite",
+        }
+    }
+}
+
+/// A new sprite's grid, in tiles. 2x2 `TILE_PX` tiles is the smallest
+/// size that reads as a sprite rather than a single tile, and every
+/// dimension is editable afterwards (`DocOp::Resize`).
+const NEW_SPRITE_TILES: u8 = 2;
+
+/// How many frames a new METASPRITE seeds. Two is the minimum that makes
+/// a clip mean anything (a one-frame "animation" is a sprite), and the
+/// seeded clip spans exactly this range.
+const NEW_METASPRITE_FRAMES: usize = 2;
+
+/// The seeded clip's name on a new metasprite -- `edits::default_new_clip`'s
+/// own `clip{N}` scheme at N = 1, so the first clip a user adds by hand
+/// continues the same sequence.
+const NEW_METASPRITE_CLIP: &str = "clip1";
+
+/// The first free stem for a new document: `base`, then `base-2`,
+/// `base-3`, ... `taken` answers whether a candidate is already in use.
+/// Pure, so the naming rule is testable without a filesystem. Only the
+/// `.spr` is checked by callers: unlike [`free_copy_base`], a new sprite
+/// does NOT mint sidecars of its own -- it binds to an existing tileset,
+/// so there is no `.til`/`.pal` of its name to collide.
+fn free_new_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2u32..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken(candidate))
+        .expect("a free base-N name exists long before N overflows")
+}
+
+/// Write a blank `.spr` of `kind` into the worktree-relative directory
+/// `dir_rel`, bound to the asset-root-relative tileset `til_rel`,
+/// returning the new file's worktree-relative path.
+///
+/// **The new sprite is BOUND, to a tileset the user picked in the panel**
+/// -- the one place this diverges from `ggo_map_panel::create_blank_map`,
+/// and for a reason that comes from the format rather than from taste.
+/// M2 chose *unbound* for a new `.map` because a map's cells are pool
+/// indices, so a GUESSED tileset yields a file that looks authored and is
+/// wrong. Every word of that applies to a `.spr` -- its frame cells are
+/// pool indices and its pixels are palette indices, so a wrong tileset
+/// misreads both. What does NOT carry over is the remedy: a `.map` has a
+/// legal unbound representation (`til_path: ""`, `MapOp::BindTileset`
+/// attaches one later), while a `.spr` has none -- `io::open_sprite`
+/// hard-errors when the `.til`/`.pal` it names can't be read, so an
+/// "unbound" `.spr` is a file that cannot be opened, including by this
+/// panel. And a sprite's pool IS its `.til`, byte for byte, so binding is
+/// also what gives the tile picker anything to pick from; an unbound
+/// sprite would be a frame grid with one blank tile and no way to get
+/// more, which is exactly the ggo-ide dependency this task exists to end.
+///
+/// So: nothing is guessed, and nothing is written until a tileset has
+/// been chosen -- the choice is made in the panel's form (spec: forms
+/// live in the panel, the menu only routes), and this function is only
+/// reached once it has been.
+///
+/// The pool is the tileset's own bytes, so the `save_sprite` write-back
+/// to `til_rel` is byte-identical to what was read (pinned by
+/// `test_new_sprite_leaves_the_bound_tileset_byte_identical`); `pal_rel`
+/// comes from `open_tileset`, which derives it from the `.til` stem.
+fn create_sprite(
+    project_root: &Path,
+    dir_rel: &str,
+    kind: NewKind,
+    til_rel: &str,
+) -> Result<String, String> {
+    let dir_abs = project_root.join(dir_rel);
+    let name = free_new_name(kind.name_base(), |candidate| {
+        dir_abs.join(format!("{candidate}.{SPRITE_EXT}")).exists()
+    });
+    let file = format!("{name}.{SPRITE_EXT}");
+    let source_rel = if dir_rel.is_empty() {
+        file
+    } else {
+        format!("{dir_rel}/{file}")
+    };
+    let (root, rel_path) = split_sprite_path(project_root, &source_rel);
+
+    let tileset = io::open_tileset(&root, til_rel).map_err(|e| e.to_string())?;
+    if tileset.tile_count == 0 {
+        return Err(format!("{til_rel} has no tiles"));
+    }
+    let mut state =
+        blank_sprite_state(NEW_SPRITE_TILES, NEW_SPRITE_TILES).map_err(|e| e.to_string())?;
+    // The pool IS the bound `.til` (that is what `open_sprite` reads into
+    // it), so binding means adopting its tiles and palette wholesale --
+    // every frame cell then addresses a tile that actually exists.
+    state.pool = pack_indices_to_til(&tileset.indices, tileset.tile_count);
+    state.tile_count = tileset.tile_count;
+    state.palette = tileset.palette;
+    if kind == NewKind::Metasprite {
+        let first = state.frames[0].clone();
+        state.frames.resize(NEW_METASPRITE_FRAMES, first);
+        state.clips.push(ClipEdit {
+            name: NEW_METASPRITE_CLIP.to_string(),
+            from: 0,
+            to: NEW_METASPRITE_FRAMES - 1,
+            loop_: true,
+        });
+    }
+    save_sprite(&root, &rel_path, &state, til_rel, &tileset.pal_path).map_err(|e| e.to_string())?;
+    Ok(source_rel)
+}
+
+// ------------------------------------------------------ renaming a `.spr`
+
+/// The worktree-relative path a rename of `source_rel` to the typed
+/// `text` targets, or `Err(message)` for a name the panel must refuse.
+///
+/// Same-directory, name-only: a `/` would move the file, and moving a
+/// `.spr` can invalidate its sidecars -- `io::resolve_sidecar`'s
+/// bare-sibling fallback resolves a stored bare `hero.til` relative to the
+/// `.spr`'s OWN directory, so a sprite that arrived that way stops
+/// resolving the moment it leaves that directory. Staying put keeps both
+/// sidecar forms (asset-root-relative and bare sibling) valid without
+/// rewriting a single byte of the `.spr`.
+///
+/// A trailing `.spr` in the typed text is accepted and not doubled, since
+/// the field is prefilled with the stem and a user may well retype the
+/// extension.
+fn rename_target(source_rel: &str, text: &str) -> Result<String, String> {
+    let typed = text.trim();
+    let stem = typed
+        .strip_suffix(&format!(".{SPRITE_EXT}"))
+        .unwrap_or(typed)
+        .trim();
+    if stem.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    if stem.contains('/') || stem.contains('\\') {
+        return Err("name cannot contain a path separator".to_string());
+    }
+    if stem == "." || stem == ".." {
+        return Err(format!("{stem} is not a name"));
+    }
+    let file = format!("{stem}.{SPRITE_EXT}");
+    Ok(match source_rel.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{file}"),
+        None => file,
+    })
+}
+
+/// The name a rename field is prefilled with: `source_rel`'s file stem.
+fn rename_seed(source_rel: &str) -> String {
+    let file = source_rel.rsplit('/').next().unwrap_or(source_rel);
+    file.strip_suffix(&format!(".{SPRITE_EXT}"))
+        .unwrap_or(file)
+        .to_string()
 }
 
 fn bind_panel_keys(cx: &mut App) {
@@ -439,9 +724,12 @@ struct OpenSprite {
     /// One composed BGRA image per frame index; rebuilt wholesale after
     /// every doc mutation (see `loader::LoadedSprite::frames`).
     frames: Vec<Arc<RenderImage>>,
-    /// One composed BGRA image per pool tile index -- the tile palette's
-    /// thumbnails; same invalidation as `frames`.
-    pool_tiles: Vec<Arc<RenderImage>>,
+    /// The bound tileset composed as the tile picker's sheet; same
+    /// invalidation as `frames`.
+    pool_strip: Option<loader::PoolStrip>,
+    /// The tile picker sheet's on-screen bounds, recorded at prepaint --
+    /// same overlay-canvas idiom as [`Self::preview_bounds`].
+    picker_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// The active pool tile: while `Some`, a preview-cell click assigns
     /// it (`FrameTileSet`); `None` means clicks don't mutate. Cleared by
     /// re-clicking the tile, Escape, or the tile vanishing under an
@@ -487,7 +775,8 @@ impl OpenSprite {
             pal_path: loaded.pal_path,
             store: SpriteDocStore::new(loaded.state),
             frames: loaded.frames,
-            pool_tiles: loaded.pool_tiles,
+            pool_strip: loaded.pool_strip,
+            picker_bounds: Rc::new(RefCell::new(None)),
             selected_tile: None,
             preview_bounds: Rc::new(RefCell::new(None)),
             selected_frame: 0,
@@ -530,7 +819,40 @@ enum ViewerState {
     Error(String),
 }
 
-pub struct MetaSpritePanel {
+/// A modal-ish form rendered as a bar above the viewer. Both entries the
+/// spec routes here need typed or picked input that a `window.prompt`
+/// (button-choice only) cannot collect, which is why they are panel forms
+/// rather than menu prompts.
+///
+/// Only one can be open at a time: they are both started from the project
+/// panel's context menu, one click at a time, and a second start replaces
+/// the first rather than stacking.
+enum PanelForm {
+    /// "New Sprite…"/"New Metasprite…": pick the tileset to bind, then
+    /// create. Nothing is on disk until [`SpritePanel::confirm_new`] runs
+    /// -- see [`create_sprite`] for why a binding must be chosen at all.
+    New {
+        kind: NewKind,
+        /// The clicked directory, worktree-relative.
+        dir_rel: String,
+        /// Every `.til` under the asset root, asset-root-relative
+        /// (`io::list_tilesets`). Empty means the project has no tileset
+        /// yet and the form can only be cancelled.
+        tilesets: Vec<String>,
+        selected: usize,
+        error: Option<String>,
+    },
+    /// "Rename Sprite…": the typed name, committed by the button or
+    /// Enter.
+    Rename {
+        /// The sprite being renamed, worktree-relative.
+        source_rel: String,
+        editor: Entity<Editor>,
+        error: Option<String>,
+    },
+}
+
+pub struct SpritePanel {
     focus_handle: FocusHandle,
     position: DockPosition,
     workspace: Option<WeakEntity<Workspace>>,
@@ -538,11 +860,13 @@ pub struct MetaSpritePanel {
     root_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
     state: ViewerState,
+    /// The open "New …"/"Rename …" form, if any.
+    form: Option<PanelForm>,
     load_generation: u64,
     _load_task: Option<Task<()>>,
 }
 
-impl MetaSpritePanel {
+impl SpritePanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
@@ -551,6 +875,7 @@ impl MetaSpritePanel {
             root_override: None,
             project_root: None,
             state: ViewerState::Empty,
+            form: None,
             load_generation: 0,
             _load_task: None,
         }
@@ -724,6 +1049,211 @@ impl MetaSpritePanel {
             })
             .ok();
         })
+    }
+
+    // ------------------------------------------------------- new / rename
+
+    /// Open the "New Sprite…"/"New Metasprite…" form for the
+    /// worktree-relative directory `dir_rel` -- the body of those two
+    /// project-panel entries.
+    ///
+    /// **The unsaved-edits guard runs BEFORE the form opens, and the form
+    /// is the only thing that writes** -- so a Cancel at either step
+    /// leaves the disk untouched. `ggo_map_panel`'s "New Map…" originally
+    /// created the file first and prompted afterwards, which orphaned a
+    /// `map.map` on Cancel and pushed the next attempt onto `map-2.map`
+    /// (M2 fix round 1, BLOCKING 2); guarding first is that lesson, and
+    /// deferring the write to [`Self::confirm_new`] makes it structural
+    /// here rather than a matter of statement order.
+    ///
+    /// Refreshes the root first for the same reason `duplicate_sprite`
+    /// does: a right-click can reach a panel that was never activated.
+    fn new_sprite(
+        &mut self,
+        kind: NewKind,
+        dir_rel: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_root(cx);
+        if self.project_root.is_none() {
+            return;
+        }
+        let dir_rel = dir_rel.to_string();
+        let proceed = ggo_common::prepare_to_close_dirty(
+            self.dirty_sprite_name(),
+            window,
+            cx,
+            Self::save_for_close,
+        );
+        cx.spawn(async move |this, cx| {
+            if !proceed.await {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.refresh_root(cx);
+                let Some(project_root) = this.project_root.clone() else {
+                    return;
+                };
+                // The tileset list is asset-root-relative because that is
+                // the frame a `.spr` stores its `til_path` in.
+                let root = asset_root_of_dir(&project_root.join(&dir_rel))
+                    .unwrap_or_else(|| project_root.clone());
+                this.form = Some(PanelForm::New {
+                    kind,
+                    dir_rel,
+                    tilesets: io::list_tilesets(&root),
+                    selected: 0,
+                    error: None,
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Pick which tileset the pending new sprite binds to.
+    fn select_new_tileset(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(PanelForm::New {
+            tilesets, selected, ..
+        }) = &mut self.form
+            && ix < tilesets.len()
+        {
+            *selected = ix;
+            cx.notify();
+        }
+    }
+
+    /// Create the pending new sprite and open it. The dirty guard already
+    /// ran in [`Self::new_sprite`], so this loads directly rather than
+    /// going through `open_rel_path` and prompting twice.
+    fn confirm_new(&mut self, cx: &mut Context<Self>) {
+        let Some(PanelForm::New {
+            kind,
+            dir_rel,
+            tilesets,
+            selected,
+            ..
+        }) = &self.form
+        else {
+            return;
+        };
+        let (kind, dir_rel) = (*kind, dir_rel.clone());
+        let Some(til_rel) = tilesets.get(*selected).cloned() else {
+            return; // no tileset in the project: the form only cancels
+        };
+        let Some(project_root) = self.project_root.clone() else {
+            return;
+        };
+        match create_sprite(&project_root, &dir_rel, kind, &til_rel) {
+            Ok(source_rel) => {
+                self.form = None;
+                self.load_rel_path(&source_rel, cx);
+            }
+            Err(message) => {
+                log::error!("GGO: failed to create sprite in {dir_rel}: {message}");
+                if let Some(PanelForm::New { error, .. }) = &mut self.form {
+                    *error = Some(message);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Open the rename form for the sprite at worktree-relative `rel` --
+    /// the body of the project panel's "Rename Sprite…" entry, prefilled
+    /// with the current stem and focused so it can be typed into
+    /// immediately.
+    fn begin_rename(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        let seed = rename_seed(&rel);
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(seed, window, cx);
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        self.form = Some(PanelForm::Rename {
+            source_rel: rel,
+            editor,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    /// Rename the `.spr` to the typed name.
+    ///
+    /// **Only the `.spr` moves.** Its `.til`/`.pal` keep both their names
+    /// and their stored rels, which is what keeps a renamed sprite
+    /// resolvable: those rels are asset-root-relative (the `ggo-sprfix`
+    /// contract F4 exists to repair), so they are not affected by the
+    /// `.spr`'s own name at all, and the bare-sibling fallback form is
+    /// safe too because [`rename_target`] keeps the file in its
+    /// directory. Renaming the sidecars WOULD require rewriting the
+    /// `.spr`'s stored rels, and would break every OTHER sprite sharing
+    /// that tileset -- worldlib's `scan_til_sharers`/`pool_shared` exist
+    /// precisely because sharing is expected. The same call `delete_sprite`
+    /// makes, for the same reason.
+    ///
+    /// No unsaved-edits guard: nothing is lost. The open document, if it
+    /// is this file, simply follows the rename -- `source_rel` (what the
+    /// title and the "already open?" check compare) and `rel_path` (what
+    /// a save writes to) are both repointed, so a dirty document stays
+    /// dirty and saves to the new name.
+    fn confirm_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(PanelForm::Rename {
+            source_rel, editor, ..
+        }) = &self.form
+        else {
+            return;
+        };
+        let source_rel = source_rel.clone();
+        let text = editor.read(cx).text(cx);
+        let Some(project_root) = self.project_root.clone() else {
+            return;
+        };
+        let target = rename_target(&source_rel, &text).and_then(|target| {
+            if target == source_rel {
+                // Committing the name it already has is a dismissal, not
+                // an error -- and must not trip the exists check below.
+                return Ok(target);
+            }
+            if project_root.join(&target).exists() {
+                return Err(format!("{target} already exists"));
+            }
+            std::fs::rename(project_root.join(&source_rel), project_root.join(&target))
+                .map_err(|e| e.to_string())
+                .map(|()| target)
+        });
+        match target {
+            Ok(target) => {
+                if let ViewerState::Ready(open) = &mut self.state
+                    && open.source_rel == source_rel
+                {
+                    let (_, rel_in_root) = split_sprite_path(&project_root, &target);
+                    open.source_rel = target;
+                    open.rel_path = rel_in_root;
+                }
+                self.form = None;
+            }
+            Err(message) => {
+                log::error!("GGO: failed to rename sprite {source_rel}: {message}");
+                if let Some(PanelForm::Rename { error, .. }) = &mut self.form {
+                    *error = Some(message);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Dismiss whichever form is open, writing nothing.
+    fn cancel_form(&mut self, cx: &mut Context<Self>) -> bool {
+        let had = self.form.take().is_some();
+        if had {
+            cx.notify();
+        }
+        had
     }
 
     /// Kick off the off-thread load of `rel`. A stale result (superseded by
@@ -919,12 +1449,12 @@ impl MetaSpritePanel {
             return;
         };
         let frames = loader::compose_frames(open.store.state()).unwrap_or_default();
-        let pool_tiles = loader::compose_pool_tiles(open.store.state()).unwrap_or_default();
+        let pool_strip = loader::compose_pool_strip(open.store.state());
         let frame_count = open.store.state().frames.len();
         let clip_count = open.store.state().clips.len();
         let tile_count = open.store.state().tile_count;
         open.frames = frames;
-        open.pool_tiles = pool_tiles;
+        open.pool_strip = pool_strip;
         open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
         if open.active_clip.is_some_and(|c| c >= clip_count) {
             open.active_clip = None;
@@ -1130,6 +1660,32 @@ impl MetaSpritePanel {
             Some(tile)
         };
         cx.notify();
+    }
+
+    /// The tile picker's left-click body: map the click through the
+    /// recorded sheet bounds onto a pool index (`tiles::picker_tile_at`)
+    /// and select it. A click on the padded tail of a partial last row
+    /// selects nothing rather than the nearest tile.
+    fn on_picker_click(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(strip) = open.pool_strip.as_ref() else {
+            return;
+        };
+        let Some(bounds) = *open.picker_bounds.borrow() else {
+            return;
+        };
+        let tile = tiles::picker_tile_at(
+            f32::from(position.x - bounds.origin.x),
+            f32::from(position.y - bounds.origin.y),
+            PICKER_CELL_PX,
+            strip.cols,
+            strip.tile_count,
+        );
+        if let Some(tile) = tile {
+            self.select_tile(tile, cx);
+        }
     }
 
     fn deselect_tile(&mut self, cx: &mut Context<Self>) {
@@ -1479,6 +2035,15 @@ impl MetaSpritePanel {
     }
 
     fn on_commit_field(&mut self, _: &CommitField, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter in the rename field commits the rename -- the form's own
+        // editor is not one of the doc's `EditTarget` editors, so it has
+        // to be checked before the loop below.
+        if let Some(PanelForm::Rename { editor, .. }) = &self.form
+            && editor.focus_handle(cx).is_focused(window)
+        {
+            self.confirm_rename(cx);
+            return;
+        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -1499,13 +2064,18 @@ impl MetaSpritePanel {
     fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add(KEY_CONTEXT);
-        let editing = match &self.state {
-            ViewerState::Ready(open) => open
-                .editors
-                .iter()
-                .any(|e| e.editor.focus_handle(cx).is_focused(window)),
-            _ => false,
-        };
+        let form_editing = matches!(
+            &self.form,
+            Some(PanelForm::Rename { editor, .. }) if editor.focus_handle(cx).is_focused(window)
+        );
+        let editing = form_editing
+            || match &self.state {
+                ViewerState::Ready(open) => open
+                    .editors
+                    .iter()
+                    .any(|e| e.editor.focus_handle(cx).is_focused(window)),
+                _ => false,
+            };
         key_context.add(if editing { "editing" } else { "not_editing" });
         key_context
     }
@@ -1561,13 +2131,10 @@ impl MetaSpritePanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                Button::new(
-                    "ggo-metasprite-play",
-                    if playing { "Pause" } else { "Play" },
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
+                Button::new("ggo-sprite-play", if playing { "Pause" } else { "Play" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
             )
-            .child(DropdownMenu::new("ggo-metasprite-clip", clip_label, menu))
+            .child(DropdownMenu::new("ggo-sprite-clip", clip_label, menu))
             .child(div().flex_1())
             .child(
                 Label::new(SharedString::from(title))
@@ -1575,19 +2142,19 @@ impl MetaSpritePanel {
                     .color(if dirty { Color::Modified } else { Color::Muted }),
             )
             .child(
-                IconButton::new("ggo-metasprite-undo", IconName::Undo)
+                IconButton::new("ggo-sprite-undo", IconName::Undo)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Undo"))
                     .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
             )
             .child(
-                IconButton::new("ggo-metasprite-redo", IconName::RotateCw)
+                IconButton::new("ggo-sprite-redo", IconName::RotateCw)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Redo"))
                     .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
             )
             .child(
-                Button::new("ggo-metasprite-save", "Save")
+                Button::new("ggo-sprite-save", "Save")
                     .disabled(!dirty)
                     .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
             )
@@ -1652,60 +2219,184 @@ impl MetaSpritePanel {
         preview.into_any_element()
     }
 
-    /// The tile-palette section: every pool tile as a thumbnail, wrap
-    /// grid, click to select (re-click to deselect), the active tile
-    /// outlined; the hw budget line rides along on the header row.
-    fn render_tiles(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The tile picker, beside the frame grid: the BOUND TILESET's tiles
+    /// as one composed sheet (`loader::compose_pool_strip` -- the sprite's
+    /// pool is that `.til`, byte for byte), laid out
+    /// [`loader::PICKER_COLS`] wide at [`PICKER_CELL_PX`] per tile. Click
+    /// a tile to make it active (re-click to deselect), then click a frame
+    /// cell in the preview to place it -- the missing SOURCE half of
+    /// F2/M6's already-shipped `FrameTileSet` placement.
+    ///
+    /// One image plus an absolutely-positioned selection outline, rather
+    /// than one element per tile: a `.til` runs to hundreds of tiles, and
+    /// the same overlay-canvas + hit-math shape the preview already uses
+    /// ([`tiles::picker_tile_at`]) costs one element either way.
+    fn render_tile_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_tiles is only called in the Ready state");
+            unreachable!("render_tile_picker is only called in the Ready state");
         };
-        let state = open.store.state();
         let border = cx.theme().colors().border;
         let accent = cx.theme().colors().border_focused;
-        let meter = tiles::hw_meter_line(state, state.frames.get(open.selected_frame));
-        v_flex()
+        let mut column = v_flex()
             .flex_none()
-            .border_t_1()
+            .w(PICKER_WIDTH)
+            .h_full()
+            .border_l_1()
             .border_color(border)
             .child(
-                h_flex()
-                    .gap_1()
-                    .px_1()
-                    .pt_1()
+                div().px_1().pt_1().child(
+                    Label::new("Tiles")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            );
+        if let Some(strip) = open.pool_strip.as_ref() {
+            let sheet_w = px(PICKER_CELL_PX * strip.cols as f32);
+            let sheet_h = px(PICKER_CELL_PX * strip.rows as f32);
+            let bounds_cell = open.picker_bounds.clone();
+            let overlay = gpui::canvas(
+                move |bounds, _window, _cx| {
+                    *bounds_cell.borrow_mut() = Some(bounds);
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .size_full();
+            let selection = open.selected_tile.map(|tile| {
+                let ix = tile as usize;
+                div()
+                    .absolute()
+                    .left(px((ix % strip.cols) as f32 * PICKER_CELL_PX))
+                    .top(px((ix / strip.cols) as f32 * PICKER_CELL_PX))
+                    .w(px(PICKER_CELL_PX))
+                    .h(px(PICKER_CELL_PX))
+                    .border_1()
+                    .border_color(accent)
+            });
+            column = column.child(
+                div()
+                    .id("ggo-sprite-tiles")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_1()
                     .child(
-                        Label::new("Tiles")
+                        div()
+                            .relative()
+                            .w(sheet_w)
+                            .h(sheet_h)
+                            .child(img(strip.image.clone()).w(sheet_w).h(sheet_h))
+                            .child(overlay)
+                            .children(selection)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    window.focus(&this.focus_handle, cx);
+                                    this.on_picker_click(event.position, cx);
+                                }),
+                            ),
+                    ),
+            );
+        }
+        column.into_any_element()
+    }
+
+    /// The open "New …"/"Rename …" form, as a bar above the viewer.
+    fn render_form(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let row = h_flex()
+            .gap_1()
+            .p_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border);
+        match self.form.as_ref()? {
+            PanelForm::New {
+                kind,
+                dir_rel,
+                tilesets,
+                selected,
+                error,
+            } => {
+                let label = format!("{} in {}", kind.label(), dir_rel);
+                let has_tilesets = !tilesets.is_empty();
+                let picked: SharedString = tilesets
+                    .get(*selected)
+                    .cloned()
+                    .unwrap_or_else(|| "no tilesets".to_string())
+                    .into();
+                let weak = cx.weak_entity();
+                let names = tilesets.clone();
+                let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                    for (ix, name) in names.into_iter().enumerate() {
+                        let weak = weak.clone();
+                        menu = menu.entry(SharedString::from(name), None, move |_window, cx| {
+                            weak.update(cx, |this, cx| this.select_new_tileset(ix, cx))
+                                .ok();
+                        });
+                    }
+                    menu
+                });
+                Some(
+                    row.child(
+                        Label::new(SharedString::from(label))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(div().flex_1())
+                    .child(DropdownMenu::new("ggo-sprite-new-tileset", picked, menu))
                     .child(
-                        Label::new(SharedString::from(meter))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(
-                div()
-                    .id("ggo-metasprite-tiles")
-                    .max_h(TILES_MAX_H)
-                    .overflow_y_scroll()
-                    .child(h_flex().flex_wrap().gap_1().p_1().children(
-                        open.pool_tiles.iter().enumerate().map(|(ix, image)| {
-                            let selected = open.selected_tile == Some(ix as u16);
-                            div()
-                                .id(("ggo-metasprite-tile", ix))
-                                .p_0p5()
-                                .border_1()
-                                .rounded_sm()
-                                .border_color(if selected { accent } else { border })
-                                .child(img(image.clone()).w(px(TILE_THUMB_PX)).h(px(TILE_THUMB_PX)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_tile(ix as u16, cx)
-                                }))
-                        }),
+                        Button::new("ggo-sprite-new-create", "Create")
+                            .disabled(!has_tilesets)
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_new(cx))),
+                    )
+                    .child(
+                        Button::new("ggo-sprite-new-cancel", "Cancel").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.cancel_form(cx);
+                            },
+                        )),
+                    )
+                    .children(
+                        error
+                            .clone()
+                            .or_else(|| {
+                                (!has_tilesets).then(|| {
+                                    "no .til in this project -- import a tileset first".to_string()
+                                })
+                            })
+                            .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+                    )
+                    .into_any_element(),
+                )
+            }
+            PanelForm::Rename {
+                source_rel,
+                editor,
+                error,
+            } => Some(
+                row.child(
+                    Label::new(format!("Rename {source_rel} to"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Self::editor_input(editor.clone(), cx))
+                .child(
+                    Button::new("ggo-sprite-rename-apply", "Rename")
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm_rename(cx))),
+                )
+                .child(
+                    Button::new("ggo-sprite-rename-cancel", "Cancel").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.cancel_form(cx);
+                        },
                     )),
-            )
-            .into_any_element()
+                )
+                .children(
+                    error
+                        .clone()
+                        .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+                )
+                .into_any_element(),
+            ),
+        }
     }
 
     /// One field text input, in world_panel's minimal bordered box.
@@ -1755,7 +2446,7 @@ impl MetaSpritePanel {
                             editor_for(EditTarget::ClipName(i)).map(|e| Self::editor_input(e, cx)),
                         )
                         .child(
-                            IconButton::new(("ggo-metasprite-clip-delete", i), IconName::Trash)
+                            IconButton::new(("ggo-sprite-clip-delete", i), IconName::Trash)
                                 .icon_size(IconSize::Small)
                                 .tooltip(ui::Tooltip::text("Delete clip"))
                                 .on_click(
@@ -1775,7 +2466,7 @@ impl MetaSpritePanel {
                         .child({
                             let weak = cx.weak_entity();
                             Checkbox::new(
-                                ("ggo-metasprite-clip-loop", i),
+                                ("ggo-sprite-clip-loop", i),
                                 ToggleState::from(clip.loop_),
                             )
                             .label("loop")
@@ -1798,11 +2489,11 @@ impl MetaSpritePanel {
             col = col.child(row);
         }
         col = col.child(
-            Button::new("ggo-metasprite-clip-add", "+ Clip")
+            Button::new("ggo-sprite-clip-add", "+ Clip")
                 .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
         );
         div()
-            .id("ggo-metasprite-clips")
+            .id("ggo-sprite-clips")
             .w(CLIPS_WIDTH)
             .h_full()
             .flex_none()
@@ -1814,52 +2505,61 @@ impl MetaSpritePanel {
     }
 
     /// Frame-op row above the strip: add/duplicate/delete/move buttons
-    /// acting on the selected frame, plus its duration editor.
+    /// acting on the selected frame, its duration editor, and the
+    /// hardware budget line (which used to head the tile palette; the
+    /// palette became a narrow side column in F5.2, too narrow for it).
     fn render_frame_ops(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_frame_ops is only called in the Ready state");
         };
-        let len = open.store.state().frames.len();
+        let state = open.store.state();
+        let len = state.frames.len();
         let selected = open.selected_frame;
+        let meter = tiles::hw_meter_line(state, state.frames.get(selected));
         h_flex()
             .gap_1()
             .p_1()
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .child(
-                IconButton::new("ggo-metasprite-frame-add", IconName::Plus)
+                IconButton::new("ggo-sprite-frame-add", IconName::Plus)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Add blank frame"))
                     .on_click(cx.listener(|this, _, _, cx| this.add_blank_frame(cx))),
             )
             .child(
-                IconButton::new("ggo-metasprite-frame-dup", IconName::Copy)
+                IconButton::new("ggo-sprite-frame-dup", IconName::Copy)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Duplicate frame"))
                     .on_click(cx.listener(|this, _, _, cx| this.duplicate_selected_frame(cx))),
             )
             .child(
-                IconButton::new("ggo-metasprite-frame-delete", IconName::Trash)
+                IconButton::new("ggo-sprite-frame-delete", IconName::Trash)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Delete frame"))
                     .disabled(len <= 1)
                     .on_click(cx.listener(|this, _, _, cx| this.delete_selected_frame(cx))),
             )
             .child(
-                IconButton::new("ggo-metasprite-frame-left", IconName::ChevronLeft)
+                IconButton::new("ggo-sprite-frame-left", IconName::ChevronLeft)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Move frame left"))
                     .disabled(selected == 0)
                     .on_click(cx.listener(|this, _, _, cx| this.move_selected_frame(-1, cx))),
             )
             .child(
-                IconButton::new("ggo-metasprite-frame-right", IconName::ChevronRight)
+                IconButton::new("ggo-sprite-frame-right", IconName::ChevronRight)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Move frame right"))
                     .disabled(selected + 1 >= len)
                     .on_click(cx.listener(|this, _, _, cx| this.move_selected_frame(1, cx))),
             )
             .child(div().flex_1())
+            .child(
+                Label::new(SharedString::from(meter))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
             .child(Label::new("ms").size(LabelSize::Small).color(Color::Muted))
             .child(
                 div().w(px(56.)).flex_none().children(
@@ -1888,7 +2588,7 @@ impl MetaSpritePanel {
         let accent = cx.theme().colors().border_focused;
         let state = open.store.state();
         div()
-            .id("ggo-metasprite-strip")
+            .id("ggo-sprite-strip")
             .flex_none()
             .p_1()
             .border_t_1()
@@ -1904,7 +2604,7 @@ impl MetaSpritePanel {
                             img(image.clone()).w(px(fit_w)).h(px(fit_h))
                         });
                         v_flex()
-                            .id(("ggo-metasprite-frame", ix))
+                            .id(("ggo-sprite-frame", ix))
                             .items_center()
                             .gap_0p5()
                             .p_0p5()
@@ -1941,9 +2641,9 @@ impl MetaSpritePanel {
                     .min_h_0()
                     .items_stretch()
                     .child(self.render_preview(cx))
+                    .child(self.render_tile_picker(cx))
                     .child(self.render_clips(cx)),
             )
-            .child(self.render_tiles(cx))
             .child(self.render_frame_ops(cx))
             .child(self.render_strip(cx))
             .into_any_element()
@@ -1957,7 +2657,7 @@ fn image_px_size(image: &Arc<RenderImage>) -> (u32, u32) {
     (size.width.0 as u32, size.height.0 as u32)
 }
 
-impl Render for MetaSpritePanel {
+impl Render for SpritePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_editors(window, cx);
         let body = match &self.state {
@@ -1968,6 +2668,7 @@ impl Render for MetaSpritePanel {
             ViewerState::Error(e) => self.render_message(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
+        let form = self.render_form(window, cx);
         v_flex()
             .key_context(self.dispatch_context(window, cx))
             .size_full()
@@ -1976,28 +2677,37 @@ impl Render for MetaSpritePanel {
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
-            .on_action(cx.listener(|this, _: &DeselectTile, _window, cx| this.deselect_tile(cx)))
+            .on_action(cx.listener(|this, _: &DeselectTile, _window, cx| {
+                // Escape dismisses an open form first: while one is up it
+                // is the thing the user is looking at, and a form that
+                // could only be closed by its Cancel button would be a
+                // trap the rest of the panel's Escape handling isn't.
+                if !this.cancel_form(cx) {
+                    this.deselect_tile(cx);
+                }
+            }))
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
+            .children(form)
             .child(div().flex_1().min_h_0().child(body))
     }
 }
 
-impl Focusable for MetaSpritePanel {
+impl Focusable for SpritePanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl EventEmitter<PanelEvent> for MetaSpritePanel {}
+impl EventEmitter<PanelEvent> for SpritePanel {}
 
-impl Panel for MetaSpritePanel {
+impl Panel for SpritePanel {
     fn persistent_name() -> &'static str {
-        "GGO MetaSprite"
+        "GGO Sprite"
     }
 
     fn panel_key() -> &'static str {
-        GGO_METASPRITE_PANEL_KEY
+        GGO_SPRITE_PANEL_KEY
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
@@ -2033,7 +2743,7 @@ impl Panel for MetaSpritePanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO MetaSprite")
+        Some("GGO Sprite")
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
@@ -2079,8 +2789,9 @@ mod tests {
     use super::*;
     use ggo_worldlib::sprites::cow::{ClipEdit, Frame};
     use ggo_worldlib::sprites::hw::{TILE_BYTES, TILE_PX};
-    use ggo_worldlib::sprites::io::{open_sprite, save_sprite};
+    use ggo_worldlib::sprites::io::{open_sprite, save_sprite, save_tileset};
     use ggo_worldlib::sprites::sprite_doc::DEFAULT_FRAME_DURATION_MS;
+    use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
     use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
     use gpui::TestAppContext;
     use project::{FakeFs, Project, WorktreeId};
@@ -2113,8 +2824,8 @@ mod tests {
 
         workspace.update(cx, |workspace, cx| {
             assert!(
-                workspace.panel::<MetaSpritePanel>(cx).is_some(),
-                "MetaSpritePanel should have been added to the workspace by init()"
+                workspace.panel::<SpritePanel>(cx).is_some(),
+                "SpritePanel should have been added to the workspace by init()"
             );
             assert!(
                 !workspace.right_dock().read(cx).is_open(),
@@ -2126,8 +2837,8 @@ mod tests {
 
         workspace.update(cx, |workspace, cx| {
             let panel = workspace
-                .panel::<MetaSpritePanel>(cx)
-                .expect("MetaSpritePanel should still be registered");
+                .panel::<SpritePanel>(cx)
+                .expect("SpritePanel should still be registered");
             assert_eq!(panel.read(cx).position, DockPosition::Right);
             assert!(
                 workspace.right_dock().read(cx).is_open(),
@@ -2212,12 +2923,12 @@ mod tests {
     async fn ready_panel(
         cx: &mut TestAppContext,
         root: &std::path::Path,
-    ) -> gpui::Entity<MetaSpritePanel> {
+    ) -> gpui::Entity<SpritePanel> {
         write_sprite_fixture(root);
         let root = root.to_path_buf();
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut panel = MetaSpritePanel::new(None, cx);
+                let mut panel = SpritePanel::new(None, cx);
                 panel.root_override = Some(root);
                 panel
             })
@@ -2313,7 +3024,7 @@ mod tests {
         });
     }
 
-    fn ready(panel: &MetaSpritePanel) -> &OpenSprite {
+    fn ready(panel: &SpritePanel) -> &OpenSprite {
         match &panel.state {
             ViewerState::Ready(open) => open,
             _ => panic!("expected Ready"),
@@ -2324,7 +3035,7 @@ mod tests {
 
     /// Dirty the open sprite (retime frame 0) so the close guard has
     /// something to protect.
-    fn dirty_the_sprite(panel: &Entity<MetaSpritePanel>, cx: &mut gpui::VisualTestContext) {
+    fn dirty_the_sprite(panel: &Entity<SpritePanel>, cx: &mut gpui::VisualTestContext) {
         panel.update(cx, |panel, cx| {
             assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
             assert!(
@@ -2449,7 +3160,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let panel = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<MetaSpritePanel>(cx)
+                .panel::<SpritePanel>(cx)
                 .expect("init() adds the panel")
         });
 
@@ -2564,7 +3275,7 @@ mod tests {
         let worktree_id = worktree_id(&project, cx);
         let panel = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<MetaSpritePanel>(cx)
+                .panel::<SpritePanel>(cx)
                 .expect("init() adds the panel")
         });
         let root = dir.path().to_path_buf();
@@ -2986,18 +3697,29 @@ mod tests {
         panel.update(cx, |panel, cx| {
             {
                 let open = ready(panel);
-                assert_eq!(open.pool_tiles.len(), 2, "one thumbnail per pool tile");
-                let t0 = open.pool_tiles[0].as_bytes(0).unwrap();
-                assert_eq!(t0.len(), TILE_PX * TILE_PX * 4);
-                assert!(
-                    t0.chunks_exact(4).all(|p| p[3] == 0),
-                    "tile 0 (all index 0) must compose fully transparent"
+                let strip = open.pool_strip.as_ref().expect("picker sheet composed");
+                assert_eq!(strip.tile_count, 2);
+                assert_eq!(
+                    (strip.cols, strip.rows),
+                    (2, 1),
+                    "a 2-tile pool is one row, clamped below PICKER_COLS"
                 );
-                let t1 = open.pool_tiles[1].as_bytes(0).unwrap();
-                assert!(
-                    t1.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
-                    "tile 1 (palette red) must compose opaque red in BGRA"
-                );
+                // One sheet, tile 0 then tile 1 side by side: every row is
+                // 16 transparent pixels followed by 16 opaque red ones.
+                let sheet = strip.image.as_bytes(0).unwrap();
+                assert_eq!(sheet.len(), 2 * TILE_PX * TILE_PX * 4);
+                for row in sheet.chunks_exact(2 * TILE_PX * 4) {
+                    assert!(
+                        row[..TILE_PX * 4].chunks_exact(4).all(|p| p[3] == 0),
+                        "tile 0 (all index 0) must compose fully transparent"
+                    );
+                    assert!(
+                        row[TILE_PX * 4..]
+                            .chunks_exact(4)
+                            .all(|p| p == [0, 0, 255, 255]),
+                        "tile 1 (palette red) must compose opaque red in BGRA"
+                    );
+                }
                 assert_eq!(open.selected_tile, None);
             }
 
@@ -3070,6 +3792,45 @@ mod tests {
             );
             assert_eq!(panel.preview_cell_at(gpui::point(px(9.), px(20.))), None);
             assert_eq!(panel.preview_cell_at(gpui::point(px(250.), px(20.))), None);
+        });
+    }
+
+    /// The picker's own click path -- the SOURCE half of "click a tile,
+    /// then click a frame cell to place it" -- over manually stamped
+    /// sheet bounds (the headless panel never paints). The 2-tile fixture
+    /// lays out as one row of two [`PICKER_CELL_PX`] cells, so the sheet
+    /// splits at its midpoint; anything past the tiles selects nothing
+    /// rather than the nearest one.
+    #[gpui::test]
+    async fn test_tile_picker_click_selects_the_tile_under_the_cursor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            *ready(panel).picker_bounds.borrow_mut() = Some(gpui::bounds(
+                gpui::point(px(10.), px(20.)),
+                gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX)),
+            ));
+
+            panel.on_picker_click(gpui::point(px(12.), px(22.)), cx);
+            assert_eq!(ready(panel).selected_tile, Some(0));
+
+            panel.on_picker_click(gpui::point(px(10. + PICKER_CELL_PX), px(22.)), cx);
+            assert_eq!(ready(panel).selected_tile, Some(1), "second cell, tile 1");
+
+            // Placing it is the already-shipped `FrameTileSet` path.
+            panel.select_frame(0, cx);
+            panel.set_tile_on_cell(0, cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![1]);
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![0]);
+            assert!(!ready(panel).store.dirty());
+
+            // Outside the two tiles: no selection change at all.
+            panel.on_picker_click(gpui::point(px(9.), px(22.)), cx);
+            assert_eq!(ready(panel).selected_tile, Some(1));
+            panel.on_picker_click(gpui::point(px(10. + PICKER_CELL_PX * 2.), px(22.)), cx);
+            assert_eq!(ready(panel).selected_tile, Some(1));
         });
     }
 
@@ -3260,7 +4021,7 @@ mod tests {
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut panel = MetaSpritePanel::new(None, cx);
+                let mut panel = SpritePanel::new(None, cx);
                 // The WORKTREE root -- the panel must narrow it itself.
                 panel.root_override = Some(root);
                 panel
@@ -3347,7 +4108,7 @@ mod tests {
         let root = dir.path().to_path_buf();
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut panel = MetaSpritePanel::new(None, cx);
+                let mut panel = SpritePanel::new(None, cx);
                 panel.root_override = Some(root);
                 panel
             })
@@ -3419,7 +4180,7 @@ mod tests {
         root: &std::path::Path,
     ) -> (
         Entity<Workspace>,
-        Entity<MetaSpritePanel>,
+        Entity<SpritePanel>,
         WorktreeId,
         &'a mut gpui::VisualTestContext,
     ) {
@@ -3430,7 +4191,7 @@ mod tests {
         let worktree_id = worktree_id(&project, cx);
         let panel = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<MetaSpritePanel>(cx)
+                .panel::<SpritePanel>(cx)
                 .expect("init() adds the panel")
         });
         let root = root.to_path_buf();
@@ -3440,7 +4201,7 @@ mod tests {
 
     /// Load `rel` into the workspace's own panel and leave it Ready.
     fn open_in_menu_panel(
-        panel: &Entity<MetaSpritePanel>,
+        panel: &Entity<SpritePanel>,
         cx: &mut gpui::VisualTestContext,
         rel: &str,
     ) {
@@ -3451,10 +4212,13 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// The two entries are offered for a `.spr` and for NOTHING else --
+    /// The file entries are offered for a `.spr` and for NOTHING else --
     /// the same extension rule the open interceptor uses
-    /// ([`is_sprite_path`]), so a `.til` sidecar, a plain text file, and
-    /// the containing DIRECTORY all leave upstream's menu as it was.
+    /// ([`is_sprite_path`]), so a `.til` sidecar and a plain text file
+    /// leave upstream's menu as it was. A DIRECTORY gets the two "New …"
+    /// entries instead, and only inside an emerald project's assets tree
+    /// (this fixture has no `emerald.toml`, so every directory here is
+    /// outside one).
     #[gpui::test]
     async fn test_context_menu_offers_sprite_ops_only_for_spr_files(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -3470,8 +4234,8 @@ mod tests {
 
         assert_eq!(
             contributed("sprites/hero.spr", false, cx),
-            2,
-            "a .spr must get Duplicate + Delete"
+            3,
+            "a .spr must get Duplicate + Rename + Delete"
         );
         assert_eq!(
             contributed("sprites/hero.til", false, cx),
@@ -3482,7 +4246,7 @@ mod tests {
         assert_eq!(
             contributed("sprites", true, cx),
             0,
-            "the containing directory is not a sprite"
+            "a directory outside an emerald assets tree gets nothing"
         );
     }
 
@@ -3697,6 +4461,484 @@ mod tests {
                 panic!("deleting another sprite must not disturb the open one");
             };
             assert_eq!(open.source_rel, "sprites/hero.spr");
+        });
+    }
+
+    // ------------------------------ New Sprite / New Metasprite / Rename
+
+    /// The tileset a new sprite binds to: three tiles, each filled with a
+    /// different palette index, so a bound sprite's pool is verifiable
+    /// tile by tile.
+    const FIXTURE_TILES: usize = 3;
+
+    /// An emerald project holding one tileset and one sprite, laid out the
+    /// way the menu entries see it: `emerald.toml` at the root,
+    /// `assets/tiles/world.til` (+ `.pal`), `assets/sprites/hero.spr` (+
+    /// its own trio). The sprite is deliberately NOT bound to `world.til`
+    /// -- a new sprite binding to it must not perturb an unrelated one.
+    fn emerald_with_tileset() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("emerald.toml"),
+            "[project]\nname='t'\ntitle='t'\n",
+        )
+        .unwrap();
+        let assets = dir.path().join("assets");
+        std::fs::create_dir_all(assets.join("tiles")).unwrap();
+        std::fs::create_dir_all(assets.join("sprites")).unwrap();
+        let mut indices = vec![0u8; FIXTURE_TILES * TILE_PIXELS];
+        for (t, chunk) in indices.chunks_exact_mut(TILE_PIXELS).enumerate() {
+            chunk.fill(t as u8);
+        }
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800; // pure 565 red
+        palette[2] = 0x07E0; // pure 565 green
+        save_tileset(
+            &assets,
+            "tiles/world.til",
+            &indices,
+            FIXTURE_TILES,
+            &palette,
+        )
+        .unwrap();
+        write_sprite_fixture_at(&assets, "sprites/hero");
+        dir
+    }
+
+    /// [`menu_workspace`] over [`emerald_with_tileset`]: the fake-fs
+    /// worktree is inserted AT the real temp path, so the contributor's
+    /// `is_assets_dir` stats (which run against the worktree's `abs_path`)
+    /// see the real `emerald.toml`.
+    async fn emerald_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<SpritePanel>,
+        WorktreeId,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            root,
+            serde_json::json!({
+                "emerald.toml": "",
+                "scratch": { "notes.txt": "" },
+                "assets": {
+                    "tiles": { "world.til": "", "world.pal": "" },
+                    "sprites": { "hero.spr": "", "hero.til": "", "hero.pal": "" },
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<SpritePanel>(cx)
+                .expect("init() adds the panel")
+        });
+        let root = root.to_path_buf();
+        panel.update(cx, |panel, _| panel.root_override = Some(root));
+        (workspace, panel, worktree_id, cx)
+    }
+
+    /// The "New …" entries are offered for directories inside the asset
+    /// root and for nothing else -- not the project root, not a directory
+    /// outside `assets/`, and not a file (which gets the file ops
+    /// instead).
+    #[gpui::test]
+    async fn test_context_menu_offers_new_sprite_entries_on_assets_dirs(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let (workspace, _panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let contributed = |rel: &str, is_dir: bool, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace
+                    .context_menu_contributions(&project_path(worktree_id, rel), is_dir, window, cx)
+                    .len()
+            })
+        };
+        assert_eq!(
+            contributed("assets", true, cx),
+            2,
+            "the asset root itself: New Sprite + New Metasprite"
+        );
+        assert_eq!(contributed("assets/sprites", true, cx), 2, "and below it");
+        assert_eq!(
+            contributed("", true, cx),
+            0,
+            "the project root is not assets"
+        );
+        assert_eq!(contributed("scratch", true, cx), 0, "outside assets/");
+        assert_eq!(
+            contributed("assets/sprites/hero.spr", false, cx),
+            3,
+            "a file still gets the file ops, not the New entries"
+        );
+    }
+
+    /// Fire the real menu handler and answer the tileset form's Create.
+    fn new_via_menu(
+        workspace: &Entity<Workspace>,
+        panel: &Entity<SpritePanel>,
+        kind: NewKind,
+        dir_rel: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let handler = new_sprite_handler(workspace.downgrade(), kind, dir_rel.to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.confirm_new(cx));
+        cx.run_until_parked();
+    }
+
+    /// "New Sprite…" writes a real, BOUND `.spr`: it round-trips through
+    /// worldlib's own `open_sprite`, its sidecar rels are the chosen
+    /// tileset's (asset-root-relative, no `assets/` segment -- the
+    /// `ggo-sprfix` contract), its pool is that tileset's tiles, it has
+    /// exactly ONE frame and NO clips (a sprite is a single frame), and it
+    /// is left open in the panel. A second invocation takes the next free
+    /// name rather than clobbering the first.
+    #[gpui::test]
+    async fn test_new_sprite_creates_a_bound_single_frame_sprite(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        // The form opens with the project's tilesets and writes nothing.
+        let handler = new_sprite_handler(
+            workspace.downgrade(),
+            NewKind::Sprite,
+            "assets/sprites".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            let Some(PanelForm::New { kind, tilesets, .. }) = &panel.form else {
+                panic!("New Sprite… must open the binding form");
+            };
+            assert_eq!(*kind, NewKind::Sprite);
+            assert_eq!(
+                tilesets,
+                &vec![
+                    "sprites/hero.til".to_string(),
+                    "tiles/world.til".to_string()
+                ],
+                "every .til under the asset root, asset-root-relative"
+            );
+        });
+        assert!(
+            !assets.join("sprites/sprite.spr").exists(),
+            "opening the form must not write anything yet"
+        );
+
+        panel.update(cx, |panel, cx| panel.select_new_tileset(1, cx));
+        panel.update(cx, |panel, cx| panel.confirm_new(cx));
+        cx.run_until_parked();
+
+        let opened = open_sprite(&assets, "sprites/sprite.spr").expect("round-trips");
+        assert_eq!(opened.til_path, "tiles/world.til");
+        assert_eq!(opened.pal_path, "tiles/world.pal");
+        assert_eq!(opened.state.tile_count, FIXTURE_TILES, "bound pool");
+        assert_eq!(opened.state.frames.len(), 1, "a sprite is ONE frame");
+        assert!(opened.state.clips.is_empty(), "and defines no clips");
+        assert_eq!(
+            (opened.state.w_tiles, opened.state.h_tiles),
+            (NEW_SPRITE_TILES, NEW_SPRITE_TILES)
+        );
+        assert!(
+            opened.state.frames[0].map.iter().all(|&t| t == 0),
+            "every cell addresses a tile the bound pool actually has"
+        );
+        // The bytes on disk must never carry the `assets/` prefix.
+        let text =
+            String::from_utf8_lossy(&std::fs::read(assets.join("sprites/sprite.spr")).unwrap())
+                .into_owned();
+        assert!(text.contains("tiles/world.til"), "{text:?}");
+        assert!(!text.contains("assets/tiles/world.til"), "{text:?}");
+
+        panel.update(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.source_rel, "assets/sprites/sprite.spr");
+            assert_eq!(open.rel_path, "sprites/sprite.spr");
+            assert_eq!(open.root, assets);
+            assert!(!open.store.dirty(), "creating it is not an unsaved edit");
+            let strip = open.pool_strip.as_ref().expect("picker sheet composed");
+            assert_eq!(
+                strip.tile_count, FIXTURE_TILES,
+                "the picker offers the bound tileset's tiles"
+            );
+            assert!(panel.form.is_none(), "the form closes on Create");
+        });
+
+        // Second run: next free name, not a clobber.
+        new_via_menu(&workspace, &panel, NewKind::Sprite, "assets/sprites", cx);
+        assert!(assets.join("sprites/sprite-2.spr").is_file());
+        panel.update(cx, |panel, _| {
+            assert_eq!(ready(panel).source_rel, "assets/sprites/sprite-2.spr");
+        });
+    }
+
+    /// "New Metasprite…" seeds the OTHER usage of the same format:
+    /// several frames plus a first clip over them. Everything else --
+    /// binding, sidecars, round trip -- is identical to a sprite's,
+    /// because it is the same file type.
+    #[gpui::test]
+    async fn test_new_metasprite_seeds_frames_and_a_first_clip(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        new_via_menu(&workspace, &panel, NewKind::Metasprite, "assets", cx);
+
+        let opened = open_sprite(&assets, "metasprite.spr").expect("round-trips");
+        assert_eq!(opened.state.frames.len(), NEW_METASPRITE_FRAMES);
+        assert_eq!(
+            opened.state.clips,
+            vec![ClipEdit {
+                name: NEW_METASPRITE_CLIP.to_string(),
+                from: 0,
+                to: NEW_METASPRITE_FRAMES - 1,
+                loop_: true,
+            }],
+            "a metasprite is clip definitions over its frames"
+        );
+        assert_eq!(
+            opened.til_path, "sprites/hero.til",
+            "first tileset by default"
+        );
+        panel.update(cx, |panel, _| {
+            assert_eq!(ready(panel).source_rel, "assets/metasprite.spr");
+        });
+    }
+
+    /// Binding must not disturb the tileset it binds TO. `save_sprite`
+    /// writes the document's pool back to `til_path`, so a new sprite
+    /// rewrites the `.til` it just adopted -- with byte-identical content,
+    /// or every existing sprite sharing that tileset silently changes.
+    #[gpui::test]
+    async fn test_new_sprite_leaves_the_bound_tileset_byte_identical(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let before_til = std::fs::read(assets.join("tiles/world.til")).unwrap();
+        let before_pal = std::fs::read(assets.join("tiles/world.pal")).unwrap();
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let handler = new_sprite_handler(
+            workspace.downgrade(),
+            NewKind::Sprite,
+            "assets/sprites".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.select_new_tileset(1, cx));
+        panel.update(cx, |panel, cx| panel.confirm_new(cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read(assets.join("tiles/world.til")).unwrap(),
+            before_til,
+            "binding must round-trip the .til byte for byte"
+        );
+        assert_eq!(
+            std::fs::read(assets.join("tiles/world.pal")).unwrap(),
+            before_pal
+        );
+    }
+
+    /// **The M2 lesson, structurally.** "New …" runs the unsaved-edits
+    /// guard BEFORE it opens the form, and the form is the only thing that
+    /// writes -- so a Cancel at the prompt leaves no orphaned file, no
+    /// form, and the dirty document exactly as it was.
+    #[gpui::test]
+    async fn test_new_sprite_cancel_with_a_dirty_document_writes_nothing(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "assets/sprites/hero.spr");
+        panel.update(cx, |panel, cx| {
+            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+        });
+
+        let handler = new_sprite_handler(
+            workspace.downgrade(),
+            NewKind::Sprite,
+            "assets/sprites".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        assert_eq!(
+            cx.pending_prompt().map(|(msg, _)| msg),
+            Some(
+                "assets/sprites/hero.spr contains unsaved edits. Do you want to save it?"
+                    .to_string()
+            ),
+            "creating a sprite while the open one is dirty must prompt FIRST"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(
+            !assets.join("sprites/sprite.spr").exists(),
+            "Cancel must not leave a file behind"
+        );
+        panel.update(cx, |panel, _| {
+            assert!(panel.form.is_none(), "and no form is left open");
+            let open = ready(panel);
+            assert_eq!(open.source_rel, "assets/sprites/hero.spr");
+            assert!(open.store.dirty(), "the edits stay put");
+        });
+        assert_eq!(
+            open_sprite(&assets, "sprites/hero.spr")
+                .unwrap()
+                .state
+                .frames[0]
+                .duration_ms,
+            100,
+            "and nothing was written for them either"
+        );
+    }
+
+    /// The typed-name rules, without a filesystem.
+    #[gpui::test]
+    fn test_rename_target_keeps_the_file_in_its_directory(_cx: &mut gpui::App) {
+        assert_eq!(
+            rename_target("assets/sprites/hero.spr", "villain"),
+            Ok("assets/sprites/villain.spr".to_string())
+        );
+        assert_eq!(
+            rename_target("hero.spr", " villain "),
+            Ok("villain.spr".to_string()),
+            "trimmed, and a root-level sprite keeps no directory"
+        );
+        assert_eq!(
+            rename_target("assets/hero.spr", "villain.spr"),
+            Ok("assets/villain.spr".to_string()),
+            "a retyped extension is not doubled"
+        );
+        assert!(rename_target("a/hero.spr", "   ").is_err(), "empty");
+        assert!(
+            rename_target("a/hero.spr", "sub/villain").is_err(),
+            "a rename may not move the file: it would strand a sibling sidecar"
+        );
+        assert!(rename_target("a/hero.spr", "..").is_err());
+        assert_eq!(rename_seed("assets/sprites/hero.spr"), "hero");
+        assert_eq!(rename_seed("hero.spr"), "hero");
+    }
+
+    /// Rename end to end: the file moves, **its sidecars do not** -- and
+    /// the renamed sprite still resolves the same `.til`/`.pal` through
+    /// worldlib's own `open_sprite`, which is the whole point (the stored
+    /// rels are asset-root-relative, so the `.spr`'s own name never
+    /// entered into them). The open document follows the file: its title
+    /// path and its save target both repoint, and a save after the rename
+    /// lands on the new name.
+    #[gpui::test]
+    async fn test_rename_sprite_preserves_sidecars_and_the_open_document_follows(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "assets/sprites/hero.spr");
+
+        let handler =
+            rename_sprite_handler(workspace.downgrade(), "assets/sprites/hero.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        panel.update(cx, |panel, cx| {
+            let Some(PanelForm::Rename { editor, .. }) = &panel.form else {
+                panic!("Rename Sprite… must open the rename form");
+            };
+            assert_eq!(editor.read(cx).text(cx), "hero", "prefilled with the stem");
+        });
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let Some(PanelForm::Rename { editor, .. }) = &panel.form else {
+                    unreachable!()
+                };
+                editor.update(cx, |editor, cx| editor.set_text("villain", window, cx));
+                panel.confirm_rename(cx);
+            })
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !assets.join("sprites/hero.spr").exists(),
+            "the old name is gone"
+        );
+        assert!(assets.join("sprites/villain.spr").is_file());
+        assert!(
+            assets.join("sprites/hero.til").is_file() && assets.join("sprites/hero.pal").is_file(),
+            "the sidecars keep their names -- they are shareable, and renaming \
+             them would mean rewriting the stored rels"
+        );
+
+        let opened = open_sprite(&assets, "sprites/villain.spr")
+            .expect("a renamed sprite must still resolve its tileset");
+        assert_eq!(opened.til_path, "sprites/hero.til");
+        assert_eq!(opened.pal_path, "sprites/hero.pal");
+        assert_eq!(opened.state.tile_count, 2, "the fixture pool came through");
+
+        // The document followed the file, and saves to the new name.
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                assert!(panel.form.is_none());
+                assert_eq!(open.source_rel, "assets/sprites/villain.spr");
+                assert_eq!(open.rel_path, "sprites/villain.spr");
+            }
+            panel.commit_edit(EditTarget::Duration, "40".into(), cx);
+            panel.save_impl(cx);
+            assert!(ready(panel).save_error.is_none());
+        });
+        assert_eq!(
+            open_sprite(&assets, "sprites/villain.spr")
+                .unwrap()
+                .state
+                .frames[0]
+                .duration_ms,
+            40
+        );
+    }
+
+    /// A rename onto a name that is already taken is refused inline: the
+    /// form stays open with the message, and neither file moves.
+    #[gpui::test]
+    async fn test_rename_refuses_a_name_that_already_exists(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        write_sprite_fixture_at(&assets, "sprites/other");
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let handler =
+            rename_sprite_handler(workspace.downgrade(), "assets/sprites/hero.spr".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let Some(PanelForm::Rename { editor, .. }) = &panel.form else {
+                    unreachable!()
+                };
+                editor.update(cx, |editor, cx| editor.set_text("other", window, cx));
+                panel.confirm_rename(cx);
+            })
+        });
+
+        assert!(assets.join("sprites/hero.spr").is_file(), "nothing moved");
+        panel.update(cx, |panel, _| {
+            let Some(PanelForm::Rename { error, .. }) = &panel.form else {
+                panic!("the form must stay open on a refused name");
+            };
+            assert_eq!(
+                error.as_deref(),
+                Some("assets/sprites/other.spr already exists")
+            );
         });
     }
 }

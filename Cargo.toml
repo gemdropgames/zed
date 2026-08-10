@@ -356,7 +356,7 @@ ggo_emu_panel = { path = "crates/ggo/emu_panel" } # GGO
 ggo_import_panel = { path = "crates/ggo/import_panel" } # GGO
 ggo_language = { path = "crates/ggo/language" } # GGO
 ggo_map_panel = { path = "crates/ggo/map_panel" } # GGO
-ggo_metasprite_panel = { path = "crates/ggo/metasprite_panel" } # GGO
+ggo_sprite_panel = { path = "crates/ggo/sprite_panel" } # GGO
 ggo_tileset_panel = { path = "crates/ggo/tileset_panel" } # GGO
 ggo_world_panel = { path = "crates/ggo/world_panel" } # GGO
 git = { path = "crates/git" }

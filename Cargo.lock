@@ -7636,7 +7636,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ggo_metasprite_panel"
+name = "ggo_sprite_panel"
 version = "0.1.0"
 dependencies = [
  "editor",
@@ -24444,7 +24444,7 @@ dependencies = [
  "ggo_import_panel",
  "ggo_language",
  "ggo_map_panel",
- "ggo_metasprite_panel",
+ "ggo_sprite_panel",
  "ggo_tileset_panel",
  "ggo_world_panel",
  "git",

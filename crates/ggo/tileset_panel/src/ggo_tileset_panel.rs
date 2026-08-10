@@ -8,7 +8,7 @@
 //! here: no store, no ops, no save, no dirty state. That is a product
 //! decision, not an oversight -- pixel editing stays in ggo-ide for now.
 //! The direct consequence for this module: there is nothing this panel
-//! can lose, so unlike `ggo_world_panel`/`ggo_metasprite_panel` it has no
+//! can lose, so unlike `ggo_world_panel`/`ggo_sprite_panel` it has no
 //! `Panel::prepare_to_close` override and never calls
 //! `ggo_common::prepare_to_close_dirty`. If a `TilesetOp` is ever applied
 //! from this panel, BOTH must come back with it.
@@ -17,7 +17,7 @@
 //! clicking a `.til` there routes here through [`intercept_tileset_open`];
 //! the panel has no picker of its own.
 //!
-//! Structural mirror of `ggo_charts_panel`/`ggo_metasprite_panel`: `Panel`
+//! Structural mirror of `ggo_charts_panel`/`ggo_sprite_panel`: `Panel`
 //! impl, `ToggleFocus`, `observe_new` registration into every new
 //! workspace, a `KeymapEventChannel` observer scaffold, and off-thread
 //! loading behind a load-generation staleness guard. `loader` owns
@@ -126,7 +126,7 @@ fn bind_panel_keys(cx: &mut App) {
 /// file, for a path outside the primary worktree, and when no panel is
 /// docked.
 ///
-/// Note the extension split with `ggo_metasprite_panel`: a sprite's `.til`
+/// Note the extension split with `ggo_sprite_panel`: a sprite's `.til`
 /// is its tile POOL and is opened through the `.spr` that names it, so
 /// clicking the `.til` itself lands here (the sheet, read-only) rather than
 /// in the sprite editor. Both interceptors key off disjoint extensions, so
@@ -236,7 +236,7 @@ impl TilesetPanel {
     /// entry point from the file explorer ([`intercept_tileset_open`]);
     /// there is no in-panel picker.
     ///
-    /// No unsaved-document guard, unlike the world/metasprite panels: this
+    /// No unsaved-document guard, unlike the world/sprite panels: this
     /// viewer holds no edits (see the module doc), so there is nothing a
     /// switch could discard.
     ///
@@ -539,7 +539,7 @@ impl Panel for TilesetPanel {
         // (`assets/icons/blocks.svg` -- interlocking rectangles; grep for
         // grid/table/tile in assets/icons finds nothing else), and no
         // other panel uses it as its dock icon. `Image` is taken by
-        // `ggo_metasprite_panel`.
+        // `ggo_sprite_panel`.
         Some(IconName::Blocks)
     }
 
@@ -553,7 +553,7 @@ impl Panel for TilesetPanel {
 
     fn activation_priority(&self) -> u32 {
         // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_metasprite_panel` 9,
+        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
         // `ggo_charts_panel` 10, `ggo_emu_panel` 11 (grep
         // activation_priority across crates/).
         12

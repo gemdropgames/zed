@@ -127,7 +127,7 @@ const PNG_EXT: &str = "png";
 /// The emerald manifest that marks a project root, and the assets
 /// subdirectory hanging off it. Both are hardcoded upstream -- the assets
 /// dir is NOT a configurable `emerald.toml` key. Same pair
-/// `ggo_metasprite_panel` and `ggo_map_panel` resolve their sidecars with.
+/// `ggo_sprite_panel` and `ggo_map_panel` resolve their sidecars with.
 const EMERALD_MANIFEST: &str = "emerald.toml";
 const ASSETS_DIR: &str = "assets";
 
@@ -251,7 +251,7 @@ fn import_png_handler(
 /// Walk up from `start`'s own directory to the nearest emerald project root
 /// (the nearest ancestor holding `emerald.toml`, mirroring emerald's
 /// `Project::discover`), returning that project's `assets/` dir. Same
-/// function `ggo_metasprite_panel` uses to resolve a `.spr`'s root.
+/// function `ggo_sprite_panel` uses to resolve a `.spr`'s root.
 fn emerald_asset_root(start: &Path) -> Option<PathBuf> {
     let mut cur = start.parent();
     while let Some(dir) = cur {
@@ -1597,7 +1597,7 @@ impl Panel for ImportPanel {
         // exactly it, and `extensions_ui` uses it for installing), which is
         // what this panel does. No panel uses it as a dock icon, and the
         // GGO neighbours are all taken: `Blocks` is `ggo_tileset_panel`,
-        // `SquareDot` `ggo_map_panel`, `Image` `ggo_metasprite_panel`,
+        // `SquareDot` `ggo_map_panel`, `Image` `ggo_sprite_panel`,
         // `Public` `ggo_world_panel`.
         Some(IconName::Download)
     }
@@ -1612,7 +1612,7 @@ impl Panel for ImportPanel {
 
     fn activation_priority(&self) -> u32 {
         // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_metasprite_panel` 9,
+        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
         // `ggo_charts_panel` 10, `ggo_emu_panel` 11, `ggo_tileset_panel` 12,
         // `ggo_map_panel` 14 -- which deliberately left 13 for this panel
         // (grep activation_priority across crates/).

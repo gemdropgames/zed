@@ -1,4 +1,4 @@
-//! Pure playback-range and strip-layout math for the metasprite panel.
+//! Pure playback-range and strip-layout math for the sprite panel.
 //! The transport semantics mirror ggo-ide's `sprites/timeline.rs`
 //! (`play_range`/`play_loop`/`toggle_play`'s start-offset seeding); the
 //! per-timestamp frame walk itself lives in worldlib

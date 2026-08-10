@@ -46,7 +46,7 @@ ggo-ide is still in-tree and still the only place the "dropped" and several
 | Cross-page handoffs (Reports Re-run, World Emulate, inspector "→" sprite, Emulator View in Reports) | emu → charts "View in Reports" only | partial | Only that one hop shipped; the other three are listed separately below. |
 | Native OS confirm dialogs with per-dialog action binding | none | dropped | The destructive operations that used them (world delete, sprite delete, file delete, project remove) are not in the fork. |
 | Window-close unsaved-changes guard naming dirty pages | `ggo_common::prepare_to_close_dirty`, wired through each panel's `Panel::prepare_to_close` | ✓ | |
-| Typing guard (single-letter hotkeys suppressed while a text field is live) | gpui focus contexts (`not_editing` predicate on the metasprite panel; emu pad keys are focus-scoped) | ✓ | Real focus/blur exists here, so the Iced workaround is unnecessary. |
+| Typing guard (single-letter hotkeys suppressed while a text field is live) | gpui focus contexts (`not_editing` predicate on the sprite panel; emu pad keys are focus-scoped) | ✓ | Real focus/blur exists here, so the Iced workaround is unnecessary. |
 | Theme (22 Iced themes, persisted) | Zed themes | ✓ | |
 | `capture_lint` source lint | none | dropped | Guards an Iced `ButtonReleased`/`and_capture` bug class that has no gpui analogue. |
 
@@ -62,27 +62,27 @@ ggo-ide is still in-tree and still the only place the "dropped" and several
 ## 3. Assets page (pixel-art suite)
 
 This is the largest gap in the migration and the least ambiguous: per the fork
-spec, `ggo_metasprite_panel` is "animation creation/editing (clips/timeline)
+spec, `ggo_sprite_panel` is "animation creation/editing (clips/timeline)
 and tile setting … **not a full pixel editor**". Pixel authoring is not
 covered by the fork at all.
 
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | Browser rail: fuzzy filter over all sections, refresh | Zed project panel + file finder; clicking a `.spr`/`.til`/`.cart`/world `.toml` there routes directly into its GGO panel (F4) | partial | Generic file search, not asset-typed sections with extension badges. The in-panel pickers this row used to credit are all gone as of X4 — see the Assets/World/cart-library rows and Known deferrals for what explorer-driven routing does and doesn't cover. |
-| Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | Project-panel context menu: **Duplicate Sprite** + **Delete Sprite**, contributed by `ggo_metasprite_panel` (F5.0) | partial | Two of four. Duplicate goes through worldlib `open_sprite`->`save_sprite` from the LIVE document, so the copy gets its own `.til`/`.pal` and carries unsaved edits; Delete confirms, names unsaved edits, and unlinks the `.spr` only (the sidecars are shareable). **New** is still deferred — no CLI and no create affordance for the trio. **Rename** is deferred to F5.2: it needs text entry, `window.prompt` has none, and the spec rule is that forms live in panels. Divergence to note: ggo-ide's duplicate was a raw byte copy that made the two sprites pool-sharing siblings (`pages/assets/sprite.rs:626-631`); ours un-shares, because a shared pool makes `DocOp::Dedup`/`DocOp::PaletteRemap` return `DocError::PoolShared` on BOTH sprites (`sprite_doc.rs:627,:677`) — private sidecars are the only variant where either stays dedupable. The cost is real: `save_sprite` writes the full pool to the copy's `.til`, so duplicating out of a large shared tileset gives the copy a complete private pool, a cart-size multiplier per duplicate. |
+| Sprite rail ops: New / Duplicate / Rename / Delete `.spr` | Project-panel context menu: **New Sprite…** / **New Metasprite…** on an assets dir, **Duplicate Sprite** + **Rename Sprite…** + **Delete Sprite** on a `.spr`, contributed by `ggo_sprite_panel` (F5.0 + F5.2) | ✓ | All four. Duplicate goes through worldlib `open_sprite`->`save_sprite` from the LIVE document, so the copy gets its own `.til`/`.pal` and carries unsaved edits; Delete confirms, names unsaved edits, and unlinks the `.spr` only (the sidecars are shareable). **New** creates a blank `.spr` bound to a tileset picked in the panel (Sprite seeds one frame, Metasprite seeds frames plus a first clip); the binding is chosen rather than guessed, because a `.spr` — unlike a `.map` — has no legal unbound form (`open_sprite` hard-errors on an unreadable `.til`/`.pal`) and its pool IS that `.til`. **Rename** moves the `.spr` only, within its directory: the `.til`/`.pal` rels are assets-root-relative, so they survive untouched, and the sidecars stay shareable. Divergence to note: ggo-ide's duplicate was a raw byte copy that made the two sprites pool-sharing siblings (`pages/assets/sprite.rs:626-631`); ours un-shares, because a shared pool makes `DocOp::Dedup`/`DocOp::PaletteRemap` return `DocError::PoolShared` on BOTH sprites (`sprite_doc.rs:627,:677`) — private sidecars are the only variant where either stays dedupable. The cost is real: `save_sprite` writes the full pool to the copy's `.til`, so duplicating out of a large shared tileset gives the copy a complete private pool, a cart-size multiplier per duplicate. |
 | New tileset / new map | none | deferred | Same — no CLI, no panel. |
 | Files tree (create folder, delete file/dir, extension badges) | Zed project panel | partial | Create/delete/rename exist; the GGO extension badges do not. |
 | **Pixel editor**: 14 tools, brush sizes, mirror, pixel-perfect, shapes, marquee/lasso/wand, floating-selection move/flip/rotate, eyedropper, zoom/pan, per-editor undo | none | dropped | Explicit spec scope call. Pixel authoring is an external editor plus an import path. |
 | **Palette panel**: RGB565 16-slot editor, draft picker (5/6/5 sliders, 565 + 888 hex, quantized preview), swap / sort / ramp, shared-palette warnings | none | dropped | Part of the pixel-editor scope not taken. |
 | **Tile-pool panel** + dedup preview/apply | none | dropped | Same. Dedup still happens implicitly on metasprite save (worldlib's fold-back). |
-| Animation timeline: transport, clip lanes (name/from/to/loop/delete/add), frame strip (select, add, duplicate, delete, move, per-frame ms), playback honouring durations + clip range + loop | `ggo_metasprite_panel` | ✓ | |
+| Animation timeline: transport, clip lanes (name/from/to/loop/delete/add), frame strip (select, add, duplicate, delete, move, per-frame ms), playback honouring durations + clip range + loop | `ggo_sprite_panel` | ✓ | |
 | Onion skin (toggle, back/fwd ghost counts, opacity) | none | deferred | The timeline was ported without ghost compositing; no blocker beyond effort. |
-| Preview panel (1:1 live frame, background picker, LCD filter) | metasprite panel centre preview | partial | Live composed frame with aspect fit shipped; checker/black/white background picker and the LCD scanline filter did not. |
-| Hardware budget meter (4 traffic-light rows + tooltips) | metasprite panel `hw_meter_line` | partial | Same four value/cap pairs from worldlib `sprites::hw`, condensed into one header line — no per-row dots or tooltips. |
-| Per-cell tile assignment from the pool | metasprite panel tile palette + preview cell click | ✓ | |
+| Preview panel (1:1 live frame, background picker, LCD filter) | sprite panel centre preview | partial | Live composed frame with aspect fit shipped; checker/black/white background picker and the LCD scanline filter did not. |
+| Hardware budget meter (4 traffic-light rows + tooltips) | sprite panel `hw_meter_line` | partial | Same four value/cap pairs from worldlib `sprites::hw`, condensed into one header line — no per-row dots or tooltips. |
+| Per-cell tile assignment from the pool | sprite panel tile picker + preview cell click | ✓ | F5.2 gave the picker a real source: it composes the BOUND TILESET (the sprite's pool is that `.til` byte for byte) as one sheet via worldlib `unpack_til_to_indices` → `compose_tile_grid` → `indices_to_rgba`, the same three calls `ggo_tileset_panel` makes. |
 | Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | `ggo_tileset_panel` — read-only overview grid + 16-slot palette swatch row, integer zoom 1x-8x | partial | Viewing shipped (F4): routed off a `.til` click in the project panel, no in-panel picker. The **magnified tile canvas**, pencil/fill/eyedropper, palette slot editing, append/duplicate/delete-last and the cols setting are all still dropped — the fork's zoom magnifies the whole sheet, not one selected tile, so there is no per-tile editing surface at all. This is a viewer, not the editor ggo-ide had; do not read it as more than that. |
 | Map editor (`.map`): tileset binding, multi-tile stamp, H/V flip, palSub, brush/rect-fill/eraser/eyedropper, grid, zoom, resize | `ggo_map_panel` (F5.1 M2) — the fork's one editing surface | partial | Maps are **authored here, never imported** (user's call). Ported: tileset binding (`MapOp::BindTileset`, with the bound tileset's tiles as a rect-selectable stamp strip), multi-tile stamp placement, H/V flip and palSub on the stamp, rect-fill, eraser, eyedropper, grid toggle, pan, resize, undo/redo/save with the dirty guard. Opened by clicking a `.map` in the explorer, or created by "New Map…" on an assets directory (blank + **unbound**: cells are pool indices, so a guessed binding is worse than none — you bind from the panel). Not ported: the float zoom slider (integer 1x–8x ladder here, so 16px tiles never resample) and the palSub slider (a stepper over the same 0–15). **The real loss is the per-tileset `cols` setting.** ggo-ide resolves the tile-strip column count through the shared `resolve_and_migrate_cols`, keyed on the `.til` in `~/.ggo/ggo_ide.db`, so its map and tileset editors lay a given tileset out identically and the user can set that width. The fork has no db-backed cols and falls back to 8 columns (clamped) in both `ggo_map_panel` and `ggo_tileset_panel` — they still agree with each other, but not with a tileset authored at some other width. Because `cols` **is** the stamp coordinate system (`build_stamp` indexes `row * cols + col`), a tileset whose metatiles were laid out spatially contiguous at, say, 6 or 12 wide has them scattered across the fork's 8-wide reflow: those metatiles are no longer rect-selectable as one stamp, and have to be placed tile by tile. Defensible while the fork has no settings store, but it is a workflow regression for any non-8-wide tileset, not just a cosmetic relayout. Maps also still *render* in the world panel as backgrounds/tilemaps. |
-| PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | `ggo_import_panel` (F5.1 Task I2) — tileset-only | partial | Ported: crop rect + cell-grid overlay, quantized preview, commit to `.til`/`.pal` (assets-root-relative sidecars, overwrite-collision confirm), source-PNG cleanup confirm, "Import as tileset…" on a `.png` in the explorer, opening the result in `ggo_tileset_panel` on commit. **Sprite and Metasprite import modes are NOT ported, by design** — the domain model changed: a sprite is one frame and a metasprite is clips over frames, both assembled from tiles in `ggo_metasprite_panel`, not decoded straight from a PNG, so there is no destination for a `.spr` import to land in. `WizardState::sprite_import`/`Mode::{Sprite,Metasprite}` moved into worldlib verbatim (Task I1, dependency-light so splitting the file wasn't worth it) but the panel never calls them. |
+| PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | `ggo_import_panel` (F5.1 Task I2) — tileset-only | partial | Ported: crop rect + cell-grid overlay, quantized preview, commit to `.til`/`.pal` (assets-root-relative sidecars, overwrite-collision confirm), source-PNG cleanup confirm, "Import as tileset…" on a `.png` in the explorer, opening the result in `ggo_tileset_panel` on commit. **Sprite and Metasprite import modes are NOT ported, by design** — the domain model changed: a sprite is one frame and a metasprite is clips over frames, both assembled from tiles in `ggo_sprite_panel`, not decoded straight from a PNG, so there is no destination for a `.spr` import to land in. `WizardState::sprite_import`/`Mode::{Sprite,Metasprite}` moved into worldlib verbatim (Task I1, dependency-light so splitting the file wasn't worth it) but the panel never calls them. |
 | Legacy `.meta.json` sidecar import | none | dropped | One-shot migration aid for a format generation that is already past. |
 | Save / dirty marker / save-status / discard guards | Per-panel Save button + dirty dot + `ctrl-s`/`cmd-s` + inline `save failed:` | partial | Per-document save and dirty state shipped; the cross-page discard confirms and the "doc changed during save" race message did not. |
 | Draggable splitters (rail / right column) persisted | Zed dock resize | ✓ | |
@@ -104,7 +104,7 @@ covered by the fork at all.
 | "+ Merge" fuzzy world search → add instance | "+ Instance" dropdown over cycle-guarded `merge_candidates` | partial | Instance add shipped, including the cycle guard and immediate subtree resolve; the fuzzy-search picker UI became a plain dropdown. |
 | Delete entity / remove instance | `Delete selected` button + `delete`/`backspace` | partial | ggo-ide confirms before removing an instance; the fork does not confirm anything. |
 | Inspector: schema-driven typed fields (int/fixed/str/bool/vec2), asset dropdowns, MetaSprite clip dropdown, per-component Remove, "+ Add component…" | world panel `inspector` | ✓ | Commit on Enter **and** on blur — strictly better than ggo-ide's Enter-only. |
-| MetaSprite `stem` "→" goto sprite on Assets | none | deferred | Cross-panel navigation (world → metasprite panel) is unwired; on the F2 gap list. |
+| MetaSprite `stem` "→" goto sprite on Assets | none | deferred | Cross-panel navigation (world → sprite panel) is unwired; on the F2 gap list. |
 | Background merging from instances (priority, first-claimant, drawn at origin) | ✓ (worldlib `backgrounds::MergedBackground`) | ✓ | |
 | Undo / redo / dirty / Save (`WorldDocStore` + `write_world`) | ✓ | ✓ | |
 | "Emulate" (save, full-system build with this boot world, jump to Emulator) | `emd: run` task, or the emu panel on an already-packed `.cart` | deferred | On the F2 gap list. The panel cannot bake a boot world, and no task takes one. |
@@ -213,8 +213,8 @@ edit and `emd` is a command you run.
 
 | Status | Rows |
 |---|---|
-| ✓ | 32 |
-| partial | 32 |
+| ✓ | 33 |
+| partial | 31 |
 | deferred | 28 |
 | dropped | 11 |
 | **total** | **103** |
@@ -238,6 +238,8 @@ and "Sprite rail ops" deferred → partial, both on the project-panel context-me
 contributor hook. Before G2: ✓ 31 / partial 29 / deferred 31 / dropped 12.
 After: ✓ 32 / partial 30 / deferred 29 / dropped 12.)
 
+(F5.2/S2: **one row moved.** "Sprite rail ops: New / Duplicate / Rename / Delete `.spr`" partial → ✓, now that New Sprite…/New Metasprite… and Rename Sprite… ship alongside Duplicate and Delete. Before S2: ✓ 32 / partial 32 / deferred 28 / dropped 11. After: ✓ 33 / partial 31 / deferred 28 / dropped 11.)
+
 (F5.1 wrap: **two more rows moved**, plus a table correction. "Map editor"
 went dropped → partial when M2 shipped `ggo_map_panel` (fix-round commit
 `811a84d872`, ahead of this wrap — that commit updated the row's own text but
@@ -254,7 +256,7 @@ feature and are excluded, except that the LSP row there is a deferral in its
 own right.)
 
 Read that shape honestly: the panels the fork set out to build (world,
-metasprite, charts, emulator) are largely ✓; the *ancillary* pages — Emerald
+sprite, charts, emulator) are largely ✓; the *ancillary* pages — Emerald
 ops, Device, Settings, Reports' non-chart furniture — are mostly "partial via a
 task or a text file"; and the pixel-art half of Assets is a deliberate drop
 with no replacement in this repo.
@@ -288,7 +290,7 @@ guards and follow-ups that someone has to pick up:
   implements the `Window::drop_image` release contract (double-buffered retire,
   full release on stop, `on_release` at teardown). `ggo_world_panel` rebuilds
   its whole image cache on add-instance and on every world switch, and
-  `ggo_metasprite_panel` rebuilds every frame + pool-tile `RenderImage` after
+  `ggo_sprite_panel` rebuilds every frame + pool-tile `RenderImage` after
   *every* op/undo/redo/save — neither ever calls `drop_image`, so both leak
   atlas tiles at edit frequency. Bounded by session length, not by a loop, so it
   was not an F2/F3 blocker; it is still a real leak.
@@ -330,7 +332,7 @@ guards and follow-ups that someone has to pick up:
   here because it is a visible rendering difference, not just an internal one.
 - **Upstream's generic "Duplicate" is still in the menu for a `.spr` (F5.0).**
   `project_panel.rs`'s own "Duplicate" (`:1182`) sits three separator groups
-  above `ggo_metasprite_panel`'s "Duplicate Sprite", and it performs precisely
+  above `ggo_sprite_panel`'s "Duplicate Sprite", and it performs precisely
   the raw byte copy the sprite entry exists to avoid: the resulting file points
   at the ORIGINAL's `.til`/`.pal`, which flips both sprites into `pool_shared`
   and makes `DocOp::Dedup`/`DocOp::PaletteRemap` fail on the source. Two

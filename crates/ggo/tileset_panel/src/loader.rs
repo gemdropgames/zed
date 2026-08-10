@@ -1,7 +1,7 @@
 //! Off-thread tileset loading + the pure grid geometry the viewer needs:
 //! open one `.til` (worldlib resolves its companion `.pal` itself) and
 //! compose the whole tile sheet into a single BGRA [`RenderImage`] -- the
-//! tileset-panel analog of `ggo_metasprite_panel::loader` (same one-shot
+//! tileset-panel analog of `ggo_sprite_panel::loader` (same one-shot
 //! background pass; the panel guards staleness with a load-generation
 //! counter).
 //!
@@ -41,7 +41,7 @@ pub struct LoadedTileset {
     pub pal_path: String,
     /// The whole tile sheet as ONE composed BGRA image. Built once at
     /// load: nothing in this panel mutates the tileset, so there is no
-    /// invalidation point at all (contrast `ggo_metasprite_panel`'s
+    /// invalidation point at all (contrast `ggo_sprite_panel`'s
     /// rebuild-after-every-op).
     pub grid: Arc<RenderImage>,
     /// `grid`'s pixel size, kept alongside it so the zoom math doesn't

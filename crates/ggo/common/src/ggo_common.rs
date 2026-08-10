@@ -3,7 +3,7 @@
 //! "A cached and processed image, in BGRA format"; worldlib composes
 //! straight-alpha RGBA, so only a channel swap is needed, no alpha
 //! unpremultiply), the unsaved-document close guard shared by the world and
-//! metasprite panels, the destructive-action confirmation every GGO file op
+//! sprite panels, the destructive-action confirmation every GGO file op
 //! goes through, and the file-explorer glue every panel's
 //! `PathOpenInterceptor` and `ContextMenuContributor` needs. Deliberately
 //! depends on no worldlib, so any GGO panel can use it without pulling in

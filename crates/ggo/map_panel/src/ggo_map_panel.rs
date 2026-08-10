@@ -98,7 +98,7 @@ const MAP_EXT: &str = "map";
 /// The emerald manifest that marks a project root, and the assets
 /// subdirectory hanging off it. Both are hardcoded upstream -- the assets
 /// dir is NOT a configurable `emerald.toml` key. Same pair
-/// `ggo_metasprite_panel` resolves a `.spr`'s sidecars with.
+/// `ggo_sprite_panel` resolves a `.spr`'s sidecars with.
 const EMERALD_MANIFEST: &str = "emerald.toml";
 const ASSETS_DIR: &str = "assets";
 
@@ -206,7 +206,7 @@ fn is_map_path(path: &ProjectPath) -> bool {
 /// and when no panel is docked.
 ///
 /// One of five such predicates: `**/worlds/**/*.toml` (`ggo_world_panel`),
-/// `*.cart` (`ggo_emu_panel`), `*.spr` (`ggo_metasprite_panel`),
+/// `*.cart` (`ggo_emu_panel`), `*.spr` (`ggo_sprite_panel`),
 /// `*.til` (`ggo_tileset_panel`), and `*.map`. All five key off disjoint
 /// paths, so registration order between them doesn't matter -- and it
 /// isn't documented here because it drifts with alphabetical crate init
@@ -298,7 +298,7 @@ fn new_map_handler(
 /// nearest ancestor holding `emerald.toml`, mirroring emerald's
 /// `Project::discover` -- returning that project's `assets/` dir.
 ///
-/// The `ggo_metasprite_panel` twin takes a FILE and starts at its parent;
+/// The `ggo_sprite_panel` twin takes a FILE and starts at its parent;
 /// this one takes a directory and starts at the directory itself, because
 /// "New Map…" is offered on `assets/` itself as well as on subdirectories.
 fn emerald_asset_root(dir: &Path) -> Option<PathBuf> {
@@ -321,7 +321,7 @@ fn is_assets_dir(dir: &Path) -> bool {
 /// The asset root a `.map` resolves its `til_path`/`pal_path` against, plus
 /// the map's path relative to THAT root.
 ///
-/// Same rule (and same reason) as `ggo_metasprite_panel::split_sprite_path`:
+/// Same rule (and same reason) as `ggo_sprite_panel::split_sprite_path`:
 /// emerald treats an asset's sidecar rels as **asset-root-relative**, where
 /// the asset root is `<project>/assets`. Clicking `<proj>/assets/maps/a.map`
 /// therefore has to yield root `<proj>/assets` and rel `maps/a.map`, so the
@@ -1894,7 +1894,7 @@ impl Panel for MapPanel {
         // nothing matching grid/layer/table/map/tile), and the three
         // closest shapes are already dock icons: `Blocks` is
         // `ggo_tileset_panel`, `Public` is `ggo_world_panel`, `Image` is
-        // `ggo_metasprite_panel`. `SquareDot` -- a rounded square with a
+        // `ggo_sprite_panel`. `SquareDot` -- a rounded square with a
         // dot at its centre -- reads as one cell of a grid, which is what
         // this panel places, and no panel uses it as a dock icon.
         Some(IconName::SquareDot)
@@ -1910,7 +1910,7 @@ impl Panel for MapPanel {
 
     fn activation_priority(&self) -> u32 {
         // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_metasprite_panel` 9,
+        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
         // `ggo_charts_panel` 10, `ggo_emu_panel` 11, `ggo_tileset_panel`
         // 12 (grep activation_priority across crates/). 13 is left for
         // F5.1's import panel, which lands in parallel with this task.

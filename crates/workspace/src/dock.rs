@@ -102,7 +102,7 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
         None
     }
     // GGO: dock panels can own unsaved documents of their own (the GGO
-    // world/metasprite editors keep a doc store in panel state, not in a
+    // world/sprite editors keep a doc store in panel state, not in a
     // workspace `Item`), which `Workspace::save_all_internal` cannot see.
     // `Workspace::prepare_to_close` awaits this for every panel in every
     // dock, so returning `false` vetoes the close exactly like a cancelled

@@ -41,6 +41,34 @@ pub fn cell_at(
     Some(row * w_tiles + col)
 }
 
+/// Which pool tile a click at `(local_x, local_y)` inside the tile
+/// picker's sheet lands on. The sheet is a `cols`-wide grid of
+/// `cell_px`-square cells (`loader::compose_pool_strip` composes it,
+/// `render_tile_picker` scales it so one tile is exactly `cell_px` CSS
+/// px), row-major -- the same shape [`cell_at`] walks, but sized by a
+/// per-cell edge rather than by a fit box, and bounded by `tile_count`
+/// instead of the grid: the last row of a sheet whose tile count isn't a
+/// multiple of `cols` is zero-padded, and a click on that padding must
+/// select nothing rather than a tile the pool doesn't have.
+pub fn picker_tile_at(
+    local_x: f32,
+    local_y: f32,
+    cell_px: f32,
+    cols: usize,
+    tile_count: usize,
+) -> Option<u16> {
+    if cell_px <= 0.0 || cols == 0 || local_x < 0.0 || local_y < 0.0 {
+        return None;
+    }
+    let col = (local_x / cell_px) as usize;
+    let row = (local_y / cell_px) as usize;
+    if col >= cols {
+        return None;
+    }
+    let index = row * cols + col;
+    (index < tile_count).then(|| index as u16)
+}
+
 /// The hardware-budget meter line for the open sprite: `Pool`
 /// (`tile_count` / `VRAM_TILE_CAP`), `OAM` (greedy [`hw::oam_split`]
 /// entry count / `OAM_ENTRIES`), `Scanline` (worst-case per-scanline OAM
@@ -119,6 +147,46 @@ mod tests {
     fn cell_at_on_a_1x1_grid_is_always_cell_0_inside_the_box() {
         assert_eq!(cell_at(0.0, 0.0, 240.0, 240.0, 1, 1), Some(0));
         assert_eq!(cell_at(239.9, 239.9, 240.0, 240.0, 1, 1), Some(0));
+    }
+
+    // ----------------------------------------------------- picker_tile_at
+
+    #[test]
+    fn picker_tile_at_is_row_major_over_the_sheet_grid() {
+        // 4 columns of 24px cells, 6 tiles => two rows, the second half
+        // full.
+        assert_eq!(picker_tile_at(0.0, 0.0, 24.0, 4, 6), Some(0));
+        assert_eq!(picker_tile_at(23.9, 23.9, 24.0, 4, 6), Some(0));
+        assert_eq!(picker_tile_at(24.0, 0.0, 24.0, 4, 6), Some(1));
+        assert_eq!(picker_tile_at(72.0, 0.0, 24.0, 4, 6), Some(3));
+        assert_eq!(picker_tile_at(0.0, 24.0, 24.0, 4, 6), Some(4));
+        assert_eq!(picker_tile_at(24.0, 24.0, 24.0, 4, 6), Some(5));
+    }
+
+    #[test]
+    fn picker_tile_at_rejects_the_padded_tail_of_a_partial_last_row() {
+        // 6 tiles at 4 cols: cells 6 and 7 are zero-fill, not tiles.
+        assert_eq!(picker_tile_at(48.0, 24.0, 24.0, 4, 6), None);
+        assert_eq!(picker_tile_at(72.0, 24.0, 24.0, 4, 6), None);
+    }
+
+    #[test]
+    fn picker_tile_at_rejects_clicks_outside_the_sheet() {
+        assert_eq!(picker_tile_at(-0.1, 0.0, 24.0, 4, 6), None);
+        assert_eq!(picker_tile_at(0.0, -0.1, 24.0, 4, 6), None);
+        assert_eq!(
+            picker_tile_at(96.0, 0.0, 24.0, 4, 6),
+            None,
+            "past the last column"
+        );
+        assert_eq!(picker_tile_at(0.0, 96.0, 24.0, 4, 6), None, "past the rows");
+    }
+
+    #[test]
+    fn picker_tile_at_rejects_degenerate_geometry() {
+        assert_eq!(picker_tile_at(0.0, 0.0, 0.0, 4, 6), None);
+        assert_eq!(picker_tile_at(0.0, 0.0, 24.0, 0, 6), None);
+        assert_eq!(picker_tile_at(0.0, 0.0, 24.0, 4, 0), None, "empty pool");
     }
 
     // ------------------------------------------------------ hw_meter_line

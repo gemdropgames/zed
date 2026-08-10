@@ -1,6 +1,6 @@
 //! Off-thread perf-run listing: reads `~/.ggo/ggo_ide.db`'s `run`/`cart`
 //! tables directly -- the charts-panel analog of `ggo_world_panel::loader`
-//! / `ggo_metasprite_panel::loader` (same one-shot background-pass
+//! / `ggo_sprite_panel::loader` (same one-shot background-pass
 //! framing), reading the SAME database ggo-ide's `backend/db.rs` opens
 //! and `backend/perf.rs::carts`/`cart_runs` query (read those two files
 //! before touching this one -- this is a deliberately narrower port: one

@@ -28,7 +28,7 @@
 //! `ggo-emu --perf` -> `ggo_ide.db` step with a native one; run a cart
 //! here, and it is in the charts panel's picker the moment it stops.
 //!
-//! Structural mirror of `ggo_world_panel`/`ggo_metasprite_panel`/
+//! Structural mirror of `ggo_world_panel`/`ggo_sprite_panel`/
 //! `ggo_charts_panel`: `Panel` impl, `ToggleFocus`, `observe_new`
 //! registration into every new workspace, a `KeymapEventChannel` observer
 //! that re-binds the panel's keys on every keymap reload, and project-root
@@ -947,7 +947,7 @@ impl Panel for EmuPanel {
 
     fn activation_priority(&self) -> u32 {
         // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_metasprite_panel` 9,
+        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
         // `ggo_charts_panel` 10 (grep activation_priority across
         // crates/).
         11

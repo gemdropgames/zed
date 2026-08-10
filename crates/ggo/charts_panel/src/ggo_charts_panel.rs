@@ -4,7 +4,7 @@
 //!
 //! Two views. The picker (C1) lists every run (cart/label/date), loaded
 //! off-thread with a load-generation guard against a stale result -- the
-//! same shape `ggo_world_panel`/`ggo_metasprite_panel` use. Selecting a
+//! same shape `ggo_world_panel`/`ggo_sprite_panel` use. Selecting a
 //! run (C2) kicks off a second background pass for its samples and then
 //! renders the same chart set ggo-ide's run-detail page shows for it, with
 //! a hover readout over the nearest sample.
@@ -16,7 +16,7 @@
 //! turns that scene into gpui paint calls -- the same
 //! `build_draw_list`/`paint_scene` split `ggo_world_panel` uses.
 //!
-//! Structural mirror of `ggo_world_panel`/`ggo_metasprite_panel`: `Panel`
+//! Structural mirror of `ggo_world_panel`/`ggo_sprite_panel`: `Panel`
 //! impl, `ToggleFocus`, `observe_new` registration into every new
 //! workspace, and a `KeymapEventChannel` observer scaffold (no panel
 //! keybinds exist yet -- see `bind_panel_keys`'s doc for why the observer
@@ -65,7 +65,7 @@ const GGO_CHARTS_PANEL_KEY: &str = "GGOChartsPanel";
 const KEY_CONTEXT: &str = "GgoChartsPanel";
 
 /// Fixed default width until the panel grows real settings persistence
-/// (same call `ggo_world_panel`/`ggo_metasprite_panel` made at their own
+/// (same call `ggo_world_panel`/`ggo_sprite_panel` made at their own
 /// skeleton stage).
 const DEFAULT_WIDTH: Pixels = px(360.);
 
@@ -74,7 +74,7 @@ const CHART_HEIGHT: Pixels = px(240.);
 
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
-    // Same rule as `ggo_world_panel::init`/`ggo_metasprite_panel::init`:
+    // Same rule as `ggo_world_panel::init`/`ggo_sprite_panel::init`:
     // `zed::reload_keymaps` clears and rebuilds ALL key bindings on every
     // keymap/settings change (including once at startup), and keymap
     // assets are upstream files this fork doesn't edit. Re-running
@@ -103,7 +103,7 @@ pub fn init(cx: &mut App) {
 /// No panel-specific keybinds exist yet: run selection is a click and
 /// the chart readout follows the pointer, so nothing in this panel is
 /// reachable only by key. Kept as its own fn (rather than inlined into `init`)
-/// so it matches `ggo_world_panel`/`ggo_metasprite_panel`'s shape
+/// so it matches `ggo_world_panel`/`ggo_sprite_panel`'s shape
 /// exactly: `init` calls it once at startup AND the `KeymapEventChannel`
 /// observer calls it again on every reload.
 fn bind_panel_keys(cx: &mut App) {
@@ -594,7 +594,7 @@ impl Panel for ChartsPanel {
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        // Same call as `ggo_world_panel`/`ggo_metasprite_panel`: no
+        // Same call as `ggo_world_panel`/`ggo_sprite_panel`: no
         // settings persistence yet, and Bottom isn't a sensible spot for
         // a charts sidebar.
         matches!(position, DockPosition::Left | DockPosition::Right)
@@ -635,7 +635,7 @@ impl Panel for ChartsPanel {
 
     fn activation_priority(&self) -> u32 {
         // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_metasprite_panel` took 9 (grep
+        // `ggo_world_panel` took 8, `ggo_sprite_panel` took 9 (grep
         // activation_priority across crates/).
         10
     }

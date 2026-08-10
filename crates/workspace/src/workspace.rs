@@ -966,7 +966,7 @@ pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
 }
 
 // GGO: fork-local open interceptors. A registered fn may claim a project
-// path -- e.g. route a `.spr` into the metasprite dock panel -- and returns
+// path -- e.g. route a `.spr` into the sprite dock panel -- and returns
 // `true` to mean "handled, open no pane item for this path". Nothing
 // upstream registers one, so with an empty registry every call site behaves
 // exactly as it did before. `register_project_item` above cannot express
@@ -3493,7 +3493,7 @@ impl Workspace {
             }
 
             // GGO: dock panels can own unsaved documents that are not
-            // workspace items (the GGO world/metasprite editors keep their
+            // workspace items (the GGO world/sprite editors keep their
             // doc store in panel state), so `save_all_internal` below
             // cannot see them. Poll every panel's `Panel::prepare_to_close`
             // first; `false` cancels the close, exactly like a cancelled
