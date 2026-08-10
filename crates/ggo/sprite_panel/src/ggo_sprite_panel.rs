@@ -855,6 +855,17 @@ struct OpenSprite {
     /// One composed BGRA image per frame index; rebuilt wholesale after
     /// every doc mutation (see `loader::LoadedSprite::frames`).
     frames: Vec<Arc<RenderImage>>,
+    /// Onion-skin ghost images, composed and tinted lazily on first paint
+    /// and kept keyed by `(dist, frame idx)` -- `loader::compose_ghost`'s
+    /// output is pure in both, so the same key always produces the same
+    /// image and there is no reason to recompose it on every render.
+    /// `RefCell` because [`Self::render_preview`] (and `ghosts`, which it
+    /// calls) only ever sees `&self` -- same interior-mutability idiom as
+    /// [`Self::preview_bounds`]/[`Self::picker_bounds`], just caching
+    /// pixels instead of layout. Cleared alongside `frames` in
+    /// `refresh_after_doc_change`: a doc mutation can change any frame's
+    /// pixels, and the key doesn't carry a generation to invalidate by.
+    ghost_cache: RefCell<HashMap<(i32, usize), Arc<RenderImage>>>,
     /// The bound tileset composed as the tile picker's sheet; same
     /// invalidation as `frames`.
     pool_strip: Option<loader::PoolStrip>,
@@ -908,6 +919,7 @@ impl OpenSprite {
             pal_path: loaded.pal_path,
             store: SpriteDocStore::new(loaded.state),
             frames: loaded.frames,
+            ghost_cache: RefCell::new(HashMap::new()),
             pool_strip: loaded.pool_strip,
             picker_bounds: Rc::new(RefCell::new(None)),
             selected_tile: None,
@@ -955,6 +967,23 @@ impl OpenSprite {
         let clip = self.active_clip.and_then(|i| state.clips.get(i));
         self.onion
             .ghosts(self.shown_frame(), state.frames.len(), clip)
+    }
+
+    /// The tinted image for one onion-skin ghost, from
+    /// [`Self::ghost_cache`] if this `(dist, idx)` was composed before,
+    /// else composed via [`loader::compose_ghost`] and cached for next
+    /// time. `&self` (not `&mut self`): called from [`render_preview`],
+    /// which only borrows the Ready state immutably -- the cache's
+    /// `RefCell` is what makes filling it in from there sound.
+    fn ghost_image(&self, dist: i32, idx: usize) -> Option<Arc<RenderImage>> {
+        if let Some(image) = self.ghost_cache.borrow().get(&(dist, idx)) {
+            return Some(image.clone());
+        }
+        let image = loader::compose_ghost(self.store.state(), idx, dist)?;
+        self.ghost_cache
+            .borrow_mut()
+            .insert((dist, idx), image.clone());
+        Some(image)
     }
 }
 
@@ -1657,6 +1686,7 @@ impl SpritePanel {
         let clip_count = open.store.state().clips.len();
         let tile_count = open.store.state().tile_count;
         open.frames = frames;
+        open.ghost_cache.borrow_mut().clear();
         open.pool_strip = pool_strip;
         open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
         if open.active_clip.is_some_and(|c| c >= clip_count) {
@@ -2482,14 +2512,19 @@ impl SpritePanel {
             // Onion ghosts, farthest first, each absolutely positioned over
             // the same box as the real frame and drawn BEFORE it (so the
             // current frame is on top). Frames all share the sprite's
-            // dimensions, so one fit box serves them all.
+            // dimensions, so one fit box serves them all. Each ghost is
+            // its OWN tinted image (red behind, blue ahead --
+            // `loader::compose_ghost`), not the plain `open.frames` entry:
+            // `ghost.alpha` still governs the layer's overall opacity here,
+            // exactly as before this fast-follow -- the tint is baked into
+            // the pixels underneath it, not a replacement for it.
             let ghosts: Vec<gpui::AnyElement> = open
                 .ghosts()
                 .into_iter()
                 .filter_map(|ghost| {
-                    let image = open.frames.get(ghost.idx)?;
+                    let image = open.ghost_image(ghost.dist, ghost.idx)?;
                     Some(
-                        img(image.clone())
+                        img(image)
                             .absolute()
                             .w(px(fit_w))
                             .h(px(fit_h))

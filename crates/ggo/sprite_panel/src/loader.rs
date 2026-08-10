@@ -21,6 +21,8 @@ use ggo_worldlib::sprites::tileset_doc::{
 };
 use gpui::RenderImage;
 
+use crate::onion;
+
 /// Everything the panel needs to enter its Ready state, assembled
 /// entirely off the UI thread.
 pub struct LoadedSprite {
@@ -107,6 +109,56 @@ pub fn compose_pool_strip(state: &SpriteState) -> Option<PoolStrip> {
     })
 }
 
+/// Blend every OPAQUE pixel of `rgba` (straight RGBA8, four bytes per
+/// pixel) toward `tint` by `strength`, leaving alpha untouched. A pixel
+/// whose alpha is already 0 (the locked transparent palette slot,
+/// `palette565::TRANSPARENT_SLOT`) is skipped outright -- tinting its RGB
+/// would do nothing visible on its own, but leaving the branch out would
+/// be exactly the "tint the transparent index into visibility" bug this
+/// exists to avoid if a future caller ever stops treating alpha 0 as
+/// fully transparent.
+fn tint_rgba(rgba: &mut [u8], tint: (u8, u8, u8), strength: f32) {
+    let strength = strength.clamp(0.0, 1.0);
+    let (tr, tg, tb) = (tint.0 as f32, tint.1 as f32, tint.2 as f32);
+    for px in rgba.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        px[0] = (px[0] as f32 + (tr - px[0] as f32) * strength).round() as u8;
+        px[1] = (px[1] as f32 + (tg - px[1] as f32) * strength).round() as u8;
+        px[2] = (px[2] as f32 + (tb - px[2] as f32) * strength).round() as u8;
+    }
+}
+
+/// Compose one onion-skin ghost: frame `idx` of `state`, tinted red
+/// (behind) or blue (ahead) per [`onion::tint_for`]/[`onion::tint_strength`]
+/// for `dist` -- the panel's ghost's signed distance from the shown frame
+/// (`onion::Ghost::dist`; negative is past, positive is future).
+///
+/// Reuses [`compose_frame_rgba`] -- the SAME decode [`compose_frames`]
+/// calls -- rather than re-expanding indices to RGBA itself (ggo PR #80's
+/// one definition of that expansion lives in
+/// [`ggo_worldlib::sprites::palette565::indices_to_rgba`], which
+/// `compose_frame_rgba` already calls); this only tints the bytes that
+/// decode already produced. Straight RGBA in and out of [`tint_rgba`],
+/// exactly like `compose_frames`' own buffers -- [`to_render_image`] does
+/// the one BGRA swap, here as everywhere else.
+///
+/// Callers should cache the result keyed by `(dist, idx)`
+/// (`OpenSprite::ghost_cache`) -- this recomposes from scratch every call,
+/// which is fine once per cache miss but wrong to call every paint.
+pub fn compose_ghost(state: &SpriteState, idx: usize, dist: i32) -> Option<Arc<RenderImage>> {
+    let rgba = compose_frame_rgba(state, idx, false);
+    let (w, h) = rgba.dimensions();
+    let mut bytes = rgba.into_raw();
+    tint_rgba(
+        &mut bytes,
+        onion::tint_for(dist),
+        onion::tint_strength(dist),
+    );
+    to_render_image(&bytes, w, h)
+}
+
 /// Open `rel` and compose every frame plus the tile-picker sheet.
 pub fn load_sprite(project_dir: &Path, rel: &str) -> Result<LoadedSprite, String> {
     let opened = io::open_sprite(project_dir, rel).map_err(|e| e.to_string())?;
@@ -119,4 +171,111 @@ pub fn load_sprite(project_dir: &Path, rel: &str) -> Result<LoadedSprite, String
         frames,
         pool_strip,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ggo_worldlib::sprites::cow::{PixelWrite, write_pixels};
+    use ggo_worldlib::sprites::sprite_doc::blank_sprite_state;
+
+    // ------------------------------------------------------- tint_rgba
+
+    #[test]
+    fn tint_rgba_pushes_an_opaque_pixel_toward_the_tint_and_leaves_alpha_alone() {
+        let mut rgba = vec![10, 20, 30, 255];
+        tint_rgba(&mut rgba, (200, 0, 0), 0.5);
+        // Halfway from (10, 20, 30) to (200, 0, 0), alpha untouched.
+        assert_eq!(rgba, vec![105, 10, 15, 255]);
+    }
+
+    #[test]
+    fn tint_rgba_leaves_a_transparent_pixel_fully_untouched() {
+        let mut rgba = vec![0, 0, 0, 0];
+        tint_rgba(&mut rgba, (255, 0, 0), 1.0);
+        assert_eq!(
+            rgba,
+            vec![0, 0, 0, 0],
+            "alpha-0 pixels must never be tinted into visibility"
+        );
+    }
+
+    #[test]
+    fn tint_rgba_at_full_strength_becomes_the_tint_color_exactly() {
+        let mut rgba = vec![1, 2, 3, 255];
+        tint_rgba(&mut rgba, onion::TINT_PREV, 1.0);
+        assert_eq!(
+            rgba,
+            vec![
+                onion::TINT_PREV.0,
+                onion::TINT_PREV.1,
+                onion::TINT_PREV.2,
+                255
+            ]
+        );
+    }
+
+    // ------------------------------------------------------ compose_ghost
+
+    /// A single-tile sprite with one opaque pixel set to a known
+    /// mid-tone: enough to tell, byte for byte, that a PAST ghost (dist
+    /// -1) is pushed toward red and a FUTURE ghost (dist +1) toward blue
+    /// for the exact same source pixel, and that the frame's remaining
+    /// (still-transparent) pixels stay alpha 0 in both directions -- the
+    /// two things TASK 1 asked this fast-follow to prove at the byte
+    /// level, through the real `compose_frame_rgba` -> `to_render_image`
+    /// path rather than just the `tint_rgba` helper in isolation.
+    #[test]
+    fn compose_ghost_tints_a_past_ghost_red_and_a_future_ghost_blue_for_the_same_pixel() {
+        let mut s = blank_sprite_state(1, 1).expect("1x1 tile sprite");
+        // A mid-grey slot, opaque and far from either tint so the push is
+        // unambiguous in both directions.
+        s.palette[1] = 0x0000; // 565 black -> rgb888 (0, 0, 0), opaque
+        let r = write_pixels(
+            &s,
+            0,
+            &[PixelWrite {
+                x: 0,
+                y: 0,
+                index: 1,
+            }],
+        )
+        .expect("in-bounds pixel write");
+        s = r.state;
+
+        let past = compose_ghost(&s, 0, -1).expect("past ghost composes");
+        let future = compose_ghost(&s, 0, 1).expect("future ghost composes");
+        // BGRA bytes: [B, G, R, A].
+        let past_px = past.as_bytes(0).expect("one frame");
+        let future_px = future.as_bytes(0).expect("one frame");
+
+        // The written pixel, blended from black toward each tint at
+        // ONION_FALLOFF's dist-1 (nearest-ghost) strength: past reads
+        // redder (higher R, byte index 2) than future, future reads
+        // bluer (higher B, byte index 0) than past.
+        assert!(
+            past_px[2] > future_px[2],
+            "past ghost should read redder: past {past_px:?} future {future_px:?}"
+        );
+        assert!(
+            future_px[0] > past_px[0],
+            "future ghost should read bluer: past {past_px:?} future {future_px:?}"
+        );
+        assert_eq!(past_px[3], 255, "the written pixel stays opaque");
+        assert_eq!(future_px[3], 255, "the written pixel stays opaque");
+
+        // Every other pixel in this 16x16 tile is still index 0
+        // (transparent) -- both ghosts must leave it alpha 0, not tint it
+        // into visibility.
+        assert_eq!(
+            &past_px[4..8],
+            &[0, 0, 0, 0],
+            "an untouched transparent pixel must stay alpha 0 in the past ghost"
+        );
+        assert_eq!(
+            &future_px[4..8],
+            &[0, 0, 0, 0],
+            "an untouched transparent pixel must stay alpha 0 in the future ghost"
+        );
+    }
 }

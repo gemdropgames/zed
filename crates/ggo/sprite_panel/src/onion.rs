@@ -9,19 +9,23 @@
 //! `onion_fwd`/`onion_opacity`, same defaults and same clamps) and turns
 //! each selected ghost's signed distance into the alpha it draws at.
 //!
-//! Two deviations from ggo-ide, both forced by the target toolkit:
+//! One deviation from ggo-ide, forced by the target toolkit:
 //!
-//! - **No red/blue tint.** ggo-ide's `GhostLayer` carries a tint colour
-//!   (red behind, blue ahead) that its own pixel surface blends per pixel.
-//!   gpui has no image tint (`Img` exposes only `grayscale`), so tinting
-//!   would mean composing and caching a second, distance-keyed BGRA image
-//!   per ghost per frame. Ghosts are distinguished by alpha alone here;
-//!   the falloff-per-step dimming that ggo-ide applies ON TOP of the tint
-//!   is kept, so nearer ghosts still read as nearer.
 //! - **Opacity is a stepper, not a slider.** `ui` has no slider primitive
 //!   (see its `components/` list -- toggle, dropdown, button, no range
 //!   control). The `-`/`+` buttons move by ggo-ide's own slider step, over
 //!   ggo-ide's own range, so the reachable values are identical.
+//!
+//! Red/blue tint (spec §4: red behind, blue ahead) IS implemented, just not
+//! here: gpui has no image tint (`Img` exposes only `grayscale`, and
+//! `paint_image`'s `PolychromeSprite` carries no colour field either), so
+//! there is no element-level tint to apply the way ggo-ide's pixel surface
+//! does. Instead [`loader::compose_ghost`] composes a tinted BGRA image per
+//! ghost, per frame, using [`tint_for`]/[`tint_strength`] below for the
+//! colour and blend amount. This module only owns those two pure
+//! functions (plus each ghost's signed [`Ghost::dist`], which decides
+//! direction) -- the pixel work lives in `loader` next to the rest of the
+//! frame composition it reuses.
 
 use ggo_worldlib::sprites::cow::ClipEdit;
 use ggo_worldlib::sprites::timeline_ops::{self, OnionClip};
@@ -42,12 +46,54 @@ pub const DEFAULT_OPACITY: f32 = 0.5;
 /// `ONION_FALLOFF_PER_STEP`.
 const FALLOFF_PER_STEP: f32 = 0.3;
 
-/// One resolved ghost: which frame to draw and at what alpha. Farthest
-/// first, so a nearer (brighter) ghost paints over a farther one -- the
-/// same ordering ggo-ide's `ghost_layers` hands its pixel surface.
+/// Onion ghost tint colours -- ggo-ide `ONION_TINT_PREV`/`ONION_TINT_NEXT`
+/// (spec §4: red behind, blue ahead), byte for byte.
+pub(crate) const TINT_PREV: (u8, u8, u8) = (0xff, 0x44, 0x44);
+pub(crate) const TINT_NEXT: (u8, u8, u8) = (0x44, 0x88, 0xff);
+
+/// Which tint a ghost `dist` steps from the current frame takes -- past
+/// (`dist < 0`) red, future (`dist > 0`) blue, matching
+/// `timeline::State::ghost_layers`' `if g.dist < 0` branch. `dist == 0`
+/// never reaches a ghost (it would be the current frame), so it falls to
+/// the `else` arm same as ggo-ide's does; the branch is never taken in
+/// practice.
+pub(crate) fn tint_for(dist: i32) -> (u8, u8, u8) {
+    if dist < 0 { TINT_PREV } else { TINT_NEXT }
+}
+
+/// How strongly a ghost `dist` steps away is blended toward its tint --
+/// the same falloff shape `alpha_at` dims WITH (one full step at the
+/// nearest ghost, `FALLOFF_PER_STEP` less per extra step, floored at 0),
+/// scaled by [`DEFAULT_OPACITY`] rather than the live [`OnionState::opacity`].
+///
+/// ggo-ide multiplies this falloff by the user's live opacity control
+/// (`ghost_layers`' `self.onion_opacity * (1 - ...)`), so its tint tracks
+/// the opacity slider. Here the tint is baked into a `RenderImage` cached
+/// by `(dist, frame idx)` alone (`loader::compose_ghost` /
+/// `OpenSprite::ghost_cache`) -- keying that cache on the live opacity too
+/// would mean rebuilding every ghost image on every opacity step, which is
+/// exactly the per-render recompose the cache exists to avoid. Fixing the
+/// multiplier at ggo-ide's own default (0.5) instead means the two match
+/// exactly at ggo-ide's (and this port's) freshly-opened defaults, and the
+/// live opacity control still governs each ghost's overall on-screen
+/// strength via [`OnionState::alpha_at`]'s unchanged element-level
+/// compositing -- tint direction/distance read consistently no matter
+/// where the opacity stepper sits, only the ghost's overall visibility
+/// dims with it, same division of labour as before this fast-follow.
+pub(crate) fn tint_strength(dist: i32) -> f32 {
+    let abs = dist.unsigned_abs() as f32;
+    (DEFAULT_OPACITY * (1.0 - (abs - 1.0) * FALLOFF_PER_STEP)).clamp(0.0, 1.0)
+}
+
+/// One resolved ghost: which frame to draw, how far (signed -- negative
+/// is behind/past, positive is ahead/future; see [`tint_for`]), and at
+/// what alpha. Farthest first, so a nearer (brighter) ghost paints over a
+/// farther one -- the same ordering ggo-ide's `ghost_layers` hands its
+/// pixel surface.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ghost {
     pub idx: usize,
+    pub dist: i32,
     pub alpha: f32,
 }
 
@@ -142,6 +188,7 @@ impl OnionState {
             .into_iter()
             .map(|g| Ghost {
                 idx: g.idx,
+                dist: g.dist,
                 alpha: self.alpha_at(g.dist),
             })
             .collect()
@@ -352,6 +399,31 @@ mod tests {
         let ghosts = s.ghosts(3, 6, Some(&clip(1, 3, true)));
         let idxs: Vec<usize> = ghosts.iter().map(|g| g.idx).collect();
         assert!(idxs.contains(&2) && idxs.contains(&1), "wrapped: {idxs:?}");
+    }
+
+    // ------------------------------------------------------------ tint
+
+    #[test]
+    fn tint_for_is_red_behind_and_blue_ahead() {
+        assert_eq!(tint_for(-3), TINT_PREV);
+        assert_eq!(tint_for(-1), TINT_PREV);
+        assert_eq!(tint_for(1), TINT_NEXT);
+        assert_eq!(tint_for(3), TINT_NEXT);
+    }
+
+    #[test]
+    fn tint_strength_matches_ggo_ides_default_opacity_at_the_nearest_ghost_and_falls_off() {
+        // dist 1 -> DEFAULT_OPACITY * 1.0 == ggo-ide's own default-opacity
+        // tint strength at the nearest ghost.
+        assert!((tint_strength(1) - DEFAULT_OPACITY).abs() < 1e-6);
+        assert!(
+            (tint_strength(-1) - DEFAULT_OPACITY).abs() < 1e-6,
+            "sign doesn't affect strength"
+        );
+        // dist 2 -> one falloff step dimmer, same shape as alpha_at.
+        assert!((tint_strength(2) - DEFAULT_OPACITY * 0.7).abs() < 1e-6);
+        // Never negative even past where the raw falloff would go negative.
+        assert!(tint_strength(10) >= 0.0);
     }
 
     /// A clip may legally store its range reversed; the ghosts must be the
