@@ -6,7 +6,11 @@
 //! tilesets (`tileset_doc::TilesetDocStore` + `TilesetOp::Paint`/`Fill`/
 //! `SetPalette`/... and `io::save_tileset`), and NONE of it is wired up
 //! here: no store, no ops, no save, no dirty state. That is a product
-//! decision, not an oversight -- pixel editing stays in ggo-ide for now.
+//! decision, not an oversight -- pixel authoring was scoped out of the
+//! migration entirely. This comment used to say "pixel editing stays in
+//! ggo-ide for now"; ggo-ide was deleted in ggo `281fd557` (F5.5), so there
+//! is no "for now" and no fallback -- pixel editing happens in an external
+//! editor plus the `.png` import path (`ggo_import_panel`).
 //! The direct consequence for this module: there is nothing this panel
 //! can lose, so unlike `ggo_world_panel`/`ggo_sprite_panel` it has no
 //! `Panel::prepare_to_close` override and never calls

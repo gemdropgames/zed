@@ -8,7 +8,10 @@ carried panel deferrals — onion skin, world view controls, arrow nudge, goto
 sprite), and 2026-08-10 (end of **F5.4**: the reports-depth block — KPI tiles,
 run detail header, failure tables, stored UART console, history rail,
 click-to-inspect, I$ profile table, historic overlays, drag-zoom — plus
-emulator audio). Fork branch `ggo`.
+emulator audio), and finally 2026-08-10 (**F5.5**, which deleted `ggo-ide`
+itself and gave this file its last edit as a migration document — see
+"`tools/ggo-ide` no longer exists" below, and the closing section). Fork
+branch `ggo`.
 
 What this is: a row for **every** user-facing ggo-ide feature, and what — if
 anything — answers it in the fork today. It exists so nobody has to guess
@@ -16,10 +19,13 @@ whether a thing was ported, replaced, or simply dropped. It is a reference,
 not a status report to be proud of; the honest answer for a large part of the
 Assets suite is "not covered".
 
-**Sources of truth.** ggo-ide's surface is enumerated from
+**Sources of truth.** ggo-ide's surface was enumerated from
 `ggo/tools/ggo-ide/src/pages/` + `nav.rs` and from
 `ggo/docs/ggo-ide-feature-inventory.md` (the redesign brief, which is the
-complete list). The intended dispositions come from
+complete list). **That first path no longer exists on disk** — see the section
+below; read it as `main@281fd557^:tools/ggo-ide/src/pages/`. The inventory
+doc survives in the ggo repo and is the more useful of the two anyway. The
+intended dispositions come from
 `ggo/docs/superpowers/specs/2026-08-07-zed-pure-extension-design.md` (its
 feature-disposition table) as amended by
 `2026-08-07-zed-fork-design.md` (native dock panels, F1-F3 phasing). What
@@ -36,8 +42,44 @@ repo's `.zed/settings.json`, `.zed/tasks.json` and
 | deferred | intended, not built yet; the rationale says why |
 | dropped | deliberately not coming back |
 
-ggo-ide is still in-tree and still the only place the "dropped" and several
-"deferred" rows work. Freezing or removing it is a separate decision.
+---
+
+## `tools/ggo-ide` no longer exists
+
+**It was deleted from the ggo repo on 2026-08-10, in `281fd557` (PR #90).**
+That decision was taken deliberately, as F5.5 Task D2, after Task D1 audited
+its 1193 executing tests for coverage that would die with it.
+
+Three things follow, and they are why this section sits above the table
+rather than in a footnote:
+
+1. **Every "reference implementation" citation in this fork's docs and code
+   comments now resolves into git history, not into a working tree.** A
+   reader following one needs `git show`, not `ls`. The ggo repo's existing
+   convention for these is the git-qualified `main@<sha>:tools/ggo-ide/…`
+   form; anything in this file that names a bare `pages/…` or
+   `tools/ggo-ide/…` path means `main@281fd557^:tools/ggo-ide/…` in the ggo
+   repo.
+2. **Every present-tense sentence about ggo-ide below describes code as it
+   stood at `281fd557^`.** They were not rewritten into the past tense — a
+   hundred-odd comparison sentences retensed is churn that would make this
+   file harder to diff against the phase reports that produced it, and the
+   ggo repo made the same call for its own ~90 "ported from ggo-ide"
+   provenance citations, which D2 deliberately kept. Read "ggo-ide shows a
+   red Failed-to-load banner" as "ggo-ide showed one, at `281fd557^`".
+3. **The "dropped" rows and the deferred set are now genuinely unavailable**,
+   not merely un-ported. Until F5.5 there was a fallback: the pixel editor,
+   the project library and the full-system window still ran if you launched
+   ggo-ide. There is no such fallback now. The closing section names exactly
+   what that costs.
+
+The ggo workspace went **2314 → 1109** tests across that deletion, a drop of
+1205 that accounts exactly: ggo-ide's 1193 executing tests plus the 12 tests
+of `ggo_worldlib::emerald::toml_sections`, an orphaned helper deleted in the
+same PR. `ggo-worldlib` itself went 675 → 663, entirely those 12. **This
+fork lost nothing**: the ten ggo crates are at 703 before and after, because
+the fork never depended on ggo-ide — only on `ggo-worldlib`, which survives
+and is the whole point of the eight extraction PRs that preceded this.
 
 ---
 
@@ -62,7 +104,7 @@ ggo-ide is still in-tree and still the only place the "dropped" and several
 |---|---|---|---|
 | Project library (list, add existing, select, remove) | Zed open-folder / recent projects | dropped | The page is superseded by the editor's own project model; the spec's disposition table already called the library and its persistence dropped. |
 | Launcher view (branding screen when nothing is open) | Zed's own welcome/recent-projects screen | dropped | Same. |
-| "Create Emerald project" (`emd new <name>`) | `emd: new project scaffold` task | partial | Zed's `tasks.json` has no interactive input variable, so the name comes from `GGO_NEW_NAME` or the task picker's edit-and-spawn flow — not a prompt. |
+| "Create Emerald project" (`emd new <name>`) | `emd: new project scaffold` task | partial | Zed's `tasks.json` has no interactive input variable, so the name comes from `GGO_NEW_NAME` or the task picker's edit-and-spawn flow — not a prompt. **As of F5.5 this task is the only project-scaffolding affordance that exists anywhere** (the ggo repo's `.zed/tasks.json` says so in the task's own comment): ggo-ide's Projects page wrapped the same `emd new <name>` call and is gone. The capability survives; scaffolding as a *GUI action* does not. |
 | Saved launch-target badges | none | dropped | Display-only data in ggo-ide with no consumer. |
 
 ## 3. Assets page (pixel-art suite)
@@ -82,14 +124,14 @@ covered by the fork at all.
 | **Palette panel**: RGB565 16-slot editor, draft picker (5/6/5 sliders, 565 + 888 hex, quantized preview), swap / sort / ramp, shared-palette warnings | none | dropped | Part of the pixel-editor scope not taken. |
 | **Tile-pool panel** + dedup preview/apply | none | dropped | Same. Dedup still happens implicitly on metasprite save (worldlib's fold-back). |
 | Animation timeline: transport, clip lanes (name/from/to/loop/delete/add), frame strip (select, add, duplicate, delete, move, per-frame ms), playback honouring durations + clip range + loop | `ggo_sprite_panel` | ✓ | |
-| Onion skin (toggle, back/fwd ghost counts, opacity) | `ggo_sprite_panel` `onion.rs` + a control row under the transport (F5.3/E5) | ✓ | Toggle, back/fwd counts (clamped 0–3), opacity and the `opacity * (1 - (|dist|-1) * 0.3)` falloff are ggo-ide's values; frame selection is worldlib's own `timeline_ops::onion_frames`, not a second copy. Ghosts carry ggo-ide's directional red/blue tint (E5 fast-follow) and paint farthest-first under the live frame. Two deliberate divergences: opacity is a `-`/`+` stepper rather than a slider (`ui` has no slider; same range, same 0.05 step, so the reachable values are identical), and ghosts are suppressed while the transport is playing (ggo-ide stacks them under a moving image, which only smears it). |
+| Onion skin (toggle, back/fwd ghost counts, opacity) | `ggo_sprite_panel` `onion.rs` + a control row under the transport (F5.3/E5) | ✓ | Toggle, back/fwd counts (clamped 0–3), opacity and the `opacity * (1 - (|dist|-1) * 0.3)` falloff are ggo-ide's values; frame selection is worldlib's own `timeline_ops::onion_frames`, not a second copy. Ghosts carry ggo-ide's directional red/blue tint (E5 fast-follow) and paint farthest-first under the live frame. **Three** deliberate divergences (the third was documented in the code but missing from this row until F5.5). (1) Opacity is a `-`/`+` stepper rather than a slider (`ui` has no slider; same range, same 0.05 step, so the reachable values are identical). (2) Ghosts are suppressed while the transport is playing (ggo-ide stacks them under a moving image, which only smears it). (3) **The tint does not track the opacity control.** `onion.rs::tint_strength` scales its falloff by `DEFAULT_OPACITY` (0.5), not by the live `OnionState::opacity` that ggo-ide's `ghost_layers` multiplies in — because the tint is baked into a `RenderImage` cached by `(dist, frame idx)` alone, and keying that cache on the live opacity would rebuild every ghost image on every opacity step. The two match exactly at freshly-opened defaults, and the stepper still governs each ghost's overall on-screen strength through `alpha_at`; what differs is the tint's *relative* strength once you move the stepper off 0.5. Reasoned in place at `sprite_panel/src/onion.rs:64-85`. |
 | Preview panel (1:1 live frame, background picker, LCD filter) | sprite panel centre preview | partial | Live composed frame with aspect fit shipped; checker/black/white background picker and the LCD scanline filter did not. |
 | Hardware budget meter (4 traffic-light rows + tooltips) | sprite panel `hw_meter_line` | partial | Same four value/cap pairs from worldlib `sprites::hw`, condensed into one header line — no per-row dots or tooltips. |
 | Per-cell tile assignment from the pool | sprite panel tile picker + preview cell click | ✓ | F5.2 gave the picker a real source: it composes the BOUND TILESET (the sprite's pool is that `.til` byte for byte) as one sheet via worldlib `unpack_til_to_indices` → `compose_tile_grid` → `indices_to_rgba`, the same three calls `ggo_tileset_panel` makes. |
 | Tileset editor (`.til`): overview grid, magnified tile canvas, pencil/fill/eyedropper, palette slot edit, append/duplicate/delete-last, cols setting | `ggo_tileset_panel` — read-only overview grid + 16-slot palette swatch row, integer zoom 1x-8x | partial | Viewing shipped (F4): routed off a `.til` click in the project panel, no in-panel picker. The **magnified tile canvas**, pencil/fill/eyedropper, palette slot editing, append/duplicate/delete-last and the cols setting are all still dropped — the fork's zoom magnifies the whole sheet, not one selected tile, so there is no per-tile editing surface at all. This is a viewer, not the editor ggo-ide had; do not read it as more than that. |
-| Map editor (`.map`): tileset binding, multi-tile stamp, H/V flip, palSub, brush/rect-fill/eraser/eyedropper, grid, zoom, resize | `ggo_map_panel` (F5.1 M2) — the fork's one editing surface | partial | Maps are **authored here, never imported** (user's call). Ported: tileset binding (`MapOp::BindTileset`, with the bound tileset's tiles as a rect-selectable stamp strip), multi-tile stamp placement, H/V flip and palSub on the stamp, rect-fill, eraser, eyedropper, grid toggle, pan, resize, undo/redo/save with the dirty guard. Opened by clicking a `.map` in the explorer, or created by "New Map…" on an assets directory (blank + **unbound**: cells are pool indices, so a guessed binding is worse than none — you bind from the panel). Not ported: the float zoom slider (integer 1x–8x ladder here, so 16px tiles never resample) and the palSub slider (a stepper over the same 0–15). **The real loss is the per-tileset `cols` setting.** ggo-ide resolves the tile-strip column count through the shared `resolve_and_migrate_cols`, keyed on the `.til` in `~/.ggo/ggo_ide.db`, so its map and tileset editors lay a given tileset out identically and the user can set that width. The fork has no db-backed cols and falls back to 8 columns (clamped) in both `ggo_map_panel` and `ggo_tileset_panel` — they still agree with each other, but not with a tileset authored at some other width. Because `cols` **is** the stamp coordinate system (`build_stamp` indexes `row * cols + col`), a tileset whose metatiles were laid out spatially contiguous at, say, 6 or 12 wide has them scattered across the fork's 8-wide reflow: those metatiles are no longer rect-selectable as one stamp, and have to be placed tile by tile. Defensible while the fork has no settings store, but it is a workflow regression for any non-8-wide tileset, not just a cosmetic relayout. Maps also still *render* in the world panel as backgrounds/tilemaps. |
+| Map editor (`.map`): tileset binding, multi-tile stamp, H/V flip, palSub, brush/rect-fill/eraser/eyedropper, grid, zoom, resize | `ggo_map_panel` (F5.1 M2) — the fork's one editing surface | partial | Maps are **authored here, never imported** (user's call). Ported: tileset binding (`MapOp::BindTileset`, with the bound tileset's tiles as a rect-selectable stamp strip), multi-tile stamp placement, H/V flip and palSub on the stamp, rect-fill, eraser, eyedropper, grid toggle, pan, resize, undo/redo/save with the dirty guard. Opened by clicking a `.map` in the explorer, or created by "New Map…" on an assets directory (blank + **unbound**: cells are pool indices, so a guessed binding is worse than none — you bind from the panel). Not ported: the float zoom slider (integer 1x–8x ladder here, so 16px tiles never resample) and the palSub slider (a stepper over the same 0–15). **The real loss is the per-tileset `cols` setting.** ggo-ide resolves the tile-strip column count through the shared `resolve_and_migrate_cols`, keyed on the `.til` in `~/.ggo/ggo_ide.db`, so its map and tileset editors lay a given tileset out identically and the user can set that width. The fork has no db-backed cols and falls back to 8 columns (clamped) in both `ggo_map_panel` and `ggo_tileset_panel` — they still agree with each other, but not with a tileset authored at some other width. Because `cols` **is** the stamp coordinate system (`build_stamp` indexes `row * cols + col`), a tileset whose metatiles were laid out spatially contiguous at, say, 6 or 12 wide has them scattered across the fork's 8-wide reflow: those metatiles are no longer rect-selectable as one stamp, and have to be placed tile by tile. Defensible while the fork has no settings store, but it is a workflow regression for any non-8-wide tileset, not just a cosmetic relayout. **F5.5 sharpened this into a concrete orphan.** The db-backed setting is not merely un-read — the `tileset_cols:*` rows in `~/.ggo/ggo_ide.db` are the *output* of the legacy-sidecar migration two rows up, and with ggo-ide gone **nothing writes them and nothing reads them**: `grep -rn tileset_cols crates/ggo/` returns zero hits, and both `ggo_tileset_panel::loader::grid_cols` and `ggo_map_panel::loader::grid_cols` pass `None` for that chain step. Any width a user ever set is now unreachable data in a live database (one such row exists on this machine today, pointing at a path that no longer exists). Reconnecting it is a small read against a db both panels' sibling panels already open — it is the cheapest of the losses listed in the closing section. Maps also still *render* in the world panel as backgrounds/tilemaps. |
 | PNG import wizard (crop, tileset/sprite/metasprite modes, cell grid, quantized preview, commit, source-PNG cleanup) | `ggo_import_panel` (F5.1 Task I2) — tileset-only | partial | Ported: crop rect + cell-grid overlay, quantized preview, commit to `.til`/`.pal` (assets-root-relative sidecars, overwrite-collision confirm), source-PNG cleanup confirm, "Import as tileset…" on a `.png` in the explorer, opening the result in `ggo_tileset_panel` on commit. **Sprite and Metasprite import modes are NOT ported, by design** — the domain model changed: a sprite is one frame and a metasprite is clips over frames, both assembled from tiles in `ggo_sprite_panel`, not decoded straight from a PNG, so there is no destination for a `.spr` import to land in. `WizardState::sprite_import`/`Mode::{Sprite,Metasprite}` moved into worldlib verbatim (Task I1, dependency-light so splitting the file wasn't worth it) but the panel never calls them. |
-| Legacy `.meta.json` sidecar import | none | dropped | One-shot migration aid for a format generation that is already past. |
+| Legacy `.meta.json` sidecar import | none | dropped | One-shot migration aid for a format generation that is already past. **Corrected in F5.5**: an earlier draft of the D1 audit called this a capability lost with ggo-ide. It is not. The *reader* is `ggo_worldlib::sprites::io::read_legacy_sidecar` (`io.rs:910`), which survives, which this fork already depends on by path, and which was never ggo-ide's only caller. What died is ~20 lines of glue (`pages/assets/mod.rs::resolve_and_migrate_cols`). No fork crate calls `read_legacy_sidecar` today, so the row stays `dropped` — but it is a wiring job away, not a port, and there is no stranded data: zero `.meta.json` sidecars and no `.ggo-ide/` directory exist. **The real loss is the inverse** — see the map-editor row's `cols` note. |
 | Save / dirty marker / save-status / discard guards | Per-panel Save button + dirty dot + `ctrl-s`/`cmd-s` + inline `save failed:` | partial | Per-document save and dirty state shipped; the cross-page discard confirms and the "doc changed during save" race message did not. |
 | Draggable splitters (rail / right column) persisted | Zed dock resize | ✓ | |
 
@@ -109,7 +151,7 @@ covered by the fork at all.
 | "+ Entity" (default Transform at view centre) | Add-entity toolbar button | ✓ | |
 | "+ Merge" fuzzy world search → add instance | "+ Instance" dropdown over cycle-guarded `merge_candidates` | partial | Instance add shipped, including the cycle guard and immediate subtree resolve; the fuzzy-search picker UI became a plain dropdown. |
 | Delete entity / remove instance | `Delete selected` button + `delete`/`backspace` | partial | ggo-ide confirms before removing an instance; the fork does not confirm anything. |
-| Inspector: schema-driven typed fields (int/fixed/str/bool/vec2), asset dropdowns, MetaSprite clip dropdown, per-component Remove, "+ Add component…" | world panel `inspector` | ✓ | Commit on Enter **and** on blur — strictly better than ggo-ide's Enter-only. |
+| Inspector: schema-driven typed fields (int/fixed/str/bool/vec2), asset dropdowns, MetaSprite clip dropdown, per-component Remove, "+ Add component…" | world panel `inspector` | partial | Commit on Enter **and** on blur — strictly better than ggo-ide's Enter-only. **But the asset dropdowns are not ported, and F5.5 found this is a correctness regression, not a cosmetic one.** The fork treats `FieldKind::Asset(_)` exactly like `Str` — verified at `world_panel/src/inspector.rs:113` (display) and `:159` (commit), where both arms are literally `Some(FieldKind::Str) \| Some(FieldKind::Asset(_))`. ggo-ide rendered an `Asset(ext)` field as a `pick_list` over the stems that actually exist, so only a real asset could be committed. Here it is a free-text editor: a `Sprite.stem` can be typed to point at a `.spr` that does not exist, the value lands in the world doc, and nothing complains until load time — where §4's own "dangling `[[instance]]` refs are invisible" ledger entry says the resulting `node["error"]` is never rendered either. Two unvalidated-reference paths, one unrendered error. Downgraded ✓ → partial here rather than left as a footnote. |
 | MetaSprite `stem` "→" goto sprite on Assets | Inspector jump button beside the MetaSprite component's Remove, into `ggo_sprite_panel` (F5.3/E5) | ✓ | Resolves `{stem}.spr` under the OPEN DOCUMENT's asset root and re-relativizes into the worktree, since every explorer-driven open takes a worktree-relative path. The button exists only when a destination does: an unauthored stem gets no button rather than a disabled one or a sprite panel parked in an error state. |
 | Background merging from instances (priority, first-claimant, drawn at origin) | ✓ (worldlib `backgrounds::MergedBackground`) | ✓ | |
 | Undo / redo / dirty / Save (`WorldDocStore` + `write_world`) | ✓ | ✓ | |
@@ -129,7 +171,7 @@ but `emerald.toml` itself is still read as text.
 
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
-| Project tab: structured `emerald.toml` viewer | Open `emerald.toml` in the editor | partial | Text, not a structured section/entry view. |
+| Project tab: structured `emerald.toml` viewer | Open `emerald.toml` in the editor | partial | Text, not a structured section/entry view. **F5.5 note for whoever builds the structured view later**: there used to be a worldlib helper shaped exactly for it — `ggo_worldlib::emerald::toml_sections`, with `TomlSection`, `TomlEntry`, `entries_of`, `display_of` and `ROOT_SECTION_NAME`. It was **deleted** in `281fd557` alongside ggo-ide (its only consumer), with its 12 tests. That was the right call — dead code carrying green tests reads as covered when nothing exercises it — but it means this row's substitute (the editor) is the *shipped* answer, not a placeholder in front of a waiting helper. A structured viewer starts from `281fd557^`, not from worldlib's current API. |
 | Components / Systems / Schedules browsing (module groups, list → detail) | emerald panel three-tab browser (F5.3/E2): rows grouped by module (shared bucket first), a detail pane per selection — a component's field list, a system's "in update, render" line, a schedule's ordered run list | partial | The dashboard shipped, but smaller than ggo-ide's: no `[scene]` tag, no per-row field/system counts, and **no distinct load states** — `read_manifest` treats an unreadable or malformed manifest as an ABSENT one, where ggo-ide shows a red "Failed to load: …" naming the file (see Known deferrals). `emerald.toml` itself is still read as text in the editor (row above). |
 | Create component/system/schedule (validated forms → `emd generate …`) | emerald panel forms, opened from the project panel's context menu | ✓ | Right-click the project root or `manifests/` → New Component… / New System… / New Schedule…; the form also generates resources, modules and worlds via its kind selector. Validated with worldlib's own `valid_item_name`/`valid_field_spec` before spawning, so an invalid name never reaches `emd`, and a component's PascalCase "stored as" preview is shown exactly where ggo-ide showed it. A new component refreshes the world panel's inspector schemas in place; a new world opens in the world panel. **Resource and Module have the same form** (reachable via the kind selector inside any of the three menu entries) **but no menu entry of their own** — a six-entry directory menu appended to upstream's own Duplicate/Rename/Delete was judged worse than a selector (see the contributor's own doc comment). |
 | New tileset (blank `.til`/`.pal` pair) | emerald panel form, on any assets directory | ✓ | Not a ggo-ide feature and not an `emd` verb — added here because a `.til` is a prerequisite for New Sprite / a bound `.map`, and the import panel needs a source PNG. The palette is worldlib's own `.pal`-less fallback, read back rather than restated. |
@@ -143,10 +185,10 @@ but `emerald.toml` itself is still read as text.
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | Embedded 320×240 screen, integer scale, latest-wins frames | `ggo_emu_panel` live video (`RenderImage` per frame, bounded depth-1 channel) | partial | Scaling is gpui's `img()` fit, i.e. linear — not the guaranteed integer nearest-neighbour ggo-ide hard-coded. See Known deferrals. |
-| "Build & run project" (full system: OS + FAT image + game) | `emd: run` task (launches the standalone `ggo-emu`) | partial | The panel runs `.cart` files only. The full-system build+boot path stays external — and so, therefore, does full-system *audio*: F5.4/R6 gave the panel a stream, but only on the cart path (see the audio row). |
+| "Build & run project" (full system: OS + FAT image + game) | `emd: run` task (launches the standalone `ggo-emu`); `ggo-emu --full-system CARD_DIR` for the OS boot itself | partial | The panel runs `.cart` files only. The full-system build+boot path stays external — and so, therefore, does full-system *audio*: F5.4/R6 gave the panel a stream, but only on the cart path (see the audio row). **F5.5 verified what "external" now means, because an earlier draft overstated it.** Full-system boot did **not** die with ggo-ide: `build_full_system` was ~30 lines of glue over `ggo_emu_core::fullsystem::{os_image::build_os_image, card::build_fat_image}`, both of which survive, and `ggo-emu --full-system CARD_DIR` (plus `--no-cart` / `--os-only`) still drives them. `emd pack-ggo` → `ggo-emu --full-system <card dir>` reproduces the build-and-run end to end. **What is genuinely gone is the interactive, windowed full-system session**: `native::Display` is wired only to `ggo-emu`'s cart path, so the surviving full-system entry point is *headless* — a boot plus a perf capture to an instruction/frame budget, not a playable window. Nothing anywhere renders a full-system frame to a screen you can sit in front of. One further narrowing: `run_full_system` prints its profile report but never calls `report::write_db`, so profiled db rows are cart-mode only from here. |
 | Run / Stop | ✓ (`ctrl-alt-r` / `ctrl-alt-s`; Run over a running cart restarts cleanly) | ✓ | |
 | Cart library (`~/.ggo/ggo-ide/carts`: list, Upload with magic-header validation, Remove) | Zed project panel — clicking a `.cart` there selects it in the emu panel, routed by `ggo_emu_panel::intercept_cart_open` | partial | Browsing instead of a managed library — no upload, no delete, no header validation (a bad cart fails loudly at Run, deliberately). Explorer-driven since F4 X4: the panel's own `.cart` dropdown and its filesystem walk are gone, so this row is now the project panel plus the interceptor. A click **selects** the cart; Run stays an explicit user action, because starting a cart spawns an emulator thread and takes over the keyboard. Clicking a different cart mid-run stops the running one through the normal `finish_run` path, so its perf data still reaches `ggo_ide.db`. |
-| Keyboard → gamepad (18-button cart map) | ✓ (18-bit level-triggered mask, 10 of 17 keys pinned key-by-key against the standalone binary) | partial | Only the cart map exists (`emu_panel/src/input.rs`); ggo-ide's second full-system `FS_BTN_*` map has no fork equivalent, since the panel has no full-system mode. Focus-scoped, so pad keys never leak into an editor. |
+| Keyboard → gamepad (18-button cart map) | ✓ (18-bit level-triggered mask, 10 of 17 keys pinned key-by-key against the standalone binary) | partial | Only the cart map exists (`emu_panel/src/input.rs`); ggo-ide's second full-system `FS_BTN_*` map has no fork equivalent, since the panel has no full-system mode. Focus-scoped, so pad keys never leak into an editor. **F5.5 measured the net loss precisely, and it is smaller than it first looked.** Cart-mode keyboard input survives *twice* — `emu_panel/src/input.rs:30` here and `tools/ggo-emu/src/native.rs:282` (winit) in the ggo repo — so playing a cart with a keyboard is not at risk. But `pages/emulator.rs:1266-1286` was the **only** place in any codebase that mapped keys onto `firmware/ggo-hal/src/dev_input.rs`'s hardware button layout, and it is gone. **Net: you can no longer press UP/DOWN in the GemOS launcher by hand.** The only remaining driver of that register is `--auto-input`'s scripted F1 pulse (`fullsystem/bus.rs:769`) and an unused wasm export. Re-adding it is a keymap onto a register that still exists, not a lost mechanism — but until someone does, the OS menu is only reachable by script. |
 | Audio + Mute/Unmute + underrun counter | `ggo_emu_panel` audio out (F5.4/R6): the panel owns a `cpal` output stream, Mute/Unmute on `ctrl-alt-m`, dropout count in the stats row | partial | **The panel owns the stream, but only for the length of a run** — it is opened on the emu thread inside `drive::run`, after the cart parses, and dropped before the perf JSON is serialised, so a slow ingest cannot charge dropouts against it (`emu_panel/src/audio.rs`, `drive.rs:354-384`). Three honest limits. (1) **Cart mode only** — audio is wired through `EmuPanel::run` → `drive::start`, and the panel has no full-system mode (row above), so `emd: run` / standalone `ggo-emu` remains the only with-audio *full-system* path. (2) **The counter counts dropout EVENTS, not starved samples or frames** — one `fetch_add` per short callback however many stereo pairs came up empty, which is the diagnostic "did the ring run dry this callback", not a duration (pinned by `one_short_callback_counts_exactly_one_dropout_however_many_pairs_were_empty`). (3) **Linux/ALSA only in practice** — the COM-apartment reasoning for opening on the emu thread is written down, but no Windows/CoreAudio run has happened. A machine with no device is not an error: `start_output` is infallible, records `Unavailable(reason)` with cpal's verbatim text, prints `[audio unavailable] …` to the console and runs silent. No volume control (mute is a submission gate that clears the queue). |
 | Stats line (fps / drops / step+blit ms) | ✓ | ✓ | |
 | Live guest UART console (collapsible, N lines, 2000-line ring) | ✓ (plus cart `log()` output, via ggo PR #75's `Peripherals::log_sink`) | ✓ | |
@@ -170,7 +212,7 @@ but `emerald.toml` itself is still read as text.
 | Chart set (wire vs budget, wire breakdown, cache misses, syscalls, tile working set, I$ misses + evictions by function, i/d-miss histograms, PPU evictions, tile-load wire, APU fetch wire, instructions) | ✓ — `chart_set::build_charts` mirrors `reports.rs::charts_section`, same order and same gating | ✓ | |
 | Historic overlay (up to 5 prior runs, age-faded) | Historic toggle above the plots (F5.4/R5); prior runs picked by `charts::reports::historic`, drawn by `chart_geom` | ✓ | Same four charts ggo-ide overlays (wire cycles, cache misses, tile working set, instructions), same picker (`pick_prior_ids`: same `cart_id`, lower `run.id`, descending, capped at `HISTORIC_OPACITY.len()` = 5), same age ramp `[0.5, 0.36, 0.26, 0.18, 0.12]`. Overlays **contribute to the y-scale** — the fold and the polyline loop read one `drawn_overlays` list, specifically so scale and paint cannot disagree. Three things to know. **Alignment is by index position, not by frame number** (ggo-ide's contract, kept): a shorter prior run stops early rather than dropping to zero, and a prior run with fewer than 2 points on the axis is dropped from both scale and paint. `pick_prior_ids` assumes run ids are allocated in **ingest** order (they are — an `INTEGER PRIMARY KEY` rowid), so "prior" means ingested earlier, **not** captured earlier. And there is still **no run-kind column**, so a cart's cart-mode and full-system runs can be overlaid on one chart with nothing marking which is which (see the Known-deferrals entry). Two deliberate divergences: the toggle is *disabled* with a reason at zero priors where ggo-ide renders a live checkbox next to "(0 prior runs)", and the overlay loads with the run rather than lazily behind the toggle — costing up to six extra queries per selection, paid whether or not the toggle is used. |
 | Click-to-inspect frame → per-function misses/evicted table | Click a frame on a selectable chart (F5.4/R4) → a caller/callee misses+evicted pane | ✓ | Hit-tested by `chart_geom::frame_at` under the *current* zoom view, so the pane and the plot cannot disagree about which frame was clicked. **The pane renders directly beneath the chart that opened it, not in ggo-ide's one fixed slot** — deliberate, because a fixed mid-list slot is usually scrolled off-screen from the click in a 360 px dock; the consequence is that clicking the same frame number on a *different* chart moves the pane rather than closing it (ggo-ide's `pickFrame` toggles on frame alone, because its slot never moves). The empty state names a state and never a cause: `no per-function rows recorded for this frame`, asserted character for character, where ggo-ide claims `"No I$ misses recorded this frame."` |
-| I$ profile table with sortable header | Profile table last in the detail (F5.4/R4), `misses` header toggles direction | ✓ | Same single sortable column ggo-ide has (one `profile_sort_ascending` bool there too), with the arrow doubling as affordance and readout; both orders are precomputed off-thread by `charts::reports::profile::aggregate_profile_sorted`, so a click sorts nothing at click time. Three distinct empty states where ggo-ide has one, and the split is more truthful than ggo-ide's: it keys its fallback off the *ignore-filtered* rows, so a run whose only rows are on frame 0 gets told it has no profile data at all. **Worth knowing: the emu panel never writes profile rows** — `drive` passes `None` for both dumps — so this table is empty for every panel-produced run; every profile row in `ggo_ide.db` came from a native `ggo-emu --profile` ingest, and the empty state says so. That is equally true of ggo-ide, which reads the same table. |
+| I$ profile table with sortable header | Profile table last in the detail (F5.4/R4), `misses` header toggles direction | ✓ | Same single sortable column ggo-ide has (one `profile_sort_ascending` bool there too), with the arrow doubling as affordance and readout; both orders are precomputed off-thread by `charts::reports::profile::aggregate_profile_sorted`, so a click sorts nothing at click time. Three distinct empty states where ggo-ide has one, and the split is more truthful than ggo-ide's: it keys its fallback off the *ignore-filtered* rows, so a run whose only rows are on frame 0 gets told it has no profile data at all. **Worth knowing: the emu panel never writes profile rows** — `drive` passes `None` for both dumps — so this table is empty for every panel-produced run; every profile row in `ggo_ide.db` came from a native `ggo-emu --profile` ingest, and the empty state says so. That is equally true of ggo-ide, which reads the same table. **F5.5 checked whether this table and the two per-function charts became a dead feature when ggo-ide went, and they did not.** An earlier draft of the audit claimed ggo-ide's `cart_elf_bytes` was the only *producer* of `profile`/`dprofile` rows, which would have left this surface rendering something nothing could generate. That is **disproved**: `ggo-emu <cart> --profile <elf>` loads the ELF symbols (`tools/ggo-emu/src/lib.rs:241`) and `report::write_db` persists both dumps **by default** (`lib.rs:522-544`), into `cfg.perf_db.or_else(report::default_db_path)`. `cart_elf_bytes` was best-effort *auto-discovery* of the companion ELF from `emerald.toml` — convenience, so the GUI could ship a profiled build without the user typing `--profile`. Convenience is what was lost. This panel's own `inspect.rs:64` already documented the surviving producer correctly. |
 | Reads `~/.ggo/ggo_ide.db` off-thread, stale-response-guarded | ✓ — the same DB file, not a copy; load-generation guards on both the list and the detail | ✓ | |
 
 ## 8. Device page
@@ -216,16 +258,19 @@ but `emerald.toml` itself is still read as text.
 | `.zed/tasks.json` task layer (6 tasks) + `scripts/check-zed-config.sh` JSONC validator | ggo repo | Committed, per-user values via env, all six verified against real invocations. |
 | Native perf ingest straight from the emulator pane into `ggo_ide.db` | `ggo_emu_panel::ingest` | Replaces the spec's CLI-chained ingest task. |
 | **LSP** (diagnostics, completion, hover, code actions on worlds/manifests) | — | The pure-extension spec's central mechanism. **Deferred**: `ggo_language` registers grammar + queries only; there is no `ggo-lsp` binary and no `LspAdapter`. Every capability the old spec assigned to the LSP (world validation, hardware-budget diagnostics, snap/center/offset code actions, import diagnostics) is therefore unbuilt. |
-| Legend band on chart widgets | `chart_geom.rs` `legend_layout` (:612), `legend_height` (:642), consumed at :783-811 | ggo-ide's charts have no legends (a deliberate omission); the fork adds one. Documented as a divergence in the module doc (`chart_geom.rs:25-29`). §9's "No legends" row does not apply here — this is new surface, not parity. |
+| Legend band on chart widgets | `chart_geom.rs` `legend_layout` (:736), `legend_height` (:766), consumed at :1001 and :1024 | ggo-ide's charts have no legends (a deliberate omission); the fork adds one. Documented as a divergence in the module doc (`chart_geom.rs:25-29`). **Stale cross-reference corrected in F5.5**: this note used to point at a "§9's 'No legends' row" that does not exist — §9 has no such row, and never did in any version of this file. There is nothing to except this from; the legend band is simply fork-only surface, not a parity gap. |
 
 ---
 
 ## Counts
 
+**These are the final counts. This file's last edit as a migration document
+was F5.5; the table below is not expected to move again.**
+
 | Status | Rows |
 |---|---|
-| ✓ | 56 |
-| partial | 35 |
+| ✓ | 55 |
+| partial | 36 |
 | deferred | 2 |
 | dropped | 11 |
 | **total** | **104** |
@@ -317,6 +362,26 @@ than on the old "scenes rebuilt on hover" — R5 added the memo, and one
 partial 34 / deferred 15 / dropped 11, total 104. After: ✓ 56 / partial 35 /
 deferred 2 / dropped 11, total 104.)
 
+(**F5.5 wrap: one row moved, and it moved the wrong way** — the only such
+entry in this table's history, which is why it gets said plainly rather than
+folded into a total. §4's **inspector row went ✓ → partial.** Nothing
+regressed in the code; the audit did. The row enumerates "asset dropdowns"
+among the features it claims to cover, and the fork does not have them: it
+maps `FieldKind::Asset(_)` onto `Str` (`world_panel/src/inspector.rs:113`,
+`:159`), so an asset reference is unvalidated free text where ggo-ide offered
+a `pick_list` over stems that exist. That is "materially smaller than
+ggo-ide's" by this file's own legend, and it was carrying a ✓ for three
+phases. Found by D1's audit while reading ggo-ide's inspector tests, i.e. by
+looking at the thing being deleted — which is an argument for having done the
+coverage audit before the `rm`, not after. No other row moved: F5.5 shipped
+no features, it deleted the reference implementation. Before this wrap:
+✓ 56 / partial 35 / deferred 2 / dropped 11, total 104. After: ✓ 55 /
+partial 36 / deferred 2 / dropped 11, total 104. Several rows changed *text*
+without changing status — the legacy `.meta.json` row, the map editor's
+`cols` note, "Build & run project", the keyboard/gamepad row, the I$ profile
+table and §5's structured-viewer row, each correcting or narrowing a claim
+about what the deletion cost; see the closing section.)
+
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
 own right.)
@@ -349,6 +414,130 @@ remaining *ancillary* pages — Device, Settings, and Emerald's `emerald.toml`
 viewer — are still mostly "partial via a task or a text file"; and the
 pixel-art half of Assets is a deliberate drop with no replacement in this
 repo.
+
+---
+
+## Closing: what is actually gone, in plain terms
+
+This section exists so that nobody arriving in six months has to reconstruct
+the answer by reading 104 table rows. It is the whole picture as of F5.5,
+with ggo-ide deleted.
+
+### Four things you could do before and cannot do now
+
+Not "not ported" — **not available anywhere**, in any repo, by any command.
+Each was verified against both trees rather than inferred from a report.
+
+1. **Play the full system interactively.** You can still *boot* it:
+   `ggo-emu --full-system CARD_DIR` (and `--no-cart` / `--os-only`) drives
+   `ggo_emu_core::fullsystem::{os_image::build_os_image, card::build_fat_image}`,
+   which survive, and `emd pack-ggo` → `ggo-emu --full-system <dir>`
+   reproduces ggo-ide's Build-&-run end to end. But that path is **headless**
+   — `native::Display` is wired only to `ggo-emu`'s cart path — so what you
+   get is a boot plus a perf capture to an instruction/frame budget, not a
+   window. The fork's `ggo_emu_panel` is cart-only. **No surface anywhere
+   renders a full-system frame to a screen.**
+2. **Press a button in the GemOS launcher.** `pages/emulator.rs`'s `fs_key_bit`
+   was the only keyboard map onto `firmware/ggo-hal/src/dev_input.rs`'s
+   hardware button layout in any codebase. Cart-mode keyboard input survives
+   twice (`ggo_emu_panel`'s `input.rs` here, `ggo-emu`'s `native.rs` there),
+   so playing a *cart* is fine — but the OS menu's UP/DOWN can now only be
+   driven by `--auto-input`'s scripted F1 pulse. Combined with (1): the OS is
+   bootable and unwatchable and untouchable.
+3. **Scaffold a project from a GUI.** `emd new <name>` is alive and well; the
+   ggo repo's `emd: new project scaffold` task is now its only affordance,
+   and it takes its name from `GGO_NEW_NAME` or the task picker's
+   edit-and-spawn flow rather than a prompt. The Projects page — library,
+   add/select/remove, launcher screen — was a deliberate `dropped`, and Zed's
+   own project model is the replacement.
+4. **Reach a per-tileset `cols` width you previously set.** The `tileset_cols:*`
+   rows in `~/.ggo/ggo_ide.db` now have **no writer and no reader**: ggo-ide
+   was both, and no fork crate mentions the key. Both `grid_cols`
+   implementations pass `None` and fall back to 8. This is the one loss that
+   strands *existing user data* rather than a capability, and it is also the
+   cheapest to undo — a small read against a database two fork panels already
+   open.
+
+### Three things that were *reported* lost and are not
+
+Recorded because each was a live claim during F5.5, and believing any of them
+would send someone rebuilding something that already works:
+
+- **Full-system boot itself.** Partial, not lost — see (1) above. What died
+  was ~100 lines of glue and the window, not the engine.
+- **`profile`/`dprofile` row production.** `ggo-emu <cart> --profile <elf>`
+  loads the symbols and `report::write_db` persists both dumps **by default**.
+  ggo-ide's `cart_elf_bytes` was auto-*discovery* of the companion ELF, i.e.
+  convenience. **The charts panel's I$ profile table and its two per-function
+  charts are not rendering a dead feature** — the opposite conclusion would
+  have been serious, so it is stated positively here.
+- **Reading legacy `.meta.json` sidecars.** The reader is
+  `ggo_worldlib::sprites::io::read_legacy_sidecar`, it survives, this fork
+  already depends on it by path, and it was never ggo-ide's only caller. No
+  fork crate calls it — but that is unwired, not unavailable, and there is no
+  data to strand (zero sidecars exist).
+
+### The deferred set, in full
+
+Three items. Unchanged by F5.5, which shipped no features.
+
+1. **LSP** (§11) — the pure-extension spec's central mechanism and the only
+   large thing left. `ggo_language` registers a tree-sitter grammar and
+   queries; there is no `ggo-lsp` binary and no `LspAdapter`, so world
+   validation, hardware-budget diagnostics, snap/center/offset code actions
+   and import diagnostics are all unbuilt. Not counted in the table (§11 rows
+   are fork-only), but it is the honest headline for "what is left".
+2. **§10's version/environment row + `emd` re-check** — nothing probes
+   `emd --version` *for display*. The version **lock** does ship (§5, F5.3/E4)
+   and gates every mutating emerald control with a 30 s mtime poll; what is
+   missing is the Settings-page readout and its manual re-check button.
+3. **§7's "Copy for agent" text export** — never started.
+
+### Coverage that is now single-covered here
+
+D1's audit classified ggo-ide's 1193 executing tests before the deletion and
+moved the one genuine orphaned assertion into worldlib (plus six gap-fills,
+worldlib 668 → 675). What it also found is that for a number of behaviours
+**the fork's own test is now the only test in existence**. Four are
+outright gaps — the fork implements the arm and nothing pins it:
+
+- `emu_panel/src/drive.rs:455`'s `FrameEvent::Fault` arm is untested here;
+  ggo-ide's `illegal_instruction_body_faults_on_first_step` was the only cover.
+- `emu_panel/src/ingest.rs` asserts only the *empty* profile/dprofile case;
+  ggo-ide's populated-row test was the only cover of the populated one.
+- `charts_panel/src/chart_geom.rs::bins` has three `bins_*` tests, none of
+  them the two exact `Histogram.tsx` parity vectors — the only record of the
+  `all_int → step.ceil()` rounding contract, which dies with them. Also now
+  unpinned: `zoom_domain`'s right-to-left drag, `edge_marks`' half-integer
+  round-away-from-zero, `format_tick`'s negative-with-suffix (`-12k`), and
+  `accumulate` at three series deep.
+- `world_panel/src/inspector.rs` implements the `FieldKind::Fixed` arm
+  (`:158`) with no test naming it; ggo-ide had ten `commit_field` tests.
+
+None is a crash risk today. They are named so that a future change to any of
+those four is understood to be unguarded.
+
+### The debts this migration is knowingly leaving behind
+
+Scheduled, not forgotten. Fuller entries in the ledger below.
+
+- **The missing run-kind column.** Cart-mode and full-system runs land in one
+  `runs` table distinguished only by a path convention in `label`. Deferred by
+  F5.2, F5.3 **and** F5.4 — three phases — while becoming load-bearing in
+  three surfaces (the run picker, the historic overlay, the device history
+  rail). One schema column plus three small reads.
+- **`charts_panel/src/ggo_charts_panel.rs` is 4,998 lines**, up ~1,700 in
+  F5.4 alone. Split it before adding to it.
+- **The 100k-frame hover ceiling.** ~11.8 ms per memoized hover move in a
+  debug build, at or past a frame budget. The memo already cut this from
+  O(charts × frames) to one chart; the residual is that single chart's
+  `O(frames)` rebuild, and the fix is decimating **by index before**
+  `plot_points` materialises 100k points that `envelope` immediately cuts
+  to 2048.
+- **Up to 10 short-lived tokio runtimes per run selection** (four for
+  `load_run_samples`, up to six more for the historic overlay, paid whether
+  or not the toggle is used). The fix is worldlib-side: a shared connection
+  the panel borrows instead of a runtime per query.
 
 ---
 
@@ -590,3 +779,35 @@ guards and follow-ups that someone has to pick up:
   also be pointed at with `GGO_REPO` — ggo-ide lives inside the repo and
   auto-detects from `CARGO_MANIFEST_DIR`, which a fork whose worktree is the
   user's game project cannot do.
+- **`ggo_charts_panel.rs` is 4,998 lines (F5.5).** It grew ~1,700 lines in
+  F5.4 alone. Nothing is wrong with it, and that is the problem: it is a
+  single file holding the run picker, the detail view, every KPI and chart
+  render path, the device rail, the inspect pane and the profile table.
+  **Split it before adding to it** — the natural seams are already module
+  boundaries elsewhere in the crate (`chart_set`, `chart_geom`, `report`,
+  `inspect`, `history`).
+- **`tileset_cols:*` is an orphaned settings key (F5.5).** The rows exist in
+  `~/.ggo/ggo_ide.db`, ggo-ide was their only writer *and* reader, and
+  `grep -rn tileset_cols crates/ggo/` returns nothing. Both
+  `grid_cols` implementations pass `None` for that chain step and fall back
+  to 8 columns. This strands real user data (one stale row on this machine),
+  and it is the cheapest item in the closing section to undo. Documented at
+  the fallback itself, `tileset_panel/src/loader.rs`.
+- **`FieldKind::Asset(_)` commits unvalidated free text (F5.5).**
+  `world_panel/src/inspector.rs:113`/`:159` fold `Asset(_)` into the `Str`
+  arm, so a `Sprite.stem` can name a `.spr` that does not exist and the value
+  lands in the world doc. ggo-ide used a `pick_list` over existing stems, so
+  the invalid state was unreachable there. Compounds the dangling-`[[instance]]`
+  entry above: two unvalidated-reference paths and one `node["error"]` that
+  `inspector.rs` never renders. §4's row is marked `partial` for this.
+- **Four behaviours are now single-covered by the fork's own tests (F5.5).**
+  `emu_panel/src/drive.rs:455`'s `FrameEvent::Fault` arm and
+  `emu_panel/src/ingest.rs`'s populated profile/dprofile case have **no** test
+  in any repo; `chart_geom::bins` has three tests but neither of ggo-ide's two
+  exact `Histogram.tsx` parity vectors (the only record of the
+  `all_int → step.ceil()` rounding contract), and `zoom_domain`'s
+  right-to-left drag, `edge_marks`' half-integer rounding, `format_tick`'s
+  `-12k` case and `accumulate` at three series deep went with them; and
+  `world_panel/src/inspector.rs:158`'s `FieldKind::Fixed` arm is implemented
+  and unpinned. Cheap to close (four small tests), listed so that a change to
+  any of them is known to be unguarded rather than discovered to be.

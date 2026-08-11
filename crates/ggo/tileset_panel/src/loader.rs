@@ -52,11 +52,17 @@ pub struct LoadedTileset {
 /// How many columns to lay a `tile_count`-tile sheet out in.
 ///
 /// This panel has neither of worldlib's two better sources -- no db-backed
-/// `{cols}` setting (that lives in ggo-ide's own store) and no legacy
-/// `.meta.json` sidecar reader -- so both chain steps are `None` and
-/// [`resolve_cols`]'s fallback decides. The fallback is clamped to
-/// `tile_count` so a sheet SHORTER than one full row renders exactly its
-/// own tiles instead of a row padded with blanks.
+/// `{cols}` setting and no legacy `.meta.json` sidecar reader -- so both
+/// chain steps are `None` and [`resolve_cols`]'s fallback decides. The
+/// fallback is clamped to `tile_count` so a sheet SHORTER than one full row
+/// renders exactly its own tiles instead of a row padded with blanks.
+///
+/// The db-backed setting is not merely unread: the `tileset_cols:*` rows in
+/// `~/.ggo/ggo_ide.db` were written and read by ggo-ide, which was deleted
+/// in ggo `281fd557` (F5.5). Nothing writes them and nothing reads them now,
+/// so any width a user once set is unreachable. Wiring this step up is a
+/// settings read against a db `ggo_charts_panel`/`ggo_emu_panel` already
+/// open; see `docs/ggo/MIGRATION.md`'s closing section.
 pub fn grid_cols(tile_count: usize) -> usize {
     let fallback = GRID_COLS_FALLBACK.min(tile_count.max(1));
     resolve_cols(None, None, tile_count, fallback)
