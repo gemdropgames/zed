@@ -275,7 +275,7 @@ fn paint_item(
         }
         DrawKind::Text { content } => {
             window.paint_quad(fill(b, gpui::rgba(0x00000066)));
-            paint_label(content, b.origin, scene.text_color, window, cx);
+            paint_world_text(content, b, view.zoom, scene.text_color, window, cx);
         }
         DrawKind::Marker => {
             window.paint_quad(outline(b, color(0x88c0d0), BorderStyle::default()));
@@ -421,6 +421,58 @@ fn paint_device_screen(
         window,
         cx,
     );
+}
+
+/// Glyph cell of the engine's fixed 8x8 bitmap font, world px -- must
+/// match worldlib's `TEXT_GLYPH_PX`, which sizes the Text item's
+/// (hit-tested) bounding box.
+const WORLD_GLYPH_PX: f64 = 8.0;
+
+/// Paint a `DrawKind::Text` on the engine's glyph grid: one glyph per
+/// 8-world-px cell, scaled with zoom and clipped to the item box, so the
+/// painted text lines up with the bounding box the hit test uses. The
+/// editor's UI font stands in for the device font (spec: text is
+/// approximated), but each glyph's PLACEMENT is grid-exact.
+fn paint_world_text(
+    text: &str,
+    b: Bounds<Pixels>,
+    zoom: f64,
+    color: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let cell = px((WORLD_GLYPH_PX * zoom) as f32);
+    if f32::from(cell) <= 0.0 {
+        return;
+    }
+    window.with_content_mask(Some(ContentMask { bounds: b }), |window| {
+        for (row, line) in text.lines().enumerate() {
+            let y = b.origin.y + cell * row as f32;
+            for (col, ch) in line.chars().enumerate() {
+                if ch.is_whitespace() {
+                    continue;
+                }
+                let glyph: SharedString = ch.to_string().into();
+                let run = TextRun {
+                    len: glyph.len(),
+                    font: window.text_style().font(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(glyph, cell, &[run], None);
+                let _ = shaped.paint(
+                    point(b.origin.x + cell * col as f32, y),
+                    cell,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+        }
+    });
 }
 
 /// Paint a single line of text at fixed (screen-space) size -- same rule
