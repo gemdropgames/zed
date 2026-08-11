@@ -1,3 +1,26 @@
+# ZedGG
+
+ZedGG is the GemDrop Games fork of Zed, adding GGO game-development panels
+(world, sprite, tileset, map, charts, emulator). It installs alongside a
+regular Zed installation: separate `zedgg` binary, install directory, desktop
+entry, and app id.
+
+### Installing ZedGG (Linux)
+
+From the repo root, with the [build dependencies](./docs/src/development/linux.md) installed:
+
+```sh
+./script/install-zedgg
+```
+
+This builds a release binary and installs it into `~/.local`. Launch **ZedGG**
+from your app launcher / search bar, or run `zedgg` in a terminal (requires
+`~/.local/bin` on your `PATH`). Re-run the script after pulling changes to
+update. To uninstall: remove `~/.local/zedgg.app`, `~/.local/bin/zedgg`, and
+`~/.local/share/applications/dev.zed.Zed-Dev.desktop`.
+
+---
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

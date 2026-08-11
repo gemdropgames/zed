@@ -205,7 +205,9 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
+            // GemDrop Games fork: dev-channel builds are branded ZedGG so
+            // the app is distinguishable from a system Zed installation.
+            ReleaseChannel::Dev => "ZedGG",
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",

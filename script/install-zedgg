@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build and install ZedGG (the GemDrop Games zed fork) into ~/.local,
+# alongside -- not replacing -- a system Zed installation: separate
+# binary (zedgg), install dir (zedgg.app), and desktop entry.
+#
+# The repo pins RELEASE_CHANNEL=dev, so the app runs with the
+# dev.zed.Zed-Dev app id; the desktop file below must keep that
+# basename so Wayland/X11 match the running window to the entry.
+
+cd "$(dirname "$0")/.."
+
+cargo build --release --package zed --package cli
+
+app_dir="$HOME/.local/zedgg.app"
+mkdir -p "$app_dir/bin" "$app_dir/libexec" \
+    "$app_dir/share/icons/hicolor/512x512/apps" \
+    "$HOME/.local/bin" "$HOME/.local/share/applications"
+
+target_dir="${CARGO_TARGET_DIR:-target}"
+cp "$target_dir/release/zed" "$app_dir/libexec/zed-editor"
+cp "$target_dir/release/cli" "$app_dir/bin/zed"
+cp crates/zed/resources/app-icon-dev.png \
+    "$app_dir/share/icons/hicolor/512x512/apps/zedgg.png"
+ln -sf "$app_dir/bin/zed" "$HOME/.local/bin/zedgg"
+
+cat > "$HOME/.local/share/applications/dev.zed.Zed-Dev.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ZedGG
+GenericName=Text Editor
+Comment=GemDrop Games fork of the Zed editor.
+TryExec=$HOME/.local/bin/zedgg
+StartupNotify=true
+Exec=$HOME/.local/bin/zedgg %U
+Icon=$app_dir/share/icons/hicolor/512x512/apps/zedgg.png
+Categories=Utility;TextEditor;Development;IDE;
+Keywords=zedgg;zed;ggo;gemdrop;
+Actions=NewWorkspace;
+
+[Desktop Action NewWorkspace]
+Exec=$HOME/.local/bin/zedgg --new %U
+Name=Open a new workspace
+EOF
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$HOME/.local/share/applications" || true
+fi
+
+echo "ZedGG installed. Launch 'ZedGG' from your app launcher, or run: zedgg"
