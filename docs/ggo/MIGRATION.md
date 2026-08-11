@@ -2,10 +2,13 @@
 
 Date: 2026-08-08 (end of F3), rows amended 2026-08-09 (end of F4: explorer-driven
 panel routing + the read-only tileset viewer; then X4, which removed the last
-in-panel file picker — the emulator's `.cart` dropdown), and 2026-08-10 (end of
+in-panel file picker — the emulator's `.cart` dropdown), 2026-08-10 (end of
 F5.3: the emerald mutation/reorder ops, the emd version lock, and the four
 carried panel deferrals — onion skin, world view controls, arrow nudge, goto
-sprite). Fork branch `ggo`.
+sprite), and 2026-08-10 (end of **F5.4**: the reports-depth block — KPI tiles,
+run detail header, failure tables, stored UART console, history rail,
+click-to-inspect, I$ profile table, historic overlays, drag-zoom — plus
+emulator audio). Fork branch `ggo`.
 
 What this is: a row for **every** user-facing ggo-ide feature, and what — if
 anything — answers it in the fork today. It exists so nobody has to guess
@@ -140,16 +143,16 @@ but `emerald.toml` itself is still read as text.
 | ggo-ide feature | Fork-era answer | Status | Rationale (non-✓) |
 |---|---|---|---|
 | Embedded 320×240 screen, integer scale, latest-wins frames | `ggo_emu_panel` live video (`RenderImage` per frame, bounded depth-1 channel) | partial | Scaling is gpui's `img()` fit, i.e. linear — not the guaranteed integer nearest-neighbour ggo-ide hard-coded. See Known deferrals. |
-| "Build & run project" (full system: OS + FAT image + game) | `emd: run` task (launches the standalone `ggo-emu`, with audio) | partial | The panel runs `.cart` files only. The full-system build+boot path stays external. |
+| "Build & run project" (full system: OS + FAT image + game) | `emd: run` task (launches the standalone `ggo-emu`) | partial | The panel runs `.cart` files only. The full-system build+boot path stays external — and so, therefore, does full-system *audio*: F5.4/R6 gave the panel a stream, but only on the cart path (see the audio row). |
 | Run / Stop | ✓ (`ctrl-alt-r` / `ctrl-alt-s`; Run over a running cart restarts cleanly) | ✓ | |
 | Cart library (`~/.ggo/ggo-ide/carts`: list, Upload with magic-header validation, Remove) | Zed project panel — clicking a `.cart` there selects it in the emu panel, routed by `ggo_emu_panel::intercept_cart_open` | partial | Browsing instead of a managed library — no upload, no delete, no header validation (a bad cart fails loudly at Run, deliberately). Explorer-driven since F4 X4: the panel's own `.cart` dropdown and its filesystem walk are gone, so this row is now the project panel plus the interceptor. A click **selects** the cart; Run stays an explicit user action, because starting a cart spawns an emulator thread and takes over the keyboard. Clicking a different cart mid-run stops the running one through the normal `finish_run` path, so its perf data still reaches `ggo_ide.db`. |
 | Keyboard → gamepad (18-button cart map) | ✓ (18-bit level-triggered mask, 10 of 17 keys pinned key-by-key against the standalone binary) | partial | Only the cart map exists (`emu_panel/src/input.rs`); ggo-ide's second full-system `FS_BTN_*` map has no fork equivalent, since the panel has no full-system mode. Focus-scoped, so pad keys never leak into an editor. |
-| Audio + Mute/Unmute + underrun counter | `emd: run` / standalone `ggo-emu` | deferred | Explicitly out of scope for F3 (`constraints.md`); the standalone binary remains the with-audio path. |
+| Audio + Mute/Unmute + underrun counter | `ggo_emu_panel` audio out (F5.4/R6): the panel owns a `cpal` output stream, Mute/Unmute on `ctrl-alt-m`, dropout count in the stats row | partial | **The panel owns the stream, but only for the length of a run** — it is opened on the emu thread inside `drive::run`, after the cart parses, and dropped before the perf JSON is serialised, so a slow ingest cannot charge dropouts against it (`emu_panel/src/audio.rs`, `drive.rs:354-384`). Three honest limits. (1) **Cart mode only** — audio is wired through `EmuPanel::run` → `drive::start`, and the panel has no full-system mode (row above), so `emd: run` / standalone `ggo-emu` remains the only with-audio *full-system* path. (2) **The counter counts dropout EVENTS, not starved samples or frames** — one `fetch_add` per short callback however many stereo pairs came up empty, which is the diagnostic "did the ring run dry this callback", not a duration (pinned by `one_short_callback_counts_exactly_one_dropout_however_many_pairs_were_empty`). (3) **Linux/ALSA only in practice** — the COM-apartment reasoning for opening on the emu thread is written down, but no Windows/CoreAudio run has happened. A machine with no device is not an error: `start_output` is infallible, records `Unavailable(reason)` with cpal's verbatim text, prints `[audio unavailable] …` to the console and runs silent. No volume control (mute is a submission gate that clears the queue). |
 | Stats line (fps / drops / step+blit ms) | ✓ | ✓ | |
 | Live guest UART console (collapsible, N lines, 2000-line ring) | ✓ (plus cart `log()` output, via ggo PR #75's `Peripherals::log_sink`) | ✓ | |
 | End-of-run perf ingest into `ggo_ide.db` (+ status line, + "View in Reports") | ✓, natively — Stop / cart exit / fault / restart all funnel through one `finish_run` | ✓ | Subsumes the spec's CLI-chained `ggo-emu --perf` → `ggo-cli ingest` task. |
 | Implicit pause on navigating away, resume on return | none | dropped | Docks have no page crossing; the cart keeps running when the dock is hidden. |
-| Reports "Re-run" entry point | none | deferred | Charts panel → emu panel handoff unwired (the reverse direction shipped). |
+| Reports "Re-run" entry point | Re-run button in the charts panel's run-detail header (F5.4/R3), through `ggo_common`'s `CartRunner` registry into `ggo_emu_panel::rerun` | ✓ | The last of the cross-panel hops. It routes to the emu panel's **existing** run path (`stop` then `run`, the same entry S4's context menu uses), not a second one, via a registry in `ggo_common` so the charts panel never depends on the emu crate. Two named-reason disabled states rather than a dead button: `NO_RERUN_PATH` when the run's `label` carries no project-relative cart path (so `ggo-emu`, `ggo-server` and ggo-ide-ingested runs cannot be re-run — ggo-ide gates its own button the same way, on `rerun::matches_stored`), and `NO_CART_RUNNER` when no emu panel has registered. Different surface from ggo-ide's, whose button sits at the cart level; that the cart level is collapsed away is counted once, in §7's drill-down row. |
 | Build error surfaced in a scrollable read-only editor | Terminal output of the `emd:` tasks | ✓ | |
 
 ## 7. Reports page
@@ -158,16 +161,16 @@ but `emerald.toml` itself is still read as text.
 |---|---|---|---|
 | Carts → Runs → Detail drill-down with slim back headers | `ggo_charts_panel`: flat run picker (cart · label · started_at) → detail with a Back button | partial | The cart level is collapsed away; there is no per-cart grouping or last-run relative time. |
 | Per-cart "Re-run" | Project-panel context menu: **Re-run (perf)** on a `.cart`, contributed by `ggo_emu_panel` (F5.2/S4) | ✓ | Different surface than ggo-ide's (a context-menu entry on the cart file, not a button inside the Reports page), but the capability is complete end to end: re-runs the cart through the panel's own run path and, once perf ingest lands, focuses the charts panel and opens that run — the reverse hop of the "View in Reports" one §1's cross-page-handoffs row already credited. |
-| Run detail header + config line (budget, wire-model constants, wire-wait tag) | Run title only | deferred | C2's not-ported list. |
-| "Copy for agent" text export | none | deferred | Same list. |
-| Failed-asset-loads table, Panics table | none | deferred | Same list. |
-| Guest UART console for a stored run | none | deferred | The emu panel shows the *live* console; the ingested one is written to the DB but never read back. |
-| Ignored-frames editor (chips, comma/space input, "N of M excluded") | Default frame-0 ignore + a muted `"N frame(s) ignored"` caption | partial | Parity of the *filter* shipped; the editor did not — an ignore set is a UI task, not a port. |
-| KPI tile rows (Frames, Over-budget, Avg wire vs budget, IPC, I$/D$ hit rate, max misses, conditional PPU/APU tiles) | none | deferred | C2's not-ported list; the panel has no KPI row at all. |
+| Run detail header + config line (budget, wire-model constants, wire-wait tag) | Detail header with Back, Re-run, title, ignore caption and a config line (F5.4/R2) | ✓ | The config line is `ggo_worldlib::charts::reports::kpi::run_config_line` **verbatim** — the same function ggo-ide's page calls, not a re-implementation — so the budget, scanout/refill/writeback constants and the idealized / calibrated / pessimistic-2x wire-wait tag are the same strings in both. A device run (no wire model) gets `hardware counters (no wire model)` instead of fabricated constants. Absent only when the run row itself is missing. |
+| "Copy for agent" text export | none | deferred | Same list. One of the two feature stragglers left after F5.4 (the other is §10's version/environment row). |
+| Failed-asset-loads table, Panics table | Both tables in the run detail (F5.4/R2), rendered first so a frameless panicking run still shows them | ✓ | Empty states are two different facts, not one: `none recorded` when the run captured UART and nothing matched, versus a deliberately hedged line for a run with no UART at all — `"no UART lines captured for this run (none emitted, a diag run, or a run predating UART persistence)"`. A test forbids narrowing that to any single cause, because the data cannot distinguish them. |
+| Guest UART console for a stored run | `Console — guest UART` in the run detail (F5.4/R3), from `perf_db::run_uart` | ✓ | Scrollable (`uniform_list`, virtualized) and monospace (`buffer_font`). Every stored line — the 2000-line ring is producer-side, in the emu panel, so the reader imposes no second cap. The emu panel's *live* console is a separate surface and stays as-is; the two share the row renderer, not the state. |
+| Ignored-frames editor (chips, comma/space input, "N of M excluded") | Default frame-0 ignore + a muted `"N frame(s) ignored"` caption | partial | Parity of the *filter* shipped; the editor did not — an ignore set is a UI task, not a port. **After F5.4 this is the reports page's one remaining feature gap vs ggo-ide** (everything else on this table is ✓ or a stated divergence). |
+| KPI tile rows (Frames, Over-budget, Avg wire vs budget, IPC, I$/D$ hit rate, max misses, conditional PPU/APU tiles) | Wrapping tile row above the plots (F5.4/R2), derived by `ggo_worldlib::charts::reports::kpi` | ✓ | Eight unconditional tiles in ggo-ide's order, plus five conditional ones on ggo-ide's own thresholds. **Read an absent conditional tile carefully.** Peak sprites/scanline, VRAM uploads/frame and APU underruns hide at exactly zero, so absence there does mean "never measured" and a measured zero is never rendered as a `0`. The two working-set tiles hide unless the max exceeds `kpi::TILE_CACHE_TILES` (**64**), so **absence means "at or below cache capacity, *or* never measured", and this surface cannot tell you which** — a real 40-tile working set renders nothing. That is faithful to ggo-ide (`RunPage.tsx:365/373`) and deliberately unchanged; a qualifier that separates the two cases is a later call. The whole row is suppressed when no frames survive the ignore filter. |
 | Chart set (wire vs budget, wire breakdown, cache misses, syscalls, tile working set, I$ misses + evictions by function, i/d-miss histograms, PPU evictions, tile-load wire, APU fetch wire, instructions) | ✓ — `chart_set::build_charts` mirrors `reports.rs::charts_section`, same order and same gating | ✓ | |
-| Historic overlay (up to 5 prior runs, age-faded) | none | deferred | C2's not-ported list. |
-| Click-to-inspect frame → per-function misses/evicted table | none | deferred | Same. |
-| I$ profile table with sortable header | none | deferred | Same. |
+| Historic overlay (up to 5 prior runs, age-faded) | Historic toggle above the plots (F5.4/R5); prior runs picked by `charts::reports::historic`, drawn by `chart_geom` | ✓ | Same four charts ggo-ide overlays (wire cycles, cache misses, tile working set, instructions), same picker (`pick_prior_ids`: same `cart_id`, lower `run.id`, descending, capped at `HISTORIC_OPACITY.len()` = 5), same age ramp `[0.5, 0.36, 0.26, 0.18, 0.12]`. Overlays **contribute to the y-scale** — the fold and the polyline loop read one `drawn_overlays` list, specifically so scale and paint cannot disagree. Three things to know. **Alignment is by index position, not by frame number** (ggo-ide's contract, kept): a shorter prior run stops early rather than dropping to zero, and a prior run with fewer than 2 points on the axis is dropped from both scale and paint. `pick_prior_ids` assumes run ids are allocated in **ingest** order (they are — an `INTEGER PRIMARY KEY` rowid), so "prior" means ingested earlier, **not** captured earlier. And there is still **no run-kind column**, so a cart's cart-mode and full-system runs can be overlaid on one chart with nothing marking which is which (see the Known-deferrals entry). Two deliberate divergences: the toggle is *disabled* with a reason at zero priors where ggo-ide renders a live checkbox next to "(0 prior runs)", and the overlay loads with the run rather than lazily behind the toggle — costing up to six extra queries per selection, paid whether or not the toggle is used. |
+| Click-to-inspect frame → per-function misses/evicted table | Click a frame on a selectable chart (F5.4/R4) → a caller/callee misses+evicted pane | ✓ | Hit-tested by `chart_geom::frame_at` under the *current* zoom view, so the pane and the plot cannot disagree about which frame was clicked. **The pane renders directly beneath the chart that opened it, not in ggo-ide's one fixed slot** — deliberate, because a fixed mid-list slot is usually scrolled off-screen from the click in a 360 px dock; the consequence is that clicking the same frame number on a *different* chart moves the pane rather than closing it (ggo-ide's `pickFrame` toggles on frame alone, because its slot never moves). The empty state names a state and never a cause: `no per-function rows recorded for this frame`, asserted character for character, where ggo-ide claims `"No I$ misses recorded this frame."` |
+| I$ profile table with sortable header | Profile table last in the detail (F5.4/R4), `misses` header toggles direction | ✓ | Same single sortable column ggo-ide has (one `profile_sort_ascending` bool there too), with the arrow doubling as affordance and readout; both orders are precomputed off-thread by `charts::reports::profile::aggregate_profile_sorted`, so a click sorts nothing at click time. Three distinct empty states where ggo-ide has one, and the split is more truthful than ggo-ide's: it keys its fallback off the *ignore-filtered* rows, so a run whose only rows are on frame 0 gets told it has no profile data at all. **Worth knowing: the emu panel never writes profile rows** — `drive` passes `None` for both dumps — so this table is empty for every panel-produced run; every profile row in `ggo_ide.db` came from a native `ggo-emu --profile` ingest, and the empty state says so. That is equally true of ggo-ide, which reads the same table. |
 | Reads `~/.ggo/ggo_ide.db` off-thread, stale-response-guarded | ✓ — the same DB file, not a copy; load-generation guards on both the list and the detail | ✓ | |
 
 ## 8. Device page
@@ -178,7 +181,7 @@ but `emerald.toml` itself is still read as text.
 | Flash `.ggo` via `ggo-diag --provision --launch` (file picker + magic check, Full-run/Skip-PnR toggle, collect seconds, baud) | `ulx3s: flash bitstream (fujprog)` task | partial | The task flashes a **bitstream** with `fujprog`, which is the canonical `scripts/fpga-test` invocation — it is not the `ggo-diag` provision+launch flow with its options. |
 | "Run hardware diagnostics" (built-in diagnostic cart, no project needed) | Project-panel context menu: **Run hardware diagnostics**, contributed by `ggo_emu_panel` (F5.2/S4) | partial | `ggo-diag --tty <port> --skip-pnr --launch`, gated to a right-click on a directory (any directory, not tied to an emerald project — the spec's "no project needed"). Needs a GGO repo checkout (`GGO_REPO`) and a board; missing either names exactly what's missing on the status row and spawns nothing. One-shot, not streamed, no cancel, no baud/collect-seconds/port picker — ggo-ide's Device page is the model for all three, unbuilt here. |
 | Live run log with stick-to-bottom autoscroll, Cancel, PASS/FAIL/TIMEOUT verdict | Terminal panel output; Ctrl-C | partial | Raw stdout with no verdict parsing and no state machine. |
-| History rail (clone `~/.ggo/diag.db`, 50 recent runs, per-run log viewer) | none | deferred | Nothing clones or reads `diag.db` in the fork. |
+| History rail (clone `~/.ggo/diag.db`, 50 recent runs, per-run log viewer) | Device-run rail in the charts panel (F5.4/R3): clones `~/.ggo/diag.db` into `ggo_ide.db`, lists 50 recent runs, selection drives the panel, per-run log viewer | ✓ | Clones rather than reading live, for ggo-ide's own reason (it opens `diag.db` read-write to migrate, and two writers on one file is the failure it was avoiding). ggo PR #88 made that clone **reconcile** instead of copy-once, which fixed two permanent data-corruption paths and self-heals databases already corrupted by the old shape. `HISTORY_LIMIT = 50`, ordered `started_at DESC, id DESC`. Three named absent states rather than a blank or a panic — no `diag.db`, a `diag.db` with no runs, and a pre-migration `diag.db` — and they render *under* any rows already loaded, not instead of them. Two limits to read honestly: rows carry only `started_at`, `state` and `verdict`, so **runs are listed undifferentiated** — the `runs` table still has no run-kind column, so nothing marks a cart-mode capture apart from a full-system one (as in ggo-ide); and the rail lives in the charts panel, not on a Device page, because §8's flash/diagnostics surface is not here. |
 | UART monitor | `ulx3s: UART monitor` task (mirrors `fpga-test`'s `configure_tty`, documents the FT231X re-enum gap) | ✓ | |
 
 ## 9. Shared chart widgets
@@ -188,10 +191,10 @@ but `emerald.toml` itself is still read as text.
 | Line / StackedArea / Histogram with nice-step gridlines, compact tick labels, axis captions | `chart_geom` (renderer-independent `ChartScene`) + `chart_paint` (gpui) | ✓ | |
 | Hover crosshair + flipping tooltip | ✓ | ✓ | |
 | Dashed budget line participating in the y-scale | ✓ | ✓ | |
-| Click-drag x-zoom + double-click reset | none | deferred | C2's not-ported list. |
-| Click-to-select a frame (drives the inspect panel) | none | deferred | Dead without the inspect panel (§7). |
-| Historic overlays (grey, age-ramped opacity, contribute to y-scale) | none | deferred | Same list. |
-| Cached static layer, cheap hover redraws | Scenes rebuilt on hover | partial | Hover `notify()` rebuilds every chart's scene; fine at real run sizes, a documented ceiling at the 100k-frame cap. |
+| Click-drag x-zoom + double-click reset | ✓ (F5.4/R5): one `resolve_gesture` resolver — double-click resets, a drag of `DRAG_MIN_PX` (3 px) or more zooms, anything shorter falls through to frame selection | ✓ | Line charts only, which is ggo-ide's own scope (`stacked.rs`/`histogram.rs` both say "no zoom, no drag") and not a fork shrinkage. `zoom_domain` re-reads through the *current* scale so drags compound, clamps inside the full domain and enforces a `MIN_ZOOM_DOMAIN_WIDTH` so a zoom-to-nothing is unreachable. Zoom is keyed by chart index and cleared on selection change, since an index means nothing across chart sets. |
+| Click-to-select a frame (drives the inspect panel) | ✓ (F5.4/R4) — `ChartSpec::selectable`, hit-tested by `chart_geom::frame_at` | ✓ | Exactly the four charts `RunPage.tsx` passes `onSelect` to: cache misses, tile working set, and the two per-function charts — pinned by a test that names all four. Ties resolve to the earlier frame; histograms are never selectable; a keyboard-dispatched click with no cursor selects nothing. |
+| Historic overlays (grey, age-ramped opacity, contribute to y-scale) | ✓ (F5.4/R5) — one implementation, `chart_geom::drawn_overlays`, read by both the y-scale fold and the polyline loop | ✓ | Grey is `palette.text.opacity(age)` (theme text dimmed, not a hardcoded grey, so it follows light/dark). Painted **before** the live series so the current run draws over its history, and x-clipped to the visible zoom domain — a deliberate divergence from ggo-ide's `line.rs`, reasoned in place. Alignment, picker and run-kind caveats: §7's historic-overlay row. |
+| Cached static layer, cheap hover redraws | Per-chart scene memo (F5.4/R5): `CachedScene { spec, size, view, scene }`, invalidated on `Arc::ptr_eq(spec)` / size / zoom-view change | partial | A hover move no longer rebuilds every chart — but it still rebuilds **one**, because the hovered chart's spec is what carries the readout. Measured at the 100k-frame cap in a debug build: ~11.8 ms per memoized hover move, at or past a frame budget once the rest of the frame is counted; the `Arc` clone share of that is 0.4%, so the residual is a single chart's `O(frames)` rebuild and the real fix is decimating by index **before** `plot_points` materialises 100k points that `envelope` immediately cuts to 2048. Cache is a field of the panel entity, so it is per panel, not per window (they coincide today — `init` creates one panel per workspace). |
 
 ## 10. Settings page
 
@@ -202,7 +205,7 @@ but `emerald.toml` itself is still read as text.
 | Serial device (tty) + scanned-port dropdown | `GGO_TTY` env | partial | Free-form env var, no scan, no picker. |
 | Baud rate (validated positive integer) | `GGO_BAUD` env | partial | No validation; a bad value fails at `stty`. |
 | `emd` binary path (blank = resolve from PATH) | PATH | partial | The override is gone; `emd` must be on PATH. |
-| Version/environment row + `emd` re-check | none | deferred | Nothing probes `emd --version` in the fork. |
+| Version/environment row + `emd` re-check | none | deferred | Nothing probes `emd --version` **for display** in the fork. Note what does exist: F5.3/E4's version *lock* (§5) checks the binary and gates every mutating control on the result, with a 30 s mtime poll. What is missing is the Settings-page readout of the version/environment and its manual re-check button. One of the two feature stragglers left after F5.4. |
 | Per-key persistence in the settings DB | `.zed/settings.json` (repo-shared) + shell env (per-user) | ✓ | Split exactly as the spec's disposition table proposed. |
 
 ## 11. Fork-only additions (no ggo-ide equivalent)
@@ -221,9 +224,9 @@ but `emerald.toml` itself is still read as text.
 
 | Status | Rows |
 |---|---|
-| ✓ | 44 |
-| partial | 34 |
-| deferred | 15 |
+| ✓ | 56 |
+| partial | 35 |
+| deferred | 2 |
 | dropped | 11 |
 | **total** | **104** |
 
@@ -294,17 +297,58 @@ all four hops ship, on the one residual that its Emulate hop is cart mode.
 Before this wrap: ✓ 38 / partial 33 / deferred 22 / dropped 11, total 104.
 After: ✓ 44 / partial 34 / deferred 15 / dropped 11, total 104.)
 
+(F5.4 wrap: **thirteen rows moved**, the largest single-phase movement, and
+the one that empties the deferred column. Twelve deferred → ✓: the Reports
+"Re-run" entry point (§6, R3), run detail header + config line (§7, R2),
+failed-asset-loads + Panics tables (§7, R2), guest UART console for a stored
+run (§7, R3), KPI tile rows (§7, R2), historic overlay (§7, R5),
+click-to-inspect frame (§7, R4), I$ profile table with sortable header (§7,
+R4), the device history rail (§8, R3), click-drag x-zoom + double-click reset
+(§9, R5), click-to-select a frame (§9, R4) and historic overlays on the chart
+widgets (§9, R5). One deferred → partial: emulator audio + Mute + underrun
+counter (§6, R6) — the panel owns the stream now, but only on the cart path
+and only exercised on Linux/ALSA, and the counter counts dropout *events*.
+Three rows changed *text* without changing status: "Build & run project"
+(§6) now says full-system audio is what stays external; "Ignored-frames
+editor" (§7) is flagged as the reports page's last remaining gap; and
+"Cached static layer" (§9) stays `partial` on a measured residual rather
+than on the old "scenes rebuilt on hover" — R5 added the memo, and one
+`O(frames)` rebuild per hover move survives it. Before this wrap: ✓ 44 /
+partial 34 / deferred 15 / dropped 11, total 104. After: ✓ 56 / partial 35 /
+deferred 2 / dropped 11, total 104.)
+
 (Counted over §§1-10; §11's fork-only rows are not dispositions of a ggo-ide
 feature and are excluded, except that the LSP row there is a deferral in its
 own right.)
 
+**The remaining deferred set, named in full.** After F5.4 it is three items,
+and only one of them is large:
+
+1. **LSP** (§11) — the pure-extension spec's central mechanism, and the only
+   substantial thing left. `ggo_language` registers a grammar and queries;
+   there is no `ggo-lsp` binary and no `LspAdapter`, so world validation,
+   hardware-budget diagnostics, snap/center/offset code actions and import
+   diagnostics are all unbuilt. It is not counted in the table above (§11
+   rows are not ggo-ide dispositions) but it is a real deferral and the
+   honest headline for "what is left".
+2. **§10's version/environment row + `emd` re-check** — nothing in the fork
+   probes `emd --version` for display. Note the version *lock* does ship
+   (§5, F5.3/E4); what is missing is the Settings-page readout and its
+   manual re-check button.
+3. **§7's "Copy for agent" text export** — never started.
+
+That is the whole deferred column: LSP plus two stragglers. Everything else
+outstanding is now either a `partial` with its shortfall written into the row,
+a deliberate `dropped`, or an entry in the ledger below.
+
 Read that shape honestly: the panels the fork set out to build (world,
-sprite, charts, emulator) are largely ✓, and as of F5.3 so is Emerald ops —
-the mutations run in-panel, gated on the version lock, rather than in a
-terminal. The remaining *ancillary* pages — Device, Settings, Reports'
-non-chart furniture, and Emerald's `emerald.toml` viewer — are still mostly
-"partial via a task or a text file"; and the pixel-art half of Assets is a
-deliberate drop with no replacement in this repo.
+sprite, charts, emulator) are largely ✓ — and as of F5.4 the Reports surface
+is too, which was the last big block of "deferred" outside the LSP. Emerald
+ops run in-panel, gated on the version lock, rather than in a terminal. The
+remaining *ancillary* pages — Device, Settings, and Emerald's `emerald.toml`
+viewer — are still mostly "partial via a task or a text file"; and the
+pixel-art half of Assets is a deliberate drop with no replacement in this
+repo.
 
 ---
 
@@ -349,10 +393,23 @@ guards and follow-ups that someone has to pick up:
 - **`MAX_FRAMES = 100_000` ingest rejection.** Ported verbatim from ggo-ide for
   parity: a run longer than roughly 28 minutes at 60 Hz is rejected outright at
   ingest rather than truncated.
-- **Frame-0 ignore-set editor.** The charts panel applies ggo-ide's default
-  (drop frame 0) and captions it, but there is no way to change the set.
-- **Hover rebuild ceiling.** Every hover move rebuilds all chart scenes;
-  O(charts × frames) per mouse-move frame.
+- **Frame-0 ignore-set editor — the reports page's one remaining gap vs
+  ggo-ide (as of F5.4).** The charts panel applies ggo-ide's default (drop
+  frame 0), captions it, and threads the ignore set through every derivation
+  that needs it (KPI tiles, charts, overlays, the profile table's
+  "all rows ignored" state), but there is **no chip editor**: no way to add
+  or remove a frame from the set, and no "N of M excluded" readout. Every
+  other §7 row is now ✓ or a stated divergence, so this is the whole
+  remainder.
+- **Hover rebuild ceiling (narrowed by F5.4/R5, not closed).** It used to be
+  O(charts × frames) per mouse-move frame; the scene memo cut it to one
+  chart's rebuild, because the hovered chart's spec carries the readout.
+  Measured at the 100k-frame cap in a debug build: **~11.8 ms per memoized
+  hover move**, which is at or past a frame budget once the rest of the frame
+  is counted. The `Arc` clone share is **0.4%**, so the residual is the single
+  `O(frames)` rebuild and not the caching. The real win is decimating **by
+  index before `plot_points`** rather than after: today `plot_points`
+  materialises 100k points that `envelope` immediately reduces to 2048.
 - **Glob duplicated between the fork and the repo.** `ggo_language`'s
   `PROJECT_FILE_TYPE_GLOB` and the ggo repo's `.zed/settings.json` `file_types`
   entry must agree, and nothing checks that they do across the two repos.
@@ -420,20 +477,25 @@ guards and follow-ups that someone has to pick up:
      with ggo-ide's.
   3. **Both kinds land in the same `runs` table, with no mode column**
      (`emu_panel/src/ingest.rs` keys on the cart path; the `label` column is
-     the rel path). There is no historic overlay yet to conflate them on one
-     chart (`chart_geom.rs`'s own doc: "no historic overlay ... the panel has
-     no prior-run picker yet") — the real risk today is in the run **picker
+     the rel path). It shows up in three places now. In the run **picker
      list** (C1): a cart-mode run and a full-system run of the same game
      share one `cart_name`, so two rows can read as just `"demo"` next to
      each other with nothing marking which is which except an opaque
      free-text `label`, and ggo-ide's own runs leave `label` unset entirely.
+     In the **historic overlay** (F5.4/R5), which the entry as written in
+     F5.2 said did not exist yet and now does: `pick_prior_ids` scopes on
+     `cart_id` alone, so a cart-mode run's ghosts can be full-system runs of
+     the same cart — two different workloads on one chart, with only the age
+     ramp to tell them apart. And in the device **history rail** (F5.4/R3),
+     whose rows carry `started_at`/`state`/`verdict` and nothing else.
      Until a mode column exists, the only discriminator is `label`: `None` =
      ggo-ide, `target/ggo-emulate/*.ggo` = this entry, anything else = a cart
-     clicked in the fork's explorer — none of that is surfaced in the picker
-     UI today. **F5.3 input**: add an explicit run-kind column (and show it
-     in the picker) rather than leaning on that convention; the same column
-     would also be what a future historic overlay needs to avoid mixing
-     modes once a prior-run picker exists.
+     clicked in the fork's explorer — none of that is surfaced in any of the
+     three UIs. **Still the recommendation**: add an explicit run-kind column
+     and show it in the picker, the rail and the overlay, rather than leaning
+     on that convention. (Overlaying possibly-different workloads of one cart
+     is ggo-ide's assumption too, so R5 matched it rather than inventing a
+     fork-only filter — but matched, not fixed.)
 - **An unreadable manifest reads as an absent one (F5.3/E2).**
   `manifests::read_manifest` maps any read/parse failure to "no such manifest",
   where ggo-ide shows a red "Failed to load: …" naming the file and fails the
@@ -473,6 +535,52 @@ guards and follow-ups that someone has to pick up:
   machine; a real group kill needs the child put in its own process group
   (`setsid` / `process_group(0)`) and a signal to the negated pgid, which is
   platform work this phase did not take.
+- **`AudioOut::stop()` does not join the stream thread (F5.4/R6).** Stopping
+  a run drops the handle and returns; cpal tears the stream down
+  asynchronously, so a Run issued immediately after a Stop can have **two
+  output streams alive for roughly one buffer period (~16 ms)**. Audible as a
+  brief doubling at restart, nothing worse. Same shape, one layer up: a
+  verdict write from run A that lands after run B has been selected shows
+  A's status on B's row — cosmetic, corrected by the next refresh, and worth
+  fixing with the same generation guard the detail loads already use.
+- **Emulator audio is untested off Linux, and cart-mode only (F5.4/R6).**
+  Every run of it has been Linux/ALSA. The Windows/CoreAudio path is written
+  against cpal's documented COM-apartment rule (the device is opened on the
+  emu thread for exactly that reason) but has never been executed, and
+  `snd_pcm_open` has no timeout around it. Audio is wired only through
+  `drive::run`, the cart path, so the panel has no full-system audio at all.
+  **`pump_audio` is the seam** a full-system mode would tap: it is the single
+  point where the emulator's sample output reaches the ring, so full-system
+  audio is a call site, not a redesign.
+- **Up to 10 short-lived tokio runtimes per run selection (F5.4/R3, R5).**
+  Each worldlib query opens its own connection and spins its own runtime:
+  four for `load_run_samples`, then up to six more once R5 added the
+  historic overlay (one `cart_runs` + up to five `run_frames`) — and the
+  overlay six are paid on every selection whether or not the toggle is ever
+  switched on. Not felt at current run sizes. The fix is worldlib-side: a
+  shared connection (or a connection pool) that the panel borrows, rather
+  than a runtime per query.
+- **A zoomed chart can keep a frame selected outside its own window
+  (F5.4/R5).** Zoom and frame selection are independent, so the inspect pane
+  goes on showing a frame the plot no longer draws. ggo-ide behaves the same
+  way (its zoom and `selFrame` are likewise independent), so this is matched,
+  not fixed. Related and separate: the scene cache is a field of the
+  `ChartsPanel` entity, i.e. **keyed per panel, not per window** — they
+  coincide today because `init` creates one panel per workspace, but nothing
+  enforces that.
+- **Non-finite overlay values are unguarded (F5.4/R5).** The only `is_finite`
+  filter in `chart_geom` is in `bins()`, for histograms. Overlay (and live
+  line) values go straight into the y-scale fold and the point mapper. Not
+  reachable today — every overlay field is an `i64 as f32` cast — but a
+  producer of float columns would not be caught, and a single NaN poisons the
+  chart's whole y-scale.
+- **`has_data()` ignores the `historic` field (F5.4/R5).** A `ChartSpec`
+  carrying only overlays and no live series reports "no data", so
+  `build_chart_scene` and `frame_at` early-out and the overlays are dropped
+  **silently**. Deliberate and documented ("an overlay is context for a run,
+  not a run"), and unreachable from `chart_set`, which never builds an
+  overlay-only spec — noted here because it is a silent drop rather than a
+  visible one if that ever changes.
 - **Hardware diagnostics is one-shot, with no streaming, cancel or options
   (F5.2/S4).** The "Run hardware diagnostics" entry spawns
   `ggo-diag --tty <port> --skip-pnr --launch` and shows the transcript when it
