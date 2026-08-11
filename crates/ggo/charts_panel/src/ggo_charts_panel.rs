@@ -18,6 +18,14 @@
 //! guest-UART console (R3) and a Re-run entry that hands the run's cart back
 //! to the emulator pane through `ggo_common`'s cart-runner registry.
 //!
+//! R4 made the plots interactive: clicking a point on one of the four
+//! frame-selectable charts opens an inspect pane for that frame beneath
+//! it, and the I$ profile table under the charts sorts by misses either
+//! way. Both are [`inspect`]'s view models, derived with everything else
+//! in the one background pass -- the panel picks and paints, and the
+//! guard that keeps it that way now reaches event listeners too
+//! ([`ChartsPanel::guarded_listener`]).
+//!
 //! **Everything a selection needs is queried AND derived off-thread**, in
 //! one background spawn per selection -- see [`detail`]'s module doc, which
 //! is also where the guard that keeps it that way lives.
@@ -40,6 +48,7 @@ mod chart_paint;
 mod chart_set;
 mod detail;
 mod history;
+mod inspect;
 // `pub`: `ggo_emu_panel`'s ingest round-trip test reads its own writes back
 // through THESE query functions (as a dev-dependency), which is what proves
 // the two panels agree on `ggo_ide.db`'s schema rather than each having its
@@ -101,6 +110,13 @@ const KPI_ROW_SELECTOR: &str = "ggo-charts-kpi-row";
 const FAILURES_SELECTOR: &str = "ggo-charts-failures";
 const PANICS_SELECTOR: &str = "ggo-charts-panics";
 const HISTORY_RAIL_SELECTOR: &str = "ggo-charts-history-rail";
+const PROFILE_TABLE_SELECTOR: &str = "ggo-charts-profile-table";
+const FRAME_INSPECT_SELECTOR: &str = "ggo-charts-frame-inspect";
+const PROFILE_SORT_SELECTOR: &str = "ggo-charts-profile-sort";
+
+/// `RunPage.tsx`'s label for a leaf that shares its caller's name: that
+/// caller's own samples, as opposed to something inlined into it.
+const SELF_LEAF_LABEL: &str = "<self>";
 
 /// Height of a log/console scroll region -- ggo-ide's `UART_HEIGHT` (220),
 /// which is also what its history log viewer uses.
@@ -309,6 +325,16 @@ pub struct ChartsPanel {
     history_generation: u64,
     _history_task: Option<Task<()>>,
     hover: Option<Hover>,
+    /// The frame the user last clicked, already grouped -- `RunPage.tsx`'s
+    /// `selFrame`. `None` until a click lands, and dropped whenever the
+    /// selection changes (a frame number means nothing across runs).
+    frame_inspect: Option<inspect::FrameInspect>,
+    /// Which way the I$ profile table's "misses" header sorts --
+    /// `reports.rs`'s `profile_sort_ascending`. Descending (the biggest
+    /// offender first) is the default, here as there. A direction only:
+    /// both orders are already derived, so this picks between them and
+    /// never sorts anything.
+    profile_sort_ascending: bool,
     /// Each chart canvas's last painted bounds, recorded in its prepaint
     /// (the only place an element learns where it landed) so a mouse-move
     /// on the wrapper can be converted to canvas-local coordinates. Shared
@@ -339,8 +365,54 @@ impl ChartsPanel {
             history_generation: 0,
             _history_task: None,
             hover: None,
+            frame_inspect: None,
+            profile_sort_ascending: false,
             chart_bounds: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// `cx.listener`, with `detail`'s no-derivation guard held across the
+    /// whole handler body.
+    ///
+    /// R3's review named arbitrary event listeners as the gap in that
+    /// guard's reach -- it wrapped `select_run`'s update closure and the
+    /// whole of `Render::render`, and a listener that re-derived would
+    /// have sailed past both. R4 adds the first listeners that could
+    /// plausibly want to (a click that opens a per-frame table, a header
+    /// that reorders one), so the gap is closed at the seam every
+    /// listener in this panel already goes through rather than at the two
+    /// call sites that happen to need it today. Nothing outside this
+    /// function calls `cx.listener` any more; a `guarded_listener`-shaped
+    /// grep is what keeps that true.
+    ///
+    /// Free outside `cfg(test)`: the guard is a ZST whose `Drop` does not
+    /// exist in a release build.
+    ///
+    /// Returns a `Box<dyn Fn>` rather than an `impl Fn`, which is the one
+    /// non-obvious line here. An unboxed wrapper does not compile: under
+    /// edition 2024's RPIT capture rules `Context::listener`'s own opaque
+    /// type captures the borrow of `cx`, so a `use<E, H>` return that
+    /// wraps it is `E0700`, and without `use<..>` the listener becomes
+    /// unnameable outside the `update` that built it -- which the drill
+    /// test needs, since it has to hold one and then call it. Boxing
+    /// erases that lifetime, satisfies gpui's `impl Fn(..) + 'static`
+    /// handler bounds unchanged, and costs one allocation per listener
+    /// per render. Copying `Context::listener`'s body into this crate
+    /// would also compile, and was rejected: an upstream internal
+    /// hand-copied into `crates/ggo` is fork drift we would carry
+    /// forever to save an allocation nobody can measure next to
+    /// `build_chart_scene`.
+    fn guarded_listener<E: ?Sized + 'static, H>(
+        cx: &Context<Self>,
+        handler: H,
+    ) -> Box<dyn Fn(&E, &mut Window, &mut App) + 'static>
+    where
+        H: Fn(&mut Self, &E, &mut Window, &mut Context<Self>) + 'static,
+    {
+        Box::new(cx.listener(move |view, event: &E, window, cx| {
+            let _no_build_here = detail::no_build_here();
+            handler(view, event, window, cx);
+        }))
     }
 
     fn db_path(&self) -> Option<PathBuf> {
@@ -446,6 +518,11 @@ impl ChartsPanel {
         self.device_log = None;
         self.rerun_note = None;
         self.hover = None;
+        // A frame number and a chart index both mean something only
+        // within one run's chart set, so neither survives a selection
+        // change. The sort DIRECTION does -- it is a reading preference,
+        // not run state, and ggo-ide keeps it across runs too.
+        self.frame_inspect = None;
         self.chart_bounds.borrow_mut().clear();
         self.detail_generation += 1;
     }
@@ -517,6 +594,7 @@ impl ChartsPanel {
         self.device_log = None;
         self.rerun_note = None;
         self.hover = None;
+        self.frame_inspect = None;
         self.chart_bounds.borrow_mut().clear();
         cx.notify();
     }
@@ -741,9 +819,12 @@ impl ChartsPanel {
                         .cursor_pointer()
                         .child(Label::new(run.display_title()))
                         .child(Label::new(run.started_at.clone()).color(Color::Muted))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.select_run(run.clone(), cx);
-                        }))
+                        .on_click(Self::guarded_listener(
+                            cx,
+                            move |this, _event, _window, cx| {
+                                this.select_run(run.clone(), cx);
+                            },
+                        ))
                 }))
                 .into_any_element(),
         };
@@ -793,9 +874,12 @@ impl ChartsPanel {
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                             )
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.select_device_run(summary.clone(), cx);
-                            }))
+                            .on_click(Self::guarded_listener(
+                                cx,
+                                move |this, _event, _window, cx| {
+                                    this.select_device_run(summary.clone(), cx);
+                                },
+                            ))
                             .into_any_element()
                     })
                     .collect();
@@ -853,9 +937,12 @@ impl ChartsPanel {
                             .child(
                                 IconButton::new("ggo-charts-device-back", IconName::ArrowLeft)
                                     .tooltip(Tooltip::text("Back to runs"))
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.clear_selection(cx);
-                                    })),
+                                    .on_click(Self::guarded_listener(
+                                        cx,
+                                        |this, _event, _window, cx| {
+                                            this.clear_selection(cx);
+                                        },
+                                    )),
                             )
                             .child(Label::new(run.started_at.clone()).size(LabelSize::Small)),
                     )
@@ -938,6 +1025,12 @@ impl ChartsPanel {
                         );
                         out
                     })
+                    // Last, and for every run -- ggo-ide pushes
+                    // `profile_section` outside the frames branch for the
+                    // same reason the two diagnostic tables are hoisted
+                    // above it: it has something to say (its own empty
+                    // state) about a run with no frames at all.
+                    .child(self.render_profile_table(&detail.profiles, cx))
                     .into_any_element()
             }
         };
@@ -964,9 +1057,12 @@ impl ChartsPanel {
                             .child(
                                 IconButton::new("ggo-charts-back", IconName::ArrowLeft)
                                     .tooltip(Tooltip::text("Back to runs"))
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.clear_selection(cx);
-                                    })),
+                                    .on_click(Self::guarded_listener(
+                                        cx,
+                                        |this, _event, _window, cx| {
+                                            this.clear_selection(cx);
+                                        },
+                                    )),
                             )
                             .child(self.render_rerun_button(cx))
                             .child(Label::new(title).size(LabelSize::Small))
@@ -1014,7 +1110,7 @@ impl ChartsPanel {
         IconButton::new("ggo-charts-rerun", IconName::RotateCcw)
             .disabled(rel.is_none())
             .tooltip(Tooltip::text(tooltip))
-            .on_click(cx.listener(|this, _event, window, cx| {
+            .on_click(Self::guarded_listener(cx, |this, _event, window, cx| {
                 this.rerun_selected(window, cx);
             }))
             .into_any_element()
@@ -1180,6 +1276,213 @@ impl ChartsPanel {
         .into_any_element()
     }
 
+    /// The I$ profile table: every function's `misses`/`evicted` across
+    /// the run's kept frames, with a sortable "misses" header --
+    /// `reports.rs`'s `profile_section`.
+    ///
+    /// Last in the detail view, and rendered for every run, exactly as
+    /// there: a run with no profile rows gets the heading and the reason
+    /// it is empty rather than silently nothing, which is how a user
+    /// learns the data exists at all.
+    fn render_profile_table(
+        &self,
+        profiles: &inspect::Profiles,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ascending = self.profile_sort_ascending;
+        let section = Self::table(
+            "I$ profile — misses by function",
+            PROFILE_TABLE_SELECTOR,
+            profiles.table_empty_state(),
+            cx,
+        );
+        let rows = profiles.table().rows(ascending);
+        if rows.is_empty() {
+            return section.into_any_element();
+        }
+        section
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new("function")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        // The one interactive column header. The arrow is
+                        // the affordance AND the state readout, matching
+                        // ggo-ide's `arrow_up`/`arrow_down` icon. Wrapped
+                        // in a selector-bearing div so a render test can
+                        // click the header itself rather than reaching
+                        // past it to the handler.
+                        div()
+                            .debug_selector(|| PROFILE_SORT_SELECTOR.to_string())
+                            .child(
+                                Button::new("ggo-charts-profile-sort", "misses")
+                                    .label_size(LabelSize::XSmall)
+                                    .end_icon(Icon::new(if ascending {
+                                        IconName::ArrowUp
+                                    } else {
+                                        IconName::ArrowDown
+                                    }))
+                                    .tooltip(Tooltip::text(if ascending {
+                                        "Sort by misses, largest first"
+                                    } else {
+                                        "Sort by misses, smallest first"
+                                    }))
+                                    .on_click(Self::guarded_listener(
+                                        cx,
+                                        |this, _event: &gpui::ClickEvent, _window, cx| {
+                                            this.toggle_profile_sort(cx);
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Label::new("evicted")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .children(rows.iter().map(|agg| {
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(agg.func.clone())
+                                .size(LabelSize::Small)
+                                .buffer_font(cx),
+                        ),
+                    )
+                    .child(
+                        Label::new(ggo_worldlib::charts::reports::fmt::with_thousands(
+                            agg.misses,
+                        ))
+                        .size(LabelSize::Small),
+                    )
+                    .child(
+                        Label::new(ggo_worldlib::charts::reports::fmt::with_thousands(
+                            agg.evicted,
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    /// The click-to-inspect pane: one clicked frame's I$ misses, grouped
+    /// by calling function with its inlined callees indented under it --
+    /// `reports.rs`'s `inspect_panel`.
+    fn render_frame_inspect(
+        &self,
+        selected: &inspect::FrameInspect,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let frame = selected.frame;
+        v_flex()
+            .w_full()
+            .gap_1()
+            .p_2()
+            .rounded_sm()
+            .bg(cx.theme().colors().element_background)
+            .debug_selector(|| FRAME_INSPECT_SELECTOR.to_string())
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        Label::new(format!("Frame {frame} — I$ misses by function"))
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        IconButton::new("ggo-charts-inspect-close", IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Close the frame inspector"))
+                            .on_click(Self::guarded_listener(
+                                cx,
+                                |this, _event: &gpui::ClickEvent, _window, cx| {
+                                    this.frame_inspect = None;
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            )
+            // ggo-ide's subtitle verbatim: `evicted` is the column most
+            // often misread (it counts this function's lines DISPLACED by
+            // someone else, not lines it displaced).
+            .child(
+                Self::note(
+                    "outer function > inlined callees; evicted = lines of that function \
+                     displaced this frame (the victims)",
+                )
+                .size(LabelSize::XSmall),
+            )
+            .children(selected.empty_state().map(Self::note))
+            .children(selected.groups().iter().flat_map(|group| {
+                let mut rows = vec![Self::inspect_row(
+                    group.caller.clone(),
+                    group.misses,
+                    group.evicted,
+                    false,
+                    cx,
+                )];
+                rows.extend(group.leaves.iter().map(|leaf| {
+                    // A leaf sharing its caller's name is that caller's
+                    // own (non-inlined) samples -- `RunPage.tsx`'s
+                    // `<self>`, applied per leaf and independently of the
+                    // whole-group collapse `group_frame_profile` resolved.
+                    let label = if leaf.func == group.caller {
+                        SELF_LEAF_LABEL.to_string()
+                    } else {
+                        leaf.func.clone()
+                    };
+                    Self::inspect_row(label, leaf.misses, leaf.evicted, true, cx)
+                }));
+                rows
+            }))
+            .into_any_element()
+    }
+
+    /// One row of the inspect pane, indented when it is an inlined callee.
+    fn inspect_row(
+        label: String,
+        misses: i64,
+        evicted: i64,
+        leaf: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        h_flex()
+            .w_full()
+            .gap_2()
+            .justify_between()
+            .when(leaf, |el| el.pl_3())
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .color(if leaf { Color::Muted } else { Color::Default })
+                        .buffer_font(cx),
+                ),
+            )
+            .child(
+                Label::new(ggo_worldlib::charts::reports::fmt::with_thousands(misses))
+                    .size(LabelSize::Small),
+            )
+            .child(
+                Label::new(ggo_worldlib::charts::reports::fmt::with_thousands(evicted))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+    }
+
     /// A titled table section, already carrying its empty-state line when
     /// it has one. Shared by both diagnostic tables so the two agree on
     /// heading weight and spacing.
@@ -1233,6 +1536,7 @@ impl ChartsPanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let title = SharedString::from(spec.title.clone());
+        let selectable = spec.selectable;
         // Refcount bump, not a deep clone -- see `DetailState::Ready`.
         let spec = spec.clone();
         let hover = self.hover.filter(|h| h.chart == ix).map(|h| (h.x, h.y));
@@ -1262,6 +1566,15 @@ impl ChartsPanel {
         )
         .size_full();
 
+        // The inspect pane renders directly beneath the chart that opened
+        // it -- see `inspect::FrameInspect::chart` for why not ggo-ide's
+        // one fixed slot.
+        let inspect_pane = self
+            .frame_inspect
+            .as_ref()
+            .filter(|sel| sel.chart == ix)
+            .map(|sel| self.render_frame_inspect(sel, cx));
+
         v_flex()
             .w_full()
             .gap_1()
@@ -1274,23 +1587,44 @@ impl ChartsPanel {
                     .rounded_sm()
                     .overflow_hidden()
                     .child(canvas)
-                    .on_mouse_move(
-                        cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    // Click-to-inspect, on the four charts `chart_set`
+                    // marked selectable. `mouse_position`, not
+                    // `position`: a keyboard-dispatched click reports the
+                    // hitbox's bottom-left corner, which is a pixel the
+                    // user never pointed at, so it selects nothing rather
+                    // than an arbitrary frame.
+                    .when(selectable, |el| {
+                        el.cursor_pointer().on_click(Self::guarded_listener(
+                            cx,
+                            move |this, event: &gpui::ClickEvent, _window, cx| {
+                                if let Some(position) = event.mouse_position() {
+                                    this.select_frame(ix, position, cx);
+                                }
+                            },
+                        ))
+                    })
+                    .on_mouse_move(Self::guarded_listener(
+                        cx,
+                        move |this, event: &MouseMoveEvent, _window, cx| {
                             this.hover_chart(ix, event.position, cx);
-                        }),
-                    )
+                        },
+                    ))
                     // `on_mouse_move` is hitbox-gated, so it never fires
                     // once the cursor leaves this chart -- moving into the
                     // gap between charts, onto the header, or off the
                     // panel entirely would otherwise leave the crosshair
                     // and readout pinned where the cursor last was.
                     // `on_hover(false)` is the only signal for that.
-                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                        if !*hovered {
-                            this.clear_hover(ix, cx);
-                        }
-                    })),
+                    .on_hover(Self::guarded_listener(
+                        cx,
+                        move |this, hovered: &bool, _window, cx| {
+                            if !*hovered {
+                                this.clear_hover(ix, cx);
+                            }
+                        },
+                    )),
             )
+            .children(inspect_pane)
             .into_any_element()
     }
 
@@ -1318,6 +1652,80 @@ impl ChartsPanel {
             self.hover = next;
             cx.notify();
         }
+    }
+
+    /// A click on chart `ix` at window-space `position`: select the frame
+    /// under the cursor, and group that frame's profile rows for the
+    /// inspect pane.
+    ///
+    /// Clicking the point that is already selected clears the selection
+    /// instead -- `RunPage.tsx`'s `pickFrame` (`n === selFrame() ? null :
+    /// n`), which is what makes the pane dismissable without a second
+    /// affordance (there is a Close button too, for discoverability).
+    /// The chart is part of "already selected" here and is not in
+    /// `pickFrame`, because this pane is anchored under the chart that
+    /// opened it rather than in one fixed slot: clicking the same frame
+    /// on a DIFFERENT chart moves the pane there, which is what the click
+    /// looks like it should do, instead of making it vanish.
+    ///
+    /// **Derives nothing that scales with the run.** The hit-test is
+    /// `chart_geom::frame_at` (a legend layout and one pass over the
+    /// frame axis) and the grouping reaches only the clicked frame's own
+    /// rows, through the index `detail::build` already built off-thread.
+    /// The listener that calls this holds the no-derivation guard, so a
+    /// future edit that reached for `detail::build`/`load` here fails
+    /// every test that clicks.
+    fn select_frame(&mut self, ix: usize, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let next = {
+            // Perf runs only. A device selection sets `device_log`, never
+            // `detail`, so there is no chart to click and no profile to
+            // inspect -- the two id spaces stay apart here as everywhere
+            // else (`Selection`'s doc).
+            let Some(DetailState::Ready(detail)) = &self.detail else {
+                return;
+            };
+            let Some(spec) = detail.charts.get(ix) else {
+                return;
+            };
+            if !spec.selectable {
+                return;
+            }
+            let Some(bounds) = self.chart_bounds.borrow().get(ix).copied().flatten() else {
+                return;
+            };
+            if !bounds.contains(&position) {
+                return;
+            }
+            let Some(frame) = chart_geom::frame_at(
+                spec,
+                (f32::from(bounds.size.width), f32::from(bounds.size.height)),
+                (
+                    f32::from(position.x - bounds.origin.x),
+                    f32::from(position.y - bounds.origin.y),
+                ),
+            ) else {
+                return;
+            };
+            match &self.frame_inspect {
+                Some(selected) if selected.frame == frame && selected.chart == ix => None,
+                _ => Some(detail.profiles.inspect(ix, frame)),
+            }
+        };
+        self.frame_inspect = next;
+        cx.notify();
+    }
+
+    /// The I$ profile table's "misses" column header -- flips the sort
+    /// direction. `reports.rs`'s `ToggleProfileSortAscending`.
+    ///
+    /// Both orders were derived off-thread by
+    /// `profile::aggregate_profile_sorted`, so this flips a bool and the
+    /// render picks the other vector. It does not sort, and it does not
+    /// reverse: R1 ported the sort out of ggo-ide's widget so that the
+    /// panel would stop being the thing that expresses the ordering.
+    fn toggle_profile_sort(&mut self, cx: &mut Context<Self>) {
+        self.profile_sort_ascending = !self.profile_sort_ascending;
+        cx.notify();
     }
 
     /// Drops the hover if (and only if) chart `ix` currently owns it --
@@ -2277,7 +2685,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path);
+            panel.db_path_override = Some(db_path.clone());
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -2997,5 +3405,586 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             assert_eq!(panel.rerun_note, Some(NO_CART_RUNNER));
         });
+    }
+
+    // --------------------------- click-to-inspect + the I$ profile table
+
+    /// `seed_run_with_samples`'s single profile row is not enough to
+    /// exercise the grouping, so this adds a real per-frame shape: a
+    /// cold-cache burst on the ignored frame 0, two functions under one
+    /// caller on frame 1, two callers on frame 3 -- and nothing at all on
+    /// frame 4, which is the "no per-function data" case.
+    fn seed_profile_rows(db_path: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(db_path).await.unwrap();
+            let conn = db.conn().unwrap();
+            for (frame, caller, func, misses, evicted) in [
+                (0i64, "boot", "boot", 9_000i64, 4_000i64),
+                (1, "main", "update", 30, 2),
+                (1, "main", "render", 10, 8),
+                (3, "main", "update", 5, 1),
+                (3, "draw", "blit", 40, 0),
+            ] {
+                conn.execute(
+                    "INSERT INTO profile (run_id, frame, caller, func, misses, evicted)
+                     VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                    (frame, caller, func, misses, evicted),
+                )
+                .await
+                .unwrap();
+            }
+        });
+    }
+
+    /// A second run in the same fixture db, so the run -> run selection
+    /// path can be exercised for real. Deliberately a DIFFERENT frame
+    /// range (10..=12) from run 1: a frame number that survived the
+    /// switch would then name a frame this run does not even have.
+    fn seed_second_run(db_path: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(db_path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles, label)
+                 VALUES (2, 1, '2026-08-03T00:00:00Z', 3, 555549, 'arena-2')",
+                (),
+            )
+            .await
+            .unwrap();
+            for n in 10..=12 {
+                conn.execute(
+                    "INSERT INTO frame
+                       (run_id, n, instrs, i_hits, i_misses, d_hits, d_misses,
+                        scanout_wire, blit_wire, miss_wire, wire_total, over_budget)
+                     VALUES (2, ?1, 1000, 0, 7, 0, 3, 164400, 30, 40, 164470, 0)",
+                    [n],
+                )
+                .await
+                .unwrap();
+            }
+        });
+    }
+
+    /// Window-space centre of the point chart `ix` drew for `frame`,
+    /// derived from the bounds its own prepaint recorded and the same
+    /// scale it painted with. This is what a user's cursor is over when
+    /// they click that point.
+    fn point_of(panel: &ChartsPanel, ix: usize, frame: f32) -> gpui::Point<Pixels> {
+        let bounds = panel.chart_bounds.borrow()[ix].expect("chart must have been laid out");
+        let spec = &panel.chart_specs()[ix];
+        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let plot = chart_geom::plot_for(spec, size);
+        let x = chart_geom::x_scale(plot, chart_geom::full_x_domain(&spec.x)).map(frame);
+        gpui::point(
+            bounds.origin.x + px(x),
+            bounds.origin.y + px(plot.y + plot.h / 2.0),
+        )
+    }
+
+    fn chart_index(panel: &ChartsPanel, title: &str) -> usize {
+        panel
+            .chart_specs()
+            .iter()
+            .position(|c| c.title == title)
+            .unwrap_or_else(|| panic!("{title} must be in the chart set"))
+    }
+
+    /// A drawn window showing the seeded run's detail view, ready to be
+    /// clicked. Tall enough that every chart is laid out rather than
+    /// scrolled out of the frame.
+    async fn drawn_detail_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        gpui::Entity<ChartsPanel>,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_profile_rows(&db_path);
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path.clone());
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        // Tall enough that every chart AND the profile table under them
+        // are laid out inside the window rather than scrolled out of it
+        // -- a hitbox the window never painted cannot be clicked.
+        cx.simulate_resize(gpui::size(DEFAULT_WIDTH, px(6000.)));
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        (dir, db_path, panel, cx)
+    }
+
+    /// The whole click path, through a real mouse event on a real
+    /// painted canvas: the frame under the cursor is resolved, its rows
+    /// are grouped, and the pane is painted beneath the chart clicked.
+    #[gpui::test]
+    async fn test_clicking_a_plot_opens_the_inspect_pane_for_that_frame(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, at) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 3.0))
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+
+        panel.update(cx, |panel, _cx| {
+            let selected = panel
+                .frame_inspect
+                .as_ref()
+                .expect("the click must select a frame");
+            assert_eq!(selected.frame, 3, "the frame the cursor was over");
+            assert_eq!(selected.chart, ix, "and the chart it was over");
+            let callers: Vec<&str> = selected
+                .groups()
+                .iter()
+                .map(|g| g.caller.as_str())
+                .collect();
+            assert_eq!(callers, vec!["draw", "main"], "misses desc");
+            assert_eq!(selected.empty_state(), None);
+        });
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        let pane = cx
+            .debug_bounds(FRAME_INSPECT_SELECTOR)
+            .expect("the inspect pane must be painted");
+        let chart = panel.update(cx, |panel, _cx| panel.chart_bounds.borrow()[ix].unwrap());
+        assert!(
+            pane.origin.y >= chart.origin.y,
+            "the pane renders beneath the chart that opened it"
+        );
+    }
+
+    /// Clicking the selected frame again dismisses the pane --
+    /// `RunPage.tsx`'s `pickFrame` toggle.
+    #[gpui::test]
+    async fn test_clicking_the_selected_frame_again_clears_it(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let at = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| assert!(panel.frame_inspect.is_some()));
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.frame_inspect.is_none(),
+                "the second click on the same point closes the pane"
+            );
+        });
+    }
+
+    /// ...but the same FRAME on a different chart moves the pane rather
+    /// than closing it: the pane is anchored under the chart that opened
+    /// it, so a click that looks like "show me this frame here" must not
+    /// read as "dismiss".
+    #[gpui::test]
+    async fn test_the_same_frame_on_another_chart_moves_the_pane(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (first, at_first) = panel.update(cx, |panel, _cx| {
+            let first = chart_index(panel, "Cache misses per frame");
+            (first, point_of(panel, first, 3.0))
+        });
+        cx.simulate_click(at_first, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.frame_inspect.as_ref().unwrap().chart, first);
+        });
+
+        // Re-lay-out first: the pane the first click opened pushes every
+        // chart below it down, so a point captured before it existed no
+        // longer names the same chart.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        let (second, at_second) = panel.update(cx, |panel, _cx| {
+            let second = chart_index(panel, "I$ misses by function");
+            (second, point_of(panel, second, 3.0))
+        });
+        cx.simulate_click(at_second, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            let selected = panel
+                .frame_inspect
+                .as_ref()
+                .expect("the pane moves, it does not close");
+            assert_eq!(selected.chart, second);
+            assert_eq!(selected.frame, 3);
+        });
+    }
+
+    /// A frame the profiler recorded nothing for still opens the pane --
+    /// with the empty state, read from the view model the renderer reads
+    /// rather than from a literal at the call site (R3's F2: a test that
+    /// compares two constants proves nothing about what was painted).
+    #[gpui::test]
+    async fn test_a_frame_with_no_per_function_data_shows_the_empty_state(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let at = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 4.0)
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            let selected = panel.frame_inspect.as_ref().expect("still a selection");
+            assert_eq!(selected.frame, 4);
+            assert!(selected.groups().is_empty());
+            assert_eq!(
+                selected.empty_state(),
+                Some(inspect::NO_FRAME_PROFILE),
+                "the pane says what is true of the frame, and claims no cause"
+            );
+        });
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(FRAME_INSPECT_SELECTOR).is_some(),
+            "an empty frame gets the pane and its reason, never a blank"
+        );
+    }
+
+    /// Only the four selectable charts are clickable. A click on the
+    /// wire chart must leave the pane alone rather than opening an I$
+    /// inspector about a frame the user was reading wire cycles on.
+    #[gpui::test]
+    async fn test_a_click_on_an_unselectable_chart_selects_nothing(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let at = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Wire cycles per frame vs budget");
+            assert!(!panel.chart_specs()[ix].selectable);
+            point_of(panel, ix, 3.0)
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| assert!(panel.frame_inspect.is_none()));
+    }
+
+    /// A frame number means nothing in another run's chart set, so
+    /// switching runs must drop the selection rather than carry it over.
+    ///
+    /// Both ways out of a run, because they are two different code paths:
+    /// picking another run (`select_run` -> `begin_selection`) and going
+    /// Back (`clear_selection`). Run 2's frames are 10..=12, so a
+    /// selection that survived would be pointing at a frame that run does
+    /// not have.
+    #[gpui::test]
+    async fn test_leaving_a_run_drops_the_frame_selection(cx: &mut TestAppContext) {
+        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(&db_path);
+        let at = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
+        });
+
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.frame_inspect.as_ref().unwrap().frame, 3);
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 2,
+                    started_at: "2026-08-03T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena-2".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.frame_inspect.is_none(),
+                "run 2 has no frame 3 -- the selection cannot follow the switch"
+            );
+            assert_eq!(
+                panel.chart_specs()[0].x,
+                vec![10.0, 11.0, 12.0],
+                "and it really is the other run that is showing"
+            );
+        });
+
+        // ...and the Back path, from a fresh selection on run 2.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        let at = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 11.0)
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.frame_inspect.as_ref().unwrap().frame, 11);
+        });
+        panel.update(cx, |panel, cx| panel.clear_selection(cx));
+        panel.update(cx, |panel, _cx| assert!(panel.frame_inspect.is_none()));
+    }
+
+    /// The sort header, clicked for real: the table's order flips, and it
+    /// flips because the panel asked worldlib for the other direction --
+    /// not because anything here reversed a vector.
+    #[gpui::test]
+    async fn test_the_profile_sort_header_toggles_the_tables_order(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let order = |panel: &ChartsPanel| -> Vec<String> {
+            let Some(DetailState::Ready(detail)) = &panel.detail else {
+                panic!("ready");
+            };
+            detail
+                .profiles
+                .table()
+                .rows(panel.profile_sort_ascending)
+                .iter()
+                .map(|a| a.func.clone())
+                .collect()
+        };
+        let descending = panel.update(cx, |panel, _cx| {
+            assert!(!panel.profile_sort_ascending, "descending is the default");
+            order(panel)
+        });
+        assert_eq!(
+            descending,
+            vec!["blit", "update", "update_entities", "render"],
+            "biggest offender first, frame 0's burst excluded"
+        );
+
+        let header = cx
+            .debug_bounds(PROFILE_SORT_SELECTOR)
+            .expect("the sortable header must be painted");
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+
+        let ascending = panel.update(cx, |panel, _cx| {
+            assert!(panel.profile_sort_ascending, "the header click flipped it");
+            order(panel)
+        });
+        assert_eq!(
+            ascending,
+            descending.iter().rev().cloned().collect::<Vec<_>>(),
+            "the two directions are exact inverses -- worldlib's, not ours"
+        );
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        let header = cx.debug_bounds(PROFILE_SORT_SELECTOR).unwrap();
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert!(!panel.profile_sort_ascending);
+            assert_eq!(order(panel), descending, "toggling twice round-trips");
+        });
+    }
+
+    /// The profile table is painted for a run that HAS profile rows...
+    #[gpui::test]
+    async fn test_the_profile_table_is_painted_below_the_charts(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let table = cx
+            .debug_bounds(PROFILE_TABLE_SELECTOR)
+            .expect("the I$ profile table must be painted");
+        let last_chart = panel.update(cx, |panel, _cx| {
+            let last = panel.chart_specs().len() - 1;
+            panel.chart_bounds.borrow()[last].expect("laid out")
+        });
+        assert!(
+            table.origin.y > last_chart.origin.y,
+            "ggo-ide puts the profile section last, under the charts"
+        );
+    }
+
+    /// ...and for one that has none, carrying the reason instead of
+    /// silently disappearing -- which is how a reader learns the data
+    /// exists at all. A frameless run has no charts either, so this also
+    /// covers the branch where the table is the only thing left.
+    #[gpui::test]
+    async fn test_a_run_without_profile_rows_still_paints_the_table_and_its_reason(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_without_frames(&db_path);
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: None,
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let Some(DetailState::Ready(detail)) = &panel.detail else {
+                panic!("ready");
+            };
+            assert!(panel.chart_specs().is_empty(), "the frameless branch");
+            assert_eq!(
+                detail.profiles.table_empty_state(),
+                Some(inspect::NO_PROFILE_DATA)
+            );
+        });
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(1200.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(PROFILE_TABLE_SELECTOR).is_some(),
+            "a run with no profile rows still gets the heading and the reason"
+        );
+        assert!(
+            cx.debug_bounds(PROFILE_SORT_SELECTOR).is_none(),
+            "with no rows there is nothing to sort"
+        );
+    }
+
+    /// Inspect is perf-only. A device run comes out of the OTHER id space
+    /// (`runs`, TEXT ids, cloned from `diag.db`), has no frames, no
+    /// charts and no profile, and sets `device_log` instead of `detail` --
+    /// so the click path has nothing to reach even if something called
+    /// it. Asserted both ways: the entry point refuses, and neither
+    /// profile surface is painted.
+    #[gpui::test]
+    async fn test_inspect_is_unreachable_from_a_device_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let diag_path = dir.path().join("diag.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_profile_rows(&db_path);
+        seed_device_run(&diag_path, "dev-1", "2026-08-02T00:00:00Z", "pass");
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path);
+            panel.diag_db_path_override = Some(diag_path);
+            panel
+        });
+        // Show a perf run first, so the failure mode this guards against
+        // -- a device selection still able to inspect the run it
+        // replaced -- is actually reachable if the guard is missing.
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: None,
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        let at = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.select_device_run(
+                RunSummary {
+                    id: "dev-1".to_string(),
+                    started_at: "2026-08-02T00:00:00Z".to_string(),
+                    state: "done".to_string(),
+                    verdict: Some("pass".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            assert!(panel.detail.is_none(), "a device run sets device_log only");
+            // The same click that selected frame 3 a moment ago.
+            panel.select_frame(0, at, cx);
+            assert!(
+                panel.frame_inspect.is_none(),
+                "there is no perf detail to inspect from a device selection"
+            );
+        });
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(PROFILE_TABLE_SELECTOR).is_none(),
+            "the device view paints no I$ profile table"
+        );
+        assert!(
+            cx.debug_bounds(FRAME_INSPECT_SELECTOR).is_none(),
+            "and no inspect pane"
+        );
+    }
+
+    /// R3's F1 said the tripwire covered `select_run`'s update closure
+    /// and `Render::render` and nothing else, and named event listeners
+    /// as the gap R4's click-to-inspect would walk straight through.
+    /// `guarded_listener` is that gap closed, and this is the drill that
+    /// proves it: a listener that derives fails, rather than quietly
+    /// re-running a 327 ms pass on every click.
+    #[gpui::test]
+    #[should_panic(expected = "built on the UI thread")]
+    async fn test_a_listener_that_derives_trips_the_guard(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let (panel, cx) = cx.add_window_view(|_window, cx| ChartsPanel::new(None, cx));
+        let listener = panel.update(cx, |_panel, cx| {
+            ChartsPanel::guarded_listener(cx, |_this, _event: &bool, _window, _cx| {
+                let _ = detail::build(&loader::RunSamples::default());
+            })
+        });
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            listener(&true, window, cx);
+        })
+        .unwrap();
     }
 }

@@ -36,14 +36,17 @@
 //!   synchronously (`render_detail`, the tables, the console, the KPI row),
 //!   which is the per-frame path -- a re-derivation there costs on every
 //!   hover mouse-move, not once per selection.
+//! * **every event listener this panel installs.** R3's review named
+//!   these as the gap and R4's click-to-inspect as the change that would
+//!   walk through it, so R4 closed it at the seam rather than at the two
+//!   call sites that needed it: `ChartsPanel::guarded_listener` holds the
+//!   guard across the handler body, and it is now the only thing in the
+//!   panel that calls `Context::listener`. A click that re-derived --
+//!   the shape a per-frame inspect table invites -- fails every test that
+//!   clicks.
 //!
 //! **Not covered, and deliberately named rather than implied:**
 //!
-//! * arbitrary event listeners. A `cx.listener` that derived something
-//!   would slip past unless it happens to run inside a render. R4's
-//!   click-to-inspect is exactly that shape -- if it needs to re-derive per
-//!   frame selection, it should take a guard of its own (or better, do the
-//!   work where `build` already does).
 //! * gpui prepaint closures, which run inside `Window::draw` rather than
 //!   inside `render`. That is where `chart_geom::build_chart_scene` already
 //!   runs, once per chart per frame over the full sample set -- pre-existing
@@ -56,6 +59,7 @@ use std::sync::Arc;
 
 use crate::chart_geom::ChartSpec;
 use crate::chart_set;
+use crate::inspect::{self, Profiles};
 use crate::loader::{self, RunSamples};
 use crate::report::{self, RunReport};
 
@@ -84,6 +88,11 @@ pub struct Detail {
     /// rendered through a `uniform_list`, which lays out only the rows on
     /// screen, so the reader imposes no cap of its own.
     pub console: Arc<Vec<String>>,
+    /// The I$ profile table (both sort directions) and the per-frame
+    /// index click-to-inspect looks a clicked frame up in. Derived here
+    /// so neither interaction has anything left to aggregate -- see
+    /// [`crate::inspect`]'s module doc.
+    pub profiles: Arc<Profiles>,
 }
 
 /// Query `run_id` out of `db_path` and derive everything from it.
@@ -109,6 +118,11 @@ pub fn build(samples: &RunSamples) -> Detail {
             .map(Arc::new)
             .collect(),
         console: Arc::new(samples.uart.clone()),
+        // The SAME ignore set the charts and the KPI tiles above them
+        // used -- `chart_set::ignore_set` is the panel's one definition
+        // of it, and a profile table filtered differently from the tiles
+        // it sits under is R1's concern (1) made visible.
+        profiles: Arc::new(inspect::build(&samples.profile, &chart_set::ignore_set())),
     }
 }
 

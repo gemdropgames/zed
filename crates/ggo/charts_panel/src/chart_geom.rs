@@ -291,6 +291,45 @@ pub fn nearest_x(px: f32, xs: &[f32], scale: &LinearScale) -> Option<usize> {
     best
 }
 
+/// Which frame a click at canvas-local `point` on a chart of `spec`
+/// drawn at `size` lands on -- the frame NUMBER out of [`ChartSpec::x`],
+/// not an index into it, because that is what the profile rows are keyed
+/// by. `None` for a click outside the plot area (the margins, the legend
+/// band, the x-axis caption strip) and for a chart with no frame axis at
+/// all (a histogram plots a distribution -- its x is empty, so there is
+/// no frame under the cursor to name).
+///
+/// Pure, and deliberately NOT a second geometry: it resolves through the
+/// same [`plot_for`] and the same `x_scale(plot, full_x_domain(..))` that
+/// [`build_chart_scene`] paints the points with, so a click and the hover
+/// readout under the same cursor can never disagree about which sample is
+/// there (`the_click_and_the_hover_readout_resolve_the_same_sample` is
+/// what holds that). When R5 gives the panel a zoomed/panned x-domain,
+/// the domain has to move into `plot_for`'s neighbourhood and BOTH call
+/// sites take it -- changing only one is what that test exists to catch.
+///
+/// Ties go to the earlier frame ([`nearest_x`]'s rule): a click exactly
+/// between two samples selects the left one, deterministically.
+pub fn frame_at(spec: &ChartSpec, size: (f32, f32), point: (f32, f32)) -> Option<i64> {
+    // The SAME two preconditions `build_chart_scene` early-outs on
+    // (`!spec.has_data() || !plot.is_drawable()`), and `has_data` is here
+    // rather than left to the caller for a reason: a `Line` spec with an
+    // x-axis but no series paints nothing and produces no readout, yet
+    // `nearest_x` would happily name a frame for it -- a click resolving
+    // a frame on a blank canvas, with no crosshair to agree with.
+    // Nothing in `chart_set` can produce such a spec today
+    // (`every_produced_chart_has_data` pins that), but that invariant
+    // lives in another module and R5 builds `ChartSpec`s of its own for
+    // historic overlays, so the function that depends on it enforces it.
+    let plot = plot_for(spec, size);
+    if !spec.has_data() || !plot.is_drawable() || !plot.contains(point.0, point.1) {
+        return None;
+    }
+    let xs = x_scale(plot, full_x_domain(&spec.x));
+    let idx = nearest_x(point.0, &spec.x, &xs)?;
+    spec.x.get(idx).map(|&x| x.round() as i64)
+}
+
 /// The histogram slot (bin) pixel `px` falls into -- `histogram.rs`'s
 /// `slot_index`, clamped into `[0, nbins)` the same way `computeBins`'s
 /// own count-assignment loop clamps out-of-range values into the last bin.
@@ -679,6 +718,13 @@ pub struct ChartSpec {
     /// Frame numbers, shared by every series. Empty for [`ChartKind::Histogram`].
     pub x: Vec<f32>,
     pub series: Vec<SeriesSpec>,
+    /// Whether clicking a point on this chart selects that frame for the
+    /// inspect pane -- `reports.rs`'s `LineChart::on_select` hook, which
+    /// `RunPage.tsx` passes (`onSelect={pickFrame}`) on exactly four
+    /// charts: cache-misses, tile-working-set, and the two per-function
+    /// ones. `chart_set` is what decides; [`frame_at`] is pure geometry
+    /// and answers for any chart with a frame axis, selectable or not.
+    pub selectable: bool,
 }
 
 impl ChartSpec {
@@ -775,30 +821,49 @@ pub fn margins_for(kind: &ChartKind) -> Margins {
 /// An empty spec or a degenerate plot area yields an EMPTY scene -- the
 /// panel checks [`ChartSpec::has_data`] first and renders a message
 /// instead, so a blank canvas is never what a user sees.
-pub fn build_chart_scene(
-    spec: &ChartSpec,
-    size: (f32, f32),
-    hover: Option<(f32, f32)>,
-) -> ChartScene {
-    let legend = legend_layout(
+/// The legend band a chart of `spec` draws at `size`, laid out.
+///
+/// A histogram plots one unnamed distribution; naming it in a legend
+/// would just repeat the chart title, so it gets none.
+fn legend_for(spec: &ChartSpec, size: (f32, f32)) -> Vec<LegendEntry> {
+    if matches!(spec.kind, ChartKind::Histogram) {
+        return Vec::new();
+    }
+    let m = margins_for(&spec.kind);
+    legend_layout(
         &spec
             .series
             .iter()
             .map(|s| (s.name.clone(), s.color))
             .collect::<Vec<_>>(),
-        margins_for(&spec.kind).left,
+        m.left,
         0.0,
-        (size.0 - margins_for(&spec.kind).left - margins_for(&spec.kind).right).max(0.0),
-    );
-    // A histogram plots one unnamed distribution; naming it in a legend
-    // would just repeat the chart title.
-    let legend = if matches!(spec.kind, ChartKind::Histogram) {
-        Vec::new()
-    } else {
-        legend
-    };
-    let legend_h = legend_height(&legend);
-    let plot = plot_rect(size, margins_for(&spec.kind), legend_h);
+        (size.0 - m.left - m.right).max(0.0),
+    )
+}
+
+/// The plot area a chart of `spec` gets at `size`, legend band included.
+///
+/// The ONE place that derivation lives: [`build_chart_scene`] paints into
+/// this rect and [`frame_at`] hit-tests against it, so a click cannot
+/// resolve against a plot area the points were never drawn in. Cheap
+/// (a legend layout, no series work), which is what lets the click path
+/// call it without going anywhere near a scene build.
+pub fn plot_for(spec: &ChartSpec, size: (f32, f32)) -> Rect {
+    plot_rect(
+        size,
+        margins_for(&spec.kind),
+        legend_height(&legend_for(spec, size)),
+    )
+}
+
+pub fn build_chart_scene(
+    spec: &ChartSpec,
+    size: (f32, f32),
+    hover: Option<(f32, f32)>,
+) -> ChartScene {
+    let legend = legend_for(spec, size);
+    let plot = plot_for(spec, size);
 
     let mut scene = ChartScene {
         primitives: Vec::new(),
@@ -1257,6 +1322,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![10.0, 20.0, 30.0, 40.0],
             }],
+            selectable: true,
         }
     }
 
@@ -1406,6 +1472,209 @@ mod tests {
             range: (0.0, 100.0),
         };
         assert_eq!(nearest_x(50.0, &[], &scale), None);
+    }
+
+    // ------------------------------------------------ click -> frame
+
+    /// A run whose ignore filter dropped frame 0, so the axis starts at 1
+    /// and a frame NUMBER is never a frame INDEX -- the confusion the
+    /// return type exists to prevent.
+    fn selectable_spec() -> ChartSpec {
+        ChartSpec {
+            title: "Cache misses per frame".to_string(),
+            kind: ChartKind::Line { budget: None },
+            x: vec![1.0, 2.0, 3.0, 4.0],
+            series: vec![SeriesSpec {
+                name: "i_misses".to_string(),
+                color: Rgb(0x4a8fe3),
+                values: vec![10.0, 20.0, 30.0, 40.0],
+            }],
+            selectable: true,
+        }
+    }
+
+    /// The x pixel a given frame's point was drawn at, derived the same
+    /// way the chart draws it.
+    fn px_of(spec: &ChartSpec, size: (f32, f32), frame: f32) -> f32 {
+        let plot = plot_for(spec, size);
+        x_scale(plot, full_x_domain(&spec.x)).map(frame)
+    }
+
+    #[test]
+    fn a_click_on_a_sample_resolves_to_that_frames_number() {
+        let spec = selectable_spec();
+        let plot = plot_for(&spec, CANVAS);
+        let mid_y = plot.y + plot.h / 2.0;
+        for frame in [1.0, 2.0, 3.0, 4.0] {
+            assert_eq!(
+                frame_at(&spec, CANVAS, (px_of(&spec, CANVAS, frame), mid_y)),
+                Some(frame as i64),
+                "frame {frame}"
+            );
+        }
+    }
+
+    /// The x-scale is a function of the canvas the chart actually got,
+    /// and this panel lives in a resizable dock -- the same frame sits at
+    /// a different pixel in a 360 px dock than in a 900 px one, and the
+    /// hit-test has to follow the scale rather than a remembered layout.
+    #[test]
+    fn the_same_frame_is_hit_at_whatever_pixel_the_current_scale_puts_it() {
+        let spec = selectable_spec();
+        let narrow = (200.0, 180.0);
+        let wide = (1200.0, 400.0);
+        let narrow_px = px_of(&spec, narrow, 3.0);
+        let wide_px = px_of(&spec, wide, 3.0);
+        assert!(
+            (narrow_px - wide_px).abs() > 100.0,
+            "the two scales must actually differ for this to prove anything"
+        );
+        for (size, px) in [(narrow, narrow_px), (wide, wide_px)] {
+            let plot = plot_for(&spec, size);
+            assert_eq!(
+                frame_at(&spec, size, (px, plot.y + plot.h / 2.0)),
+                Some(3),
+                "canvas {size:?}"
+            );
+        }
+        // ...and the wide canvas's pixel for frame 3 is nowhere near
+        // frame 3 on the narrow one.
+        let narrow_plot = plot_for(&spec, narrow);
+        assert_ne!(
+            frame_at(
+                &spec,
+                narrow,
+                (wide_px, narrow_plot.y + narrow_plot.h / 2.0)
+            ),
+            Some(3),
+            "a stale pixel from another layout must not still name frame 3"
+        );
+    }
+
+    /// A click between two samples takes the nearer one, and a tie takes
+    /// the earlier frame -- [`nearest_x`]'s rule, so a click and a hover
+    /// at the same pixel cannot disagree.
+    #[test]
+    fn a_click_between_samples_takes_the_nearer_frame_and_ties_go_left() {
+        let spec = selectable_spec();
+        let plot = plot_for(&spec, CANVAS);
+        let mid_y = plot.y + plot.h / 2.0;
+        let (a, b) = (px_of(&spec, CANVAS, 2.0), px_of(&spec, CANVAS, 3.0));
+        assert_eq!(frame_at(&spec, CANVAS, (a + (b - a) * 0.4, mid_y)), Some(2));
+        assert_eq!(frame_at(&spec, CANVAS, (a + (b - a) * 0.6, mid_y)), Some(3));
+        assert_eq!(
+            frame_at(&spec, CANVAS, ((a + b) / 2.0, mid_y)),
+            Some(2),
+            "an exact tie resolves to the earlier frame, deterministically"
+        );
+    }
+
+    /// Outside the plot area there is no sample to name: the legend band
+    /// above it, the y-tick gutter left of it, and the x-caption strip
+    /// below it are all margins, not data.
+    #[test]
+    fn a_click_outside_the_plot_area_selects_nothing() {
+        let spec = selectable_spec();
+        let plot = plot_for(&spec, CANVAS);
+        let mid_x = plot.x + plot.w / 2.0;
+        assert_eq!(frame_at(&spec, CANVAS, (mid_x, plot.y - 1.0)), None);
+        assert_eq!(frame_at(&spec, CANVAS, (mid_x, plot.bottom() + 1.0)), None);
+        assert_eq!(
+            frame_at(&spec, CANVAS, (plot.x - 1.0, plot.y + plot.h / 2.0)),
+            None
+        );
+        assert_eq!(
+            frame_at(&spec, CANVAS, (plot.right() + 1.0, plot.y + plot.h / 2.0)),
+            None
+        );
+        // And a canvas smaller than its own margins has no plot at all.
+        assert_eq!(frame_at(&spec, (4.0, 4.0), (2.0, 2.0)), None);
+    }
+
+    /// A chart that paints nothing has no frame under the cursor either,
+    /// even though its x-axis would happily name one: `has_data` is false
+    /// for a `Line` spec with an axis and no series, `build_chart_scene`
+    /// early-outs on exactly that, and a click must early-out with it --
+    /// otherwise a blank canvas answers a click with a frame and no
+    /// crosshair to corroborate it.
+    #[test]
+    fn a_chart_that_paints_nothing_resolves_no_frame() {
+        let blank = ChartSpec {
+            series: Vec::new(),
+            ..selectable_spec()
+        };
+        assert!(!blank.has_data());
+        assert!(
+            build_chart_scene(&blank, CANVAS, None)
+                .primitives
+                .is_empty(),
+            "the precondition frame_at has to share"
+        );
+        let plot = plot_for(&blank, CANVAS);
+        assert_eq!(
+            frame_at(
+                &blank,
+                CANVAS,
+                (plot.x + plot.w / 2.0, plot.y + plot.h / 2.0)
+            ),
+            None
+        );
+    }
+
+    /// A histogram's x is empty (it plots a distribution, not a time
+    /// series), so there is no frame under the cursor at any pixel.
+    #[test]
+    fn a_chart_with_no_frame_axis_never_resolves_a_frame() {
+        let spec = ChartSpec {
+            title: "i_misses distribution".to_string(),
+            kind: ChartKind::Histogram,
+            x: Vec::new(),
+            series: vec![SeriesSpec {
+                name: "i_misses".to_string(),
+                color: Rgb(0x4a8fe3),
+                values: vec![1.0, 2.0, 3.0],
+            }],
+            selectable: false,
+        };
+        let plot = plot_for(&spec, CANVAS);
+        assert_eq!(
+            frame_at(
+                &spec,
+                CANVAS,
+                (plot.x + plot.w / 2.0, plot.y + plot.h / 2.0)
+            ),
+            None
+        );
+    }
+
+    /// The anti-drift guard between the two geometries. `frame_at` and
+    /// `build_chart_scene`'s hover readout resolve the same pixel through
+    /// the same `plot_for` + `x_scale(full_x_domain)`; if a future change
+    /// (R5's zoom/pan domain is the one in flight) moves one of them, the
+    /// click would select a frame the crosshair is not on, and nothing
+    /// else in the suite would notice. Swept across the plot so an
+    /// off-by-one at a single probe point cannot hide.
+    #[test]
+    fn the_click_and_the_hover_readout_resolve_the_same_sample() {
+        for spec in [selectable_spec(), line_spec()] {
+            let plot = plot_for(&spec, CANVAS);
+            let y = plot.y + plot.h / 2.0;
+            let mut checked = 0;
+            for step in 0..=40 {
+                let x = plot.x + plot.w * (step as f32 / 40.0);
+                let readout = build_chart_scene(&spec, CANVAS, Some((x, y)))
+                    .readout
+                    .expect("inside the plot, over a sample");
+                let clicked = frame_at(&spec, CANVAS, (x, y)).expect("same point, same answer");
+                assert_eq!(
+                    clicked, spec.x[readout.index] as i64,
+                    "click and crosshair disagree at x={x} on {}",
+                    spec.title
+                );
+                checked += 1;
+            }
+            assert_eq!(checked, 41);
+        }
     }
 
     #[test]
@@ -1653,6 +1922,7 @@ mod tests {
                     values: vec![4.0, 5.0, 6.0],
                 },
             ],
+            selectable: false,
         };
         let scene = build_chart_scene(&spec, CANVAS, None);
         let bands = scene
@@ -1689,6 +1959,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![1.0, 1.0, 2.0, 3.0],
             }],
+            selectable: false,
         };
         let scene = build_chart_scene(&spec, CANVAS, None);
         let bars = scene
@@ -1717,6 +1988,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![1.0, 1.0, 2.0, 3.0],
             }],
+            selectable: false,
         };
         let scene = build_chart_scene(&spec, CANVAS, None);
         let bar_colors: Vec<ChartColor> = scene
@@ -1831,6 +2103,7 @@ mod tests {
                     values: vec![3.0, 4.0],
                 },
             ],
+            selectable: false,
         };
         let legend = legend_layout(
             &[
@@ -1866,6 +2139,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![0.0, 0.0, 1.0],
             }],
+            selectable: false,
         };
         let plot = plot_rect(CANVAS, HISTOGRAM_MARGINS, 0.0);
         let bin_list = bins(&[0.0, 0.0, 1.0], HISTOGRAM_BIN_TARGET);

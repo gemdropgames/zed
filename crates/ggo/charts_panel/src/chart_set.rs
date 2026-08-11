@@ -8,12 +8,13 @@
 //! sampled `FrameRow`/`ProfileRow`s to [`ChartSpec`]s, and is pure, so
 //! the whole chart set is unit-testable without a window or a database.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use ggo_worldlib::charts::reports::{gates, ignore, kpi};
+use ggo_worldlib::charts::reports::profile::NamedSeries;
+use ggo_worldlib::charts::reports::{gates, ignore, kpi, profile};
 
 use crate::chart_geom::{ChartKind, ChartSpec, Rgb, SeriesSpec};
-use crate::loader::{FrameRow, ProfileRow, RunSamples};
+use crate::loader::{FrameRow, RunSamples};
 
 // ---------------------------------------------------------------- palette
 
@@ -48,13 +49,21 @@ const PROF_COLORS: [Rgb; 6] = [C1, C2, C3, C4, C5, C6];
 const TOP_FUNCTIONS_TAKE: usize = PROF_COLORS.len() - 1;
 
 /// The `"other"` fold's bucket name. **Derived from worldlib's, not
-/// re-spelled** -- `profile::top_function_series` emits that exact string,
-/// `PROF_COLORS`' dedicated last slot is reserved for it, and a private
-/// copy that drifted would silently stop matching the row it is supposed
-/// to colour. (This panel still has its own `top_functions`; R4 collapses
-/// that onto `profile::top_function_series`. Routing the constant now
-/// means that collapse cannot introduce a mismatch on its way through.)
-const OTHER_FUNCTION_NAME: &str = ggo_worldlib::charts::reports::profile::OTHER_FUNCTION_NAME;
+/// re-spelled** -- `profile::top_function_series` emits that exact string
+/// and `PROF_COLORS`' dedicated last slot is reserved for it.
+///
+/// R2 routed this constant here ahead of R4's collapse so the collapse
+/// could not introduce a mismatch on its way through. R4 checked that
+/// rather than trusting it, and it holds: this is a direct reference to
+/// `profile::OTHER_FUNCTION_NAME`, not a copy of its value.
+///
+/// Drift is now **structurally impossible rather than guarded**: with the
+/// local ranking gone, there is no second spelling of the fold's name
+/// anywhere in this crate to drift from, and this line cannot disagree
+/// with a constant it *is*. The [`colored`] assertion below is about the
+/// fold's palette SLOT, which is a different question and a much weaker
+/// guarantee -- see its comment for exactly how weak.
+const OTHER_FUNCTION_NAME: &str = profile::OTHER_FUNCTION_NAME;
 
 /// The 8 KB / 128 B-per-tile cache capacity the tile-working-set chart
 /// draws as its reference line. It is a CAPACITY, not a budget, but
@@ -108,6 +117,7 @@ fn line(title: &str, x: &[f32], budget: Option<f32>, series: Vec<SeriesSpec>) ->
         kind: ChartKind::Line { budget },
         x: x.to_vec(),
         series,
+        selectable: false,
     }
 }
 
@@ -117,7 +127,23 @@ fn stacked(title: &str, x: &[f32], series: Vec<SeriesSpec>) -> ChartSpec {
         kind: ChartKind::Stacked,
         x: x.to_vec(),
         series,
+        selectable: false,
     }
+}
+
+/// Marks a chart click-to-inspect enabled.
+///
+/// `RunPage.tsx` passes `onSelect={pickFrame}` to exactly four charts and
+/// `reports.rs`'s `charts_section` mirrors that set (`on_select:
+/// Some(frame_select_hook(..))` at four call sites, `None` everywhere
+/// else): the cache-misses chart, the tile-working-set chart, and the two
+/// per-function charts. Those are the four whose x-position a reader is
+/// pointing at *because of* what the I$ profile says about that frame --
+/// which is what the inspect pane then shows. Every other chart stays
+/// hover-only, here as there.
+fn frame_selectable(mut spec: ChartSpec) -> ChartSpec {
+    spec.selectable = true;
+    spec
 }
 
 fn histogram(title: &str, name: &str, frames: &[FrameRow], get: fn(&FrameRow) -> i64) -> ChartSpec {
@@ -125,9 +151,11 @@ fn histogram(title: &str, name: &str, frames: &[FrameRow], get: fn(&FrameRow) ->
         title: title.to_string(),
         kind: ChartKind::Histogram,
         // A histogram plots a DISTRIBUTION, not a time series: it has no
-        // frame axis at all (`Histogram.tsx` never receives one).
+        // frame axis at all (`Histogram.tsx` never receives one), which
+        // is also why it can never be frame-selectable.
         x: Vec::new(),
         series: vec![series(name, C1, frames, get)],
+        selectable: false,
     }
 }
 
@@ -183,7 +211,7 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
                 series("miss_wire", C3, &frames, |f| f.miss_wire),
             ],
         ),
-        line(
+        frame_selectable(line(
             "Cache misses per frame",
             &x,
             None,
@@ -191,7 +219,7 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
                 series("i_misses", C1, &frames, |f| f.i_misses),
                 series("d_misses", C2, &frames, |f| f.d_misses),
             ],
-        ),
+        )),
     ];
 
     if gates::has_syscalls(&frames) {
@@ -209,7 +237,7 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
     }
 
     if gates::has_tile_working_set(&frames) {
-        charts.push(line(
+        charts.push(frame_selectable(line(
             "Tile working set vs cache capacity",
             &x,
             Some(TILE_CACHE_TILES),
@@ -217,14 +245,24 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
                 series("bg_tiles_distinct", C1, &frames, |f| f.bg_tiles_distinct),
                 series("spr_tiles_distinct", C2, &frames, |f| f.spr_tiles_distinct),
             ],
-        ));
+        )));
     }
 
     if !profile.is_empty() {
-        let misses = top_functions(&profile, &frame_axis, TOP_FUNCTIONS_TAKE);
-        let evicted = pivot_evicted(&misses, &profile, &frame_axis);
-        charts.push(line("I$ misses by function", &x, None, misses));
-        charts.push(line("I$ eviction victims by function", &x, None, evicted));
+        let misses = profile::top_function_series(&profile, &frame_axis, TOP_FUNCTIONS_TAKE);
+        let evicted = profile::pivot_evicted(&misses, &profile, &frame_axis);
+        charts.push(frame_selectable(line(
+            "I$ misses by function",
+            &x,
+            None,
+            colored(&misses),
+        )));
+        charts.push(frame_selectable(line(
+            "I$ eviction victims by function",
+            &x,
+            None,
+            colored(&evicted),
+        )));
     }
 
     charts.push(histogram(
@@ -280,113 +318,69 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
 
 // ------------------------------------------------- per-function pivots
 
-/// Functions ranked by total `misses + evicted`, descending, ties broken
-/// by name ascending -- `reports.rs`'s `function_totals`, including its
-/// deterministic tie-break (a `HashMap` iteration order would otherwise
-/// make the chart's series order vary run to run).
-fn function_totals(rows: &[ProfileRow]) -> Vec<(String, i64)> {
-    let mut totals: HashMap<&str, i64> = HashMap::new();
-    for r in rows {
-        *totals.entry(r.func.as_str()).or_insert(0) += r.misses + r.evicted;
-    }
-    let mut ranked: Vec<(String, i64)> = totals
-        .into_iter()
-        .map(|(f, total)| (f.to_string(), total))
-        .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked
-}
-
-/// The top `take` functions' per-frame `misses`, pivoted onto
-/// `frame_axis` -- `reports.rs`'s `top_functions`.
+/// worldlib's colourless [`NamedSeries`] with this panel's palette
+/// attached **by rank position** -- the colour half of the split R1 made
+/// when `top_functions`/`pivot_evicted` moved
+/// (`profile::top_function_series`/`profile::pivot_evicted` own the
+/// ranking, the `"other"` fold and the frame-axis pivot; only
+/// `iced::Color` could not travel, and this panel's `Rgb` is its
+/// replacement).
 ///
-/// Pivoting onto the FULL (ignore-filtered) frame axis rather than onto
-/// the frame numbers `rows` happens to mention is load-bearing: a frame
-/// with zero I$ misses emits no profile rows at all, so the other axis
-/// would silently drop every quiet frame and misalign this chart against
-/// the wire/cache-miss charts above it. Absent (function, frame) pairs
-/// zero-pad. Functions past `take` are summed into a trailing `"other"`
-/// series.
-fn top_functions(rows: &[ProfileRow], frame_axis: &[i64], take: usize) -> Vec<SeriesSpec> {
-    if rows.is_empty() {
-        return Vec::new();
-    }
-    let ranked = function_totals(rows);
-    let kept: Vec<&str> = ranked.iter().take(take).map(|(f, _)| f.as_str()).collect();
-    let other_needed = ranked.len() > kept.len();
-
-    let frame_idx: HashMap<i64, usize> = frame_axis
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| (n, i))
-        .collect();
-
-    let mut series: Vec<SeriesSpec> = kept
-        .iter()
-        .enumerate()
-        .map(|(i, &name)| SeriesSpec {
-            name: name.to_string(),
-            color: PROF_COLORS[i % PROF_COLORS.len()],
-            values: vec![0.0f32; frame_axis.len()],
-        })
-        .collect();
-    let mut other_values = vec![0.0f32; frame_axis.len()];
-
-    for r in rows {
-        let Some(&idx) = frame_idx.get(&r.frame) else {
-            continue;
-        };
-        if let Some(pos) = kept.iter().position(|&n| n == r.func) {
-            series[pos].values[idx] += r.misses as f32;
-        } else {
-            other_values[idx] += r.misses as f32;
-        }
-    }
-    if other_needed {
-        series.push(SeriesSpec {
-            name: OTHER_FUNCTION_NAME.to_string(),
-            color: PROF_COLORS[kept.len() % PROF_COLORS.len()],
-            values: other_values,
-        });
-    }
+/// Rank order IS the colour contract (R1's concern (4)): worldlib emits
+/// the kept functions in ranked order with the `"other"` fold last, so
+/// slot `i` of `PROF_COLORS` belongs to rank `i` and `"other"` lands on
+/// the palette's dedicated final slot exactly when it is present. That
+/// is the same mapping the deleted local `top_functions` made with
+/// `PROF_COLORS[i % len]` for the kept names and
+/// `PROF_COLORS[kept.len() % len]` for the fold -- identical, because
+/// the fold is at index `kept.len()` of what worldlib returns.
+///
+/// Applying it positionally to BOTH charts is what keeps them agreeing,
+/// and the result is IDENTICAL to the old code rather than merely
+/// equivalent: `profile::pivot_evicted` clones `top`'s names in `top`'s
+/// own order, so colouring the two by position assigns each name the
+/// colour the old code copied across from its misses-chart twin. Same
+/// colours, one fewer thing to keep in step.
+fn colored(series: &[NamedSeries]) -> Vec<SeriesSpec> {
+    // The fold, when present, must land on the palette's dedicated final
+    // slot.
+    //
+    // Be precise about what this does and does not buy, because it is
+    // easy to overstate. It **cannot fire today**: worldlib appends the
+    // fold only once the kept set is full, so it sits at index
+    // `TOP_FUNCTIONS_TAKE`, and `TOP_FUNCTIONS_TAKE` is *defined* as
+    // `PROF_COLORS.len() - 1`. It is also `debug_assert!`, so it is not
+    // evaluated in a release build at all (Zed's `[profile.release]`
+    // does not turn debug assertions on). It is therefore a
+    // DEVELOPMENT-TIME statement of the invariant, and its one real job
+    // is to fail if someone decouples those two constants -- set
+    // `TOP_FUNCTIONS_TAKE` to 3 and the fold lands on slot 3 while slot
+    // 5 stays reserved for it, which is exactly the silent recolouring
+    // R1's concern (4) is about. Kept debug-only deliberately: a
+    // mis-slotted colour is cosmetic and must not take a user's run
+    // report down with it.
+    debug_assert!(
+        series
+            .iter()
+            .position(|s| s.name == OTHER_FUNCTION_NAME)
+            .is_none_or(|i| i == PROF_COLORS.len() - 1),
+        "the \"other\" fold must land on PROF_COLORS' dedicated last slot"
+    );
     series
-}
-
-/// The same names/colors [`top_functions`] chose, re-pivoted onto
-/// `evicted` -- `reports.rs`'s `pivot_evicted`. The two charts MUST share
-/// one name selection (not each re-rank by its own metric), or their
-/// legends stop agreeing.
-fn pivot_evicted(top: &[SeriesSpec], rows: &[ProfileRow], frame_axis: &[i64]) -> Vec<SeriesSpec> {
-    let frame_idx: HashMap<i64, usize> = frame_axis
         .iter()
         .enumerate()
-        .map(|(i, &n)| (n, i))
-        .collect();
-    let mut out: Vec<SeriesSpec> = top
-        .iter()
-        .map(|s| SeriesSpec {
+        .map(|(i, s)| SeriesSpec {
             name: s.name.clone(),
-            color: s.color,
-            values: vec![0.0f32; frame_axis.len()],
+            color: PROF_COLORS[i % PROF_COLORS.len()],
+            values: s.values.clone(),
         })
-        .collect();
-    let other_idx = top.iter().position(|s| s.name == OTHER_FUNCTION_NAME);
-    for r in rows {
-        let Some(&idx) = frame_idx.get(&r.frame) else {
-            continue;
-        };
-        if let Some(pos) = top.iter().position(|s| s.name == r.func) {
-            out[pos].values[idx] += r.evicted as f32;
-        } else if let Some(oi) = other_idx {
-            out[oi].values[idx] += r.evicted as f32;
-        }
-    }
-    out
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loader::ProfileRow;
 
     /// A minimal run: frames 0..=2, only the always-on columns populated,
     /// so every gated chart stays hidden.
@@ -611,6 +605,11 @@ mod tests {
         assert!(!titles(&build_charts(&samples)).contains(&"I$ misses by function"));
     }
 
+    /// The collapsed path: worldlib ranks and pivots, [`colored`] paints.
+    fn top_functions(rows: &[ProfileRow], frame_axis: &[i64], take: usize) -> Vec<SeriesSpec> {
+        colored(&profile::top_function_series(rows, frame_axis, take))
+    }
+
     #[test]
     fn top_functions_ranks_by_total_and_folds_the_remainder_into_other() {
         let axis = [1i64, 2];
@@ -669,6 +668,10 @@ mod tests {
         assert_eq!(names, vec!["alpha", "zeta"]);
     }
 
+    /// The eviction chart's colours used to be COPIED off the misses
+    /// chart's series; now both are painted positionally and the sharing
+    /// rests on `profile::pivot_evicted` returning the same names in the
+    /// same order. Same guarantee, different mechanism -- so this stays.
     #[test]
     fn pivot_evicted_reuses_the_same_names_and_colors_over_evicted() {
         let axis = [1i64, 2];
@@ -688,8 +691,9 @@ mod tests {
                 evicted: 5,
             },
         ];
-        let misses = top_functions(&rows, &axis, TOP_FUNCTIONS_TAKE);
-        let evicted = pivot_evicted(&misses, &rows, &axis);
+        let named = profile::top_function_series(&rows, &axis, TOP_FUNCTIONS_TAKE);
+        let misses = colored(&named);
+        let evicted = colored(&profile::pivot_evicted(&named, &rows, &axis));
         assert_eq!(evicted.len(), misses.len());
         assert_eq!(evicted[0].name, misses[0].name);
         assert_eq!(evicted[0].color, misses[0].color);
@@ -699,6 +703,282 @@ mod tests {
     #[test]
     fn top_functions_of_no_rows_is_empty() {
         assert!(top_functions(&[], &[1, 2], TOP_FUNCTIONS_TAKE).is_empty());
+    }
+
+    // ------------------------------- the R4 collapse, checked not assumed
+
+    /// The local `top_functions`/`function_totals`/`pivot_evicted` this
+    /// module carried until F5.4 R4, verbatim, kept ONLY as this test's
+    /// reference. R1's concern (4) is that rank order is the whole colour
+    /// contract, so a collapse that re-ranked would silently recolour
+    /// both per-function charts with nothing failing; the brief's
+    /// instruction was to test the new path against the old behaviour
+    /// rather than assume the two agree. This is that old behaviour.
+    mod legacy {
+        use super::*;
+        use std::collections::HashMap;
+
+        pub fn function_totals(rows: &[ProfileRow]) -> Vec<(String, i64)> {
+            let mut totals: HashMap<&str, i64> = HashMap::new();
+            for r in rows {
+                *totals.entry(r.func.as_str()).or_insert(0) += r.misses + r.evicted;
+            }
+            let mut ranked: Vec<(String, i64)> = totals
+                .into_iter()
+                .map(|(f, total)| (f.to_string(), total))
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            ranked
+        }
+
+        pub fn top_functions(
+            rows: &[ProfileRow],
+            frame_axis: &[i64],
+            take: usize,
+        ) -> Vec<SeriesSpec> {
+            if rows.is_empty() {
+                return Vec::new();
+            }
+            let ranked = function_totals(rows);
+            let kept: Vec<&str> = ranked.iter().take(take).map(|(f, _)| f.as_str()).collect();
+            let other_needed = ranked.len() > kept.len();
+
+            let frame_idx: HashMap<i64, usize> = frame_axis
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, i))
+                .collect();
+
+            let mut series: Vec<SeriesSpec> = kept
+                .iter()
+                .enumerate()
+                .map(|(i, &name)| SeriesSpec {
+                    name: name.to_string(),
+                    color: PROF_COLORS[i % PROF_COLORS.len()],
+                    values: vec![0.0f32; frame_axis.len()],
+                })
+                .collect();
+            let mut other_values = vec![0.0f32; frame_axis.len()];
+
+            for r in rows {
+                let Some(&idx) = frame_idx.get(&r.frame) else {
+                    continue;
+                };
+                if let Some(pos) = kept.iter().position(|&n| n == r.func) {
+                    series[pos].values[idx] += r.misses as f32;
+                } else {
+                    other_values[idx] += r.misses as f32;
+                }
+            }
+            if other_needed {
+                series.push(SeriesSpec {
+                    name: OTHER_FUNCTION_NAME.to_string(),
+                    color: PROF_COLORS[kept.len() % PROF_COLORS.len()],
+                    values: other_values,
+                });
+            }
+            series
+        }
+
+        pub fn pivot_evicted(
+            top: &[SeriesSpec],
+            rows: &[ProfileRow],
+            frame_axis: &[i64],
+        ) -> Vec<SeriesSpec> {
+            let frame_idx: HashMap<i64, usize> = frame_axis
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, i))
+                .collect();
+            let mut out: Vec<SeriesSpec> = top
+                .iter()
+                .map(|s| SeriesSpec {
+                    name: s.name.clone(),
+                    color: s.color,
+                    values: vec![0.0f32; frame_axis.len()],
+                })
+                .collect();
+            let other_idx = top.iter().position(|s| s.name == OTHER_FUNCTION_NAME);
+            for r in rows {
+                let Some(&idx) = frame_idx.get(&r.frame) else {
+                    continue;
+                };
+                if let Some(pos) = top.iter().position(|s| s.name == r.func) {
+                    out[pos].values[idx] += r.evicted as f32;
+                } else if let Some(oi) = other_idx {
+                    out[oi].values[idx] += r.evicted as f32;
+                }
+            }
+            out
+        }
+    }
+
+    /// A profile with more distinct functions than palette slots, an
+    /// exact tie STRADDLING the rank boundary, a quiet frame on the axis
+    /// and rows on a frame off it -- every case the ranking, the
+    /// `"other"` fold and the zero-pad have to get right at once.
+    ///
+    /// Each function's ranking total is `4 * (misses + evicted)` (four
+    /// frames' worth of identical rows), so the totals are readable
+    /// straight off the table below: `zzz_tie` and `aaa_tie` are both
+    /// 40, which is the boundary -- four functions rank above them and
+    /// only one of the two can be kept.
+    /// `the_collapse_fixture_reaches_the_fold_and_the_tie_break` asserts
+    /// that tie is real rather than taking this comment's word for it.
+    fn collapse_fixture() -> (Vec<ProfileRow>, Vec<i64>) {
+        let mut rows = Vec::new();
+        // Eight distinct functions, only five palette slots before the
+        // fold. `zzz_tie`/`aaa_tie` tie exactly on total (4 * (9 + 1) =
+        // 40 each) at the rank boundary, so the name tie-break alone
+        // decides which is kept and which is folded -- the ranking's
+        // sharpest edge. No per-function offset is applied to the values:
+        // one would perturb the totals and quietly dissolve that tie.
+        let spec: [(&str, i64, i64); 8] = [
+            ("render", 50, 5),    // 220
+            ("update", 40, 10),   // 200
+            ("collide", 30, 3),   // 132
+            ("audio_mix", 20, 1), // 84
+            ("zzz_tie", 9, 1),    // 40  <- tie, folded (name desc)
+            ("aaa_tie", 9, 1),    // 40  <- tie, kept   (name asc)
+            ("despawn", 1, 7),    // 32
+            ("spawn", 4, 0),      // 16
+        ];
+        for (func, misses, evicted) in spec {
+            // Spread the rows over frames 1, 3 and 7 -- frame 5 is on the
+            // axis but emits nothing (a quiet frame) and frame 9 is off it.
+            for frame in [1, 3, 7, 9] {
+                rows.push(ProfileRow {
+                    frame,
+                    caller: "main".to_string(),
+                    func: func.to_string(),
+                    misses,
+                    evicted,
+                });
+            }
+        }
+        (rows, vec![1, 3, 5, 7])
+    }
+
+    #[test]
+    fn the_collapse_onto_worldlib_reproduces_the_old_local_ranking_exactly() {
+        let (rows, axis) = collapse_fixture();
+        let named = profile::top_function_series(&rows, &axis, TOP_FUNCTIONS_TAKE);
+        assert_eq!(
+            colored(&named),
+            legacy::top_functions(&rows, &axis, TOP_FUNCTIONS_TAKE),
+            "same names, same rank ORDER, same colour per rank, same \
+             zero-padded values -- a collapse that re-ranked would recolour \
+             both per-function charts with nothing else noticing"
+        );
+        assert_eq!(
+            colored(&profile::pivot_evicted(&named, &rows, &axis)),
+            legacy::pivot_evicted(
+                &legacy::top_functions(&rows, &axis, TOP_FUNCTIONS_TAKE),
+                &rows,
+                &axis
+            ),
+            "and the eviction chart still mirrors the misses chart's \
+             selection, now by shared ordering rather than by copied colour"
+        );
+    }
+
+    /// The fixture is only worth what it exercises: it must actually
+    /// trip the `"other"` fold and the name tie-break, or the equality
+    /// above would hold for two functions that agree on the easy cases.
+    #[test]
+    fn the_collapse_fixture_reaches_the_fold_and_the_tie_break() {
+        let (rows, axis) = collapse_fixture();
+        let named = profile::top_function_series(&rows, &axis, TOP_FUNCTIONS_TAKE);
+        let names: Vec<&str> = named.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names.last(),
+            Some(&OTHER_FUNCTION_NAME),
+            "more functions than slots, so the fold is present"
+        );
+        // The tie is asserted, not asserted-about: a fixture edit that
+        // perturbed either function's totals would leave the name check
+        // below passing while testing nothing at all about tie-breaking.
+        let totals = profile::function_totals(&rows);
+        let total_of = |func: &str| {
+            totals
+                .iter()
+                .find(|(f, _)| f == func)
+                .unwrap_or_else(|| panic!("{func} must be in the fixture"))
+                .1
+        };
+        assert_eq!(
+            total_of("aaa_tie"),
+            total_of("zzz_tie"),
+            "the two must actually TIE, or the name tie-break is never consulted"
+        );
+        let rank_of = |func: &str| {
+            totals
+                .iter()
+                .position(|(f, _)| f == func)
+                .unwrap_or_else(|| panic!("{func} must be in the fixture"))
+        };
+        assert_eq!(
+            (rank_of("aaa_tie"), rank_of("zzz_tie")),
+            (TOP_FUNCTIONS_TAKE - 1, TOP_FUNCTIONS_TAKE),
+            "and the tied pair must STRADDLE the kept/folded boundary -- \
+             last kept and first folded: {totals:?}"
+        );
+        assert!(
+            names.contains(&"aaa_tie") && !names.contains(&"zzz_tie"),
+            "so the tie at the rank boundary breaks by name ascending: {names:?}"
+        );
+        // ...and a quiet frame (5) is still a point on the axis.
+        assert_eq!(named[0].values.len(), axis.len());
+        assert_eq!(named[0].values[2], 0.0, "frame 5 emitted nothing");
+    }
+
+    // -------------------------------------------------- click-to-inspect
+
+    /// `RunPage.tsx`/`reports.rs` pass `onSelect` to exactly four charts.
+    /// Marking more would make a click on, say, the wire chart open an
+    /// inspect pane about I$ misses; marking fewer would leave the
+    /// per-function charts -- the ones the pane is ABOUT -- inert.
+    #[test]
+    fn exactly_the_four_reports_page_charts_are_frame_selectable() {
+        let mut samples = plain_samples();
+        samples.frames[1].sc_upload = 3;
+        samples.frames[1].bg_tiles_distinct = 12;
+        samples.frames[1].bg_evictions = 1;
+        samples.frames[1].apu_fetch_wire = 8;
+        samples.profile = vec![ProfileRow {
+            frame: 1,
+            caller: String::new(),
+            func: "update".to_string(),
+            misses: 4,
+            evicted: 1,
+        }];
+        let charts = build_charts(&samples);
+        let selectable: Vec<&str> = charts
+            .iter()
+            .filter(|c| c.selectable)
+            .map(|c| c.title.as_str())
+            .collect();
+        assert_eq!(
+            selectable,
+            vec![
+                "Cache misses per frame",
+                "Tile working set vs cache capacity",
+                "I$ misses by function",
+                "I$ eviction victims by function",
+            ]
+        );
+    }
+
+    /// A histogram has no frame axis at all, so it can never be
+    /// selectable -- there is no frame under the cursor to name.
+    #[test]
+    fn no_histogram_is_frame_selectable() {
+        let charts = build_charts(&plain_samples());
+        for c in &charts {
+            if matches!(c.kind, ChartKind::Histogram) {
+                assert!(!c.selectable, "{} is a distribution", c.title);
+            }
+        }
     }
 
     /// Every chart the set produces must actually have plottable data --
