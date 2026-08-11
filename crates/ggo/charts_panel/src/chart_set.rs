@@ -10,10 +10,11 @@
 
 use std::collections::HashSet;
 
+use ggo_worldlib::charts::reports::historic::{self, HistoricRunFrames, HistoricSeries};
 use ggo_worldlib::charts::reports::profile::NamedSeries;
 use ggo_worldlib::charts::reports::{gates, ignore, kpi, profile};
 
-use crate::chart_geom::{ChartKind, ChartSpec, Rgb, SeriesSpec};
+use crate::chart_geom::{ChartKind, ChartSpec, OverlaySpec, Rgb, SeriesSpec};
 use crate::loader::{FrameRow, RunSamples};
 
 // ---------------------------------------------------------------- palette
@@ -117,6 +118,7 @@ fn line(title: &str, x: &[f32], budget: Option<f32>, series: Vec<SeriesSpec>) ->
         kind: ChartKind::Line { budget },
         x: x.to_vec(),
         series,
+        historic: Vec::new(),
         selectable: false,
     }
 }
@@ -127,8 +129,34 @@ fn stacked(title: &str, x: &[f32], series: Vec<SeriesSpec>) -> ChartSpec {
         kind: ChartKind::Stacked,
         x: x.to_vec(),
         series,
+        historic: Vec::new(),
         selectable: false,
     }
+}
+
+/// worldlib's [`HistoricSeries`] re-shaped into the geometry layer's
+/// [`OverlaySpec`] and hung on a chart -- the overlay twin of [`colored`],
+/// and the same split: `historic::overlay_series`/`overlay_series_multi`
+/// own the alignment (by index, against each prior run's OWN
+/// ignore-filtered frames) and the age ramp; this only carries the result
+/// across a crate boundary. Nothing is re-derived here, and in particular
+/// no opacity is chosen here -- `HISTORIC_OPACITY` is worldlib's.
+///
+/// **Which charts get one is `RunPage.tsx`'s decision, mirrored**: the
+/// four `<LineChart>`s it passes a `context` prop to. Not the stacked
+/// charts or histograms (neither TS component takes overlays at all), and
+/// not the two per-function charts -- a prior run's top-N functions rarely
+/// line up with this run's, so an overlay there would pair unrelated
+/// series (`reports.rs:1699-1704`).
+fn with_historic(mut spec: ChartSpec, overlays: Vec<HistoricSeries>) -> ChartSpec {
+    spec.historic = overlays
+        .into_iter()
+        .map(|hs| OverlaySpec {
+            values: hs.values,
+            opacity: hs.opacity,
+        })
+        .collect();
+    spec
 }
 
 /// Marks a chart click-to-inspect enabled.
@@ -152,9 +180,11 @@ fn histogram(title: &str, name: &str, frames: &[FrameRow], get: fn(&FrameRow) ->
         kind: ChartKind::Histogram,
         // A histogram plots a DISTRIBUTION, not a time series: it has no
         // frame axis at all (`Histogram.tsx` never receives one), which
-        // is also why it can never be frame-selectable.
+        // is also why it can never be frame-selectable, zoomable, or
+        // overlaid (an overlay is index-paired against that missing axis).
         x: Vec::new(),
         series: vec![series(name, C1, frames, get)],
+        historic: Vec::new(),
         selectable: false,
     }
 }
@@ -168,6 +198,29 @@ pub fn ignored_count(frames: &[FrameRow]) -> usize {
     frames.iter().filter(|f| ignored.contains(&f.n)).count()
 }
 
+/// How many of `prior` will actually draw a ghost -- the number the
+/// Historic toggle states.
+///
+/// A prior run needs two points on the primary run's axis to draw a line
+/// (`chart_geom`'s `drawn_overlays`), so this applies that rule rather
+/// than counting rows: `min(its own filtered frames, the axis)` >= 2. Both
+/// sides go through the SAME ignore set the charts use, so the count and
+/// the picture cannot disagree -- a toggle reading "3 prior runs" over a
+/// chart with two ghosts on it is the ambiguity the count exists to
+/// remove.
+///
+/// Chart-independent even though `drawn_overlays` is per chart, because
+/// every overlaid chart shares one x axis: the primary run's
+/// ignore-filtered frame numbers.
+pub fn drawable_prior_runs(samples: &RunSamples, prior: &[HistoricRunFrames]) -> usize {
+    let ignored = ignore_set();
+    let axis = ignore::apply(&samples.frames, &ignored).len();
+    prior
+        .iter()
+        .filter(|r| ignore::apply(&r.frames, &ignored).len().min(axis) >= 2)
+        .count()
+}
+
 /// Every chart a selected run shows, in ggo-ide's exact top-to-bottom
 /// order. Empty when the run has no frames left after the ignore filter
 /// (the panel shows an explicit message instead).
@@ -177,7 +230,16 @@ pub fn ignored_count(frames: &[FrameRow]) -> usize {
 /// i.e. only for a native `ggo-emu --profile <elf>` capture; the syscall,
 /// tile-working-set, PPU and APU charts each have their own
 /// zero-columns gate ([`gates`]). Everything else is unconditional.
-pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
+///
+/// `prior` is the run's historic overlay input -- up to five earlier runs
+/// of the same cart, newest first, as `loader::load_prior_runs` picked
+/// them (see that fn for exactly what "prior" means). The overlays are
+/// attached to four charts here regardless of whether the panel's Historic
+/// toggle is on; `ChartView::historic` decides whether they are PAINTED,
+/// which is what keeps the toggle from re-deriving anything on the UI
+/// thread. Pass `&[]` for a run with no earlier runs -- every chart then
+/// carries an empty overlay list and behaves exactly as it did before R5.
+pub fn build_charts(samples: &RunSamples, prior: &[HistoricRunFrames]) -> Vec<ChartSpec> {
     let ignored = ignore_set();
     let frames = ignore::apply(&samples.frames, &ignored);
     if frames.is_empty() {
@@ -196,11 +258,14 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
         .map(|b| b as f32);
 
     let mut charts = vec![
-        line(
-            "Wire cycles per frame vs budget",
-            &x,
-            budget,
-            vec![series("wire_total", C1, &frames, |f| f.wire_total)],
+        with_historic(
+            line(
+                "Wire cycles per frame vs budget",
+                &x,
+                budget,
+                vec![series("wire_total", C1, &frames, |f| f.wire_total)],
+            ),
+            historic::overlay_series(prior, &ignored, |f| f.wire_total as f32),
         ),
         stacked(
             "Wire breakdown per frame",
@@ -211,15 +276,25 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
                 series("miss_wire", C3, &frames, |f| f.miss_wire),
             ],
         ),
-        frame_selectable(line(
-            "Cache misses per frame",
-            &x,
-            None,
-            vec![
-                series("i_misses", C1, &frames, |f| f.i_misses),
-                series("d_misses", C2, &frames, |f| f.d_misses),
-            ],
-        )),
+        with_historic(
+            frame_selectable(line(
+                "Cache misses per frame",
+                &x,
+                None,
+                vec![
+                    series("i_misses", C1, &frames, |f| f.i_misses),
+                    series("d_misses", C2, &frames, |f| f.d_misses),
+                ],
+            )),
+            historic::overlay_series_multi(
+                prior,
+                &ignored,
+                &[
+                    |f: &FrameRow| f.i_misses as f32,
+                    |f: &FrameRow| f.d_misses as f32,
+                ],
+            ),
+        ),
     ];
 
     if gates::has_syscalls(&frames) {
@@ -237,15 +312,25 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
     }
 
     if gates::has_tile_working_set(&frames) {
-        charts.push(frame_selectable(line(
-            "Tile working set vs cache capacity",
-            &x,
-            Some(TILE_CACHE_TILES),
-            vec![
-                series("bg_tiles_distinct", C1, &frames, |f| f.bg_tiles_distinct),
-                series("spr_tiles_distinct", C2, &frames, |f| f.spr_tiles_distinct),
-            ],
-        )));
+        charts.push(with_historic(
+            frame_selectable(line(
+                "Tile working set vs cache capacity",
+                &x,
+                Some(TILE_CACHE_TILES),
+                vec![
+                    series("bg_tiles_distinct", C1, &frames, |f| f.bg_tiles_distinct),
+                    series("spr_tiles_distinct", C2, &frames, |f| f.spr_tiles_distinct),
+                ],
+            )),
+            historic::overlay_series_multi(
+                prior,
+                &ignored,
+                &[
+                    |f: &FrameRow| f.bg_tiles_distinct as f32,
+                    |f: &FrameRow| f.spr_tiles_distinct as f32,
+                ],
+            ),
+        ));
     }
 
     if !profile.is_empty() {
@@ -306,11 +391,14 @@ pub fn build_charts(samples: &RunSamples) -> Vec<ChartSpec> {
         ));
     }
 
-    charts.push(line(
-        "Instructions per frame",
-        &x,
-        None,
-        vec![series("instrs", C1, &frames, |f| f.instrs)],
+    charts.push(with_historic(
+        line(
+            "Instructions per frame",
+            &x,
+            None,
+            vec![series("instrs", C1, &frames, |f| f.instrs)],
+        ),
+        historic::overlay_series(prior, &ignored, |f| f.instrs as f32),
     ));
 
     charts
@@ -410,7 +498,7 @@ mod tests {
 
     #[test]
     fn the_always_on_chart_set_matches_the_reports_page() {
-        let charts = build_charts(&plain_samples());
+        let charts = build_charts(&plain_samples(), &[]);
         assert_eq!(
             titles(&charts),
             vec![
@@ -438,7 +526,7 @@ mod tests {
 
     #[test]
     fn frame_zero_is_ignored_by_default() {
-        let charts = build_charts(&plain_samples());
+        let charts = build_charts(&plain_samples(), &[]);
         // Frames 0, 1, 2 seeded; frame 0 dropped.
         assert_eq!(charts[0].x, vec![1.0, 2.0]);
         assert_eq!(charts[0].series[0].values, vec![164_470.0, 164_470.0]);
@@ -446,7 +534,7 @@ mod tests {
 
     #[test]
     fn the_budget_line_comes_from_the_runs_frame_budget_column() {
-        let charts = build_charts(&plain_samples());
+        let charts = build_charts(&plain_samples(), &[]);
         assert_eq!(
             charts[0].kind,
             ChartKind::Line {
@@ -464,7 +552,7 @@ mod tests {
         for f in &mut samples.frames {
             f.frame_budget_cycles = None;
         }
-        let charts = build_charts(&samples);
+        let charts = build_charts(&samples, &[]);
         assert_eq!(charts[0].kind, ChartKind::Line { budget: None });
     }
 
@@ -477,12 +565,12 @@ mod tests {
             }],
             ..RunSamples::default()
         };
-        assert!(build_charts(&samples).is_empty());
+        assert!(build_charts(&samples, &[]).is_empty());
     }
 
     #[test]
     fn a_run_with_no_frames_has_no_charts() {
-        assert!(build_charts(&RunSamples::default()).is_empty());
+        assert!(build_charts(&RunSamples::default(), &[]).is_empty());
     }
 
     /// The anti-drift guard for the last cross-layer constant this module
@@ -498,7 +586,7 @@ mod tests {
     fn the_cache_capacity_line_is_worldlibs_constant_not_a_local_copy() {
         let mut samples = plain_samples();
         samples.frames[1].bg_tiles_distinct = 12;
-        let charts = build_charts(&samples);
+        let charts = build_charts(&samples, &[]);
         let chart = charts
             .iter()
             .find(|c| c.title == "Tile working set vs cache capacity")
@@ -518,22 +606,22 @@ mod tests {
     fn each_gate_adds_exactly_its_own_charts() {
         let mut syscalls = plain_samples();
         syscalls.frames[1].sc_upload = 3;
-        assert!(titles(&build_charts(&syscalls)).contains(&"Syscalls per frame"));
+        assert!(titles(&build_charts(&syscalls, &[])).contains(&"Syscalls per frame"));
 
         let mut tiles = plain_samples();
         tiles.frames[1].bg_tiles_distinct = 12;
-        assert!(titles(&build_charts(&tiles)).contains(&"Tile working set vs cache capacity"));
+        assert!(titles(&build_charts(&tiles, &[])).contains(&"Tile working set vs cache capacity"));
 
         let mut ppu = plain_samples();
         ppu.frames[1].bg_evictions = 1;
-        let ppu_charts = build_charts(&ppu);
+        let ppu_charts = build_charts(&ppu, &[]);
         let ppu_titles = titles(&ppu_charts);
         assert!(ppu_titles.contains(&"PPU tile-cache evictions per frame"));
         assert!(ppu_titles.contains(&"Tile-load wire per frame"));
 
         let mut apu = plain_samples();
         apu.frames[1].apu_underruns = 2;
-        assert!(titles(&build_charts(&apu)).contains(&"APU fetch wire per frame"));
+        assert!(titles(&build_charts(&apu, &[])).contains(&"APU fetch wire per frame"));
     }
 
     /// A gate that only ever trips on the IGNORED frame must not fire --
@@ -542,14 +630,14 @@ mod tests {
     fn a_gate_tripped_only_on_the_ignored_frame_does_not_fire() {
         let mut samples = plain_samples();
         samples.frames[0].sc_upload = 99;
-        assert!(!titles(&build_charts(&samples)).contains(&"Syscalls per frame"));
+        assert!(!titles(&build_charts(&samples, &[])).contains(&"Syscalls per frame"));
     }
 
     #[test]
     fn the_tile_working_set_chart_draws_the_cache_capacity_line() {
         let mut samples = plain_samples();
         samples.frames[1].spr_tiles_distinct = 10;
-        let charts = build_charts(&samples);
+        let charts = build_charts(&samples, &[]);
         let chart = charts
             .iter()
             .find(|c| c.title == "Tile working set vs cache capacity")
@@ -565,7 +653,7 @@ mod tests {
     #[test]
     fn the_per_function_charts_appear_only_with_profile_rows() {
         let mut samples = plain_samples();
-        assert!(!titles(&build_charts(&samples)).contains(&"I$ misses by function"));
+        assert!(!titles(&build_charts(&samples, &[])).contains(&"I$ misses by function"));
 
         samples.profile = vec![ProfileRow {
             frame: 1,
@@ -574,7 +662,7 @@ mod tests {
             misses: 4,
             evicted: 1,
         }];
-        let with_profile = build_charts(&samples);
+        let with_profile = build_charts(&samples, &[]);
         let t = titles(&with_profile);
         assert!(t.contains(&"I$ misses by function"));
         assert!(t.contains(&"I$ eviction victims by function"));
@@ -602,7 +690,7 @@ mod tests {
             misses: 4,
             evicted: 1,
         }];
-        assert!(!titles(&build_charts(&samples)).contains(&"I$ misses by function"));
+        assert!(!titles(&build_charts(&samples, &[])).contains(&"I$ misses by function"));
     }
 
     /// The collapsed path: worldlib ranks and pivots, [`colored`] paints.
@@ -952,7 +1040,7 @@ mod tests {
             misses: 4,
             evicted: 1,
         }];
-        let charts = build_charts(&samples);
+        let charts = build_charts(&samples, &[]);
         let selectable: Vec<&str> = charts
             .iter()
             .filter(|c| c.selectable)
@@ -969,11 +1057,169 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------ historic overlays
+
+    /// Two prior runs of the same shape as `plain_samples`, with values
+    /// that identify which run and which field a series came from.
+    fn prior_runs() -> Vec<HistoricRunFrames> {
+        (0..2)
+            .map(|k| HistoricRunFrames {
+                id: 10 - k,
+                frames: (0..3)
+                    .map(|n| FrameRow {
+                        n,
+                        // frame 0 is the ignored one; give it a value no
+                        // overlay may ever show.
+                        wire_total: if n == 0 { 999_999 } else { 100 * (k + 1) + n },
+                        i_misses: if n == 0 { 999_999 } else { 10 * (k + 1) + n },
+                        d_misses: if n == 0 { 999_999 } else { 20 * (k + 1) + n },
+                        instrs: if n == 0 { 999_999 } else { 30 * (k + 1) + n },
+                        bg_tiles_distinct: if n == 0 { 999_999 } else { 40 * (k + 1) + n },
+                        spr_tiles_distinct: if n == 0 { 999_999 } else { 50 * (k + 1) + n },
+                        ..FrameRow::default()
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn overlaid(charts: &[ChartSpec]) -> Vec<&str> {
+        charts
+            .iter()
+            .filter(|c| !c.historic.is_empty())
+            .map(|c| c.title.as_str())
+            .collect()
+    }
+
+    /// `RunPage.tsx` passes a `context` prop to exactly four charts and
+    /// this mirrors that set -- not the stacked charts, not the
+    /// histograms, and deliberately not the two per-function charts.
+    #[test]
+    fn exactly_the_four_reports_page_charts_carry_an_overlay() {
+        let mut samples = plain_samples();
+        samples.frames[1].sc_upload = 3;
+        samples.frames[1].bg_tiles_distinct = 12;
+        samples.frames[1].bg_evictions = 1;
+        samples.frames[1].apu_fetch_wire = 8;
+        samples.profile = vec![ProfileRow {
+            frame: 1,
+            caller: String::new(),
+            func: "update".to_string(),
+            misses: 4,
+            evicted: 1,
+        }];
+        let charts = build_charts(&samples, &prior_runs());
+        assert_eq!(
+            overlaid(&charts),
+            vec![
+                "Wire cycles per frame vs budget",
+                "Cache misses per frame",
+                "Tile working set vs cache capacity",
+                "Instructions per frame",
+            ]
+        );
+    }
+
+    /// With no prior runs, every chart is exactly what it was before R5 --
+    /// the overlay is additive, never a reshaping.
+    #[test]
+    fn no_prior_runs_means_no_overlay_anywhere() {
+        let charts = build_charts(&plain_samples(), &[]);
+        assert!(overlaid(&charts).is_empty());
+        assert_eq!(drawable_prior_runs(&plain_samples(), &[]), 0);
+    }
+
+    /// The count the toggle states is the count of ghosts a reader will
+    /// see. A prior run the ignore filter leaves with one frame draws no
+    /// line anywhere (`chart_geom`'s `drawn_overlays`), so counting it
+    /// would put "2 prior runs" over a chart carrying one.
+    #[test]
+    fn a_prior_run_too_short_to_draw_is_not_counted() {
+        let mut prior = prior_runs();
+        // Frames 0 and 1, with 0 ignored -> one usable frame.
+        prior[1].frames.truncate(2);
+        assert_eq!(
+            drawable_prior_runs(&plain_samples(), &prior),
+            1,
+            "the two-frame run has one usable frame and draws nothing"
+        );
+        assert_eq!(prior.len(), 2, "...but it is still a prior run that loaded");
+
+        // Both usable is the ordinary case.
+        assert_eq!(drawable_prior_runs(&plain_samples(), &prior_runs()), 2);
+    }
+
+    /// Each prior run's own frames are ignore-filtered with the SAME set
+    /// the primary run's charts use, and the values land in the order
+    /// worldlib produced them -- run-major on the multi-field charts, so
+    /// one run's two fields sit next to each other.
+    #[test]
+    fn an_overlays_values_are_the_prior_runs_own_filtered_frames() {
+        let charts = build_charts(&plain_samples(), &prior_runs());
+        let wire = &charts[0];
+        assert_eq!(wire.title, "Wire cycles per frame vs budget");
+        assert_eq!(wire.historic.len(), 2, "one series per prior run");
+        assert_eq!(
+            wire.historic[0].values,
+            vec![101.0, 102.0],
+            "frame 0's 999999 is filtered out of the OVERLAY too"
+        );
+        assert_eq!(wire.historic[1].values, vec![201.0, 202.0]);
+
+        let misses = charts
+            .iter()
+            .find(|c| c.title == "Cache misses per frame")
+            .unwrap();
+        assert_eq!(misses.historic.len(), 4, "2 runs x 2 fields");
+        assert_eq!(
+            misses.historic[0].values,
+            vec![11.0, 12.0],
+            "run 0 i_misses"
+        );
+        assert_eq!(
+            misses.historic[1].values,
+            vec![21.0, 22.0],
+            "run 0 d_misses"
+        );
+        assert_eq!(
+            misses.historic[2].values,
+            vec![21.0, 22.0],
+            "run 1 i_misses"
+        );
+        assert_eq!(
+            misses.historic[3].values,
+            vec![41.0, 42.0],
+            "run 1 d_misses"
+        );
+    }
+
+    /// The age ramp is worldlib's `HISTORIC_OPACITY`, positionally: the
+    /// nearest prior run is brightest, and on a multi-field chart BOTH of
+    /// one run's series share that run's opacity (the run is what is being
+    /// aged, not the field).
+    #[test]
+    fn each_prior_run_gets_its_own_ramp_step_across_all_its_fields() {
+        let charts = build_charts(&plain_samples(), &prior_runs());
+        let ramp = ggo_worldlib::charts::reports::historic::HISTORIC_OPACITY;
+
+        let wire = &charts[0];
+        assert_eq!(wire.historic[0].opacity, ramp[0]);
+        assert_eq!(wire.historic[1].opacity, ramp[1]);
+
+        let misses = charts
+            .iter()
+            .find(|c| c.title == "Cache misses per frame")
+            .unwrap();
+        let alphas: Vec<f32> = misses.historic.iter().map(|h| h.opacity).collect();
+        assert_eq!(alphas, vec![ramp[0], ramp[0], ramp[1], ramp[1]]);
+        assert!(ramp[0] > ramp[1], "and older is dimmer, not merely other");
+    }
+
     /// A histogram has no frame axis at all, so it can never be
     /// selectable -- there is no frame under the cursor to name.
     #[test]
     fn no_histogram_is_frame_selectable() {
-        let charts = build_charts(&plain_samples());
+        let charts = build_charts(&plain_samples(), &[]);
         for c in &charts {
             if matches!(c.kind, ChartKind::Histogram) {
                 assert!(!c.selectable, "{} is a distribution", c.title);
@@ -998,7 +1244,7 @@ mod tests {
             misses: 4,
             evicted: 1,
         }];
-        let charts = build_charts(&samples);
+        let charts = build_charts(&samples, &[]);
         assert_eq!(charts.len(), 13, "the full reports-page chart set");
         for c in &charts {
             assert!(c.has_data(), "{} has no data", c.title);

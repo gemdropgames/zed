@@ -29,6 +29,7 @@
 
 use std::path::Path;
 
+use ggo_worldlib::charts::reports::historic::{self, HistoricRunFrames};
 use ggo_worldlib::charts::reports::perf_db;
 use turso::Value;
 
@@ -216,6 +217,71 @@ pub fn load_run_samples(db_path: &Path, run_id: i64) -> Result<RunSamples, Strin
         detail: perf_db::run_detail(db_path, run_id).map_err(|e| format!("{e:#}"))?,
         uart: perf_db::run_uart(db_path, run_id).map_err(|e| format!("{e:#}"))?,
     })
+}
+
+/// The runs the historic overlay draws underneath `run_id`, newest first.
+///
+/// **What "prior" means here, exactly** -- the brief asks for this to be
+/// stated rather than implied, and `run` has no more columns to lean on
+/// than `runs` did (R1's concern (6), R3's finding):
+///
+/// * **Same cart.** `run.cart_id` of the selected run, read off the
+///   `RunDetail` the same pass already fetched. This is ggo-ide's scoping
+///   (its Reports page drills cart -> runs -> detail, so its `prior`
+///   resource can only ever see one cart's runs) and it is the ONLY
+///   differentiation the schema offers: there is still no run-kind column,
+///   so a cart's runs may mix this panel's own captures, `ggo-emu` runs
+///   and `ggo-server` ingests, and nothing distinguishes them. Overlaying
+///   two different workloads of the same cart is the assumption the
+///   feature is built on, here as there.
+/// * **Lower `run.id`, taken in descending id order**, capped at
+///   `HISTORIC_OPACITY.len()` (5) -- `historic::pick_prior_ids`, which is
+///   `RunPage.tsx`'s `runs.filter(r => r.id < run.id).sort(desc).slice(0, 5)`.
+///   That assumes ids are allocated in INGEST order (they are -- an
+///   `INTEGER PRIMARY KEY` rowid), and therefore that "lower id" means
+///   "ingested earlier". It does NOT mean "captured earlier": `started_at`
+///   is written at ingest by whoever ingested, so a capture replayed into
+///   the db today gets a higher id than a run that happened after it. The
+///   picker above sorts on `started_at` while this sorts on `id`, exactly
+///   as ggo-ide does -- matched rather than "fixed", because changing it
+///   would make this panel and that page disagree about which five runs a
+///   ghost is.
+/// * **No liveness assumption at all**, and none needed: unlike the `runs`
+///   table R3 dealt with, a perf run's `run` row and every one of its
+///   `frame` rows are written inside one `BEGIN`/`COMMIT` by
+///   `ggo_emu_panel::ingest`, so a prior run is never observed
+///   half-ingested. Even if a foreign producer wrote one, the overlay
+///   aligns by index and stops at the shorter series -- a short ghost,
+///   never an error.
+///
+/// A cart with no earlier runs yields an empty vec, which is a state the
+/// panel names rather than a failure.
+///
+/// **Blocking**, and each id costs one `perf_db::run_frames` call (i.e.
+/// one more short-lived tokio runtime, R1's concern (5)): up to 1 + 5 of
+/// them on top of `load_run_samples`' four. Off-thread only -- `detail::
+/// load` is the one caller, inside `select_run`'s existing background
+/// spawn, and there is deliberately no second, lazier load path behind the
+/// Historic toggle.
+pub fn load_prior_runs(
+    db_path: &Path,
+    run_id: i64,
+    cart_id: Option<i64>,
+) -> Result<Vec<HistoricRunFrames>, String> {
+    // Same guard, same reason as `list_runs`: opening a missing file
+    // CREATES an empty tableless one.
+    let Some(cart_id) = cart_id.filter(|_| db_path.exists()) else {
+        return Ok(Vec::new());
+    };
+    let runs = perf_db::cart_runs(db_path, cart_id).map_err(|e| format!("{e:#}"))?;
+    historic::pick_prior_ids(run_id, &runs)
+        .into_iter()
+        .map(|id| {
+            perf_db::run_frames(db_path, id)
+                .map(|frames| HistoricRunFrames { id, frames })
+                .map_err(|e| format!("{e:#}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -510,6 +576,84 @@ mod tests {
             samples.frames[0].frame_budget_cycles, None,
             "an un-set budget column reads as None, so no budget line is drawn"
         );
+    }
+
+    // ------------------------------------------------ historic overlays
+
+    /// Two carts; cart 1 has runs 1..=8, cart 2 has run 100. Every run
+    /// gets one frame carrying its own id as `wire_total`, so a prior
+    /// run's frames can be traced back to the run they came from.
+    fn seed_two_carts(path: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(path).await.unwrap();
+            let conn = db.conn().unwrap();
+            for (id, name) in [(1i64, "demo"), (2, "other")] {
+                conn.execute("INSERT INTO cart (id, name) VALUES (?1, ?2)", (id, name))
+                    .await
+                    .unwrap();
+            }
+            for (run_id, cart_id) in (1i64..=8).map(|i| (i, 1i64)).chain([(100, 2)]) {
+                conn.execute(
+                    "INSERT INTO run (id, cart_id, started_at, frames) VALUES (?1, ?2, 'x', 1)",
+                    (run_id, cart_id),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO frame (run_id, n, wire_total) VALUES (?1, 0, ?2)",
+                    (run_id, run_id),
+                )
+                .await
+                .unwrap();
+            }
+        });
+    }
+
+    /// The overlay's five runs: same cart, lower id, nearest first. The
+    /// other cart's run 100 is excluded even though its id is higher than
+    /// every candidate -- cart scoping is the only differentiation the
+    /// schema offers, and it is applied before the id rule, not after.
+    #[test]
+    fn load_prior_runs_takes_the_five_nearest_lower_ids_of_the_same_cart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ggo_ide.db");
+        seed_two_carts(&path);
+
+        let prior = load_prior_runs(&path, 8, Some(1)).unwrap();
+        let ids: Vec<i64> = prior.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![7, 6, 5, 4, 3], "capped at the ramp's five steps");
+        assert_eq!(
+            prior[0].frames.len(),
+            1,
+            "each prior run brings its own frames"
+        );
+        assert_eq!(
+            prior[0].frames[0].wire_total, 7,
+            "and they are that run's frames, not the selected run's"
+        );
+    }
+
+    /// A cart's FIRST run has nothing behind it. Not an error, and not an
+    /// occasion to reach into another cart.
+    #[test]
+    fn load_prior_runs_of_a_carts_first_run_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ggo_ide.db");
+        seed_two_carts(&path);
+        assert!(load_prior_runs(&path, 1, Some(1)).unwrap().is_empty());
+        // ...and a run whose `run` row is gone has no cart to scope to.
+        assert!(load_prior_runs(&path, 8, None).unwrap().is_empty());
+    }
+
+    /// Same guard as every other read here: a missing db reads as "no
+    /// prior runs" and must not CREATE the file (`new_local` would).
+    #[test]
+    fn load_prior_runs_of_a_missing_db_creates_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.db");
+        assert!(load_prior_runs(&missing, 5, Some(1)).unwrap().is_empty());
+        assert!(!missing.exists());
     }
 
     /// A run id with no rows at all (deleted/never-ingested) is an empty

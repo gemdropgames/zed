@@ -26,6 +26,16 @@
 //! guard that keeps it that way now reaches event listeners too
 //! ([`ChartsPanel::guarded_listener`]).
 //!
+//! R5 finished the interaction set: a **Historic overlay** of up to five
+//! earlier runs of the same cart (grey, dimmer with age, and folded into
+//! the y-scale so a taller prior run is visible rather than off-canvas)
+//! and **click-drag x-zoom with a double-click reset** on the line charts.
+//! Both are state the panel owns and hands down as a
+//! [`chart_geom::ChartView`]; the overlay's series were derived in the same
+//! background pass as everything else, so the toggle paints and never
+//! fetches. The same pass is now also where every chart's scene is
+//! memoized -- see [`CachedScene`].
+//!
 //! **Everything a selection needs is queried AND derived off-thread**, in
 //! one background spawn per selection -- see [`detail`]'s module doc, which
 //! is also where the guard that keeps it that way lives.
@@ -66,8 +76,8 @@ use gpui::{
     MouseMoveEvent, Pixels, Render, Styled, Task, WeakEntity, Window, actions, div, px,
     uniform_list,
 };
-use ui::Tooltip;
 use ui::prelude::*;
+use ui::{Checkbox, Tooltip};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -113,6 +123,22 @@ const HISTORY_RAIL_SELECTOR: &str = "ggo-charts-history-rail";
 const PROFILE_TABLE_SELECTOR: &str = "ggo-charts-profile-table";
 const FRAME_INSPECT_SELECTOR: &str = "ggo-charts-frame-inspect";
 const PROFILE_SORT_SELECTOR: &str = "ggo-charts-profile-sort";
+const HISTORIC_TOGGLE_SELECTOR: &str = "ggo-charts-historic-toggle";
+
+/// The historic overlay has nothing to draw.
+///
+/// **Names a STATE and never a cause** -- the rule R2's blocker, R3's F2
+/// and R4's F3 each landed on, and the reason this is a constant with a
+/// test pinning it character for character rather than a sentence built at
+/// the call site. The signal behind it is exactly "`load_prior_runs`
+/// returned no runs", and that covers several different situations at
+/// once: this really is the cart's first run; every other run of it was
+/// ingested later and so carries a HIGHER id; the run has no `run` row to
+/// take a `cart_id` from at all. The surface cannot tell those apart, so
+/// it says what it knows -- there are none -- and claims nothing about
+/// why. (`load_prior_runs`' doc is where "prior" is defined; a reader who
+/// wants the rule goes there.)
+const NO_PRIOR_RUNS: &str = "no prior runs of this cart to overlay";
 
 /// `RunPage.tsx`'s label for a leaf that shares its caller's name: that
 /// caller's own samples, as opposed to something inlined into it.
@@ -289,6 +315,85 @@ struct Hover {
     y: f32,
 }
 
+/// One chart's memoized scene, plus every input it was built from.
+///
+/// **Why this exists.** `render_chart`'s prepaint closure rebuilds a
+/// chart's whole scene from the run's full sample set, and it runs once
+/// per chart per painted frame -- so on every hover mouse-move it ran for
+/// every chart on the page (up to 13 for a fully-gated run, 11 in the
+/// fixture measured below), all but one of them for charts the cursor is
+/// nowhere near, since `hover_chart` notifies and gpui re-renders the
+/// whole panel. That was
+/// pre-existing (C2) and honestly documented but never addressed; R5
+/// measured it before touching it, because R5 both adds up to five overlay
+/// series per chart and puts a gesture on the same mouse-move.
+///
+/// Measured against this tree, debug build, 11 charts, one painted frame.
+/// Median of 3 passes of 5 reps after a warm-up; the memoized column is
+/// averaged over WHICH chart the cursor is on, since the charts differ in
+/// cost and picking one flatters or punishes the result:
+///
+/// | frames | Historic off | Historic on (5 prior runs) | memoized hover move |
+/// |---|---|---|---|
+/// | 3,000 | 2.41 ms | 5.37 ms | 0.54 ms |
+/// | 100,000 | 53.5 ms | 128.6 ms | 11.8 ms |
+///
+/// (A 300-frame run measures ~0.6 ms and 0.086 ms, but this harness's
+/// floor is around 0.6 ms, so that row says nothing useful and is left
+/// out.) So the overlay roughly doubles a per-frame cost that was already
+/// the panel's largest, and at ingest's 100,000-frame cap that cost was
+/// past a frame budget before R5 existed.
+///
+/// The fix is not to make the build cheaper but to stop doing it for the
+/// ten charts nothing changed about. A scene is a pure function of
+/// `(spec, size, view)`, so caching it on exactly those three is sound by
+/// construction, and a hover move becomes one rebuild plus ten clones of
+/// an already-decimated scene -- 10x cheaper at both sizes above.
+///
+/// **Still over budget at the cap, though, and by design of what is left.**
+/// 11.8 ms for one hover move in debug is at or past a 16.7 ms frame once
+/// the rest of the frame is counted. The cache removed the ten scenes that
+/// did not change; the one that did is a full `O(frames)` rebuild, and it
+/// is essentially the whole residual -- cloning all eleven cached scenes
+/// measures **0.050 ms** at 100,000 frames, 0.4% of it, because
+/// `MAX_PLOT_POINTS` caps a painted polyline at 2048 points regardless of
+/// run length. The rebuild does not get that cap until too late:
+/// `plot_points` materialises all 100,000 points and `envelope` decimates
+/// afterwards. Decimating by index before mapping is the next real win and
+/// is deliberately not in R5's scope.
+///
+/// The spec is held as an `Arc` and compared with `ptr_eq` rather than by
+/// value: comparing thirteen charts' worth of `Vec<f32>` per frame would
+/// give back everything this saves, and holding the `Arc` is what makes
+/// the pointer comparison safe -- a cached entry keeps its allocation
+/// alive, so a later spec cannot land on the same address and read as
+/// equal.
+struct CachedScene {
+    spec: Arc<ChartSpec>,
+    size: (f32, f32),
+    view: chart_geom::ChartView,
+    scene: chart_geom::ChartScene,
+}
+
+/// A left button held down on chart `chart`, from canvas-local `from_x` to
+/// wherever the cursor is now.
+///
+/// Only ever a PREVIEW: the zoom is committed on release, and it is
+/// committed from the click event's own down/up positions rather than from
+/// this. That independence is deliberate -- the preview is per-chart UI
+/// state that several things can legitimately drop, while the event pair
+/// is the gesture itself.
+///
+/// The cursor leaving the chart mid-drag does NOT drop it (gpui stops
+/// delivering `on_mouse_move` past the hitbox, so the band simply stops
+/// widening and holds its last edge); the release does, wherever it lands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Drag {
+    chart: usize,
+    from_x: f32,
+    to_x: f32,
+}
+
 pub struct ChartsPanel {
     focus_handle: FocusHandle,
     position: DockPosition,
@@ -325,6 +430,23 @@ pub struct ChartsPanel {
     history_generation: u64,
     _history_task: Option<Task<()>>,
     hover: Option<Hover>,
+    /// Whether the historic overlay is switched on -- `reports.rs`'s
+    /// `historic_enabled`. OFF by default, as there: the prior runs are
+    /// already loaded either way (see [`detail::load`]), so this is a
+    /// display switch and nothing more, and grey ghosts appearing on a run
+    /// nobody asked to compare would be the surprising default.
+    historic_enabled: bool,
+    /// Per-chart zoomed x-domain, keyed by chart INDEX. Like
+    /// [`inspect::FrameInspect::chart`] that index means something only
+    /// within one selection's chart set, so this is cleared alongside it
+    /// (R4's concern (4)). Per chart rather than shared because that is
+    /// what `line.rs` does -- each `canvas::Program` retains its own zoom
+    /// -- and because a drag on one chart saying something about the chart
+    /// six rows down would be startling.
+    zoom: std::collections::HashMap<usize, (f32, f32)>,
+    /// The drag in progress, if any -- at most one, since it takes a held
+    /// button.
+    drag: Option<Drag>,
     /// The frame the user last clicked, already grouped -- `RunPage.tsx`'s
     /// `selFrame`. `None` until a click lands, and dropped whenever the
     /// selection changes (a frame number means nothing across runs).
@@ -335,6 +457,10 @@ pub struct ChartsPanel {
     /// both orders are already derived, so this picks between them and
     /// never sorts anything.
     profile_sort_ascending: bool,
+    /// Each chart's last built scene, keyed by everything that scene was
+    /// built from -- see [`CachedScene`]. Shared with the prepaint closure
+    /// the same way (and for the same reason) `chart_bounds` is.
+    scenes: Rc<RefCell<Vec<Option<CachedScene>>>>,
     /// Each chart canvas's last painted bounds, recorded in its prepaint
     /// (the only place an element learns where it landed) so a mouse-move
     /// on the wrapper can be converted to canvas-local coordinates. Shared
@@ -365,9 +491,13 @@ impl ChartsPanel {
             history_generation: 0,
             _history_task: None,
             hover: None,
+            historic_enabled: false,
+            zoom: std::collections::HashMap::new(),
+            drag: None,
             frame_inspect: None,
             profile_sort_ascending: false,
             chart_bounds: Rc::new(RefCell::new(Vec::new())),
+            scenes: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -520,10 +650,19 @@ impl ChartsPanel {
         self.hover = None;
         // A frame number and a chart index both mean something only
         // within one run's chart set, so neither survives a selection
-        // change. The sort DIRECTION does -- it is a reading preference,
-        // not run state, and ggo-ide keeps it across runs too.
+        // change -- and R5's zoom is keyed by that same chart index over a
+        // frame domain, so it goes too (R4's concern (4)). The sort
+        // DIRECTION survives: it is a reading preference, not run state,
+        // and ggo-ide keeps it across runs too. `historic_enabled` is the
+        // same kind of preference, but ggo-ide resets it per run
+        // (`SelectRun` sets `historic_enabled = false`) because the
+        // overlay is about THIS run's history, so it is reset here too.
         self.frame_inspect = None;
+        self.historic_enabled = false;
+        self.zoom.clear();
+        self.drag = None;
         self.chart_bounds.borrow_mut().clear();
+        self.scenes.borrow_mut().clear();
         self.detail_generation += 1;
     }
 
@@ -595,7 +734,11 @@ impl ChartsPanel {
         self.rerun_note = None;
         self.hover = None;
         self.frame_inspect = None;
+        self.historic_enabled = false;
+        self.zoom.clear();
+        self.drag = None;
         self.chart_bounds.borrow_mut().clear();
+        self.scenes.borrow_mut().clear();
         cx.notify();
     }
 
@@ -675,16 +818,35 @@ impl ChartsPanel {
         }
     }
 
-    /// The scene chart `ix` paints at `size`, honoring the current hover
-    /// -- the identical `build_chart_scene(spec, size, hover)` call
-    /// `render_chart`'s prepaint closure makes (that closure is
-    /// `'static` and clones its inputs, so it can't share this method
-    /// directly; the arguments are what's shared).
+    /// Everything chart `ix` is currently being viewed under: the hover if
+    /// it owns it, its own zoom window, its own in-progress drag, and the
+    /// Historic switch.
+    ///
+    /// The ONE place that value is assembled. `render_chart`'s prepaint
+    /// paints through it and [`Self::select_frame`] hit-tests through it,
+    /// so a zoomed chart cannot answer a click with a frame it did not
+    /// draw under the cursor (R4's concern (1)).
+    fn view_for(&self, ix: usize) -> chart_geom::ChartView {
+        chart_geom::ChartView {
+            hover: self.hover.filter(|h| h.chart == ix).map(|h| (h.x, h.y)),
+            zoom: self.zoom.get(&ix).copied(),
+            drag: self
+                .drag
+                .filter(|d| d.chart == ix)
+                .map(|d| (d.from_x, d.to_x)),
+            historic: self.historic_enabled,
+        }
+    }
+
+    /// The scene chart `ix` paints at `size` -- the identical
+    /// `build_chart_scene(spec, size, &view)` call `render_chart`'s
+    /// prepaint closure makes (that closure is `'static` and clones its
+    /// inputs, so it can't share this method directly; the arguments are
+    /// what's shared, [`Self::view_for`] included).
     #[cfg(test)]
     fn scene_for(&self, ix: usize, size: (f32, f32)) -> Option<chart_geom::ChartScene> {
         let spec = self.chart_specs().get(ix)?;
-        let hover = self.hover.filter(|h| h.chart == ix).map(|h| (h.x, h.y));
-        Some(build_chart_scene(spec, size, hover))
+        Some(build_chart_scene(spec, size, &self.view_for(ix)))
     }
 
     /// Kick off the off-thread run listing. Runs on every panel
@@ -977,6 +1139,7 @@ impl ChartsPanel {
             Some(DetailState::Ready(detail)) => {
                 let (charts, report) = (&detail.charts, &detail.report);
                 self.chart_bounds.borrow_mut().resize(charts.len(), None);
+                self.scenes.borrow_mut().resize_with(charts.len(), || None);
                 // ggo-ide's `detail_view` order, top to bottom: the two
                 // diagnostic tables, the stored console, then the KPI row,
                 // then the charts. The tables come FIRST there and here for
@@ -1017,6 +1180,11 @@ impl ChartsPanel {
                         ]
                     } else {
                         let mut out = vec![self.render_kpi_row(&report.tiles, cx)];
+                        // Directly above the first chart -- `charts_section`
+                        // pushes `historic_toggle_row` as its own first row
+                        // for the same reason: it is a statement about every
+                        // chart below it, not about any one of them.
+                        out.push(self.render_historic_toggle(detail.prior_runs, cx));
                         out.extend(
                             charts
                                 .iter()
@@ -1529,6 +1697,49 @@ impl ChartsPanel {
         )
     }
 
+    /// The Historic checkbox + how many prior runs it has to draw --
+    /// `reports.rs`'s `historic_toggle_row`.
+    ///
+    /// The count is stated either way, switched on or off, because "the
+    /// overlay is on and I see nothing" and "there is nothing to overlay"
+    /// are the two states a reader has to be able to tell apart. When
+    /// there are none the checkbox is disabled and [`NO_PRIOR_RUNS`] says
+    /// so; ggo-ide renders "(0 prior runs)" beside a live checkbox, which
+    /// invites a click that cannot do anything.
+    fn render_historic_toggle(
+        &self,
+        prior_runs: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let plural = if prior_runs == 1 { "run" } else { "runs" };
+        h_flex()
+            .w_full()
+            .gap_2()
+            .debug_selector(|| HISTORIC_TOGGLE_SELECTOR.to_string())
+            .child(
+                Checkbox::new(
+                    "ggo-charts-historic",
+                    ToggleState::from(self.historic_enabled),
+                )
+                .label("Historic")
+                .disabled(prior_runs == 0)
+                .on_click(Self::guarded_listener(
+                    cx,
+                    |this, _toggle: &ToggleState, _window, cx| this.toggle_historic(cx),
+                )),
+            )
+            .child(
+                Label::new(if prior_runs == 0 {
+                    NO_PRIOR_RUNS.to_string()
+                } else {
+                    format!("{prior_runs} prior {plural}")
+                })
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
     fn render_chart(
         &self,
         ix: usize,
@@ -1537,28 +1748,58 @@ impl ChartsPanel {
     ) -> gpui::AnyElement {
         let title = SharedString::from(spec.title.clone());
         let selectable = spec.selectable;
+        // Drag-zoom is a LINE chart affordance, exactly as in ggo-ide:
+        // `line.rs` owns `zoom_domain` and `stacked.rs`/`histogram.rs`
+        // state plainly that they have "no zoom, no drag". A histogram has
+        // no frame axis to zoom in the first place.
+        let zoomable =
+            matches!(spec.kind, chart_geom::ChartKind::Line { .. }) && !spec.x.is_empty();
         // Refcount bump, not a deep clone -- see `DetailState::Ready`.
         let spec = spec.clone();
-        let hover = self.hover.filter(|h| h.chart == ix).map(|h| (h.x, h.y));
+        let view = self.view_for(ix);
         let palette = chart_paint::Palette::from_theme(cx);
         let chart_bounds = self.chart_bounds.clone();
+        let scenes = self.scenes.clone();
 
         let canvas = gpui::canvas(
             move |canvas_bounds, _window, _cx| {
                 // Prepaint: record where this chart landed (for
                 // hit-testing) and build its scene at the size it
-                // actually got.
+                // actually got -- or reuse the last one, when nothing this
+                // chart's scene depends on has changed. See `CachedScene`
+                // for the measurement that put the cache here; the short
+                // version is that a hover move re-renders the panel and
+                // this closure then ran for every chart, not just the one
+                // under the cursor.
                 if let Some(slot) = chart_bounds.borrow_mut().get_mut(ix) {
                     *slot = Some(canvas_bounds);
                 }
-                build_chart_scene(
-                    &spec,
-                    (
-                        f32::from(canvas_bounds.size.width),
-                        f32::from(canvas_bounds.size.height),
-                    ),
-                    hover,
-                )
+                let size = (
+                    f32::from(canvas_bounds.size.width),
+                    f32::from(canvas_bounds.size.height),
+                );
+                let mut cache = scenes.borrow_mut();
+                let Some(slot) = cache.get_mut(ix) else {
+                    // No slot: the chart list is being laid out before
+                    // `render_detail` sized the cache. Build uncached
+                    // rather than growing it from a paint closure.
+                    return build_chart_scene(&spec, size, &view);
+                };
+                if let Some(cached) = slot.as_ref()
+                    && cached.size == size
+                    && cached.view == view
+                    && Arc::ptr_eq(&cached.spec, &spec)
+                {
+                    return cached.scene.clone();
+                }
+                let scene = build_chart_scene(&spec, size, &view);
+                *slot = Some(CachedScene {
+                    spec: spec.clone(),
+                    size,
+                    view,
+                    scene: scene.clone(),
+                });
+                scene
             },
             move |canvas_bounds, scene, window, cx| {
                 chart_paint::paint_scene(&scene, &palette, canvas_bounds, window, cx)
@@ -1587,21 +1828,47 @@ impl ChartsPanel {
                     .rounded_sm()
                     .overflow_hidden()
                     .child(canvas)
-                    // Click-to-inspect, on the four charts `chart_set`
-                    // marked selectable. `mouse_position`, not
-                    // `position`: a keyboard-dispatched click reports the
-                    // hitbox's bottom-left corner, which is a pixel the
-                    // user never pointed at, so it selects nothing rather
-                    // than an arbitrary frame.
-                    .when(selectable, |el| {
+                    // One handler for the whole press/release gesture,
+                    // because the three outcomes are three readings of the
+                    // SAME event pair and splitting them across
+                    // `on_mouse_up` and `on_click` would race: gpui fires
+                    // both on the release, and a zoom must not also select
+                    // a frame. `ClickEvent::Mouse` carries the original
+                    // `down` alongside the `up`, which is what makes the
+                    // drag/click discrimination readable from one place --
+                    // see `resolve_gesture`.
+                    .when(selectable || zoomable, |el| {
                         el.cursor_pointer().on_click(Self::guarded_listener(
                             cx,
                             move |this, event: &gpui::ClickEvent, _window, cx| {
-                                if let Some(position) = event.mouse_position() {
-                                    this.select_frame(ix, position, cx);
-                                }
+                                this.resolve_gesture(ix, zoomable, selectable, event, cx);
                             },
                         ))
+                    })
+                    // The drag PREVIEW only (the translucent band): press
+                    // records where, the move handler below widens it, and
+                    // a release outside the chart -- which gpui never turns
+                    // into a click, so `resolve_gesture` never sees it --
+                    // abandons it.
+                    .when(zoomable, |el| {
+                        el.on_mouse_down(
+                            gpui::MouseButton::Left,
+                            Self::guarded_listener(
+                                cx,
+                                move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                                    this.begin_drag(ix, event.position, cx);
+                                },
+                            ),
+                        )
+                        .on_mouse_up_out(
+                            gpui::MouseButton::Left,
+                            Self::guarded_listener(
+                                cx,
+                                move |this, _event: &gpui::MouseUpEvent, _window, cx| {
+                                    this.cancel_drag(ix, cx);
+                                },
+                            ),
+                        )
                     })
                     .on_mouse_move(Self::guarded_listener(
                         cx,
@@ -1614,7 +1881,9 @@ impl ChartsPanel {
                     // gap between charts, onto the header, or off the
                     // panel entirely would otherwise leave the crosshair
                     // and readout pinned where the cursor last was.
-                    // `on_hover(false)` is the only signal for that.
+                    // `on_hover(false)` is the only signal for that -- and
+                    // it is NOT a signal that a drag ended; see
+                    // `clear_hover` for why it fires at every drag's start.
                     .on_hover(Self::guarded_listener(
                         cx,
                         move |this, hovered: &bool, _window, cx| {
@@ -1633,14 +1902,15 @@ impl ChartsPanel {
     /// stale readout.
     ///
     /// Every hover change `cx.notify()`s, which re-renders ALL of the
-    /// run's charts, each rebuilding its scene from scratch
-    /// (`accumulate`/`bins`/`envelope` over the full sample set). That is
-    /// fine at the frame counts a normal capture produces and it is what
-    /// keeps the render path stateless, but it is O(charts x frames) per
-    /// mouse-move frame and would bite at ingest's 100,000-frame cap.
-    /// The upgrade, if a real run ever makes this visible: memoize each
-    /// chart's scene keyed by `(canvas size, hover)` so a hover move only
-    /// rebuilds the chart actually under the cursor.
+    /// run's charts. Until R5 that meant every one of them rebuilt its
+    /// scene from scratch (`accumulate`/`bins`/`envelope` over the full
+    /// sample set) on every mouse-move frame -- O(charts x frames) for a
+    /// change that can only ever affect one chart. It is now memoized on
+    /// exactly what a scene is built from, so a hover move rebuilds the
+    /// chart under the cursor and reuses the rest: see [`CachedScene`] for
+    /// the measurement, and
+    /// `test_a_hover_move_rebuilds_only_the_chart_under_the_cursor` for
+    /// the assertion that it stays that way.
     fn hover_chart(&mut self, ix: usize, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let bounds = self.chart_bounds.borrow().get(ix).copied().flatten();
         let next = bounds.filter(|b| b.contains(&position)).map(|b| Hover {
@@ -1648,10 +1918,168 @@ impl ChartsPanel {
             x: f32::from(position.x - b.origin.x),
             y: f32::from(position.y - b.origin.y),
         });
+        // Widen the drag band to follow the cursor. Same event, because
+        // the band's far edge IS the hover position; a second
+        // `on_mouse_move` listener for it would just be this one again.
+        let dragged = match (&mut self.drag, next) {
+            (Some(drag), Some(hover)) if drag.chart == ix && drag.to_x != hover.x => {
+                drag.to_x = hover.x;
+                true
+            }
+            _ => false,
+        };
         if self.hover != next {
             self.hover = next;
             cx.notify();
+        } else if dragged {
+            cx.notify();
         }
+    }
+
+    /// A left press on chart `ix`: start a drag preview there.
+    ///
+    /// The press does NOT clear the zoom or select anything -- both of
+    /// those are decided on release ([`Self::resolve_gesture`]), where the
+    /// gesture is finally known to have been a click, a drag or a
+    /// double-click.
+    fn begin_drag(&mut self, ix: usize, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = self.chart_bounds.borrow().get(ix).copied().flatten() else {
+            return;
+        };
+        if !bounds.contains(&position) {
+            return;
+        }
+        let x = f32::from(position.x - bounds.origin.x);
+        self.drag = Some(Drag {
+            chart: ix,
+            from_x: x,
+            to_x: x,
+        });
+        cx.notify();
+    }
+
+    /// The release, and the three things it can mean.
+    ///
+    /// 1. **Double-click** (`down.click_count >= 2`) -> drop this chart's
+    ///    zoom, back to the full frame domain. `line.rs` hand-rolls this
+    ///    from an `Instant` + a drift box because iced's canvas events
+    ///    carry no click count; gpui's `MouseDownEvent` does, so the
+    ///    platform's own double-click interval is used instead of a
+    ///    400 ms constant of ours.
+    /// 2. **A drag** -- press and release more than
+    ///    [`chart_geom::DRAG_MIN_PX`] apart in x -> zoom to the dragged
+    ///    window, and select NOTHING. This is the load-bearing half of the
+    ///    discrimination now that R4 put a frame-selection click on these
+    ///    same charts: without the threshold every click would zoom to a
+    ///    two-frame window, and without the exclusion every zoom would
+    ///    also open the inspect pane for whichever frame the release
+    ///    happened to land on.
+    /// 3. **A click** -> R4's frame selection, unchanged, on the charts
+    ///    `chart_set` marked selectable.
+    ///
+    /// The endpoints come from the event's own `down`/`up`, not from
+    /// [`Self::drag`]: that state is a per-chart preview that several
+    /// things may legitimately drop, while the event pair IS the gesture.
+    /// `mouse_position()` stays the source for case 3 for R4's reason -- a
+    /// keyboard-dispatched click has no cursor and must select nothing
+    /// rather than the hitbox's corner.
+    fn resolve_gesture(
+        &mut self,
+        ix: usize,
+        zoomable: bool,
+        selectable: bool,
+        event: &gpui::ClickEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let drag = self.drag.take();
+        if drag.is_some() {
+            cx.notify();
+        }
+        let gpui::ClickEvent::Mouse(mouse) = event else {
+            return;
+        };
+        if zoomable && mouse.down.click_count >= 2 {
+            self.reset_zoom(ix, cx);
+            return;
+        }
+        let dx = f32::from(mouse.up.position.x - mouse.down.position.x).abs();
+        if zoomable && dx >= chart_geom::DRAG_MIN_PX {
+            self.zoom_chart(ix, mouse.down.position, mouse.up.position, cx);
+            return;
+        }
+        if selectable && let Some(position) = event.mouse_position() {
+            self.select_frame(ix, position, cx);
+        }
+    }
+
+    /// Zoom chart `ix`'s x-domain to the window dragged between two
+    /// window-space points.
+    ///
+    /// The drag is interpreted through the scale the chart is CURRENTLY
+    /// painted at -- `view_for(ix)`'s zoom, not the full domain -- so a
+    /// second drag zooms further in rather than re-reading the same pixels
+    /// against the original domain. `zoom_domain` then clamps back inside
+    /// the full domain, so no sequence of drags can walk off the data.
+    fn zoom_chart(
+        &mut self,
+        ix: usize,
+        from: gpui::Point<Pixels>,
+        to: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(DetailState::Ready(detail)) = &self.detail else {
+            return;
+        };
+        let Some(spec) = detail.charts.get(ix) else {
+            return;
+        };
+        let Some(bounds) = self.chart_bounds.borrow().get(ix).copied().flatten() else {
+            return;
+        };
+        if spec.x.is_empty() {
+            return;
+        }
+        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let plot = chart_geom::plot_for(spec, size);
+        if !plot.is_drawable() {
+            return;
+        }
+        let view = self.view_for(ix);
+        let scale = chart_geom::x_scale_for(spec, plot, &view);
+        let domain = chart_geom::zoom_domain(
+            f32::from(from.x - bounds.origin.x),
+            f32::from(to.x - bounds.origin.x),
+            &scale,
+            chart_geom::full_x_domain(&spec.x),
+        );
+        self.zoom.insert(ix, domain);
+        cx.notify();
+    }
+
+    /// Back to the full frame domain on chart `ix` -- the double-click
+    /// reset. A chart that was never zoomed is left exactly as it was.
+    fn reset_zoom(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.zoom.remove(&ix).is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The Historic overlay switch -- `reports.rs`'s `ToggleHistoric`.
+    ///
+    /// **Derives nothing.** The prior runs were fetched and their series
+    /// built in the same background pass as everything else
+    /// ([`detail::load`]), so this flips a bool and the next render paints
+    /// (or stops painting) overlays the specs already carry. ggo-ide
+    /// fetches lazily on this event instead; this panel deliberately does
+    /// not, because that would be a blocking query hanging off a UI event
+    /// and a second load path to keep generation-guarded.
+    ///
+    /// The chart LIST does not change, only what each chart draws, so the
+    /// frame selection and the zoom windows -- both keyed by chart index
+    /// -- stay valid and are deliberately left alone (R4's concern (4)).
+    fn toggle_historic(&mut self, cx: &mut Context<Self>) {
+        self.historic_enabled = !self.historic_enabled;
+        cx.notify();
     }
 
     /// A click on chart `ix` at window-space `position`: select the frame
@@ -1703,6 +2131,10 @@ impl ChartsPanel {
                     f32::from(position.x - bounds.origin.x),
                     f32::from(position.y - bounds.origin.y),
                 ),
+                // The SAME view the prepaint painted this chart under, so
+                // a zoomed chart resolves the click against the domain
+                // the user is looking at (R4's concern (1)).
+                &self.view_for(ix),
             ) else {
                 return;
             };
@@ -1732,9 +2164,39 @@ impl ChartsPanel {
     /// the guard matters because hover-end on the chart being left can
     /// arrive AFTER hover-start on the chart being entered, which would
     /// otherwise clear the new chart's fresh readout.
+    ///
+    /// **A hover-end that arrives while this chart is being dragged is not
+    /// one.** gpui computes a div's hover as `has_mouse_down.is_none() &&
+    /// !cx.has_active_drag() && hitbox.is_hovered(window)`
+    /// (`div.rs:3038-3041`), so pressing the button on a chart flips its
+    /// hover to false *by definition*, and `on_hover(false)` fires once at
+    /// the start of every drag with the cursor still sitting on the chart.
+    /// Taken at face value that ends the readout the moment a drag begins
+    /// -- and, when this fn also dropped `self.drag`, it destroyed the
+    /// selection band before a single frame could paint it, which is how
+    /// R5 round 1 shipped a drag preview that never appeared. The drag is
+    /// released by the gesture that ends it instead: `resolve_gesture` on
+    /// a release inside the chart, [`Self::cancel_drag`] on one outside.
     fn clear_hover(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.drag.is_some_and(|d| d.chart == ix) {
+            return;
+        }
         if self.hover.is_some_and(|h| h.chart == ix) {
             self.hover = None;
+            cx.notify();
+        }
+    }
+
+    /// Abandon the drag preview on chart `ix` -- the release that happened
+    /// somewhere else.
+    ///
+    /// gpui only fires a click when press and release share a hitbox, so a
+    /// release outside the chart never reaches `resolve_gesture` and never
+    /// zooms (`line.rs` clamps such a drag instead; matched to gpui's own
+    /// rule rather than re-implemented). Without this the band would hang
+    /// on screen over a gesture that has already ended.
+    fn cancel_drag(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.drag.take_if(|d| d.chart == ix).is_some() {
             cx.notify();
         }
     }
@@ -3476,11 +3938,43 @@ mod tests {
         let spec = &panel.chart_specs()[ix];
         let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
         let plot = chart_geom::plot_for(spec, size);
-        let x = chart_geom::x_scale(plot, chart_geom::full_x_domain(&spec.x)).map(frame);
+        // Through the chart's CURRENT view, so a zoomed chart's frame 3 is
+        // where the user now sees it rather than where it used to be.
+        let x = chart_geom::x_scale_for(spec, plot, &panel.view_for(ix)).map(frame);
         gpui::point(
             bounds.origin.x + px(x),
             bounds.origin.y + px(plot.y + plot.h / 2.0),
         )
+    }
+
+    /// A press at `from`, a move, and a release at `to` -- the gesture the
+    /// panel has to tell apart from a click.
+    fn simulate_drag(
+        cx: &mut gpui::VisualTestContext,
+        from: gpui::Point<Pixels>,
+        to: gpui::Point<Pixels>,
+    ) {
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+    }
+
+    /// A press+release the platform reports as the second click of a
+    /// double click. `simulate_click` only ever sends `click_count: 1`.
+    fn simulate_double_click(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: gpui::MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: gpui::MouseButton::Left,
+            click_count: 2,
+        });
     }
 
     fn chart_index(panel: &ChartsPanel, title: &str) -> usize {
@@ -3964,6 +4458,520 @@ mod tests {
         );
     }
 
+    // ------------------------------------------- R5: drag-zoom + overlays
+
+    /// A drag across a chart sets that chart's x-domain to what was
+    /// dragged over -- and does NOT select a frame, even though the
+    /// release lands on one and this chart is frame-selectable.
+    #[gpui::test]
+    async fn test_a_drag_zooms_the_chart_to_the_dragged_window(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, from, to) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 2.0), point_of(panel, ix, 4.0))
+        });
+        simulate_drag(cx, from, to);
+
+        panel.update(cx, |panel, _cx| {
+            let (lo, hi) = *panel.zoom.get(&ix).expect("the drag must zoom the chart");
+            assert!(
+                (lo - 2.0).abs() < 0.05 && (hi - 4.0).abs() < 0.05,
+                "dragged frames 2..4, got {lo}..{hi}"
+            );
+            assert!(
+                panel.frame_inspect.is_none(),
+                "a drag is not a click -- it must not also open the inspect pane"
+            );
+            assert!(panel.drag.is_none(), "and the preview is released with it");
+        });
+
+        // The chart really is showing the window now: its readout at the
+        // left edge is the window's first frame, not the run's.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        panel.update(cx, |panel, cx| {
+            let at = point_of(panel, ix, 2.0);
+            panel.hover_chart(ix, at, cx);
+            let bounds = panel.chart_bounds.borrow()[ix].unwrap();
+            let scene = panel
+                .scene_for(
+                    ix,
+                    (f32::from(bounds.size.width), f32::from(bounds.size.height)),
+                )
+                .unwrap();
+            let readout = scene.readout.expect("hovering a sample");
+            assert_eq!(readout.title, "frame 2");
+        });
+    }
+
+    /// Double-clicking a zoomed chart puts it back to the whole run --
+    /// and, because the reset consumes the gesture, does not leave a
+    /// frame selected behind it.
+    #[gpui::test]
+    async fn test_a_double_click_restores_the_full_domain(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, from, to) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
+        });
+        simulate_drag(cx, from, to);
+        panel.update(cx, |panel, _cx| assert!(panel.zoom.contains_key(&ix)));
+
+        let at = panel.update(cx, |panel, _cx| point_of(panel, ix, 2.0));
+        simulate_double_click(cx, at);
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.zoom.is_empty(),
+                "a double click restores the full frame domain"
+            );
+            assert!(
+                panel.frame_inspect.is_none(),
+                "the reset gesture must not also select a frame"
+            );
+        });
+    }
+
+    /// **The threshold is what makes R4's click-to-inspect survive R5.**
+    /// A press and release two pixels apart is a click: it selects the
+    /// frame, and it must not zoom to the two-frame minimum window
+    /// `zoom_domain` would widen it to.
+    #[gpui::test]
+    async fn test_a_sub_threshold_drag_selects_a_frame_instead_of_zooming(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let from = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
+        });
+        assert!(
+            chart_geom::DRAG_MIN_PX > 2.0,
+            "the fixture's 2px jitter has to be below the threshold"
+        );
+        simulate_drag(cx, from, gpui::point(from.x + px(2.), from.y));
+
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.zoom.is_empty(),
+                "a 2px jitter is a click, not a zoom-to-nothing"
+            );
+            assert_eq!(
+                panel.frame_inspect.as_ref().map(|s| s.frame),
+                Some(3),
+                "and it selects the frame under the cursor"
+            );
+        });
+    }
+
+    /// R4's concern (1) at the panel level: once a chart is zoomed, a
+    /// click on it has to resolve against the domain the user is looking
+    /// at. The click is aimed at a pixel that names a DIFFERENT frame
+    /// under the full domain, so a hit-test that ignored the zoom would
+    /// select the wrong one rather than merely a coincidentally right one.
+    #[gpui::test]
+    async fn test_a_click_on_a_zoomed_chart_selects_what_is_under_it(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, from, to) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
+        });
+        simulate_drag(cx, from, to);
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        let (at, unzoomed_answer) = panel.update(cx, |panel, _cx| {
+            let at = point_of(panel, ix, 3.0);
+            let bounds = panel.chart_bounds.borrow()[ix].unwrap();
+            let spec = panel.chart_specs()[ix].clone();
+            let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let local = (
+                f32::from(at.x - bounds.origin.x),
+                f32::from(at.y - bounds.origin.y),
+            );
+            // What the SAME pixel would have named without the zoom.
+            (
+                at,
+                chart_geom::frame_at(&spec, size, local, &chart_geom::ChartView::default()),
+            )
+        });
+        assert_ne!(
+            unzoomed_answer,
+            Some(3),
+            "the fixture must aim at a pixel the two domains disagree about"
+        );
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.frame_inspect.as_ref().map(|s| s.frame),
+                Some(3),
+                "the click follows the zoomed chart, not the original scale"
+            );
+        });
+    }
+
+    /// The zoom is keyed by chart INDEX, which means something only
+    /// inside one selection's chart set -- so leaving the run drops it,
+    /// exactly as the frame selection does (R4's concern (4)).
+    #[gpui::test]
+    async fn test_leaving_a_run_drops_the_zoom_and_the_overlay_switch(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, from, to) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
+        });
+        simulate_drag(cx, from, to);
+        panel.update(cx, |panel, cx| {
+            panel.toggle_historic(cx);
+            assert!(panel.zoom.contains_key(&ix) && panel.historic_enabled);
+            panel.clear_selection(cx);
+            assert!(panel.zoom.is_empty(), "a chart index outlives nothing");
+            assert!(
+                !panel.historic_enabled,
+                "the overlay is about THIS run's history"
+            );
+        });
+    }
+
+    /// The whole overlay path, end to end and through the real db: a
+    /// second run of the same cart draws the first one underneath it, at
+    /// the ramp's brightest step, with the prior run's OWN values.
+    #[gpui::test]
+    async fn test_the_overlay_draws_the_prior_run_of_the_same_cart(cx: &mut TestAppContext) {
+        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(&db_path);
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 2,
+                    started_at: "2026-08-03T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena-2".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let Some(DetailState::Ready(detail)) = &panel.detail else {
+                panic!("run 2 must be loaded");
+            };
+            assert_eq!(detail.prior_runs, 1, "run 1 is run 2's only earlier run");
+            let wire = &detail.charts[0];
+            assert_eq!(wire.title, "Wire cycles per frame vs budget");
+            assert_eq!(wire.historic.len(), 1);
+            assert_eq!(
+                wire.historic[0].opacity,
+                ggo_worldlib::charts::reports::historic::HISTORIC_OPACITY[0],
+                "the nearest prior run is the brightest step"
+            );
+            // Run 1's frames are 0..=4 at 164_470 + n*100 and frame 0 is
+            // ignored, so the overlay is run 1's frames 1..=4.
+            assert_eq!(
+                wire.historic[0].values,
+                vec![164_570.0, 164_670.0, 164_770.0, 164_870.0]
+            );
+            // Run 2's own axis is 10..=12 -- three samples against the
+            // overlay's four, which is exactly the index-alignment case:
+            // the ghost is truncated by the renderer, not by the data.
+            assert_eq!(wire.x, vec![10.0, 11.0, 12.0]);
+        });
+    }
+
+    /// Switching the toggle on paints the ghosts; switching it off stops.
+    /// Nothing is re-derived either way -- `guarded_listener` holds the
+    /// no-build guard across the toggle handler, so a re-derivation here
+    /// fails this test with the tripwire's message.
+    #[gpui::test]
+    async fn test_the_historic_toggle_paints_the_overlays_it_was_given(cx: &mut TestAppContext) {
+        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(&db_path);
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 2,
+                    started_at: "2026-08-03T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena-2".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        let ghosts = |panel: &ChartsPanel| {
+            panel
+                .scene_for(0, (360.0, 240.0))
+                .unwrap()
+                .primitives
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        chart_geom::Primitive::Polyline {
+                            color: chart_geom::ChartColor::Historic(_),
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        panel.update(cx, |panel, cx| {
+            assert_eq!(ghosts(panel), 0, "off by default, as in ggo-ide");
+            panel.toggle_historic(cx);
+            assert_eq!(ghosts(panel), 1, "one prior run, one ghost");
+            panel.toggle_historic(cx);
+            assert_eq!(ghosts(panel), 0);
+        });
+    }
+
+    /// A run with nothing behind it says so, in a sentence that names the
+    /// STATE and claims no cause.
+    ///
+    /// Pinned character for character, which is R4's F3 lesson: the round-1
+    /// guard there was a phrase denylist and the reviewer walked a
+    /// semantically identical over-claim straight through it. The rule this
+    /// string has to satisfy is on `NO_PRIOR_RUNS`; a replacement has to be
+    /// defended there, not slipped past a filter here.
+    #[gpui::test]
+    async fn test_a_run_with_no_earlier_runs_names_that_state_and_no_cause(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        panel.update(cx, |panel, _cx| {
+            let Some(DetailState::Ready(detail)) = &panel.detail else {
+                panic!("the fixture run must be loaded");
+            };
+            assert_eq!(detail.prior_runs, 0, "run 1 is the cart's first");
+        });
+        assert_eq!(
+            NO_PRIOR_RUNS, "no prior runs of this cart to overlay",
+            "this sentence states that the overlay set is empty and nothing else. \
+             The signal behind it -- load_prior_runs returned no runs -- covers a \
+             first run, runs ingested later with higher ids, and a run with no run \
+             row at all, so any wording that explains WHY is a claim it cannot \
+             support. See NO_PRIOR_RUNS' doc before changing this."
+        );
+        assert!(
+            cx.debug_bounds(HISTORIC_TOGGLE_SELECTOR).is_some(),
+            "the toggle row is painted even with nothing to overlay -- that is \
+             where the reader learns there is nothing"
+        );
+    }
+
+    /// The selection band a chart `ix` would paint right now, if any.
+    fn drag_band(panel: &ChartsPanel, ix: usize) -> Option<chart_geom::Rect> {
+        let bounds = panel.chart_bounds.borrow()[ix].unwrap();
+        panel
+            .scene_for(
+                ix,
+                (f32::from(bounds.size.width), f32::from(bounds.size.height)),
+            )
+            .unwrap()
+            .primitives
+            .iter()
+            .find_map(|p| match p {
+                chart_geom::Primitive::Quad {
+                    rect,
+                    color: chart_geom::ChartColor::Selection,
+                } => Some(*rect),
+                _ => None,
+            })
+    }
+
+    /// The drag has to be VISIBLE while it is being aimed -- a zoom
+    /// gesture with no feedback is a gesture a user cannot aim.
+    ///
+    /// **The cursor arrives on the chart before the press**, which is what
+    /// a real cursor always does and what round 1's version of this test
+    /// omitted. It matters because gpui reports a div with a pending
+    /// mouse-down as NOT hovered (`div.rs:3038-3041`), so the first move of
+    /// every drag fires `on_hover(false)`; without a prior move the
+    /// listener's `was_hovered` is already `false`, the `false -> false`
+    /// transition never invokes it, and a mechanism that destroys the drag
+    /// on hover-end passes anyway. Round 1 shipped exactly that: a preview
+    /// that never painted in the app, with a green test over it. See
+    /// `clear_hover`.
+    #[gpui::test]
+    async fn test_an_in_flight_drag_paints_its_band(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, from, to) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
+        });
+
+        // Arrive, press, drag -- all through real events.
+        cx.simulate_mouse_move(from, None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+
+        panel.update(cx, |panel, _cx| {
+            let rect = drag_band(panel, ix).expect("an in-flight drag paints its band");
+            let bounds = panel.chart_bounds.borrow()[ix].unwrap();
+            assert!(
+                (rect.x - f32::from(from.x - bounds.origin.x)).abs() < 1.0,
+                "the band starts where the press did"
+            );
+            assert!(
+                (rect.right() - f32::from(to.x - bounds.origin.x)).abs() < 1.0,
+                "and follows the cursor"
+            );
+            assert!(
+                panel.hover.is_some(),
+                "the readout survives the drag too -- the hover-end gpui \
+                 reports at a press is an artifact, not a departure"
+            );
+        });
+
+        // Releasing inside consumes the preview along with the gesture.
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(drag_band(panel, ix), None);
+            assert!(panel.zoom.contains_key(&ix), "and the drag still zoomed");
+        });
+    }
+
+    /// A release somewhere else never becomes a click, so `resolve_gesture`
+    /// never runs and the preview would otherwise hang on screen over a
+    /// gesture that has already ended.
+    #[gpui::test]
+    async fn test_a_release_outside_the_chart_abandons_the_drag(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, from, to) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
+        });
+        cx.simulate_mouse_move(from, None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| {
+            assert!(drag_band(panel, ix).is_some(), "the drag has a band");
+        });
+
+        // Far above the chart -- the detail header, not a canvas.
+        cx.simulate_mouse_up(
+            gpui::point(from.x, px(4.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(drag_band(panel, ix), None, "the band goes with the release");
+            assert!(panel.zoom.is_empty(), "and nothing was zoomed");
+        });
+    }
+
+    /// The checkbox itself, not just the method behind it: a click inside
+    /// the painted toggle row switches the overlay on.
+    #[gpui::test]
+    async fn test_clicking_the_historic_checkbox_switches_the_overlay_on(cx: &mut TestAppContext) {
+        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(&db_path);
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 2,
+                    started_at: "2026-08-03T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena-2".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        let row = cx
+            .debug_bounds(HISTORIC_TOGGLE_SELECTOR)
+            .expect("the toggle row is painted");
+        // The checkbox is the row's leading child.
+        cx.simulate_click(
+            gpui::point(row.origin.x + px(6.), row.origin.y + row.size.height / 2.),
+            gpui::Modifiers::default(),
+        );
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.historic_enabled,
+                "clicking the checkbox switches the overlay on"
+            );
+        });
+    }
+
+    /// Zooming is not limited to the four frame-selectable charts:
+    /// `line.rs` gives every line chart a zoom and only some of them an
+    /// `on_select`, and so does this. (The click on this chart still
+    /// selects nothing -- `test_a_click_on_an_unselectable_chart_selects_
+    /// nothing` is the other half.)
+    #[gpui::test]
+    async fn test_an_unselectable_line_chart_still_zooms(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, from, to) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Wire cycles per frame vs budget");
+            assert!(!panel.chart_specs()[ix].selectable);
+            (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
+        });
+        simulate_drag(cx, from, to);
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.zoom.contains_key(&ix), "a line chart zooms");
+            assert!(panel.frame_inspect.is_none());
+        });
+    }
+
+    /// The scene cache does its job: a hover move rebuilds the chart under
+    /// the cursor and reuses every other chart's scene.
+    ///
+    /// The counter is `chart_geom::scene_builds`, and it is what makes the
+    /// memoization assertable at all -- both paths return the same scene by
+    /// construction, so nothing about the OUTPUT can distinguish them.
+    /// Without the cache this is 11 builds instead of 1 (`CachedScene`'s
+    /// doc carries the measurement that motivated it).
+    #[gpui::test]
+    async fn test_a_hover_move_rebuilds_only_the_chart_under_the_cursor(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let charts = panel.update(cx, |panel, _cx| panel.chart_specs().len());
+        assert!(charts > 1, "the fixture must have several charts");
+
+        let at = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 2.0)
+        });
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        let before = chart_geom::scene_builds();
+        cx.simulate_mouse_move(
+            gpui::point(at.x + px(8.), at.y),
+            None,
+            gpui::Modifiers::default(),
+        );
+        let built = chart_geom::scene_builds() - before;
+        assert_eq!(
+            built, 1,
+            "a hover move must rebuild only the hovered chart, not all {charts}"
+        );
+
+        // And what the cache hands back is what a fresh build would.
+        panel.update(cx, |panel, _cx| {
+            for (ix, cached) in panel.scenes.borrow().iter().enumerate() {
+                let Some(cached) = cached else { continue };
+                assert_eq!(
+                    cached.scene,
+                    build_chart_scene(&cached.spec, cached.size, &cached.view),
+                    "chart {ix}'s cached scene must equal a fresh build of it"
+                );
+            }
+        });
+    }
+
     /// R3's F1 said the tripwire covered `select_run`'s update closure
     /// and `Render::render` and nothing else, and named event listeners
     /// as the gap R4's click-to-inspect would walk straight through.
@@ -3979,7 +4987,7 @@ mod tests {
         let (panel, cx) = cx.add_window_view(|_window, cx| ChartsPanel::new(None, cx));
         let listener = panel.update(cx, |_panel, cx| {
             ChartsPanel::guarded_listener(cx, |_this, _event: &bool, _window, _cx| {
-                let _ = detail::build(&loader::RunSamples::default());
+                let _ = detail::build(&loader::RunSamples::default(), &[]);
             })
         });
         cx.update_window(cx.window_handle(), |_, window, cx| {

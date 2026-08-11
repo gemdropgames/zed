@@ -83,8 +83,19 @@ fn resolve(color: ChartColor, palette: &Palette) -> Hsla {
         ChartColor::Accent => palette.accent,
         ChartColor::AccentAlpha(alpha) => palette.accent.opacity(alpha),
         ChartColor::Band(rgb) => mix(hsla_from_rgb(rgb), palette.surface, BAND_FILL_SERIES_WEIGHT),
+        // `line.rs`: `Color { a: text_color.a * hs.opacity, ..text_color }`
+        // -- the muted text color, dimmed by the age ramp. Multiplied by
+        // the palette's own alpha rather than replacing it, so a theme
+        // whose muted text is already translucent stays consistent.
+        ChartColor::Historic(opacity) => palette.text.opacity(opacity),
+        ChartColor::Selection => palette.budget.opacity(DRAG_OVERLAY_ALPHA),
     }
 }
+
+/// `line.rs`'s `DRAG_OVERLAY_ALPHA`: the drag-zoom band is a hint, not a
+/// highlight -- the series under it must stay readable while the drag is
+/// being aimed.
+const DRAG_OVERLAY_ALPHA: f32 = 0.15;
 
 fn to_bounds(rect: Rect, origin: Point<Pixels>) -> Bounds<Pixels> {
     bounds(

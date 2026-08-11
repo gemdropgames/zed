@@ -48,14 +48,21 @@
 //! **Not covered, and deliberately named rather than implied:**
 //!
 //! * gpui prepaint closures, which run inside `Window::draw` rather than
-//!   inside `render`. That is where `chart_geom::build_chart_scene` already
-//!   runs, once per chart per frame over the full sample set -- pre-existing
-//!   from C2, documented on `ChartsPanel::hover_chart`, and **invisible to
-//!   this counter**, which only ever tracks `build`. It is the remaining
-//!   UI-thread hot path in this panel and it is R5's to weigh.
+//!   inside `render`, and are still **invisible to this counter** (it only
+//!   ever tracks [`build`]). `chart_geom::build_chart_scene` runs there.
+//!   R5 weighed it, as R3's review asked: measured, then memoized. It used
+//!   to run once per chart per painted frame over the full sample set, so a
+//!   hover move rebuilt every chart on the page; `ChartsPanel`'s scene
+//!   cache now makes that one rebuild plus a clone each for the rest (see
+//!   `CachedScene`, which carries the numbers). What is left there is a
+//!   pure scene build, never a query and never a `build` -- so a future
+//!   edit that reached for THIS module from a prepaint closure would still
+//!   slip past the counter, and that is the standing gap.
 
 use std::path::Path;
 use std::sync::Arc;
+
+use ggo_worldlib::charts::reports::historic::HistoricRunFrames;
 
 use crate::chart_geom::ChartSpec;
 use crate::chart_set;
@@ -93,6 +100,19 @@ pub struct Detail {
     /// so neither interaction has anything left to aggregate -- see
     /// [`crate::inspect`]'s module doc.
     pub profiles: Arc<Profiles>,
+    /// How many prior runs the historic overlay will actually DRAW
+    /// (0..=5) -- the toggle row's count, and what tells it whether to
+    /// offer the toggle at all. The overlay VALUES are already on the
+    /// specs; this is only the number, so the toggle renders without
+    /// reaching into them.
+    ///
+    /// Counted post-filter, not `prior.len()`: a prior run left with fewer
+    /// than two frames by the ignore filter (a two-frame capture from an
+    /// aborted run, say) draws no line on any chart -- see
+    /// `chart_geom`'s `drawn_overlays`. Counting it would put "3 prior
+    /// runs" above a chart showing two, which is the exact ambiguity this
+    /// number exists to remove.
+    pub prior_runs: usize,
 }
 
 /// Query `run_id` out of `db_path` and derive everything from it.
@@ -101,22 +121,62 @@ pub struct Detail {
 /// spins four short-lived tokio runtimes (R1's concern (5)) and the build
 /// half is the cost this module's doc opens with. `select_run`'s
 /// `cx.background_spawn` is the only caller.
+///
+/// R5's historic overlay loads HERE, in this same pass, rather than behind
+/// its own toggle-triggered fetch the way ggo-ide's `load_historic_task`
+/// does: a second load path would be a second place to get the generation
+/// guard wrong, and the toggle would then have a blocking query hanging
+/// off a UI event. The price, stated plainly, is up to six more queries per
+/// selection ([`loader::load_prior_runs`]) whether or not the toggle is
+/// ever switched on.
+///
+/// **The samples' failures are fatal; the overlay's are not** -- see
+/// [`prior_or_none`]. That asymmetry is the whole reason the two loads are
+/// separate statements rather than one `?`-chained expression.
 pub fn load(db_path: &Path, run_id: i64) -> Result<Detail, String> {
     let samples = loader::load_run_samples(db_path, run_id)?;
-    Ok(build(&samples))
+    let prior = prior_or_none(db_path, run_id, samples.detail.as_ref().map(|d| d.cart_id));
+    Ok(build(&samples, &prior))
+}
+
+/// [`loader::load_prior_runs`], degraded to "no overlay" on failure.
+///
+/// A `?` here instead would let a failure in ANY of the overlay's six
+/// queries take down the whole run detail: the KPI tiles, the panic and
+/// failed-asset tables, the stored console, every chart and the inspect
+/// pane would all be replaced by `"Failed to load samples: …"`, because
+/// `select_run` has one error state for the selection as a whole. That is
+/// a wildly disproportionate response to losing an **off-by-default
+/// decoration**, and it is reachable rather than theoretical: R3's history
+/// rail writes to this same database on every panel activation, and lock
+/// contention is exactly the transient that produces it.
+///
+/// The samples are a different matter -- a run detail with no frames, no
+/// `run` row and no UART is not a degraded view of the run, it is nothing
+/// -- so [`load`] still fails on those.
+///
+/// The failure is silent by design rather than by omission: an empty
+/// overlay set already has a surface that says so (`NO_PRIOR_RUNS`), and
+/// the alternative -- a second error channel plumbed through `Detail` for
+/// a decoration -- would cost more than it explains. It does mean a
+/// transient lock failure reads as "no prior runs of this cart", which is
+/// noted as a residual in this task's report.
+fn prior_or_none(db_path: &Path, run_id: i64, cart_id: Option<i64>) -> Vec<HistoricRunFrames> {
+    loader::load_prior_runs(db_path, run_id, cart_id).unwrap_or_default()
 }
 
 /// The pure half of [`load`] -- every derivation, no I/O.
-pub fn build(samples: &RunSamples) -> Detail {
+pub fn build(samples: &RunSamples, prior: &[HistoricRunFrames]) -> Detail {
     #[cfg(test)]
     BUILDS.with(|n| n.set(n.get() + 1));
     Detail {
         ignored: chart_set::ignored_count(&samples.frames),
         report: report::build(samples),
-        charts: chart_set::build_charts(samples)
+        charts: chart_set::build_charts(samples, prior)
             .into_iter()
             .map(Arc::new)
             .collect(),
+        prior_runs: chart_set::drawable_prior_runs(samples, prior),
         console: Arc::new(samples.uart.clone()),
         // The SAME ignore set the charts and the KPI tiles above them
         // used -- `chart_set::ignore_set` is the panel's one definition
@@ -212,7 +272,7 @@ mod tests {
     /// UI thread has nothing left but refcount bumps.
     #[test]
     fn build_returns_a_finished_view_model() {
-        let detail = build(&samples());
+        let detail = build(&samples(), &[]);
         assert!(
             !detail.charts.is_empty(),
             "the charts are already assembled"
@@ -228,16 +288,48 @@ mod tests {
         assert_eq!(detail.console.len(), 2, "the stored UART came along");
     }
 
+    /// **A prior-run query failure must not take the run detail with it.**
+    ///
+    /// Two halves, because a test of the degrade alone would pass over a
+    /// query that cannot fail. First: an unreadable database really does
+    /// make `load_prior_runs` return `Err` -- a file that exists (so the
+    /// `!exists()` guard lets it through) but is not a database. Second:
+    /// [`prior_or_none`] turns exactly that into an empty overlay set.
+    ///
+    /// What the `?` this replaced would have done, from the reviewer's
+    /// drill: 30 run-detail tests fail, because `select_run` has ONE error
+    /// state for the selection and an off-by-default decoration would have
+    /// been claiming it -- no KPI tiles, no panic table, no console, no
+    /// charts, no inspect pane, just "Failed to load samples".
+    #[test]
+    fn a_prior_run_query_failure_degrades_to_no_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("not_a_database.db");
+        std::fs::write(&junk, b"this is not a SQLite file, not even close").unwrap();
+
+        assert!(
+            loader::load_prior_runs(&junk, 5, Some(1)).is_err(),
+            "the fixture has to actually fail, or the degrade below proves nothing"
+        );
+        assert!(
+            prior_or_none(&junk, 5, Some(1)).is_empty(),
+            "a failed overlay load is no overlay, not a failed run detail"
+        );
+    }
+
     /// The stored console is the run's UART verbatim and in order -- no
     /// tail, no cap, no reformatting. The reader must not quietly impose
     /// the producer's `UART_LOG_CAP`.
     #[test]
     fn the_console_is_every_stored_line_in_order() {
         let lines: Vec<String> = (0..5_000).map(|i| format!("line {i}")).collect();
-        let detail = build(&RunSamples {
-            uart: lines.clone(),
-            ..RunSamples::default()
-        });
+        let detail = build(
+            &RunSamples {
+                uart: lines.clone(),
+                ..RunSamples::default()
+            },
+            &[],
+        );
         assert_eq!(*detail.console, lines);
     }
 
@@ -257,13 +349,13 @@ mod tests {
     #[should_panic(expected = "built on the UI thread")]
     fn the_tripwire_fires_when_something_is_built_inside_the_guarded_scope() {
         let _guard = no_build_here();
-        let _ = build(&RunSamples::default());
+        let _ = build(&RunSamples::default(), &[]);
     }
 
     /// ...and does not fire when nothing is.
     #[test]
     fn the_tripwire_is_quiet_when_the_scope_only_moves_an_already_built_detail() {
-        let detail = build(&samples());
+        let detail = build(&samples(), &[]);
         let guard = no_build_here();
         let moved = detail.clone();
         drop(guard);

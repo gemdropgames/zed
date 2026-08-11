@@ -27,10 +27,14 @@
 //!   `StackedArea.tsx`'s direct end-of-band labels were skipped by that
 //!   port -- but a 360px-wide dock panel needs the series named without
 //!   requiring a hover, so [`legend_layout`] is new here.
-//! * no drag-zoom / double-click-reset (`line.rs`'s `zoom_domain`): this
-//!   task's brief scopes interactivity to hover readout only.
-//! * no historic overlay (`line.rs`'s `HistoricSeries`): the panel has no
-//!   prior-run picker yet.
+//!
+//! F5.4 R5 closed the two that used to be listed here: `line.rs`'s
+//! `zoom_domain` (drag x-zoom + double-click reset) and its historic
+//! overlay are both ported now -- see [`zoom_domain`], [`OverlaySpec`] and
+//! [`ChartView`]. Where iced keeps hover/drag/zoom inside each
+//! `canvas::Program`'s own retained `State`, this crate has no retained
+//! per-widget state at all: the panel owns it and hands a [`ChartView`]
+//! down per render, which is what keeps this layer pure.
 
 use ggo_worldlib::charts::scale::{LinearScale, nice_step};
 
@@ -71,6 +75,15 @@ pub enum ChartColor {
     /// blended by the painter (which is the only layer that knows what
     /// "surface" is).
     Band(Rgb),
+    /// A historic-overlay line: the text color at the given opacity, which
+    /// is the ONLY thing distinguishing one prior run from another
+    /// (`line.rs`'s `Color { a: text_color.a * hs.opacity, ..text_color }`).
+    /// Grey rather than the series' own hue on purpose -- an overlay that
+    /// carried the live color would read as more data of the same run.
+    Historic(f32),
+    /// The translucent band under an in-progress drag-zoom --
+    /// `line.rs`'s `DRAG_OVERLAY_ALPHA` over the budget/danger color.
+    Selection,
 }
 
 /// Horizontal text anchoring for a [`Primitive::Text`].
@@ -244,6 +257,72 @@ pub fn x_scale(plot: Rect, domain: (f32, f32)) -> LinearScale {
     }
 }
 
+/// The x-domain a chart is CURRENTLY showing: the zoom window when one is
+/// set, else the whole data domain.
+///
+/// The one place that choice is made. [`frame_at`] and every scene builder
+/// resolve their x through [`x_scale_for`], which resolves through this --
+/// R4's concern (1), which is that a zoom applied in the paint path but not
+/// in the hit-test path puts a click on a different frame from the
+/// crosshair over it. `the_click_and_the_hover_readout_resolve_the_same_
+/// sample` sweeps a zoomed chart for exactly that.
+pub fn x_domain(spec: &ChartSpec, view: &ChartView) -> (f32, f32) {
+    view.zoom.unwrap_or_else(|| full_x_domain(&spec.x))
+}
+
+/// [`x_scale`] over [`x_domain`] -- what both the painter and the hit-test
+/// call, so neither can be zoomed without the other.
+pub fn x_scale_for(spec: &ChartSpec, plot: Rect, view: &ChartView) -> LinearScale {
+    x_scale(plot, x_domain(spec, view))
+}
+
+/// Narrowest x-domain (in x units, i.e. frames) a drag may select --
+/// `line.rs`'s `MIN_ZOOM_DOMAIN_WIDTH`, which stops a near-zero drag
+/// zooming to a degenerate one-sample domain.
+pub const MIN_ZOOM_DOMAIN_WIDTH: f32 = 2.0;
+
+/// A press/release pair whose x endpoints are closer than this (px) is a
+/// CLICK, not a drag -- `line.rs`'s `DRAG_MIN_PX`. Below it the pointer
+/// just jittered, and the brief's "a drag shorter than a threshold is a
+/// click, not a zoom-to-nothing" is this constant: without it, a click on
+/// one of the four frame-selectable charts would zoom to a two-frame
+/// window instead of opening the inspect pane.
+pub const DRAG_MIN_PX: f32 = 3.0;
+
+/// A left-drag from pixel `px_a` to `px_b` (in `scale`'s range space) ->
+/// the new x-domain, clamped into `full_domain` and widened to
+/// [`MIN_ZOOM_DOMAIN_WIDTH`] if the drag was too narrow. Ported from
+/// `line.rs`'s `zoom_domain` verbatim, including the "slide the window
+/// back inside rather than shrink it" rule, so a drag that starts or ends
+/// past the data edge still zooms.
+pub fn zoom_domain(
+    px_a: f32,
+    px_b: f32,
+    scale: &LinearScale,
+    full_domain: (f32, f32),
+) -> (f32, f32) {
+    let da = scale.invert(px_a);
+    let db = scale.invert(px_b);
+    let (mut lo, mut hi) = if da <= db { (da, db) } else { (db, da) };
+
+    if hi - lo < MIN_ZOOM_DOMAIN_WIDTH {
+        let mid = (lo + hi) / 2.0;
+        lo = mid - MIN_ZOOM_DOMAIN_WIDTH / 2.0;
+        hi = mid + MIN_ZOOM_DOMAIN_WIDTH / 2.0;
+    }
+
+    let (fd0, fd1) = full_domain;
+    if lo < fd0 {
+        hi += fd0 - lo;
+        lo = fd0;
+    }
+    if hi > fd1 {
+        lo -= hi - fd1;
+        hi = fd1;
+    }
+    (lo.max(fd0), hi.min(fd1))
+}
+
 /// The "nice" tick at or above `max` -- the y-domain top every chart in
 /// the iced port uses (`probe.ticks(..).next_back()`, falling back to 1.0).
 /// `integer` selects `ticks_integer` (the histogram's whole-number step).
@@ -300,17 +379,23 @@ pub fn nearest_x(px: f32, xs: &[f32], scale: &LinearScale) -> Option<usize> {
 /// no frame under the cursor to name).
 ///
 /// Pure, and deliberately NOT a second geometry: it resolves through the
-/// same [`plot_for`] and the same `x_scale(plot, full_x_domain(..))` that
+/// same [`plot_for`] and the same [`x_scale_for`] that
 /// [`build_chart_scene`] paints the points with, so a click and the hover
 /// readout under the same cursor can never disagree about which sample is
 /// there (`the_click_and_the_hover_readout_resolve_the_same_sample` is
-/// what holds that). When R5 gives the panel a zoomed/panned x-domain,
-/// the domain has to move into `plot_for`'s neighbourhood and BOTH call
-/// sites take it -- changing only one is what that test exists to catch.
+/// what holds that). That is why it takes the whole [`ChartView`] rather
+/// than just a zoom: R5 threaded the domain through `x_scale_for`, which
+/// both this and the painter go through, so there is no way to zoom one
+/// without the other.
 ///
 /// Ties go to the earlier frame ([`nearest_x`]'s rule): a click exactly
 /// between two samples selects the left one, deterministically.
-pub fn frame_at(spec: &ChartSpec, size: (f32, f32), point: (f32, f32)) -> Option<i64> {
+pub fn frame_at(
+    spec: &ChartSpec,
+    size: (f32, f32),
+    point: (f32, f32),
+    view: &ChartView,
+) -> Option<i64> {
     // The SAME two preconditions `build_chart_scene` early-outs on
     // (`!spec.has_data() || !plot.is_drawable()`), and `has_data` is here
     // rather than left to the caller for a reason: a `Line` spec with an
@@ -325,7 +410,7 @@ pub fn frame_at(spec: &ChartSpec, size: (f32, f32), point: (f32, f32)) -> Option
     if !spec.has_data() || !plot.is_drawable() || !plot.contains(point.0, point.1) {
         return None;
     }
-    let xs = x_scale(plot, full_x_domain(&spec.x));
+    let xs = x_scale_for(spec, plot, view);
     let idx = nearest_x(point.0, &spec.x, &xs)?;
     spec.x.get(idx).map(|&x| x.round() as i64)
 }
@@ -709,6 +794,68 @@ pub enum ChartKind {
     Histogram,
 }
 
+/// One de-emphasized prior-run overlay line: values only, plus how far
+/// back the run is, expressed as the opacity it draws at.
+///
+/// The geometry layer's shape of `ggo_worldlib::charts::reports::historic::
+/// HistoricSeries`, which is what actually produces these (the alignment
+/// and the age ramp are worldlib's; `chart_set` re-shapes, it does not
+/// re-derive -- the same split `SeriesSpec` has from `NamedSeries`).
+///
+/// **Values pair with [`ChartSpec::x`] BY INDEX POSITION**, not by frame
+/// number: a prior run's own frame numbering is never consulted (R1's
+/// concern (2)). The renderer clips to `min(values.len(), x.len())`, so a
+/// shorter prior run stops partway across the chart and a longer one is
+/// truncated -- never an out-of-bounds index either way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlaySpec {
+    pub values: Vec<f32>,
+    /// `historic::HISTORIC_OPACITY[k]` for the k-th nearest prior run.
+    pub opacity: f32,
+}
+
+/// The interaction state one chart is painted under, and the reason it is
+/// ONE struct rather than three arguments.
+///
+/// iced keeps hover/drag/zoom in each `canvas::Program`'s own retained
+/// `State`; gpui re-renders from view state, so the panel owns all three
+/// and passes them down per render. Bundling them means [`frame_at`] and
+/// [`build_chart_scene`] take the *same* value, and a future fourth piece
+/// of interaction state cannot be threaded into one and forgotten in the
+/// other.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChartView {
+    /// Cursor position in canvas-local px, when it is over THIS chart.
+    pub hover: Option<(f32, f32)>,
+    /// The zoomed x-domain, or `None` for the full data domain.
+    pub zoom: Option<(f32, f32)>,
+    /// An in-progress drag's canvas-local x endpoints (press, cursor).
+    /// Paints the selection band; the zoom itself is only committed on
+    /// release, by the panel.
+    pub drag: Option<(f32, f32)>,
+    /// Whether the historic overlay is switched on. The overlays live on
+    /// the SPEC (derived off-thread with everything else) and this decides
+    /// whether they are painted -- **and therefore whether they count
+    /// toward the y-scale**, which is the only honest coupling: an
+    /// overlay that moved the scale while hidden would rescale a chart
+    /// around a line the reader cannot see.
+    pub historic: bool,
+}
+
+impl ChartView {
+    /// The view of a chart with the cursor over it and nothing else set --
+    /// the common shape in the hover tests, which is the only place it is
+    /// wanted: the panel always has a zoom and a toggle to report too, so
+    /// it builds the whole struct (`ChartsPanel::view_for`).
+    #[cfg(test)]
+    pub fn hovering(at: (f32, f32)) -> Self {
+        Self {
+            hover: Some(at),
+            ..Self::default()
+        }
+    }
+}
+
 /// Everything one chart needs: title, kind, the shared frame axis, and
 /// its series.
 #[derive(Debug, Clone, PartialEq)]
@@ -718,6 +865,11 @@ pub struct ChartSpec {
     /// Frame numbers, shared by every series. Empty for [`ChartKind::Histogram`].
     pub x: Vec<f32>,
     pub series: Vec<SeriesSpec>,
+    /// Prior-run overlay lines, drawn beneath `series` and only when
+    /// [`ChartView::historic`] is set. Empty on every chart but the four
+    /// `charts_section` opts into the "Historic" toggle -- see
+    /// [`OverlaySpec`].
+    pub historic: Vec<OverlaySpec>,
     /// Whether clicking a point on this chart selects that frame for the
     /// inspect pane -- `reports.rs`'s `LineChart::on_select` hook, which
     /// `RunPage.tsx` passes (`onSelect={pickFrame}`) on exactly four
@@ -729,7 +881,19 @@ pub struct ChartSpec {
 
 impl ChartSpec {
     /// Whether this chart has anything to draw at all -- the panel shows
-    /// an explicit empty message instead of a blank canvas otherwise.
+    /// an explicit empty message instead of a blank canvas otherwise, and
+    /// [`build_chart_scene`] and [`frame_at`] both early-out on it.
+    ///
+    /// **`historic` deliberately does not count.** R5 gave this fn a
+    /// second job -- it now also decides whether a chart's overlays get
+    /// painted, since nothing is painted at all when it returns false --
+    /// and the rule it applies is that an overlay is context for a run,
+    /// not a run: a chart with prior-run ghosts and no live series of its
+    /// own has nothing to be the history OF, and would show a reader
+    /// nothing but grey. Unreachable from `chart_set` today (every spec it
+    /// builds pairs the overlay with the live series it belongs to), so
+    /// this is a rule being stated rather than a case being handled --
+    /// pinned by `a_chart_with_only_overlays_has_no_data`.
     pub fn has_data(&self) -> bool {
         match self.kind {
             ChartKind::Histogram => self.series.iter().any(|s| !s.values.is_empty()),
@@ -783,6 +947,10 @@ const AXIS_CAPTION_FONT_SIZE: f32 = 10.0;
 const AXIS_CAPTION_BOTTOM_GAP_PX: f32 = 3.0;
 
 const SERIES_STROKE_WIDTH: f32 = 2.0;
+/// `line.rs`'s `HISTORIC_STROKE_WIDTH` (`LineChart.tsx`'s historic-context
+/// `<polyline stroke-width="1.5">`): thinner than a live series, so a
+/// ghost never competes with the run being read.
+const HISTORIC_STROKE_WIDTH: f32 = 1.5;
 const BUDGET_STROKE_WIDTH: f32 = 1.5;
 const BUDGET_DASH: (f32, f32) = (6.0, 4.0);
 const BAND_SEPARATOR_STROKE_WIDTH: f32 = 1.5;
@@ -857,13 +1025,32 @@ pub fn plot_for(spec: &ChartSpec, size: (f32, f32)) -> Rect {
     )
 }
 
-pub fn build_chart_scene(
-    spec: &ChartSpec,
-    size: (f32, f32),
-    hover: Option<(f32, f32)>,
-) -> ChartScene {
+// How many scenes have been built ON THIS THREAD. Test-only, and the same
+// shape (and the same reason for being thread-local rather than static)
+// as `detail::BUILDS`: `cargo test` runs the suite concurrently.
+//
+// What it is for: `ChartsPanel`'s scene cache is only worth its
+// complexity if a hover move really does rebuild one chart instead of
+// eleven, and "how many times was this function called during that draw"
+// is the only way to assert that from outside -- the cheap and the
+// expensive path return the same scene by construction.
+#[cfg(test)]
+thread_local! {
+    static SCENE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many scenes this thread has built so far.
+#[cfg(test)]
+pub fn scene_builds() -> usize {
+    SCENE_BUILDS.with(std::cell::Cell::get)
+}
+
+pub fn build_chart_scene(spec: &ChartSpec, size: (f32, f32), view: &ChartView) -> ChartScene {
+    #[cfg(test)]
+    SCENE_BUILDS.with(|n| n.set(n.get() + 1));
     let legend = legend_for(spec, size);
     let plot = plot_for(spec, size);
+    let hover = view.hover;
 
     let mut scene = ChartScene {
         primitives: Vec::new(),
@@ -889,9 +1076,31 @@ pub fn build_chart_scene(
     }
 
     match &spec.kind {
-        ChartKind::Line { budget } => build_line(&mut scene, spec, plot, size, *budget, hover),
-        ChartKind::Stacked => build_stacked(&mut scene, spec, plot, size, hover),
+        ChartKind::Line { budget } => build_line(&mut scene, spec, plot, size, *budget, view),
+        ChartKind::Stacked => build_stacked(&mut scene, spec, plot, size, view),
         ChartKind::Histogram => build_histogram(&mut scene, spec, plot, hover),
+    }
+
+    // The drag-zoom selection band, over the series and under the
+    // tooltip -- `line.rs` paints it into its own uncached dynamic layer
+    // for the same reason (it changes on every mouse-move). An
+    // axis-aligned rect, so it is a `Quad`: the concave-band fan hazard
+    // `chart_paint::polygon_path` documents cannot arise for it.
+    if let Some((from, to)) = view.drag {
+        let (x0, x1) = (from.min(to), from.max(to));
+        let x0 = x0.clamp(plot.x, plot.right());
+        let x1 = x1.clamp(plot.x, plot.right());
+        if x1 > x0 {
+            scene.primitives.push(Primitive::Quad {
+                rect: Rect {
+                    x: x0,
+                    y: plot.y,
+                    w: x1 - x0,
+                    h: plot.h,
+                },
+                color: ChartColor::Selection,
+            });
+        }
     }
 
     if let Some(readout) = &scene.readout {
@@ -981,14 +1190,96 @@ fn push_frame_axis(
     push_x_caption(scene, plot, canvas_h);
 }
 
+/// The overlays a chart actually draws under `view`, each truncated to the
+/// frame axis: `(values, opacity)`. Empty when the Historic toggle is off.
+///
+/// Built ONCE and read by BOTH the y-scale fold and the polyline loop,
+/// which is the whole point -- `line.rs`'s `y_scale` folds `props.context`
+/// into its max, and R1's concern (2) is that nothing in worldlib will stop
+/// a renderer forgetting to. One list means the scale and the paint cannot
+/// disagree about which overlays exist.
+///
+/// **An overlay with fewer than two points on this axis is dropped from
+/// that list rather than folded into the scale**, because a one-point
+/// polyline paints nothing (`points.len() >= 2` below, and `Polyline` is a
+/// stroked ribbon -- there is no segment to stroke). R5 round 1 folded it
+/// and then failed to draw it: a prior run left with a single frame by the
+/// ignore filter -- a two-frame capture from an aborted run, entirely
+/// ordinary -- silently rescaled the current run's chart around a ghost
+/// that was never painted, collapsing the live series to a fraction of the
+/// plot with no visible cause. Skipping it in one place fixes both halves
+/// at once.
+///
+/// The truncation to `spec.x.len()` is the alignment contract
+/// ([`OverlaySpec`]): a longer prior run is cut at the axis's end, and the
+/// y-scale must not see the part that falls off it.
+///
+/// One residual, deliberately matched rather than fixed: under a ZOOM the
+/// x-clip in [`plot_points`] can drop further points that this list still
+/// folds, so a sample outside the window can still move the scale. The
+/// LIVE series behaves identically, and so does `line.rs:241-259`, so
+/// changing it here would make the overlay disagree with the line it sits
+/// under. It is also unreachable on a contiguous frame axis:
+/// [`MIN_ZOOM_DOMAIN_WIDTH`] guarantees a window at least two frames wide.
+fn drawn_overlays<'a>(spec: &'a ChartSpec, view: &ChartView) -> Vec<(&'a [f32], f32)> {
+    if !view.historic {
+        return Vec::new();
+    }
+    spec.historic
+        .iter()
+        .filter_map(|hs| {
+            let n = hs.values.len().min(spec.x.len());
+            (n >= 2).then(|| (&hs.values[..n], hs.opacity))
+        })
+        .collect()
+}
+
+/// Series points under the current x-domain: `(pixel, pixel)` pairs for
+/// the samples still inside it. A zoomed-out chart keeps every sample; a
+/// zoomed-in one drops the rest rather than mapping them past the plot
+/// edge (`line.rs`'s `if x < d0 || x > d1 { continue }`).
+///
+/// `values` is indexed BY POSITION against `spec.x` -- true of a live
+/// series and of an [`OverlaySpec`] alike, which is what lets both go
+/// through one function. They differ only in what a SHORT `values` means,
+/// which is `pad`: a live series shorter than the frame axis reads as zero
+/// past its end (the pre-R5 behaviour, and what `chart_set`'s own pivot
+/// onto the frame axis already guarantees), while a prior run with fewer
+/// frames simply stops partway across the chart rather than dropping to
+/// the baseline -- a ghost that dived to zero would read as a measurement.
+fn plot_points(
+    spec: &ChartSpec,
+    values: &[f32],
+    xs: &LinearScale,
+    ys: &LinearScale,
+    pad: bool,
+) -> Vec<(f32, f32)> {
+    let (d0, d1) = xs.domain;
+    let mut points = Vec::with_capacity(spec.x.len());
+    for (i, &x) in spec.x.iter().enumerate() {
+        if x < d0 || x > d1 {
+            continue;
+        }
+        let v = match values.get(i) {
+            Some(&v) => v,
+            None if pad => 0.0,
+            None => break,
+        };
+        points.push((xs.map(x), ys.map(v)));
+    }
+    points
+}
+
 fn build_line(
     scene: &mut ChartScene,
     spec: &ChartSpec,
     plot: Rect,
     size: (f32, f32),
     budget: Option<f32>,
-    hover: Option<(f32, f32)>,
+    view: &ChartView,
 ) {
+    let historic = drawn_overlays(spec, view);
+
     // y-domain tops out at a nice tick above the largest value AND the
     // budget line, so a budget above every sample still fits --
     // `line.rs`'s `y_scale`.
@@ -998,11 +1289,24 @@ fn build_line(
             max = max.max(v);
         }
     }
+    // **Historic values participate in the y-scale.** This is the brief's
+    // load-bearing clause: an overlay taller than the live run would
+    // otherwise map above `plot.y` and be clipped away by the content mask
+    // -- silently absent precisely when it has the most to say.
+    // `line.rs`'s `y_scale` folds `self.historic` in for the same reason.
+    // The list folded here is the same list painted below, already
+    // truncated to the axis and already missing anything that cannot draw
+    // -- see `drawn_overlays`, which is where that rule lives.
+    for (values, _) in &historic {
+        for &v in *values {
+            max = max.max(v);
+        }
+    }
     if let Some(b) = budget {
         max = max.max(b);
     }
     let ys = y_scale(plot, max, Y_TICK_TARGET, false);
-    let xs = x_scale(plot, full_x_domain(&spec.x));
+    let xs = x_scale_for(spec, plot, view);
 
     push_y_gridlines(scene, plot, &ys.ticks(Y_TICK_TARGET), &ys);
     push_x_baseline(scene, plot);
@@ -1019,13 +1323,31 @@ fn build_line(
         });
     }
 
+    // Overlays first, so the live run draws OVER its own history.
+    //
+    // Clipped to the visible domain, which `line.rs` deliberately does NOT
+    // do (its comment reasons that an index-plotted overlay has no
+    // "outside the domain" test). It does: an overlay is plotted at
+    // `xs.map(spec.x[i])`, the same expression the live series is clipped
+    // on, so the same test applies exactly. Not clipping would paint a
+    // zoomed-out chart's ghosts across this chart's margins and y-axis
+    // labels, since gpui masks to the CANVAS, not to the plot rect.
+    for (values, opacity) in &historic {
+        let points = plot_points(spec, values, &xs, &ys, false);
+        let points = envelope(&points, MAX_PLOT_POINTS);
+        // Still guarded, for the zoom case `drawn_overlays`' doc names:
+        // an x-clip can leave one point where the axis had two.
+        if points.len() >= 2 {
+            scene.primitives.push(Primitive::Polyline {
+                points,
+                width: HISTORIC_STROKE_WIDTH,
+                color: ChartColor::Historic(*opacity),
+            });
+        }
+    }
+
     for s in &spec.series {
-        let points: Vec<(f32, f32)> = spec
-            .x
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| (xs.map(x), ys.map(s.values.get(i).copied().unwrap_or(0.0))))
-            .collect();
+        let points = plot_points(spec, &s.values, &xs, &ys, true);
         let points = envelope(&points, MAX_PLOT_POINTS);
         if points.len() >= 2 {
             scene.primitives.push(Primitive::Polyline {
@@ -1036,19 +1358,26 @@ fn build_line(
         }
     }
 
-    scene.readout = shared_x_readout(spec, plot, &xs, hover, false);
+    scene.readout = shared_x_readout(spec, plot, &xs, view.hover, false);
     if let Some(readout) = &scene.readout {
         push_crosshair(scene, plot, readout.anchor_x);
     }
 }
 
+/// Stacked bands. No historic overlay and no drag-zoom affordance --
+/// `StackedArea.tsx`/`stacked.rs` have neither (the panel only installs
+/// the drag handlers on [`ChartKind::Line`]) -- but the x-domain still
+/// resolves through [`x_scale_for`] rather than `full_x_domain` directly,
+/// so this chart cannot end up with a second answer to "which x am I
+/// showing" if that ever changes.
 fn build_stacked(
     scene: &mut ChartScene,
     spec: &ChartSpec,
     plot: Rect,
     size: (f32, f32),
-    hover: Option<(f32, f32)>,
+    view: &ChartView,
 ) {
+    let hover = view.hover;
     let values: Vec<Vec<f32>> = spec.series.iter().map(|s| s.values.clone()).collect();
     let cum = accumulate(&values);
     let mut max = 0f32;
@@ -1058,7 +1387,7 @@ fn build_stacked(
         }
     }
     let ys = y_scale(plot, max, Y_TICK_TARGET, false);
-    let xs = x_scale(plot, full_x_domain(&spec.x));
+    let xs = x_scale_for(spec, plot, view);
     let n = spec.x.len();
 
     push_y_gridlines(scene, plot, &ys.ticks(Y_TICK_TARGET), &ys);
@@ -1309,6 +1638,10 @@ fn push_tooltip(scene: &mut ChartScene, plot: Rect, readout: &Readout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The REAL age ramp, swept by
+    // `the_age_ramp_gives_each_prior_run_a_distinguishable_opacity`. A
+    // copy of its values would guard the copy -- see that test.
+    use ggo_worldlib::charts::reports::historic::HISTORIC_OPACITY;
 
     const CANVAS: (f32, f32) = (400.0, 240.0);
 
@@ -1322,6 +1655,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![10.0, 20.0, 30.0, 40.0],
             }],
+            historic: Vec::new(),
             selectable: true,
         }
     }
@@ -1489,6 +1823,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![10.0, 20.0, 30.0, 40.0],
             }],
+            historic: Vec::new(),
             selectable: true,
         }
     }
@@ -1507,7 +1842,12 @@ mod tests {
         let mid_y = plot.y + plot.h / 2.0;
         for frame in [1.0, 2.0, 3.0, 4.0] {
             assert_eq!(
-                frame_at(&spec, CANVAS, (px_of(&spec, CANVAS, frame), mid_y)),
+                frame_at(
+                    &spec,
+                    CANVAS,
+                    (px_of(&spec, CANVAS, frame), mid_y),
+                    &ChartView::default()
+                ),
                 Some(frame as i64),
                 "frame {frame}"
             );
@@ -1532,7 +1872,12 @@ mod tests {
         for (size, px) in [(narrow, narrow_px), (wide, wide_px)] {
             let plot = plot_for(&spec, size);
             assert_eq!(
-                frame_at(&spec, size, (px, plot.y + plot.h / 2.0)),
+                frame_at(
+                    &spec,
+                    size,
+                    (px, plot.y + plot.h / 2.0),
+                    &ChartView::default()
+                ),
                 Some(3),
                 "canvas {size:?}"
             );
@@ -1544,7 +1889,8 @@ mod tests {
             frame_at(
                 &spec,
                 narrow,
-                (wide_px, narrow_plot.y + narrow_plot.h / 2.0)
+                (wide_px, narrow_plot.y + narrow_plot.h / 2.0),
+                &ChartView::default()
             ),
             Some(3),
             "a stale pixel from another layout must not still name frame 3"
@@ -1560,10 +1906,26 @@ mod tests {
         let plot = plot_for(&spec, CANVAS);
         let mid_y = plot.y + plot.h / 2.0;
         let (a, b) = (px_of(&spec, CANVAS, 2.0), px_of(&spec, CANVAS, 3.0));
-        assert_eq!(frame_at(&spec, CANVAS, (a + (b - a) * 0.4, mid_y)), Some(2));
-        assert_eq!(frame_at(&spec, CANVAS, (a + (b - a) * 0.6, mid_y)), Some(3));
         assert_eq!(
-            frame_at(&spec, CANVAS, ((a + b) / 2.0, mid_y)),
+            frame_at(
+                &spec,
+                CANVAS,
+                (a + (b - a) * 0.4, mid_y),
+                &ChartView::default()
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            frame_at(
+                &spec,
+                CANVAS,
+                (a + (b - a) * 0.6, mid_y),
+                &ChartView::default()
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            frame_at(&spec, CANVAS, ((a + b) / 2.0, mid_y), &ChartView::default()),
             Some(2),
             "an exact tie resolves to the earlier frame, deterministically"
         );
@@ -1577,18 +1939,42 @@ mod tests {
         let spec = selectable_spec();
         let plot = plot_for(&spec, CANVAS);
         let mid_x = plot.x + plot.w / 2.0;
-        assert_eq!(frame_at(&spec, CANVAS, (mid_x, plot.y - 1.0)), None);
-        assert_eq!(frame_at(&spec, CANVAS, (mid_x, plot.bottom() + 1.0)), None);
         assert_eq!(
-            frame_at(&spec, CANVAS, (plot.x - 1.0, plot.y + plot.h / 2.0)),
+            frame_at(&spec, CANVAS, (mid_x, plot.y - 1.0), &ChartView::default()),
             None
         );
         assert_eq!(
-            frame_at(&spec, CANVAS, (plot.right() + 1.0, plot.y + plot.h / 2.0)),
+            frame_at(
+                &spec,
+                CANVAS,
+                (mid_x, plot.bottom() + 1.0),
+                &ChartView::default()
+            ),
+            None
+        );
+        assert_eq!(
+            frame_at(
+                &spec,
+                CANVAS,
+                (plot.x - 1.0, plot.y + plot.h / 2.0),
+                &ChartView::default()
+            ),
+            None
+        );
+        assert_eq!(
+            frame_at(
+                &spec,
+                CANVAS,
+                (plot.right() + 1.0, plot.y + plot.h / 2.0),
+                &ChartView::default()
+            ),
             None
         );
         // And a canvas smaller than its own margins has no plot at all.
-        assert_eq!(frame_at(&spec, (4.0, 4.0), (2.0, 2.0)), None);
+        assert_eq!(
+            frame_at(&spec, (4.0, 4.0), (2.0, 2.0), &ChartView::default()),
+            None
+        );
     }
 
     /// A chart that paints nothing has no frame under the cursor either,
@@ -1605,7 +1991,7 @@ mod tests {
         };
         assert!(!blank.has_data());
         assert!(
-            build_chart_scene(&blank, CANVAS, None)
+            build_chart_scene(&blank, CANVAS, &ChartView::default())
                 .primitives
                 .is_empty(),
             "the precondition frame_at has to share"
@@ -1615,7 +2001,8 @@ mod tests {
             frame_at(
                 &blank,
                 CANVAS,
-                (plot.x + plot.w / 2.0, plot.y + plot.h / 2.0)
+                (plot.x + plot.w / 2.0, plot.y + plot.h / 2.0),
+                &ChartView::default()
             ),
             None
         );
@@ -1634,6 +2021,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![1.0, 2.0, 3.0],
             }],
+            historic: Vec::new(),
             selectable: false,
         };
         let plot = plot_for(&spec, CANVAS);
@@ -1641,7 +2029,8 @@ mod tests {
             frame_at(
                 &spec,
                 CANVAS,
-                (plot.x + plot.w / 2.0, plot.y + plot.h / 2.0)
+                (plot.x + plot.w / 2.0, plot.y + plot.h / 2.0),
+                &ChartView::default()
             ),
             None
         );
@@ -1649,32 +2038,546 @@ mod tests {
 
     /// The anti-drift guard between the two geometries. `frame_at` and
     /// `build_chart_scene`'s hover readout resolve the same pixel through
-    /// the same `plot_for` + `x_scale(full_x_domain)`; if a future change
-    /// (R5's zoom/pan domain is the one in flight) moves one of them, the
-    /// click would select a frame the crosshair is not on, and nothing
-    /// else in the suite would notice. Swept across the plot so an
+    /// the same `plot_for` + `x_scale_for`; if a future change moves one of
+    /// them, the click would select a frame the crosshair is not on, and
+    /// nothing else in the suite would notice. Swept across the plot so an
     /// off-by-one at a single probe point cannot hide.
+    ///
+    /// **Now swept under a ZOOM as well**, which is the case R4 built this
+    /// test for ("when R5 gives the panel a zoomed domain, changing only
+    /// one of the two fails this"): with a zoom applied only inside
+    /// `build_line`, the crosshair lands on the zoomed sample while the
+    /// click still answers from the full domain. Drill: reverting
+    /// `frame_at`'s `x_scale_for` to `x_scale(plot, full_x_domain(..))`
+    /// fails this test and nothing else.
     #[test]
     fn the_click_and_the_hover_readout_resolve_the_same_sample() {
+        let zoomed = ChartView {
+            zoom: Some((1.0, 3.0)),
+            ..ChartView::default()
+        };
+        let mut checked = 0;
         for spec in [selectable_spec(), line_spec()] {
-            let plot = plot_for(&spec, CANVAS);
-            let y = plot.y + plot.h / 2.0;
-            let mut checked = 0;
-            for step in 0..=40 {
-                let x = plot.x + plot.w * (step as f32 / 40.0);
-                let readout = build_chart_scene(&spec, CANVAS, Some((x, y)))
-                    .readout
-                    .expect("inside the plot, over a sample");
-                let clicked = frame_at(&spec, CANVAS, (x, y)).expect("same point, same answer");
-                assert_eq!(
-                    clicked, spec.x[readout.index] as i64,
-                    "click and crosshair disagree at x={x} on {}",
-                    spec.title
-                );
-                checked += 1;
+            for base in [ChartView::default(), zoomed] {
+                let plot = plot_for(&spec, CANVAS);
+                let y = plot.y + plot.h / 2.0;
+                for step in 0..=40 {
+                    let x = plot.x + plot.w * (step as f32 / 40.0);
+                    let hovering = ChartView {
+                        hover: Some((x, y)),
+                        ..base
+                    };
+                    let readout = build_chart_scene(&spec, CANVAS, &hovering)
+                        .readout
+                        .expect("inside the plot, over a sample");
+                    let clicked =
+                        frame_at(&spec, CANVAS, (x, y), &base).expect("same point, same answer");
+                    assert_eq!(
+                        clicked, spec.x[readout.index] as i64,
+                        "click and crosshair disagree at x={x} on {} (zoom {:?})",
+                        spec.title, base.zoom
+                    );
+                    checked += 1;
+                }
             }
-            assert_eq!(checked, 41);
         }
+        assert_eq!(checked, 4 * 41);
+    }
+
+    // ------------------------------------------------------ zoom + drag
+
+    fn approx(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-4, "{a} !~= {b}");
+    }
+
+    /// `line.rs`'s four `zoom_domain` tests, ported with it.
+    #[test]
+    fn zoom_domain_maps_a_drag_to_domain_values() {
+        let scale = LinearScale {
+            domain: (0.0, 100.0),
+            range: (0.0, 500.0),
+        };
+        let (lo, hi) = zoom_domain(100.0, 200.0, &scale, (0.0, 100.0));
+        approx(lo, 20.0);
+        approx(hi, 40.0);
+    }
+
+    /// A drag of almost no width is widened to [`MIN_ZOOM_DOMAIN_WIDTH`]
+    /// around its midpoint rather than collapsing the chart onto one
+    /// sample. (The panel never gets here for a *click* -- `DRAG_MIN_PX`
+    /// catches that first -- but a slow 4 px drag is a real gesture.)
+    #[test]
+    fn zoom_domain_widens_a_near_zero_drag() {
+        let scale = LinearScale {
+            domain: (0.0, 100.0),
+            range: (0.0, 500.0),
+        };
+        let (lo, hi) = zoom_domain(100.0, 101.0, &scale, (0.0, 100.0));
+        approx(hi - lo, MIN_ZOOM_DOMAIN_WIDTH);
+        approx((lo + hi) / 2.0, 20.1);
+    }
+
+    #[test]
+    fn zoom_domain_slides_back_inside_the_full_domain() {
+        let scale = LinearScale {
+            domain: (0.0, 100.0),
+            range: (0.0, 500.0),
+        };
+        let (lo, hi) = zoom_domain(-50.0, 50.0, &scale, (0.0, 100.0));
+        approx(lo, 0.0);
+        approx(hi, 20.0);
+    }
+
+    #[test]
+    fn zoom_domain_clamps_a_drag_wider_than_the_data() {
+        let scale = LinearScale {
+            domain: (0.0, 100.0),
+            range: (0.0, 500.0),
+        };
+        let (lo, hi) = zoom_domain(-250.0, 750.0, &scale, (0.0, 100.0));
+        approx(lo, 0.0);
+        approx(hi, 100.0);
+    }
+
+    /// A zoomed chart plots ONLY the samples inside the window, spread
+    /// across the whole plot -- and its x tick labels follow, because they
+    /// are positioned through the same scale.
+    #[test]
+    fn a_zoomed_chart_maps_and_clips_to_its_window() {
+        let spec = ChartSpec {
+            x: (0..=10).map(|i| i as f32).collect(),
+            series: vec![SeriesSpec {
+                name: "wire_total".to_string(),
+                color: Rgb(0x4a8fe3),
+                values: (0..=10).map(|i| i as f32).collect(),
+            }],
+            kind: ChartKind::Line { budget: None },
+            ..line_spec()
+        };
+        let view = ChartView {
+            zoom: Some((4.0, 6.0)),
+            ..ChartView::default()
+        };
+        let scene = build_chart_scene(&spec, CANVAS, &view);
+        let plot = plot_for(&spec, CANVAS);
+        let series = scene
+            .primitives
+            .iter()
+            .find_map(|p| match p {
+                Primitive::Polyline { points, width, .. } if *width == SERIES_STROKE_WIDTH => {
+                    Some(points.clone())
+                }
+                _ => None,
+            })
+            .expect("the series is painted");
+        assert_eq!(series.len(), 3, "frames 4, 5 and 6 only");
+        approx(series[0].0, plot.x);
+        approx(series[2].0, plot.right());
+        // Frame 10 is outside the window, so nothing is drawn past the
+        // plot's right edge (a clip, not an overflow).
+        assert!(series.iter().all(|p| p.0 <= plot.right() + 1e-3));
+    }
+
+    /// The drag band spans the dragged pixels, clamped to the plot, and is
+    /// there only while a drag is in flight.
+    #[test]
+    fn the_drag_band_covers_the_dragged_span() {
+        let spec = line_spec();
+        let plot = plot_for(&spec, CANVAS);
+        let band = |view: &ChartView| {
+            build_chart_scene(&spec, CANVAS, view)
+                .primitives
+                .iter()
+                .find_map(|p| match p {
+                    Primitive::Quad {
+                        rect,
+                        color: ChartColor::Selection,
+                    } => Some(*rect),
+                    _ => None,
+                })
+        };
+        assert_eq!(band(&ChartView::default()), None, "no drag, no band");
+
+        let dragging = ChartView {
+            // Backwards (right to left) and past the left edge: the band
+            // still reads left-to-right and stays inside the plot.
+            drag: Some((plot.x + 100.0, plot.x - 40.0)),
+            ..ChartView::default()
+        };
+        let rect = band(&dragging).expect("a drag paints its band");
+        approx(rect.x, plot.x);
+        approx(rect.right(), plot.x + 100.0);
+        approx(rect.y, plot.y);
+        approx(rect.h, plot.h);
+    }
+
+    // ------------------------------------------------- historic overlay
+
+    /// A spec with one live series topping out at 40 and one overlay
+    /// topping out at 400.
+    fn overlaid_spec() -> ChartSpec {
+        ChartSpec {
+            historic: vec![OverlaySpec {
+                values: vec![100.0, 200.0, 300.0, 400.0],
+                opacity: 0.5,
+            }],
+            kind: ChartKind::Line { budget: None },
+            ..line_spec()
+        }
+    }
+
+    fn overlay_polyline(scene: &ChartScene) -> Option<Vec<(f32, f32)>> {
+        scene.primitives.iter().find_map(|p| match p {
+            Primitive::Polyline {
+                points,
+                color: ChartColor::Historic(_),
+                ..
+            } => Some(points.clone()),
+            _ => None,
+        })
+    }
+
+    /// The largest y-axis tick label a scene painted -- what the chart is
+    /// scaled to, read back off the picture rather than recomputed.
+    fn top_y_tick(scene: &ChartScene) -> f32 {
+        scene
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Text {
+                    content,
+                    color: ChartColor::Text,
+                    anchor: TextAnchor::Right,
+                    ..
+                } => content.replace(',', "").parse::<f32>().ok(),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    /// **The load-bearing clause.** An overlay four times taller than the
+    /// live run has to move the y-scale, or every point of it maps above
+    /// the plot and the reader is shown a blank where the comparison
+    /// should be.
+    ///
+    /// Asserted two ways, because either alone is weak: the top y tick has
+    /// to reach the overlay's own maximum, AND every painted overlay point
+    /// has to land inside the plot rect. Drill: dropping the overlay fold
+    /// out of `build_line`'s max fails both halves -- top tick 40, and the
+    /// four overlay points at y = -234, -674, -1114, -1554.
+    #[test]
+    fn the_y_scale_includes_the_historic_overlays_extrema() {
+        let spec = overlaid_spec();
+        let view = ChartView {
+            historic: true,
+            ..ChartView::default()
+        };
+        let scene = build_chart_scene(&spec, CANVAS, &view);
+        let plot = plot_for(&spec, CANVAS);
+
+        let top_tick = top_y_tick(&scene);
+        assert!(
+            top_tick >= 400.0,
+            "the y-axis must reach the overlay's 400, topped out at {top_tick}"
+        );
+
+        let points = overlay_polyline(&scene).expect("the overlay is painted");
+        assert!(
+            points
+                .iter()
+                .all(|(_, y)| *y >= plot.y - 1e-3 && *y <= plot.bottom() + 1e-3),
+            "every overlay point must land inside the plot: {points:?}"
+        );
+    }
+
+    /// ...and an overlay that is NOT being shown must not move the scale
+    /// either -- rescaling a chart around a line the reader cannot see is
+    /// the same bug from the other side.
+    #[test]
+    fn a_hidden_overlay_neither_paints_nor_moves_the_scale() {
+        let spec = overlaid_spec();
+        let scene = build_chart_scene(&spec, CANVAS, &ChartView::default());
+        assert!(overlay_polyline(&scene).is_none(), "toggle off, no ghost");
+
+        let plot = plot_for(&spec, CANVAS);
+        let live = scene
+            .primitives
+            .iter()
+            .find_map(|p| match p {
+                Primitive::Polyline { points, width, .. } if *width == SERIES_STROKE_WIDTH => {
+                    Some(points.clone())
+                }
+                _ => None,
+            })
+            .expect("the live series is painted");
+        // Live max 40 against a nice top of 40 -> the last sample sits on
+        // the plot's top edge. With the overlay folded in it would be at
+        // 10% of the height instead.
+        approx(live[3].1, plot.y);
+    }
+
+    /// Overlays are index-paired against the PRIMARY run's x axis: the
+    /// k-th overlay value is plotted at the k-th frame's pixel, whatever
+    /// frame numbers the prior run had. A shorter overlay stops partway
+    /// across; a longer one is truncated at the axis's end.
+    #[test]
+    fn an_overlay_aligns_to_the_primary_runs_x_by_index() {
+        // Primary x is 0..=3 (see `line_spec`). The overlay is shorter,
+        // and its own frame numbering is deliberately unrelated.
+        let spec = ChartSpec {
+            historic: vec![
+                OverlaySpec {
+                    values: vec![10.0, 20.0],
+                    opacity: 0.5,
+                },
+                OverlaySpec {
+                    values: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    opacity: 0.36,
+                },
+            ],
+            kind: ChartKind::Line { budget: None },
+            ..line_spec()
+        };
+        let view = ChartView {
+            historic: true,
+            ..ChartView::default()
+        };
+        let scene = build_chart_scene(&spec, CANVAS, &view);
+        let plot = plot_for(&spec, CANVAS);
+        let xs = x_scale(plot, full_x_domain(&spec.x));
+        let painted: Vec<Vec<(f32, f32)>> = scene
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Polyline {
+                    points,
+                    color: ChartColor::Historic(_),
+                    ..
+                } => Some(points.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(painted.len(), 2);
+
+        let short = &painted[0];
+        assert_eq!(short.len(), 2, "a shorter prior run stops partway");
+        approx(short[0].0, xs.map(0.0));
+        approx(short[1].0, xs.map(1.0));
+
+        let long = &painted[1];
+        assert_eq!(long.len(), 4, "a longer prior run is truncated at the axis");
+        approx(long[3].0, xs.map(3.0));
+    }
+
+    /// The age ramp has to be VISIBLE, not merely present: R5's ancestor
+    /// in F3 shipped two ghosts at the same alpha, which looks fine in the
+    /// code and is invisible on screen. So: one distinct opacity per prior
+    /// run, strictly dimmer as the runs get older.
+    /// **Over the real ramp, not a copy of it.** Round 1 built this
+    /// fixture from a hand-copied `[0.5, 0.36, 0.26, 0.18, 0.12]`, so it
+    /// guarded the copy: worldlib could drift steps 3 and 4 to the same
+    /// value -- the literal bug this test names -- and the whole suite
+    /// stayed green. `HISTORIC_OPACITY` is what `chart_set` actually hangs
+    /// on the specs, so `HISTORIC_OPACITY` is what has to be swept. (The
+    /// "no worldlib import for five floats" excuse was also just wrong:
+    /// this module already imports `charts::scale` from it.)
+    ///
+    /// Every step is covered, not just the first pair: with fewer than
+    /// five prior runs the ramp is indexed from the bright end, so a
+    /// collision anywhere in it is reachable.
+    #[test]
+    fn the_age_ramp_gives_each_prior_run_a_distinguishable_opacity() {
+        let spec = ChartSpec {
+            historic: HISTORIC_OPACITY
+                .iter()
+                .map(|&opacity| OverlaySpec {
+                    values: vec![1.0, 2.0, 3.0, 4.0],
+                    opacity,
+                })
+                .collect(),
+            kind: ChartKind::Line { budget: None },
+            ..line_spec()
+        };
+        let view = ChartView {
+            historic: true,
+            ..ChartView::default()
+        };
+        let scene = build_chart_scene(&spec, CANVAS, &view);
+        let alphas: Vec<f32> = scene
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Polyline {
+                    color: ChartColor::Historic(a),
+                    ..
+                } => Some(*a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(alphas.len(), HISTORIC_OPACITY.len());
+        for pair in alphas.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "each older run must be strictly dimmer than the one before it: {alphas:?}"
+            );
+        }
+        // Distinguishable on screen, not merely unequal: the painter maps
+        // these through `Hsla::opacity`, and 8-bit alpha is what a reader
+        // gets. A ramp whose adjacent steps round to the same byte would
+        // pass the loop above and still show two identical ghosts.
+        let bytes: Vec<u8> = alphas.iter().map(|a| (a * 255.0).round() as u8).collect();
+        for pair in bytes.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "the ramp has to survive 8-bit alpha, not just f32: {bytes:?}"
+            );
+        }
+    }
+
+    /// **A ghost that cannot be drawn must not move the scale either.**
+    ///
+    /// One frame survives the ignore filter of a two-frame capture -- an
+    /// aborted run, entirely ordinary -- and a one-point polyline strokes
+    /// nothing. R5 round 1 folded that single value into the y-max and
+    /// then painted no line, so the current run's chart silently rescaled
+    /// around something invisible: `top_tick=500` with the live series
+    /// maxing at 40, collapsing it to ~8% of the plot with no cause on
+    /// screen. `drawn_overlays` is the one list both halves read, so the
+    /// two cannot part company again.
+    #[test]
+    fn an_overlay_too_short_to_draw_is_left_out_of_the_scale_too() {
+        let one_sample = ChartSpec {
+            historic: vec![OverlaySpec {
+                values: vec![500.0],
+                opacity: 0.5,
+            }],
+            kind: ChartKind::Line { budget: None },
+            ..line_spec()
+        };
+        let view = ChartView {
+            historic: true,
+            ..ChartView::default()
+        };
+        let scene = build_chart_scene(&one_sample, CANVAS, &view);
+        assert!(
+            overlay_polyline(&scene).is_none(),
+            "one point strokes no line -- that is the premise"
+        );
+        assert_eq!(
+            top_y_tick(&scene),
+            40.0,
+            "so the scale must still be the live run's, not the ghost's 500"
+        );
+
+        // ...and an overlay with two points does both.
+        let two_samples = ChartSpec {
+            historic: vec![OverlaySpec {
+                values: vec![500.0, 500.0],
+                opacity: 0.5,
+            }],
+            ..one_sample
+        };
+        let scene = build_chart_scene(&two_samples, CANVAS, &view);
+        assert!(overlay_polyline(&scene).is_some());
+        assert!(top_y_tick(&scene) >= 500.0);
+    }
+
+    /// The rule `has_data`'s doc states, pinned: an overlay is context for
+    /// a run, not a run. A spec carrying ghosts and no live series draws
+    /// nothing and answers no click -- and `frame_at` shares that
+    /// early-out, so it cannot resolve a frame on a canvas full of grey
+    /// either (R4's F5, now with a second way in).
+    #[test]
+    fn a_chart_with_only_overlays_has_no_data() {
+        let ghosts_only = ChartSpec {
+            series: Vec::new(),
+            historic: vec![OverlaySpec {
+                values: vec![1.0, 2.0, 3.0, 4.0],
+                opacity: 0.5,
+            }],
+            ..line_spec()
+        };
+        assert!(!ghosts_only.has_data());
+        let view = ChartView {
+            historic: true,
+            ..ChartView::default()
+        };
+        assert!(
+            build_chart_scene(&ghosts_only, CANVAS, &view)
+                .primitives
+                .is_empty()
+        );
+        let plot = plot_for(&ghosts_only, CANVAS);
+        assert_eq!(
+            frame_at(
+                &ghosts_only,
+                CANVAS,
+                (plot.x + plot.w / 2.0, plot.y + plot.h / 2.0),
+                &view
+            ),
+            None
+        );
+    }
+
+    /// Overlays are drawn UNDER the live series, and thinner -- a ghost
+    /// that painted over the run being read would be worse than no ghost.
+    #[test]
+    fn overlays_are_painted_beneath_the_live_series() {
+        let spec = overlaid_spec();
+        let view = ChartView {
+            historic: true,
+            ..ChartView::default()
+        };
+        let scene = build_chart_scene(&spec, CANVAS, &view);
+        let ghost = scene
+            .primitives
+            .iter()
+            .position(|p| {
+                matches!(
+                    p,
+                    Primitive::Polyline {
+                        color: ChartColor::Historic(_),
+                        ..
+                    }
+                )
+            })
+            .expect("the overlay is painted");
+        let live = scene
+            .primitives
+            .iter()
+            .position(|p| {
+                matches!(
+                    p,
+                    Primitive::Polyline {
+                        color: ChartColor::Series(_),
+                        ..
+                    }
+                )
+            })
+            .expect("the live series is painted");
+        assert!(ghost < live, "the overlay must be painted first");
+        assert!(HISTORIC_STROKE_WIDTH < SERIES_STROKE_WIDTH);
+    }
+
+    /// An overlay is clipped to the zoom window like everything else, so a
+    /// zoomed-in chart does not paint ghosts across its own axis labels.
+    #[test]
+    fn a_zoomed_chart_clips_its_overlays_too() {
+        let spec = overlaid_spec();
+        let view = ChartView {
+            historic: true,
+            zoom: Some((1.0, 2.0)),
+            ..ChartView::default()
+        };
+        let scene = build_chart_scene(&spec, CANVAS, &view);
+        let plot = plot_for(&spec, CANVAS);
+        let points = overlay_polyline(&scene).expect("the overlay is still painted");
+        assert_eq!(points.len(), 2, "frames 1 and 2 only");
+        assert!(
+            points
+                .iter()
+                .all(|(x, _)| *x >= plot.x - 1e-3 && *x <= plot.right() + 1e-3)
+        );
     }
 
     #[test]
@@ -1877,7 +2780,7 @@ mod tests {
 
     #[test]
     fn line_scene_has_axes_series_legend_and_a_budget_line() {
-        let scene = build_chart_scene(&line_spec(), CANVAS, None);
+        let scene = build_chart_scene(&line_spec(), CANVAS, &ChartView::default());
         assert!(!scene.primitives.is_empty());
         assert!(
             scene
@@ -1922,9 +2825,10 @@ mod tests {
                     values: vec![4.0, 5.0, 6.0],
                 },
             ],
+            historic: Vec::new(),
             selectable: false,
         };
-        let scene = build_chart_scene(&spec, CANVAS, None);
+        let scene = build_chart_scene(&spec, CANVAS, &ChartView::default());
         let bands = scene
             .primitives
             .iter()
@@ -1959,9 +2863,10 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![1.0, 1.0, 2.0, 3.0],
             }],
+            historic: Vec::new(),
             selectable: false,
         };
-        let scene = build_chart_scene(&spec, CANVAS, None);
+        let scene = build_chart_scene(&spec, CANVAS, &ChartView::default());
         let bars = scene
             .primitives
             .iter()
@@ -1988,9 +2893,10 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![1.0, 1.0, 2.0, 3.0],
             }],
+            historic: Vec::new(),
             selectable: false,
         };
-        let scene = build_chart_scene(&spec, CANVAS, None);
+        let scene = build_chart_scene(&spec, CANVAS, &ChartView::default());
         let bar_colors: Vec<ChartColor> = scene
             .primitives
             .iter()
@@ -2013,7 +2919,7 @@ mod tests {
         let hovered = build_chart_scene(
             &spec,
             CANVAS,
-            Some((plot.x + slot_w * 0.5, plot.y + plot.h / 2.0)),
+            &ChartView::hovering((plot.x + slot_w * 0.5, plot.y + plot.h / 2.0)),
         );
         assert!(
             hovered.primitives.iter().any(|p| matches!(
@@ -2039,12 +2945,12 @@ mod tests {
         };
         assert!(!empty.has_data());
         assert!(
-            build_chart_scene(&empty, CANVAS, None)
+            build_chart_scene(&empty, CANVAS, &ChartView::default())
                 .primitives
                 .is_empty()
         );
         assert!(
-            build_chart_scene(&line_spec(), (8.0, 8.0), None)
+            build_chart_scene(&line_spec(), (8.0, 8.0), &ChartView::default())
                 .primitives
                 .is_empty()
         );
@@ -2060,7 +2966,11 @@ mod tests {
         let plot = plot_rect(CANVAS, LINE_MARGINS, LEGEND_ROW_HEIGHT);
         let xs = x_scale(plot, full_x_domain(&spec.x));
         let px = xs.map(2.0);
-        let scene = build_chart_scene(&spec, CANVAS, Some((px, plot.y + plot.h / 2.0)));
+        let scene = build_chart_scene(
+            &spec,
+            CANVAS,
+            &ChartView::hovering((px, plot.y + plot.h / 2.0)),
+        );
         let readout = scene.readout.expect("hover inside the plot must read out");
         assert_eq!(readout.index, 2);
         assert_eq!(readout.title, "frame 2");
@@ -2079,7 +2989,7 @@ mod tests {
 
     #[test]
     fn hover_outside_the_plot_area_reads_out_nothing() {
-        let scene = build_chart_scene(&line_spec(), CANVAS, Some((2.0, 2.0)));
+        let scene = build_chart_scene(&line_spec(), CANVAS, &ChartView::hovering((2.0, 2.0)));
         assert!(scene.readout.is_none());
     }
 
@@ -2103,6 +3013,7 @@ mod tests {
                     values: vec![3.0, 4.0],
                 },
             ],
+            historic: Vec::new(),
             selectable: false,
         };
         let legend = legend_layout(
@@ -2116,7 +3027,11 @@ mod tests {
         );
         let plot = plot_rect(CANVAS, STACKED_MARGINS, legend_height(&legend));
         let xs = x_scale(plot, full_x_domain(&spec.x));
-        let scene = build_chart_scene(&spec, CANVAS, Some((xs.map(1.0), plot.y + plot.h / 2.0)));
+        let scene = build_chart_scene(
+            &spec,
+            CANVAS,
+            &ChartView::hovering((xs.map(1.0), plot.y + plot.h / 2.0)),
+        );
         let readout = scene.readout.expect("hover must read out");
         assert_eq!(readout.index, 1);
         let labels: Vec<&str> = readout.rows.iter().map(|r| r.label.as_str()).collect();
@@ -2139,6 +3054,7 @@ mod tests {
                 color: Rgb(0x4a8fe3),
                 values: vec![0.0, 0.0, 1.0],
             }],
+            historic: Vec::new(),
             selectable: false,
         };
         let plot = plot_rect(CANVAS, HISTOGRAM_MARGINS, 0.0);
@@ -2148,7 +3064,7 @@ mod tests {
         let scene = build_chart_scene(
             &spec,
             CANVAS,
-            Some((plot.x + slot_w * 0.5, plot.y + plot.h / 2.0)),
+            &ChartView::hovering((plot.x + slot_w * 0.5, plot.y + plot.h / 2.0)),
         );
         let readout = scene.readout.expect("hover inside the plot must read out");
         assert_eq!(readout.index, 0);
@@ -2159,7 +3075,7 @@ mod tests {
         let scene = build_chart_scene(
             &spec,
             CANVAS,
-            Some((plot.x + slot_w * 1.5, plot.y + plot.h / 2.0)),
+            &ChartView::hovering((plot.x + slot_w * 1.5, plot.y + plot.h / 2.0)),
         );
         let readout = scene.readout.expect("hover inside the plot must read out");
         assert_eq!(readout.index, 1);
@@ -2186,7 +3102,7 @@ mod tests {
         let scene = build_chart_scene(
             &spec,
             CANVAS,
-            Some((plot.x + plot.w / 2.0, plot.y + plot.h / 2.0)),
+            &ChartView::hovering((plot.x + plot.w / 2.0, plot.y + plot.h / 2.0)),
         );
         assert!(!scene.primitives.is_empty());
         let readout = scene.readout.expect("a one-sample run still reads out");
