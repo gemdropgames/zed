@@ -27,6 +27,38 @@
 //! file, and cloning is the "IDE pulls, the secondary never pushes"
 //! direction the rule requires.
 //!
+//! # When it clones -- and why that is not ggo-ide's trigger
+//!
+//! ggo-ide clones **once, from its own `RunFinished` handler**
+//! (`pages/device.rs`: `clone_after_run_task()` is returned only from that
+//! arm; the Refresh button and page entry both call `refresh_history_task`,
+//! which is `list_cloned_runs` alone and never clones). It can do that
+//! because it *owns* the run -- it spawned the `ggo-diag` child and knows
+//! the instant it exited.
+//!
+//! This panel owns nothing. It has no `RunFinished`, no child process, no
+//! signal of any kind that a device run has ended, and a `runs` row carries
+//! no usable liveness flag either (`diag_db::clone_runs`' doc traces why:
+//! `state` is `NOT NULL DEFAULT 'done'` and `create_run` never overrides
+//! it, so a live run reads `'done'` from birth). **There is no correct
+//! instant available to this caller.** So the trigger is not chosen -- it
+//! is made not to matter: [`load`] runs on panel activation, and
+//! `clone_runs` is now *convergent*, re-cloning any run whose source row
+//! moved and replacing its child rows rather than appending to them. A run
+//! caught mid-pipeline is repaired by the next activation instead of being
+//! frozen by the first.
+//!
+//! Two corollaries worth keeping:
+//!
+//! * **An mtime gate on `diag.db` would be actively wrong.** It fires
+//!   exactly while a run is writing -- the moment a copy is most likely to
+//!   be half a run -- and suppresses the later refresh that would have
+//!   repaired it. Convergence is what makes frequent, cheap reconciliation
+//!   safe; caching is what makes it dangerous.
+//! * **A Refresh button is orthogonal.** It would add a second entry to a
+//!   reconcile that is already correct at any instant; it fixes nothing
+//!   about correctness, and its absence causes no corruption.
+//!
 //! # What the rail assumes about run kinds -- nothing, deliberately
 //!
 //! `diag_db::list_cloned_runs` lists **every** cloned run, undifferentiated
@@ -66,6 +98,23 @@ pub const NO_DIAG_DB: &str =
 /// hedging rule: this says what is true (no cloned rows), not why.
 pub const NO_RUNS: &str = "no device runs recorded yet";
 
+/// `diag.db` exists but is missing a column this build reads -- it was
+/// written by a `ggo-diag` older than the migration that added it (e.g.
+/// `007_perf_run_id.sql`'s `runs.perf_run_id`).
+///
+/// This state is **permanent until `ggo-diag` next runs**, and saying so is
+/// the point: nothing on this side may fix it. `ggo_db::open_existing` is
+/// deliberately incapable of migrating another tool's file (that is the
+/// whole no-shared-dbs rule -- see this module's doc), so the rail cannot
+/// upgrade `diag.db` even though it knows exactly what is missing. The tool
+/// that owns the file migrates it on its own next open.
+///
+/// Rendered with the underlying error appended, so the missing column is
+/// still visible to anyone diagnosing it.
+pub const OLD_DIAG_DB: &str = "~/.ggo/diag.db was written by an older ggo-diag and is missing a \
+     column this build reads; ggo-diag migrates its own file the next time it runs, and the rail \
+     will read it then (nothing here may migrate another tool's database)";
+
 /// What the rail shows: the runs it found, plus the reason it found none
 /// (or found them incompletely).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -79,8 +128,9 @@ pub struct History {
     pub note: Option<String>,
 }
 
-/// Pull whatever `diag_db_path` has that `ide_db_path` does not, then list
-/// the cloned runs newest first.
+/// Reconcile our copy of `diag_db_path`'s runs, then list them newest
+/// first. See this module's doc for when this runs and why the timing does
+/// not have to be right.
 ///
 /// **BLOCKING** (`diag_db`'s calls each spin their own current-thread tokio
 /// runtime -- R1's concern (5)); background threads only.
@@ -89,20 +139,29 @@ pub struct History {
 /// `ggo_ide.db`, and a read that errors all come back as an empty rail with
 /// a reason, because on a fresh machine all three are ordinary.
 ///
-/// **Neither path is created.** The `!exists()` guards in front are
-/// load-bearing, exactly as `loader`'s are: `list_cloned_runs` opens
-/// through `ggo_db::open`, which CREATES and migrates a missing file, so an
-/// unguarded rail refresh would litter `~/.ggo` with a database on a
-/// machine that has never run anything. (`clone_runs` is already safe on
-/// its own side -- `open_existing` errors rather than creating -- but it is
-/// skipped anyway so the reason the rail shows is this module's wording
-/// rather than a raw "does not exist".)
+/// # What the `!exists()` guards do, exactly
+///
+/// **`diag.db` is never created** -- neither by the guard nor by
+/// `clone_runs`, which opens it through `ggo_db::open_existing`. It is
+/// guarded anyway so the rail's reason is [`NO_DIAG_DB`]'s wording rather
+/// than a raw "does not exist".
+///
+/// **`ggo_ide.db` is never created *by a read*** -- which is not the same
+/// as never created. `clone_runs` opens it through `ggo_db::open`, which
+/// creates and migrates it, so a machine that has `diag.db` and no
+/// `ggo_ide.db` gets one: that is this app's own file and cloning into it
+/// is the point (`tests::load_clones_and_lists_the_seeded_runs_newest_first`
+/// asserts it appears). The guard in front of `list_cloned_runs` stops the
+/// *other* case -- nothing to clone, nothing ingested, and a rail refresh
+/// that would still have left a database behind in `~/.ggo` and then failed
+/// its `SELECT`. Removing it is caught by
+/// `tests::a_missing_diag_db_is_a_reason_not_an_error_and_creates_no_file`.
 pub fn load(diag_db_path: &Path, ide_db_path: &Path, limit: i64) -> History {
     let mut note = None;
     if !diag_db_path.exists() {
         note = Some(NO_DIAG_DB.to_string());
     } else if let Err(e) = diag_db::clone_runs(diag_db_path, ide_db_path) {
-        note = Some(format!("could not read {}: {e}", diag_db_path.display()));
+        note = Some(clone_failure(&e));
     }
 
     if !ide_db_path.exists() {
@@ -125,6 +184,21 @@ pub fn load(diag_db_path: &Path, ide_db_path: &Path, limit: i64) -> History {
             note: Some(format!("could not list device runs: {e}")),
         },
     }
+}
+
+/// Turn a `clone_runs` failure into something a user can act on.
+///
+/// One case gets its own sentence: a `diag.db` written before a migration
+/// this build's column list assumes, which surfaces from turso as a bare
+/// `no such column: perf_run_id`. That reads as a bug in this app, and it
+/// is the one failure here with a definite, non-obvious resolution --
+/// [`OLD_DIAG_DB`] says what it is and who fixes it. Everything else keeps
+/// the raw error, which is the honest answer when the cause is unknown.
+fn clone_failure(error: &str) -> String {
+    if error.contains("no such column") {
+        return format!("{OLD_DIAG_DB} — {error}");
+    }
+    format!("could not read the device-run database: {error}")
 }
 
 /// One cloned run's `run_log` lines, in `seq` order.
@@ -225,7 +299,108 @@ mod tests {
         let history = load(&diag, &ide, HISTORY_LIMIT);
         assert!(history.runs.is_empty());
         let note = history.note.expect("an unreadable db must say so");
-        assert!(note.contains("diag.db"), "{note}");
+        assert!(note.contains("device-run database"), "{note}");
+    }
+
+    /// A `diag.db` written before `007_perf_run_id.sql` fails with a bare
+    /// `no such column: perf_run_id`, which reads as a bug in this app. It
+    /// is the one failure here with a definite resolution -- and one this
+    /// side may not perform, because `open_existing` cannot migrate another
+    /// tool's file. The message has to carry both halves.
+    #[test]
+    fn an_older_schema_diag_db_explains_itself_and_who_can_fix_it() {
+        let (_dir, diag, ide) = paths();
+        // `003_diag.sql`'s `runs` plus `004_diag_live.sql`'s two columns,
+        // and NOT `007_perf_run_id.sql`'s -- exactly the shape a pre-007
+        // `ggo-diag` left behind, and the case the reviewer hit.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = turso::Builder::new_local(&diag.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            db.connect()
+                .unwrap()
+                .execute(
+                    "CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT, branch TEXT, \
+                     commit_hash TEXT, git_describe TEXT, hostname TEXT, verdict TEXT, \
+                     boot_outcome TEXT, telem_overflows INTEGER, \
+                     state TEXT NOT NULL DEFAULT 'done', updated_at TEXT)",
+                    (),
+                )
+                .await
+                .unwrap();
+        });
+
+        let note = load(&diag, &ide, HISTORY_LIMIT)
+            .note
+            .expect("a schema mismatch must be reported");
+        assert!(
+            note.starts_with(OLD_DIAG_DB),
+            "the explanation comes first: {note}"
+        );
+        assert!(
+            note.contains("perf_run_id"),
+            "and the raw error survives for whoever is diagnosing it: {note}"
+        );
+        assert!(
+            note.contains("ggo-diag migrates its own file"),
+            "it must name who can fix it, since this side cannot: {note}"
+        );
+    }
+
+    /// The convergence property the rail depends on, asserted from this
+    /// side of the boundary too (`diag_db`'s own tests pin the mechanism):
+    /// a run copied mid-pipeline is repaired by the next refresh, so the
+    /// activation trigger does not have to be the right instant.
+    #[test]
+    fn a_run_cloned_mid_flight_is_repaired_by_the_next_load() {
+        let (_dir, diag, ide) = paths();
+        seed_diag_run(&diag, "run-live", "2026-08-01T00:00:00Z");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(&diag).await.unwrap();
+            db.conn()
+                .unwrap()
+                .execute(
+                    "UPDATE runs SET state = 'running', verdict = NULL WHERE id = 'run-live'",
+                    (),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mid = load(&diag, &ide, HISTORY_LIMIT);
+        assert_eq!(mid.runs[0].state, "running");
+        assert_eq!(mid.runs[0].verdict, None);
+
+        rt.block_on(async {
+            let db = ggo_db::open(&diag).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE runs SET state = 'done', updated_at = '2026-08-01T00:05:00Z', \
+                 verdict = 'FAIL' WHERE id = 'run-live'",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO run_log (run_id, seq, text) VALUES ('run-live', 2, 'RESULT: FAIL')",
+                (),
+            )
+            .await
+            .unwrap();
+        });
+
+        let after = load(&diag, &ide, HISTORY_LIMIT);
+        assert_eq!(after.runs[0].state, "done");
+        assert_eq!(after.runs[0].verdict.as_deref(), Some("FAIL"));
+        assert_eq!(
+            log(&ide, "run-live").unwrap(),
+            vec!["==> compile", "<== compile — ok", "RESULT: FAIL"],
+            "the repaired log replaces the truncated one rather than \
+             appending to it"
+        );
     }
 
     /// `diag.db` exists but holds no runs: a different fact from "there is

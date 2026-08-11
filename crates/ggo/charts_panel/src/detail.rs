@@ -19,14 +19,37 @@
 //! crosses back to the UI thread is [`Detail`], a finished view model whose
 //! `Arc`s the render path only refcount-bumps.
 //!
-//! # The tripwire
+//! # The tripwire, and exactly what it covers
 //!
 //! gpui's test scheduler runs background and foreground runnables on ONE
 //! thread (`scheduler::test_scheduler`), so no test can prove this by
 //! comparing thread ids. [`no_build_here`] is what proves it instead:
-//! [`build`] bumps a counter, and `select_run`'s update closure holds a
-//! guard that asserts the counter did not move while it ran. Anything
-//! rebuilt on the UI thread fails every test that selects a run.
+//! [`build`] bumps a counter, and a guard asserts the counter did not move
+//! while it was held.
+//!
+//! **Covered** -- a `detail::build` (or [`load`]) reached from any of these
+//! fails every test that touches them:
+//!
+//! * `ChartsPanel::select_run`'s update closure, the one part of a run load
+//!   that genuinely runs on the UI thread;
+//! * the whole of `ChartsPanel::render` and everything it calls
+//!   synchronously (`render_detail`, the tables, the console, the KPI row),
+//!   which is the per-frame path -- a re-derivation there costs on every
+//!   hover mouse-move, not once per selection.
+//!
+//! **Not covered, and deliberately named rather than implied:**
+//!
+//! * arbitrary event listeners. A `cx.listener` that derived something
+//!   would slip past unless it happens to run inside a render. R4's
+//!   click-to-inspect is exactly that shape -- if it needs to re-derive per
+//!   frame selection, it should take a guard of its own (or better, do the
+//!   work where `build` already does).
+//! * gpui prepaint closures, which run inside `Window::draw` rather than
+//!   inside `render`. That is where `chart_geom::build_chart_scene` already
+//!   runs, once per chart per frame over the full sample set -- pre-existing
+//!   from C2, documented on `ChartsPanel::hover_chart`, and **invisible to
+//!   this counter**, which only ever tracks `build`. It is the remaining
+//!   UI-thread hot path in this panel and it is R5's to weigh.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -106,11 +129,13 @@ thread_local! {
 
 /// A scope guard that asserts NOTHING was derived while it was held.
 ///
-/// Held across `select_run`'s update closure -- the one piece of that load
-/// that genuinely runs on the UI thread. If a future edit moves
+/// Held across `select_run`'s update closure and across the whole of
+/// `ChartsPanel::render` -- see this module's doc for the exact coverage,
+/// including what is outside it. If a future edit moves
 /// `report::build`/`chart_set::build_charts` (or a `detail::build`/`load`
-/// call) back into that closure, every test that selects a run fails with
-/// the message below rather than silently reintroducing a 327 ms stall.
+/// call) into either, every test that selects a run or paints a frame fails
+/// with the message below rather than silently reintroducing a 327 ms
+/// stall (or, in the render path, one per frame).
 ///
 /// A zero-sized no-op outside `cfg(test)`: the counter it reads does not
 /// exist in a release build, so this costs the shipped panel nothing.

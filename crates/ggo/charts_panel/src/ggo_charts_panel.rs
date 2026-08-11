@@ -100,28 +100,69 @@ const CHART_HEIGHT: Pixels = px(240.);
 const KPI_ROW_SELECTOR: &str = "ggo-charts-kpi-row";
 const FAILURES_SELECTOR: &str = "ggo-charts-failures";
 const PANICS_SELECTOR: &str = "ggo-charts-panics";
-const CONSOLE_SELECTOR: &str = "ggo-charts-console";
 const HISTORY_RAIL_SELECTOR: &str = "ggo-charts-history-rail";
-const DEVICE_LOG_SELECTOR: &str = "ggo-charts-device-log";
 
 /// Height of a log/console scroll region -- ggo-ide's `UART_HEIGHT` (220),
 /// which is also what its history log viewer uses.
 const LOG_HEIGHT: Pixels = px(220.);
 
-/// Heading of the stored-run console. ggo-ide's `uart_section` heading
-/// verbatim, so a reader who knows that page knows this pane.
-const CONSOLE_TITLE: &str = "Console — guest UART";
-
-/// Heading of a device run's log viewer. `run_log` is the pipeline's own
-/// narration (see `history`'s doc), not guest UART, and the two must not
-/// read as the same thing.
-const DEVICE_LOG_TITLE: &str = "Log — ggo-diag pipeline";
-
 /// A device run that cloned no `run_log` rows. Like `report::NO_UART` this
 /// names a STATE, not a cause: a run can reach `runs` with no narration
 /// because it died before its first log write, because only its `uart`
-/// rows were populated, or because the clone caught it mid-run.
+/// rows were populated, or because the clone caught it before its first
+/// line landed.
 const NO_DEVICE_LOG: &str = "no log lines recorded for this run";
+
+/// The two log surfaces this panel renders. Every string that identifies
+/// one hangs off this enum rather than being passed to [`ChartsPanel::render_log`]
+/// as a loose argument, and that is the whole point: an empty-state
+/// sentence handed over as a literal at the call site is a sentence no test
+/// can read. R2's review blocked a `NoUart` message that asserted a cause
+/// the signal cannot support, and with literals at the call site the exact
+/// same sentence could be reintroduced with the suite still green. Ask
+/// [`LogKind::empty_state`] instead -- that is what `render_log` uses, so a
+/// test and the renderer cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogKind {
+    /// A perf run's persisted guest UART (`uart`, via `perf_db::run_uart`).
+    Console,
+    /// A device run's `ggo-diag` pipeline narration (`run_log`).
+    DeviceLog,
+}
+
+impl LogKind {
+    /// ggo-ide's `uart_section` heading verbatim for the console, so a
+    /// reader who knows that page knows this pane. The device log gets its
+    /// own, because `run_log` is pipeline narration, not guest UART, and
+    /// the two must not read as the same thing.
+    fn title(self) -> &'static str {
+        match self {
+            Self::Console => "Console — guest UART",
+            Self::DeviceLog => "Log — ggo-diag pipeline",
+        }
+    }
+
+    fn selector(self) -> &'static str {
+        match self {
+            Self::Console => "ggo-charts-console",
+            Self::DeviceLog => "ggo-charts-device-log",
+        }
+    }
+
+    /// What the surface says instead of lines when it has none.
+    ///
+    /// The console's is `report::NO_UART` itself -- the same hedged
+    /// sentence the two diagnostic tables print for the same zero-rows
+    /// signal, single-sourced rather than re-spelled, because the console
+    /// and those tables read the *same* `uart` rows and cannot honestly
+    /// draw different conclusions from their absence.
+    fn empty_state(self) -> &'static str {
+        match self {
+            Self::Console => report::NO_UART,
+            Self::DeviceLog => NO_DEVICE_LOG,
+        }
+    }
+}
 
 /// Re-run refused: the run carries no cart path to hand the emulator.
 /// Only runs the emulator pane itself ingested do -- `ggo_emu_panel`
@@ -418,11 +459,24 @@ impl ChartsPanel {
     /// list is refreshed either way, so the row is there when the user
     /// hits Back -- and so a run id that has somehow gone missing lands on
     /// the picker rather than on an error.
+    ///
+    /// **Generation-guarded like every other load here**, which it was not
+    /// when R3 first added the device-run selection alongside it. This
+    /// lookup is detached and lands whenever it lands; without the guard,
+    /// a user who picked a device run (or hit Back) while it was in flight
+    /// had that choice silently replaced by a hop they had already moved
+    /// past. Whoever bumped [`Self::detail_generation`] last wins, and the
+    /// stale arrival is dropped -- the same rule `select_run`,
+    /// `select_device_run` and `clear_selection` already follow through
+    /// [`Self::begin_selection`].
     pub fn open_run(&mut self, run_id: i64, cx: &mut Context<Self>) {
         self.refresh_runs(cx);
         let Some(db_path) = self.db_path() else {
             return;
         };
+        // Claimed NOW, on the UI thread, not when the lookup lands.
+        self.detail_generation += 1;
+        let generation = self.detail_generation;
         let load = cx.background_spawn(async move { loader::list_runs(&db_path) });
         cx.spawn(async move |this, cx| {
             let listing = load
@@ -430,7 +484,13 @@ impl ChartsPanel {
                 .ok()
                 .and_then(|runs| runs.into_iter().find(|run| run.id == run_id));
             if let Some(run) = listing {
-                this.update(cx, |this, cx| this.select_run(run, cx)).ok();
+                this.update(cx, |this, cx| {
+                    if this.detail_generation != generation {
+                        return;
+                    }
+                    this.select_run(run, cx);
+                })
+                .ok();
             }
         })
         .detach();
@@ -772,13 +832,7 @@ impl ChartsPanel {
                 .size_full()
                 .overflow_y_scroll()
                 .p_2()
-                .child(Self::render_log(
-                    DEVICE_LOG_TITLE,
-                    DEVICE_LOG_SELECTOR,
-                    lines,
-                    NO_DEVICE_LOG,
-                    cx,
-                ))
+                .child(Self::render_log(LogKind::DeviceLog, lines, cx))
                 .into_any_element(),
         };
 
@@ -854,13 +908,7 @@ impl ChartsPanel {
                     .gap_3()
                     .child(self.render_failures_table(&report.diagnostics, cx))
                     .child(self.render_panics_table(&report.diagnostics, cx))
-                    .child(Self::render_log(
-                        CONSOLE_TITLE,
-                        CONSOLE_SELECTOR,
-                        &detail.console,
-                        report::NO_UART,
-                        cx,
-                    ))
+                    .child(Self::render_log(LogKind::Console, &detail.console, cx))
                     .children(if charts.is_empty() {
                         // An explicit message, never a blank canvas -- and
                         // which message matters. A run that recorded no
@@ -994,20 +1042,17 @@ impl ChartsPanel {
     /// parameterising all four differences -- more coupling than the
     /// ~20 lines it would save, between two crates that already share the
     /// `uart` TABLE, which is the part that actually has to agree.
-    fn render_log(
-        title: &'static str,
-        selector: &'static str,
-        lines: &Arc<Vec<String>>,
-        empty_state: &'static str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_log(kind: LogKind, lines: &Arc<Vec<String>>, cx: &mut Context<Self>) -> AnyElement {
+        let selector = kind.selector();
         let section = v_flex()
             .w_full()
             .gap_1()
-            .debug_selector(|| selector.to_string())
-            .child(Label::new(title).size(LabelSize::Small));
+            .debug_selector(move || selector.to_string())
+            .child(Label::new(kind.title()).size(LabelSize::Small));
         if lines.is_empty() {
-            return section.child(Self::note(empty_state)).into_any_element();
+            return section
+                .child(Self::note(kind.empty_state()))
+                .into_any_element();
         }
         // Refcount bump, not a deep clone: `uniform_list`'s renderer is
         // `'static` and has to own what it reads, and this is the whole
@@ -1304,6 +1349,12 @@ impl ChartsPanel {
 
 impl Render for ChartsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Nothing below may DERIVE anything -- this runs once per frame,
+        // i.e. on every hover mouse-move while a run is showing, so a
+        // re-derivation here is far worse than the once-per-selection one
+        // `select_run` used to do. Same guard, same reason; see `detail`'s
+        // module doc for exactly what it does and does not cover.
+        let _no_build_here = detail::no_build_here();
         v_flex()
             .key_context(KEY_CONTEXT)
             .size_full()
@@ -2259,7 +2310,7 @@ mod tests {
             .debug_bounds(PANICS_SELECTOR)
             .expect("the panics table must be painted");
         let console = cx
-            .debug_bounds(CONSOLE_SELECTOR)
+            .debug_bounds(LogKind::Console.selector())
             .expect("the stored console must be painted");
         let kpis = cx
             .debug_bounds(KPI_ROW_SELECTOR)
@@ -2327,7 +2378,7 @@ mod tests {
             "a frameless run must still paint its panics table"
         );
         assert!(
-            cx.debug_bounds(CONSOLE_SELECTOR).is_some(),
+            cx.debug_bounds(LogKind::Console.selector()).is_some(),
             "and its console -- the frameless run is exactly the one whose \
              last few UART lines say what went wrong"
         );
@@ -2453,10 +2504,49 @@ mod tests {
                 "the console's empty state IS the tables', not a second copy"
             );
         });
-        // And the device log's empty state is a different sentence about a
-        // different table -- `run_log` is pipeline narration, not guest
-        // UART, so borrowing NO_UART's wording for it would be wrong.
-        assert_ne!(NO_DEVICE_LOG, report::NO_UART);
+    }
+
+    /// **The wording `render_log` actually uses**, read from the same place
+    /// it reads it. Every other assertion in this module reaches a string
+    /// through a view-model field; these two were passed to `render_log` as
+    /// literal arguments, which meant a reviewer could replace the
+    /// console's empty state with *"this run predates UART capture"* -- the
+    /// precise sentence R2's review blocked -- and watch the suite stay
+    /// green. `LogKind::empty_state` exists so there is one place to read.
+    #[test]
+    fn the_log_empty_states_are_the_hedged_ones_the_renderer_uses() {
+        // The console's IS the diagnostic tables' -- the same `uart` rows
+        // are the signal for all three, so they cannot draw different
+        // conclusions from their absence.
+        assert_eq!(LogKind::Console.empty_state(), report::NO_UART);
+        // ...and it names a state, never a cause (R2's blocker, restated
+        // at the surface that renders it).
+        let console = LogKind::Console.empty_state();
+        assert!(
+            console.starts_with("no UART lines captured for this run"),
+            "the fact comes first: {console}"
+        );
+        assert!(
+            console.contains("none emitted")
+                && console.contains("diag run")
+                && console.contains("predating UART persistence"),
+            "causes are offered as examples, not asserted: {console}"
+        );
+
+        // The device log is a different table (`run_log`, pipeline
+        // narration) so it needs its own sentence -- but the same rule: it
+        // says no lines were recorded, not that nothing happened.
+        let device = LogKind::DeviceLog.empty_state();
+        assert_eq!(device, NO_DEVICE_LOG);
+        assert_ne!(device, console);
+        assert!(
+            device.starts_with("no log lines recorded"),
+            "a state, not a cause: {device}"
+        );
+
+        // And the two surfaces stay distinguishable in a painted frame.
+        assert_ne!(LogKind::Console.selector(), LogKind::DeviceLog.selector());
+        assert_ne!(LogKind::Console.title(), LogKind::DeviceLog.title());
     }
 
     // ------------------------------ R3: the load is entirely off-thread
@@ -2546,7 +2636,7 @@ mod tests {
             |_window, _cx| panel.clone().into_any_element(),
         );
         assert!(
-            cx.debug_bounds(CONSOLE_SELECTOR).is_none(),
+            cx.debug_bounds(LogKind::Console.selector()).is_none(),
             "nothing of the run is painted yet -- the load has not landed"
         );
 
@@ -2567,7 +2657,7 @@ mod tests {
             |_window, _cx| panel.clone().into_any_element(),
         );
         assert!(
-            cx.debug_bounds(CONSOLE_SELECTOR).is_some(),
+            cx.debug_bounds(LogKind::Console.selector()).is_some(),
             "the console paints once the run has landed"
         );
     }
@@ -2704,6 +2794,63 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             assert!(panel.selected.is_none());
             assert!(panel.device_log.is_none());
+        });
+    }
+
+    /// `open_run` is the emu panel's hop and it lands whenever its detached
+    /// lookup finishes. A user who picked a device run in the meantime has
+    /// moved on, and the late hop must be dropped rather than silently
+    /// replacing their choice with a run from the other id space.
+    #[gpui::test]
+    async fn test_a_device_selection_survives_an_in_flight_open_run(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let diag_path = dir.path().join("diag.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_device_run(&diag_path, "run-1", "2026-08-02T00:00:00Z", "PASS");
+
+        let panel = history_panel(cx, db_path, diag_path).await;
+        let summary = panel.update(cx, |panel, _cx| history_of(panel).runs[0].clone());
+
+        panel.update(cx, |panel, cx| {
+            // The hop starts...
+            panel.open_run(1, cx);
+            // ...and the user picks a device run before it lands.
+            panel.select_device_run(summary.clone(), cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            match &panel.selected {
+                Some(Selection::Device(run)) => assert_eq!(run.id, "run-1"),
+                _ => panic!("the user's later choice must win, not the stale hop"),
+            }
+            assert!(panel.detail.is_none(), "and no perf detail lands over it");
+        });
+    }
+
+    /// The other direction: with nothing else selected, the hop still
+    /// works. (A guard that dropped every hop would pass the test above.)
+    #[gpui::test]
+    async fn test_open_run_still_selects_the_run_it_was_given(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = ChartsPanel::new(None, cx);
+                panel.db_path_override = Some(db_path);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| panel.open_run(1, cx));
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            match &panel.selected {
+                Some(Selection::Perf(run)) => assert_eq!(run.id, 1),
+                _ => panic!("the hop must select the run it was handed"),
+            }
+            assert!(!panel.chart_specs().is_empty());
         });
     }
 
