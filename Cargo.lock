@@ -7560,6 +7560,7 @@ dependencies = [
 name = "ggo_emerald_panel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "editor",
  "ggo-worldlib",
  "ggo_common",

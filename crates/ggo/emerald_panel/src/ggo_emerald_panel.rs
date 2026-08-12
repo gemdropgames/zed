@@ -84,7 +84,9 @@ actions!(
         /// Toggles focus on the GGO emerald panel.
         ToggleFocus,
         /// Submits the open generate/new-tileset form.
-        Submit
+        Submit,
+        /// Scaffolds a new Emerald/GGO project (`emd new`) and opens it.
+        NewProject
     ]
 );
 
@@ -155,8 +157,100 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<EmeraldPanel>(window, cx);
         });
+
+        workspace.register_action(new_project);
     })
     .detach();
+}
+
+/// What the failure toast says when `emd new`'s transcript has no usable
+/// last line -- ggo-ide's `EMD_NEW_FALLBACK`.
+const NEW_PROJECT_FALLBACK: &str = "emd new failed";
+
+/// File → New GGO Project…: a native save dialog picks where the project
+/// goes and what it's called, `emd new <name>` scaffolds it there, and the
+/// scaffolded folder opens as a workspace -- ggo-ide's ProjectsPage
+/// create flow minus its project DB, which this fork doesn't have.
+fn new_project(
+    workspace: &mut Workspace,
+    _: &NewProject,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let lister = project::DirectoryLister::Local(
+        workspace.project().clone(),
+        workspace.app_state().fs.clone(),
+    );
+    let dest = workspace.prompt_for_new_path(lister, Some("my-game".to_string()), window, cx);
+    cx.spawn_in(window, async move |workspace, cx| {
+        // A dropped or cancelled dialog is a plain "never mind".
+        let Some(dest) = dest.await.ok().flatten().and_then(|paths| paths.into_iter().next())
+        else {
+            return anyhow::Ok(());
+        };
+        let Some((request, project_dir)) = new_project_request(&dest) else {
+            return Ok(());
+        };
+        let outcome = cx.background_spawn(runner::run_emd(request)).await;
+        if outcome.ok {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_workspace_for_paths(
+                        workspace::OpenMode::default(),
+                        vec![project_dir],
+                        window,
+                        cx,
+                    )
+                })?
+                .await?;
+        } else {
+            workspace.update(cx, |workspace, cx| {
+                // Same priority ggo-ide's onCreate used: the transcript's
+                // last non-empty line, else the fixed fallback.
+                let message = outcome
+                    .output
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or(NEW_PROJECT_FALLBACK)
+                    .to_string();
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::named(
+                            "ggo-new-project-failed".into(),
+                        ),
+                        format!("New GGO project: {message}"),
+                    ),
+                    cx,
+                );
+            })?;
+        }
+        Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+/// The `emd new` invocation and resulting project dir for a save-dialog
+/// destination: `emd new <name>` runs in the PARENT directory, so `emd`
+/// itself creates (and owns the layout of) `<parent>/<name>`.
+fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
+    let name = dest.file_name()?.to_str()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let parent = dest.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some((
+        EmdRequest::new(
+            ggo_common::emd_bin(),
+            parent,
+            vec!["new".to_string(), name],
+        ),
+        dest.to_path_buf(),
+    ))
 }
 
 /// Enter submits the open form.
@@ -2383,6 +2477,22 @@ impl Panel for EmeraldPanel {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// The save-dialog destination becomes `emd new <name>` in the PARENT
+    /// dir (emd creates the folder itself), and degenerate destinations --
+    /// no name, no parent -- become "no request" rather than a bad spawn.
+    #[test]
+    fn new_project_request_runs_emd_new_in_the_parent_dir() {
+        let (request, project_dir) =
+            new_project_request(Path::new("/home/me/games/my-game")).unwrap();
+        assert_eq!(request.cwd, PathBuf::from("/home/me/games"));
+        assert_eq!(request.args, vec!["new".to_string(), "my-game".to_string()]);
+        assert_eq!(project_dir, PathBuf::from("/home/me/games/my-game"));
+
+        assert_eq!(new_project_request(Path::new("/")), None);
+        assert_eq!(new_project_request(Path::new("")), None);
+        assert_eq!(new_project_request(Path::new("my-game")), None, "relative destination with no parent dir");
+    }
 
     use ggo_worldlib::emerald::{
         EmdRunOutcome, FieldEntry, build_generate_component_args, emd_run_outcome,

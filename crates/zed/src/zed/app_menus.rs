@@ -110,6 +110,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New", workspace::NewFile),
                 MenuItem::action("New Window", workspace::NewWindow),
+                MenuItem::action("New GGO Project…", ggo_emerald_panel::NewProject), // GGO
                 MenuItem::separator(),
                 #[cfg(not(target_os = "macos"))]
                 MenuItem::action("Open File...", workspace::OpenFiles),
