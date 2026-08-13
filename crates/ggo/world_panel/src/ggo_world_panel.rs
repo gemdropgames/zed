@@ -1525,6 +1525,31 @@ impl WorldPanel {
         }
     }
 
+    /// The toolbar's Emulate button: boot the cart to the world this panel
+    /// is viewing, via `ggo_common`'s emulator registry (`ggo_emu_panel`
+    /// depends on this crate, so it cannot be called directly). Deferred
+    /// because the registered emulator saves THIS panel's doc through its
+    /// own `update`, which must not nest inside this one.
+    fn emulate_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let rel = open.source_rel.clone();
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                if !ggo_common::emulate_world(workspace, &rel, window, cx) {
+                    log::warn!("no emulator pane is available to boot {rel}");
+                }
+            });
+        });
+    }
+
     // ------------------------------------------------------------- render
 
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1579,6 +1604,12 @@ impl WorldPanel {
                 Color::Muted
             }))
             .child(div().flex_1())
+            .child(
+                IconButton::new("ggo-world-emulate", IconName::PlayFilled)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Emulate this world (cart)"))
+                    .on_click(cx.listener(|this, _, window, cx| this.emulate_impl(window, cx))),
+            )
             .child(
                 IconButton::new("ggo-world-add-entity", IconName::Plus)
                     .icon_size(IconSize::Small)
@@ -4041,6 +4072,57 @@ mod tests {
                 .read(cx)
                 .id()
         })
+    }
+
+    thread_local! {
+        static EMULATED: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn recording_emulator(
+        _workspace: &mut Workspace,
+        rel: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Workspace>,
+    ) -> bool {
+        EMULATED.with(|e| e.borrow_mut().push(rel.to_string()));
+        true
+    }
+
+    /// The toolbar's Emulate button hands the OPEN world's worktree-rel
+    /// path to `ggo_common`'s emulator registry (the emu panel's `init`
+    /// registers the real handler there; this test registers a recorder).
+    #[gpui::test]
+    async fn test_emulate_button_routes_the_open_world_to_the_registry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        cx.update(|cx| ggo_common::register_world_emulator(cx, recording_emulator));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+        panel.update(cx, |panel, _| {
+            panel.root_override = Some(dir.path().to_path_buf())
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("worlds/test.toml", window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| panel.emulate_impl(window, cx));
+        cx.run_until_parked();
+
+        EMULATED.with(|e| {
+            assert_eq!(
+                e.borrow().as_slice(),
+                ["worlds/test.toml"],
+                "the open world's rel path reaches the registered emulator"
+            );
+        });
     }
 
     /// With nothing registered, `intercept_path_open` claims nothing --

@@ -179,6 +179,18 @@ pub fn init(cx: &mut App) {
         })
     });
 
+    // The world panel's Emulate button lands here through the same
+    // `ggo_common` registry hop as the charts panel's Re-run above, for
+    // the same cycle. It routes to the SAME save-first handler the
+    // explorer's "Emulate this world (cart)" entry uses, deferred because
+    // that handler saves the world panel's doc and takes the workspace
+    // itself -- neither may nest inside the caller's updates.
+    ggo_common::register_world_emulator(cx, |workspace, rel, window, cx| {
+        let handler = menu::emulate_world_handler(workspace.weak_handle(), rel.to_string());
+        window.defer(cx, move |window, cx| handler(window, cx));
+        true
+    });
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -3208,6 +3220,42 @@ mod tests {
             assert!(
                 workspace.right_dock().read(cx).is_open(),
                 "the emu dock must come forward"
+            );
+        });
+    }
+
+    /// The world panel's Emulate button arrives through `ggo_common`'s
+    /// emulator registry: `init` must register a handler that lands in the
+    /// SAME save-first build path the explorer entry uses.
+    #[gpui::test]
+    async fn test_registered_world_emulator_routes_to_the_same_build(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ok_capture());
+        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::emulate_world(workspace, "assets/worlds/main.toml", window, cx)
+        });
+        assert!(claimed, "init registers a world emulator");
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one build");
+        assert!(
+            calls[0].args.iter().any(|a| a == "worlds/main"),
+            "the viewed world must be baked in as the boot world"
+        );
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.selected.as_deref(),
+                Some("target/ggo-emulate/worlds-main.ggo"),
+                "the built cartridge becomes the selection"
             );
         });
     }

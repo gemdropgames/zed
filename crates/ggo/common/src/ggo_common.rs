@@ -378,6 +378,41 @@ pub fn run_cart(
     runners.iter().any(|run| run(workspace, rel, window, cx))
 }
 
+/// A handler that can build and boot a world into an emulator pane. Same
+/// registry pattern as [`CartRunner`], for the same reason: `ggo_emu_panel`
+/// already depends on `ggo_world_panel`, so the world panel's Emulate
+/// button cannot call it directly.
+pub type WorldEmulator = fn(&mut Workspace, &str, &mut Window, &mut Context<Workspace>) -> bool;
+
+#[derive(Default)]
+struct WorldEmulators(Vec<WorldEmulator>);
+
+impl gpui::Global for WorldEmulators {}
+
+/// Register a [`WorldEmulator`]. Called once by `ggo_emu_panel::init`.
+pub fn register_world_emulator(cx: &mut App, emulator: WorldEmulator) {
+    cx.default_global::<WorldEmulators>().0.push(emulator);
+}
+
+/// Offer `rel` (a worktree-relative world file) to every registered
+/// [`WorldEmulator`], stopping at the first that claims it. `false` means
+/// no emulator pane exists in this build -- see [`run_cart`] on why that
+/// is reported rather than swallowed.
+pub fn emulate_world(
+    workspace: &mut Workspace,
+    rel: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let emulators = match cx.try_global::<WorldEmulators>() {
+        Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+        _ => return false,
+    };
+    emulators
+        .iter()
+        .any(|emulate| emulate(workspace, rel, window, cx))
+}
+
 /// Wrap `action` into the `Fn(&mut Window, &mut App)` a
 /// `ui::ContextMenuEntry::handler` takes, resolving GGO panel `P` out of
 /// the workspace first.
