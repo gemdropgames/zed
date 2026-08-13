@@ -2399,6 +2399,11 @@ impl WorldPanel {
                                                     .id(SharedString::from(format!(
                                                         "ggo-color-swatch-{component}-{field}"
                                                     )))
+                                                    .debug_selector(|| {
+                                                        format!(
+                                                            "ggo-color-swatch-{component}-{field}"
+                                                        )
+                                                    })
                                                     .size_4()
                                                     .flex_none()
                                                     .rounded_xs()
@@ -3675,6 +3680,35 @@ mod tests {
         let saved = std::fs::read(dir.path().join("art/main.pal")).unwrap();
         let saved = ggo_asset_formats::decode_pal(&saved).unwrap();
         assert_eq!(saved[0], 0, "slot 0 untouched on disk");
+    }
+
+    /// A real CLICK on the rendered swatch (not a direct method call) must
+    /// open the picker -- covers the element wiring end to end.
+    #[gpui::test]
+    async fn test_clicking_the_color_swatch_opens_the_picker(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        let bounds = cx
+            .debug_bounds("ggo-color-swatch-RectFill-color")
+            .expect("the color swatch is rendered for the selected RectFill entity");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker opened by click");
+            assert_eq!(
+                picker.target,
+                inspector::FieldTarget::EntityField {
+                    entity: 0,
+                    component: "RectFill".to_string(),
+                    field: "color".to_string(),
+                }
+            );
+        });
     }
 
     /// Several `.pal` files: all are listed (sorted), switching palettes
