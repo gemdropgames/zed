@@ -3677,6 +3677,103 @@ mod tests {
         assert_eq!(saved[0], 0, "slot 0 untouched on disk");
     }
 
+    /// Several `.pal` files: all are listed (sorted), switching palettes
+    /// swaps the swatch source and resets the slot, and a slot edit lands
+    /// in the SELECTED palette's file only.
+    #[gpui::test]
+    async fn test_color_picker_lists_and_switches_between_palettes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pal_a = [0u16; ggo_asset_formats::PAL_ENTRIES];
+        pal_a[1] = 0x001f;
+        let pal_b = [0x0777u16; ggo_asset_formats::PAL_ENTRIES];
+        std::fs::create_dir_all(dir.path().join("art")).unwrap();
+        std::fs::write(
+            dir.path().join("art/a.pal"),
+            ggo_asset_formats::encode_pal(&pal_a),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("art/b.pal"),
+            ggo_asset_formats::encode_pal(&pal_b),
+        )
+        .unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        let target = inspector::FieldTarget::EntityField {
+            entity: 0,
+            component: "RectFill".to_string(),
+            field: "color".to_string(),
+        };
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_color_picker(target.clone(), window, cx);
+            panel.picker_select_slot(1, window, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker open");
+            assert_eq!(picker.candidates, ["art/a.pal", "art/b.pal"], "all pals listed");
+            assert_eq!(picker.pal_rel.as_deref(), Some("art/a.pal"), "first preselects");
+            assert_eq!(picker.slot, Some(1));
+            assert_eq!(
+                open.store.state().entities[0].components["RectFill"]["color"],
+                json!(0x001f),
+                "slot color comes from palette A"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.picker_select_pal("art/b.pal".to_string(), cx)
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker open");
+            assert_eq!(picker.pal_rel.as_deref(), Some("art/b.pal"));
+            assert_eq!(picker.slot, None, "slot resets on palette switch");
+            assert_eq!(picker.palette.map(|p| p[1]), Some(0x0777));
+
+            // Edit slot 5 of palette B.
+            panel.picker_select_slot(5, window, cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker open");
+            for (editor, text) in [
+                (picker.r_editor.clone(), "10"),
+                (picker.g_editor.clone(), "20"),
+                (picker.b_editor.clone(), "30"),
+            ] {
+                editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+            }
+            panel.picker_set_slot_color(cx);
+        });
+
+        let expected = (10u16 << 11) | (20 << 5) | 30;
+        let b = ggo_asset_formats::decode_pal(
+            &std::fs::read(dir.path().join("art/b.pal")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(b[5], expected, "edit landed in palette B slot 5");
+        let a = ggo_asset_formats::decode_pal(
+            &std::fs::read(dir.path().join("art/a.pal")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(a[5], 0, "palette A untouched");
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["RectFill"]["color"],
+                json!(expected),
+                "edited color became the field value"
+            );
+        });
+    }
+
     /// Typing into a field and then clicking (focusing) another field must
     /// commit the typed buffer -- the draw that follows the focus change
     /// runs before the old editor's Blurred event is delivered, and must
