@@ -106,7 +106,9 @@ pub fn display_text(
         } => {
             let value = entity_field_value(state, *entity, component, field);
             match field_kind(schemas, component, field) {
-                Some(FieldKind::Int) | Some(FieldKind::Fixed) => value
+                // Color565 is stored and displayed as the raw packed
+                // integer; the panel layers the picker UI on top.
+                Some(FieldKind::Int) | Some(FieldKind::Fixed) | Some(FieldKind::Color565) => value
                     .and_then(Value::as_f64)
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "0".to_string()),
@@ -154,7 +156,9 @@ pub fn commit_field(
             field,
         } => {
             let value = match field_kind(schemas, component, field) {
-                Some(FieldKind::Int) => Value::from(text.trim().parse::<i64>().ok()?),
+                Some(FieldKind::Int) | Some(FieldKind::Color565) => {
+                    Value::from(text.trim().parse::<i64>().ok()?)
+                }
                 Some(FieldKind::Fixed) => Value::from(text.trim().parse::<f64>().ok()?),
                 Some(FieldKind::Str) | Some(FieldKind::Asset(_)) => Value::String(text.to_string()),
                 Some(FieldKind::Bool) | Some(FieldKind::Vec2) => return None,
@@ -379,6 +383,17 @@ mod tests {
             commit_field(&ef("Transform", "z"), "1.5", &state, &schemas),
             None
         );
+    }
+
+    #[test]
+    fn color565_field_displays_and_commits_as_a_raw_integer() {
+        let schemas = builtin_schemas();
+        let state = state_with(json!({"RectFill": {"w": 8.0, "h": 8.0, "color": 63488.0}}));
+        let color = ef("RectFill", "color");
+        assert_eq!(display_text(&color, &state, &schemas), "63488");
+        let op = commit_field(&color, "2016", &state, &schemas).unwrap();
+        assert!(matches!(op, WorldOp::SetField { ref value, .. } if *value == json!(2016)));
+        assert_eq!(commit_field(&color, "red", &state, &schemas), None);
     }
 
     #[test]

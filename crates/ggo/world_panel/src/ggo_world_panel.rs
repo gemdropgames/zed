@@ -53,7 +53,8 @@ use ggo_worldlib::render::{
     AssetLoads, DEVICE_SCREEN_H, DEVICE_SCREEN_W, DrawItem, Selection, active_camera_origin,
     build_draw_list, hit_test, world_label,
 };
-use ggo_worldlib::schemas::{ComponentSchema, defaults_for};
+use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
+use ggo_worldlib::sprites::palette565;
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
 use ggo_worldlib::world_file::write_world;
 use ggo_worldlib::world_files::{self, WorldListing};
@@ -475,6 +476,25 @@ struct OpenWorld {
     gesture_counter: u64,
     inspector: Vec<InspectorEntry>,
     save_error: Option<String>,
+    /// The open palette color picker, if any -- at most one, anchored to
+    /// one Color565 field.
+    color_picker: Option<ColorPicker>,
+}
+
+/// Inline palette picker state for one Color565 inspector field: pick a
+/// project `.pal`, then either take an existing slot's color or write a
+/// new RGB565 color into the selected slot (saving the `.pal`).
+struct ColorPicker {
+    target: inspector::FieldTarget,
+    /// Valid `.pal` rel_paths under the project root, scanned on open.
+    candidates: Vec<String>,
+    pal_rel: Option<String>,
+    palette: Option<ggo_worldlib::sprites::palette565::Pal>,
+    slot: Option<usize>,
+    r_editor: Entity<Editor>,
+    g_editor: Entity<Editor>,
+    b_editor: Entity<Editor>,
+    error: Option<String>,
 }
 
 impl OpenWorld {
@@ -511,7 +531,19 @@ impl OpenWorld {
             gesture_counter: 0,
             inspector: Vec::new(),
             save_error: None,
+            color_picker: None,
         }
+    }
+}
+
+/// Packed RGB565 -> gpui color, via the PPU's own 565->888 expansion.
+fn color565_rgba(c: u16) -> gpui::Rgba {
+    let (r, g, b) = ggo_asset_formats::pixel::rgb888(c);
+    gpui::Rgba {
+        r: f32::from(r) / 255.0,
+        g: f32::from(g) / 255.0,
+        b: f32::from(b) / 255.0,
+        a: 1.0,
     }
 }
 
@@ -1550,6 +1582,312 @@ impl WorldPanel {
         });
     }
 
+    // ------------------------------------------------- color picker
+
+    /// Open the palette picker for `target` (or close it if it is already
+    /// open there). The first `.pal` found in the project is preselected.
+    fn toggle_color_picker(
+        &mut self,
+        target: inspector::FieldTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_root) = self.project_root.clone() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if open
+            .color_picker
+            .as_ref()
+            .is_some_and(|p| p.target == target)
+        {
+            open.color_picker = None;
+            cx.notify();
+            return;
+        }
+        let candidates = ggo_worldlib::sprites::io::list_pals(&project_root);
+        open.color_picker = Some(ColorPicker {
+            target,
+            candidates,
+            pal_rel: None,
+            palette: None,
+            slot: None,
+            r_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            g_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            b_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            error: None,
+        });
+        let first = match &self.state {
+            ViewerState::Ready(open) => open
+                .color_picker
+                .as_ref()
+                .and_then(|p| p.candidates.first().cloned()),
+            _ => None,
+        };
+        if let Some(rel) = first {
+            self.picker_select_pal(rel, cx);
+        }
+        cx.notify();
+    }
+
+    fn picker_select_pal(&mut self, rel: String, cx: &mut Context<Self>) {
+        let Some(project_root) = self.project_root.clone() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(picker) = &mut open.color_picker else {
+            return;
+        };
+        match ggo_worldlib::sprites::io::open_pal(&project_root, &rel) {
+            Ok(palette) => {
+                picker.pal_rel = Some(rel);
+                picker.palette = Some(palette);
+                picker.slot = None;
+                picker.error = None;
+            }
+            Err(e) => picker.error = Some(e.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// Click a swatch: the slot's existing color becomes the field value,
+    /// and the channel inputs are prefilled with it for editing.
+    fn picker_select_slot(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(picker) = &mut open.color_picker else {
+            return;
+        };
+        let Some(palette) = picker.palette else {
+            return;
+        };
+        let Some(&color) = palette.get(slot) else {
+            return;
+        };
+        picker.slot = Some(slot);
+        picker.error = None;
+        let target = picker.target.clone();
+        let channel_editors = [
+            picker.r_editor.clone(),
+            picker.g_editor.clone(),
+            picker.b_editor.clone(),
+        ];
+        let (r, g, b) = palette565::unpack_rgb565(color);
+        for (editor, value) in channel_editors.iter().zip([r, g, b]) {
+            editor.update(cx, |editor, cx| {
+                editor.set_text(value.to_string(), window, cx)
+            });
+        }
+        self.set_color_field(&target, color, cx);
+    }
+
+    /// "Set": pack the numeric R/G/B channels, write them into the
+    /// selected slot of the selected `.pal` (saved atomically), and make
+    /// that color the field value.
+    fn picker_set_slot_color(&mut self, cx: &mut Context<Self>) {
+        let Some(project_root) = self.project_root.clone() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(picker) = &mut open.color_picker else {
+            return;
+        };
+        let channels = [
+            (picker.r_editor.clone(), palette565::R5_MAX),
+            (picker.g_editor.clone(), palette565::G6_MAX),
+            (picker.b_editor.clone(), palette565::B5_MAX),
+        ]
+        .map(|(editor, max)| {
+            let text = editor.read(cx).text(cx);
+            text.trim().parse::<u16>().ok().filter(|v| *v <= max)
+        });
+
+        let result = (|| -> Result<(inspector::FieldTarget, u16), String> {
+            let slot = picker.slot.ok_or("select a palette slot first")?;
+            if slot == palette565::TRANSPARENT_SLOT {
+                return Err(format!("slot {slot} is the locked transparent slot"));
+            }
+            let (Some(rel), Some(mut palette)) = (picker.pal_rel.clone(), picker.palette) else {
+                return Err("select a .pal first".to_string());
+            };
+            let [Some(r), Some(g), Some(b)] = channels else {
+                return Err(format!(
+                    "channels are r 0-{}, g 0-{}, b 0-{}",
+                    palette565::R5_MAX,
+                    palette565::G6_MAX,
+                    palette565::B5_MAX
+                ));
+            };
+            let color = palette565::pack_rgb565(r, g, b);
+            if let Some(entry) = palette.get_mut(slot) {
+                *entry = color;
+            }
+            ggo_worldlib::sprites::io::save_pal(&project_root, &rel, &palette)
+                .map_err(|e| e.to_string())?;
+            picker.palette = Some(palette);
+            picker.error = None;
+            Ok((picker.target.clone(), color))
+        })();
+        match result {
+            Ok((target, color)) => self.set_color_field(&target, color, cx),
+            Err(message) => {
+                if let ViewerState::Ready(open) = &mut self.state
+                    && let Some(picker) = &mut open.color_picker
+                {
+                    picker.error = Some(message);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn set_color_field(
+        &mut self,
+        target: &inspector::FieldTarget,
+        color: u16,
+        cx: &mut Context<Self>,
+    ) {
+        let inspector::FieldTarget::EntityField {
+            entity,
+            component,
+            field,
+        } = target
+        else {
+            return;
+        };
+        self.apply_op(
+            WorldOp::SetField {
+                entity: *entity,
+                component: component.clone(),
+                field: field.clone(),
+                value: Value::from(i64::from(color)),
+            },
+            cx,
+        );
+    }
+
+    /// The inline picker block rendered under an open Color565 field row.
+    fn render_color_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            return gpui::Empty.into_any_element();
+        };
+        let Some(picker) = &open.color_picker else {
+            return gpui::Empty.into_any_element();
+        };
+
+        let weak = cx.weak_entity();
+        let candidates = picker.candidates.clone();
+        let pal_menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+            for rel in candidates {
+                let weak = weak.clone();
+                let label = rel.clone();
+                menu = menu.entry(SharedString::from(label), None, move |_window, cx| {
+                    let rel = rel.clone();
+                    weak.update(cx, |this, cx| this.picker_select_pal(rel, cx))
+                        .ok();
+                });
+            }
+            menu
+        });
+
+        let mut block = v_flex()
+            .gap_1()
+            .p_1()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .rounded_sm()
+            .child(
+                h_flex().gap_1().child(Self::field_label("palette")).child(
+                    DropdownMenu::new(
+                        "ggo-color-pal",
+                        SharedString::from(
+                            picker
+                                .pal_rel
+                                .clone()
+                                .unwrap_or_else(|| "Select .pal".to_string()),
+                        ),
+                        pal_menu,
+                    ),
+                ),
+            );
+        if picker.candidates.is_empty() {
+            block = block.child(
+                Label::new("no .pal files in this project")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+        }
+        if let Some(palette) = &picker.palette {
+            let mut grid = h_flex().gap_1().flex_wrap();
+            for (i, &c) in palette.iter().enumerate() {
+                let selected = picker.slot == Some(i);
+                grid = grid.child(
+                    div()
+                        .id(i)
+                        .size_4()
+                        .flex_none()
+                        .rounded_xs()
+                        .border_1()
+                        .border_color(if selected {
+                            cx.theme().colors().border_focused
+                        } else {
+                            cx.theme().colors().border
+                        })
+                        .bg(color565_rgba(c))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.picker_select_slot(i, window, cx)
+                        })),
+                );
+            }
+            block = block.child(grid).child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("R")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::editor_input(&picker.r_editor, cx))
+                    .child(
+                        Label::new("G")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::editor_input(&picker.g_editor, cx))
+                    .child(
+                        Label::new("B")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::editor_input(&picker.b_editor, cx))
+                    .child(
+                        Button::new("ggo-color-set-slot", "Set")
+                            .on_click(cx.listener(|this, _, _, cx| this.picker_set_slot_color(cx))),
+                    ),
+            );
+        }
+        if let Some(error) = &picker.error {
+            block = block.child(
+                Label::new(error.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Error),
+            );
+        }
+        block.into_any_element()
+    }
+
     // ------------------------------------------------------------- render
 
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2040,6 +2378,56 @@ impl WorldPanel {
                                     }
                                 }
                                 panel = panel.child(row);
+                            }
+                            Some(FieldKind::Color565) => {
+                                let target = inspector::FieldTarget::EntityField {
+                                    entity: entity_ix,
+                                    component: component.clone(),
+                                    field: field.clone(),
+                                };
+                                if let Some(editor) = editors.get(&target) {
+                                    let color =
+                                        field_value.as_f64().unwrap_or(0.0) as i64 as u16;
+                                    let swatch_target = target.clone();
+                                    panel = panel.child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(Self::field_label(field.as_str()))
+                                            .child(Self::editor_input(editor, cx))
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "ggo-color-swatch-{component}-{field}"
+                                                    )))
+                                                    .size_4()
+                                                    .flex_none()
+                                                    .rounded_xs()
+                                                    .border_1()
+                                                    .border_color(cx.theme().colors().border)
+                                                    .bg(color565_rgba(color))
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.toggle_color_picker(
+                                                                swatch_target.clone(),
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            ),
+                                    );
+                                    let open_here = matches!(
+                                        &self.state,
+                                        ViewerState::Ready(open)
+                                            if open.color_picker.as_ref()
+                                                .is_some_and(|p| p.target == target)
+                                    );
+                                    if open_here {
+                                        panel = panel
+                                            .child(self.render_color_picker(window, cx));
+                                    }
+                                }
                             }
                             _ => {
                                 let target = inspector::FieldTarget::EntityField {
@@ -3176,6 +3564,117 @@ mod tests {
                 .editor
                 .clone()
         })
+    }
+
+    /// The full color-picker flow against a real `.pal` on disk: open the
+    /// picker on RectFill.color (the project's one `.pal` preselects),
+    /// take slot 2's color, then write new channels into slot 3 -- which
+    /// must land in the `.pal` file AND the field. Slot 0 stays locked.
+    #[gpui::test]
+    async fn test_color_picker_selects_and_writes_pal_slots(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pal = [0u16; ggo_asset_formats::PAL_ENTRIES];
+        pal[2] = 0x07e0;
+        std::fs::create_dir_all(dir.path().join("art")).unwrap();
+        std::fs::write(
+            dir.path().join("art/main.pal"),
+            ggo_asset_formats::encode_pal(&pal),
+        )
+        .unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        let target = inspector::FieldTarget::EntityField {
+            entity: 0,
+            component: "RectFill".to_string(),
+            field: "color".to_string(),
+        };
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_color_picker(target.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker open");
+            assert_eq!(picker.candidates, ["art/main.pal"]);
+            assert_eq!(picker.pal_rel.as_deref(), Some("art/main.pal"));
+            assert!(picker.palette.is_some(), "the only .pal preselects");
+        });
+
+        // Take an existing slot's color.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.picker_select_slot(2, window, cx)
+        });
+        panel.read_with(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["RectFill"]["color"],
+                json!(0x07e0),
+                "slot click writes the slot's color into the field"
+            );
+            let picker = open.color_picker.as_ref().expect("picker open");
+            assert_eq!(
+                picker.g_editor.read(cx).text(cx),
+                "63",
+                "channel inputs prefill from the slot (0x07e0 = pure green)"
+            );
+        });
+
+        // Write a new color into slot 3.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.picker_select_slot(3, window, cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker open");
+            for (editor, text) in [
+                (picker.r_editor.clone(), "31"),
+                (picker.g_editor.clone(), "0"),
+                (picker.b_editor.clone(), "31"),
+            ] {
+                editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+            }
+            panel.picker_set_slot_color(cx);
+        });
+        let saved = std::fs::read(dir.path().join("art/main.pal")).unwrap();
+        let saved = ggo_asset_formats::decode_pal(&saved).unwrap();
+        assert_eq!(saved[3], 0xf81f, "magenta landed in the .pal on disk");
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["RectFill"]["color"],
+                json!(0xf81f),
+                "and became the field value"
+            );
+            assert!(
+                open.color_picker.as_ref().is_some_and(|p| p.error.is_none()),
+                "no error on a successful write"
+            );
+        });
+
+        // Slot 0 is the locked transparent slot: refused, file untouched.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.picker_select_slot(0, window, cx);
+            panel.picker_set_slot_color(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker open");
+            assert!(
+                picker.error.as_deref().is_some_and(|e| e.contains("slot 0")),
+                "writing slot 0 reports the lock"
+            );
+        });
+        let saved = std::fs::read(dir.path().join("art/main.pal")).unwrap();
+        let saved = ggo_asset_formats::decode_pal(&saved).unwrap();
+        assert_eq!(saved[0], 0, "slot 0 untouched on disk");
     }
 
     /// Typing into a field and then clicking (focusing) another field must
