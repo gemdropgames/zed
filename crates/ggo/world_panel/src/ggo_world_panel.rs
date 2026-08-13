@@ -73,6 +73,12 @@ actions!(
         /// Commits the focused inspector field (bound to Enter inside the
         /// panel's field editors).
         CommitField,
+        /// Moves focus to the next inspector field (bound to Tab inside
+        /// the panel's field editors); the blur commits the current one.
+        FocusNextField,
+        /// Moves focus to the previous inspector field (bound to Shift-Tab
+        /// inside the panel's field editors).
+        FocusPrevField,
         /// Deletes the selected entity or instance from the open world.
         DeleteSelected,
         /// Resets the canvas camera to the default framing.
@@ -359,6 +365,20 @@ fn bind_panel_keys(cx: &mut App) {
             CommitField,
             Some(&format!("{KEY_CONTEXT} > Editor")),
         ),
+        // These outrank the default keymap's `Editor`-context
+        // `tab -> editor::Tab`: same dispatch depth (both match at the
+        // editor node), and later-added bindings win -- `init` re-adds
+        // these after every keymap reload.
+        KeyBinding::new(
+            "tab",
+            FocusNextField,
+            Some(&format!("{KEY_CONTEXT} > Editor")),
+        ),
+        KeyBinding::new(
+            "shift-tab",
+            FocusPrevField,
+            Some(&format!("{KEY_CONTEXT} > Editor")),
+        ),
     ]);
 }
 
@@ -398,6 +418,13 @@ struct EditDrag {
 struct InspectorEntry {
     target: inspector::FieldTarget,
     editor: Entity<Editor>,
+    /// The doc-derived text last pushed into the editor. Refresh compares
+    /// against THIS, not the editor's live buffer: a draw runs between a
+    /// focus change and the old editor's `Blurred` delivery (gpui fires
+    /// focus-out listeners after the draw), so comparing the buffer would
+    /// clobber a just-typed, not-yet-committed value with the stale doc
+    /// text.
+    last_display: String,
     _subscription: Subscription,
 }
 
@@ -1375,16 +1402,18 @@ impl WorldPanel {
                 .all(|(entry, spec)| entry.target == spec.target);
 
         if same_targets {
-            for entry in &open.inspector {
+            for entry in &mut open.inspector {
+                let text = inspector::display_text(&entry.target, &state, &open.schemas);
+                if entry.last_display == text {
+                    continue;
+                }
+                entry.last_display = text.clone();
                 if entry.editor.focus_handle(cx).is_focused(window) {
                     continue;
                 }
-                let text = inspector::display_text(&entry.target, &state, &open.schemas);
-                if entry.editor.read(cx).text(cx) != text {
-                    entry
-                        .editor
-                        .update(cx, |editor, cx| editor.set_text(text, window, cx));
-                }
+                entry
+                    .editor
+                    .update(cx, |editor, cx| editor.set_text(text, window, cx));
             }
             return;
         }
@@ -1394,13 +1423,14 @@ impl WorldPanel {
             let text = inspector::display_text(&spec.target, &state, &open.schemas);
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
-                editor.set_text(text, window, cx);
+                editor.set_text(text.clone(), window, cx);
                 editor
             });
-            let subscription = cx.subscribe(&editor, Self::handle_editor_event);
+            let subscription = cx.subscribe_in(&editor, window, Self::handle_editor_event);
             entries.push(InspectorEntry {
                 target: spec.target.clone(),
                 editor,
+                last_display: text,
                 _subscription: subscription,
             });
         }
@@ -1410,14 +1440,35 @@ impl WorldPanel {
     /// Blur commits the field, matching the brief's enter/blur rule (and
     /// ggo-ide's cross-field commit-on-input). An unchanged or unparsable
     /// buffer is a no-op in the store, so committing every blur is safe.
+    /// After the commit the editor is resynced from the doc, so a dropped
+    /// (unparsable) buffer reverts instead of lingering on screen.
     fn handle_editor_event(
         &mut self,
-        editor: Entity<Editor>,
+        editor: &Entity<Editor>,
         event: &EditorEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(event, EditorEvent::Blurred) {
-            self.commit_editor(editor.entity_id(), cx);
+        if !matches!(event, EditorEvent::Blurred) {
+            return;
+        }
+        self.commit_editor(editor.entity_id(), cx);
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let state = open.store.state();
+        if let Some(entry) = open
+            .inspector
+            .iter_mut()
+            .find(|e| e.editor.entity_id() == editor.entity_id())
+        {
+            let text = inspector::display_text(&entry.target, &state, &open.schemas);
+            entry.last_display = text.clone();
+            if entry.editor.read(cx).text(cx) != text {
+                entry
+                    .editor
+                    .update(cx, |editor, cx| editor.set_text(text, window, cx));
+            }
         }
     }
 
@@ -1451,6 +1502,26 @@ impl WorldPanel {
             .map(|e| e.editor.entity_id());
         if let Some(id) = focused {
             self.commit_editor(id, cx);
+        }
+    }
+
+    /// Tab/shift-tab between inspector fields: the focus move blurs the
+    /// current editor, which commits it.
+    fn focus_field_sibling(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(current) = open
+            .inspector
+            .iter()
+            .position(|e| e.editor.focus_handle(cx).is_focused(window))
+        else {
+            return;
+        };
+        let len = open.inspector.len() as isize;
+        let next = (current as isize + delta).rem_euclid(len) as usize;
+        if let Some(entry) = open.inspector.get(next) {
+            entry.editor.focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -2176,6 +2247,12 @@ impl Render for WorldPanel {
                 this.nudge_impl("ArrowDown", true, cx)
             }))
             .on_action(cx.listener(Self::on_commit_field))
+            .on_action(cx.listener(|this, _: &FocusNextField, window, cx| {
+                this.focus_field_sibling(1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusPrevField, window, cx| {
+                this.focus_field_sibling(-1, window, cx)
+            }))
             .bg(cx.theme().colors().panel_background)
             .child(div().flex_1().min_h_0().child(body))
     }
@@ -3003,6 +3080,207 @@ mod tests {
                 json!(0)
             );
         });
+    }
+
+    /// Load `worlds/test` into a panel that is the root view of a real
+    /// test window, with Entity(0) selected so the inspector editors
+    /// exist. Rendering in a window is what drives gpui's draw/focus
+    /// cycle, which the blur-commit ordering tests below depend on.
+    async fn ready_panel_in_window<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (gpui::Entity<WorldPanel>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        write_fixture(root);
+        let root = root.to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = WorldPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        // Focus in/out events only fire while the window is ACTIVE -- an
+        // inactive window's focus paths are blanked in the draw's focus
+        // phase, and blur-commit never runs.
+        cx.update(|window, _| window.activate_window());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_worlds(cx);
+            panel.load_rel_path("worlds/test.toml", cx);
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready state after load");
+            };
+            open.view.borrow_mut().pan = Some([0.0, 0.0]);
+            open.selected = Some(Selection::Entity(0));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    fn field_editor(
+        panel: &gpui::Entity<WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        component: &str,
+        field: &str,
+    ) -> gpui::Entity<Editor> {
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            open.inspector
+                .iter()
+                .find(|e| {
+                    matches!(
+                        &e.target,
+                        inspector::FieldTarget::EntityField { component: c, field: f, .. }
+                            if c == component && f == field
+                    )
+                })
+                .unwrap_or_else(|| panic!("no editor for {component}.{field}"))
+                .editor
+                .clone()
+        })
+    }
+
+    /// Typing into a field and then clicking (focusing) another field must
+    /// commit the typed buffer -- the draw that follows the focus change
+    /// runs before the old editor's Blurred event is delivered, and must
+    /// not clobber the in-progress buffer with the stale doc value.
+    #[gpui::test]
+    async fn test_focus_move_to_another_field_commits_the_buffer(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        let w_editor = field_editor(&panel, cx, "RectFill", "w");
+        let h_editor = field_editor(&panel, cx, "RectFill", "h");
+
+        w_editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+        w_editor.update_in(cx, |editor, window, cx| editor.set_text("12", window, cx));
+        cx.run_until_parked();
+
+        h_editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["RectFill"]["w"],
+                json!(12),
+                "the typed value must be committed when focus moves away"
+            );
+        });
+        assert_eq!(
+            w_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "12",
+            "the field keeps showing the committed value"
+        );
+    }
+
+    /// An unparsable buffer is dropped on blur (ggo-ide's rule) and the
+    /// field reverts to the doc value instead of showing the stale buffer.
+    #[gpui::test]
+    async fn test_unparsable_buffer_reverts_to_doc_value_on_blur(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        let w_editor = field_editor(&panel, cx, "RectFill", "w");
+        let h_editor = field_editor(&panel, cx, "RectFill", "h");
+
+        w_editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+        w_editor.update_in(cx, |editor, window, cx| editor.set_text("abc", window, cx));
+        h_editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["RectFill"]["w"],
+                json!(16),
+                "an unparsable buffer must not change the doc"
+            );
+        });
+        assert_eq!(
+            w_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "16",
+            "the field reverts to the doc value"
+        );
+    }
+
+    /// Tab commits the focused field (via the blur it causes) and moves
+    /// focus to the next field editor; shift-tab moves back.
+    #[gpui::test]
+    async fn test_tab_moves_to_next_field_and_commits(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        let w_editor = field_editor(&panel, cx, "RectFill", "w");
+
+        // The editor following `w` in the inspector's own (rendered) order,
+        // whatever that order is.
+        let next_editor = panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let w_index = open
+                .inspector
+                .iter()
+                .position(|e| e.editor == w_editor)
+                .expect("w editor is in the inspector");
+            open.inspector[(w_index + 1) % open.inspector.len()]
+                .editor
+                .clone()
+        });
+
+        w_editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+        w_editor.update_in(cx, |editor, window, cx| editor.set_text("12", window, cx));
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+
+        assert!(
+            next_editor.update_in(cx, |editor, window, cx| editor
+                .focus_handle(cx)
+                .is_focused(window)),
+            "tab moves focus to the next field"
+        );
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["RectFill"]["w"],
+                json!(12),
+                "tabbing away commits the typed value"
+            );
+        });
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        assert!(
+            w_editor.update_in(cx, |editor, window, cx| editor
+                .focus_handle(cx)
+                .is_focused(window)),
+            "shift-tab moves focus back to the previous field"
+        );
     }
 
     // ------------------------------------------- unsaved-document guard
