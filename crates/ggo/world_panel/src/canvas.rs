@@ -182,11 +182,6 @@ fn color(hex: u32) -> Hsla {
     gpui::rgb(hex).into()
 }
 
-fn rgb565_color(c: u16) -> Hsla {
-    let (r, g, b) = ggo_asset_formats::pixel::rgb888(c);
-    gpui::rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into()
-}
-
 const TEXT_FONT_SIZE: f32 = 12.0;
 const TEXT_LINE_HEIGHT: f32 = 14.0;
 const LABEL_GAP: f32 = 2.0;
@@ -270,9 +265,6 @@ fn paint_item(
         return;
     }
     match &item.kind {
-        DrawKind::Rect { color565 } => {
-            window.paint_quad(fill(b, rgb565_color(*color565)));
-        }
         DrawKind::Text { content } => {
             window.paint_quad(fill(b, gpui::rgba(0x00000066)));
             paint_world_text(content, b, view.zoom, scene.text_color, window, cx);

@@ -2861,7 +2861,7 @@ mod tests {
         }
     }
 
-    /// Fixture note: the world is built from RectFill/Text/Camera entities
+    /// Fixture note: the world is built from Text/Camera entities
     /// plus a nested `[[instance]]` -- deliberately NO image assets
     /// (authoring a valid `.spr`/`.til`/`.pal`/`.map` set through
     /// `sprites::io` save fns would dwarf the test; the brief allows this
@@ -2871,7 +2871,7 @@ mod tests {
         let sub = WorldFile {
             entities: vec![entity(json!({
                 "Transform": { "pos": [0.0, 0.0], "z": 1.0 },
-                "RectFill": { "w": 8.0, "h": 8.0, "color": 2016.0 }
+                "Text": { "content": "a" }
             }))],
             instances: vec![],
             backgrounds: vec![],
@@ -2882,7 +2882,7 @@ mod tests {
             entities: vec![
                 entity(json!({
                     "Transform": { "pos": [4.0, 4.0], "z": 0.0 },
-                    "RectFill": { "w": 16.0, "h": 12.0, "color": 63488.0 }
+                    "Text": { "content": "ab", "max_width": 16.0, "max_height": 12.0 }
                 })),
                 entity(json!({
                     "Transform": { "pos": [40.0, 8.0], "z": 2.0 },
@@ -2937,7 +2937,7 @@ mod tests {
     /// enumerates both worlds, selecting `worlds/test` runs the off-thread
     /// loader (including recursive instance resolution of `worlds/sub`),
     /// and the panel reaches Ready with a non-empty draw list containing
-    /// both the top-level and the instance-resolved RectFill.
+    /// both the top-level and the instance-resolved Text entities.
     #[gpui::test]
     async fn test_select_world_reaches_ready_with_draw_items(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -2968,13 +2968,13 @@ mod tests {
             let items = draw_items(open);
             assert!(!items.is_empty(), "draw list should not be empty");
 
-            let rects = items
+            let texts = items
                 .iter()
-                .filter(|i| matches!(i.kind, DrawKind::Rect { .. }))
+                .filter(|i| matches!(i.kind, DrawKind::Text { .. }))
                 .count();
             assert_eq!(
-                rects, 2,
-                "one top-level RectFill + one from the resolved worlds/sub instance"
+                texts, 3,
+                "two top-level Texts + one from the resolved worlds/sub instance"
             );
             assert!(
                 items
@@ -3038,13 +3038,13 @@ mod tests {
                 open.listing.stem, "worlds/test",
                 "the listing is asset-root-relative, matching engine-side stems"
             );
-            let rects = draw_items(open)
+            let texts = draw_items(open)
                 .iter()
-                .filter(|i| matches!(i.kind, DrawKind::Rect { .. }))
+                .filter(|i| matches!(i.kind, DrawKind::Text { .. }))
                 .count();
             assert_eq!(
-                rects, 2,
-                "top-level RectFill + the worlds/sub instance's, which only \
+                texts, 3,
+                "top-level Texts + the worlds/sub instance's, which only \
                  resolves if the derived root reached instance resolution"
             );
             assert_eq!(
@@ -3055,7 +3055,7 @@ mod tests {
         });
     }
 
-    /// Click select: a primary-down over the RectFill (world [4,4]..[20,16]
+    /// Click select: a primary-down over the Text box (world [4,4]..[20,12]
     /// at identity view) selects Entity(0) and the rebuilt draw list gains
     /// a SelectionOutline; a primary-down over empty space deselects.
     #[gpui::test]
@@ -3401,7 +3401,7 @@ mod tests {
     /// M7 fix round 1: a freshly added instance's subtree must render
     /// WITHOUT a reload -- add resolves the stem and composes its
     /// assets immediately (ggo-ide re-resolves after every message).
-    /// `worlds/sub` carries a RectFill child, so the draw list's rect
+    /// `worlds/sub` carries a Text child, so the draw list's text
     /// count must grow right after the add.
     #[gpui::test]
     async fn test_add_instance_resolves_subtree_without_reload(cx: &mut TestAppContext) {
@@ -3409,10 +3409,10 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            let rect_count = |open: &OpenWorld| {
+            let text_count = |open: &OpenWorld| {
                 draw_items(open)
                     .iter()
-                    .filter(|i| matches!(i.kind, DrawKind::Rect { .. }))
+                    .filter(|i| matches!(i.kind, DrawKind::Text { .. }))
                     .count()
             };
             {
@@ -3420,9 +3420,9 @@ mod tests {
                     panic!("expected Ready");
                 };
                 assert_eq!(
-                    rect_count(open),
-                    2,
-                    "fixture baseline: top-level RectFill + the existing sub instance's"
+                    text_count(open),
+                    3,
+                    "fixture baseline: top-level Texts + the existing sub instance's"
                 );
             }
 
@@ -3438,9 +3438,9 @@ mod tests {
             );
             assert!(state.instances[1].error.is_none());
             assert_eq!(
-                rect_count(open),
-                3,
-                "the new instance's RectFill child renders without a reload"
+                text_count(open),
+                4,
+                "the new instance's Text child renders without a reload"
             );
         });
     }
@@ -3596,8 +3596,37 @@ mod tests {
         })
     }
 
+    /// Give entity 0 an `Fx` component with a Color565 `color` field (no
+    /// builtin component carries one), so picker tests have a target.
+    fn add_fx_color(panel: &gpui::Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) {
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.schemas.push(ComponentSchema {
+                name: "Fx".to_string(),
+                fields: vec![ggo_worldlib::schemas::SchemaField {
+                    name: "color".to_string(),
+                    kind: ggo_worldlib::schemas::FieldKind::Color565,
+                    def: None,
+                }],
+            });
+            open.store.apply(WorldOp::AddComponent {
+                entity: 0,
+                name: "Fx".to_string(),
+                defaults: serde_json::json!({"color": 0})
+                    .as_object()
+                    .expect("object literal")
+                    .clone(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
     /// The full color-picker flow against a real `.pal` on disk: open the
-    /// picker on RectFill.color (the project's one `.pal` preselects),
+    /// picker on the Fx test component's Color565 field (the project's
+    /// one `.pal` preselects),
     /// take slot 2's color, then write new channels into slot 3 -- which
     /// must land in the `.pal` file AND the field. Slot 0 stays locked.
     #[gpui::test]
@@ -3612,10 +3641,11 @@ mod tests {
         )
         .unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        add_fx_color(&panel, cx);
 
         let target = inspector::FieldTarget::EntityField {
             entity: 0,
-            component: "RectFill".to_string(),
+            component: "Fx".to_string(),
             field: "color".to_string(),
         };
         panel.update_in(cx, |panel, window, cx| {
@@ -3641,7 +3671,7 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(
-                open.store.state().entities[0].components["RectFill"]["color"],
+                open.store.state().entities[0].components["Fx"]["color"],
                 json!(0x07e0),
                 "slot click writes the slot's color into the field"
             );
@@ -3677,7 +3707,7 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(
-                open.store.state().entities[0].components["RectFill"]["color"],
+                open.store.state().entities[0].components["Fx"]["color"],
                 json!(0xf81f),
                 "and became the field value"
             );
@@ -3714,12 +3744,13 @@ mod tests {
     async fn test_picker_with_no_palettes_creates_a_default_main_pal(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        add_fx_color(&panel, cx);
 
         panel.update_in(cx, |panel, window, cx| {
             panel.toggle_color_picker(
                 inspector::FieldTarget::EntityField {
                     entity: 0,
-                    component: "RectFill".to_string(),
+                    component: "Fx".to_string(),
                     field: "color".to_string(),
                 },
                 window,
@@ -3751,10 +3782,11 @@ mod tests {
     async fn test_clicking_the_color_swatch_opens_the_picker(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        add_fx_color(&panel, cx);
 
         let bounds = cx
-            .debug_bounds("ggo-color-swatch-RectFill-color")
-            .expect("the color swatch is rendered for the selected RectFill entity");
+            .debug_bounds("ggo-color-swatch-Fx-color")
+            .expect("the color swatch is rendered for the selected entity's Fx color");
         cx.simulate_click(bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
@@ -3767,7 +3799,7 @@ mod tests {
                 picker.target,
                 inspector::FieldTarget::EntityField {
                     entity: 0,
-                    component: "RectFill".to_string(),
+                    component: "Fx".to_string(),
                     field: "color".to_string(),
                 }
             );
@@ -3795,10 +3827,11 @@ mod tests {
         )
         .unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        add_fx_color(&panel, cx);
 
         let target = inspector::FieldTarget::EntityField {
             entity: 0,
-            component: "RectFill".to_string(),
+            component: "Fx".to_string(),
             field: "color".to_string(),
         };
         panel.update_in(cx, |panel, window, cx| {
@@ -3814,7 +3847,7 @@ mod tests {
             assert_eq!(picker.pal_rel.as_deref(), Some("art/a.pal"), "first preselects");
             assert_eq!(picker.slot, Some(1));
             assert_eq!(
-                open.store.state().entities[0].components["RectFill"]["color"],
+                open.store.state().entities[0].components["Fx"]["color"],
                 json!(0x001f),
                 "slot color comes from palette A"
             );
@@ -3864,7 +3897,7 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(
-                open.store.state().entities[0].components["RectFill"]["color"],
+                open.store.state().entities[0].components["Fx"]["color"],
                 json!(expected),
                 "edited color became the field value"
             );
@@ -3879,8 +3912,8 @@ mod tests {
     async fn test_focus_move_to_another_field_commits_the_buffer(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
-        let w_editor = field_editor(&panel, cx, "RectFill", "w");
-        let h_editor = field_editor(&panel, cx, "RectFill", "h");
+        let w_editor = field_editor(&panel, cx, "Text", "max_width");
+        let h_editor = field_editor(&panel, cx, "Text", "max_height");
 
         w_editor.update_in(cx, |editor, window, cx| {
             window.focus(&editor.focus_handle(cx), cx);
@@ -3899,7 +3932,7 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(
-                open.store.state().entities[0].components["RectFill"]["w"],
+                open.store.state().entities[0].components["Text"]["max_width"],
                 json!(12),
                 "the typed value must be committed when focus moves away"
             );
@@ -3917,8 +3950,8 @@ mod tests {
     async fn test_unparsable_buffer_reverts_to_doc_value_on_blur(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
-        let w_editor = field_editor(&panel, cx, "RectFill", "w");
-        let h_editor = field_editor(&panel, cx, "RectFill", "h");
+        let w_editor = field_editor(&panel, cx, "Text", "max_width");
+        let h_editor = field_editor(&panel, cx, "Text", "max_height");
 
         w_editor.update_in(cx, |editor, window, cx| {
             window.focus(&editor.focus_handle(cx), cx);
@@ -3935,7 +3968,7 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(
-                open.store.state().entities[0].components["RectFill"]["w"],
+                open.store.state().entities[0].components["Text"]["max_width"],
                 json!(16),
                 "an unparsable buffer must not change the doc"
             );
@@ -3953,7 +3986,7 @@ mod tests {
     async fn test_tab_moves_to_next_field_and_commits(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
-        let w_editor = field_editor(&panel, cx, "RectFill", "w");
+        let w_editor = field_editor(&panel, cx, "Text", "max_width");
 
         // The editor following `w` in the inspector's own (rendered) order,
         // whatever that order is.
@@ -3991,7 +4024,7 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(
-                open.store.state().entities[0].components["RectFill"]["w"],
+                open.store.state().entities[0].components["Text"]["max_width"],
                 json!(12),
                 "tabbing away commits the typed value"
             );

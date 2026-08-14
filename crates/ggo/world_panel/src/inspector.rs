@@ -387,9 +387,18 @@ mod tests {
 
     #[test]
     fn color565_field_displays_and_commits_as_a_raw_integer() {
-        let schemas = builtin_schemas();
-        let state = state_with(json!({"RectFill": {"w": 8.0, "h": 8.0, "color": 63488.0}}));
-        let color = ef("RectFill", "color");
+        // No builtin component carries a Color565 field; pin the kind's
+        // behavior with a custom schema.
+        let schemas = vec![ggo_worldlib::schemas::ComponentSchema {
+            name: "Fx".to_string(),
+            fields: vec![ggo_worldlib::schemas::SchemaField {
+                name: "color".to_string(),
+                kind: FieldKind::Color565,
+                def: None,
+            }],
+        }];
+        let state = state_with(json!({"Fx": {"color": 63488.0}}));
+        let color = ef("Fx", "color");
         assert_eq!(display_text(&color, &state, &schemas), "63488");
         let op = commit_field(&color, "2016", &state, &schemas).unwrap();
         assert!(matches!(op, WorldOp::SetField { ref value, .. } if *value == json!(2016)));

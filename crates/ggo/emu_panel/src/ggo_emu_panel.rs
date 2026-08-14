@@ -3467,7 +3467,7 @@ mod tests {
             root.join("assets/worlds/main.toml"),
             "[[entity]]\n\
              Transform = { pos = [4.0, 4.0], z = 0.0 }\n\
-             RectFill = { w = 16.0, h = 12.0, color = 63488.0 }\n",
+             Text = { content = \"hi\" }\n",
         )
         .unwrap();
     }
