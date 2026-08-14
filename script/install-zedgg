@@ -19,6 +19,9 @@ mkdir -p "$app_dir/bin" "$app_dir/libexec" \
     "$HOME/.local/bin" "$HOME/.local/share/applications"
 
 target_dir="${CARGO_TARGET_DIR:-target}"
+# rm first: cp onto a RUNNING binary fails with "Text file busy", while
+# unlinking + recreating succeeds (the running process keeps its inode).
+rm -f "$app_dir/libexec/zed-editor" "$app_dir/bin/zed"
 cp "$target_dir/release/zed" "$app_dir/libexec/zed-editor"
 cp "$target_dir/release/cli" "$app_dir/bin/zed"
 cp crates/zed/resources/app-icon-dev.png \
