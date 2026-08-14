@@ -1229,7 +1229,7 @@ impl ImportPanel {
             (Some(image), Some(preview)) => div()
                 .p_1()
                 .child(
-                    img(image.clone())
+                    img(image.clone()).nearest(true)
                         .w(px(preview.w as f32))
                         .h(px(preview.h as f32)),
                 )
@@ -1479,6 +1479,7 @@ fn paint_crop(scene: &CropScene, canvas: Bounds<Pixels>, window: &mut Window) {
                 image.clone(),
                 0,
                 false,
+                true,
             );
         }
         window.paint_quad(outline(image_bounds, scene.border, BorderStyle::default()));

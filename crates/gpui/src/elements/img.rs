@@ -128,6 +128,8 @@ where
 /// The style of an image element.
 pub struct ImageStyle {
     grayscale: bool,
+    /// Nearest-neighbor sampling -- crisp integer upscales for pixel art.
+    nearest: bool,
     object_fit: ObjectFit,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
@@ -137,6 +139,7 @@ impl Default for ImageStyle {
     fn default() -> Self {
         Self {
             grayscale: false,
+            nearest: false,
             object_fit: ObjectFit::Contain,
             loading: None,
             fallback: None,
@@ -148,6 +151,13 @@ impl Default for ImageStyle {
 pub trait StyledImage: Sized {
     /// Get a mutable [ImageStyle] from the element.
     fn image_style(&mut self) -> &mut ImageStyle;
+
+    /// Set the image to sample nearest-neighbor -- crisp integer
+    /// upscales for pixel art instead of bilinear blur.
+    fn nearest(mut self, nearest: bool) -> Self {
+        self.image_style().nearest = nearest;
+        self
+    }
 
     /// Set the image to be displayed in grayscale.
     fn grayscale(mut self, grayscale: bool) -> Self {
@@ -500,6 +510,7 @@ impl Element for Img {
                             data,
                             layout_state.frame_index,
                             self.style.grayscale,
+                            self.style.nearest,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {

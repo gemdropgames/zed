@@ -1757,6 +1757,7 @@ fn paint_map(scene: &MapScene, canvas: Bounds<Pixels>, window: &mut Window) {
                 image.clone(),
                 0,
                 false,
+                true,
             );
         }
         window.paint_quad(outline(map_bounds, scene.border, BorderStyle::default()));
@@ -1806,7 +1807,7 @@ fn paint_strip(scene: &StripScene, canvas: Bounds<Pixels>, window: &mut Window) 
     window.with_content_mask(Some(ContentMask { bounds: canvas }), |window| {
         window.paint_quad(fill(canvas, scene.background));
         if let Some(image) = &scene.image {
-            let _ = window.paint_image(canvas, canvas, Corners::default(), image.clone(), 0, false);
+            let _ = window.paint_image(canvas, canvas, Corners::default(), image.clone(), 0, false, true);
         }
         let (c0, r0, c1, r1) = scene.sel;
         let r = cell_rect(canvas, [0.0, 0.0], geom::STRIP_ZOOM, c0, r0, c1, r1);

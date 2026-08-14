@@ -314,7 +314,7 @@ fn paint_item(
         DrawKind::Image { image } => match scene.images.get(&image_key(image)) {
             Some(render_image) => {
                 let _ =
-                    window.paint_image(b, b, Corners::default(), render_image.clone(), 0, false);
+                    window.paint_image(b, b, Corners::default(), render_image.clone(), 0, false, true);
             }
             // A Ready image missing from the cache can only mean the cache
             // and draw list are out of sync -- degrade to a placeholder

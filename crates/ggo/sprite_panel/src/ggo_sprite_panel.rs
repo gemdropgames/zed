@@ -2524,7 +2524,7 @@ impl SpritePanel {
                 .filter_map(|ghost| {
                     let image = open.ghost_image(ghost.dist, ghost.idx)?;
                     Some(
-                        img(image)
+                        img(image).nearest(true)
                             .absolute()
                             .w(px(fit_w))
                             .h(px(fit_h))
@@ -2539,7 +2539,7 @@ impl SpritePanel {
                     .w(px(fit_w))
                     .h(px(fit_h))
                     .children(ghosts)
-                    .child(img(image.clone()).w(px(fit_w)).h(px(fit_h)))
+                    .child(img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h)))
                     .child(overlay)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2621,7 +2621,7 @@ impl SpritePanel {
                             .relative()
                             .w(sheet_w)
                             .h(sheet_h)
-                            .child(img(strip.image.clone()).w(sheet_w).h(sheet_h))
+                            .child(img(strip.image.clone()).nearest(true).w(sheet_w).h(sheet_h))
                             .child(overlay)
                             .children(selection)
                             .on_mouse_down(
@@ -2947,7 +2947,7 @@ impl SpritePanel {
                         let thumb = open.frames.get(ix).map(|image| {
                             let (w, h) = image_px_size(image);
                             let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
-                            img(image.clone()).w(px(fit_w)).h(px(fit_h))
+                            img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
                         });
                         v_flex()
                             .id(("ggo-sprite-frame", ix))

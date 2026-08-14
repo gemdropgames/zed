@@ -459,7 +459,7 @@ impl TilesetPanel {
             .child(
                 div()
                     .p_1()
-                    .child(img(open.loaded.grid.clone()).w(px(w)).h(px(h))),
+                    .child(img(open.loaded.grid.clone()).nearest(true).w(px(w)).h(px(h))),
             )
             .into_any_element()
     }

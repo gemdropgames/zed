@@ -1195,7 +1195,7 @@ impl EmuPanel {
                         // clip, so log-and-drop beats poisoning the
                         // frame with an unwrap.
                         window
-                            .paint_image(b, b, gpui::Corners::default(), frame, 0, false)
+                            .paint_image(b, b, gpui::Corners::default(), frame, 0, false, true)
                             .log_err();
                     },
                 ).size_full())

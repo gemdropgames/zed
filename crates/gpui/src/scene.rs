@@ -748,7 +748,10 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    /// Sample the sprite with nearest-neighbor instead of bilinear
+    /// filtering -- crisp integer upscales for pixel art. Lives in what
+    /// was a padding slot, so the GPU-side layout is unchanged.
+    pub nearest: PaddedBool32,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,

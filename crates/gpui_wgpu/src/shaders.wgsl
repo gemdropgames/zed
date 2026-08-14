@@ -1261,7 +1261,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    nearest: u32,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
@@ -1293,13 +1293,21 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let sprite = load_poly_sprite(input.sprite_id);
+    var tile_position = input.tile_position;
+    if (sprite.nearest != 0u) {
+        // Nearest-neighbor through the linear sampler: snap the sample
+        // point to the covered texel's center, so bilinear weights
+        // degenerate to that one texel. Crisp pixel-art upscales.
+        let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+        tile_position = (floor(tile_position * atlas_size) + 0.5) / atlas_size;
+    }
+    let sample = textureSample(t_sprite, s_sprite, tile_position);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
