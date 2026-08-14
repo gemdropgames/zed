@@ -1595,20 +1595,39 @@ impl WorldPanel {
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        let ViewerState::Ready(open) = &mut self.state else {
-            return;
-        };
-        if open
-            .color_picker
-            .as_ref()
-            .is_some_and(|p| p.target == target)
         {
-            open.color_picker = None;
-            cx.notify();
-            return;
+            let ViewerState::Ready(open) = &mut self.state else {
+                return;
+            };
+            if open
+                .color_picker
+                .as_ref()
+                .is_some_and(|p| p.target == target)
+            {
+                open.color_picker = None;
+                cx.notify();
+                return;
+            }
         }
-        let candidates = ggo_worldlib::sprites::io::list_pals(&project_root);
-        open.color_picker = Some(ColorPicker {
+        let mut candidates = ggo_worldlib::sprites::io::list_pals(&project_root);
+        let mut error = None;
+        if candidates.is_empty() {
+            // No palette anywhere in the project: seed `main.pal` at the
+            // asset root with the default ramp so the picker always has a
+            // base palette to offer.
+            if let Some(rel) = self.default_pal_rel(&project_root) {
+                match ggo_worldlib::sprites::io::save_pal(
+                    &project_root,
+                    &rel,
+                    &ggo_worldlib::sprites::sprite_doc::default_palette(),
+                ) {
+                    Ok(()) => candidates = vec![rel],
+                    Err(e) => error = Some(e.to_string()),
+                }
+            }
+        }
+        let first = candidates.first().cloned();
+        let picker = ColorPicker {
             target,
             candidates,
             pal_rel: None,
@@ -1617,19 +1636,25 @@ impl WorldPanel {
             r_editor: cx.new(|cx| Editor::single_line(window, cx)),
             g_editor: cx.new(|cx| Editor::single_line(window, cx)),
             b_editor: cx.new(|cx| Editor::single_line(window, cx)),
-            error: None,
-        });
-        let first = match &self.state {
-            ViewerState::Ready(open) => open
-                .color_picker
-                .as_ref()
-                .and_then(|p| p.candidates.first().cloned()),
-            _ => None,
+            error,
         };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.color_picker = Some(picker);
         if let Some(rel) = first {
             self.picker_select_pal(rel, cx);
         }
         cx.notify();
+    }
+
+    /// Where the seeded default palette goes: `main.pal` at the ASSET root
+    /// (`assets/main.pal` in an assets-dir project), as a rel path under
+    /// the project root.
+    fn default_pal_rel(&self, project_root: &Path) -> Option<String> {
+        let asset_root = self.asset_root()?;
+        let rel = asset_root.strip_prefix(project_root).ok()?.join("main.pal");
+        Some(rel.to_string_lossy().replace('\\', "/"))
     }
 
     fn picker_select_pal(&mut self, rel: String, cx: &mut Context<Self>) {
@@ -3680,6 +3705,44 @@ mod tests {
         let saved = std::fs::read(dir.path().join("art/main.pal")).unwrap();
         let saved = ggo_asset_formats::decode_pal(&saved).unwrap();
         assert_eq!(saved[0], 0, "slot 0 untouched on disk");
+    }
+
+    /// A project with no `.pal` anywhere: opening the picker seeds the
+    /// default palette at the asset root as `main.pal` (ggo-ide's sprite
+    /// default black->white ramp) and preselects it.
+    #[gpui::test]
+    async fn test_picker_with_no_palettes_creates_a_default_main_pal(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_color_picker(
+                inspector::FieldTarget::EntityField {
+                    entity: 0,
+                    component: "RectFill".to_string(),
+                    field: "color".to_string(),
+                },
+                window,
+                cx,
+            )
+        });
+
+        let expected = ggo_worldlib::sprites::sprite_doc::default_palette();
+        let on_disk = ggo_asset_formats::decode_pal(
+            &std::fs::read(dir.path().join("main.pal")).expect("main.pal was created"),
+        )
+        .expect("a valid .pal");
+        assert_eq!(on_disk, expected, "seeded with the default ramp");
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let picker = open.color_picker.as_ref().expect("picker open");
+            assert_eq!(picker.candidates, ["main.pal"]);
+            assert_eq!(picker.pal_rel.as_deref(), Some("main.pal"));
+            assert_eq!(picker.palette, Some(expected), "and preselected");
+        });
     }
 
     /// A real CLICK on the rendered swatch (not a direct method call) must
