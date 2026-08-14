@@ -91,7 +91,7 @@ use gpui::{
     Action, AnyWindowHandle, App, Context, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
     Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription, Task,
-    WeakEntity, Window, actions, div, img, px,
+    WeakEntity, Window, actions, div, px,
 };
 use project::ProjectPath;
 use ui::Tooltip;
@@ -349,14 +349,11 @@ pub struct EmuPanel {
     /// most one run.
     build_generation: u64,
     _build_task: Option<Task<()>>,
-    /// Armed by [`Self::rerun`] and consumed by the next [`Self::run`]:
-    /// "when THIS run's perf ingest lands, hop to the charts panel". A
-    /// plain Run clears it, so the hop only ever follows the Re-run entry
-    /// that asked for it.
-    charts_after_ingest: bool,
-    /// The run generation the hop is owed to, plus the window to do it in
-    /// -- the ingest completes on a background task with no `Window` of
-    /// its own, and focusing a dock needs one.
+    /// The run generation the pending "hop to the charts panel when this
+    /// run's perf ingest lands" is owed to, plus the window to do it in --
+    /// the ingest completes on a background task with no `Window` of its
+    /// own, and focusing a dock needs one. Armed by every [`Self::run`]:
+    /// EVERY stopped run routes to its generated report.
     charts_for_run: Option<(u64, AnyWindowHandle)>,
 
     /// The running emulator, if any. Dropping it signals the thread to
@@ -459,7 +456,6 @@ impl EmuPanel {
             diag_env_override: None,
             build_generation: 0,
             _build_task: None,
-            charts_after_ingest: false,
             charts_for_run: None,
             session: None,
             _pump_task: None,
@@ -560,15 +556,10 @@ impl EmuPanel {
         // so it must still see the pre-bump value. This is the new
         // current run from here on -- see `run_generation`'s doc.
         self.run_generation += 1;
-        // Claim (or clear) the pending "hop to the charts panel when this
-        // one's perf lands" -- the window handle has to be captured here,
-        // because the ingest completes without one. A plain Run leaves
-        // `charts_after_ingest` false, which clears any arming a
-        // superseded Re-run left behind.
-        self.charts_for_run = self
-            .charts_after_ingest
-            .then(|| (self.run_generation, window.window_handle()));
-        self.charts_after_ingest = false;
+        // Arm the "hop to the charts panel when this one's perf lands"
+        // for THIS run -- the window handle has to be captured here,
+        // because the ingest completes without one.
+        self.charts_for_run = Some((self.run_generation, window.window_handle()));
 
         // Clear the previous run's underrun count and device verdict
         // BEFORE the thread starts, so the pane never shows the last run's
@@ -802,10 +793,6 @@ impl EmuPanel {
     pub fn emulate_world(&mut self, world_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(window, cx);
         self.build_generation += 1;
-        // A Re-run whose `run` never happened (this click replaced its
-        // task) must not leave its charts hop behind for THIS run to
-        // inherit -- see `charts_after_ingest`.
-        self.charts_after_ingest = false;
         let generation = self.build_generation;
         let world_rel = world_rel.to_string();
         self.status = Some(format!("building {world_rel}…"));
@@ -909,7 +896,6 @@ impl EmuPanel {
             self.frame = 0;
             self.stats = RunStats::default();
         }
-        self.charts_after_ingest = true;
         cx.notify();
 
         let this = cx.weak_entity();
@@ -941,7 +927,6 @@ impl EmuPanel {
     pub fn run_hardware_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(window, cx);
         self.build_generation += 1;
-        self.charts_after_ingest = false;
         let generation = self.build_generation;
 
         let env = self
@@ -1188,19 +1173,32 @@ impl EmuPanel {
         .into_any_element()
     }
 
-    /// The pane itself: the framebuffer at whatever size the dock gives
-    /// it, or a message. `w_full`/`h_full` on the img rather than a fixed
-    /// 320x240 -- gpui scales the one image, which is what the standalone
-    /// binary's `--scale` does with `scale_nearest`.
+    /// The pane itself: the framebuffer integer-scaled to the dock's
+    /// size, or a message. Painted through a `canvas` at the bounds
+    /// [`scaled_frame_bounds`] picks rather than a stretched
+    /// `w_full`/`h_full` img: at an integer multiple on whole-pixel
+    /// origins the sampler lands exactly on texel centers, so the
+    /// upscale is crisp (the panel's answer to the standalone binary's
+    /// `--scale` + `scale_nearest`).
     fn render_screen(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if let Some(frame) = &self.latest_frame {
+            let frame = frame.clone();
             return div()
                 .size_full()
-                .flex()
-                .justify_center()
-                .items_center()
-                .bg(gpui::black())
-                .child(img(frame.clone()).w_full().h_full())
+                .bg(cx.theme().colors().panel_background)
+                .child(gpui::canvas(
+                    |_bounds, _window, _cx| {},
+                    move |bounds, _prepaint, window, _cx| {
+                        let b = scaled_frame_bounds(bounds);
+                        // A zero-area panel has nothing to paint into;
+                        // paint_image only fails on that degenerate
+                        // clip, so log-and-drop beats poisoning the
+                        // frame with an unwrap.
+                        window
+                            .paint_image(b, b, gpui::Corners::default(), frame, 0, false)
+                            .log_err();
+                    },
+                ).size_full())
                 .into_any_element();
         }
         let message = match (self.is_running(), &self.selected) {
@@ -1467,10 +1465,89 @@ impl EmuPanel {
     }
 }
 
+/// Where the framebuffer lands inside `panel`: the largest INTEGER
+/// multiple of 320x240 that fits both axes, centered on floored
+/// whole-pixel origins -- or, in a panel smaller than one framebuffer,
+/// a fractional aspect-fit shrink (downscale blur beats clipping).
+fn scaled_frame_bounds(panel: gpui::Bounds<Pixels>) -> gpui::Bounds<Pixels> {
+    let frame_w = drive::WIDTH as f32;
+    let frame_h = drive::HEIGHT as f32;
+    let panel_w = f32::from(panel.size.width);
+    let panel_h = f32::from(panel.size.height);
+    let fit = (panel_w / frame_w).min(panel_h / frame_h);
+    let scale = if fit >= 1.0 { fit.floor() } else { fit };
+    let w = frame_w * scale;
+    let h = frame_h * scale;
+    let x = ((panel_w - w) / 2.0).floor();
+    let y = ((panel_h - h) / 2.0).floor();
+    gpui::Bounds::new(
+        gpui::point(panel.origin.x + gpui::px(x), panel.origin.y + gpui::px(y)),
+        gpui::size(gpui::px(w), gpui::px(h)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{Entity, TestAppContext};
+
+    // ------------------------------------------------- viewport scaling
+
+    /// A panel bigger than the framebuffer gets the largest INTEGER
+    /// multiple that fits both axes, centered on whole-pixel origins --
+    /// integer scale on aligned bounds is what keeps sprites crisp.
+    #[test]
+    fn scaled_frame_bounds_snaps_to_the_largest_integer_fit() {
+        let panel = gpui::Bounds::new(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(1000.), gpui::px(800.)),
+        );
+        let b = scaled_frame_bounds(panel);
+        assert_eq!(b.size.width, gpui::px(960.), "3x of 320");
+        assert_eq!(b.size.height, gpui::px(720.), "3x of 240");
+        assert_eq!(b.origin.x, gpui::px(20.), "(1000-960)/2");
+        assert_eq!(b.origin.y, gpui::px(40.), "(800-720)/2");
+    }
+
+    /// The panel's own origin offsets the centered frame.
+    #[test]
+    fn scaled_frame_bounds_is_relative_to_the_panel_origin() {
+        let panel = gpui::Bounds::new(
+            gpui::point(gpui::px(10.), gpui::px(30.)),
+            gpui::size(gpui::px(640.), gpui::px(480.)),
+        );
+        let b = scaled_frame_bounds(panel);
+        assert_eq!(b.origin.x, gpui::px(10.), "2x fills the width exactly");
+        assert_eq!(b.origin.y, gpui::px(30.));
+        assert_eq!(b.size.width, gpui::px(640.));
+        assert_eq!(b.size.height, gpui::px(480.));
+    }
+
+    /// A fractional centering remainder is floored to a whole pixel so
+    /// the texel grid stays aligned with the device grid.
+    #[test]
+    fn scaled_frame_bounds_floors_the_centering_offset() {
+        let panel = gpui::Bounds::new(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(645.), gpui::px(485.)),
+        );
+        let b = scaled_frame_bounds(panel);
+        assert_eq!(b.origin.x, gpui::px(2.), "floor(5/2)");
+        assert_eq!(b.origin.y, gpui::px(2.), "floor(5/2)");
+    }
+
+    /// A panel smaller than one framebuffer falls back to a fractional
+    /// aspect-fit shrink -- downscale blur beats clipping the screen.
+    #[test]
+    fn scaled_frame_bounds_shrinks_to_fit_a_small_panel() {
+        let panel = gpui::Bounds::new(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(160.), gpui::px(600.)),
+        );
+        let b = scaled_frame_bounds(panel);
+        assert_eq!(b.size.width, gpui::px(160.), "width-bound shrink");
+        assert_eq!(b.size.height, gpui::px(120.), "aspect preserved");
+    }
     use project::{FakeFs, Project, WorktreeId};
     use workspace::dock::DockPosition;
     use workspace::{AppState, MultiWorkspace};
@@ -3427,10 +3504,10 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// A plain Run must NOT inherit a Re-run's hop: the charts panel is
-    /// where the Re-run entry sends you, not where every run ends.
+    /// EVERY run ends at its report: a plain Run's stop ingests the run
+    /// and hands focus to the charts panel on that run, same as Re-run.
     #[gpui::test]
-    async fn test_a_plain_run_does_not_hop_to_the_charts_panel(cx: &mut TestAppContext) {
+    async fn test_a_plain_run_hops_to_the_charts_panel_on_stop(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3438,7 +3515,19 @@ mod tests {
             drive::fixture::green_screen_cart(),
         )
         .unwrap();
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let charts = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<ggo_charts_panel::ChartsPanel>(cx)
+                .expect("ggo_charts_panel::init adds its panel")
+        });
+        let db_path = dir.path().join("ggo_ide.db");
+        charts.update(cx, |charts, _cx| {
+            charts.set_db_path_override(db_path.clone());
+        });
+        panel.update(cx, |panel, _cx| {
+            panel.db_path_override = Some(db_path.clone());
+        });
 
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
@@ -3447,12 +3536,30 @@ mod tests {
         panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
         panel.update(cx, |panel, _cx| {
             assert!(
-                panel.charts_for_run.is_none(),
-                "a plain Run arms no hop at all"
+                panel.charts_for_run.is_some(),
+                "a plain Run arms the hop to its report"
             );
         });
+        await_first_frame(&panel, cx);
+
         panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
         cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                "the run must have ingested: {:?}",
+                panel.ingest_status
+            );
+            assert!(
+                panel.charts_for_run.is_none(),
+                "the arming is spent once the hop has been taken"
+            );
+        });
+        assert!(
+            cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
+            "stopping a plain run must hand focus to the charts panel"
+        );
     }
 
     // ------------------------------------ fix round 1: the two red drills
