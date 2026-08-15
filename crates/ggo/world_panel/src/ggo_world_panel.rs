@@ -155,6 +155,10 @@ pub fn init(cx: &mut App) {
 /// worlds arrive by clicking a `**/worlds/**/*.toml` in the project panel.
 const EMPTY_MESSAGE: &str = "Open a world file from the project panel";
 
+/// Screen px one arrow keypress pans the camera when nothing is selected
+/// (Shift: 4x).
+const CAMERA_PAN_STEP_PX: f64 = 32.0;
+
 /// Byte index of the LAST `worlds/` path COMPONENT in `rel`, or `None` when
 /// `rel` has none. Component-anchored: `myworlds/x.toml` does not match,
 /// only a segment that IS `worlds`.
@@ -1042,7 +1046,35 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        // Nothing selected: the arrows look around instead -- pan the
+        // camera opposite the content (arrow right slides content left).
+        // `delta`'s sign is the world direction of the keypress, so the pan
+        // step reuses it; the magnitude is the camera's own (screen px, not
+        // the nudge's world px). No pan before first layout: nothing to do.
         let Some(selection) = open.selected else {
+            let step = if tile {
+                CAMERA_PAN_STEP_PX * 4.0
+            } else {
+                CAMERA_PAN_STEP_PX
+            };
+            let mut view = open.view.borrow_mut();
+            let Some(pan) = view.pan else {
+                return;
+            };
+            // Not `signum`: `0.0_f64.signum()` is 1.0, which would drag the
+            // cross axis along.
+            let sign = |axis: f64| {
+                if axis > 0.0 {
+                    1.0
+                } else if axis < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            };
+            view.pan = Some([pan[0] - sign(delta[0]) * step, pan[1] - sign(delta[1]) * step]);
+            drop(view);
+            cx.notify();
             return;
         };
         let state = open.store.state();
@@ -1157,6 +1189,40 @@ impl WorldPanel {
             open.grid = on;
             cx.notify();
         }
+    }
+
+    /// Set the camera zoom from the zoom bar or its `-`/`+` buttons,
+    /// keeping the world point at the CANVAS CENTER fixed (these controls
+    /// have no cursor to anchor on, unlike wheel zoom). Before the first
+    /// layout there are no bounds and no pan: only the zoom is set, and the
+    /// initial centering still runs on the next paint.
+    fn set_zoom(&mut self, new_zoom: f64, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let new_zoom = new_zoom.clamp(canvas::ZOOM_MIN, canvas::ZOOM_MAX);
+        let mut view = open.view.borrow_mut();
+        if new_zoom == view.zoom {
+            return;
+        }
+        if let (Some(pan), Some(bounds)) = (view.pan, view.last_bounds) {
+            let center = [
+                f64::from(bounds.size.width) / 2.0,
+                f64::from(bounds.size.height) / 2.0,
+            ];
+            view.pan = Some(canvas::zoom_at(pan, view.zoom, center, new_zoom));
+        }
+        view.zoom = new_zoom;
+        drop(view);
+        cx.notify();
+    }
+
+    fn step_zoom(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let zoom = open.view.borrow().zoom;
+        self.set_zoom(canvas::zoom_step(zoom, dir), cx);
     }
 
     fn step_preview_scale(&mut self, dir: i32, cx: &mut Context<Self>) {
@@ -2057,6 +2123,54 @@ impl WorldPanel {
                             })
                             .ok();
                     }),
+            )
+            .child(
+                IconButton::new("ggo-world-zoom-minus", IconName::Dash)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Zoom out"))
+                    .disabled(zoom <= canvas::ZOOM_MIN)
+                    .on_click(cx.listener(|this, _, _, cx| this.step_zoom(-1, cx))),
+            )
+            .child(
+                // The zoom bar: one segment per ladder level, filled up to
+                // the current zoom. Click or drag across segments to set the
+                // level directly -- per-segment mouse handlers, so no
+                // track-bounds math and drag needs no capture (the segment
+                // under the cursor hears the move).
+                h_flex().gap_0p5().children(canvas::ZOOM_LEVELS.iter().enumerate().map(
+                    |(index, &level)| {
+                        let filled = level <= zoom + 1e-9;
+                        div()
+                            .id(("ggo-world-zoom-bar", index))
+                            .w(px(6.0))
+                            .h(px(10.0))
+                            .rounded_xs()
+                            .bg(if filled {
+                                cx.theme().colors().text_accent
+                            } else {
+                                cx.theme().colors().element_background
+                            })
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.set_zoom(level, cx)),
+                            )
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &MouseMoveEvent, _, cx| {
+                                    if event.pressed_button == Some(MouseButton::Left) {
+                                        this.set_zoom(level, cx);
+                                    }
+                                },
+                            ))
+                    },
+                )),
+            )
+            .child(
+                IconButton::new("ggo-world-zoom-plus", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Zoom in"))
+                    .disabled(zoom >= canvas::ZOOM_MAX)
+                    .on_click(cx.listener(|this, _, _, cx| this.step_zoom(1, cx))),
             )
             .child(
                 Label::new(format!("{:.0}%", zoom * 100.0))
@@ -4093,6 +4207,103 @@ mod tests {
             let v = open_of(panel).view.borrow();
             assert_eq!(v.zoom, canvas::ZOOM_DEFAULT);
             assert_eq!(v.pan, None, "reset re-arms the initial centering");
+        });
+    }
+
+    /// `set_zoom` (the zoom bar and `-`/`+` buttons) re-anchors the pan so
+    /// the world point at the CANVAS CENTER stays put, and falls back to a
+    /// plain zoom assignment before the first layout (no bounds yet).
+    #[gpui::test]
+    async fn test_set_zoom_anchors_at_the_canvas_center(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            {
+                let mut v = open_of(panel).view.borrow_mut();
+                v.zoom = 1.0;
+                v.pan = Some([10.0, 20.0]);
+                v.last_bounds = Some(gpui::bounds(
+                    gpui::point(px(0.0), px(0.0)),
+                    gpui::size(px(200.0), px(100.0)),
+                ));
+            }
+            panel.set_zoom(2.0, cx);
+            {
+                let v = open_of(panel).view.borrow();
+                assert_eq!(v.zoom, 2.0);
+                assert_eq!(
+                    v.pan,
+                    Some(canvas::zoom_at([10.0, 20.0], 1.0, [100.0, 50.0], 2.0))
+                );
+            }
+
+            // Out-of-range requests clamp to the ladder ends.
+            panel.set_zoom(100.0, cx);
+            assert_eq!(open_of(panel).view.borrow().zoom, canvas::ZOOM_MAX);
+
+            // Before the first layout there is nothing to anchor: zoom is
+            // set, pan stays None so the initial centering still runs.
+            {
+                let mut v = open_of(panel).view.borrow_mut();
+                v.pan = None;
+                v.last_bounds = None;
+            }
+            panel.set_zoom(0.5, cx);
+            {
+                let v = open_of(panel).view.borrow();
+                assert_eq!(v.zoom, 0.5);
+                assert_eq!(v.pan, None);
+            }
+
+            // The `-`/`+` buttons walk the same ladder as the wheel.
+            panel.step_zoom(1, cx);
+            assert_eq!(open_of(panel).view.borrow().zoom, 1.0);
+            panel.step_zoom(-1, cx);
+            assert_eq!(open_of(panel).view.borrow().zoom, 0.5);
+        });
+    }
+
+    /// With NOTHING selected, arrows fall through to panning the camera:
+    /// arrow right looks right (content slides left, pan.x decreases),
+    /// shift pans by the larger step. Before first layout (pan `None`)
+    /// there is no camera to move, and with a selection arrows still
+    /// nudge -- pan untouched.
+    #[gpui::test]
+    async fn test_arrow_keys_pan_the_camera_when_nothing_is_selected(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = None,
+                _ => panic!("expected Ready"),
+            }
+            open_of(panel).view.borrow_mut().pan = Some([0.0, 0.0]);
+
+            panel.nudge_impl("ArrowRight", false, cx);
+            assert_eq!(open_of(panel).view.borrow().pan, Some([-32.0, 0.0]));
+            panel.nudge_impl("ArrowDown", true, cx);
+            assert_eq!(open_of(panel).view.borrow().pan, Some([-32.0, -128.0]));
+            panel.nudge_impl("ArrowLeft", false, cx);
+            panel.nudge_impl("ArrowUp", false, cx);
+            assert_eq!(open_of(panel).view.borrow().pan, Some([0.0, -96.0]));
+
+            // Pre-layout: no pan yet, nothing to move.
+            open_of(panel).view.borrow_mut().pan = None;
+            panel.nudge_impl("ArrowRight", false, cx);
+            assert_eq!(open_of(panel).view.borrow().pan, None);
+
+            // Selected: the nudge path runs instead, camera stays put.
+            match &mut panel.state {
+                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                _ => panic!("expected Ready"),
+            }
+            open_of(panel).view.borrow_mut().pan = Some([5.0, 6.0]);
+            let start = entity_pos_of(panel, 0);
+            panel.nudge_impl("ArrowRight", false, cx);
+            assert_eq!(open_of(panel).view.borrow().pan, Some([5.0, 6.0]));
+            assert_eq!(entity_pos_of(panel, 0), [start[0] + 1.0, start[1]]);
         });
     }
 
