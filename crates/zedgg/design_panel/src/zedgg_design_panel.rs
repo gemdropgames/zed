@@ -33,7 +33,7 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 use zedgg_project_db::design_docs::{self, DesignNode, NodeKind, ROOT_ID};
 use zedgg_project_db::{Connection, DB_FILE, open, open_existing};
 
-pub use doc_view::DesignDocView;
+pub use doc_view::{DesignDocView, open_doc};
 
 actions!(
     zedgg_design,
@@ -406,9 +406,20 @@ impl DesignPanel {
 
     fn click_row(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(id);
+        let is_markdown_file = self
+            .node(id)
+            .is_some_and(|n| n.kind == NodeKind::File && is_markdown_name(&n.name));
         match self.node(id).map(|n| n.kind) {
             Some(NodeKind::Folder) => self.toggle_expanded(id, cx),
             Some(NodeKind::Doc) => self.open_doc(id, window, cx),
+            // Markdown imported before docs were recognized sits in the DB
+            // as a blob `File`; convert it in place and open the editor.
+            Some(NodeKind::File) if is_markdown_file => self.mutate(
+                window,
+                cx,
+                move |connection| design_docs::convert_file_to_doc(connection, id),
+                move |this, (), window, cx| this.open_doc_by_id(id, window, cx),
+            ),
             _ => cx.notify(),
         }
     }
@@ -842,7 +853,25 @@ impl DesignPanel {
                         .ok_or_else(|| anyhow::anyhow!("bad file name {}", path.display()))?;
                     let bytes = std::fs::read(path)
                         .with_context(|| format!("reading {}", path.display()))?;
-                    design_docs::create_file(connection, parent_id, name, &bytes)?;
+                    if is_markdown_name(name) {
+                        match String::from_utf8(bytes) {
+                            Ok(text) => {
+                                design_docs::create_doc_with_body(
+                                    connection, parent_id, name, &text,
+                                )?;
+                            }
+                            Err(error) => {
+                                design_docs::create_file(
+                                    connection,
+                                    parent_id,
+                                    name,
+                                    error.as_bytes(),
+                                )?;
+                            }
+                        }
+                    } else {
+                        design_docs::create_file(connection, parent_id, name, &bytes)?;
+                    }
                 }
                 Ok(())
             },
@@ -866,6 +895,15 @@ impl DesignPanel {
             move |this, (), _, _| this.selected = Some(id),
         );
     }
+}
+
+fn is_markdown_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
 }
 
 impl Render for DesignPanel {
@@ -1352,5 +1390,47 @@ mod interaction_tests {
         let c = open(dir.path()).unwrap();
         let file = design_docs::resolve_path(&c, a, "shot.png").unwrap().unwrap();
         assert_eq!(design_docs::load_file(&c, file.id).unwrap(), b"\x89PNGdata");
+
+        // Markdown imports become editable docs, not blobs.
+        let markdown = dir.path().join("notes.md");
+        std::fs::write(&markdown, "# Notes\n").unwrap();
+        panel.update_in(cx, |panel, window, cx| {
+            panel.import_paths(a, vec![markdown], window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.error.is_none(), "{:?}", panel.error);
+            let doc = panel.nodes.iter().find(|n| n.name == "notes.md").unwrap();
+            assert_eq!((doc.kind, doc.parent_id), (NodeKind::Doc, Some(a)));
+        });
+        let doc = design_docs::resolve_path(&c, a, "notes.md").unwrap().unwrap();
+        assert_eq!(design_docs::load_body(&c, doc.id).unwrap(), "# Notes\n");
+    }
+
+    #[gpui::test]
+    async fn test_click_legacy_markdown_file_converts_and_opens(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = design_workspace(cx, dir.path()).await;
+        let file_id = {
+            let c = open(dir.path()).unwrap();
+            design_docs::create_file(&c, ROOT_ID, "legacy.md", b"# Legacy\n").unwrap()
+        };
+        panel.update(cx, |panel, cx| panel.reload(cx));
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| panel.click_row(file_id, window, cx));
+        cx.run_until_parked();
+
+        let c = open(dir.path()).unwrap();
+        let node = design_docs::get_node(&c, file_id).unwrap().unwrap();
+        assert_eq!(node.kind, NodeKind::Doc, "click converts legacy .md file");
+        assert_eq!(design_docs::load_body(&c, file_id).unwrap(), "# Legacy\n");
+        let view = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<DesignDocView>(cx)
+                .next()
+                .expect("conversion opens the doc tab")
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.doc_id()), file_id);
     }
 }

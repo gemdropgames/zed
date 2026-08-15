@@ -37,7 +37,7 @@ impl QuickActionBar {
             return None;
         }
 
-        let editor = self.active_editor()?;
+        let editor = self.active_editor(cx)?;
 
         let is_valid_project = editor
             .read(cx)
@@ -277,7 +277,7 @@ impl QuickActionBar {
     }
 
     pub fn render_kernel_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = if let Some(editor) = self.active_editor() {
+        let editor = if let Some(editor) = self.active_editor(cx) {
             editor
         } else {
             return div().into_any_element();

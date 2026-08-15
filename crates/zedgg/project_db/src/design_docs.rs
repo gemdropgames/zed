@@ -141,6 +141,32 @@ pub fn create_doc(connection: &Connection, parent_id: i64, name: &str) -> Result
     insert(connection, parent_id, NodeKind::Doc, name, Some(""), None)
 }
 
+pub fn create_doc_with_body(
+    connection: &Connection,
+    parent_id: i64,
+    name: &str,
+    body: &str,
+) -> Result<i64> {
+    insert(connection, parent_id, NodeKind::Doc, name, Some(body), None)
+}
+
+/// Convert a UTF-8 text `File` node (markdown imported before docs were
+/// recognized, say) into an editable `Doc` in place, keeping its id, name
+/// and position in the tree.
+pub fn convert_file_to_doc(connection: &Connection, id: i64) -> Result<()> {
+    match get_node(connection, id)? {
+        Some(node) if node.kind == NodeKind::File => {}
+        Some(node) => bail!("{:?} is not a file", node.name),
+        None => bail!("no design node with id {id}"),
+    }
+    let body = String::from_utf8(load_file(connection, id)?)
+        .context("file is not valid UTF-8 text")?;
+    connection.exec_bound::<(&str, i64)>(
+        "UPDATE design_nodes SET kind = 'doc', body = ?, data = NULL, \
+         updated_at = datetime('now') WHERE id = ?",
+    )?((&body, id))
+}
+
 pub fn create_file(
     connection: &Connection,
     parent_id: i64,
@@ -310,6 +336,23 @@ mod tests {
         assert!(create_doc(&c, ROOT_ID, "..").is_err());
         let doc = create_doc(&c, ROOT_ID, "d").unwrap();
         assert!(create_doc(&c, doc, "child").is_err(), "docs are not folders");
+    }
+
+    #[test]
+    fn convert_file_to_doc_keeps_place_and_requires_utf8_file() {
+        let c = open_memory("design_docs_convert");
+        let folder = create_folder(&c, ROOT_ID, "specs").unwrap();
+        let file = create_file(&c, folder, "combat.md", "# Combat\n".as_bytes()).unwrap();
+        convert_file_to_doc(&c, file).unwrap();
+        let node = get_node(&c, file).unwrap().unwrap();
+        assert_eq!((node.kind, node.parent_id), (NodeKind::Doc, Some(folder)));
+        assert_eq!(load_body(&c, file).unwrap(), "# Combat\n");
+        save_body(&c, file, "edited").unwrap();
+
+        assert!(convert_file_to_doc(&c, file).is_err(), "already a doc");
+        let binary = create_file(&c, folder, "shot.png", b"\x89PNG\xff").unwrap();
+        assert!(convert_file_to_doc(&c, binary).is_err(), "not UTF-8");
+        assert_eq!(load_file(&c, binary).unwrap(), b"\x89PNG\xff", "unchanged");
     }
 
     #[test]

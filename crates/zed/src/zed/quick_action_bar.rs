@@ -81,10 +81,12 @@ impl QuickActionBar {
         this
     }
 
-    fn active_editor(&self) -> Option<Entity<Editor>> {
+    // ZedGG: `act_as` instead of `downcast` so items that wrap an editor
+    // (e.g. `DesignDocView`) get the toolbar too.
+    fn active_editor(&self, cx: &App) -> Option<Entity<Editor>> {
         self.active_item
             .as_ref()
-            .and_then(|item| item.downcast::<Editor>())
+            .and_then(|item| item.act_as::<Editor>(cx))
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
@@ -92,13 +94,13 @@ impl QuickActionBar {
         if new_show != self.show {
             self.show = new_show;
             cx.emit(ToolbarItemEvent::ChangeLocation(
-                self.get_toolbar_item_location(),
+                self.get_toolbar_item_location(cx),
             ));
         }
     }
 
-    fn get_toolbar_item_location(&self) -> ToolbarItemLocation {
-        if self.show && self.active_editor().is_some() {
+    fn get_toolbar_item_location(&self, cx: &App) -> ToolbarItemLocation {
+        if self.show && self.active_editor(cx).is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
             ToolbarItemLocation::Hidden
@@ -108,7 +110,7 @@ impl QuickActionBar {
 
 impl Render for QuickActionBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(editor) = self.active_editor() else {
+        let Some(editor) = self.active_editor(cx) else {
             return div().id("empty quick action bar");
         };
 
@@ -818,6 +820,6 @@ impl ToolbarItemView for QuickActionBar {
                     }));
             }
         }
-        self.get_toolbar_item_location()
+        self.get_toolbar_item_location(cx)
     }
 }

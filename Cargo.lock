@@ -24591,6 +24591,7 @@ dependencies = [
  "zed_credentials_provider",
  "zed_env_vars",
  "zedgg_design_panel",
+ "zedgg_project_db",
  "zlog",
  "zlog_settings",
  "ztracing",

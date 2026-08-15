@@ -1,43 +1,48 @@
 use csv_preview::{CsvPreviewView, TabularDataPreviewFeatureFlag};
 use editor::{Editor, MultiBuffer};
 use feature_flags::FeatureFlagAppExt as _;
-use gpui::{AnyElement, Entity, Modifiers};
+use gpui::{AnyElement, Entity};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use svg_preview::svg_preview_view::SvgPreviewView;
-use ui::{Tooltip, prelude::*, text_for_keystroke};
+use ui::{Tooltip, prelude::*};
 
 use super::QuickActionBar;
 
-enum PreviewTarget {
+pub(crate) enum PreviewTarget {
     Markdown(Entity<Editor>),
     Svg(Entity<MultiBuffer>),
     Csv(Entity<Editor>),
 }
 
 impl QuickActionBar {
-    pub fn render_preview_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // Resolve against this toolbar's own pane item rather than the
-        // workspace's focused item, so each pane's button reflects and
-        // targets the content of the pane it belongs to.
+    // Resolves against this toolbar's own pane item rather than the
+    // workspace's focused item, so each pane's button reflects and
+    // targets the content of the pane it belongs to.
+    pub(crate) fn preview_target(&self, cx: &App) -> Option<PreviewTarget> {
         let active_item = self.active_item.as_ref()?;
         let editor = active_item.act_as::<Editor>(cx);
 
-        let preview_target = if let Some(editor) = &editor
+        if let Some(editor) = &editor
             && MarkdownPreviewView::is_markdown_file(editor, cx)
         {
-            PreviewTarget::Markdown(editor.clone())
+            Some(PreviewTarget::Markdown(editor.clone()))
         } else if let Some(buffer) = active_item.act_as::<MultiBuffer>(cx)
             && SvgPreviewView::is_svg_file(&buffer, cx)
         {
-            PreviewTarget::Svg(buffer)
+            Some(PreviewTarget::Svg(buffer))
         } else if let Some(editor) = editor
             && cx.has_flag::<TabularDataPreviewFeatureFlag>()
             && CsvPreviewView::is_csv_file(&editor, cx)
         {
-            PreviewTarget::Csv(editor)
+            Some(PreviewTarget::Csv(editor))
         } else {
-            return None;
-        };
+            None
+        }
+    }
+
+    pub fn render_preview_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active_item = self.active_item.as_ref()?;
+        let preview_target = self.preview_target(cx)?;
 
         let (button_id, tooltip_text, open_action_for_tooltip) = match &preview_target {
             PreviewTarget::Markdown(_) => (
@@ -57,25 +62,11 @@ impl QuickActionBar {
             ),
         };
 
-        let alt_click = gpui::Keystroke {
-            key: "click".into(),
-            modifiers: Modifiers::alt(),
-            ..Default::default()
-        };
-
         let button = IconButton::new(button_id, IconName::Eye)
             .icon_size(IconSize::Small)
             .style(ButtonStyle::Subtle)
             .tooltip(move |_window, cx| {
-                Tooltip::with_meta(
-                    tooltip_text,
-                    Some(open_action_for_tooltip),
-                    format!(
-                        "{} to open in a split",
-                        text_for_keystroke(&alt_click.modifiers, &alt_click.key, cx)
-                    ),
-                    cx,
-                )
+                Tooltip::for_action(tooltip_text, open_action_for_tooltip, cx)
             })
             .on_click({
                 let workspace_handle = self.workspace.clone();
@@ -88,41 +79,36 @@ impl QuickActionBar {
                         let Some(pane) = workspace.pane_for(active_item.as_ref()) else {
                             return;
                         };
-                        let open_to_the_side = window.modifiers().alt;
+                        // ZedGG: always open in a split beside the editor
+                        // (reusing the adjacent pane when one exists), never
+                        // on top of the tab being previewed.
                         match &preview_target {
                             PreviewTarget::Markdown(editor) => {
-                                let editor = editor.clone();
-                                if open_to_the_side {
-                                    MarkdownPreviewView::open_preview_to_the_side_of_pane(
-                                        workspace, editor, pane, window, cx,
-                                    );
-                                } else {
-                                    MarkdownPreviewView::open_preview_in_pane(
-                                        workspace, editor, pane, window, cx,
-                                    );
-                                }
+                                MarkdownPreviewView::open_preview_to_the_side_of_pane(
+                                    workspace,
+                                    editor.clone(),
+                                    pane,
+                                    window,
+                                    cx,
+                                );
                             }
                             PreviewTarget::Svg(buffer) => {
-                                let buffer = buffer.clone();
-                                if open_to_the_side {
-                                    SvgPreviewView::open_preview_to_the_side_of_pane(
-                                        workspace, buffer, pane, window, cx,
-                                    );
-                                } else {
-                                    SvgPreviewView::open_preview_in_pane(
-                                        workspace, buffer, pane, window, cx,
-                                    );
-                                }
+                                SvgPreviewView::open_preview_to_the_side_of_pane(
+                                    workspace,
+                                    buffer.clone(),
+                                    pane,
+                                    window,
+                                    cx,
+                                );
                             }
                             PreviewTarget::Csv(editor) => {
-                                let editor = editor.clone();
-                                if open_to_the_side {
-                                    CsvPreviewView::open_preview_to_the_side_of_pane(
-                                        workspace, editor, pane, window, cx,
-                                    );
-                                } else {
-                                    CsvPreviewView::open_preview_in_pane(editor, pane, window, cx);
-                                }
+                                CsvPreviewView::open_preview_to_the_side_of_pane(
+                                    workspace,
+                                    editor.clone(),
+                                    pane,
+                                    window,
+                                    cx,
+                                );
                             }
                         }
                     });

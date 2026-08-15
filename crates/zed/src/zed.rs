@@ -6127,6 +6127,70 @@ mod tests {
         })
     }
 
+    // ZedGG: the eye preview button in the quick action bar must show for
+    // design doc tabs, which wrap an editor rather than being one.
+    #[gpui::test]
+    async fn test_quick_action_bar_eye_button_for_design_doc(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| markdown_preview::init(cx));
+
+        let dir = tempfile::tempdir().unwrap();
+        let doc_id = {
+            let connection = zedgg_project_db::open(dir.path()).unwrap();
+            zedgg_project_db::design_docs::create_doc(
+                &connection,
+                zedgg_project_db::design_docs::ROOT_ID,
+                "gdd.md",
+            )
+            .unwrap()
+        };
+
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        project.update(cx, |project, _| project.languages().add(markdown_lang()));
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        window
+            .update(cx, |_, window, cx| {
+                zedgg_design_panel::open_doc(
+                    workspace.downgrade(),
+                    dir.path().to_path_buf(),
+                    doc_id,
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // No manual `set_active_pane_item`: the pane's own activation
+        // pipeline must have handed the design doc to the bar. The gate is
+        // checked via `preview_target` rather than `render_preview_button`
+        // because building an element outside a frame parks its handles in
+        // the element arena, which the leak detector reports.
+        pane.read_with(cx, |pane, cx| {
+            let active_item = pane.active_item().expect("design doc tab is open");
+            assert!(
+                active_item
+                    .downcast::<zedgg_design_panel::DesignDocView>()
+                    .is_some(),
+                "active item should be the design doc"
+            );
+            let quick_action_bar = pane
+                .toolbar()
+                .read(cx)
+                .item_of_type::<QuickActionBar>()
+                .expect("quick action bar on pane toolbar");
+            assert!(
+                quick_action_bar.read(cx).preview_target(cx).is_some(),
+                "eye preview button should show for a design doc"
+            );
+        });
+    }
+
     #[track_caller]
     fn assert_key_bindings_for(
         window: AnyWindowHandle,

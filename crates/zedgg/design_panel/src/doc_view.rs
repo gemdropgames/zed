@@ -112,7 +112,12 @@ pub fn open_doc(
                         cx,
                     )
                 });
-                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+                let editor = view.read(cx).editor.clone();
+                let pane = workspace.active_pane().clone();
+                markdown_preview::markdown_preview_view::MarkdownPreviewView::open_preview_to_the_side_of_pane(
+                    workspace, editor, pane, window, cx,
+                );
             })
         })
         .detach_and_log_err(cx);

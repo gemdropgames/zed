@@ -291,6 +291,8 @@ image.workspace = true
 agent_ui = { workspace = true, features = ["test-support"] }
 search = { workspace = true, features = ["test-support"] }
 repl = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true # ZedGG
+zedgg_project_db.workspace = true # ZedGG
 
 
 
