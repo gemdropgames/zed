@@ -976,7 +976,18 @@ impl MarkdownPreviewView {
             .show_root_block_markers()
             .image_resolver({
                 let base_directory = self.base_directory.clone();
+                // ZedGG
+                let extra_resolver = active_editor.as_ref().and_then(|editor| {
+                    let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+                    crate::buffer_image_resolver(cx, buffer.entity_id())
+                });
+                // ZedGG
                 move |dest_url| {
+                    // ZedGG
+                    if let Some(source) = extra_resolver.as_ref().and_then(|r| r(dest_url)) {
+                        return Some(source);
+                    }
+                    // ZedGG
                     resolve_preview_image(
                         dest_url,
                         base_directory.as_deref(),

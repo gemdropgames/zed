@@ -783,6 +783,7 @@ fn main() {
         ggo_sprite_panel::init(cx); // GGO
         ggo_tileset_panel::init(cx); // GGO
         ggo_world_panel::init(cx); // GGO
+        zedgg_design_panel::init(cx); // ZedGG
         onboarding::init(cx);
         settings_ui::init(cx);
         keymap_editor::init(cx);

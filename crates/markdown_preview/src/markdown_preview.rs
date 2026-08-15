@@ -1,6 +1,44 @@
 use gpui::{App, actions};
 use workspace::Workspace;
 
+// ZedGG
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use gpui::{EntityId, Global, ImageSource};
+
+/// ZedGG: an extra image resolver for one buffer's preview, consulted
+/// before the file-system-relative resolution. Lets a buffer that has no
+/// file on disk (ZedGG's design docs live in `zedgg.sqlite`) still show
+/// `![](images/x.png)`.
+pub type BufferImageResolver = Arc<dyn Fn(&str) -> Option<ImageSource> + Send + Sync>;
+
+#[derive(Default)]
+struct BufferImageResolvers(HashMap<EntityId, BufferImageResolver>);
+
+impl Global for BufferImageResolvers {}
+
+/// ZedGG: register `resolver` for the singleton `Buffer` with id `buffer`.
+pub fn set_buffer_image_resolver(cx: &mut App, buffer: EntityId, resolver: BufferImageResolver) {
+    cx.default_global::<BufferImageResolvers>()
+        .0
+        .insert(buffer, resolver);
+}
+
+/// ZedGG: forget the resolver registered for `buffer`.
+pub fn remove_buffer_image_resolver(cx: &mut App, buffer: EntityId) {
+    cx.default_global::<BufferImageResolvers>()
+        .0
+        .remove(&buffer);
+}
+
+/// ZedGG: the resolver registered for `buffer`, if any.
+pub fn buffer_image_resolver(cx: &App, buffer: EntityId) -> Option<BufferImageResolver> {
+    cx.try_global::<BufferImageResolvers>()
+        .and_then(|resolvers| resolvers.0.get(&buffer).cloned())
+}
+// ZedGG
+
 pub mod markdown_preview_settings;
 pub mod markdown_preview_view;
 
