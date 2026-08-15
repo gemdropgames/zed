@@ -171,10 +171,6 @@ impl DesignDocView {
         self.doc_id
     }
 
-    pub fn project_root(&self) -> &Path {
-        &self.project_root
-    }
-
     pub fn set_name(&mut self, name: SharedString, cx: &mut Context<Self>) {
         self.name = name;
         cx.emit(EditorEvent::TitleChanged);
