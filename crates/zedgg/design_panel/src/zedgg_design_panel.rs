@@ -18,18 +18,20 @@ mod doc_view;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString,
-    Subscription, Task, WeakEntity, Window, actions, anchored, deferred, div, px, uniform_list,
+    Action, App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    PathPromptOptions, Pixels, Point, Render, SharedString, Subscription, Task, WeakEntity,
+    Window, actions, anchored, deferred, div, px, uniform_list,
 };
+use project::Project;
 use ui::{ContextMenu, ListItem, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use zedgg_project_db::design_docs::{self, DesignNode, NodeKind, ROOT_ID};
-use zedgg_project_db::{Connection, open, open_existing};
+use zedgg_project_db::{Connection, DB_FILE, open, open_existing};
 
 pub use doc_view::DesignDocView;
 
@@ -70,7 +72,8 @@ pub fn init(cx: &mut App) {
             return;
         };
         let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| DesignPanel::new(Some(weak_workspace), cx));
+        let project = workspace.project().clone();
+        let panel = cx.new(|cx| DesignPanel::new(Some((weak_workspace, project)), cx));
         workspace.add_panel(panel, window, cx);
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<DesignPanel>(window, cx);
@@ -138,6 +141,27 @@ pub struct DesignPanel {
     error: Option<SharedString>,
     load_generation: u64,
     _load_task: Option<Task<()>>,
+    _project_subscription: Option<Subscription>,
+}
+
+/// What a tree row carries while being dragged onto a folder.
+#[derive(Clone, Debug)]
+struct DraggedNode {
+    id: i64,
+    name: SharedString,
+}
+
+struct DragPreview(SharedString);
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(cx.theme().colors().element_background)
+            .child(Label::new(self.0.clone()).size(LabelSize::Small))
+    }
 }
 
 fn synthetic_root() -> DesignNode {
@@ -150,9 +174,30 @@ fn synthetic_root() -> DesignNode {
 }
 
 impl DesignPanel {
-    pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: Option<(WeakEntity<Workspace>, Entity<Project>)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut expanded = HashSet::new();
         expanded.insert(ROOT_ID);
+        let (workspace, project) = workspace.unzip();
+        // `git checkout`/`pull` swapping `zedgg.sqlite` under us: re-read
+        // the tree when the worktree reports that file changed. Our own
+        // writes trigger this too, which is a harmless second reload.
+        let _project_subscription = project.map(|project| {
+            cx.subscribe(&project, |this, _, event: &project::Event, cx| {
+                if let project::Event::WorktreeUpdatedEntries(_, changes) = event
+                    && changes
+                        .iter()
+                        .any(|(path, _, _)| path.file_name() == Some(DB_FILE))
+                {
+                    this.reload(cx);
+                    for view in this.open_views(cx) {
+                        view.update(cx, |view, cx| view.clear_image_cache(cx));
+                    }
+                }
+            })
+        });
         Self {
             focus_handle: cx.focus_handle(),
             position: DockPosition::Left,
@@ -169,6 +214,7 @@ impl DesignPanel {
             error: None,
             load_generation: 0,
             _load_task: None,
+            _project_subscription,
         }
     }
 
@@ -222,12 +268,10 @@ impl DesignPanel {
                     Ok(Some(nodes)) => {
                         this.nodes = nodes;
                         this.db_exists = true;
-                        this.error = None;
                     }
                     Ok(None) => {
                         this.nodes = vec![synthetic_root()];
                         this.db_exists = false;
-                        this.error = None;
                     }
                     Err(error) => this.error = Some(format!("{error:#}").into()),
                 }
@@ -262,15 +306,16 @@ impl DesignPanel {
             cx.notify();
             return;
         };
+        // A new attempt clears the previous attempt's error; `reload`
+        // deliberately leaves `error` alone so a failed mutation stays
+        // visible past the reload that follows it.
+        self.error = None;
         let write = cx.background_spawn(async move { op(&open(&root)?) });
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
             this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(value) => {
-                        this.error = None;
-                        then(this, value, window, cx);
-                    }
+                    Ok(value) => then(this, value, window, cx),
                     Err(error) => this.error = Some(format!("{error:#}").into()),
                 }
                 this.reload(cx);
@@ -643,7 +688,8 @@ impl DesignPanel {
             NodeKind::File => IconName::File,
         };
         let selected = self.selected == Some(id) && !row.pending;
-        ListItem::new(("zedgg-design-row", ix))
+        let name = row.name.clone();
+        let item = ListItem::new(("zedgg-design-row", ix))
             .indent_level(row.depth)
             .indent_step_size(INDENT)
             .toggle_state(selected)
@@ -674,7 +720,35 @@ impl DesignPanel {
                             .size(LabelSize::Small)
                             .into_any_element(),
                     }),
-            )
+            );
+        div()
+            .id(("zedgg-design-row-drag", ix))
+            .when(!row.pending && id != ROOT_ID, |this| {
+                this.on_drag(
+                    DraggedNode {
+                        id,
+                        name: name.clone(),
+                    },
+                    |dragged, _, _, cx| cx.new(|_| DragPreview(dragged.name.clone())),
+                )
+            })
+            .when(is_folder && !row.pending, |this| {
+                this.drag_over::<DraggedNode>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .on_drop(cx.listener(move |this, dragged: &DraggedNode, window, cx| {
+                    cx.stop_propagation();
+                    this.move_node(dragged.id, id, window, cx);
+                }))
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                    cx.stop_propagation();
+                    this.import_paths(id, paths.paths().to_vec(), window, cx);
+                }))
+            })
+            .child(item)
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -720,10 +794,77 @@ impl DesignPanel {
             )
     }
 
-    fn import_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        // Step 6 wires the file prompt + external drop.
-        self.error = Some("Import is not wired yet".into());
-        cx.notify();
+    fn import_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_root.is_none() {
+            self.error = Some(EMPTY_MESSAGE.into());
+            cx.notify();
+            return;
+        }
+        let parent_id = self.target_folder();
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                this.update_in(cx, |this, window, cx| {
+                    this.import_paths(parent_id, paths, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Store each file's bytes as a `file` node under `parent_id`, named
+    /// by its file name. Directories are skipped.
+    fn import_paths(
+        &mut self,
+        parent_id: i64,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        self.expanded.insert(parent_id);
+        self.mutate(
+            window,
+            cx,
+            move |connection| {
+                for path in paths.iter().filter(|p| p.is_file()) {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| anyhow::anyhow!("bad file name {}", path.display()))?;
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    design_docs::create_file(connection, parent_id, name, &bytes)?;
+                }
+                Ok(())
+            },
+            |this, (), _, cx| {
+                for view in this.open_views(cx) {
+                    view.update(cx, |view, cx| view.clear_image_cache(cx));
+                }
+            },
+        );
+    }
+
+    fn move_node(&mut self, id: i64, new_parent_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if id == new_parent_id || self.node(id).is_some_and(|n| n.parent_id == Some(new_parent_id)) {
+            return;
+        }
+        self.expanded.insert(new_parent_id);
+        self.mutate(
+            window,
+            cx,
+            move |connection| design_docs::move_node(connection, id, new_parent_id),
+            move |this, (), _, _| this.selected = Some(id),
+        );
     }
 }
 
@@ -780,6 +921,12 @@ impl Render for DesignPanel {
                     .id("zedgg-design-tree")
                     .flex_1()
                     .min_h_0()
+                    .on_drop(cx.listener(|this, dragged: &DraggedNode, window, cx| {
+                        this.move_node(dragged.id, ROOT_ID, window, cx);
+                    }))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        this.import_paths(ROOT_ID, paths.paths().to_vec(), window, cx);
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
@@ -904,7 +1051,7 @@ mod tests {
     /// A workspace with the panel registered and pointed at `root` (a real
     /// temp dir) via `root_override`, so DB reads/writes hit disk while
     /// the project itself is a `FakeFs`.
-    async fn design_workspace<'a>(
+    pub(super) async fn design_workspace<'a>(
         cx: &'a mut TestAppContext,
         root: &std::path::Path,
     ) -> (
@@ -944,7 +1091,7 @@ mod tests {
         (workspace, panel, cx)
     }
 
-    fn row_names(panel: &DesignPanel) -> Vec<(usize, String)> {
+    pub(super) fn row_names(panel: &DesignPanel) -> Vec<(usize, String)> {
         panel
             .rows
             .iter()
@@ -1109,5 +1256,101 @@ mod tests {
         assert!(resolver("images/missing.png").is_none());
         assert!(resolver("../specs/images/hero.png").is_some());
         assert!(resolver("https://example.com/x.png").is_none(), "left to the path resolver");
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::tests::*;
+    use super::*;
+    use gpui::TestAppContext;
+    use workspace::item::Item as _;
+
+    #[gpui::test]
+    async fn test_rename_retitles_open_tab_and_delete_closes_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = design_workspace(cx, dir.path()).await;
+        let (folder, doc) = {
+            let c = open(dir.path()).unwrap();
+            let folder = design_docs::create_folder(&c, ROOT_ID, "f").unwrap();
+            (folder, design_docs::create_doc(&c, folder, "old.md").unwrap())
+        };
+        panel.update(cx, |panel, cx| panel.reload(cx));
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.open_doc_by_id(doc, window, cx));
+        cx.run_until_parked();
+        let view = workspace.read_with(cx, |workspace, cx| {
+            workspace.items_of_type::<DesignDocView>(cx).next().unwrap()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected = Some(doc);
+            panel.rename_selected(window, cx);
+            let editor = panel.edit.as_ref().unwrap().editor.clone();
+            assert_eq!(editor.read(cx).text(cx), "old.md", "prefilled");
+            editor.update(cx, |editor, cx| editor.set_text("new.md", window, cx));
+            panel.confirm_edit(window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| assert_eq!(view.tab_content_text(0, cx), "new.md"));
+
+        // Delete the FOLDER: cascade removes the doc, its tab closes.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected = Some(folder);
+            panel.delete_selected(window, cx);
+        });
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<DesignDocView>(cx).count(), 0);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(row_names(panel), [(0, "Design Docs".to_string())]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_move_and_import(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, cx) = design_workspace(cx, dir.path()).await;
+        let (a, b, doc) = {
+            let c = open(dir.path()).unwrap();
+            let a = design_docs::create_folder(&c, ROOT_ID, "a").unwrap();
+            let b = design_docs::create_folder(&c, ROOT_ID, "b").unwrap();
+            (a, b, design_docs::create_doc(&c, a, "d.md").unwrap())
+        };
+        panel.update(cx, |panel, cx| panel.reload(cx));
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| panel.move_node(doc, b, window, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node(doc).unwrap().parent_id, Some(b));
+            assert!(panel.expanded.contains(&b), "drop target expands");
+            assert!(panel.error.is_none());
+        });
+
+        // Illegal move surfaces an error and changes nothing.
+        panel.update_in(cx, |panel, window, cx| panel.move_node(a, doc, window, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.error.is_some());
+            assert_eq!(panel.node(a).unwrap().parent_id, Some(ROOT_ID));
+        });
+
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNGdata").unwrap();
+        panel.update_in(cx, |panel, window, cx| {
+            panel.import_paths(a, vec![png, dir.path().to_path_buf()], window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.error.is_none(), "{:?}", panel.error);
+            let file = panel.nodes.iter().find(|n| n.name == "shot.png").unwrap();
+            assert_eq!((file.kind, file.parent_id), (NodeKind::File, Some(a)));
+        });
+        let c = open(dir.path()).unwrap();
+        let file = design_docs::resolve_path(&c, a, "shot.png").unwrap().unwrap();
+        assert_eq!(design_docs::load_file(&c, file.id).unwrap(), b"\x89PNGdata");
     }
 }

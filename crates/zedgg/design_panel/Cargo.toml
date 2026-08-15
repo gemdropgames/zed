@@ -22,7 +22,6 @@ markdown_preview.workspace = true # ZedGG per-buffer image resolver hook
 menu.workspace = true
 project.workspace = true
 ui.workspace = true
-util.workspace = true
 workspace.workspace = true
 zedgg_project_db.workspace = true
 

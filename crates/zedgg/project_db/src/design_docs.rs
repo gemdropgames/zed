@@ -201,10 +201,16 @@ pub fn load_body(connection: &Connection, id: i64) -> Result<String> {
         .with_context(|| format!("no design doc with id {id}"))
 }
 
+/// Errors if `id` is not a document (deleted under an open tab, say) so
+/// the editor's save fails visibly instead of silently updating nothing.
 pub fn save_body(connection: &Connection, id: i64, body: &str) -> Result<()> {
+    match get_node(connection, id)? {
+        Some(node) if node.kind == NodeKind::Doc => {}
+        Some(node) => bail!("{:?} is not a document", node.name),
+        None => bail!("design doc {id} no longer exists"),
+    }
     connection.exec_bound::<(&str, i64)>(
-        "UPDATE design_nodes SET body = ?, updated_at = datetime('now') \
-         WHERE id = ? AND kind = 'doc'",
+        "UPDATE design_nodes SET body = ?, updated_at = datetime('now') WHERE id = ?",
     )?((body, id))
 }
 
@@ -322,6 +328,7 @@ mod tests {
         delete_node(&c, b).unwrap();
         assert!(get_node(&c, doc).unwrap().is_none(), "cascade");
         assert!(load_body(&c, doc).is_err());
+        assert!(save_body(&c, doc, "late").is_err(), "save to a deleted doc must fail");
     }
 
     #[test]
