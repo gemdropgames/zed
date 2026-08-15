@@ -24590,6 +24590,7 @@ dependencies = [
  "zed_actions",
  "zed_credentials_provider",
  "zed_env_vars",
+ "zedgg_design_panel",
  "zlog",
  "zlog_settings",
  "ztracing",
@@ -24790,6 +24791,34 @@ name = "zed_test_extension"
 version = "0.1.0"
 dependencies = [
  "zed_extension_api 0.8.0",
+]
+
+[[package]]
+name = "zedgg_design_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "ggo_common",
+ "gpui",
+ "keymap_editor",
+ "language",
+ "markdown_preview",
+ "menu",
+ "project",
+ "tempfile",
+ "ui",
+ "workspace",
+ "zedgg_project_db",
+]
+
+[[package]]
+name = "zedgg_project_db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sqlez",
+ "tempfile",
 ]
 
 [[package]]
