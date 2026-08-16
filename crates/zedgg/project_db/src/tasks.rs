@@ -185,6 +185,10 @@ pub fn move_task_between(
     above: Option<i64>,
     below: Option<i64>,
 ) -> Result<()> {
+    match get_task(connection, id)? {
+        Some(_) => {}
+        None => bail!("task {id} no longer exists"),
+    }
     let rank_of = |task: i64| -> Result<i64> {
         connection
             .select_row_bound::<i64, i64>("SELECT rank FROM tasks WHERE id = ?")?(task)?
@@ -304,5 +308,13 @@ mod tests {
         assert_eq!(order, [b, d, a]);
         let ranks: Vec<i64> = list_tasks(&c).unwrap().iter().map(|t| t.rank).collect();
         assert!(ranks.windows(2).all(|w| w[1] - w[0] >= 2), "gaps restored");
+    }
+
+    #[test]
+    fn move_nonexistent_task_fails() {
+        let c = open_memory("tasks_move_missing");
+        let a = create_task(&c, "a").unwrap();
+        let missing_id = 9999;
+        assert!(move_task_between(&c, missing_id, TaskState::Backlog, None, Some(a)).is_err());
     }
 }
