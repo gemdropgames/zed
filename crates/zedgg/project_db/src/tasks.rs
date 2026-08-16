@@ -174,6 +174,52 @@ pub fn save_description(connection: &Connection, id: i64, description: &str) -> 
     )?((description, id))
 }
 
+/// Move `id` into `state`, dropped between neighbor tasks `above` and
+/// `below` (either may be None at a column edge). Neighbor ranks are read
+/// fresh inside the call, and a dense column is renumbered to multiples of
+/// 1000 before computing the midpoint.
+pub fn move_task_between(
+    connection: &Connection,
+    id: i64,
+    state: TaskState,
+    above: Option<i64>,
+    below: Option<i64>,
+) -> Result<()> {
+    let rank_of = |task: i64| -> Result<i64> {
+        connection
+            .select_row_bound::<i64, i64>("SELECT rank FROM tasks WHERE id = ?")?(task)?
+            .with_context(|| format!("no task with id {task}"))
+    };
+    let rank = match (above, below) {
+        (Some(above), Some(below)) => {
+            let (mut high, mut low) = (rank_of(above)?, rank_of(below)?);
+            if low - high < 2 {
+                renumber_column(connection, state)?;
+                high = rank_of(above)?;
+                low = rank_of(below)?;
+            }
+            high + (low - high) / 2
+        }
+        (Some(above), None) => rank_of(above)? + 1000,
+        (None, Some(below)) => rank_of(below)? - 1000,
+        (None, None) => 0,
+    };
+    connection.exec_bound::<(&str, i64, i64)>(
+        "UPDATE tasks SET state = ?, rank = ?, updated_at = datetime('now') WHERE id = ?",
+    )?((state.as_str(), rank, id))?;
+    Ok(())
+}
+
+fn renumber_column(connection: &Connection, state: TaskState) -> Result<()> {
+    connection.exec_bound::<&str>(
+        "WITH ordered AS (SELECT id, ROW_NUMBER() OVER (ORDER BY rank) AS n \
+         FROM tasks WHERE state = ?1) \
+         UPDATE tasks SET rank = (SELECT n * 1000 FROM ordered WHERE ordered.id = tasks.id) \
+         WHERE id IN (SELECT id FROM ordered)",
+    )?(state.as_str())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +261,48 @@ mod tests {
         delete_task(&c, id).unwrap();
         assert!(save_description(&c, id, "late").is_err());
         assert!(load_description(&c, id).is_err());
+    }
+
+    #[test]
+    fn move_between_neighbors_takes_the_midpoint() {
+        let c = open_memory("tasks_move_mid");
+        let a = create_task(&c, "a").unwrap(); // ranks: c=-2000, b=-1000, a=0
+        let b = create_task(&c, "b").unwrap();
+        let d = create_task(&c, "d").unwrap();
+        move_task_between(&c, a, TaskState::Backlog, Some(d), Some(b)).unwrap();
+        let order: Vec<i64> = list_tasks(&c).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(order, [d, a, b]);
+    }
+
+    #[test]
+    fn move_to_column_edges_and_across_states() {
+        let c = open_memory("tasks_move_edge");
+        let a = create_task(&c, "a").unwrap();
+        let b = create_task(&c, "b").unwrap();
+        move_task_between(&c, a, TaskState::Review, None, None).unwrap();
+        let rows = list_tasks(&c).unwrap();
+        assert_eq!(rows.iter().find(|t| t.id == a).unwrap().state, TaskState::Review);
+        // Drop b above a in Review.
+        move_task_between(&c, b, TaskState::Review, None, Some(a)).unwrap();
+        let review: Vec<i64> = list_tasks(&c).unwrap().iter()
+            .filter(|t| t.state == TaskState::Review).map(|t| t.id).collect();
+        assert_eq!(review, [b, a]);
+    }
+
+    #[test]
+    fn dense_column_renumbers_instead_of_failing() {
+        let c = open_memory("tasks_move_dense");
+        let a = create_task(&c, "a").unwrap();
+        let b = create_task(&c, "b").unwrap();
+        let d = create_task(&c, "d").unwrap();
+        // Force adjacent ranks so no midpoint exists between b and a.
+        c.exec_bound::<(i64, i64)>("UPDATE tasks SET rank = ? WHERE id = ?").unwrap()((0, d)).unwrap();
+        c.exec_bound::<(i64, i64)>("UPDATE tasks SET rank = ? WHERE id = ?").unwrap()((1, b)).unwrap();
+        c.exec_bound::<(i64, i64)>("UPDATE tasks SET rank = ? WHERE id = ?").unwrap()((2, a)).unwrap();
+        move_task_between(&c, d, TaskState::Backlog, Some(b), Some(a)).unwrap();
+        let order: Vec<i64> = list_tasks(&c).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(order, [b, d, a]);
+        let ranks: Vec<i64> = list_tasks(&c).unwrap().iter().map(|t| t.rank).collect();
+        assert!(ranks.windows(2).all(|w| w[1] - w[0] >= 2), "gaps restored");
     }
 }
