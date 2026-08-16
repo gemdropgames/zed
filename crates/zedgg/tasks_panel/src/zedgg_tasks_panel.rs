@@ -240,7 +240,18 @@ mod tests {
             workspace.items_of_type::<TaskBoard>(cx).next().expect("board")
         });
 
-        // d, b, a in Backlog (newest on top). Drag a to Review (empty column).
+        // d, b, a in Backlog (newest on top). Dropping the middle card (b)
+        // on itself is a pick-up-and-release-in-place gesture: order must
+        // not change.
+        board.update_in(cx, |board, window, cx| {
+            board.drop_card(b, tasks::TaskState::Backlog, Some(b), window, cx)
+        });
+        cx.run_until_parked();
+        board.read_with(cx, |board, _| {
+            assert_eq!(board.column(tasks::TaskState::Backlog), [d, b, a]);
+        });
+
+        // Drag a to Review (empty column).
         board.update_in(cx, |board, window, cx| {
             board.drop_card(a, tasks::TaskState::Review, None, window, cx)
         });

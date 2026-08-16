@@ -165,7 +165,10 @@ impl TaskBoard {
     /// Move card `id` into `state`, positioned above `before` (the card the
     /// drop landed on) or at the column's end if `before` is `None`. This is
     /// the `on_drop` body for both cards and column bodies, as well as the
-    /// test entry point.
+    /// test entry point. Dropping a card on itself (`before == Some(id)`) is
+    /// a no-op -- without this guard, filtering `id` out of the column
+    /// before searching for `before` would always miss and fall through to
+    /// the column-end case, silently relocating an in-place card.
     pub(crate) fn drop_card(
         &mut self,
         id: i64,
@@ -174,6 +177,9 @@ impl TaskBoard {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if before == Some(id) {
+            return;
+        }
         let column: Vec<i64> = self.column(state).into_iter().filter(|c| *c != id).collect();
         let (above, below) = match before {
             Some(before) => {
