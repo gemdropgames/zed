@@ -54,26 +54,6 @@ pub fn reset_camera() -> (f64, Option<[f64; 2]>) {
 /// guide at 1x. ggo-ide `pages::world::canvas::GRID_STEP_PX`.
 pub const GRID_STEP_PX: f64 = 16.0;
 
-/// Preview-size stepper bounds -- ggo-ide's `PREVIEW_SCALE_*`. The world
-/// canvas WIDGET renders at an exact integer multiple of the real device
-/// screen (`DEVICE_SCREEN_W` x `DEVICE_SCREEN_H`); the in-canvas pan/zoom
-/// above is a separate, unaffected axis.
-pub const PREVIEW_SCALE_MIN: u32 = 1;
-pub const PREVIEW_SCALE_MAX: u32 = 4;
-pub const PREVIEW_SCALE_DEFAULT: u32 = 2;
-
-/// One step of the preview-size stepper toward `dir` (`>= 0` up), clamped
-/// to `[PREVIEW_SCALE_MIN, PREVIEW_SCALE_MAX]` -- ggo-ide's `step_scale`,
-/// ported verbatim so the `-`/`+` buttons are unit-testable.
-pub fn step_scale(current: u32, dir: i32) -> u32 {
-    let next = if dir >= 0 {
-        current.saturating_add(1)
-    } else {
-        current.saturating_sub(1)
-    };
-    next.clamp(PREVIEW_SCALE_MIN, PREVIEW_SCALE_MAX)
-}
-
 /// Next ladder step above (`dir > 0`) or below (`dir < 0`) `zoom`,
 /// saturating at the ladder ends.
 pub fn zoom_step(zoom: f64, dir: i32) -> f64 {
@@ -313,8 +293,15 @@ fn paint_item(
         }
         DrawKind::Image { image } => match scene.images.get(&image_key(image)) {
             Some(render_image) => {
-                let _ =
-                    window.paint_image(b, b, Corners::default(), render_image.clone(), 0, false, true);
+                let _ = window.paint_image(
+                    b,
+                    b,
+                    Corners::default(),
+                    render_image.clone(),
+                    0,
+                    false,
+                    true,
+                );
             }
             // A Ready image missing from the cache can only mean the cache
             // and draw list are out of sync -- degrade to a placeholder
@@ -607,17 +594,6 @@ mod tests {
             pan_y: pan[1],
             dpr: None,
         }
-    }
-
-    #[test]
-    fn step_scale_walks_one_unit_and_clamps_to_the_preview_range() {
-        assert_eq!(step_scale(PREVIEW_SCALE_DEFAULT, 1), 3);
-        assert_eq!(step_scale(PREVIEW_SCALE_DEFAULT, -1), 1);
-        assert_eq!(step_scale(PREVIEW_SCALE_MAX, 1), PREVIEW_SCALE_MAX);
-        assert_eq!(step_scale(PREVIEW_SCALE_MIN, -1), PREVIEW_SCALE_MIN);
-        // 0 is not a reachable state even from a corrupt starting value.
-        assert_eq!(step_scale(0, -1), PREVIEW_SCALE_MIN);
-        assert_eq!(step_scale(99, 1), PREVIEW_SCALE_MAX);
     }
 
     /// Reset hands back the default zoom and NO pan, and that pair is

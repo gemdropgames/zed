@@ -50,8 +50,7 @@ use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::merge_candidates::merge_candidates;
 use ggo_worldlib::render::{
-    AssetLoads, DEVICE_SCREEN_H, DEVICE_SCREEN_W, DrawItem, Selection, active_camera_origin,
-    build_draw_list, hit_test, world_label,
+    AssetLoads, DrawItem, Selection, active_camera_origin, build_draw_list, hit_test, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
 use ggo_worldlib::sprites::palette565;
@@ -469,9 +468,6 @@ struct OpenWorld {
     /// Tile-grid overlay under the draw list -- ggo-ide `open.grid`, which
     /// also defaults ON.
     grid: bool,
-    /// Canvas widget size as a multiple of the device screen -- ggo-ide
-    /// `open.preview_scale` (see `canvas::step_scale`).
-    preview_scale: u32,
     edit_drag: Option<EditDrag>,
     /// The gesture id an in-flight RUN of arrow-key nudges shares, so the
     /// store coalesces the run into one undo entry the way it coalesces a
@@ -529,7 +525,6 @@ impl OpenWorld {
             selected: None,
             snap: false,
             grid: true,
-            preview_scale: canvas::PREVIEW_SCALE_DEFAULT,
             edit_drag: None,
             nudge_gesture: None,
             gesture_counter: 0,
@@ -1072,7 +1067,10 @@ impl WorldPanel {
                     0.0
                 }
             };
-            view.pan = Some([pan[0] - sign(delta[0]) * step, pan[1] - sign(delta[1]) * step]);
+            view.pan = Some([
+                pan[0] - sign(delta[0]) * step,
+                pan[1] - sign(delta[1]) * step,
+            ]);
             drop(view);
             cx.notify();
             return;
@@ -1223,13 +1221,6 @@ impl WorldPanel {
         };
         let zoom = open.view.borrow().zoom;
         self.set_zoom(canvas::zoom_step(zoom, dir), cx);
-    }
-
-    fn step_preview_scale(&mut self, dir: i32, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.preview_scale = canvas::step_scale(open.preview_scale, dir);
-            cx.notify();
-        }
     }
 
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
@@ -1865,11 +1856,7 @@ impl WorldPanel {
     }
 
     /// The inline picker block rendered under an open Color565 field row.
-    fn render_color_picker(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_color_picker(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             return gpui::Empty.into_any_element();
         };
@@ -1899,8 +1886,10 @@ impl WorldPanel {
             .border_color(cx.theme().colors().border_variant)
             .rounded_sm()
             .child(
-                h_flex().gap_1().child(Self::field_label("palette")).child(
-                    DropdownMenu::new(
+                h_flex()
+                    .gap_1()
+                    .child(Self::field_label("palette"))
+                    .child(DropdownMenu::new(
                         "ggo-color-pal",
                         SharedString::from(
                             picker
@@ -1909,8 +1898,7 @@ impl WorldPanel {
                                 .unwrap_or_else(|| "Select .pal".to_string()),
                         ),
                         pal_menu,
-                    ),
-                ),
+                    )),
             );
         if picker.candidates.is_empty() {
             block = block.child(
@@ -1945,23 +1933,11 @@ impl WorldPanel {
             block = block.child(grid).child(
                 h_flex()
                     .gap_1()
-                    .child(
-                        Label::new("R")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(Label::new("R").size(LabelSize::XSmall).color(Color::Muted))
                     .child(Self::editor_input(&picker.r_editor, cx))
-                    .child(
-                        Label::new("G")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(Label::new("G").size(LabelSize::XSmall).color(Color::Muted))
                     .child(Self::editor_input(&picker.g_editor, cx))
-                    .child(
-                        Label::new("B")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(Label::new("B").size(LabelSize::XSmall).color(Color::Muted))
                     .child(Self::editor_input(&picker.b_editor, cx))
                     .child(
                         Button::new("ggo-color-set-slot", "Set")
@@ -2083,10 +2059,7 @@ impl WorldPanel {
     }
 
     /// The view-control row under the toolbar: grid + snap toggles, the
-    /// live zoom readout, "Reset", and the `- Preview Nx +` stepper --
-    /// ggo-ide's `controls` and `stepper` rows, merged into one (this
-    /// panel's dock is narrower than ggo-ide's page but the row still fits,
-    /// and two half-empty rows would cost canvas height for nothing).
+    /// zoom bar with its `-`/`+` buttons and live readout, and "Reset".
     fn render_view_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_view_controls is only called in the Ready state");
@@ -2094,7 +2067,6 @@ impl WorldPanel {
         let grid = open.grid;
         let snap = open.snap;
         let zoom = open.view.borrow().zoom;
-        let scale = open.preview_scale;
         let grid_weak = cx.weak_entity();
         let snap_weak = cx.weak_entity();
         h_flex()
@@ -2137,33 +2109,38 @@ impl WorldPanel {
                 // level directly -- per-segment mouse handlers, so no
                 // track-bounds math and drag needs no capture (the segment
                 // under the cursor hears the move).
-                h_flex().gap_0p5().children(canvas::ZOOM_LEVELS.iter().enumerate().map(
-                    |(index, &level)| {
-                        let filled = level <= zoom + 1e-9;
-                        div()
-                            .id(("ggo-world-zoom-bar", index))
-                            .w(px(6.0))
-                            .h(px(10.0))
-                            .rounded_xs()
-                            .bg(if filled {
-                                cx.theme().colors().text_accent
-                            } else {
-                                cx.theme().colors().element_background
-                            })
-                            .hover(|style| style.bg(cx.theme().colors().element_hover))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| this.set_zoom(level, cx)),
-                            )
-                            .on_mouse_move(cx.listener(
-                                move |this, event: &MouseMoveEvent, _, cx| {
-                                    if event.pressed_button == Some(MouseButton::Left) {
-                                        this.set_zoom(level, cx);
-                                    }
-                                },
-                            ))
-                    },
-                )),
+                h_flex()
+                    .gap_0p5()
+                    .children(
+                        canvas::ZOOM_LEVELS
+                            .iter()
+                            .enumerate()
+                            .map(|(index, &level)| {
+                                let filled = level <= zoom + 1e-9;
+                                div()
+                                    .id(("ggo-world-zoom-bar", index))
+                                    .w(px(6.0))
+                                    .h(px(10.0))
+                                    .rounded_xs()
+                                    .bg(if filled {
+                                        cx.theme().colors().text_accent
+                                    } else {
+                                        cx.theme().colors().element_background
+                                    })
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| this.set_zoom(level, cx)),
+                                    )
+                                    .on_mouse_move(cx.listener(
+                                        move |this, event: &MouseMoveEvent, _, cx| {
+                                            if event.pressed_button == Some(MouseButton::Left) {
+                                                this.set_zoom(level, cx);
+                                            }
+                                        },
+                                    ))
+                            }),
+                    ),
             )
             .child(
                 IconButton::new("ggo-world-zoom-plus", IconName::Plus)
@@ -2181,26 +2158,6 @@ impl WorldPanel {
                 Button::new("ggo-world-reset-view", "Reset")
                     .tooltip(ui::Tooltip::text("Reset the camera to the active camera"))
                     .on_click(cx.listener(|this, _, _, cx| this.reset_view_impl(cx))),
-            )
-            .child(div().flex_1())
-            .child(
-                IconButton::new("ggo-world-preview-minus", IconName::Dash)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(ui::Tooltip::text("Smaller preview"))
-                    .disabled(scale <= canvas::PREVIEW_SCALE_MIN)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_preview_scale(-1, cx))),
-            )
-            .child(
-                Label::new(format!("Preview {scale}x"))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                IconButton::new("ggo-world-preview-plus", IconName::Plus)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(ui::Tooltip::text("Larger preview"))
-                    .disabled(scale >= canvas::PREVIEW_SCALE_MAX)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_preview_scale(1, cx))),
             )
             .into_any_element()
     }
@@ -2221,13 +2178,6 @@ impl WorldPanel {
         let images = open.images.clone();
         let view = open.view.clone();
         let grid = open.grid;
-        // The canvas WIDGET is an exact multiple of the device screen
-        // (ggo-ide's preview stepper). `max_*_full` keeps it inside a dock
-        // narrower than the chosen multiple instead of overflowing it --
-        // ggo-ide's own page had no such constraint because its canvas was
-        // laid out in a resizable page, not a dock.
-        let preview_w = px((open.preview_scale as f64 * DEVICE_SCREEN_W) as f32);
-        let preview_h = px((open.preview_scale as f64 * DEVICE_SCREEN_H) as f32);
         let background = cx.theme().colors().editor_background;
         let text_color = cx.theme().colors().text;
 
@@ -2261,116 +2211,102 @@ impl WorldPanel {
         )
         .size_full();
 
-        // Centering wrapper; the interactive element below is the canvas
-        // BOX itself, so a click in the letterboxing around a small
-        // preview is not a canvas click at all.
         div()
+            .id("ggo-world-canvas")
             .size_full()
             .overflow_hidden()
-            .flex()
-            .justify_center()
-            .items_center()
-            .child(
-                div()
-                    .id("ggo-world-canvas")
-                    .w(preview_w)
-                    .h(preview_h)
-                    .max_w_full()
-                    .max_h_full()
-                    .overflow_hidden()
-                    .child(element)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            // Take focus so the panel's Undo/Redo/Save bindings
-                            // apply (and any in-progress field edit blur-commits).
-                            window.focus(&this.focus_handle, cx);
-                            let local = {
-                                let ViewerState::Ready(open) = &this.state else {
-                                    return;
-                                };
-                                let v = open.view.borrow();
-                                let Some(bounds) = v.last_bounds else {
-                                    return;
-                                };
-                                [
-                                    f64::from(event.position.x - bounds.origin.x),
-                                    f64::from(event.position.y - bounds.origin.y),
-                                ]
-                            };
-                            this.canvas_primary_down(local, cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                            if let ViewerState::Ready(open) = &mut this.state {
-                                open.edit_drag = None;
-                            }
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
-                            let ViewerState::Ready(open) = &this.state else {
-                                return;
-                            };
-                            let mut v = open.view.borrow_mut();
-                            if let Some(pan) = v.pan {
-                                v.drag = Some(Drag {
-                                    start_cursor: [
-                                        f64::from(event.position.x),
-                                        f64::from(event.position.y),
-                                    ],
-                                    start_pan: pan,
-                                });
-                            }
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                        if this.handle_pan_move(event, cx) {
-                            return;
-                        }
-                        let Some(local) = this.edit_drag_local(event) else {
-                            return;
-                        };
-                        this.canvas_drag_to(local, cx);
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Middle,
-                        cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                            if let ViewerState::Ready(open) = &this.state {
-                                open.view.borrow_mut().drag = None;
-                            }
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+            .child(element)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    // Take focus so the panel's Undo/Redo/Save bindings
+                    // apply (and any in-progress field edit blur-commits).
+                    window.focus(&this.focus_handle, cx);
+                    let local = {
                         let ViewerState::Ready(open) = &this.state else {
                             return;
                         };
-                        let mut v = open.view.borrow_mut();
-                        let (Some(pan), Some(canvas_bounds)) = (v.pan, v.last_bounds) else {
+                        let v = open.view.borrow();
+                        let Some(bounds) = v.last_bounds else {
                             return;
                         };
-                        let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
-                        if dy == 0.0 {
-                            return;
-                        }
-                        let dir = if dy > 0.0 { 1 } else { -1 };
-                        let new_zoom = canvas::zoom_step(v.zoom, dir);
-                        if new_zoom == v.zoom {
-                            return;
-                        }
-                        let cursor = [
-                            f64::from(event.position.x - canvas_bounds.origin.x),
-                            f64::from(event.position.y - canvas_bounds.origin.y),
-                        ];
-                        v.pan = Some(canvas::zoom_at(pan, v.zoom, cursor, new_zoom));
-                        v.zoom = new_zoom;
-                        drop(v);
-                        cx.notify();
-                    })),
+                        [
+                            f64::from(event.position.x - bounds.origin.x),
+                            f64::from(event.position.y - bounds.origin.y),
+                        ]
+                    };
+                    this.canvas_primary_down(local, cx);
+                }),
             )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                    if let ViewerState::Ready(open) = &mut this.state {
+                        open.edit_drag = None;
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                    let ViewerState::Ready(open) = &this.state else {
+                        return;
+                    };
+                    let mut v = open.view.borrow_mut();
+                    if let Some(pan) = v.pan {
+                        v.drag = Some(Drag {
+                            start_cursor: [
+                                f64::from(event.position.x),
+                                f64::from(event.position.y),
+                            ],
+                            start_pan: pan,
+                        });
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.handle_pan_move(event, cx) {
+                    return;
+                }
+                let Some(local) = this.edit_drag_local(event) else {
+                    return;
+                };
+                this.canvas_drag_to(local, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                    if let ViewerState::Ready(open) = &this.state {
+                        open.view.borrow_mut().drag = None;
+                    }
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                let ViewerState::Ready(open) = &this.state else {
+                    return;
+                };
+                let mut v = open.view.borrow_mut();
+                let (Some(pan), Some(canvas_bounds)) = (v.pan, v.last_bounds) else {
+                    return;
+                };
+                let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
+                if dy == 0.0 {
+                    return;
+                }
+                let dir = if dy > 0.0 { 1 } else { -1 };
+                let new_zoom = canvas::zoom_step(v.zoom, dir);
+                if new_zoom == v.zoom {
+                    return;
+                }
+                let cursor = [
+                    f64::from(event.position.x - canvas_bounds.origin.x),
+                    f64::from(event.position.y - canvas_bounds.origin.y),
+                ];
+                v.pan = Some(canvas::zoom_at(pan, v.zoom, cursor, new_zoom));
+                v.zoom = new_zoom;
+                drop(v);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -2525,8 +2461,7 @@ impl WorldPanel {
                                     field: field.clone(),
                                 };
                                 if let Some(editor) = editors.get(&target) {
-                                    let color =
-                                        field_value.as_f64().unwrap_or(0.0) as i64 as u16;
+                                    let color = field_value.as_f64().unwrap_or(0.0) as i64 as u16;
                                     let swatch_target = target.clone();
                                     panel = panel.child(
                                         h_flex()
@@ -2568,8 +2503,7 @@ impl WorldPanel {
                                                 .is_some_and(|p| p.target == target)
                                     );
                                     if open_here {
-                                        panel = panel
-                                            .child(self.render_color_picker(window, cx));
+                                        panel = panel.child(self.render_color_picker(window, cx));
                                     }
                                 }
                             }
@@ -3826,7 +3760,9 @@ mod tests {
                 "and became the field value"
             );
             assert!(
-                open.color_picker.as_ref().is_some_and(|p| p.error.is_none()),
+                open.color_picker
+                    .as_ref()
+                    .is_some_and(|p| p.error.is_none()),
                 "no error on a successful write"
             );
         });
@@ -3842,7 +3778,10 @@ mod tests {
             };
             let picker = open.color_picker.as_ref().expect("picker open");
             assert!(
-                picker.error.as_deref().is_some_and(|e| e.contains("slot 0")),
+                picker
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("slot 0")),
                 "writing slot 0 reports the lock"
             );
         });
@@ -3957,8 +3896,16 @@ mod tests {
                 panic!("expected Ready");
             };
             let picker = open.color_picker.as_ref().expect("picker open");
-            assert_eq!(picker.candidates, ["art/a.pal", "art/b.pal"], "all pals listed");
-            assert_eq!(picker.pal_rel.as_deref(), Some("art/a.pal"), "first preselects");
+            assert_eq!(
+                picker.candidates,
+                ["art/a.pal", "art/b.pal"],
+                "all pals listed"
+            );
+            assert_eq!(
+                picker.pal_rel.as_deref(),
+                Some("art/a.pal"),
+                "first preselects"
+            );
             assert_eq!(picker.slot, Some(1));
             assert_eq!(
                 open.store.state().entities[0].components["Fx"]["color"],
@@ -3996,15 +3943,13 @@ mod tests {
         });
 
         let expected = (10u16 << 11) | (20 << 5) | 30;
-        let b = ggo_asset_formats::decode_pal(
-            &std::fs::read(dir.path().join("art/b.pal")).unwrap(),
-        )
-        .unwrap();
+        let b =
+            ggo_asset_formats::decode_pal(&std::fs::read(dir.path().join("art/b.pal")).unwrap())
+                .unwrap();
         assert_eq!(b[5], expected, "edit landed in palette B slot 5");
-        let a = ggo_asset_formats::decode_pal(
-            &std::fs::read(dir.path().join("art/a.pal")).unwrap(),
-        )
-        .unwrap();
+        let a =
+            ggo_asset_formats::decode_pal(&std::fs::read(dir.path().join("art/a.pal")).unwrap())
+                .unwrap();
         assert_eq!(a[5], 0, "palette A untouched");
         panel.read_with(cx, |panel, _| {
             let ViewerState::Ready(open) = &panel.state else {
@@ -4165,35 +4110,21 @@ mod tests {
         }
     }
 
-    /// Grid toggle, preview-size stepper and "Reset" -- the three view
-    /// controls carried over from ggo-ide, at panel level (the pure math
-    /// each one leans on is tested in `canvas`).
+    /// Grid toggle and "Reset" -- the view controls carried over from
+    /// ggo-ide, at panel level (the pure math each one leans on is tested
+    /// in `canvas`).
     #[gpui::test]
-    async fn test_view_controls_grid_stepper_and_reset(cx: &mut TestAppContext) {
+    async fn test_view_controls_grid_and_reset(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            // Defaults match ggo-ide: grid on, preview at 2x.
             assert!(open_of(panel).grid, "grid defaults on, as in ggo-ide");
-            assert_eq!(open_of(panel).preview_scale, canvas::PREVIEW_SCALE_DEFAULT);
 
             panel.set_grid(false, cx);
             assert!(!open_of(panel).grid);
             panel.set_grid(true, cx);
             assert!(open_of(panel).grid);
-
-            // The stepper walks and stops at both ends.
-            panel.step_preview_scale(-1, cx);
-            assert_eq!(open_of(panel).preview_scale, 1);
-            for _ in 0..10 {
-                panel.step_preview_scale(1, cx);
-            }
-            assert_eq!(open_of(panel).preview_scale, canvas::PREVIEW_SCALE_MAX);
-            for _ in 0..10 {
-                panel.step_preview_scale(-1, cx);
-            }
-            assert_eq!(open_of(panel).preview_scale, canvas::PREVIEW_SCALE_MIN);
 
             // Reset: a camera moved by wheel-zoom and pan goes back to the
             // default zoom and to "not laid out", which is what re-runs the
