@@ -97,6 +97,12 @@ pub struct Tag {
     pub color: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskFile {
+    pub id: i64,
+    pub name: String,
+}
+
 type TasksSelectRow = (i64, String, i64, String);
 
 fn task_from_row((id, state, rank, title): TasksSelectRow) -> Result<TaskRow> {
@@ -150,6 +156,16 @@ fn validate_title(title: &str) -> Result<()> {
 fn validate_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("tag name may not be empty");
+    }
+    Ok(())
+}
+
+fn validate_file_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("file name must not be empty");
+    }
+    if name.contains(['/', '\\']) || name == "." || name == ".." {
+        bail!("file name {name:?} may not contain path separators or be `.`/`..`");
     }
     Ok(())
 }
@@ -283,6 +299,46 @@ pub fn delete_tag(connection: &Connection, tag_id: i64) -> Result<()> {
     connection.exec_bound::<i64>("DELETE FROM task_tags WHERE id = ?")?(tag_id)
 }
 
+pub fn add_file(connection: &Connection, task_id: i64, name: &str, data: &[u8]) -> Result<i64> {
+    validate_file_name(name)?;
+    connection
+        .select_row_bound::<(i64, &str, &[u8]), i64>(
+            "INSERT INTO task_files (task_id, name, data) VALUES (?, ?, ?) RETURNING id",
+        )?((task_id, name, data))?
+        .context("INSERT ... RETURNING id produced no row")
+}
+
+pub fn list_files(connection: &Connection, task_id: i64) -> Result<Vec<TaskFile>> {
+    connection.select_bound::<i64, (i64, String)>(
+        "SELECT id, name FROM task_files WHERE task_id = ? ORDER BY name COLLATE NOCASE",
+    )?(task_id)?
+    .into_iter()
+    .map(|(id, name)| Ok(TaskFile { id, name }))
+    .collect()
+}
+
+pub fn load_file_by_name(connection: &Connection, task_id: i64, name: &str) -> Result<Option<Vec<u8>>> {
+    connection.select_row_bound::<(i64, &str), Option<Vec<u8>>>(
+        "SELECT data FROM task_files WHERE task_id = ? AND name = ?",
+    )?((task_id, name))?
+    .flatten()
+    .map(Ok)
+    .transpose()
+}
+
+pub fn load_file(connection: &Connection, file_id: i64) -> Result<Vec<u8>> {
+    connection
+        .select_row_bound::<i64, Option<Vec<u8>>>(
+            "SELECT data FROM task_files WHERE id = ?",
+        )?(file_id)?
+        .flatten()
+        .with_context(|| format!("no task file with id {file_id}"))
+}
+
+pub fn delete_file(connection: &Connection, file_id: i64) -> Result<()> {
+    connection.exec_bound::<i64>("DELETE FROM task_files WHERE id = ?")?(file_id)
+}
+
 fn tag_ids_by_task(connection: &Connection) -> Result<HashMap<i64, Vec<i64>>> {
     let rows: Vec<(i64, i64)> = connection.select(
         "SELECT a.task_id, a.tag_id FROM task_tag_assignments a \
@@ -412,5 +468,26 @@ mod tests {
         let orphans: Option<i64> = c
             .select_row("SELECT COUNT(*) FROM task_tag_assignments").unwrap()().unwrap();
         assert_eq!(orphans, Some(0), "cascade");
+    }
+
+    #[test]
+    fn files_round_trip_unique_per_task_and_cascade() {
+        let c = open_memory("tasks_files");
+        let task = create_task(&c, "t").unwrap();
+        let other = create_task(&c, "u").unwrap();
+        let shot = add_file(&c, task, "shot.png", b"\x89PNG").unwrap();
+        add_file(&c, other, "shot.png", b"elsewhere").unwrap(); // same name, other task: fine
+        assert!(add_file(&c, task, "shot.png", b"dupe").is_err());
+
+        assert_eq!(load_file(&c, shot).unwrap(), b"\x89PNG");
+        assert_eq!(load_file_by_name(&c, task, "shot.png").unwrap().unwrap(), b"\x89PNG");
+        assert!(load_file_by_name(&c, task, "missing.png").unwrap().is_none());
+        assert_eq!(
+            list_files(&c, task).unwrap(),
+            [TaskFile { id: shot, name: "shot.png".into() }]
+        );
+
+        delete_task(&c, task).unwrap();
+        assert!(load_file(&c, shot).is_err(), "cascade");
     }
 }
