@@ -79,6 +79,26 @@ struct CardRow {
     tags: Vec<(SharedString, SharedString)>,
 }
 
+/// What a card carries while being dragged onto another card or a column.
+#[derive(Clone)]
+struct CardDrag {
+    id: i64,
+    title: SharedString,
+}
+
+struct CardDragPreview(SharedString);
+
+impl Render for CardDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(cx.theme().colors().element_background)
+            .child(Label::new(self.0.clone()).size(LabelSize::Small))
+    }
+}
+
 /// An in-column "new task" title editor. Mirrors the design panel's
 /// `EditState`: created per edit session (needs a `Window`), dropped when
 /// confirmed or cancelled.
@@ -128,10 +148,7 @@ impl TaskBoard {
         board
     }
 
-    /// Card ids in column order. Not yet called outside tests -- Task 8's
-    /// drag-drop uses it at runtime to compute drop neighbors, at which
-    /// point this `allow` should come back out.
-    #[allow(dead_code)]
+    /// Card ids in column order.
     pub(crate) fn column(&self, state: TaskState) -> Vec<i64> {
         self.columns[column_index(state)]
             .iter()
@@ -143,6 +160,37 @@ impl TaskBoard {
     /// as the test entry point.
     pub(crate) fn open_card(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         open_task(self.workspace.clone(), self.project_root.clone(), id, window, cx);
+    }
+
+    /// Move card `id` into `state`, positioned above `before` (the card the
+    /// drop landed on) or at the column's end if `before` is `None`. This is
+    /// the `on_drop` body for both cards and column bodies, as well as the
+    /// test entry point.
+    pub(crate) fn drop_card(
+        &mut self,
+        id: i64,
+        state: TaskState,
+        before: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let column: Vec<i64> = self.column(state).into_iter().filter(|c| *c != id).collect();
+        let (above, below) = match before {
+            Some(before) => {
+                let index = column.iter().position(|c| *c == before);
+                match index {
+                    Some(index) => (index.checked_sub(1).map(|i| column[i]), Some(column[index])),
+                    None => (column.last().copied(), None),
+                }
+            }
+            None => (column.last().copied(), None),
+        };
+        self.mutate(
+            window,
+            cx,
+            move |connection| tasks::move_task_between(connection, id, state, above, below),
+            |_, (), _, _| {},
+        );
     }
 
     /// Re-read tasks + tags off-thread, behind a generation guard so a
@@ -283,8 +331,9 @@ impl TaskBoard {
             .unwrap_or_else(|_| Color::Muted.color(cx))
     }
 
-    fn render_card(&self, card: &CardRow, cx: &mut Context<Self>) -> AnyElement {
+    fn render_card(&self, card: &CardRow, state: TaskState, cx: &mut Context<Self>) -> AnyElement {
         let id = card.id;
+        let title = card.title.clone();
         div()
             .id(("zedgg-board-card", id as usize))
             .p_2()
@@ -295,6 +344,16 @@ impl TaskBoard {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.open_card(id, window, cx)
+            }))
+            .on_drag(CardDrag { id, title }, |dragged, _, _, cx| {
+                cx.new(|_| CardDragPreview(dragged.title.clone()))
+            })
+            .drag_over::<CardDrag>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(move |this, dragged: &CardDrag, window, cx| {
+                cx.stop_propagation();
+                this.drop_card(dragged.id, state, Some(id), window, cx);
             }))
             .child(Label::new(card.title.clone()).size(LabelSize::Small))
             .when(!card.tags.is_empty(), |parent| {
@@ -321,7 +380,7 @@ impl TaskBoard {
             .map(|edit| edit.editor.clone());
         let mut card_elements = Vec::with_capacity(cards.len());
         for card in cards {
-            card_elements.push(self.render_card(card, cx));
+            card_elements.push(self.render_card(card, state, cx));
         }
         v_flex()
             .id(("zedgg-board-column", index))
@@ -362,6 +421,12 @@ impl TaskBoard {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .drag_over::<CardDrag>(|style, _, _, cx| {
+                        style.bg(cx.theme().colors().drop_target_background)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &CardDrag, window, cx| {
+                        this.drop_card(dragged.id, state, None, window, cx);
+                    }))
                     .child(
                         v_flex()
                             .gap_1()

@@ -220,4 +220,52 @@ mod tests {
             assert_eq!(workspace.items_of_type::<TaskBoard>(cx).count(), 1);
         });
     }
+
+    #[gpui::test]
+    async fn test_drop_card_moves_state_and_orders_within_column(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, cx) = tasks_workspace(cx, dir.path()).await;
+        let (a, b, d) = {
+            let c = open(dir.path()).unwrap();
+            let a = tasks::create_task(&c, "a").unwrap();
+            let b = tasks::create_task(&c, "b").unwrap();
+            let d = tasks::create_task(&c, "d").unwrap();
+            (a, b, d)
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_board(workspace, dir.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+        let board = workspace.read_with(cx, |workspace, cx| {
+            workspace.items_of_type::<TaskBoard>(cx).next().expect("board")
+        });
+
+        // d, b, a in Backlog (newest on top). Drag a to Review (empty column).
+        board.update_in(cx, |board, window, cx| {
+            board.drop_card(a, tasks::TaskState::Review, None, window, cx)
+        });
+        cx.run_until_parked();
+        board.read_with(cx, |board, _| {
+            assert_eq!(board.column(tasks::TaskState::Review), [a]);
+            assert_eq!(board.column(tasks::TaskState::Backlog), [d, b]);
+        });
+
+        // Drag d below-target: drop ON b => lands above b.
+        board.update_in(cx, |board, window, cx| {
+            board.drop_card(d, tasks::TaskState::Backlog, Some(b), window, cx)
+        });
+        cx.run_until_parked();
+        board.read_with(cx, |board, _| {
+            assert_eq!(board.column(tasks::TaskState::Backlog), [d, b]);
+        });
+
+        // Drop b at Review column end => after a.
+        board.update_in(cx, |board, window, cx| {
+            board.drop_card(b, tasks::TaskState::Review, None, window, cx)
+        });
+        cx.run_until_parked();
+        board.read_with(cx, |board, _| {
+            assert_eq!(board.column(tasks::TaskState::Review), [a, b]);
+        });
+    }
 }
