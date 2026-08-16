@@ -18,7 +18,7 @@
 //! never "dirty" -- there's no tab-close prompt for them.
 
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ use gpui::{
 };
 use language::Buffer;
 use project::Project;
-use ui::{ContextMenu, DropdownMenu, prelude::*};
+use ui::{ContextMenu, DropdownMenu, PopoverMenu, prelude::*};
 use workspace::Workspace;
 use workspace::item::{Item, ItemBufferKind, ItemEvent, SaveOptions};
 use zedgg_project_db::Connection;
@@ -86,6 +86,8 @@ pub struct TaskView {
     /// This task's assigned tags, resolved to name+color and ordered by
     /// name (per `TaskRow::tag_ids`).
     tags: Vec<Tag>,
+    /// Every tag in the project, for the "+ tag" menu's existing-tag list.
+    all_tags: Vec<Tag>,
     error: Option<SharedString>,
     project_root: PathBuf,
     title_edit: Option<TitleEditState>,
@@ -133,13 +135,13 @@ pub fn open_task(
                     .with_context(|| format!("no task with id {id}"))?;
                 let description = tasks::load_description(&connection, id)?;
                 let all_tags = tasks::list_tags(&connection)?;
-                let tags = resolve_tags(&task.tag_ids, all_tags);
-                anyhow::Ok((task, description, tags))
+                let tags = resolve_tags(&task.tag_ids, &all_tags);
+                anyhow::Ok((task, description, all_tags, tags))
             }
         });
         window
             .spawn(cx, async move |cx| {
-                let (task, description, tags) = load.await?;
+                let (task, description, all_tags, tags) = load.await?;
                 let markdown = cx
                     .update(|_, cx| {
                         workspace.read_with(cx, |workspace, cx| {
@@ -161,6 +163,7 @@ pub fn open_task(
                             task.title.into(),
                             task.state,
                             tags,
+                            all_tags,
                             description,
                             markdown,
                             project,
@@ -175,13 +178,13 @@ pub fn open_task(
     });
 }
 
-/// Resolves `tag_ids` to full `Tag`s, keeping their order (already
-/// name-ordered -- see `tag_ids_by_task`).
-fn resolve_tags(tag_ids: &[i64], all_tags: Vec<Tag>) -> Vec<Tag> {
-    let tag_map: HashMap<i64, Tag> = all_tags.into_iter().map(|tag| (tag.id, tag)).collect();
+/// Resolves `tag_ids` to full `Tag`s (looked up in `all_tags`), keeping
+/// their order (already name-ordered -- see `tag_ids_by_task`).
+fn resolve_tags(tag_ids: &[i64], all_tags: &[Tag]) -> Vec<Tag> {
+    let tag_map: HashMap<i64, &Tag> = all_tags.iter().map(|tag| (tag.id, tag)).collect();
     tag_ids
         .iter()
-        .filter_map(|id| tag_map.get(id).cloned())
+        .filter_map(|id| tag_map.get(id).copied().cloned())
         .collect()
 }
 
@@ -193,6 +196,7 @@ impl TaskView {
         title: SharedString,
         state: TaskState,
         tags: Vec<Tag>,
+        all_tags: Vec<Tag>,
         description: String,
         markdown: Option<Arc<language::Language>>,
         project: Entity<Project>,
@@ -220,6 +224,7 @@ impl TaskView {
             title_dirty: false,
             state,
             tags,
+            all_tags,
             error: None,
             project_root,
             title_edit: None,
@@ -308,19 +313,27 @@ impl TaskView {
             cx,
             move |connection| {
                 let trimmed = name.trim();
-                let existing_tags = tasks::list_tags(connection)?;
-                let existing = existing_tags
-                    .iter()
+                let existing = tasks::list_tags(connection)?
+                    .into_iter()
                     .find(|tag| tag.name.eq_ignore_ascii_case(trimmed));
                 let tag_id = match existing {
                     Some(tag) => tag.id,
-                    None => {
-                        let color = TAG_COLORS[existing_tags.len() % TAG_COLORS.len()];
-                        tasks::create_tag(connection, trimmed, color)?
-                    }
+                    None => tasks::create_tag_with_next_color(connection, trimmed, &TAG_COLORS)?,
                 };
                 tasks::assign_tag(connection, task_id, tag_id)
             },
+            |_, (), _, _| {},
+        );
+    }
+
+    /// The "+ tag" menu's per-existing-tag entry body: assigns a tag whose
+    /// id is already known (no name lookup needed, unlike `add_tag`).
+    fn assign_existing_tag(&mut self, tag_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let task_id = self.task_id;
+        self.mutate(
+            window,
+            cx,
+            move |connection| tasks::assign_tag(connection, task_id, tag_id),
             |_, (), _, _| {},
         );
     }
@@ -418,32 +431,45 @@ impl TaskView {
                     .with_context(|| format!("no task with id {id}"))?;
                 let description = tasks::load_description(&connection, id)?;
                 let all_tags = tasks::list_tags(&connection)?;
-                let tags = resolve_tags(&task.tag_ids, all_tags);
-                anyhow::Ok((task, description, tags))
+                let tags = resolve_tags(&task.tag_ids, &all_tags);
+                anyhow::Ok((task, description, all_tags, tags))
             }
         });
         cx.spawn(async move |this, cx| {
-            let (task, description, tags) = read.await?;
-            this.update(cx, |this, cx| this.apply_refresh(task, description, tags, cx))
+            let (task, description, all_tags, tags) = read.await?;
+            this.update(cx, |this, cx| {
+                this.apply_refresh(task, description, all_tags, tags, cx)
+            })
         })
     }
 
+    /// Applies a `refresh` read. State and tags always win (they're never
+    /// "dirty" -- every change to them already went through `mutate`, which
+    /// wrote the DB first). Title and description are local-edit-aware:
+    /// overwriting either here would silently discard an in-progress
+    /// rename or buffer edit the user hasn't saved yet, so each is only
+    /// applied while its own dirty tracking says there's nothing to lose.
     fn apply_refresh(
         &mut self,
         task: TaskRow,
         description: String,
+        all_tags: Vec<Tag>,
         tags: Vec<Tag>,
         cx: &mut Context<Self>,
     ) {
-        self.title = task.title.into();
         self.state = task.state;
         self.tags = tags;
-        self.title_dirty = false;
-        self.buffer.update(cx, |buffer, cx| {
-            buffer.set_text(description, cx);
-            let version = buffer.version();
-            buffer.did_save(version, None, cx);
-        });
+        self.all_tags = all_tags;
+        if !self.title_dirty {
+            self.title = task.title.into();
+        }
+        if !self.buffer.read(cx).is_dirty() {
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.set_text(description, cx);
+                let version = buffer.version();
+                buffer.did_save(version, None, cx);
+            });
+        }
         cx.emit(EditorEvent::TitleChanged);
     }
 
@@ -496,16 +522,20 @@ impl TaskView {
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
             .child(h_flex().gap_2().items_center().child(title_row).child(state_dropdown))
-            .child(self.render_tags(cx))
+            .child(self.render_tags(window, cx))
     }
 
-    fn render_tags(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_tags(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut chips = Vec::with_capacity(self.tags.len());
+        for tag in &self.tags {
+            chips.push(self.render_tag_chip(tag, cx));
+        }
         h_flex()
             .id("zedgg-task-tags")
             .gap_1()
             .flex_wrap()
-            .children(self.tags.iter().map(|tag| self.render_tag_chip(tag, cx)))
-            .child(self.render_tag_add(cx))
+            .children(chips)
+            .child(self.render_tag_add(window, cx))
     }
 
     fn render_tag_chip(&self, tag: &Tag, cx: &Context<Self>) -> impl IntoElement {
@@ -529,11 +559,12 @@ impl TaskView {
             )
     }
 
-    /// The "+ tag" button; swaps to a free-text single-line editor while
-    /// `tag_edit` is active (`add_tag` resolves the typed name against
-    /// existing tags case-insensitively, so this single control covers both
-    /// "assign an existing tag" and "create a new one").
-    fn render_tag_add(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// The "+ tag" button: a `ContextMenu` listing every not-yet-assigned
+    /// project tag (click = assign) plus a trailing "New Tag…" entry that
+    /// swaps the button for the free-text inline editor (`tag_edit`,
+    /// confirmed through `add_tag`, which covers both "assign an existing
+    /// tag by typed name" and "create a new one").
+    fn render_tag_add(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(edit) = &self.tag_edit {
             div()
                 .id("zedgg-task-tag-add-edit")
@@ -541,12 +572,43 @@ impl TaskView {
                 .child(edit.editor.clone())
                 .into_any_element()
         } else {
-            IconButton::new("zedgg-task-tag-add", IconName::Plus)
-                .icon_size(IconSize::XSmall)
-                .tooltip(ui::Tooltip::text("Add Tag"))
-                .on_click(cx.listener(|this, _, window, cx| this.begin_tag_edit(window, cx)))
+            let menu = self.build_tag_menu(window, cx);
+            PopoverMenu::new("zedgg-task-tag-add")
+                .trigger(
+                    IconButton::new("zedgg-task-tag-add-trigger", IconName::Plus)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(ui::Tooltip::text("Add Tag")),
+                )
+                .menu(move |_, _| Some(menu.clone()))
                 .into_any_element()
         }
+    }
+
+    fn build_tag_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ContextMenu> {
+        let assigned: HashSet<i64> = self.tags.iter().map(|tag| tag.id).collect();
+        let unassigned: Vec<Tag> = self
+            .all_tags
+            .iter()
+            .filter(|tag| !assigned.contains(&tag.id))
+            .cloned()
+            .collect();
+        let weak_self = cx.weak_entity();
+        ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for tag in unassigned {
+                let tag_id = tag.id;
+                let weak_self = weak_self.clone();
+                menu = menu.entry(tag.name.clone(), None, move |window, cx| {
+                    weak_self
+                        .update(cx, |this, cx| this.assign_existing_tag(tag_id, window, cx))
+                        .ok();
+                });
+            }
+            menu.entry("New Tag…", None, move |window, cx| {
+                weak_self
+                    .update(cx, |this, cx| this.begin_tag_edit(window, cx))
+                    .ok();
+            })
+        })
     }
 }
 
@@ -644,6 +706,7 @@ impl Item for TaskView {
         let write = cx.background_spawn({
             let root = self.project_root.clone();
             let id = self.task_id;
+            let title = title.clone();
             async move {
                 let connection = open_db(&root)?;
                 // Two statements, not a single SQL transaction: the second
@@ -661,11 +724,15 @@ impl Item for TaskView {
         cx.spawn(async move |this, cx| {
             write.await?;
             // Only edits up to `version` are saved; anything typed during
-            // the write keeps the tab dirty.
+            // the write keeps the tab dirty. Title has no version counter
+            // to compare, so guard the same way by value: only clear
+            // `title_dirty` if the title we just wrote is still the live
+            // one -- a second rename committed while this save was in
+            // flight must stay dirty, or it would silently never persist.
             this.update(cx, |this, cx| {
                 this.buffer
                     .update(cx, |buffer, cx| buffer.did_save(version, None, cx));
-                if title_dirty {
+                if title_dirty && this.title.as_ref() == title.as_str() {
                     this.title_dirty = false;
                 }
             })

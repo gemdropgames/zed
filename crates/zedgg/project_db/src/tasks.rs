@@ -274,6 +274,26 @@ pub fn create_tag(connection: &Connection, name: &str, color: &str) -> Result<i6
         .context("INSERT ... RETURNING id produced no row")
 }
 
+/// Creates a tag named `name`, colored by cycling through `colors` in
+/// creation order (`colors[list_tags(connection)?.len() % colors.len()]`).
+/// The count-read and the insert are two statements on one `connection`,
+/// not one atomic transaction -- two *different* connections racing this
+/// at the same instant could still pick the same color (each reads the
+/// count before either has committed its insert). Acceptable for a
+/// single-user desktop app; a caller needing true atomicity across
+/// concurrent writers would need to wrap both in one `BEGIN IMMEDIATE`.
+pub fn create_tag_with_next_color(
+    connection: &Connection,
+    name: &str,
+    colors: &[&str],
+) -> Result<i64> {
+    if colors.is_empty() {
+        bail!("colors must not be empty");
+    }
+    let color = colors[list_tags(connection)?.len() % colors.len()];
+    create_tag(connection, name, color)
+}
+
 pub fn list_tags(connection: &Connection) -> Result<Vec<Tag>> {
     connection.select::<(i64, String, String)>(
         "SELECT id, name, color FROM task_tags ORDER BY name COLLATE NOCASE",
@@ -468,6 +488,22 @@ mod tests {
         let orphans: Option<i64> = c
             .select_row("SELECT COUNT(*) FROM task_tag_assignments").unwrap()().unwrap();
         assert_eq!(orphans, Some(0), "cascade");
+    }
+
+    #[test]
+    fn create_tag_with_next_color_cycles_the_palette() {
+        let c = open_memory("tasks_tag_palette");
+        let colors = ["#a", "#b", "#c"];
+        let first = create_tag_with_next_color(&c, "one", &colors).unwrap();
+        let second = create_tag_with_next_color(&c, "two", &colors).unwrap();
+        let third = create_tag_with_next_color(&c, "three", &colors).unwrap();
+        let fourth = create_tag_with_next_color(&c, "four", &colors).unwrap();
+        let color_of = |id: i64| list_tags(&c).unwrap().into_iter().find(|t| t.id == id).unwrap().color;
+        assert_eq!(color_of(first), "#a");
+        assert_eq!(color_of(second), "#b");
+        assert_eq!(color_of(third), "#c");
+        assert_eq!(color_of(fourth), "#a", "wraps back around");
+        assert!(create_tag_with_next_color(&c, "five", &[]).is_err());
     }
 
     #[test]

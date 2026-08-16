@@ -161,6 +161,52 @@ mod tests {
         view.read_with(cx, |view, _| assert_eq!(view.tag_names(), ["art"]));
     }
 
+    /// Regression test: `set_state` (like `add_tag`/`remove_tag`) refreshes
+    /// title/state/tags from the DB in the background, but must not
+    /// clobber an unsaved description edit sitting in the buffer -- or
+    /// silently mark it clean -- while doing so.
+    #[gpui::test]
+    async fn test_set_state_does_not_clobber_unsaved_description_edit(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = task_workspace(cx).await;
+        let id = { tasks::create_task(&open(dir.path()).unwrap(), "t").unwrap() };
+        workspace.update_in(cx, |_, window, cx| {
+            open_task(cx.weak_entity(), dir.path().to_path_buf(), id, window, cx);
+        });
+        cx.run_until_parked();
+        let view = workspace.read_with(cx, |w, cx| w.items_of_type::<TaskView>(cx).next().unwrap());
+
+        view.update_in(cx, |view, window, cx| {
+            view.editor()
+                .update(cx, |editor, cx| editor.set_text("unsaved notes", window, cx));
+        });
+        view.read_with(cx, |view, cx| assert!(view.is_dirty(cx)));
+
+        view.update_in(cx, |view, window, cx| {
+            view.set_state(tasks::TaskState::InProgress, window, cx)
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.is_dirty(cx),
+                "unsaved description edit must survive a state refresh"
+            );
+            assert_eq!(view.buffer().read(cx).text(), "unsaved notes");
+        });
+        let c = open(dir.path()).unwrap();
+        assert_eq!(
+            tasks::get_task(&c, id).unwrap().unwrap().state,
+            tasks::TaskState::InProgress,
+            "the state change itself still lands"
+        );
+        assert_eq!(
+            tasks::load_description(&c, id).unwrap(),
+            "",
+            "the unsaved edit must not have been written either"
+        );
+    }
+
     /// A workspace with the panel registered and pointed at `root` (a real
     /// temp dir) via `root_override`, so DB reads/writes hit disk while the
     /// project itself is a `FakeFs`.
