@@ -48,6 +48,7 @@ const EMPTY_MESSAGE: &str = "Open a local project to keep tasks in it";
 
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
+    crate::board::init(cx);
     // `zed::reload_keymaps` clears and rebuilds ALL key bindings on every
     // keymap/settings change (including once at startup), so re-bind on
     // `KeymapEventChannel` like every GGO panel does.
@@ -66,11 +67,26 @@ pub fn init(cx: &mut App) {
             workspace.toggle_panel_focus::<TasksPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &OpenBoard, window, cx| {
-            // Task 7 replaces this with opening the actual board view.
-            workspace.focus_panel::<TasksPanel>(window, cx);
+            let Some(root) = discover_project_root(workspace, cx) else {
+                return;
+            };
+            crate::board::open_board(workspace, root, window, cx);
         });
     })
     .detach();
+}
+
+/// The workspace's first visible LOCAL worktree, i.e. the project root a
+/// `zedgg.sqlite` would live in. Shared by the panel's own root discovery
+/// (`TasksPanel::refresh_root`) and `OpenBoard`, which has no panel instance
+/// (and thus no `root_override`) to consult.
+pub(crate) fn discover_project_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    let project = workspace.project().read(cx);
+    if !project.is_local() {
+        return None;
+    }
+    let worktree = project.visible_worktrees(cx).next()?;
+    Some(worktree.read(cx).abs_path().to_path_buf())
 }
 
 fn bind_panel_keys(cx: &mut App) {
@@ -154,12 +170,7 @@ impl TasksPanel {
     pub(crate) fn refresh_root(&mut self, cx: &mut Context<Self>) {
         let root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
-            let project = workspace.read(cx).project().read(cx);
-            if !project.is_local() {
-                return None;
-            }
-            let worktree = project.visible_worktrees(cx).next()?;
-            Some(worktree.read(cx).abs_path().to_path_buf())
+            discover_project_root(workspace.read(cx), cx)
         });
         if root != self.project_root {
             self.project_root = root;

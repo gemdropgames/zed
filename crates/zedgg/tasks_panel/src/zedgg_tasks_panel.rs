@@ -1,6 +1,8 @@
+mod board;
 mod panel;
 mod task_view;
 
+pub use board::{TaskBoard, open_board};
 pub use panel::{Delete, NewTask, OpenBoard, TasksPanel, ToggleFocus, init};
 pub use task_view::{TaskView, open_task};
 
@@ -175,6 +177,47 @@ mod tests {
         cx.dispatch_action(ToggleFocus);
         workspace.update(cx, |workspace, cx| {
             assert!(workspace.left_dock().read(cx).is_open());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_board_groups_cards_and_click_opens_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, cx) = tasks_workspace(cx, dir.path()).await;
+        let (a, b) = {
+            let c = open(dir.path()).unwrap();
+            let a = tasks::create_task(&c, "draw tiles").unwrap();
+            let b = tasks::create_task(&c, "fix jump").unwrap();
+            tasks::move_task_between(&c, b, tasks::TaskState::InProgress, None, None).unwrap();
+            (a, b)
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_board(workspace, dir.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let board = workspace.read_with(cx, |workspace, cx| {
+            workspace.items_of_type::<TaskBoard>(cx).next().expect("board tab")
+        });
+        board.read_with(cx, |board, _| {
+            assert_eq!(board.column(tasks::TaskState::Backlog), [a]);
+            assert_eq!(board.column(tasks::TaskState::InProgress), [b]);
+            assert_eq!(board.column(tasks::TaskState::Done), [] as [i64; 0]);
+        });
+
+        board.update_in(cx, |board, window, cx| board.open_card(a, window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let view = workspace.items_of_type::<TaskView>(cx).next().expect("tab");
+            assert_eq!(view.read(cx).task_id(), a);
+        });
+
+        // Second open_board re-activates, no duplicate.
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_board(workspace, dir.path().to_path_buf(), window, cx);
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<TaskBoard>(cx).count(), 1);
         });
     }
 }
