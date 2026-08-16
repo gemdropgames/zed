@@ -3,6 +3,7 @@
 
 use anyhow::{Context as _, Result, bail};
 use sqlez::connection::Connection;
+use std::collections::HashMap;
 
 pub const MIGRATION: &str = "
 CREATE TABLE tasks (
@@ -89,6 +90,13 @@ pub struct TaskRow {
     pub tag_ids: Vec<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+}
+
 type TasksSelectRow = (i64, String, i64, String);
 
 fn task_from_row((id, state, rank, title): TasksSelectRow) -> Result<TaskRow> {
@@ -102,6 +110,7 @@ fn task_from_row((id, state, rank, title): TasksSelectRow) -> Result<TaskRow> {
 }
 
 pub fn list_tasks(connection: &Connection) -> Result<Vec<TaskRow>> {
+    let tag_map = tag_ids_by_task(connection)?;
     connection.select::<TasksSelectRow>(
         "SELECT id, state, rank, title FROM tasks \
          ORDER BY CASE state \
@@ -109,22 +118,38 @@ pub fn list_tasks(connection: &Connection) -> Result<Vec<TaskRow>> {
              WHEN 'review' THEN 2 WHEN 'done' THEN 3 END, rank",
     )?()?
     .into_iter()
-    .map(task_from_row)
+    .map(|row| {
+        let mut task = task_from_row(row)?;
+        task.tag_ids = tag_map.get(&task.id).cloned().unwrap_or_default();
+        Ok(task)
+    })
     .collect()
 }
 
 pub fn get_task(connection: &Connection, id: i64) -> Result<Option<TaskRow>> {
+    let tag_map = tag_ids_by_task(connection)?;
     connection
         .select_row_bound::<i64, TasksSelectRow>(
             "SELECT id, state, rank, title FROM tasks WHERE id = ?",
         )?(id)?
-        .map(task_from_row)
+        .map(|row| {
+            let mut task = task_from_row(row)?;
+            task.tag_ids = tag_map.get(&task.id).cloned().unwrap_or_default();
+            Ok(task)
+        })
         .transpose()
 }
 
 fn validate_title(title: &str) -> Result<()> {
     if title.trim().is_empty() {
         bail!("task title may not be empty");
+    }
+    Ok(())
+}
+
+fn validate_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("tag name may not be empty");
     }
     Ok(())
 }
@@ -224,6 +249,52 @@ fn renumber_column(connection: &Connection, state: TaskState) -> Result<()> {
     Ok(())
 }
 
+pub fn create_tag(connection: &Connection, name: &str, color: &str) -> Result<i64> {
+    validate_name(name)?;
+    connection
+        .select_row_bound::<(&str, &str), i64>(
+            "INSERT INTO task_tags (name, color) VALUES (?, ?) RETURNING id",
+        )?((name, color))?
+        .context("INSERT ... RETURNING id produced no row")
+}
+
+pub fn list_tags(connection: &Connection) -> Result<Vec<Tag>> {
+    connection.select::<(i64, String, String)>(
+        "SELECT id, name, color FROM task_tags ORDER BY name COLLATE NOCASE",
+    )?()?
+    .into_iter()
+    .map(|(id, name, color)| Ok(Tag { id, name, color }))
+    .collect()
+}
+
+pub fn assign_tag(connection: &Connection, task_id: i64, tag_id: i64) -> Result<()> {
+    connection.exec_bound::<(i64, i64)>(
+        "INSERT OR IGNORE INTO task_tag_assignments (task_id, tag_id) VALUES (?, ?)",
+    )?((task_id, tag_id))
+}
+
+pub fn unassign_tag(connection: &Connection, task_id: i64, tag_id: i64) -> Result<()> {
+    connection.exec_bound::<(i64, i64)>(
+        "DELETE FROM task_tag_assignments WHERE task_id = ? AND tag_id = ?",
+    )?((task_id, tag_id))
+}
+
+pub fn delete_tag(connection: &Connection, tag_id: i64) -> Result<()> {
+    connection.exec_bound::<i64>("DELETE FROM task_tags WHERE id = ?")?(tag_id)
+}
+
+fn tag_ids_by_task(connection: &Connection) -> Result<HashMap<i64, Vec<i64>>> {
+    let rows: Vec<(i64, i64)> = connection.select(
+        "SELECT a.task_id, a.tag_id FROM task_tag_assignments a \
+         JOIN task_tags t ON t.id = a.tag_id ORDER BY t.name COLLATE NOCASE",
+    )?()?;
+    let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (task_id, tag_id) in rows {
+        map.entry(task_id).or_default().push(tag_id);
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +387,30 @@ mod tests {
         let a = create_task(&c, "a").unwrap();
         let missing_id = 9999;
         assert!(move_task_between(&c, missing_id, TaskState::Backlog, None, Some(a)).is_err());
+    }
+
+    #[test]
+    fn tags_assign_list_and_cascade() {
+        let c = open_memory("tasks_tags");
+        let task = create_task(&c, "t").unwrap();
+        let art = create_tag(&c, "art", "#e06c75").unwrap();
+        let code = create_tag(&c, "code", "#61afef").unwrap();
+        assert!(create_tag(&c, "art", "#ffffff").is_err(), "unique names");
+        assert!(create_tag(&c, " ", "#ffffff").is_err());
+
+        assign_tag(&c, task, code).unwrap();
+        assign_tag(&c, task, art).unwrap();
+        assign_tag(&c, task, art).unwrap(); // idempotent
+        assert_eq!(get_task(&c, task).unwrap().unwrap().tag_ids, [art, code], "by name");
+
+        unassign_tag(&c, task, code).unwrap();
+        assert_eq!(get_task(&c, task).unwrap().unwrap().tag_ids, [art]);
+
+        delete_tag(&c, art).unwrap();
+        assert_eq!(get_task(&c, task).unwrap().unwrap().tag_ids, [] as [i64; 0]);
+        delete_task(&c, task).unwrap();
+        let orphans: Option<i64> = c
+            .select_row("SELECT COUNT(*) FROM task_tag_assignments").unwrap()().unwrap();
+        assert_eq!(orphans, Some(0), "cascade");
     }
 }
