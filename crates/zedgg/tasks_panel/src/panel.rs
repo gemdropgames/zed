@@ -49,6 +49,7 @@ const EMPTY_MESSAGE: &str = "Open a local project to keep tasks in it";
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
     crate::board::init(cx);
+    crate::task_view::init(cx);
     // `zed::reload_keymaps` clears and rebuilds ALL key bindings on every
     // keymap/settings change (including once at startup), so re-bind on
     // `KeymapEventChannel` like every GGO panel does.

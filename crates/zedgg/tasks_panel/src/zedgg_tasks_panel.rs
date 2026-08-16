@@ -97,6 +97,70 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn test_title_edit_saves_with_description(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = task_workspace(cx).await;
+        let id = { tasks::create_task(&open(dir.path()).unwrap(), "old").unwrap() };
+        workspace.update_in(cx, |_, window, cx| {
+            open_task(cx.weak_entity(), dir.path().to_path_buf(), id, window, cx);
+        });
+        cx.run_until_parked();
+        let view = workspace.read_with(cx, |w, cx| w.items_of_type::<TaskView>(cx).next().unwrap());
+
+        view.update_in(cx, |view, window, cx| {
+            view.set_title_for_save("new title".into(), window, cx)
+        });
+        view.read_with(cx, |view, cx| assert!(view.is_dirty(cx), "title change dirties"));
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.save_active_item(workspace::SaveIntent::Save, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let c = open(dir.path()).unwrap();
+        assert_eq!(tasks::get_task(&c, id).unwrap().unwrap().title, "new title");
+        view.read_with(cx, |view, cx| {
+            assert!(!view.is_dirty(cx));
+            assert_eq!(view.tab_content_text(0, cx), "new title");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_state_change_and_tag_assign_from_view(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = task_workspace(cx).await;
+        let id = { tasks::create_task(&open(dir.path()).unwrap(), "t").unwrap() };
+        workspace.update_in(cx, |_, window, cx| {
+            open_task(cx.weak_entity(), dir.path().to_path_buf(), id, window, cx);
+        });
+        cx.run_until_parked();
+        let view = workspace.read_with(cx, |w, cx| w.items_of_type::<TaskView>(cx).next().unwrap());
+
+        view.update_in(cx, |view, window, cx| {
+            view.set_state(tasks::TaskState::InProgress, window, cx)
+        });
+        cx.run_until_parked();
+        let c = open(dir.path()).unwrap();
+        assert_eq!(
+            tasks::get_task(&c, id).unwrap().unwrap().state,
+            tasks::TaskState::InProgress
+        );
+
+        view.update_in(cx, |view, window, cx| view.add_tag("art".into(), window, cx));
+        cx.run_until_parked();
+        let c = open(dir.path()).unwrap();
+        let tags = tasks::list_tags(&c).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "art");
+        assert_eq!(
+            tasks::get_task(&c, id).unwrap().unwrap().tag_ids,
+            [tags[0].id]
+        );
+        view.read_with(cx, |view, _| assert_eq!(view.tag_names(), ["art"]));
+    }
+
     /// A workspace with the panel registered and pointed at `root` (a real
     /// temp dir) via `root_override`, so DB reads/writes hit disk while the
     /// project itself is a `FakeFs`.
