@@ -84,8 +84,10 @@ pub struct TaskView {
     title: SharedString,
     /// A committed-but-unsaved rename (from the title editor's Enter),
     /// independent of the buffer's own dirty tracking. Cleared by `save`
-    /// (after writing `rename_task`) and by `refresh` (an external reload
-    /// discards it same as it discards unsaved description edits).
+    /// (after writing `rename_task`). `apply_refresh` PRESERVES a pending
+    /// rename while this is set, the same way it preserves an unsaved
+    /// buffer edit while the buffer is dirty -- neither is discarded by a
+    /// refresh.
     title_dirty: bool,
     state: TaskState,
     /// This task's assigned tags, resolved to name+color and ordered by
@@ -101,6 +103,11 @@ pub struct TaskView {
     project_root: PathBuf,
     title_edit: Option<TitleEditState>,
     tag_edit: Option<TagEditState>,
+    /// Guards `refresh` against an in-flight read whose result has been
+    /// superseded by a newer one (e.g. a `mutate`'s post-write refresh
+    /// racing the panel's DB-change subscription) -- see `TasksPanel`'s
+    /// own `load_generation` for the same pattern.
+    load_generation: u64,
     _editor_event_subscription: Subscription,
 }
 
@@ -307,6 +314,7 @@ impl TaskView {
             project_root,
             title_edit: None,
             tag_edit: None,
+            load_generation: 0,
             _editor_event_subscription,
         }
     }
@@ -497,9 +505,13 @@ impl TaskView {
     }
 
     /// Re-read title, state, description, and tags from the DB. Shared by
-    /// the `Item::reload` hook (an external file change) and every header
-    /// mutation's post-write refresh.
-    fn refresh(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+    /// the `Item::reload` hook (an external file change), every header
+    /// mutation's post-write refresh, and the panel's DB-change
+    /// subscription (an external write to `zedgg.sqlite` while this tab is
+    /// open). `pub(crate)` for that last caller.
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.load_generation += 1;
+        let generation = self.load_generation;
         let read = cx.background_spawn({
             let root = self.project_root.clone();
             let id = self.task_id;
@@ -517,6 +529,9 @@ impl TaskView {
         cx.spawn(async move |this, cx| {
             let (task, description, all_tags, tags, attachments) = read.await?;
             this.update(cx, |this, cx| {
+                if this.load_generation != generation {
+                    return;
+                }
                 this.apply_refresh(task, description, all_tags, tags, attachments, cx)
             })
         })
@@ -558,7 +573,9 @@ impl TaskView {
     // -------------------------------------------------------- attachments
 
     /// Forget resolved preview images so a re-imported file shows fresh.
-    fn clear_image_cache(&mut self) {
+    /// `pub(crate)` for the panel's DB-change subscription, which clears
+    /// every open `TaskView`'s cache the same way an import does.
+    pub(crate) fn clear_image_cache(&mut self) {
         if let Ok(mut images) = self.images.lock() {
             images.clear();
         }

@@ -25,7 +25,8 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 use zedgg_project_db::tasks::{self, TaskRow, TaskState};
 use zedgg_project_db::{Connection, DB_FILE, open, open_existing};
 
-use crate::task_view::open_task;
+use crate::board::TaskBoard;
+use crate::task_view::{TaskView, open_task};
 
 actions!(
     zedgg_tasks,
@@ -142,6 +143,21 @@ impl TasksPanel {
                         .any(|(path, _, _)| path.file_name() == Some(DB_FILE))
                 {
                     this.reload(cx);
+                    if let Some(workspace) = this.workspace.as_ref().and_then(|w| w.upgrade()) {
+                        let boards: Vec<Entity<TaskBoard>> =
+                            workspace.read(cx).items_of_type::<TaskBoard>(cx).collect();
+                        for board in boards {
+                            board.update(cx, |board, cx| board.reload(cx));
+                        }
+                        let views: Vec<Entity<TaskView>> =
+                            workspace.read(cx).items_of_type::<TaskView>(cx).collect();
+                        for view in views {
+                            view.update(cx, |view, cx| {
+                                view.refresh(cx).detach_and_log_err(cx);
+                                view.clear_image_cache();
+                            });
+                        }
+                    }
                 }
             })
         });
@@ -311,6 +327,21 @@ impl TasksPanel {
         );
     }
 
+    /// The toolbar's open-board button: same path as the `OpenBoard`
+    /// action, but via the panel's own workspace handle since there's no
+    /// `Workspace` in scope at a button click.
+    fn open_board(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(root), Some(workspace)) = (self.project_root.clone(), self.workspace.clone())
+        else {
+            return;
+        };
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                crate::board::open_board(workspace, root, window, cx);
+            })
+            .ok();
+    }
+
     /// The `Delete` keybinding's body: acts on the current selection.
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected else {
@@ -456,6 +487,13 @@ impl TasksPanel {
                     .tooltip(ui::Tooltip::text("New Task"))
                     .disabled(!enabled)
                     .on_click(cx.listener(|this, _, window, cx| this.new_task(window, cx))),
+            )
+            .child(
+                IconButton::new("zedgg-tasks-open-board", IconName::Split)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Open Board"))
+                    .disabled(!enabled)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_board(window, cx))),
             )
     }
 }

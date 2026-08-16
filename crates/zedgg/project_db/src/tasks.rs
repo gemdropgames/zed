@@ -121,7 +121,7 @@ pub fn list_tasks(connection: &Connection) -> Result<Vec<TaskRow>> {
         "SELECT id, state, rank, title FROM tasks \
          ORDER BY CASE state \
              WHEN 'backlog' THEN 0 WHEN 'in_progress' THEN 1 \
-             WHEN 'review' THEN 2 WHEN 'done' THEN 3 END, rank",
+             WHEN 'review' THEN 2 WHEN 'done' THEN 3 END, rank, id",
     )?()?
     .into_iter()
     .map(|row| {
@@ -247,7 +247,11 @@ pub fn move_task_between(
         }
         (Some(above), None) => rank_of(above)? + 1000,
         (None, Some(below)) => rank_of(below)? - 1000,
-        (None, None) => 0,
+        (None, None) => connection
+            .select_row_bound::<&str, i64>(
+                "SELECT COALESCE((SELECT MAX(rank) FROM tasks WHERE state = ?), -1000) + 1000",
+            )?(state.as_str())?
+            .context("SELECT COALESCE(...) produced no row")?,
     };
     connection.exec_bound::<(&str, i64, i64)>(
         "UPDATE tasks SET state = ?, rank = ?, updated_at = datetime('now') WHERE id = ?",
@@ -417,7 +421,7 @@ mod tests {
     #[test]
     fn move_between_neighbors_takes_the_midpoint() {
         let c = open_memory("tasks_move_mid");
-        let a = create_task(&c, "a").unwrap(); // ranks: c=-2000, b=-1000, a=0
+        let a = create_task(&c, "a").unwrap();
         let b = create_task(&c, "b").unwrap();
         let d = create_task(&c, "d").unwrap();
         move_task_between(&c, a, TaskState::Backlog, Some(d), Some(b)).unwrap();
@@ -438,6 +442,27 @@ mod tests {
         let review: Vec<i64> = list_tasks(&c).unwrap().iter()
             .filter(|t| t.state == TaskState::Review).map(|t| t.id).collect();
         assert_eq!(review, [b, a]);
+    }
+
+    #[test]
+    fn move_with_no_neighbors_into_nonempty_column_lands_last() {
+        let c = open_memory("tasks_move_none_none");
+        let a = create_task(&c, "a").unwrap();
+        let b = create_task(&c, "b").unwrap();
+        move_task_between(&c, a, TaskState::Review, None, None).unwrap();
+        move_task_between(&c, b, TaskState::Review, None, None).unwrap();
+        let rows = list_tasks(&c).unwrap();
+        let rank_of = |id: i64| rows.iter().find(|t| t.id == id).unwrap().rank;
+        assert!(
+            rank_of(b) > rank_of(a),
+            "(None, None) into a non-empty column must land after the existing tasks, not at rank 0"
+        );
+        let review: Vec<i64> = rows
+            .iter()
+            .filter(|t| t.state == TaskState::Review)
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(review, [a, b]);
     }
 
     #[test]
