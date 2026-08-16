@@ -24824,6 +24824,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zedgg_tasks_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde_json",
+ "tempfile",
+ "zedgg_project_db",
+]
+
+[[package]]
 name = "zedgg_tasks_panel"
 version = "0.1.0"
 dependencies = [

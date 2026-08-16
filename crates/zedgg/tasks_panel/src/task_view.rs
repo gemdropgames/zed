@@ -45,9 +45,7 @@ const KEY_CONTEXT: &str = "ZedGGTaskView";
 /// looked up, missing.
 type ImageCache = Arc<Mutex<HashMap<String, Option<Arc<Image>>>>>;
 
-const TAG_COLORS: [&str; 8] = [
-    "#e06c75", "#61afef", "#98c379", "#e5c07b", "#c678dd", "#56b6c2", "#d19a66", "#abb2bf",
-];
+use zedgg_project_db::tasks::TAG_COLORS;
 
 fn bind_task_view_keys(cx: &mut App) {
     let in_editor = format!("{KEY_CONTEXT} > Editor");

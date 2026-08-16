@@ -1,0 +1,22 @@
+[package]
+name = "zedgg_tasks_cli"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zedgg-tasks"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+zedgg_project_db.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

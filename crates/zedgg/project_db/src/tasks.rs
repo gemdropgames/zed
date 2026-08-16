@@ -36,6 +36,12 @@ CREATE TABLE task_files (
 );
 ";
 
+/// The default tag palette, cycled by [`create_tag_with_next_color`].
+/// Lives here so the panel and the CLI assign consistent colors.
+pub const TAG_COLORS: [&str; 8] = [
+    "#e06c75", "#61afef", "#98c379", "#e5c07b", "#c678dd", "#56b6c2", "#d19a66", "#abb2bf",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskState {
     Backlog,
@@ -70,7 +76,7 @@ impl TaskState {
         }
     }
 
-    fn parse(state: &str) -> Result<Self> {
+    pub fn parse(state: &str) -> Result<Self> {
         Ok(match state {
             "backlog" => TaskState::Backlog,
             "in_progress" => TaskState::InProgress,
