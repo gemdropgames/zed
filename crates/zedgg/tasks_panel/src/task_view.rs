@@ -19,15 +19,15 @@
 
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyEntity, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, IntoElement, Render, Rgba, SharedString, Subscription, Task, WeakEntity,
-    Window,
+    AnyEntity, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, Hsla, Image, ImageFormat, ImageSource, IntoElement, PathPromptOptions,
+    Render, Rgba, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use language::Buffer;
 use project::Project;
@@ -36,9 +36,14 @@ use workspace::Workspace;
 use workspace::item::{Item, ItemBufferKind, ItemEvent, SaveOptions};
 use zedgg_project_db::Connection;
 use zedgg_project_db::open as open_db;
-use zedgg_project_db::tasks::{self, Tag, TaskRow, TaskState};
+use zedgg_project_db::tasks::{self, Tag, TaskFile, TaskRow, TaskState};
 
 const KEY_CONTEXT: &str = "ZedGGTaskView";
+
+/// Per-view cache of images resolved for the description's markdown
+/// preview, keyed by the reference as written (`shot.png`). `None` =
+/// looked up, missing.
+type ImageCache = Arc<Mutex<HashMap<String, Option<Arc<Image>>>>>;
 
 const TAG_COLORS: [&str; 8] = [
     "#e06c75", "#61afef", "#98c379", "#e5c07b", "#c678dd", "#56b6c2", "#d19a66", "#abb2bf",
@@ -88,6 +93,10 @@ pub struct TaskView {
     tags: Vec<Tag>,
     /// Every tag in the project, for the "+ tag" menu's existing-tag list.
     all_tags: Vec<Tag>,
+    /// This task's attachments, for the header's chip row and the
+    /// description preview's image resolver.
+    attachments: Vec<TaskFile>,
+    images: ImageCache,
     error: Option<SharedString>,
     project_root: PathBuf,
     title_edit: Option<TitleEditState>,
@@ -136,12 +145,13 @@ pub fn open_task(
                 let description = tasks::load_description(&connection, id)?;
                 let all_tags = tasks::list_tags(&connection)?;
                 let tags = resolve_tags(&task.tag_ids, &all_tags);
-                anyhow::Ok((task, description, all_tags, tags))
+                let attachments = tasks::list_files(&connection, id)?;
+                anyhow::Ok((task, description, all_tags, tags, attachments))
             }
         });
         window
             .spawn(cx, async move |cx| {
-                let (task, description, all_tags, tags) = load.await?;
+                let (task, description, all_tags, tags, attachments) = load.await?;
                 let markdown = cx
                     .update(|_, cx| {
                         workspace.read_with(cx, |workspace, cx| {
@@ -164,6 +174,7 @@ pub fn open_task(
                             task.state,
                             tags,
                             all_tags,
+                            attachments,
                             description,
                             markdown,
                             project,
@@ -188,6 +199,60 @@ fn resolve_tags(tag_ids: &[i64], all_tags: &[Tag]) -> Vec<Tag> {
         .collect()
 }
 
+/// The preview's image resolver for one task: `shot.png` is looked up
+/// among the task's attachments and the blob decoded.
+///
+/// ponytail: synchronous sqlite read on the UI thread, once per reference
+/// per view (cached, including misses). Move to a background prefetch if
+/// large images ever stall the preview.
+fn image_resolver(
+    project_root: PathBuf,
+    task_id: i64,
+    cache: ImageCache,
+) -> markdown_preview::BufferImageResolver {
+    Arc::new(move |reference: &str| {
+        if reference.contains("://") || reference.starts_with("data:") {
+            return None;
+        }
+        if let Ok(cache) = cache.lock()
+            && let Some(hit) = cache.get(reference)
+        {
+            return hit.clone().map(ImageSource::Image);
+        }
+        let image = load_image(&project_root, task_id, reference).ok().flatten();
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(reference.to_string(), image.clone());
+        }
+        image.map(ImageSource::Image)
+    })
+}
+
+fn load_image(project_root: &Path, task_id: i64, reference: &str) -> Result<Option<Arc<Image>>> {
+    let connection = open_db(project_root)?;
+    let Some(format) = image_format(reference) else {
+        return Ok(None);
+    };
+    let Some(bytes) = tasks::load_file_by_name(&connection, task_id, reference)? else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(Image::from_bytes(format, bytes))))
+}
+
+fn image_format(name: &str) -> Option<ImageFormat> {
+    let extension = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => ImageFormat::Png,
+        "jpg" | "jpeg" => ImageFormat::Jpeg,
+        "webp" => ImageFormat::Webp,
+        "gif" => ImageFormat::Gif,
+        "svg" => ImageFormat::Svg,
+        "bmp" => ImageFormat::Bmp,
+        "tif" | "tiff" => ImageFormat::Tiff,
+        "ico" => ImageFormat::Ico,
+        _ => return None,
+    })
+}
+
 impl TaskView {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -197,6 +262,7 @@ impl TaskView {
         state: TaskState,
         tags: Vec<Tag>,
         all_tags: Vec<Tag>,
+        attachments: Vec<TaskFile>,
         description: String,
         markdown: Option<Arc<language::Language>>,
         project: Entity<Project>,
@@ -216,6 +282,16 @@ impl TaskView {
         let _editor_event_subscription =
             cx.subscribe(&editor, |_, _, event: &EditorEvent, cx| cx.emit(event.clone()));
 
+        let images: ImageCache = Default::default();
+        let buffer_id = buffer.entity_id();
+        markdown_preview::set_buffer_image_resolver(
+            cx,
+            buffer_id,
+            image_resolver(project_root.clone(), task_id, images.clone()),
+        );
+        cx.on_release(move |_, cx| markdown_preview::remove_buffer_image_resolver(cx, buffer_id))
+            .detach();
+
         Self {
             editor,
             buffer,
@@ -225,6 +301,8 @@ impl TaskView {
             state,
             tags,
             all_tags,
+            attachments,
+            images,
             error: None,
             project_root,
             title_edit: None,
@@ -432,34 +510,38 @@ impl TaskView {
                 let description = tasks::load_description(&connection, id)?;
                 let all_tags = tasks::list_tags(&connection)?;
                 let tags = resolve_tags(&task.tag_ids, &all_tags);
-                anyhow::Ok((task, description, all_tags, tags))
+                let attachments = tasks::list_files(&connection, id)?;
+                anyhow::Ok((task, description, all_tags, tags, attachments))
             }
         });
         cx.spawn(async move |this, cx| {
-            let (task, description, all_tags, tags) = read.await?;
+            let (task, description, all_tags, tags, attachments) = read.await?;
             this.update(cx, |this, cx| {
-                this.apply_refresh(task, description, all_tags, tags, cx)
+                this.apply_refresh(task, description, all_tags, tags, attachments, cx)
             })
         })
     }
 
-    /// Applies a `refresh` read. State and tags always win (they're never
-    /// "dirty" -- every change to them already went through `mutate`, which
-    /// wrote the DB first). Title and description are local-edit-aware:
-    /// overwriting either here would silently discard an in-progress
-    /// rename or buffer edit the user hasn't saved yet, so each is only
-    /// applied while its own dirty tracking says there's nothing to lose.
+    /// Applies a `refresh` read. State, tags, and attachments always win
+    /// (they're never "dirty" -- every change to them already went through
+    /// `mutate`, which wrote the DB first). Title and description are
+    /// local-edit-aware: overwriting either here would silently discard an
+    /// in-progress rename or buffer edit the user hasn't saved yet, so each
+    /// is only applied while its own dirty tracking says there's nothing to
+    /// lose.
     fn apply_refresh(
         &mut self,
         task: TaskRow,
         description: String,
         all_tags: Vec<Tag>,
         tags: Vec<Tag>,
+        attachments: Vec<TaskFile>,
         cx: &mut Context<Self>,
     ) {
         self.state = task.state;
         self.tags = tags;
         self.all_tags = all_tags;
+        self.attachments = attachments;
         if !self.title_dirty {
             self.title = task.title.into();
         }
@@ -471,6 +553,93 @@ impl TaskView {
             });
         }
         cx.emit(EditorEvent::TitleChanged);
+    }
+
+    // -------------------------------------------------------- attachments
+
+    /// Forget resolved preview images so a re-imported file shows fresh.
+    fn clear_image_cache(&mut self) {
+        if let Ok(mut images) = self.images.lock() {
+            images.clear();
+        }
+    }
+
+    /// Opens the OS file picker and imports whatever the user chose.
+    fn import_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                this.update_in(cx, |this, window, cx| this.import_paths(paths, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Stores each path's bytes as an attachment named by its file name.
+    /// Directories are skipped. A duplicate name surfaces the DB's
+    /// unique-constraint error in the header via `mutate`'s standard error
+    /// handling, rather than silently overwriting.
+    pub fn import_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let task_id = self.task_id;
+        self.mutate(
+            window,
+            cx,
+            move |connection| {
+                for path in paths.iter().filter(|path| path.is_file()) {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| anyhow::anyhow!("bad file name {}", path.display()))?;
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    tasks::add_file(connection, task_id, name, &bytes)?;
+                }
+                Ok(())
+            },
+            |this, (), _, _| this.clear_image_cache(),
+        );
+    }
+
+    /// The attachment chip's ✕: confirms (empty cascade -- deleting an
+    /// attachment never takes anything else with it), then deletes.
+    fn remove_attachment(&mut self, file: TaskFile, window: &mut Window, cx: &mut Context<Self>) {
+        let confirm = ggo_common::confirm_destructive_cascade(
+            &format!("Delete \"{}\"?", file.name),
+            &[],
+            "Delete",
+            false,
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if !confirm.await {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.mutate(
+                    window,
+                    cx,
+                    move |connection| tasks::delete_file(connection, file.id),
+                    |this, (), _, _| this.clear_image_cache(),
+                )
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // -------------------------------------------------------------- render
@@ -523,6 +692,46 @@ impl TaskView {
             .border_color(cx.theme().colors().border_variant)
             .child(h_flex().gap_2().items_center().child(title_row).child(state_dropdown))
             .child(self.render_tags(window, cx))
+            .child(self.render_attachments(cx))
+    }
+
+    fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut chips = Vec::with_capacity(self.attachments.len());
+        for file in &self.attachments {
+            chips.push(self.render_attachment_chip(file, cx));
+        }
+        h_flex()
+            .id("zedgg-task-attachments")
+            .gap_1()
+            .flex_wrap()
+            .children(chips)
+            .child(
+                IconButton::new("zedgg-task-attachment-import", IconName::Download)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Import Files…"))
+                    .on_click(cx.listener(|this, _, window, cx| this.import_files(window, cx))),
+            )
+    }
+
+    fn render_attachment_chip(&self, file: &TaskFile, cx: &Context<Self>) -> impl IntoElement {
+        let file = file.clone();
+        h_flex()
+            .id(("zedgg-task-attachment", file.id as usize))
+            .gap_1()
+            .px_1()
+            .rounded_sm()
+            .bg(cx.theme().colors().element_background)
+            .child(Label::new(file.name.clone()).size(LabelSize::XSmall))
+            .child(
+                IconButton::new(
+                    ("zedgg-task-attachment-remove", file.id as usize),
+                    IconName::Close,
+                )
+                .icon_size(IconSize::XSmall)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.remove_attachment(file.clone(), window, cx)
+                })),
+            )
     }
 
     fn render_tags(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -623,7 +832,14 @@ impl Focusable for TaskView {
 impl Render for TaskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
+            .id("zedgg-task-view")
             .size_full()
+            .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.import_paths(paths.paths().to_vec(), window, cx);
+            }))
             .child(self.render_header(window, cx))
             .when_some(self.error.clone(), |parent, error| {
                 parent.child(
@@ -761,5 +977,9 @@ impl TaskView {
 
     pub fn tag_names(&self) -> Vec<String> {
         self.tags.iter().map(|tag| tag.name.clone()).collect()
+    }
+
+    pub fn attachment_names(&self) -> Vec<String> {
+        self.attachments.iter().map(|file| file.name.clone()).collect()
     }
 }

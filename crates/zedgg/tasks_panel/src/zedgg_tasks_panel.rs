@@ -207,6 +207,32 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_import_lists_attachment_and_resolver_finds_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = task_workspace(cx).await;
+        let id = { tasks::create_task(&open(dir.path()).unwrap(), "t").unwrap() };
+        workspace.update_in(cx, |_, window, cx| {
+            open_task(cx.weak_entity(), dir.path().to_path_buf(), id, window, cx);
+        });
+        cx.run_until_parked();
+        let view = workspace.read_with(cx, |w, cx| w.items_of_type::<TaskView>(cx).next().unwrap());
+
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNGdata").unwrap();
+        view.update_in(cx, |view, window, cx| view.import_paths(vec![png], window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.attachment_names(), ["shot.png"]));
+
+        let resolver = view.read_with(cx, |view, cx| {
+            markdown_preview::buffer_image_resolver(cx, view.buffer().entity_id())
+                .expect("resolver registered")
+        });
+        assert!(resolver("shot.png").is_some());
+        assert!(resolver("missing.png").is_none());
+        assert!(resolver("https://x/y.png").is_none(), "urls fall through");
+    }
+
     /// A workspace with the panel registered and pointed at `root` (a real
     /// temp dir) via `root_override`, so DB reads/writes hit disk while the
     /// project itself is a `FakeFs`.
