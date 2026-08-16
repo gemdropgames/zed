@@ -2,9 +2,36 @@ mod board;
 mod panel;
 mod task_view;
 
+use gpui::{Context, Entity, Window};
+use workspace::Workspace;
+
 pub use board::{TaskBoard, open_board};
 pub use panel::{Delete, NewTask, OpenBoard, TasksPanel, ToggleFocus, init};
 pub use task_view::{TaskView, open_task};
+
+/// Closes every open `TaskView` tab for `task_id` (just deleted -- their
+/// content is gone, so no save prompt). Mirrors
+/// `zedgg_design_panel::DesignPanel::close_views`, shared here between the
+/// panel's and board's delete paths.
+pub(crate) fn close_task_tabs(
+    workspace: &mut Workspace,
+    task_id: i64,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let doomed: Vec<Entity<TaskView>> = workspace
+        .items_of_type::<TaskView>(cx)
+        .filter(|view| view.read(cx).task_id() == task_id)
+        .collect();
+    for view in doomed {
+        if let Some(pane) = workspace.pane_for(&view) {
+            pane.update(cx, |pane, cx| {
+                pane.close_item_by_id(view.entity_id(), workspace::SaveIntent::Skip, window, cx)
+                    .detach();
+            });
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -413,6 +440,76 @@ mod tests {
         cx.run_until_parked();
         board.read_with(cx, |board, _| {
             assert_eq!(board.column(tasks::TaskState::Review), [a, b]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_task_from_panel_confirms_and_closes_open_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = tasks_workspace(cx, dir.path()).await;
+        let id = { tasks::create_task(&open(dir.path()).unwrap(), "doomed").unwrap() };
+        panel.update(cx, |panel, cx| panel.reload(cx));
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.click_task(id, window, cx));
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| panel.delete_task(id, window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        let c = open(dir.path()).unwrap();
+        assert!(tasks::get_task(&c, id).unwrap().is_none());
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<TaskView>(cx).count(),
+                0,
+                "delete closes the task's open tab"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_card_from_board_context_menu_confirms_and_closes_open_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, cx) = tasks_workspace(cx, dir.path()).await;
+        let id = { tasks::create_task(&open(dir.path()).unwrap(), "doomed").unwrap() };
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_board(workspace, dir.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+        let board = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<TaskBoard>(cx)
+                .next()
+                .expect("board")
+        });
+        board.update_in(cx, |board, window, cx| board.open_card(id, window, cx));
+        cx.run_until_parked();
+
+        board.update_in(cx, |board, window, cx| {
+            board.deploy_context_menu(gpui::Point::default(), id, window, cx)
+        });
+        board.read_with(cx, |board, _| assert!(board.context_menu_open()));
+
+        board.update_in(cx, |board, window, cx| board.delete_card(id, window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        let c = open(dir.path()).unwrap();
+        assert!(tasks::get_task(&c, id).unwrap().is_none());
+        board.read_with(cx, |board, _| {
+            assert!(board.column(tasks::TaskState::Backlog).is_empty());
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<TaskView>(cx).count(),
+                0,
+                "delete closes the task's open tab"
+            );
         });
     }
 }

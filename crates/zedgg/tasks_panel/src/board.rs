@@ -15,10 +15,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    IntoElement, Render, Rgba, SharedString, Subscription, Task, WeakEntity, Window, div,
+    AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Render, Rgba,
+    SharedString, Subscription, Task, WeakEntity, Window, anchored, deferred, div,
 };
-use ui::prelude::*;
+use ui::{ContextMenu, prelude::*};
 use workspace::Workspace;
 use workspace::item::Item;
 use zedgg_project_db::tasks::{self, Tag, TaskState};
@@ -115,6 +116,7 @@ pub struct TaskBoard {
     columns: [Vec<CardRow>; 4],
     tags: HashMap<i64, Tag>,
     edit: Option<EditState>,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     error: Option<SharedString>,
     load_generation: u64,
     _load_task: Option<Task<()>>,
@@ -139,6 +141,7 @@ impl TaskBoard {
             columns: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             tags: HashMap::new(),
             edit: None,
+            context_menu: None,
             error: None,
             load_generation: 0,
             _load_task: None,
@@ -197,6 +200,80 @@ impl TaskBoard {
             move |connection| tasks::move_task_between(connection, id, state, above, below),
             |_, (), _, _| {},
         );
+    }
+
+    fn card_title(&self, id: i64) -> Option<SharedString> {
+        self.columns
+            .iter()
+            .flatten()
+            .find(|card| card.id == id)
+            .map(|card| card.title.clone())
+    }
+
+    /// Confirm ("Delete \"<title>\"?", no cascade) then delete, then close
+    /// the card's tab if it's open. Same path as
+    /// `crate::panel::TasksPanel::delete_task`, driven from the card's
+    /// context menu instead of the panel's `Delete` keybinding.
+    pub(crate) fn delete_card(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.card_title(id) else {
+            return;
+        };
+        let confirm = ggo_common::confirm_destructive_cascade(
+            &format!("Delete \"{title}\"?"),
+            &[],
+            "Delete",
+            false,
+            window,
+            cx,
+        );
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if !confirm.await {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.mutate(
+                    window,
+                    cx,
+                    move |connection| tasks::delete_task(connection, id),
+                    move |_, (), window, cx| {
+                        if let Some(workspace) = workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                crate::close_task_tabs(workspace, id, window, cx);
+                            });
+                        }
+                    },
+                )
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ------------------------------------------------------- context menu
+
+    pub(crate) fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_self = cx.weak_entity();
+        let context_menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.entry("Delete", None, move |window, cx| {
+                weak_self
+                    .update(cx, |this, cx| this.delete_card(id, window, cx))
+                    .ok();
+            })
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
     }
 
     /// Re-read tasks + tags off-thread, behind a generation guard so a
@@ -351,6 +428,13 @@ impl TaskBoard {
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.open_card(id, window, cx)
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_context_menu(event.position, id, window, cx);
+                }),
+            )
             .on_drag(CardDrag { id, title }, |dragged, _, _, cx| {
                 cx.new(|_| CardDragPreview(dragged.title.clone()))
             })
@@ -488,6 +572,15 @@ impl Render for TaskBoard {
                 }
                 h_flex().size_full().children(columns)
             })
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(3)
+            }))
     }
 }
 
@@ -506,5 +599,12 @@ impl Item for TaskBoard {
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
         None
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TaskBoard {
+    pub(crate) fn context_menu_open(&self) -> bool {
+        self.context_menu.is_some()
     }
 }

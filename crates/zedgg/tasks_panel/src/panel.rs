@@ -311,9 +311,62 @@ impl TasksPanel {
         );
     }
 
-    /// Deletion lands in Task 11; for now the keybinding only exists so the
-    /// action and its keymap entry are in place.
-    fn delete_selected(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// The `Delete` keybinding's body: acts on the current selection.
+    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        self.delete_task(id, window, cx);
+    }
+
+    /// Confirm ("Delete \"<title>\"?", no cascade -- a task's files/tags are
+    /// implementation detail, not things the user would recognize as lost)
+    /// then delete, then close the task's tab if it's open. Mirrors
+    /// `zedgg_design_panel::DesignPanel::delete_selected` verbatim, minus
+    /// the cascade list (tasks have no children to enumerate).
+    pub(crate) fn delete_task(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self
+            .tasks
+            .iter()
+            .find(|task| task.id == id)
+            .map(|task| task.title.clone())
+        else {
+            return;
+        };
+        let confirm = ggo_common::confirm_destructive_cascade(
+            &format!("Delete \"{title}\"?"),
+            &[],
+            "Delete",
+            false,
+            window,
+            cx,
+        );
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if !confirm.await {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.mutate(
+                    window,
+                    cx,
+                    move |connection| tasks::delete_task(connection, id),
+                    move |this, (), window, cx| {
+                        if this.selected == Some(id) {
+                            this.selected = None;
+                        }
+                        if let Some(workspace) = workspace.as_ref().and_then(|w| w.upgrade()) {
+                            workspace.update(cx, |workspace, cx| {
+                                crate::close_task_tabs(workspace, id, window, cx);
+                            });
+                        }
+                    },
+                )
+            })
+            .ok();
+        })
+        .detach();
+    }
 
     // -------------------------------------------------------------- render
 
