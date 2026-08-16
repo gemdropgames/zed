@@ -128,9 +128,10 @@ impl TaskBoard {
         board
     }
 
-    /// Card ids in column order -- test helper (Task 8's tests build on it
-    /// too).
-    #[cfg(test)]
+    /// Card ids in column order. Not yet called outside tests -- Task 8's
+    /// drag-drop uses it at runtime to compute drop neighbors, at which
+    /// point this `allow` should come back out.
+    #[allow(dead_code)]
     pub(crate) fn column(&self, state: TaskState) -> Vec<i64> {
         self.columns[column_index(state)]
             .iter()
