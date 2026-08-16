@@ -14,15 +14,16 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use gpui::{
-    Action, AnyElement, App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable,
-    IntoElement, KeyBinding, Pixels, Render, SharedString, Task, WeakEntity, Window, actions, div,
-    px, uniform_list,
+    Action, AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, KeyBinding, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    actions, div, px, uniform_list,
 };
+use project::Project;
 use ui::{ListItem, prelude::*};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use zedgg_project_db::tasks::{self, TaskRow, TaskState};
-use zedgg_project_db::{Connection, open, open_existing};
+use zedgg_project_db::{Connection, DB_FILE, open, open_existing};
 
 use crate::task_view::open_task;
 
@@ -58,7 +59,8 @@ pub fn init(cx: &mut App) {
             return;
         };
         let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| TasksPanel::new(Some(weak_workspace), cx));
+        let project = workspace.project().clone();
+        let panel = cx.new(|cx| TasksPanel::new(Some((weak_workspace, project)), cx));
         workspace.add_panel(panel, window, cx);
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<TasksPanel>(window, cx);
@@ -103,10 +105,29 @@ pub struct TasksPanel {
     error: Option<SharedString>,
     load_generation: u64,
     _load_task: Option<Task<()>>,
+    _project_subscription: Option<Subscription>,
 }
 
 impl TasksPanel {
-    fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: Option<(WeakEntity<Workspace>, Entity<Project>)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (workspace, project) = workspace.unzip();
+        // `git checkout`/`pull` swapping `zedgg.sqlite` under us: re-read the
+        // task list when the worktree reports that file changed. Our own
+        // writes trigger this too, which is a harmless second reload.
+        let _project_subscription = project.map(|project| {
+            cx.subscribe(&project, |this, _, event: &project::Event, cx| {
+                if let project::Event::WorktreeUpdatedEntries(_, changes) = event
+                    && changes
+                        .iter()
+                        .any(|(path, _, _)| path.file_name() == Some(DB_FILE))
+                {
+                    this.reload(cx);
+                }
+            })
+        });
         let mut panel = Self {
             focus_handle: cx.focus_handle(),
             position: DockPosition::Left,
@@ -120,6 +141,7 @@ impl TasksPanel {
             error: None,
             load_generation: 0,
             _load_task: None,
+            _project_subscription,
         };
         panel.rebuild_rows();
         panel
