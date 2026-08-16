@@ -239,6 +239,7 @@ which_key.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zedgg_design_panel.workspace = true # ZedGG
+zedgg_tasks_panel.workspace = true # ZedGG
 zed_credentials_provider.workspace = true
 zed_env_vars.workspace = true
 zlog.workspace = true

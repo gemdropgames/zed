@@ -36,7 +36,7 @@ CREATE TABLE task_files (
 );
 ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskState {
     Backlog,
     InProgress,

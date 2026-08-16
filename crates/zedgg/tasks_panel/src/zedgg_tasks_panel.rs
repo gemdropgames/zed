@@ -1,10 +1,8 @@
+mod panel;
 mod task_view;
 
-use gpui::App;
-
+pub use panel::{Delete, NewTask, OpenBoard, TasksPanel, ToggleFocus, init};
 pub use task_view::{TaskView, open_task};
-
-pub fn init(_cx: &mut App) {}
 
 #[cfg(test)]
 mod tests {
@@ -94,6 +92,89 @@ mod tests {
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(workspace.items_of_type::<TaskView>(cx).count(), 1);
+        });
+    }
+
+    /// A workspace with the panel registered and pointed at `root` (a real
+    /// temp dir) via `root_override`, so DB reads/writes hit disk while the
+    /// project itself is a `FakeFs`.
+    pub(super) async fn tasks_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        gpui::Entity<Workspace>,
+        gpui::Entity<TasksPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            markdown_preview::init(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        project.read_with(cx, |project, _| {
+            project.languages().add(Arc::new(Language::new(
+                LanguageConfig { name: "Markdown".into(), ..Default::default() },
+                None,
+            )));
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<TasksPanel>(cx)
+                .expect("TasksPanel should have been added by init()")
+        });
+        panel.update(cx, |panel, cx| {
+            panel.root_override = Some(root.to_path_buf());
+            panel.refresh_root(cx);
+        });
+        cx.run_until_parked();
+        (workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_panel_lists_tasks_grouped_and_click_opens_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = tasks_workspace(cx, dir.path()).await;
+        let (a, b) = {
+            let c = open(dir.path()).unwrap();
+            let a = tasks::create_task(&c, "draw tiles").unwrap();
+            let b = tasks::create_task(&c, "fix jump").unwrap();
+            tasks::move_task_between(&c, b, tasks::TaskState::Review, None, None).unwrap();
+            (a, b)
+        };
+        panel.update(cx, |panel, cx| panel.reload(cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let rows = panel.visible_row_labels();
+            assert_eq!(
+                rows,
+                ["Backlog", "draw tiles", "In Progress", "Review", "fix jump", "Done"]
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| panel.click_task(a, window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let view = workspace.items_of_type::<TaskView>(cx).next().expect("tab");
+            assert_eq!(view.read(cx).task_id(), a);
+        });
+        let _ = b;
+    }
+
+    #[gpui::test]
+    async fn test_toggle_focus_opens_left_dock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, cx) = tasks_workspace(cx, dir.path()).await;
+        workspace.update(cx, |workspace, cx| {
+            assert!(!workspace.left_dock().read(cx).is_open());
+        });
+        cx.dispatch_action(ToggleFocus);
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.left_dock().read(cx).is_open());
         });
     }
 }
