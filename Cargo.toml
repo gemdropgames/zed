@@ -518,6 +518,7 @@ zed = { path = "crates/zed" }
 zed_actions = { path = "crates/zed_actions" }
 zedgg_design_panel = { path = "crates/zedgg/design_panel" } # ZedGG
 zedgg_project_db = { path = "crates/zedgg/project_db" } # ZedGG
+zedgg_tasks_panel = { path = "crates/zedgg/tasks_panel" } # ZedGG
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 edit_prediction = { path = "crates/edit_prediction" }

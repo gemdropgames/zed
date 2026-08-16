@@ -24823,6 +24823,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "zedgg_tasks_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "ggo_common",
+ "gpui",
+ "keymap_editor",
+ "language",
+ "markdown_preview",
+ "menu",
+ "project",
+ "tempfile",
+ "ui",
+ "workspace",
+ "zedgg_project_db",
+]
+
+[[package]]
 name = "zeno"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
