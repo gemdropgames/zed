@@ -17,6 +17,7 @@
 //! next operation.
 
 pub mod design_docs;
+pub mod tasks;
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +33,7 @@ const DOMAIN: &str = "zedgg";
 /// Append-only. sqlez stores each applied migration's text and refuses to
 /// start if an already-applied entry changed, so edit history by adding a
 /// new step, never by rewriting an old one.
-const MIGRATIONS: &[&str] = &[design_docs::MIGRATION];
+const MIGRATIONS: &[&str] = &[design_docs::MIGRATION, tasks::MIGRATION];
 
 pub fn db_path(project_root: &Path) -> PathBuf {
     project_root.join(DB_FILE)
