@@ -1685,6 +1685,24 @@ impl WorldPanel {
         let state = open.store.state();
         if let Some(op) = inspector::commit_field(&target, &text, &state, &open.schemas) {
             open.store.apply(op);
+            // A committed field can NAME an asset (a Sprite/Tilemap stem):
+            // loads are otherwise only resolved at world-open and
+            // instance-add, so a freshly named asset would not render
+            // until a reload. `fill_missing_asset_loads` is a no-op when
+            // the commit introduced no new load target.
+            let state = open.store.state();
+            loader::fill_missing_asset_loads(
+                &open.root,
+                &state,
+                &mut open.sprite_loads,
+                &mut open.map_loads,
+                &mut open.meta_sprite_loads,
+            );
+            open.images = Arc::new(canvas::build_image_cache(&[
+                &open.sprite_loads,
+                &open.map_loads,
+                &open.meta_sprite_loads,
+            ]));
             cx.notify();
         }
     }
@@ -3949,6 +3967,91 @@ mod tests {
             assert!(
                 open.stem_completion.is_none(),
                 "no focused asset field, no feed"
+            );
+        });
+    }
+
+    /// Committing a stem into an Asset field must feed the CANVAS, not
+    /// just the store: the newly named sprite is composed into the load
+    /// set and the image cache without a world reload. Picking
+    /// `sprites/gg_icon` right after creating it rendered nothing
+    /// otherwise -- loads were only resolved at world-open and
+    /// instance-add.
+    #[gpui::test]
+    async fn test_committing_a_stem_composes_the_named_asset(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        // A real decodable sprite trio at the fixture's asset root (the
+        // worktree root for `worlds/test.toml`), so the compose succeeds.
+        {
+            use ggo_worldlib::sprites::cow::{Frame, SpriteState};
+            use ggo_worldlib::sprites::hw::TILE_BYTES;
+            let mut pool = vec![0u8; 2 * TILE_BYTES];
+            for byte in &mut pool[TILE_BYTES..] {
+                *byte = 0x11;
+            }
+            let mut palette = [0u16; 16];
+            palette[1] = 0xF800;
+            let state = SpriteState {
+                pool,
+                tile_count: 2,
+                session_tiles: std::collections::HashSet::new(),
+                palette,
+                frames: vec![Frame {
+                    map: vec![1],
+                    duration_ms: 100,
+                }],
+                clips: vec![],
+                w_tiles: 1,
+                h_tiles: 1,
+                pool_shared: false,
+            };
+            std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
+            ggo_worldlib::sprites::io::save_sprite(
+                dir.path(),
+                "sprites/gg_icon.spr",
+                &state,
+                "sprites/gg_icon.til",
+                "sprites/gg_icon.pal",
+            )
+            .unwrap();
+        }
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.store.apply(WorldOp::AddComponent {
+                entity: 0,
+                name: "Sprite".to_string(),
+                defaults: serde_json::json!({"stem": ""})
+                    .as_object()
+                    .expect("object literal")
+                    .clone(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let editor = field_editor(&panel, cx, "Sprite", "stem");
+        panel.update_in(cx, |panel, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_text("sprites/gg_icon", window, cx)
+            });
+            panel.commit_editor(editor.entity_id(), cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(
+                matches!(
+                    open.sprite_loads.get("sprites/gg_icon"),
+                    Some(ggo_worldlib::render::Loadable::Ready(_))
+                ),
+                "the committed stem must be composed for the canvas"
             );
         });
     }
