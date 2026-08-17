@@ -2006,9 +2006,17 @@ impl WorldPanel {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.pick_stem(target.clone(), pick.clone(), window, cx)
-                    })),
+                    // `on_mouse_down`, NOT `on_click`: the down half of a
+                    // click blurs the field's editor, whose blur-commit
+                    // re-renders the inspector -- the rebuilt list never
+                    // sees the matching mouse-up, so a click handler is
+                    // simply lost. Acting on the down beats the blur.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.pick_stem(target.clone(), pick.clone(), window, cx)
+                        }),
+                    ),
             );
         }
         Some(list.into_any_element())
@@ -3941,6 +3949,62 @@ mod tests {
             assert!(
                 open.stem_completion.is_none(),
                 "no focused asset field, no feed"
+            );
+        });
+    }
+
+    /// A real CLICK on a rendered stem suggestion (not a direct
+    /// `pick_stem` call) must fill and commit the field -- covers the
+    /// element wiring end to end, including surviving whatever the click
+    /// does to the editor's focus.
+    #[gpui::test]
+    async fn test_clicking_a_stem_suggestion_fills_the_field(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
+        std::fs::write(dir.path().join("sprites/gg_icon.spr"), "").unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.store.apply(WorldOp::AddComponent {
+                entity: 0,
+                name: "Sprite".to_string(),
+                defaults: serde_json::json!({"stem": ""})
+                    .as_object()
+                    .expect("object literal")
+                    .clone(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let editor = field_editor(&panel, cx, "Sprite", "stem");
+        panel.update_in(cx, |_, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("ggo-stem-suggestion-sprites/gg_icon")
+            .expect("the focused empty stem field lists the project's sprites");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["Sprite"]["stem"],
+                json!("sprites/gg_icon"),
+                "the click must commit the stem"
+            );
+            assert_eq!(
+                editor.read(cx).text(cx),
+                "sprites/gg_icon",
+                "and the field shows it"
             );
         });
     }
