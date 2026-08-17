@@ -273,6 +273,46 @@ impl GenDraft {
     }
 }
 
+/// The `emd` argv for an inline "New World…" commit: `generate world
+/// <name>`, plus `--dir <sub>` when the target sits below
+/// `assets/worlds/`. Only valid to call after [`world_name_error`]
+/// returned `None` for the typed input the pieces came from.
+pub fn build_generate_world_args(name: &str, dir: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "generate".to_string(),
+        "world".to_string(),
+        name.to_string(),
+    ];
+    if let Some(dir) = dir {
+        args.push("--dir".to_string());
+        args.push(dir.to_string());
+    }
+    args
+}
+
+/// The inline "New World…" name gate: `/`-separated snake_case segments
+/// (the last is the file's name, the rest become `--dir` levels), each
+/// held to [`valid_item_name`] -- the exact per-segment rule `emd
+/// generate world --dir` applies, so a name that passes here is never
+/// rejected by the CLI.
+pub fn world_name_error(typed: &str) -> Option<String> {
+    if typed.split('/').any(|segment| !valid_item_name(segment)) {
+        return Some(
+            "World names must be snake_case segments, e.g. arena or dungeon/arena.".to_string(),
+        );
+    }
+    None
+}
+
+/// A typed inline world name split into (`--dir` levels, file name) --
+/// `"dungeon/arena"` is (`["dungeon"]`, `"arena"`). Only valid after
+/// [`world_name_error`] returned `None`.
+pub fn split_world_name(typed: &str) -> (Vec<&str>, &str) {
+    let mut segments: Vec<&str> = typed.split('/').collect();
+    let name = segments.pop().unwrap_or(typed);
+    (segments, name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +540,51 @@ mod tests {
         assert!(GenKind::Resource.takes_module());
         assert!(GenKind::Schedule.takes_module());
         assert!(GenKind::System.takes_module());
+    }
+
+    // ------------------------------------------- inline world name rules
+
+    /// The inline argv matches the form's argv for a plain name, and only
+    /// `--dir` distinguishes a subdir target.
+    #[test]
+    fn inline_world_args_match_the_form_and_add_only_dir() {
+        assert_eq!(
+            build_generate_world_args("arena", None),
+            draft(GenKind::World, "arena").args()
+        );
+        assert_eq!(
+            build_generate_world_args("arena", Some("dungeon/floors")),
+            vec!["generate", "world", "arena", "--dir", "dungeon/floors"]
+        );
+    }
+
+    #[test]
+    fn world_name_error_accepts_snake_case_segments() {
+        for ok in &["arena", "_x", "level_2", "dungeon/arena", "a/b/c_1"] {
+            assert!(world_name_error(ok).is_none(), "{ok} should pass");
+        }
+    }
+
+    /// Every rejected shape is one `emd generate world --dir` would also
+    /// reject: empty segments (leading/trailing/double slash), traversal,
+    /// non-snake_case, separators emd never sees.
+    #[test]
+    fn world_name_error_rejects_what_emd_would() {
+        for bad in &[
+            "", "Arena", "dungeon/Arena", "a b", "a.b", "/arena", "arena/", "a//b", "..",
+            "../a", "a/../b", "a\\b",
+        ] {
+            assert!(world_name_error(bad).is_some(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn split_world_name_separates_dir_levels_from_the_file() {
+        assert_eq!(split_world_name("arena"), (vec![], "arena"));
+        assert_eq!(split_world_name("dungeon/arena"), (vec!["dungeon"], "arena"));
+        assert_eq!(
+            split_world_name("a/b/c"),
+            (vec!["a", "b"], "c")
+        );
     }
 }

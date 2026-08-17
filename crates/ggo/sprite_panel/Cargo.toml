@@ -19,10 +19,17 @@ gpui.workspace = true
 keymap_editor.workspace = true
 log.workspace = true
 project.workspace = true
+project_panel.workspace = true
 ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+project_panel = { workspace = true, features = ["test-support"] }
+# `project`'s test-support turns on `remote/test-support`, which adds a
+# `RemoteConnectionOptions` variant that `remote_connection`'s lib only
+# matches on under ITS `test-support` -- same dance `ggo_emu_panel`'s
+# dev-deps document.
+remote_connection = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }

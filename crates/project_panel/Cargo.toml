@@ -51,6 +51,11 @@ notifications.workspace = true
 fs.workspace = true
 log.workspace = true
 
+[features]
+# GGO: lets GGO crates drive the inline new-entry hook end to end from
+# their own tests (construction + the private editor and edit state).
+test-support = []
+
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
 criterion.workspace = true

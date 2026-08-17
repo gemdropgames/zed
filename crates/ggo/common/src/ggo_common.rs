@@ -430,12 +430,32 @@ pub fn emulate_world(
 /// right answer for all of them: the entry only exists because the panel's
 /// contributor put it there, so its absence means the action has no target.
 ///
+/// Reveals + focuses the panel BEFORE running `action`: every entry that
+/// comes through here opens a form or a view inside the panel, and with the
+/// dock closed (the default) that state would be set invisibly -- to the
+/// user, a menu entry that "does nothing". The reveal happens in its own
+/// `Workspace` update that finishes before `action` runs, so a panel method
+/// that reads the workspace back (`refresh_worlds`, `refresh_root`) is
+/// still fine from `action` -- unlike `ggo_emu_panel`'s handler, which runs
+/// its action inside the update and has to defer those reads.
+///
 /// SAFE TO CALL HERE, unlike from a contributor: contributors run while
 /// `ProjectPanel` is leased (see `Workspace::context_menu_contributions`)
 /// and panic if they touch a panel; handlers run after the lease is
-/// released. `action` is also not inside a `Workspace` update, so a panel
-/// method that reads the workspace back (`refresh_worlds`, `refresh_root`)
-/// is fine from here.
+/// released.
+/// `rel` (a `/`-separated worktree-relative dir) as the `ProjectPath` the
+/// project panel's inline new-entry hook takes. `None` for a rel that is
+/// not a valid relative path (absolute, `..`, …).
+pub fn inline_project_path(
+    worktree_id: project::WorktreeId,
+    rel: &str,
+) -> Option<project::ProjectPath> {
+    Some(project::ProjectPath {
+        worktree_id,
+        path: path::rel_path::RelPath::from_unix_str(rel).ok()?.into(),
+    })
+}
+
 pub fn panel_entry_handler<P: Panel>(
     workspace: WeakEntity<Workspace>,
     action: impl Fn(&Entity<P>, &mut Window, &mut App) + 'static,
@@ -444,7 +464,13 @@ pub fn panel_entry_handler<P: Panel>(
         let Some(workspace) = workspace.upgrade() else {
             return;
         };
-        let Some(panel) = workspace.read(cx).panel::<P>(cx) else {
+        let Some(panel) = workspace.update(cx, |workspace, cx| {
+            let panel = workspace.focus_panel::<P>(window, cx)?;
+            // A zoomed center item would otherwise hide the dock we just
+            // focused.
+            workspace.reveal_panel::<P>(window, cx);
+            Some(panel)
+        }) else {
             return;
         };
         action(&panel, window, cx);

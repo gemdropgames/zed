@@ -165,6 +165,18 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
+    // GGO: when set, the open new-entry edit commits through this callback
+    // (e.g. "New World…" runs `emd generate world`) instead of
+    // `create_entry`. Lives here rather than in `EditState` because `State`
+    // is `Clone` and this holds a `FnOnce`.
+    ggo_inline_edit: Option<GgoInlineEdit>,
+}
+
+// GGO: the callback pair behind an inline new-entry edit contributed by a
+// GGO panel -- see [`ProjectPanel::ggo_new_entry_inline`].
+struct GgoInlineEdit {
+    validate: Box<dyn Fn(&str) -> Option<String>>,
+    on_commit: Box<dyn FnOnce(String, &mut Window, &mut App)>,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -863,6 +875,7 @@ impl ProjectPanel {
                 previous_drag_position: None,
                 sticky_items_count: 0,
                 last_reported_update: Instant::now(),
+                ggo_inline_edit: None, // GGO
                 state: State {
                     max_width_item_index: None,
                     edit_state: None,
@@ -1866,6 +1879,22 @@ impl ProjectPanel {
             None => return,
         };
         let filename = self.filename_editor.read(cx).text(cx);
+        // GGO: a contributed inline edit owns its name rules (snake_case
+        // for a world, a stem for a tileset, …) -- upstream's checks below
+        // (existing-entry collisions, path shape) do not apply because the
+        // commit does not create the typed path directly.
+        if let Some(inline) = &self.ggo_inline_edit {
+            let typed = filename.trim();
+            edit_state.validation_state = if typed.is_empty() {
+                ValidationState::None
+            } else if let Some(message) = (inline.validate)(typed) {
+                ValidationState::Error(message)
+            } else {
+                ValidationState::None
+            };
+            cx.notify();
+            return;
+        }
         if !filename.is_empty() {
             if filename.is_empty() {
                 edit_state.validation_state =
@@ -1937,6 +1966,34 @@ impl ProjectPanel {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let edit_state = self.state.edit_state.as_mut()?;
+        // GGO: an inline edit contributed by a GGO panel commits through
+        // its callback, deferred out of this panel's update -- see
+        // `ggo_new_entry_inline`. An empty name is a no-op (matching
+        // upstream below), an invalid one keeps the editor open with the
+        // message; both leave the callback armed for the next Enter.
+        if self.ggo_inline_edit.is_some() {
+            let typed = self.filename_editor.read(cx).text(cx);
+            let typed = typed.trim();
+            if typed.is_empty() {
+                return None;
+            }
+            let inline = self.ggo_inline_edit.as_ref()?;
+            if let Some(message) = (inline.validate)(typed) {
+                edit_state.validation_state = ValidationState::Error(message);
+                cx.notify();
+                return None;
+            }
+            let inline = self.ggo_inline_edit.take()?;
+            let typed = typed.to_string();
+            self.state.edit_state = None;
+            if refocus {
+                window.focus(&self.focus_handle, cx);
+            }
+            self.update_visible_entries(None, false, false, window, cx);
+            window.defer(cx, move |window, cx| (inline.on_commit)(typed, window, cx));
+            cx.notify();
+            return None;
+        }
         let worktree_id = edit_state.worktree_id;
         let is_new_entry = edit_state.is_new_entry();
         let mut filename = self.filename_editor.read(cx).text(cx);
@@ -2150,6 +2207,7 @@ impl ProjectPanel {
     }
 
     fn discard_edit_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ggo_inline_edit = None; // GGO: a discarded edit drops its callback
         if let Some(edit_state) = self.state.edit_state.take() {
             self.state.temporarily_unfolded_pending_state = edit_state
                 .temporarily_unfolded
@@ -2227,6 +2285,9 @@ impl ProjectPanel {
     }
 
     fn add_entry(&mut self, is_dir: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // GGO: a fresh edit must not inherit a previous inline edit's
+        // callback -- `ggo_new_entry_inline` re-arms it after this returns.
+        self.ggo_inline_edit = None;
         let Some((worktree_id, entry_id)) = self
             .selection
             .map(|entry| (entry.worktree_id, entry.entry_id))
@@ -2308,6 +2369,105 @@ impl ProjectPanel {
         cx.notify();
     }
 
+    /// GGO: open the same inline new-entry editor `New File` uses, under
+    /// the directory at `path`, but commit through `on_commit` instead of
+    /// `create_entry` -- the callback runs a generator (`emd generate
+    /// world`, a blank tileset write, …) which creates the file itself and
+    /// the worktree watcher makes it appear.
+    ///
+    /// `validate` gates the commit and feeds live feedback while typing
+    /// (the same `ValidationState` strip upstream uses); returning
+    /// `Some(message)` blocks Enter with that message. `on_commit` runs
+    /// via `window.defer`, OUTSIDE this panel's update, so it may reach
+    /// any panel or the workspace freely.
+    ///
+    /// Returns `false` (and seeds nothing) when `path` is not an existing
+    /// directory in its worktree -- callers fall back to their old flow.
+    ///
+    /// Escape, or blur with an invalid name, drops the callback with the
+    /// edit state (`discard_edit_state`); blur with a valid name commits,
+    /// exactly like upstream's New File.
+    pub fn ggo_new_entry_inline(
+        &mut self,
+        path: &ProjectPath,
+        validate: impl Fn(&str) -> Option<String> + 'static,
+        on_commit: impl FnOnce(String, &mut Window, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(worktree) = self.project.read(cx).worktree_for_id(path.worktree_id, cx) else {
+            return false;
+        };
+        let Some(entry) = worktree.read(cx).entry_for_path(&path.path) else {
+            return false;
+        };
+        if !entry.is_dir() {
+            return false;
+        }
+        self.selection = Some(SelectedEntry {
+            worktree_id: path.worktree_id,
+            entry_id: entry.id,
+        });
+        // The target may be a directory the user did not click (e.g. New
+        // World… redirecting into `assets/worlds/`), whose ancestors may
+        // be collapsed; the seeded row is only visible if they are open.
+        self.expand_to_selection(cx);
+        self.add_entry(false, window, cx);
+        if self.state.edit_state.is_none() {
+            return false;
+        }
+        self.ggo_inline_edit = Some(GgoInlineEdit {
+            validate: Box::new(validate),
+            on_commit: Box::new(on_commit),
+        });
+        true
+    }
+
+    /// GGO: test-support surface for GGO crates driving the inline hook
+    /// end to end from their own tests -- construction plus the pieces of
+    /// the flow (editor, confirm, edit state) that are rightly private
+    /// otherwise.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ggo_test_new(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        Self::new(workspace, window, cx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ggo_test_filename_editor(&self) -> &Entity<Editor> {
+        &self.filename_editor
+    }
+
+    /// (edit open, inline callback armed)
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ggo_test_inline_state(&self) -> (bool, bool) {
+        (
+            self.state.edit_state.is_some(),
+            self.ggo_inline_edit.is_some(),
+        )
+    }
+
+    /// The message of the open edit's validation error, if any.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ggo_test_validation_error(&self) -> Option<String> {
+        match &self.state.edit_state.as_ref()?.validation_state {
+            ValidationState::Error(message) => Some(message.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ggo_test_confirm_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        self.confirm_edit(true, window, cx)
+    }
+
     fn unflatten_entry_id(&self, leaf_entry_id: ProjectEntryId) -> ProjectEntryId {
         if let Some(ancestors) = self.state.ancestors.get(&leaf_entry_id) {
             ancestors
@@ -2334,6 +2494,7 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ggo_inline_edit = None; // GGO: same reason as `add_entry`
         if let Some(SelectedEntry {
             worktree_id,
             entry_id,

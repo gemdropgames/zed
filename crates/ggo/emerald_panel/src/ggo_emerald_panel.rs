@@ -57,7 +57,9 @@ use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
     Pixels, Render, SharedString, Styled, Task, WeakEntity, Window, actions, div, px,
 };
+
 use project::ProjectPath;
+use project_panel::ProjectPanel;
 use ui::prelude::*;
 use ui::{ContextMenu, DropdownMenu};
 use workspace::Workspace;
@@ -336,25 +338,99 @@ fn contribute_emerald_menu(
         }
     }
     if is_assets_dir(&dir) {
-        items.push(
-            ui::ContextMenuEntry::new("New World…")
-                .icon(ui::IconName::Plus)
-                .handler(new_item_handler(
-                    cx.weak_entity(),
-                    GenKind::World,
-                    rel.clone(),
-                ))
-                .into(),
-        );
-        items.push(
-            ui::ContextMenuEntry::new("New Tileset…")
-                .icon(ui::IconName::Plus)
-                .handler(new_tileset_handler(cx.weak_entity(), rel))
-                .into(),
-        );
+        if let Some(seed) = world_seed(&dir, &worktree_root, &rel) {
+            items.push(
+                ui::ContextMenuEntry::new("New World…")
+                    .icon(ui::IconName::Plus)
+                    .handler(new_world_inline_handler(
+                        cx.weak_entity(),
+                        path.worktree_id,
+                        seed,
+                    ))
+                    .into(),
+            );
+        }
+        if let Some(under) = tileset_under(&dir) {
+            items.push(
+                ui::ContextMenuEntry::new("New Tileset…")
+                    .icon(ui::IconName::Plus)
+                    .handler(new_tileset_inline_handler(
+                        cx.weak_entity(),
+                        path.worktree_id,
+                        rel,
+                        dir.clone(),
+                        under,
+                    ))
+                    .into(),
+            );
+        }
     }
     items
 }
+
+/// The directory `assets/worlds/` files live under, inside [`ASSETS_DIR`].
+const WORLDS_DIR: &str = "worlds";
+
+/// Everything the inline "New World…" edit needs, computed while the
+/// contributor runs (path math plus the same kind of fs stats the menu
+/// predicates already make -- no panel is touched).
+#[derive(Clone)]
+struct WorldSeed {
+    /// Worktree-relative dir the inline editor is seeded under: the
+    /// clicked dir when it is `assets/worlds` or below it, else the
+    /// project's `assets/worlds`.
+    seed_rel: String,
+    /// The clicked dir, as the seed when `seed_rel` does not exist on
+    /// disk yet -- `emd` creates `assets/worlds/` on the first world.
+    fallback_rel: String,
+    /// `--dir` prefix `seed_rel` sits at below `assets/worlds` (empty at
+    /// the worlds root or for the fallback).
+    base_sub: String,
+    /// Absolute `assets/worlds`, for the collision pre-check.
+    worlds_abs: PathBuf,
+    /// Absolute emerald project root the run executes in.
+    project_dir: PathBuf,
+}
+
+fn world_seed(dir: &Path, worktree_root: &Path, rel: &str) -> Option<WorldSeed> {
+    let project_dir = emerald_project_root(dir)?;
+    let worlds_abs = project_dir.join(ASSETS_DIR).join(WORLDS_DIR);
+    let (seed_abs, base_sub) = match dir.strip_prefix(&worlds_abs) {
+        Ok(sub) => (
+            dir.to_path_buf(),
+            sub.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+        ),
+        Err(_) => (worlds_abs.clone(), String::new()),
+    };
+    let seed_rel = seed_abs
+        .strip_prefix(worktree_root)
+        .ok()?
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    Some(WorldSeed {
+        seed_rel,
+        fallback_rel: rel.to_string(),
+        base_sub,
+        worlds_abs,
+        project_dir,
+    })
+}
+
+/// The `dir_rel`-inside-its-asset-root prefix a tileset typed in this
+/// directory gets, or `None` outside an asset root (cannot happen when
+/// [`is_assets_dir`] just passed, but the walk can be re-run cheaply).
+fn tileset_under(dir: &Path) -> Option<String> {
+    let asset_root = emerald_asset_root(dir)?;
+    Some(
+        dir.strip_prefix(&asset_root)
+            .ok()?
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+    )
+}
+
+use ggo_common::inline_project_path;
 
 /// The generate entries' handler. Split out from
 /// [`contribute_emerald_menu`] so a test can invoke exactly what the menu
@@ -374,18 +450,174 @@ fn new_item_handler(
     )
 }
 
-/// The "New Tileset…" entry's handler -- see [`new_item_handler`].
-fn new_tileset_handler(
+/// The "New World…" entry's handler: seed the project panel's inline
+/// name editor (the same UX as New File) instead of opening a form. The
+/// commit reveals the emerald panel and runs `emd generate world` through
+/// the normal run pipeline. Split out from [`contribute_emerald_menu`]
+/// for the same testability reason as [`new_item_handler`].
+fn new_world_inline_handler(
+    workspace: WeakEntity<Workspace>,
+    worktree_id: project::WorktreeId,
+    seed: WorldSeed,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(workspace.clone(), move |panel: &Entity<ProjectPanel>, window, cx| {
+        let workspace = workspace.clone();
+        let seed = seed.clone();
+        panel.update(cx, |panel, cx| {
+            let Some(path) = inline_project_path(worktree_id, &seed.seed_rel) else {
+                return;
+            };
+            let seeded = panel.ggo_new_entry_inline(
+                &path,
+                world_validate(&seed),
+                new_world_commit(workspace.clone(), seed.clone()),
+                window,
+                cx,
+            );
+            if !seeded {
+                // `assets/worlds/` may not exist yet -- seed at the
+                // clicked dir instead; `emd` creates the worlds dir on the
+                // first generate and the file appears there.
+                let Some(path) = inline_project_path(worktree_id, &seed.fallback_rel) else {
+                    return;
+                };
+                panel.ggo_new_entry_inline(
+                    &path,
+                    world_validate(&seed),
+                    new_world_commit(workspace.clone(), seed.clone()),
+                    window,
+                    cx,
+                );
+            }
+        });
+    })
+}
+
+/// The inline world-name gate: `emd`'s per-segment snake_case rule
+/// ([`forms::world_name_error`]) plus a does-it-already-exist pre-check,
+/// so Enter never spawns a run the CLI would reject and the collision
+/// message appears while typing rather than as a failed run.
+fn world_validate(seed: &WorldSeed) -> impl Fn(&str) -> Option<String> + 'static {
+    let worlds_abs = seed.worlds_abs.clone();
+    let base_sub = seed.base_sub.clone();
+    move |typed| {
+        if let Some(error) = forms::world_name_error(typed) {
+            return Some(error);
+        }
+        let (dirs, name) = forms::split_world_name(typed);
+        let mut target = worlds_abs.clone();
+        if !base_sub.is_empty() {
+            target = target.join(&base_sub);
+        }
+        for level in dirs {
+            target = target.join(level);
+        }
+        target
+            .join(format!("{name}.toml"))
+            .exists()
+            .then(|| format!("{name}.toml already exists here."))
+    }
+}
+
+/// The inline world commit: reveal + focus the emerald panel (so the
+/// Running/Done/Failed feedback is visible) and hand the run to
+/// [`EmeraldPanel::generate_world_inline`]. Reuses
+/// [`ggo_common::panel_entry_handler`] by invoking it immediately -- the
+/// reveal-then-act shape is exactly what a menu entry does.
+fn new_world_commit(
+    workspace: WeakEntity<Workspace>,
+    seed: WorldSeed,
+) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
+    move |typed, window, cx| {
+        let (dirs, name) = forms::split_world_name(&typed);
+        let mut sub: Vec<&str> = Vec::new();
+        if !seed.base_sub.is_empty() {
+            sub.extend(seed.base_sub.split('/'));
+        }
+        sub.extend(dirs);
+        let dir_flag = (!sub.is_empty()).then(|| sub.join("/"));
+        let name = name.to_string();
+        let project_dir = seed.project_dir.clone();
+        (ggo_common::panel_entry_handler(
+            workspace,
+            move |panel: &Entity<EmeraldPanel>, window, cx| {
+                let name = name.clone();
+                let dir_flag = dir_flag.clone();
+                let project_dir = project_dir.clone();
+                panel.update(cx, |panel, cx| {
+                    panel.generate_world_inline(project_dir, &name, dir_flag.as_deref(), window, cx)
+                });
+            },
+        ))(window, cx);
+    }
+}
+
+/// The "New Tileset…" entry's handler -- inline like
+/// [`new_world_inline_handler`], committing through
+/// [`EmeraldPanel::create_tileset_inline`]. The blank pair is written in
+/// the CLICKED directory (`under` inside its asset root), so no `--dir`
+/// analog is involved.
+fn new_tileset_inline_handler(
+    workspace: WeakEntity<Workspace>,
+    worktree_id: project::WorktreeId,
+    dir_rel: String,
+    dir_abs: PathBuf,
+    under: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(workspace.clone(), move |panel: &Entity<ProjectPanel>, window, cx| {
+        let workspace = workspace.clone();
+        let dir_rel = dir_rel.clone();
+        let dir_abs = dir_abs.clone();
+        let under = under.clone();
+        panel.update(cx, |panel, cx| {
+            let Some(path) = inline_project_path(worktree_id, &dir_rel) else {
+                return;
+            };
+            panel.ggo_new_entry_inline(
+                &path,
+                tileset_validate(dir_abs, under),
+                new_tileset_commit(workspace, dir_rel.clone()),
+                window,
+                cx,
+            );
+        });
+    })
+}
+
+/// The inline tileset gate: [`tileset::tileset_rel`]'s own stem rules,
+/// plus the same already-exists refusal `create_blank_tileset` makes,
+/// surfaced while typing. `dir_abs` is the clicked directory, which is
+/// exactly where the under-relative rel lands.
+fn tileset_validate(dir_abs: PathBuf, under: String) -> impl Fn(&str) -> Option<String> + 'static {
+    move |typed| match tileset::tileset_rel(&under, typed) {
+        Err(error) => Some(error),
+        Ok(rel) => {
+            let file = rel.rsplit('/').next().unwrap_or(&rel);
+            dir_abs
+                .join(file)
+                .exists()
+                .then(|| format!("{file} already exists here."))
+        }
+    }
+}
+
+/// The inline tileset commit -- see [`new_world_commit`] for the shape.
+fn new_tileset_commit(
     workspace: WeakEntity<Workspace>,
     dir_rel: String,
-) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(
-        workspace,
-        move |panel: &Entity<EmeraldPanel>, window, cx| {
-            let dir_rel = dir_rel.clone();
-            panel.update(cx, |panel, cx| panel.new_tileset(&dir_rel, window, cx));
-        },
-    )
+) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
+    move |typed, window, cx| {
+        (ggo_common::panel_entry_handler(
+            workspace,
+            move |panel: &Entity<EmeraldPanel>, _window, cx| {
+                let typed = typed.clone();
+                let dir_rel = dir_rel.clone();
+                panel.update(cx, |panel, cx| {
+                    panel.create_tileset_inline(&dir_rel, &typed, cx)
+                });
+            },
+        ))(window, cx);
+    }
 }
 
 /// Is `dir` a directory the manifest-backed generate entries belong on --
@@ -436,20 +668,8 @@ struct GenerateForm {
     fields: Vec<FieldRow>,
 }
 
-/// The "New Tileset…" form. Not an `emd` command -- see [`tileset`].
-struct TilesetForm {
-    /// The asset root the pair is written under, and the clicked
-    /// directory RELATIVE TO IT -- the asset-root-relative frame every
-    /// downstream binder stores (the F4 `ggo-sprfix` contract).
-    asset_root: PathBuf,
-    under: String,
-    stem: Entity<Editor>,
-    error: Option<String>,
-}
-
 enum PanelForm {
     Generate(GenerateForm),
-    Tileset(TilesetForm),
 }
 
 /// What the panel is showing about the most recent `emd` run.
@@ -823,9 +1043,46 @@ impl EmeraldPanel {
         cx.notify();
     }
 
-    /// Open the "New Tileset…" form for the worktree-relative directory
-    /// `dir_rel`.
-    pub fn new_tileset(&mut self, dir_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Run `emd generate world` for an inline-named commit -- no form.
+    /// Reuses the whole run pipeline ([`Self::start_run`]'s version-lock
+    /// gate, Running/Done/Failed states, and `after_success`'s open in the
+    /// world panel), so the panel the commit reveals shows the same
+    /// feedback the form flow showed. `dir` is the `--dir` value for a
+    /// target below `assets/worlds/`, already segment-validated by
+    /// [`forms::world_name_error`].
+    pub fn generate_world_inline(
+        &mut self,
+        project_dir: PathBuf,
+        name: &str,
+        dir: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `after_success` resolves the trailer's absolute path against
+        // `project_root`, and a right-click can reach a panel that was
+        // never activated -- same reason `new_item` refreshes first.
+        self.refresh_root(cx);
+        self.emerald_dir = Some(project_dir.clone());
+        self.refresh_manifests(cx);
+        self.form = None;
+        self.start_run(
+            project_dir,
+            forms::build_generate_world_args(name, dir),
+            PendingRun::Generate {
+                kind: GenKind::World,
+                name: name.to_string(),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Write the blank tileset pair for an inline-named commit in the
+    /// worktree-relative directory `dir_rel` -- the form-less successor of
+    /// the old "New Tileset…" form, keeping its Done/Failed feedback in
+    /// the run strip. Synchronous: two small file writes, no child
+    /// process.
+    pub fn create_tileset_inline(&mut self, dir_rel: &str, typed: &str, cx: &mut Context<Self>) {
         self.refresh_root(cx);
         let Some(project_root) = self.project_root.clone() else {
             return;
@@ -838,13 +1095,18 @@ impl EmeraldPanel {
             .strip_prefix(&asset_root)
             .map(|p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
             .unwrap_or_default();
-        self.form = Some(PanelForm::Tileset(TilesetForm {
-            asset_root,
-            under,
-            stem: single_line(window, cx),
-            error: None,
-        }));
-        self.run_state = RunState::Idle;
+        let result = tileset::tileset_rel(&under, typed)
+            .and_then(|rel| tileset::create_blank_tileset(&asset_root, &rel).map(|()| rel));
+        self.run_state = match result {
+            Ok(rel) => RunState::Done {
+                message: format!("Created tileset {rel}"),
+                transcript: String::new(),
+            },
+            Err(message) => RunState::Failed {
+                message,
+                transcript: String::new(),
+            },
+        };
         cx.notify();
     }
 
@@ -898,9 +1160,7 @@ impl EmeraldPanel {
     /// decision is made from -- validation, the "stored as" hint, and the
     /// argv. There is no other path from widgets to `emd`.
     fn draft(&self, cx: &App) -> Option<GenDraft> {
-        let PanelForm::Generate(form) = self.form.as_ref()? else {
-            return None;
-        };
+        let PanelForm::Generate(form) = self.form.as_ref()?;
         Some(GenDraft {
             kind: form.kind,
             name: form.name.read(cx).text(cx).trim().to_string(),
@@ -1292,7 +1552,6 @@ impl EmeraldPanel {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.form {
             Some(PanelForm::Generate(_)) => self.submit_generate(window, cx),
-            Some(PanelForm::Tileset(_)) => self.submit_tileset(cx),
             None => {}
         }
     }
@@ -1558,15 +1817,30 @@ impl EmeraldPanel {
                 else {
                     return;
                 };
-                workspace.update(cx, |workspace, cx| {
-                    ggo_common::open_in_panel(
-                        workspace,
-                        window,
-                        cx,
-                        move |panel: &mut WorldPanel, window, cx| {
-                            panel.open_rel_path(&rel, window, cx)
-                        },
-                    );
+                // Deferred, NOT called here: this runs inside the emerald
+                // panel's own update, and focusing the world panel
+                // deactivates the active panel of the same dock -- which,
+                // since the menu handler focuses this panel, is the emerald
+                // panel itself. Its `set_active(false)` would re-enter the
+                // entity mid-update and panic. `window.defer`, not
+                // `cx.defer_in`: the latter re-takes THIS entity's update
+                // for its callback, which is the same panic one frame
+                // later.
+                let workspace = workspace.downgrade();
+                window.defer(cx, move |window, cx| {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    workspace.update(cx, |workspace, cx| {
+                        ggo_common::open_in_panel(
+                            workspace,
+                            window,
+                            cx,
+                            move |panel: &mut WorldPanel, window, cx| {
+                                panel.open_rel_path(&rel, window, cx)
+                            },
+                        );
+                    });
                 });
             }
             _ => {}
@@ -1584,33 +1858,6 @@ impl EmeraldPanel {
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/"),
         )
-    }
-
-    /// Write the blank tileset pair. Synchronous: two small file writes
-    /// and a read-back, not a child process.
-    fn submit_tileset(&mut self, cx: &mut Context<Self>) {
-        let Some(PanelForm::Tileset(form)) = &self.form else {
-            return;
-        };
-        let typed = form.stem.read(cx).text(cx);
-        let asset_root = form.asset_root.clone();
-        let result = tileset::tileset_rel(&form.under, &typed)
-            .and_then(|rel| tileset::create_blank_tileset(&asset_root, &rel).map(|()| rel));
-        match result {
-            Ok(rel) => {
-                self.form = None;
-                self.run_state = RunState::Done {
-                    message: format!("Created tileset {rel}"),
-                    transcript: String::new(),
-                };
-            }
-            Err(message) => {
-                if let Some(PanelForm::Tileset(form)) = &mut self.form {
-                    form.error = Some(message);
-                }
-            }
-        }
-        cx.notify();
     }
 
     // ------------------------------------------------------------- render
@@ -1795,49 +2042,6 @@ impl EmeraldPanel {
                 ),
         )
         .into_any_element()
-    }
-
-    fn render_tileset_form(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(PanelForm::Tileset(form)) = &self.form else {
-            unreachable!("render_tileset_form is only called with a tileset form open");
-        };
-        let dir = if form.under.is_empty() {
-            "the asset root".to_string()
-        } else {
-            form.under.clone()
-        };
-        v_flex()
-            .gap_1()
-            .p_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                Label::new(format!("New blank tileset in {dir}"))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(Self::labelled(
-                "Name",
-                Self::editor_input(form.stem.clone(), cx),
-            ))
-            .children(
-                form.error
-                    .clone()
-                    .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("ggo-emerald-tileset-create", "Create")
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                    )
-                    .child(
-                        Button::new("ggo-emerald-tileset-cancel", "Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
-                    ),
-            )
-            .into_any_element()
     }
 
     /// The last run's outcome: one status line plus `emd`'s transcript.
@@ -2333,7 +2537,6 @@ impl EmeraldPanel {
         let banner = self.render_lock_banner();
         let form = match &self.form {
             Some(PanelForm::Generate(_)) => Some(self.render_generate_form(window, cx)),
-            Some(PanelForm::Tileset(_)) => Some(self.render_tileset_form(cx)),
             None => None,
         };
         let browser = self.render_browser(window, cx);
@@ -3935,6 +4138,7 @@ mod tests {
     ) {
         cx.update(|cx| {
             AppState::test(cx);
+            project_panel::init(cx);
             ggo_world_panel::init(cx);
             init(cx);
         });
@@ -3954,6 +4158,13 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
+        // The inline "New World…"/"New Tileset…" entries seed the project
+        // panel's name editor, so the tests need one docked -- production
+        // gets it from `initialize_workspace`.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_panel = ProjectPanel::ggo_test_new(workspace, window, cx);
+            workspace.add_panel(project_panel, window, cx);
+        });
         let panel = workspace.read_with(cx, |workspace, cx| {
             workspace
                 .panel::<EmeraldPanel>(cx)
@@ -4064,41 +4275,365 @@ mod tests {
             }
             _ => panic!("expected a generate form"),
         });
+    }
 
-        let handler = new_tileset_handler(workspace.downgrade(), "assets/tiles".to_string());
+    /// Where the inline editor lands for each click: at the clicked dir
+    /// when it is `assets/worlds` or below (with the depth as `base_sub`),
+    /// else redirected to `assets/worlds`; and `None` entirely outside an
+    /// emerald project or worktree.
+    #[test]
+    fn world_seed_resolves_the_click_to_a_target() {
+        let dir = emerald_project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("assets/worlds/dungeon/floors")).unwrap();
+
+        let seed = world_seed(&root.join("assets"), root, "assets").unwrap();
+        assert_eq!(seed.seed_rel, "assets/worlds");
+        assert_eq!(seed.base_sub, "");
+        assert_eq!(seed.fallback_rel, "assets");
+        assert_eq!(seed.worlds_abs, root.join("assets/worlds"));
+        assert_eq!(seed.project_dir, root);
+
+        let seed = world_seed(&root.join("assets/worlds"), root, "assets/worlds").unwrap();
+        assert_eq!(seed.seed_rel, "assets/worlds");
+        assert_eq!(seed.base_sub, "");
+
+        let seed = world_seed(
+            &root.join("assets/worlds/dungeon/floors"),
+            root,
+            "assets/worlds/dungeon/floors",
+        )
+        .unwrap();
+        assert_eq!(seed.seed_rel, "assets/worlds/dungeon/floors");
+        assert_eq!(seed.base_sub, "dungeon/floors");
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(
+            world_seed(&outside.path().join("assets"), outside.path(), "assets").is_none(),
+            "no emerald.toml, no seed"
+        );
+        assert!(
+            world_seed(&root.join("assets"), outside.path(), "assets").is_none(),
+            "a dir outside the worktree cannot be seeded"
+        );
+    }
+
+    // ------------------------------------------------ inline name editing
+
+    /// The project panel our workspace docks, for driving the inline flow.
+    fn docked_project_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<ProjectPanel> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<ProjectPanel>(cx)
+                .expect("emerald_workspace docks a project panel")
+        })
+    }
+
+    /// Type `text` into the seeded inline editor and press Enter.
+    fn commit_inline(
+        project_panel: &Entity<ProjectPanel>,
+        text: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        project_panel.update_in(cx, |panel, window, cx| {
+            panel
+                .ggo_test_filename_editor()
+                .clone()
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+            panel.ggo_test_confirm_edit(window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// "New World…" seeds the project panel's inline editor (New File's
+    /// UX) instead of opening a form -- at `assets/worlds/` when the
+    /// click was elsewhere in `assets/`.
+    #[gpui::test]
+    async fn test_new_world_seeds_the_inline_editor(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let seed = world_seed(
+            &dir.path().join("assets"),
+            dir.path(),
+            "assets",
+        )
+        .expect("an emerald project has a world seed");
+        let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
-        panel.read_with(cx, |panel, _| match &panel.form {
-            Some(PanelForm::Tileset(form)) => {
-                assert_eq!(form.asset_root, dir.path().join("assets"));
-                assert_eq!(form.under, "tiles");
-            }
-            _ => panic!("expected a tileset form"),
+
+        let project_panel = docked_project_panel(&workspace, cx);
+        project_panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.ggo_test_inline_state(),
+                (true, true),
+                "the inline editor is open with the commit armed"
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.form.is_none(), "no form opens for a world anymore");
+        });
+    }
+
+    /// The full inline path: type a name, press Enter, and `emd generate
+    /// world <name>` runs in the clicked project -- also the regression
+    /// test for the re-entrant-update crash (`after_success` focusing the
+    /// world panel deactivates the ACTIVE emerald panel mid-update
+    /// without the deferral).
+    #[gpui::test]
+    async fn test_inline_world_commit_runs_emd_and_opens_the_world(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let written = dir.path().join("assets/worlds/arena.toml");
+        let reported = written.to_string_lossy().to_string();
+        let (runner, calls) = fake_runner(move |_| {
+            std::fs::write(&written, "version = 1\n").unwrap();
+            ok_outcome(&reported)
+        });
+        panel.update(cx, |panel, _| panel.runner = runner);
+        // Make the emerald panel the right dock's active panel first, the
+        // state the crash needed.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<EmeraldPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let seed = world_seed(&dir.path().join("assets"), dir.path(), "assets").unwrap();
+        let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        let project_panel = docked_project_panel(&workspace, cx);
+        commit_inline(&project_panel, "arena", cx);
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "exactly one emd run");
+        assert_eq!(
+            recorded[0].args,
+            vec!["generate", "world", "arena", "--json"]
+        );
+        assert_eq!(recorded[0].cwd, dir.path());
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Created world arena"
+        );
+        let world_panel = workspace.read_with(cx, |workspace, cx| {
+            workspace.panel::<WorldPanel>(cx).expect("docked")
+        });
+        assert_eq!(
+            world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
+            Some("assets/worlds/arena.toml".to_string()),
+            "the generated world opens in the world panel"
+        );
+    }
+
+    /// A click below `assets/worlds/`, or a typed `sub/name`, becomes
+    /// `--dir`: the click chooses the base, typed slashes go deeper, and
+    /// the two compose.
+    #[gpui::test]
+    async fn test_inline_world_commit_passes_dir_for_subdir_targets(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        std::fs::create_dir_all(dir.path().join("assets/worlds/dungeon")).unwrap();
+        let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/whatever"));
+        panel.update(cx, |panel, _| panel.runner = runner);
+
+        // The fake fs mirror also needs the subdir so the seed resolves.
+        let fake_fs = workspace.read_with(cx, |workspace, _| workspace.app_state().fs.clone());
+        fake_fs
+            .as_fake()
+            .insert_tree(
+                dir.path().join("assets/worlds"),
+                serde_json::json!({ "dungeon": {} }),
+            )
+            .await;
+        cx.run_until_parked();
+
+        let seed = world_seed(
+            &dir.path().join("assets/worlds/dungeon"),
+            dir.path(),
+            "assets/worlds/dungeon",
+        )
+        .unwrap();
+        assert_eq!(seed.base_sub, "dungeon");
+        let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        let project_panel = docked_project_panel(&workspace, cx);
+        commit_inline(&project_panel, "floors/arena", cx);
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].args,
+            vec!["generate", "world", "arena", "--dir", "dungeon/floors", "--json"],
+            "clicked base and typed levels compose into --dir"
+        );
+    }
+
+    /// Names `emd` would reject never spawn it: the inline editor keeps
+    /// focus with the snake_case message, and an existing target is
+    /// refused while typing.
+    #[gpui::test]
+    async fn test_inline_world_names_are_gated_before_any_spawn(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(dir.path().join("assets/worlds/taken.toml"), "version = 1\n").unwrap();
+        let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        panel.update(cx, |panel, _| panel.runner = runner);
+
+        let seed = world_seed(&dir.path().join("assets"), dir.path(), "assets").unwrap();
+        let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let project_panel = docked_project_panel(&workspace, cx);
+
+        for bad in ["Arena", "bad name", "a//b", "../escape", "taken"] {
+            commit_inline(&project_panel, bad, cx);
+            project_panel.read_with(cx, |panel, _| {
+                assert_eq!(
+                    panel.ggo_test_inline_state(),
+                    (true, true),
+                    "{bad:?} must keep the editor open"
+                );
+                assert!(
+                    panel.ggo_test_validation_error().is_some(),
+                    "{bad:?} must show a message"
+                );
+            });
+        }
+        assert!(calls.lock().unwrap().is_empty(), "emd never spawned");
+    }
+
+    /// "New Tileset…" runs inline too: the typed stem writes the blank
+    /// pair in the clicked directory, and a duplicate stem is refused
+    /// while typing.
+    #[gpui::test]
+    async fn test_inline_tileset_writes_the_blank_pair(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        panel.update(cx, |panel, _| panel.runner = runner);
+
+        let handler = new_tileset_inline_handler(
+            workspace.downgrade(),
+            worktree_id,
+            "assets/tiles".to_string(),
+            dir.path().join("assets/tiles"),
+            "tiles".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let project_panel = docked_project_panel(&workspace, cx);
+        commit_inline(&project_panel, "world", cx);
+
+        assert!(calls.lock().unwrap().is_empty(), "emd is not involved");
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Created tileset tiles/world.til"
+        );
+        let read =
+            ggo_worldlib::sprites::io::open_tileset(&dir.path().join("assets"), "tiles/world.til")
+                .unwrap();
+        assert_eq!(read.tile_count, tileset::BLANK_TILES);
+        assert!(!read.missing_pal);
+        assert!(dir.path().join("assets/tiles/world.pal").is_file());
+
+        // The same stem again is refused in the editor, before any write.
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        commit_inline(&project_panel, "world", cx);
+        project_panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.ggo_test_inline_state(), (true, true));
+            assert!(
+                panel
+                    .ggo_test_validation_error()
+                    .is_some_and(|error| error.contains("already exists")),
+                "a duplicate stem is refused while typing"
+            );
+        });
+    }
+
+    /// The menu handler must REVEAL the panel: a form opened in a dock
+    /// that is closed, or showing another panel, is invisible -- the
+    /// user-visible symptom is "the menu entry does nothing". (The right
+    /// dock starts open here because the fork docks the project panel on
+    /// the right and it `starts_open`, so the reveal shows as EmeraldPanel
+    /// becoming the dock's ACTIVE panel.)
+    #[gpui::test]
+    async fn test_the_menu_handlers_reveal_the_panel(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        workspace.read_with(cx, |workspace, cx| {
+            let dock = workspace.right_dock().read(cx);
+            assert!(
+                dock.active_panel()
+                    .is_none_or(|active| active.panel_id() != panel.entity_id()),
+                "the emerald panel does not start active"
+            );
+        });
+
+        let handler = new_item_handler(
+            workspace.downgrade(),
+            GenKind::Component,
+            "manifests".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.right_dock().read(cx);
+            assert!(dock.is_open(), "the dock is open");
+            assert_eq!(
+                dock.active_panel().map(|active| active.panel_id()),
+                Some(panel.entity_id()),
+                "the handler must bring the emerald panel forward"
+            );
+            assert!(
+                panel.read(cx).focus_handle.contains_focused(window, cx),
+                "and focus the panel"
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(panel.form, Some(PanelForm::Generate(_))),
+                "the form still opens"
+            );
         });
     }
 
     // -------------------------------------------------------- new tileset
 
-    /// "New Tileset…" writes a real blank pair, asset-root-relative, and
-    /// spawns nothing.
+    /// `create_tileset_inline` writes a real blank pair, asset-root
+    /// relative, spawns nothing, and lands its outcome in the run strip --
+    /// including the refusal of a duplicate stem.
     #[gpui::test]
-    async fn test_new_tileset_writes_a_blank_pair_without_running_emd(cx: &mut TestAppContext) {
+    async fn test_create_tileset_inline_writes_a_blank_pair_without_running_emd(
+        cx: &mut TestAppContext,
+    ) {
         let dir = emerald_project();
         let cx = empty_window(cx);
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
         let panel = lone_panel(cx, dir.path(), runner);
 
-        cx.update(|window, cx| {
+        cx.update(|_, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_tileset("assets/tiles", window, cx)
+                panel.create_tileset_inline("assets/tiles", "world", cx)
             })
         });
-        let stem = panel.read_with(cx, |panel, _| match &panel.form {
-            Some(PanelForm::Tileset(form)) => form.stem.clone(),
-            _ => panic!("expected a tileset form"),
-        });
-        type_into(&stem, "world", cx);
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.submit(window, cx)));
         cx.run_until_parked();
 
         assert!(calls.lock().unwrap().is_empty(), "emd is not involved");
@@ -4113,27 +4648,18 @@ mod tests {
         assert!(!read.missing_pal);
         assert!(dir.path().join("assets/tiles/world.pal").is_file());
 
-        // A second one with the same name is refused inline, not silently.
-        cx.update(|window, cx| {
+        // A second one with the same name is refused, not silently.
+        cx.update(|_, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_tileset("assets/tiles", window, cx)
+                panel.create_tileset_inline("assets/tiles", "world", cx)
             })
         });
-        let stem = panel.read_with(cx, |panel, _| match &panel.form {
-            Some(PanelForm::Tileset(form)) => form.stem.clone(),
-            _ => panic!("expected a tileset form"),
-        });
-        type_into(&stem, "world", cx);
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.submit(window, cx)));
         cx.run_until_parked();
-        panel.read_with(cx, |panel, _| match &panel.form {
-            Some(PanelForm::Tileset(form)) => assert!(
-                form.error.as_ref().unwrap().contains("already exists"),
-                "{:?}",
-                form.error
-            ),
-            _ => panic!("the form stays open on a refused name"),
-        });
+        let message = run_state_message(&panel, cx);
+        assert!(
+            message.starts_with("failed") && message.contains("already exists"),
+            "{message:?}"
+        );
     }
 
     // ---------------------------------------------------- the version lock
@@ -4672,6 +5198,52 @@ mod tests {
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
             Some("assets/worlds/arena.toml".to_string()),
             "the generated world opens where a panel owns it"
+        );
+    }
+
+    /// The FULL user path: the menu handler reveals + focuses the emerald
+    /// panel, making it the right dock's ACTIVE panel, and a successful
+    /// world generate then focuses the world panel in the SAME dock --
+    /// which deactivates the emerald panel. That `set_active(false)` must
+    /// not land while the emerald panel is mid-update (`finish_run` runs
+    /// inside `this.update_in`): re-entering the entity is a panic, seen
+    /// as "entering the name of the new world crashed the application".
+    #[gpui::test]
+    async fn test_generating_a_world_from_the_menu_does_not_reenter_the_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = emerald_project();
+        let (workspace, panel, _worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let written = dir.path().join("assets/worlds/arena.toml");
+        let reported = written.to_string_lossy().to_string();
+        let (runner, _) = fake_runner(move |_| {
+            std::fs::write(&written, "version = 1\n").unwrap();
+            ok_outcome(&reported)
+        });
+        panel.update(cx, |panel, _| panel.runner = runner);
+
+        let handler = new_item_handler(workspace.downgrade(), GenKind::World, "assets".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        let (name, _) = generate_form(&panel, cx);
+        type_into(&name, "arena", cx);
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.submit(window, cx)));
+        cx.run_until_parked();
+
+        let world_panel = panel.read_with(cx, |panel, cx| {
+            panel
+                .workspace
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .and_then(|w| w.read(cx).panel::<WorldPanel>(cx))
+                .expect("the world panel is docked")
+        });
+        assert_eq!(
+            world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
+            Some("assets/worlds/arena.toml".to_string()),
+            "the generated world still opens in the world panel"
         );
     }
 }

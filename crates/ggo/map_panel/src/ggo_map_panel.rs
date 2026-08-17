@@ -105,11 +105,6 @@ const ASSETS_DIR: &str = "assets";
 /// arrive by clicking a `.map` in the project panel, or from "New Map…".
 const EMPTY_MESSAGE: &str = "Open a .map file from the project panel";
 
-/// The stem a brand-new map is named after -- "map", "map-2", ... (see
-/// [`free_map_name`]). No text prompt: `window.prompt` is button-choice
-/// only, so naming is deferred to the explorer's own Rename.
-const NEW_MAP_BASE: &str = "map";
-
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
     // Same rule as every other GGO panel's `init`: `zed::reload_keymaps`
@@ -152,16 +147,42 @@ pub fn init(cx: &mut App) {
 /// happens or doesn't: the caller runs it only after the unsaved-edits
 /// guard has resolved, and a failed write leaves nothing behind to open.
 /// `None` on a write failure (already logged).
-fn create_blank_map(project_root: &Path, dir_rel: &str) -> Option<String> {
-    let dir_abs = project_root.join(dir_rel);
-    let name = free_map_name(|candidate| dir_abs.join(format!("{candidate}.{MAP_EXT}")).exists());
-    let file = format!("{name}.{MAP_EXT}");
-    let source_rel = if dir_rel.is_empty() {
+/// The worktree-relative `.map` rel a typed inline name lands at, or
+/// `Err(message)` for a name the editor must refuse -- the same stem
+/// rules `ggo_emerald_panel`'s tileset applies: a separator would move
+/// the write out of the clicked directory, `.`/`..` are not names, and a
+/// retyped extension is accepted without doubling it.
+fn map_rel(dir_rel: &str, typed: &str) -> Result<String, String> {
+    let typed = typed.trim();
+    let stem = typed
+        .strip_suffix(&format!(".{MAP_EXT}"))
+        .unwrap_or(typed)
+        .trim();
+    if stem.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    if stem.contains('/') || stem.contains('\\') {
+        return Err("name cannot contain a path separator".to_string());
+    }
+    if stem == "." || stem == ".." {
+        return Err(format!("{stem} is not a name"));
+    }
+    let file = format!("{stem}.{MAP_EXT}");
+    Ok(if dir_rel.is_empty() {
         file
     } else {
-        format!("{dir_rel}/{file}")
-    };
-    let (root, rel_path) = split_map_path(project_root, &source_rel);
+        format!("{}/{file}", dir_rel.trim_end_matches('/'))
+    })
+}
+
+fn create_blank_map(project_root: &Path, source_rel: &str) -> Option<()> {
+    let (root, rel_path) = split_map_path(project_root, source_rel);
+    if root.join(&rel_path).exists() {
+        // The inline editor pre-checks this; re-checked here so a race
+        // can never truncate an existing map.
+        log::error!("GGO: refusing to overwrite existing map {source_rel}");
+        return None;
+    }
     if let Err(e) = io::save_new_map(&root, &rel_path, geom::NEW_MAP_DIM, geom::NEW_MAP_DIM) {
         // No toast surface yet (F5.2 owns notifications), but a silent
         // no-op would be indistinguishable from a bug. Upstream logs AND
@@ -169,7 +190,7 @@ fn create_blank_map(project_root: &Path, dir_rel: &str) -> Option<String> {
         log::error!("GGO: failed to create map {source_rel}: {e}");
         return None;
     }
-    Some(source_rel)
+    Some(())
 }
 
 fn bind_panel_keys(cx: &mut App) {
@@ -268,29 +289,87 @@ fn contribute_map_menu(
     else {
         return Vec::new();
     };
-    if !is_assets_dir(&worktree_root.join(&rel)) {
+    let dir_abs = worktree_root.join(&rel);
+    if !is_assets_dir(&dir_abs) {
         return Vec::new();
     }
     vec![
         ui::ContextMenuEntry::new("New Map…")
             .icon(ui::IconName::SquareDot)
-            .handler(new_map_handler(cx.weak_entity(), rel))
+            .handler(new_map_handler(
+                cx.weak_entity(),
+                path.worktree_id,
+                rel,
+                dir_abs,
+            ))
             .into(),
     ]
 }
 
-/// The "New Map…" entry's handler. Split out from [`contribute_map_menu`]
-/// so a test can invoke exactly what the menu invokes -- `ContextMenuEntry`
-/// keeps its handler private, so a contributed entry cannot be fired from
-/// a test any other way.
+/// The "New Map…" entry's handler: seed the project panel's inline name
+/// editor (New File's UX) in the clicked directory; the commit reveals
+/// this panel and creates + opens the named blank map. Split out from
+/// [`contribute_map_menu`] so a test can invoke exactly what the menu
+/// invokes -- `ContextMenuEntry` keeps its handler private, so a
+/// contributed entry cannot be fired from a test any other way.
 fn new_map_handler(
     workspace: WeakEntity<Workspace>,
+    worktree_id: project::WorktreeId,
     dir_rel: String,
+    dir_abs: PathBuf,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<MapPanel>, window, cx| {
-        let dir_rel = dir_rel.clone();
-        panel.update(cx, |panel, cx| panel.new_map(&dir_rel, window, cx));
-    })
+    ggo_common::panel_entry_handler(
+        workspace.clone(),
+        move |panel: &Entity<project_panel::ProjectPanel>, window, cx| {
+            let workspace = workspace.clone();
+            let dir_rel = dir_rel.clone();
+            let dir_abs = dir_abs.clone();
+            panel.update(cx, |panel, cx| {
+                let Some(path) = ggo_common::inline_project_path(worktree_id, &dir_rel) else {
+                    return;
+                };
+                panel.ggo_new_entry_inline(
+                    &path,
+                    map_validate(dir_abs),
+                    new_map_commit(workspace, dir_rel.clone()),
+                    window,
+                    cx,
+                );
+            });
+        },
+    )
+}
+
+/// The inline map-name gate: [`map_rel`]'s stem rules plus the
+/// already-exists refusal, surfaced while typing.
+fn map_validate(dir_abs: PathBuf) -> impl Fn(&str) -> Option<String> + 'static {
+    move |typed| match map_rel("", typed) {
+        Err(error) => Some(error),
+        Ok(file) => dir_abs
+            .join(&file)
+            .exists()
+            .then(|| format!("{file} already exists here.")),
+    }
+}
+
+/// The inline map commit: reveal + focus this panel, then create and open
+/// the named map -- same shape as `ggo_emerald_panel`'s world commit.
+fn new_map_commit(
+    workspace: WeakEntity<Workspace>,
+    dir_rel: String,
+) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
+    move |typed, window, cx| {
+        (ggo_common::panel_entry_handler(
+            workspace,
+            move |panel: &Entity<MapPanel>, window, cx| {
+                let typed = typed.clone();
+                let dir_rel = dir_rel.clone();
+                panel.update(cx, |panel, cx| {
+                    panel.create_map_inline(&dir_rel, &typed, window, cx)
+                });
+            },
+        ))(window, cx);
+    }
 }
 
 /// Walk up from `dir` (inclusive) to the nearest emerald project root
@@ -334,19 +413,6 @@ fn split_map_path(project_root: &Path, rel: &str) -> (PathBuf, String) {
         return (assets, under);
     }
     (project_root.to_path_buf(), rel.to_string())
-}
-
-/// The first free name for a new map: `map`, then `map-2`, `map-3`, ...
-/// `taken` answers whether a candidate stem is already in use. Pure, so the
-/// naming rule is testable without a filesystem.
-fn free_map_name(taken: impl Fn(&str) -> bool) -> String {
-    if !taken(NEW_MAP_BASE) {
-        return NEW_MAP_BASE.to_string();
-    }
-    (2u32..)
-        .map(|n| format!("{NEW_MAP_BASE}-{n}"))
-        .find(|candidate| !taken(candidate))
-        .expect("a free map-N name exists long before N overflows")
 }
 
 // ------------------------------------------------------------- view state
@@ -741,12 +807,25 @@ impl MapPanel {
     /// explorer can reach a panel that has never been activated. Safe
     /// here: the caller is a context-menu entry handler, which runs
     /// outside both the project panel's lease and any `Workspace` update.
-    pub fn new_map(&mut self, dir_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Create the inline-named blank map in worktree-relative `dir_rel`
+    /// and open it, keeping [`new_map`]'s dirty-map guard: an unsaved open
+    /// map gets its save/discard prompt before the new one replaces it.
+    pub fn create_map_inline(
+        &mut self,
+        dir_rel: &str,
+        typed: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.refresh_root(cx);
         if self.project_root.is_none() {
             return;
         }
-        let dir_rel = dir_rel.to_string();
+        // Re-checked here (the inline editor already validated) so this
+        // method is safe to call from anywhere.
+        let Ok(source_rel) = map_rel(dir_rel, typed) else {
+            return;
+        };
         let proceed = ggo_common::prepare_to_close_dirty(
             self.dirty_map_name(),
             window,
@@ -762,9 +841,9 @@ impl MapPanel {
                 let Some(project_root) = this.project_root.clone() else {
                     return;
                 };
-                let Some(source_rel) = create_blank_map(&project_root, &dir_rel) else {
+                if create_blank_map(&project_root, &source_rel).is_none() {
                     return;
-                };
+                }
                 this.load_rel_path(&source_rel, cx);
             })
             .ok();
@@ -2110,11 +2189,17 @@ mod tests {
         );
     }
 
+    /// [`map_rel`]'s stem rules: the same refusals the tileset stem makes,
+    /// a retyped `.map` extension accepted without doubling, and the
+    /// clicked dir joined in.
     #[test]
-    fn free_map_name_walks_until_it_finds_a_gap() {
-        assert_eq!(free_map_name(|_| false), "map");
-        assert_eq!(free_map_name(|c| c == "map"), "map-2");
-        assert_eq!(free_map_name(|c| c == "map" || c == "map-2"), "map-3");
+    fn map_rel_applies_the_stem_rules() {
+        assert_eq!(map_rel("assets/maps", "level"), Ok("assets/maps/level.map".to_string()));
+        assert_eq!(map_rel("assets/maps", "level.map"), Ok("assets/maps/level.map".to_string()));
+        assert_eq!(map_rel("", "level"), Ok("level.map".to_string()));
+        for bad in &["", "  ", "a/b", "a\\b", ".", "..", ".map"] {
+            assert!(map_rel("assets/maps", bad).is_err(), "{bad:?} must be refused");
+        }
     }
 
     #[test]
@@ -2932,7 +3017,9 @@ mod tests {
         dirty_the_map(&panel, cx);
 
         cx.update(|window, cx| {
-            panel.update(cx, |panel, cx| panel.new_map("assets/maps", window, cx))
+            panel.update(cx, |panel, cx| {
+                panel.create_map_inline("assets/maps", "arena", window, cx)
+            })
         });
         assert_eq!(
             cx.pending_prompt().map(|(msg, _)| msg),
@@ -2945,7 +3032,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            !assets.join("maps/map.map").exists(),
+            !assets.join("maps/arena.map").exists(),
             "Cancel must not leave a file behind"
         );
         panel.update(cx, |panel, _| {
@@ -2954,17 +3041,17 @@ mod tests {
             assert!(open.store.dirty(), "and the edits stay put");
         });
 
-        // Going through with it now creates `map.map` -- NOT `map-2.map`,
-        // which is what a leftover orphan would have forced.
+        // Going through with it now creates the named map.
         cx.update(|window, cx| {
-            panel.update(cx, |panel, cx| panel.new_map("assets/maps", window, cx))
+            panel.update(cx, |panel, cx| {
+                panel.create_map_inline("assets/maps", "arena", window, cx)
+            })
         });
         cx.simulate_prompt_answer("Don't Save");
         cx.run_until_parked();
-        assert!(assets.join("maps/map.map").is_file());
-        assert!(!assets.join("maps/map-2.map").exists());
+        assert!(assets.join("maps/arena.map").is_file());
         panel.update(cx, |panel, _| {
-            assert_eq!(ready(panel).source_rel, "assets/maps/map.map");
+            assert_eq!(ready(panel).source_rel, "assets/maps/arena.map");
         });
     }
 
@@ -3031,6 +3118,7 @@ mod tests {
         write_project(root);
         cx.update(|cx| {
             AppState::test(cx);
+            project_panel::init(cx);
             init(cx);
         });
         let fs = FakeFs::new(cx.executor());
@@ -3062,6 +3150,13 @@ mod tests {
         });
         let root = root.to_path_buf();
         panel.update(cx, |panel, _| panel.root_override = Some(root));
+        // The inline "New Map…" entry seeds the project panel's name
+        // editor, so the tests need one docked -- production gets it from
+        // `initialize_workspace`.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_panel = project_panel::ProjectPanel::ggo_test_new(workspace, window, cx);
+            workspace.add_panel(project_panel, window, cx);
+        });
         (workspace, panel, worktree_id, cx)
     }
 
@@ -3140,24 +3235,51 @@ mod tests {
         );
     }
 
-    /// The entry's OWN handler creates a blank, UNBOUND map in the clicked
-    /// directory and opens it here -- and a second invocation picks the
-    /// next free name rather than clobbering the first.
+    /// The entry's OWN handler seeds the project panel's inline name
+    /// editor; committing a name creates a blank, UNBOUND map with that
+    /// name in the clicked directory and opens it here -- and the same
+    /// name again is refused in the editor, before anything is written.
     #[gpui::test]
-    async fn test_new_map_creates_a_blank_unbound_map_and_opens_it(cx: &mut TestAppContext) {
+    async fn test_new_map_names_inline_then_creates_and_opens(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, panel, _, cx) = routed_workspace(cx, dir.path()).await;
+        let (workspace, panel, worktree_id, cx) = routed_workspace(cx, dir.path()).await;
         let assets = dir.path().join(ASSETS_DIR);
 
-        let handler = new_map_handler(workspace.downgrade(), "assets/maps".to_string());
+        let handler = new_map_handler(
+            workspace.downgrade(),
+            worktree_id,
+            "assets/maps".to_string(),
+            assets.join("maps"),
+        );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
-        assert!(assets.join("maps/map.map").is_file(), "the file must exist");
+        let project_panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<project_panel::ProjectPanel>(cx)
+                .expect("docked")
+        });
+        project_panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.ggo_test_inline_state(),
+                (true, true),
+                "the inline editor is open with the commit armed"
+            );
+        });
+        project_panel.update_in(cx, |panel, window, cx| {
+            panel
+                .ggo_test_filename_editor()
+                .clone()
+                .update(cx, |editor, cx| editor.set_text("arena", window, cx));
+            panel.ggo_test_confirm_edit(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(assets.join("maps/arena.map").is_file(), "the file must exist");
         panel.update(cx, |panel, _| {
             let open = ready(panel);
-            assert_eq!(open.source_rel, "assets/maps/map.map");
-            assert_eq!(open.rel_path, "maps/map.map");
+            assert_eq!(open.source_rel, "assets/maps/arena.map");
+            assert_eq!(open.rel_path, "maps/arena.map");
             assert_eq!(open.root, assets);
             let state = open.store.state();
             assert_eq!((state.w, state.h), (geom::NEW_MAP_DIM, geom::NEW_MAP_DIM));
@@ -3172,11 +3294,25 @@ mod tests {
             );
         });
 
+        // The same name again is refused while typing -- nothing written.
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
-        assert!(assets.join("maps/map-2.map").is_file(), "next free name");
-        panel.update(cx, |panel, _| {
-            assert_eq!(ready(panel).source_rel, "assets/maps/map-2.map");
+        project_panel.update_in(cx, |panel, window, cx| {
+            panel
+                .ggo_test_filename_editor()
+                .clone()
+                .update(cx, |editor, cx| editor.set_text("arena", window, cx));
+            panel.ggo_test_confirm_edit(window, cx);
+        });
+        cx.run_until_parked();
+        project_panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.ggo_test_inline_state(), (true, true));
+            assert!(
+                panel
+                    .ggo_test_validation_error()
+                    .is_some_and(|error| error.contains("already exists")),
+                "a duplicate name is refused in the editor"
+            );
         });
     }
 }

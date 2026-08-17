@@ -11600,3 +11600,332 @@ async fn test_restore_file_prompt_escapes_markdown_in_file_name(cx: &mut gpui::T
 
     assert_eq!(message, "Discard changes to `__init__.py`?");
 }
+
+// ------------------------------------------------- GGO: inline new entry
+
+/// Shared scaffold for the inline-entry tests: one worktree with
+/// `assets/worlds/`, the panel docked, and the target dir's ProjectPath.
+async fn ggo_inline_workspace(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<ProjectPanel>,
+    ProjectPath,
+    std::sync::Arc<FakeFs>,
+    VisualTestContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "assets": { "worlds": {} }, "src": { "main.rs": "" } }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        panel
+    });
+    cx.run_until_parked();
+    let worktree_id = project.read_with(&mut cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let dir = ProjectPath {
+        worktree_id,
+        path: rel_path("assets/worlds").into(),
+    };
+    (panel, dir, fs, cx)
+}
+
+/// Enter commits the typed name through the callback -- deferred, with the
+/// edit state already gone -- and the panel itself creates NO file.
+#[gpui::test]
+async fn test_ggo_inline_edit_commits_the_typed_name_through_the_callback(
+    cx: &mut TestAppContext,
+) {
+    let (panel, dir, fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+    let seeded = panel.update_in(cx, |panel, window, cx| {
+        panel.ggo_new_entry_inline(
+            &dir,
+            |_| None,
+            {
+                let committed = committed.clone();
+                let panel = cx.weak_entity();
+                // Re-updating the panel proves the callback runs OUTSIDE
+                // its update -- re-entrancy would panic right here.
+                move |name, _, cx| {
+                    panel
+                        .update(cx, |panel, _| {
+                            assert!(panel.state.edit_state.is_none());
+                        })
+                        .unwrap();
+                    *committed.borrow_mut() = Some(name)
+                }
+            },
+            window,
+            cx,
+        )
+    });
+    assert!(seeded, "an existing directory must seed the editor");
+    cx.run_until_parked();
+
+    panel.update_in(cx, |panel, window, cx| {
+        assert!(
+            panel.filename_editor.read(cx).is_focused(window),
+            "the inline editor takes focus, same as New File"
+        );
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text("arena", window, cx));
+        assert!(
+            panel.confirm_edit(true, window, cx).is_none(),
+            "an inline commit spawns no rename/create task"
+        );
+        assert!(
+            panel.state.edit_state.is_none(),
+            "the editor closes on commit"
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(committed.borrow().as_deref(), Some("arena"));
+    assert!(
+        fs.metadata(path!("/root/assets/worlds/arena").as_ref())
+            .await
+            .unwrap()
+            .is_none(),
+        "the panel must not create the typed path itself"
+    );
+}
+
+/// An invalid name blocks Enter with the validator's message and keeps the
+/// editor open; fixing the name then commits.
+#[gpui::test]
+async fn test_ggo_inline_edit_invalid_name_keeps_the_editor_open(cx: &mut TestAppContext) {
+    let (panel, dir, _fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.ggo_new_entry_inline(
+            &dir,
+            |name| (!name.chars().all(|c| c.is_ascii_lowercase())).then(|| "lowercase only".to_string()),
+            {
+                let committed = committed.clone();
+                move |name, _, _| *committed.borrow_mut() = Some(name)
+            },
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text("Arena", window, cx));
+        assert!(panel.confirm_edit(true, window, cx).is_none());
+        assert!(
+            panel.state.edit_state.is_some(),
+            "an invalid name keeps the editor open"
+        );
+        match &panel.state.edit_state.as_ref().unwrap().validation_state {
+            ValidationState::Error(message) => assert_eq!(message, "lowercase only"),
+            other => panic!("expected the validator's error, got {other:?}"),
+        }
+    });
+    cx.run_until_parked();
+    assert_eq!(*committed.borrow(), None, "nothing committed yet");
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text("arena", window, cx));
+        panel.confirm_edit(true, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(committed.borrow().as_deref(), Some("arena"));
+}
+
+/// While typing, the validator feeds the same live validation strip
+/// upstream names use; an empty editor shows no error.
+#[gpui::test]
+async fn test_ggo_inline_edit_validates_live_while_typing(cx: &mut TestAppContext) {
+    let (panel, dir, _fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.ggo_new_entry_inline(
+            &dir,
+            |name| name.contains(' ').then(|| "no spaces".to_string()),
+            |_, _, _| {},
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text("bad name", window, cx));
+    });
+    cx.run_until_parked();
+    panel.update_in(cx, |panel, _, _| {
+        match &panel.state.edit_state.as_ref().unwrap().validation_state {
+            ValidationState::Error(message) => assert_eq!(message, "no spaces"),
+            other => panic!("expected a live error, got {other:?}"),
+        }
+    });
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+    });
+    cx.run_until_parked();
+    panel.update_in(cx, |panel, _, _| {
+        assert!(
+            matches!(
+                panel.state.edit_state.as_ref().unwrap().validation_state,
+                ValidationState::None
+            ),
+            "an empty editor shows no error"
+        );
+    });
+}
+
+/// Enter on an empty editor is a no-op: editor stays open, callback stays
+/// armed.
+#[gpui::test]
+async fn test_ggo_inline_edit_empty_name_is_a_noop(cx: &mut TestAppContext) {
+    let (panel, dir, _fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.ggo_new_entry_inline(&dir, |_| None, |_, _, _| {}, window, cx);
+    });
+    cx.run_until_parked();
+    panel.update_in(cx, |panel, window, cx| {
+        assert!(panel.confirm_edit(true, window, cx).is_none());
+        assert!(panel.state.edit_state.is_some());
+        assert!(panel.ggo_inline_edit.is_some());
+    });
+}
+
+/// Escape discards the edit AND the callback -- it must never fire later.
+#[gpui::test]
+async fn test_ggo_inline_edit_cancel_drops_the_callback(cx: &mut TestAppContext) {
+    let (panel, dir, _fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(false));
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.ggo_new_entry_inline(
+            &dir,
+            |_| None,
+            {
+                let committed = committed.clone();
+                move |_, _, _| *committed.borrow_mut() = true
+            },
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    panel.update_in(cx, |panel, window, cx| {
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text("arena", window, cx));
+        panel.cancel(&Cancel, window, cx);
+        assert!(panel.state.edit_state.is_none());
+        assert!(panel.ggo_inline_edit.is_none());
+    });
+    cx.run_until_parked();
+    assert!(!*committed.borrow(), "a cancelled edit must not commit");
+}
+
+/// A missing or non-directory target seeds nothing and reports it, so the
+/// caller can fall back.
+#[gpui::test]
+async fn test_ggo_inline_edit_declines_a_bad_target(cx: &mut TestAppContext) {
+    let (panel, dir, _fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+
+    for missing in ["assets/nope", "src/main.rs"] {
+        let seeded = panel.update_in(cx, |panel, window, cx| {
+            panel.ggo_new_entry_inline(
+                &ProjectPath {
+                    worktree_id: dir.worktree_id,
+                    path: rel_path(missing).into(),
+                },
+                |_| None,
+                |_, _, _| {},
+                window,
+                cx,
+            )
+        });
+        assert!(!seeded, "{missing:?} must be declined");
+        panel.update_in(cx, |panel, _, _| {
+            assert!(panel.state.edit_state.is_none());
+            assert!(panel.ggo_inline_edit.is_none());
+        });
+    }
+}
+
+/// A plain New File begun after an inline edit must not inherit its
+/// callback: the file is created for real, the callback never fires.
+#[gpui::test]
+async fn test_ggo_inline_edit_does_not_leak_into_a_plain_new_file(cx: &mut TestAppContext) {
+    let (panel, dir, fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(false));
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.ggo_new_entry_inline(
+            &dir,
+            |_| None,
+            {
+                let committed = committed.clone();
+                move |_, _, _| *committed.borrow_mut() = true
+            },
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // The user starts a plain New File instead of finishing the inline
+    // edit (selection is still the worlds dir).
+    let task = panel.update_in(cx, |panel, window, cx| {
+        panel.new_file(&NewFile, window, cx);
+        assert!(
+            panel.ggo_inline_edit.is_none(),
+            "a fresh edit must drop the armed callback"
+        );
+        panel
+            .filename_editor
+            .update(cx, |editor, cx| editor.set_text("plain.txt", window, cx));
+        panel.confirm_edit(true, window, cx)
+    });
+    task.expect("a plain new file spawns its create task")
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    assert!(!*committed.borrow(), "the inline callback must not fire");
+    assert!(
+        fs.metadata(path!("/root/assets/worlds/plain.txt").as_ref())
+            .await
+            .unwrap()
+            .is_some(),
+        "the plain flow creates the file as before"
+    );
+}

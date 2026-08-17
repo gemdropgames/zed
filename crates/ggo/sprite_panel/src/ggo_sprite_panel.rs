@@ -319,7 +319,8 @@ fn contribute_sprite_menu(
         else {
             return Vec::new();
         };
-        if !is_assets_dir(&worktree_root.join(&rel)) {
+        let dir_abs = worktree_root.join(&rel);
+        if !is_assets_dir(&dir_abs) {
             return Vec::new();
         }
         return vec![
@@ -327,16 +328,20 @@ fn contribute_sprite_menu(
                 .icon(ui::IconName::Plus)
                 .handler(new_sprite_handler(
                     cx.weak_entity(),
+                    path.worktree_id,
                     NewKind::Sprite,
                     rel.clone(),
+                    dir_abs.clone(),
                 ))
                 .into(),
             ui::ContextMenuEntry::new("New Metasprite…")
                 .icon(ui::IconName::Plus)
                 .handler(new_sprite_handler(
                     cx.weak_entity(),
+                    path.worktree_id,
                     NewKind::Metasprite,
                     rel,
+                    dir_abs,
                 ))
                 .into(),
         ];
@@ -360,17 +365,72 @@ fn contribute_sprite_menu(
     ]
 }
 
-/// The "New Sprite…"/"New Metasprite…" entries' handler -- named for the
-/// same reason as [`duplicate_sprite_handler`].
+/// The "New Sprite…"/"New Metasprite…" entries' handler: seed the project
+/// panel's inline name editor (New File's UX) in the clicked directory;
+/// the commit reveals the sprite panel with the tileset-binding form,
+/// name already fixed. Named for the same reason as
+/// [`duplicate_sprite_handler`].
 fn new_sprite_handler(
+    workspace: WeakEntity<Workspace>,
+    worktree_id: project::WorktreeId,
+    kind: NewKind,
+    dir_rel: String,
+    dir_abs: PathBuf,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    ggo_common::panel_entry_handler(
+        workspace.clone(),
+        move |panel: &Entity<project_panel::ProjectPanel>, window, cx| {
+            let workspace = workspace.clone();
+            let dir_rel = dir_rel.clone();
+            let dir_abs = dir_abs.clone();
+            panel.update(cx, |panel, cx| {
+                let Some(path) = ggo_common::inline_project_path(worktree_id, &dir_rel) else {
+                    return;
+                };
+                panel.ggo_new_entry_inline(
+                    &path,
+                    new_sprite_validate(dir_abs),
+                    new_sprite_commit(workspace, kind, dir_rel.clone()),
+                    window,
+                    cx,
+                );
+            });
+        },
+    )
+}
+
+/// The inline sprite-name gate: [`new_sprite_rel`]'s stem rules plus the
+/// already-exists refusal, surfaced while typing.
+fn new_sprite_validate(dir_abs: PathBuf) -> impl Fn(&str) -> Option<String> + 'static {
+    move |typed| match new_sprite_rel("", typed) {
+        Err(error) => Some(error),
+        Ok(file) => dir_abs
+            .join(&file)
+            .exists()
+            .then(|| format!("{file} already exists here.")),
+    }
+}
+
+/// The inline sprite commit: reveal + focus the sprite panel and open its
+/// tileset-binding form with the typed name fixed -- the binding still
+/// needs choosing, see [`create_sprite`] on why.
+fn new_sprite_commit(
     workspace: WeakEntity<Workspace>,
     kind: NewKind,
     dir_rel: String,
-) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<SpritePanel>, window, cx| {
-        let dir_rel = dir_rel.clone();
-        panel.update(cx, |panel, cx| panel.new_sprite(kind, &dir_rel, window, cx));
-    })
+) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
+    move |typed, window, cx| {
+        (ggo_common::panel_entry_handler(
+            workspace,
+            move |panel: &Entity<SpritePanel>, window, cx| {
+                let typed = typed.clone();
+                let dir_rel = dir_rel.clone();
+                panel.update(cx, |panel, cx| {
+                    panel.new_sprite_named(kind, &dir_rel, typed, window, cx)
+                });
+            },
+        ))(window, cx);
+    }
 }
 
 /// The "Rename Sprite…" entry's handler -- see [`duplicate_sprite_handler`].
@@ -449,18 +509,6 @@ enum NewKind {
 }
 
 impl NewKind {
-    /// The stem a new document is named after -- "sprite"/"sprite-2"...,
-    /// "metasprite"/"metasprite-2"... (see [`free_new_name`]). No text
-    /// prompt at creation time: `window.prompt` is button-choice only, and
-    /// renaming afterwards is now a panel form
-    /// ([`SpritePanel::begin_rename`]).
-    fn name_base(self) -> &'static str {
-        match self {
-            NewKind::Sprite => "sprite",
-            NewKind::Metasprite => "metasprite",
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             NewKind::Sprite => "New Sprite",
@@ -483,22 +531,6 @@ const NEW_METASPRITE_FRAMES: usize = 2;
 /// own `clip{N}` scheme at N = 1, so the first clip a user adds by hand
 /// continues the same sequence.
 const NEW_METASPRITE_CLIP: &str = "clip1";
-
-/// The first free stem for a new document: `base`, then `base-2`,
-/// `base-3`, ... `taken` answers whether a candidate is already in use.
-/// Pure, so the naming rule is testable without a filesystem. Only the
-/// `.spr` is checked by callers: unlike [`free_copy_base`], a new sprite
-/// does NOT mint sidecars of its own -- it binds to an existing tileset,
-/// so there is no `.til`/`.pal` of its name to collide.
-fn free_new_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
-    if !taken(base) {
-        return base.to_string();
-    }
-    (2u32..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !taken(candidate))
-        .expect("a free base-N name exists long before N overflows")
-}
 
 /// One row of the new-sprite form's tileset dropdown: a `.til` under the
 /// asset root, plus **the other sprites that already bind it**
@@ -667,23 +699,46 @@ fn default_tileset_choice(choices: &[TilesetChoice]) -> usize {
 /// "New Sprite" can add a file next to a tileset it did not otherwise
 /// touch. Pinned by
 /// `test_new_sprite_binding_a_pal_less_tileset_writes_the_fallback_palette`.
+/// The worktree-relative `.spr` rel an inline-typed name lands at, or
+/// `Err(message)` for a name the editor must refuse -- [`rename_target`]'s
+/// stem rules, aimed at a directory instead of a sibling.
+fn new_sprite_rel(dir_rel: &str, typed: &str) -> Result<String, String> {
+    let typed = typed.trim();
+    let stem = typed
+        .strip_suffix(&format!(".{SPRITE_EXT}"))
+        .unwrap_or(typed)
+        .trim();
+    if stem.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    if stem.contains('/') || stem.contains('\\') {
+        return Err("name cannot contain a path separator".to_string());
+    }
+    if stem == "." || stem == ".." {
+        return Err(format!("{stem} is not a name"));
+    }
+    let file = format!("{stem}.{SPRITE_EXT}");
+    Ok(if dir_rel.is_empty() {
+        file
+    } else {
+        format!("{}/{file}", dir_rel.trim_end_matches('/'))
+    })
+}
+
 fn create_sprite(
     project_root: &Path,
     dir_rel: &str,
     kind: NewKind,
     til_rel: &str,
+    name: &str,
 ) -> Result<String, String> {
-    let dir_abs = project_root.join(dir_rel);
-    let name = free_new_name(kind.name_base(), |candidate| {
-        dir_abs.join(format!("{candidate}.{SPRITE_EXT}")).exists()
-    });
-    let file = format!("{name}.{SPRITE_EXT}");
-    let source_rel = if dir_rel.is_empty() {
-        file
-    } else {
-        format!("{dir_rel}/{file}")
-    };
+    let source_rel = new_sprite_rel(dir_rel, name)?;
     let (root, rel_path) = split_sprite_path(project_root, &source_rel);
+    if root.join(&rel_path).exists() {
+        // The inline editor pre-checks this; re-checked so a race can
+        // never truncate an existing sprite.
+        return Err(format!("{source_rel} already exists"));
+    }
 
     let tileset = io::open_tileset(&root, til_rel).map_err(|e| e.to_string())?;
     if tileset.tile_count == 0 {
@@ -1013,6 +1068,9 @@ enum PanelForm {
         kind: NewKind,
         /// The clicked directory, worktree-relative.
         dir_rel: String,
+        /// The stem typed into the project panel's inline editor -- the
+        /// new document's name, already validated by the editor's gate.
+        name: String,
         /// Every `.til` under the asset root with its existing sharers
         /// ([`tileset_choices`]). Empty means the project has no tileset
         /// yet and the form can only be cancelled.
@@ -1246,10 +1304,11 @@ impl SpritePanel {
     ///
     /// Refreshes the root first for the same reason `duplicate_sprite`
     /// does: a right-click can reach a panel that was never activated.
-    fn new_sprite(
+    fn new_sprite_named(
         &mut self,
         kind: NewKind,
         dir_rel: &str,
+        name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1281,6 +1340,7 @@ impl SpritePanel {
                 this.form = Some(PanelForm::New {
                     kind,
                     dir_rel,
+                    name,
                     selected: default_tileset_choice(&tilesets),
                     tilesets,
                     error: None,
@@ -1327,6 +1387,7 @@ impl SpritePanel {
         let Some(PanelForm::New {
             kind,
             dir_rel,
+            name,
             tilesets,
             selected,
             ..
@@ -1334,7 +1395,7 @@ impl SpritePanel {
         else {
             return;
         };
-        let (kind, dir_rel) = (*kind, dir_rel.clone());
+        let (kind, dir_rel, name) = (*kind, dir_rel.clone(), name.clone());
         let Some(til_rel) = tilesets.get(*selected).map(|choice| choice.rel.clone()) else {
             return; // no tileset in the project: the form only cancels
         };
@@ -1349,7 +1410,7 @@ impl SpritePanel {
                 return;
             }
             this.update(cx, |this, cx| {
-                this.create_and_open(kind, &dir_rel, &til_rel, cx)
+                this.create_and_open(kind, &dir_rel, &til_rel, &name, cx)
             })
             .ok();
         })
@@ -1363,12 +1424,13 @@ impl SpritePanel {
         kind: NewKind,
         dir_rel: &str,
         til_rel: &str,
+        name: &str,
         cx: &mut Context<Self>,
     ) {
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        match create_sprite(&project_root, dir_rel, kind, til_rel) {
+        match create_sprite(&project_root, dir_rel, kind, til_rel, name) {
             Ok(source_rel) => {
                 self.form = None;
                 self.load_rel_path(&source_rel, cx);
@@ -2648,11 +2710,12 @@ impl SpritePanel {
             PanelForm::New {
                 kind,
                 dir_rel,
+                name,
                 tilesets,
                 selected,
                 error,
             } => {
-                let label = format!("{} in {}", kind.label(), dir_rel);
+                let label = format!("{} \"{name}\" in {}", kind.label(), dir_rel);
                 let has_tilesets = !tilesets.is_empty();
                 let choice = tilesets.get(*selected);
                 let picked: SharedString = choice
@@ -3143,6 +3206,28 @@ mod tests {
     use gpui::TestAppContext;
     use project::{FakeFs, Project, WorktreeId};
     use workspace::{AppState, MultiWorkspace};
+
+    /// [`new_sprite_rel`]'s stem rules: [`rename_target`]'s refusals aimed
+    /// at a directory, a retyped `.spr` extension accepted without
+    /// doubling, and the clicked dir joined in.
+    #[test]
+    fn new_sprite_rel_applies_the_stem_rules() {
+        assert_eq!(
+            new_sprite_rel("assets/sprites", "hero"),
+            Ok("assets/sprites/hero.spr".to_string())
+        );
+        assert_eq!(
+            new_sprite_rel("assets/sprites", "hero.spr"),
+            Ok("assets/sprites/hero.spr".to_string())
+        );
+        assert_eq!(new_sprite_rel("", "hero"), Ok("hero.spr".to_string()));
+        for bad in &["", "  ", "a/b", "a\\b", ".", "..", ".spr"] {
+            assert!(
+                new_sprite_rel("assets/sprites", bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
 
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
@@ -4917,6 +5002,7 @@ mod tests {
     ) {
         cx.update(|cx| {
             AppState::test(cx);
+            project_panel::init(cx);
             init(cx);
         });
         let fs = FakeFs::new(cx.executor());
@@ -4944,7 +5030,59 @@ mod tests {
         });
         let root = root.to_path_buf();
         panel.update(cx, |panel, _| panel.root_override = Some(root));
+        // The inline "New Sprite…"/"New Metasprite…" entries seed the
+        // project panel's name editor, so the tests need one docked --
+        // production gets it from `initialize_workspace`.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_panel = project_panel::ProjectPanel::ggo_test_new(workspace, window, cx);
+            workspace.add_panel(project_panel, window, cx);
+        });
         (workspace, panel, worktree_id, cx)
+    }
+
+    /// Fire the real "New …" handler, type `name` into the project
+    /// panel's inline editor, and press Enter -- everything up to the
+    /// binding form opening.
+    fn name_inline(
+        workspace: &Entity<Workspace>,
+        kind: NewKind,
+        dir_rel: &str,
+        dir_abs: std::path::PathBuf,
+        name: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .id()
+        });
+        let handler = new_sprite_handler(
+            workspace.downgrade(),
+            worktree_id,
+            kind,
+            dir_rel.to_string(),
+            dir_abs,
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let project_panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<project_panel::ProjectPanel>(cx)
+                .expect("docked")
+        });
+        project_panel.update_in(cx, |panel, window, cx| {
+            panel
+                .ggo_test_filename_editor()
+                .clone()
+                .update(cx, |editor, cx| editor.set_text(name, window, cx));
+            panel.ggo_test_confirm_edit(window, cx);
+        });
+        cx.run_until_parked();
     }
 
     /// The "New …" entries are offered for directories inside the asset
@@ -4982,21 +5120,21 @@ mod tests {
         );
     }
 
-    /// Fire the real menu handler and accept the form's DEFAULT binding
-    /// with Create -- i.e. exactly the path a user who never touches the
-    /// dropdown takes. Deliberate: that default is the thing fix round 1
-    /// BLOCKING 1 was about, so every caller of this helper is asserting
-    /// what an untouched dropdown binds to.
+    /// Fire the real menu handler, type `name` inline, and accept the
+    /// form's DEFAULT binding with Create -- i.e. exactly the path a user
+    /// who never touches the dropdown takes. Deliberate: that default is
+    /// the thing fix round 1 BLOCKING 1 was about, so every caller of
+    /// this helper is asserting what an untouched dropdown binds to.
     fn new_via_menu(
         workspace: &Entity<Workspace>,
         panel: &Entity<SpritePanel>,
         kind: NewKind,
         dir_rel: &str,
+        dir_abs: std::path::PathBuf,
+        name: &str,
         cx: &mut gpui::VisualTestContext,
     ) {
-        let handler = new_sprite_handler(workspace.downgrade(), kind, dir_rel.to_string());
-        cx.update(|window, cx| handler(window, cx));
-        cx.run_until_parked();
+        name_inline(workspace, kind, dir_rel, dir_abs, name, cx);
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
     }
@@ -5014,17 +5152,20 @@ mod tests {
         let assets = dir.path().join("assets");
         let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        // The form opens with the project's tilesets and writes nothing.
-        let handler = new_sprite_handler(
-            workspace.downgrade(),
+        // Naming inline opens the form with the project's tilesets and
+        // writes nothing.
+        name_inline(
+            &workspace,
             NewKind::Sprite,
-            "assets/sprites".to_string(),
+            "assets/sprites",
+            assets.join("sprites"),
+            "hero_idle",
+            cx,
         );
-        cx.update(|window, cx| handler(window, cx));
-        cx.run_until_parked();
         panel.update(cx, |panel, _| {
             let Some(PanelForm::New {
                 kind,
+                name,
                 tilesets,
                 selected,
                 ..
@@ -5033,6 +5174,7 @@ mod tests {
                 panic!("New Sprite… must open the binding form");
             };
             assert_eq!(*kind, NewKind::Sprite);
+            assert_eq!(name, "hero_idle", "the typed name is fixed in the form");
             assert_eq!(
                 tilesets.iter().map(|c| c.rel.as_str()).collect::<Vec<_>>(),
                 vec!["sprites/hero.til", "tiles/world.til"],
@@ -5044,14 +5186,14 @@ mod tests {
             );
         });
         assert!(
-            !assets.join("sprites/sprite.spr").exists(),
+            !assets.join("sprites/hero_idle.spr").exists(),
             "opening the form must not write anything yet"
         );
 
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
 
-        let opened = open_sprite(&assets, "sprites/sprite.spr").expect("round-trips");
+        let opened = open_sprite(&assets, "sprites/hero_idle.spr").expect("round-trips");
         assert_eq!(opened.til_path, "tiles/world.til");
         assert_eq!(opened.pal_path, "tiles/world.pal");
         assert_eq!(opened.state.tile_count, FIXTURE_TILES, "bound pool");
@@ -5067,15 +5209,15 @@ mod tests {
         );
         // The bytes on disk must never carry the `assets/` prefix.
         let text =
-            String::from_utf8_lossy(&std::fs::read(assets.join("sprites/sprite.spr")).unwrap())
+            String::from_utf8_lossy(&std::fs::read(assets.join("sprites/hero_idle.spr")).unwrap())
                 .into_owned();
         assert!(text.contains("tiles/world.til"), "{text:?}");
         assert!(!text.contains("assets/tiles/world.til"), "{text:?}");
 
         panel.update(cx, |panel, _| {
             let open = ready(panel);
-            assert_eq!(open.source_rel, "assets/sprites/sprite.spr");
-            assert_eq!(open.rel_path, "sprites/sprite.spr");
+            assert_eq!(open.source_rel, "assets/sprites/hero_idle.spr");
+            assert_eq!(open.rel_path, "sprites/hero_idle.spr");
             assert_eq!(open.root, assets);
             assert!(!open.store.dirty(), "creating it is not an unsaved edit");
             let strip = open.pool_strip.as_ref().expect("picker sheet composed");
@@ -5086,11 +5228,19 @@ mod tests {
             assert!(panel.form.is_none(), "the form closes on Create");
         });
 
-        // Second run: next free name, not a clobber.
-        new_via_menu(&workspace, &panel, NewKind::Sprite, "assets/sprites", cx);
-        assert!(assets.join("sprites/sprite-2.spr").is_file());
+        // A second sprite with its own name lands beside the first.
+        new_via_menu(
+            &workspace,
+            &panel,
+            NewKind::Sprite,
+            "assets/sprites",
+            assets.join("sprites"),
+            "hero_run",
+            cx,
+        );
+        assert!(assets.join("sprites/hero_run.spr").is_file());
         panel.update(cx, |panel, _| {
-            assert_eq!(ready(panel).source_rel, "assets/sprites/sprite-2.spr");
+            assert_eq!(ready(panel).source_rel, "assets/sprites/hero_run.spr");
         });
     }
 
@@ -5104,9 +5254,17 @@ mod tests {
         let assets = dir.path().join("assets");
         let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        new_via_menu(&workspace, &panel, NewKind::Metasprite, "assets", cx);
+        new_via_menu(
+            &workspace,
+            &panel,
+            NewKind::Metasprite,
+            "assets",
+            assets.clone(),
+            "walker",
+            cx,
+        );
 
-        let opened = open_sprite(&assets, "metasprite.spr").expect("round-trips");
+        let opened = open_sprite(&assets, "walker.spr").expect("round-trips");
         assert_eq!(opened.state.frames.len(), NEW_METASPRITE_FRAMES);
         assert_eq!(
             opened.state.clips,
@@ -5131,7 +5289,7 @@ mod tests {
             "and the unrelated sprite is not dragged into pool sharing"
         );
         panel.update(cx, |panel, _| {
-            assert_eq!(ready(panel).source_rel, "assets/metasprite.spr");
+            assert_eq!(ready(panel).source_rel, "assets/walker.spr");
         });
     }
 
@@ -5147,15 +5305,15 @@ mod tests {
         let before_pal = std::fs::read(assets.join("tiles/world.pal")).unwrap();
         let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let handler = new_sprite_handler(
-            workspace.downgrade(),
+        new_via_menu(
+            &workspace,
+            &panel,
             NewKind::Sprite,
-            "assets/sprites".to_string(),
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
         );
-        cx.update(|window, cx| handler(window, cx));
-        cx.run_until_parked();
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
-        cx.run_until_parked();
 
         assert_eq!(
             std::fs::read(assets.join("tiles/world.til")).unwrap(),
@@ -5182,12 +5340,16 @@ mod tests {
             assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
         });
 
-        let handler = new_sprite_handler(
-            workspace.downgrade(),
+        // Naming happens in the project panel's inline editor and writes
+        // nothing; the guard fires when the name is COMMITTED.
+        name_inline(
+            &workspace,
             NewKind::Sprite,
-            "assets/sprites".to_string(),
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
         );
-        cx.update(|window, cx| handler(window, cx));
         assert_eq!(
             cx.pending_prompt().map(|(msg, _)| msg),
             Some(
@@ -5200,7 +5362,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            !assets.join("sprites/sprite.spr").exists(),
+            !assets.join("sprites/fresh.spr").exists(),
             "Cancel must not leave a file behind"
         );
         panel.update(cx, |panel, _| {
@@ -5272,13 +5434,14 @@ mod tests {
         let assets = dir.path().join("assets");
         let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let handler = new_sprite_handler(
-            workspace.downgrade(),
+        name_inline(
+            &workspace,
             NewKind::Sprite,
-            "assets/sprites".to_string(),
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
         );
-        cx.update(|window, cx| handler(window, cx));
-        cx.run_until_parked();
         panel.update(cx, |panel, _| {
             let Some(PanelForm::New {
                 tilesets, selected, ..
@@ -5317,7 +5480,7 @@ mod tests {
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
         assert_eq!(
-            open_sprite(&assets, "sprites/sprite.spr").unwrap().til_path,
+            open_sprite(&assets, "sprites/fresh.spr").unwrap().til_path,
             "sprites/hero.til",
             "the deliberate choice is honoured"
         );
@@ -5336,13 +5499,14 @@ mod tests {
         open_in_menu_panel(&panel, cx, "assets/sprites/hero.spr");
 
         // Open the form CLEAN -- no prompt at this point by construction.
-        let handler = new_sprite_handler(
-            workspace.downgrade(),
+        name_inline(
+            &workspace,
             NewKind::Sprite,
-            "assets/sprites".to_string(),
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
         );
-        cx.update(|window, cx| handler(window, cx));
-        cx.run_until_parked();
         assert!(!cx.has_pending_prompt(), "a clean document must not prompt");
 
         // ...then edit the still-live document under the form.
@@ -5363,7 +5527,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            !assets.join("sprites/sprite.spr").exists(),
+            !assets.join("sprites/fresh.spr").exists(),
             "Cancel writes nothing"
         );
         panel.update(cx, |panel, _| {
@@ -5387,7 +5551,7 @@ mod tests {
             "the edit made under the form was saved, not discarded"
         );
         panel.update(cx, |panel, _| {
-            assert_eq!(ready(panel).source_rel, "assets/sprites/sprite.spr");
+            assert_eq!(ready(panel).source_rel, "assets/sprites/fresh.spr");
         });
     }
 
@@ -5406,13 +5570,21 @@ mod tests {
         std::fs::remove_file(assets.join("tiles/world.pal")).unwrap();
         let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        new_via_menu(&workspace, &panel, NewKind::Sprite, "assets/sprites", cx);
+        new_via_menu(
+            &workspace,
+            &panel,
+            NewKind::Sprite,
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
+        );
 
         assert!(
             assets.join("tiles/world.pal").is_file(),
             "the missing .pal is created as a side effect of creating the sprite"
         );
-        let opened = open_sprite(&assets, "sprites/sprite.spr").unwrap();
+        let opened = open_sprite(&assets, "sprites/fresh.spr").unwrap();
         assert_eq!(opened.pal_path, "tiles/world.pal");
         assert_eq!(
             opened.state.palette[1],

@@ -14,6 +14,7 @@ path = "src/ggo_common.rs"
 [dependencies]
 gpui.workspace = true
 image.workspace = true
+path.workspace = true
 project.workspace = true
 # The child-process runner below (`run_capture`) -- `smol::process::Command`
 # rather than `std`'s, because this checkout's `clippy.toml` disallows the
