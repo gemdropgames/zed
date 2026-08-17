@@ -207,7 +207,11 @@ fn split_world_path(rel: &str) -> Option<(String, WorldListing)> {
 /// ASSET-ROOT-relative and extensionless (`sprites/hero`), the same frame
 /// `loader::compose_meta_sprite_rgba` opens it in (`{stem}.spr`).
 const META_SPRITE: &str = "MetaSprite";
+const SPRITE_COMPONENT: &str = "Sprite";
 const SPRITE_EXT: &str = "spr";
+
+/// How many stem suggestions render under a focused Asset field.
+const STEM_SUGGESTION_CAP: usize = 8;
 
 /// The WORKTREE-relative `.spr` path an asset-root-relative `stem` names,
 /// or `None` when it does not resolve to a file that exists.
@@ -223,6 +227,40 @@ const SPRITE_EXT: &str = "spr";
 /// yet, and handing the sprite panel a missing path would only park it in
 /// an error state), or the asset root is not inside the worktree at all
 /// (nothing worktree-relative to hand over).
+/// Every asset-root-relative, extensionless `/`-separated stem with
+/// extension `ext` under `root`, sorted -- the completion feed for one
+/// Asset-kind inspector field. Recursive on purpose: a fresh project's
+/// `sprites/gg_icon.spr` (or any nested layout) must surface.
+fn list_asset_stems(root: &Path, ext: &str) -> Vec<String> {
+    let mut stems = Vec::new();
+    walk_asset_stems(root, root, ext, &mut stems);
+    stems.sort();
+    stems
+}
+
+fn walk_asset_stems(root: &Path, dir: &Path, ext: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_asset_stems(root, &path, ext, out);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            out.push(
+                rel.with_extension("")
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
+        }
+    }
+}
+
 fn sprite_rel_for_stem(project_root: &Path, asset_root: &Path, stem: &str) -> Option<String> {
     if stem.is_empty() {
         return None;
@@ -479,6 +517,20 @@ struct OpenWorld {
     /// The open palette color picker, if any -- at most one, anchored to
     /// one Color565 field.
     color_picker: Option<ColorPicker>,
+    /// The focused Asset field's completion feed, if any -- at most one.
+    /// Recomputed only when focus moves onto a DIFFERENT asset field
+    /// ([`WorldPanel::refresh_stem_completion`]), so the directory walk
+    /// runs once per focus, not per frame.
+    stem_completion: Option<StemCompletion>,
+}
+
+/// One Asset-kind field's stem candidates: every `{stem}.{ext}` under the
+/// open world's asset root, asset-root-relative and extensionless -- the
+/// exact frame the engine's tags resolve in (`sprite_tag`/`map_tag`
+/// append the extension back).
+struct StemCompletion {
+    target: inspector::FieldTarget,
+    stems: Vec<String>,
 }
 
 /// Inline palette picker state for one Color565 inspector field: pick a
@@ -531,6 +583,7 @@ impl OpenWorld {
             inspector: Vec::new(),
             save_error: None,
             color_picker: None,
+            stem_completion: None,
         }
     }
 }
@@ -1119,7 +1172,7 @@ impl WorldPanel {
     /// ([`sprite_rel_for_stem`]). Drives BOTH whether the inspector offers
     /// the jump and where it goes, so the button can't exist without a
     /// destination.
-    fn goto_sprite_target(&self, entity_ix: usize) -> Option<String> {
+    fn goto_sprite_target(&self, entity_ix: usize, component: &str) -> Option<String> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
@@ -1130,7 +1183,7 @@ impl WorldPanel {
             .entities
             .get(entity_ix)?
             .components
-            .get(META_SPRITE)?
+            .get(component)?
             .get("stem")?
             .as_str()?
             .to_string();
@@ -1526,6 +1579,62 @@ impl WorldPanel {
         open.inspector = entries;
     }
 
+    /// Keep [`OpenWorld::stem_completion`] pointed at the focused Asset
+    /// field: cleared when no asset field is focused, rescanned when the
+    /// focus moved onto a different one. Runs from `render`, right after
+    /// [`Self::ensure_inspector`].
+    fn refresh_stem_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let focused = open
+            .inspector
+            .iter()
+            .find(|entry| entry.editor.focus_handle(cx).is_focused(window))
+            .and_then(|entry| {
+                inspector::asset_field_ext(&entry.target, &open.schemas)
+                    .map(|ext| (entry.target.clone(), ext))
+            });
+        match focused {
+            None => open.stem_completion = None,
+            Some((target, ext)) => {
+                if open.stem_completion.as_ref().map(|c| &c.target) != Some(&target) {
+                    open.stem_completion = Some(StemCompletion {
+                        stems: list_asset_stems(&open.root, &ext),
+                        target,
+                    });
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// A clicked suggestion: fill the field's editor with `stem` and
+    /// commit it -- the same path Enter takes, so undo and resync behave
+    /// identically.
+    fn pick_stem(
+        &mut self,
+        target: inspector::FieldTarget,
+        stem: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(editor) = open
+            .inspector
+            .iter()
+            .find(|entry| entry.target == target)
+            .map(|entry| entry.editor.clone())
+        else {
+            return;
+        };
+        editor.update(cx, |editor, cx| editor.set_text(stem, window, cx));
+        self.commit_editor(editor.entity_id(), cx);
+        cx.notify();
+    }
+
     /// Blur commits the field, matching the brief's enter/blur rule (and
     /// ggo-ide's cross-field commit-on-input). An unchanged or unparsable
     /// buffer is a no-op in the store, so committing every blur is safe.
@@ -1856,6 +1965,55 @@ impl WorldPanel {
     }
 
     /// The inline picker block rendered under an open Color565 field row.
+    /// The suggestion list under the focused Asset field: the completion
+    /// feed fuzzy-ranked by the buffer, capped at [`STEM_SUGGESTION_CAP`].
+    /// Absent when the feed points at another field, nothing matches, or
+    /// the buffer already IS the single match.
+    // ponytail: click-to-pick only; arrow-key navigation when it itches.
+    fn render_stem_suggestions(
+        &self,
+        target: &inspector::FieldTarget,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let completion = open
+            .stem_completion
+            .as_ref()
+            .filter(|completion| &completion.target == target)?;
+        let typed = editor.read(cx).text(cx);
+        let ranked = inspector::rank_stem_matches(&typed, &completion.stems);
+        if ranked.is_empty() || ranked == [typed.trim().to_string()] {
+            return None;
+        }
+        let mut list = v_flex().pl_2();
+        for (ix, stem) in ranked.into_iter().take(STEM_SUGGESTION_CAP).enumerate() {
+            let target = target.clone();
+            let selector_stem = stem.clone();
+            let pick = stem.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("ggo-stem-suggestion-{ix}")))
+                    .debug_selector(move || format!("ggo-stem-suggestion-{selector_stem}"))
+                    .px_1()
+                    .rounded_xs()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Label::new(SharedString::from(stem))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.pick_stem(target.clone(), pick.clone(), window, cx)
+                    })),
+            );
+        }
+        Some(list.into_any_element())
+    }
+
     fn render_color_picker(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             return gpui::Empty.into_any_element();
@@ -2355,11 +2513,11 @@ impl WorldPanel {
 
         for (component, value) in &entity.components {
             let name = component.clone();
-            // "Go to sprite" for a MetaSprite whose stem resolves to a real
-            // `.spr` -- absent (not disabled) otherwise, since an unresolved
-            // stem has nowhere to go.
-            let goto = (component == META_SPRITE)
-                .then(|| self.goto_sprite_target(entity_ix))
+            // "Go to sprite" for a Sprite or MetaSprite whose stem resolves
+            // to a real `.spr` -- absent (not disabled) otherwise, since an
+            // unresolved stem has nowhere to go.
+            let goto = matches!(component.as_str(), META_SPRITE | SPRITE_COMPONENT)
+                .then(|| self.goto_sprite_target(entity_ix, component))
                 .flatten();
             let mut panel = v_flex().gap_1().child(
                 h_flex()
@@ -2504,6 +2662,26 @@ impl WorldPanel {
                                     );
                                     if open_here {
                                         panel = panel.child(self.render_color_picker(window, cx));
+                                    }
+                                }
+                            }
+                            Some(FieldKind::Asset(_)) => {
+                                let target = inspector::FieldTarget::EntityField {
+                                    entity: entity_ix,
+                                    component: component.clone(),
+                                    field: field.clone(),
+                                };
+                                if let Some(editor) = editors.get(&target) {
+                                    panel = panel.child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(Self::field_label(field.as_str()))
+                                            .child(Self::editor_input(editor, cx)),
+                                    );
+                                    if let Some(suggestions) =
+                                        self.render_stem_suggestions(&target, editor, cx)
+                                    {
+                                        panel = panel.child(suggestions);
                                     }
                                 }
                             }
@@ -2702,6 +2880,7 @@ impl WorldPanel {
 impl Render for WorldPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inspector(window, cx);
+        self.refresh_stem_completion(window, cx);
         let body = match &self.state {
             ViewerState::Empty => self.render_message(EMPTY_MESSAGE.to_string(), cx),
             ViewerState::Loading { stem } => self.render_message(format!("Loading {stem}…"), cx),
@@ -3672,6 +3851,100 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// The full stem-completion flow: focusing `Sprite.stem` scans the
+    /// project's `.spr` stems -- recursively, so a fresh project's
+    /// `sprites/gg_icon` surfaces -- other extensions stay out, blurring
+    /// clears the feed, and picking a suggestion commits the stem through
+    /// the normal field-commit path (undoable like a typed edit).
+    #[gpui::test]
+    async fn test_stem_completion_offers_and_commits_project_sprites(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
+        std::fs::write(dir.path().join("sprites/gg_icon.spr"), "").unwrap();
+        std::fs::write(dir.path().join("hero.spr"), "").unwrap();
+        std::fs::write(dir.path().join("sprites/level.map"), "").unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.store.apply(WorldOp::AddComponent {
+                entity: 0,
+                name: "Sprite".to_string(),
+                defaults: serde_json::json!({"stem": ""})
+                    .as_object()
+                    .expect("object literal")
+                    .clone(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let editor = field_editor(&panel, cx, "Sprite", "stem");
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+            panel.refresh_stem_completion(window, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let completion = open
+                .stem_completion
+                .as_ref()
+                .expect("a focused Sprite.stem field completes");
+            assert_eq!(
+                completion.stems,
+                vec!["hero".to_string(), "sprites/gg_icon".to_string()],
+                "every .spr stem, sorted and extensionless; the .map stays out"
+            );
+        });
+
+        let target = inspector::FieldTarget::EntityField {
+            entity: 0,
+            component: "Sprite".to_string(),
+            field: "stem".to_string(),
+        };
+        panel.update_in(cx, |panel, window, cx| {
+            panel.pick_stem(target, "sprites/gg_icon".to_string(), window, cx);
+        });
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["Sprite"]["stem"],
+                json!("sprites/gg_icon"),
+                "a picked suggestion commits into the store"
+            );
+            panel.undo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["Sprite"]["stem"],
+                json!(""),
+                "and it is a normal undoable edit"
+            );
+        });
+
+        // Focus leaving the field clears the feed.
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+            panel.refresh_stem_completion(window, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(
+                open.stem_completion.is_none(),
+                "no focused asset field, no feed"
+            );
+        });
+    }
+
     /// The full color-picker flow against a real `.pal` on disk: open the
     /// picker on the Fx test component's Color565 field (the project's
     /// one `.pal` preselects),
@@ -4431,7 +4704,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             // No MetaSprite on the fixture's entity 0 yet.
-            assert_eq!(panel.goto_sprite_target(0), None);
+            assert_eq!(panel.goto_sprite_target(0, META_SPRITE), None);
 
             let mut defaults = serde_json::Map::new();
             defaults.insert("stem".to_string(), json!("sprites/hero"));
@@ -4446,7 +4719,7 @@ mod tests {
             // The stem is there, but nothing is on disk: decline rather
             // than park the sprite panel in an error state.
             assert_eq!(
-                panel.goto_sprite_target(0),
+                panel.goto_sprite_target(0, META_SPRITE),
                 None,
                 "an unauthored sprite offers no jump"
             );
@@ -4457,9 +4730,27 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             assert_eq!(
-                panel.goto_sprite_target(0),
+                panel.goto_sprite_target(0, META_SPRITE),
                 Some("sprites/hero.spr".to_string()),
                 "worktree-relative, with the .spr extension the stem omits"
+            );
+
+            // The jump reads the NAMED component -- a `Sprite` resolves its
+            // own stem, not the MetaSprite's.
+            let mut defaults = serde_json::Map::new();
+            defaults.insert("stem".to_string(), json!("sprites/hero"));
+            panel.apply_op(
+                WorldOp::AddComponent {
+                    entity: 0,
+                    name: SPRITE_COMPONENT.to_string(),
+                    defaults,
+                },
+                cx,
+            );
+            assert_eq!(
+                panel.goto_sprite_target(0, SPRITE_COMPONENT),
+                Some("sprites/hero.spr".to_string()),
+                "a static Sprite gets the jump too"
             );
 
             // A blank stem, and a stem that walks nowhere, both decline.
@@ -4472,7 +4763,7 @@ mod tests {
                 },
                 cx,
             );
-            assert_eq!(panel.goto_sprite_target(0), None);
+            assert_eq!(panel.goto_sprite_target(0, META_SPRITE), None);
             panel.apply_op(
                 WorldOp::SetField {
                     entity: 0,
@@ -4482,7 +4773,7 @@ mod tests {
                 },
                 cx,
             );
-            assert_eq!(panel.goto_sprite_target(0), None);
+            assert_eq!(panel.goto_sprite_target(0, META_SPRITE), None);
         });
     }
 
@@ -4540,7 +4831,7 @@ mod tests {
                 },
                 cx,
             );
-            panel.goto_sprite_target(0).expect("the stem resolves")
+            panel.goto_sprite_target(0, META_SPRITE).expect("the stem resolves")
         });
         assert_eq!(rel, "sprites/hero.spr");
 

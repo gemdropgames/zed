@@ -55,6 +55,62 @@ pub fn field_kind<'a>(
         .map(|f| &f.kind)
 }
 
+/// The Asset extension `target` completes against, or `None` for every
+/// non-asset field. Keyed off the SCHEMA kind, so a user component's
+/// `asset:<ext>` field completes exactly like the builtins' (`Sprite`/
+/// `MetaSprite` -> `spr`, `Tilemap` -> `map`, `Text.font` -> `til`, …).
+pub fn asset_field_ext(target: &FieldTarget, schemas: &[ComponentSchema]) -> Option<String> {
+    let FieldTarget::EntityField {
+        component, field, ..
+    } = target
+    else {
+        return None;
+    };
+    match field_kind(schemas, component, field) {
+        Some(FieldKind::Asset(ext)) => Some(ext.clone()),
+        _ => None,
+    }
+}
+
+/// Rank `candidates` against the typed text: case-insensitive, prefix
+/// matches first, then substring, then in-order subsequence; ties keep
+/// the input's (sorted) order, non-matches drop out. Empty input offers
+/// everything -- that is how a fresh project's `sprites/gg_icon` surfaces
+/// before anything is typed.
+///
+/// Deliberately not zed's `fuzzy` crate: these lists are a few hundred
+/// stems at most and this three-tier rank is testable without an
+/// executor.
+pub fn rank_stem_matches(typed: &str, candidates: &[String]) -> Vec<String> {
+    let needle = typed.trim().to_lowercase();
+    if needle.is_empty() {
+        return candidates.to_vec();
+    }
+    let mut ranked: Vec<(u8, &String)> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let hay = candidate.to_lowercase();
+            let rank = if hay.starts_with(&needle) {
+                0
+            } else if hay.contains(&needle) {
+                1
+            } else if is_subsequence(&needle, &hay) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, candidate))
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, stem)| stem.clone()).collect()
+}
+
+fn is_subsequence(needle: &str, hay: &str) -> bool {
+    let mut hay_chars = hay.chars();
+    needle.chars().all(|wanted| hay_chars.any(|c| c == wanted))
+}
+
 /// The selected entity's `Transform.pos`, if it has a well-formed one --
 /// ggo-ide's `entity_pos` (drag-start anchor).
 pub fn entity_pos(state: &WorldState, index: usize) -> Option<[f64; 2]> {
@@ -513,5 +569,78 @@ mod tests {
         let bad = state_with(json!({"Transform": {"pos": [1.0]}}));
         assert_eq!(entity_pos(&bad, 0), None);
         assert_eq!(entity_pos(&transform_state(), 5), None);
+    }
+
+    // -------------------------------------------------- stem completion
+
+    fn entity_field(component: &str, field: &str) -> FieldTarget {
+        FieldTarget::EntityField {
+            entity: 0,
+            component: component.to_string(),
+            field: field.to_string(),
+        }
+    }
+
+    /// Every Asset-kind field completes with its own extension -- the
+    /// builtins and a user component's `asset:<ext>` alike -- and nothing
+    /// else completes at all.
+    #[test]
+    fn asset_field_ext_follows_the_schema_kind() {
+        let mut schemas = ggo_worldlib::schemas::builtin_schemas();
+        schemas.push(ComponentSchema {
+            name: "Portrait".to_string(),
+            fields: vec![ggo_worldlib::schemas::SchemaField {
+                name: "face".to_string(),
+                kind: FieldKind::Asset("png".to_string()),
+                def: None,
+            }],
+        });
+
+        let ext = |c: &str, f: &str| asset_field_ext(&entity_field(c, f), &schemas);
+        assert_eq!(ext("Sprite", "stem").as_deref(), Some("spr"));
+        assert_eq!(ext("MetaSprite", "stem").as_deref(), Some("spr"));
+        assert_eq!(ext("Tilemap", "stem").as_deref(), Some("map"));
+        assert_eq!(ext("Text", "font").as_deref(), Some("til"));
+        assert_eq!(ext("Portrait", "face").as_deref(), Some("png"));
+        assert_eq!(ext("Transform", "pos"), None, "Vec2 never completes");
+        assert_eq!(ext("Sprite", "centered"), None, "Bool never completes");
+        assert_eq!(ext("Nope", "stem"), None, "unknown component");
+        assert_eq!(
+            asset_field_ext(
+                &FieldTarget::InstancePosAxis { index: 0, axis: 0 },
+                &schemas
+            ),
+            None,
+            "only entity fields complete"
+        );
+    }
+
+    #[test]
+    fn rank_stem_matches_prefers_prefix_then_substring_then_subsequence() {
+        let candidates: Vec<String> = ["icons/gg", "sprites/gg_icon", "sprites/icon", "tiles/logo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            rank_stem_matches("icon", &candidates),
+            vec!["icons/gg", "sprites/gg_icon", "sprites/icon"],
+            "prefix first, substrings keep sorted order, no-match drops"
+        );
+        assert_eq!(
+            rank_stem_matches("spgg", &candidates),
+            vec!["sprites/gg_icon"],
+            "subsequence still matches"
+        );
+        assert_eq!(
+            rank_stem_matches("GG_ICON", &candidates),
+            vec!["sprites/gg_icon"],
+            "case-insensitive"
+        );
+        assert_eq!(
+            rank_stem_matches("", &candidates),
+            candidates,
+            "empty input offers everything"
+        );
+        assert!(rank_stem_matches("zzz", &candidates).is_empty());
     }
 }
