@@ -2101,12 +2101,36 @@ impl SpritePanel {
         }
     }
 
-    /// Drop a dragged strip frame onto clip `clip_ix`'s "Drop frame"
-    /// slot: append a COPY of the frame right after the clip's last
-    /// frame and extend the range by one. Two doc ops (add, range) --
-    /// two undo steps; a composite op is the known upgrade if that
-    /// grates. Stale indices vanish as no-ops.
+    /// Drop a dragged library frame onto clip `clip_ix`'s END slot:
+    /// [`Self::insert_frame_in_clip`] at the sequence's tail.
     fn drop_frame_on_clip(&mut self, clip_ix: usize, frame_ix: usize, cx: &mut Context<Self>) {
+        let seq_len = match &self.state {
+            ViewerState::Ready(open) => open
+                .store
+                .state()
+                .clips
+                .get(clip_ix)
+                .map(|clip| clip.to.saturating_sub(clip.from) + 1),
+            _ => None,
+        };
+        if let Some(seq_len) = seq_len {
+            self.insert_frame_in_clip(clip_ix, seq_len, frame_ix, cx);
+        }
+    }
+
+    /// Insert a COPY of library frame `frame_ix` at sequence position
+    /// `seq_pos` (0 = before the clip's first frame, len = append) inside
+    /// clip `clip_ix`, extending the range by one. Two doc ops (add,
+    /// range) -- two undo steps; a composite op is the known upgrade if
+    /// that grates. The copy's editor-only name travels; stale indices
+    /// vanish as no-ops.
+    fn insert_frame_in_clip(
+        &mut self,
+        clip_ix: usize,
+        seq_pos: usize,
+        frame_ix: usize,
+        cx: &mut Context<Self>,
+    ) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -2114,10 +2138,11 @@ impl SpritePanel {
         let Some(clip) = state.clips.get(clip_ix).cloned() else {
             return;
         };
-        if frame_ix >= state.frames.len() {
+        let seq_len = clip.to.saturating_sub(clip.from) + 1;
+        if frame_ix >= state.frames.len() || seq_pos > seq_len {
             return;
         }
-        let at = clip.to + 1;
+        let at = clip.from + seq_pos;
         let mut names = open.frame_names.clone();
         names.resize(state.frames.len(), String::new());
         if !self.apply_doc(
@@ -2137,7 +2162,10 @@ impl SpritePanel {
         self.apply_doc(
             DocOp::ClipSet {
                 at: clip_ix,
-                clip: Some(ClipEdit { to: at, ..clip }),
+                clip: Some(ClipEdit {
+                    to: clip.to + 1,
+                    ..clip
+                }),
             },
             cx,
         );
@@ -3433,32 +3461,6 @@ impl SpritePanel {
                             })
                         }),
                 );
-            // The drop target the drag-a-frame flow lands on: a
-            // frame-sized dashed slot at the end of the clip.
-            row = row.child(
-                div()
-                    .id(("ggo-sprite-clip-drop", i))
-                    .w(px(THUMB_PX))
-                    .h(px(THUMB_PX / 2.))
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .border_1()
-                    .border_dashed()
-                    .rounded_sm()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(
-                        Label::new("Drop frame")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .drag_over::<DraggedFrame>(|slot, _, _, cx| {
-                        slot.bg(cx.theme().colors().drop_target_background)
-                    })
-                    .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
-                        this.drop_frame_on_clip(i, dragged.ix, cx);
-                    })),
-            );
             if let Some((at, message)) = &open.clip_error
                 && *at == i
             {
@@ -3504,25 +3506,6 @@ impl SpritePanel {
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .child(
-                IconButton::new("ggo-sprite-frame-add", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Add blank frame"))
-                    .on_click(cx.listener(|this, _, _, cx| this.add_blank_frame(cx))),
-            )
-            .child(
-                IconButton::new("ggo-sprite-frame-dup", IconName::Copy)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Duplicate frame"))
-                    .on_click(cx.listener(|this, _, _, cx| this.duplicate_selected_frame(cx))),
-            )
-            .child(
-                IconButton::new("ggo-sprite-frame-delete", IconName::Trash)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Delete frame"))
-                    .disabled(len <= 1)
-                    .on_click(cx.listener(|this, _, _, cx| this.delete_selected_frame(cx))),
-            )
-            .child(
                 IconButton::new("ggo-sprite-frame-left", IconName::ChevronLeft)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Move frame left"))
@@ -3559,8 +3542,94 @@ impl SpritePanel {
             .into_any_element()
     }
 
-    /// The bottom frame strip: one thumbnail + duration label per frame,
-    /// click to select, selected frame outlined.
+    /// The ACTIVE clip's play sequence as thumbnails, with positional
+    /// drops: a library frame dropped on a thumbnail inserts a copy at
+    /// that position, the trailing dashed slot appends. Clicking a
+    /// thumbnail selects (and previews) that frame. Without an active
+    /// clip the row is a hint.
+    fn render_clip_sequence(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_clip_sequence is only called in the Ready state");
+        };
+        let border = cx.theme().colors().border;
+        let accent = cx.theme().colors().border_focused;
+        let drop_bg = cx.theme().colors().drop_target_background;
+        let row = h_flex()
+            .gap_1()
+            .p_1()
+            .border_t_1()
+            .border_color(border)
+            .items_center();
+        let state = open.store.state();
+        let clip = open.active_clip.and_then(|i| state.clips.get(i).map(|c| (i, c)));
+        let Some((clip_ix, clip)) = clip else {
+            return row
+                .child(
+                    Label::new("Select a clip to edit its sequence")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        };
+        let mut row = row.child(
+            Label::new(format!("Clip: {}", clip.name)).size(LabelSize::Small),
+        );
+        let last = clip.to.min(state.frames.len().saturating_sub(1));
+        for (seq_pos, ix) in (clip.from..=last).enumerate() {
+            let thumb = open.frames.get(ix).map(|image| {
+                let (w, h) = image_px_size(image);
+                let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
+                img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
+            });
+            row = row.child(
+                div()
+                    .id(("ggo-sprite-seq", seq_pos))
+                    .w(px(THUMB_PX))
+                    .h(px(THUMB_PX))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .border_1()
+                    .rounded_sm()
+                    .border_color(if open.selected_frame == ix { accent } else { border })
+                    .debug_selector(|| format!("ggo-sprite-seq-{seq_pos}"))
+                    .children(thumb)
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_frame(ix, cx)))
+                    .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
+                        this.insert_frame_in_clip(clip_ix, seq_pos, dragged.ix, cx);
+                    })),
+            );
+        }
+        row = row.child(
+            div()
+                .id("ggo-sprite-seq-append")
+                .w(px(THUMB_PX))
+                .h(px(THUMB_PX / 2.))
+                .flex()
+                .justify_center()
+                .items_center()
+                .border_1()
+                .border_dashed()
+                .rounded_sm()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Label::new("Drop frame")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .drag_over::<DraggedFrame>(move |slot, _, _, _| slot.bg(drop_bg))
+                .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
+                    this.drop_frame_on_clip(clip_ix, dragged.ix, cx);
+                })),
+        );
+        row.into_any_element()
+    }
+
+    /// The frames LIBRARY: one thumbnail + name + duration per frame,
+    /// click to select (and preview), double-click to name, drag out to
+    /// reorder or to build a clip sequence. Its header carries the
+    /// create/duplicate/delete buttons so the area is self-contained.
     fn render_strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_strip is only called in the Ready state");
@@ -3570,13 +3639,37 @@ impl SpritePanel {
         let accent = cx.theme().colors().border_focused;
         let drop_bg = cx.theme().colors().drop_target_background;
         let state = open.store.state();
+        let frame_count = state.frames.len();
         let names = &open.frame_names;
-        div()
+        let header = h_flex()
+            .gap_1()
+            .px_1()
+            .pt_1()
+            .items_center()
+            .child(Label::new("Frames").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                IconButton::new("ggo-sprite-frame-add", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Add blank frame"))
+                    .on_click(cx.listener(|this, _, _, cx| this.add_blank_frame(cx))),
+            )
+            .child(
+                IconButton::new("ggo-sprite-frame-dup", IconName::Copy)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Duplicate frame"))
+                    .on_click(cx.listener(|this, _, _, cx| this.duplicate_selected_frame(cx))),
+            )
+            .child(
+                IconButton::new("ggo-sprite-frame-delete", IconName::Trash)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Delete frame"))
+                    .disabled(frame_count <= 1)
+                    .on_click(cx.listener(|this, _, _, cx| this.delete_selected_frame(cx))),
+            );
+        let strip = div()
             .id("ggo-sprite-strip")
             .flex_none()
             .p_1()
-            .border_t_1()
-            .border_color(border)
             .overflow_x_scroll()
             .child(
                 h_flex()
@@ -3643,7 +3736,13 @@ impl SpritePanel {
                                 this.move_frame_to(dragged.ix, ix, cx);
                             }))
                     })),
-            )
+            );
+        v_flex()
+            .flex_none()
+            .border_t_1()
+            .border_color(border)
+            .child(header)
+            .child(strip)
             .into_any_element()
     }
 
@@ -3661,6 +3760,7 @@ impl SpritePanel {
                     .child(self.render_tile_picker(cx))
                     .child(self.render_clips(cx)),
             )
+            .child(self.render_clip_sequence(cx))
             .child(self.render_frame_ops(cx))
             .child(self.render_strip(cx))
             .into_any_element()
@@ -4964,6 +5064,51 @@ mod tests {
         });
     }
 
+    /// The clip sequence row's positional drop: dropping a library frame
+    /// on a sequence thumbnail inserts a COPY at that position INSIDE the
+    /// clip's range (extending it by one); dropping past the end appends
+    /// -- the same op the end slot fires. Names travel; stale indices
+    /// no-op.
+    #[gpui::test]
+    async fn test_insert_frame_in_clip_at_a_position(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.set_frame_name(0, "idle".to_string(), cx);
+            // Fixture clip "walk" spans 1..=1 (its sole frame maps [1]).
+            // Insert a copy of frame 0 at sequence position 0: the copy
+            // lands at strip index 1, BEFORE the clip's old frame.
+            panel.insert_frame_in_clip(0, 0, 0, cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(state.frames.len(), 3);
+                assert_eq!(
+                    state.frames[1].map, state.frames[0].map,
+                    "the copy sits first in the clip"
+                );
+                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 2));
+                assert_eq!(open.frame_names, vec!["idle", "idle", ""]);
+            }
+
+            // Sequence position == len appends (the end slot's case).
+            panel.insert_frame_in_clip(0, 2, 0, cx);
+            {
+                let state = ready(panel).store.state();
+                assert_eq!(state.frames.len(), 4);
+                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 3));
+                assert_eq!(state.frames[3].map, state.frames[0].map);
+            }
+
+            // Stale clip / frame / position indices all no-op.
+            panel.insert_frame_in_clip(9, 0, 0, cx);
+            panel.insert_frame_in_clip(0, 0, 9, cx);
+            panel.insert_frame_in_clip(0, 9, 0, cx);
+            assert_eq!(ready(panel).store.state().frames.len(), 4);
+        });
+    }
+
     /// The Eraser tool: toggled on, a preview click blanks the cell
     /// (one undoable `FrameCellsErase`, allocating the hidden blank tile
     /// when the pool lacks one); Escape turns it off along with any
@@ -5546,6 +5691,58 @@ mod tests {
     /// (frames swap, the editor-only names travel, the moved frame stays
     /// selected) and a single undo restores the strip, proving it was
     /// ONE op.
+    #[gpui::test]
+    /// The clip sequence row end to end: with a clip active it paints
+    /// the range's thumbnails, a real drag from the FRAMES library onto
+    /// a sequence thumbnail inserts a copy at that position, and
+    /// clicking a sequence thumbnail selects (previews) that frame.
+    #[gpui::test]
+    async fn test_rendered_sequence_drop_inserts_and_click_selects(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.select_clip(Some(0), cx); // fixture clip spans 1..=1
+        });
+        cx.run_until_parked();
+
+        let library0 = cx
+            .debug_bounds("ggo-sprite-frame-0")
+            .expect("library frame 0 painted");
+        let seq0 = cx
+            .debug_bounds("ggo-sprite-seq-0")
+            .expect("the active clip's sequence is painted");
+
+        cx.simulate_mouse_move(library0.center(), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(library0.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(seq0.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(seq0.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(seq0.center(), MouseButton::Left, gpui::Modifiers::default());
+
+        panel.read_with(cx, |panel, _| {
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 3, "the drop inserted a copy");
+            assert_eq!(
+                state.frames[1].map, state.frames[0].map,
+                "the copy landed at sequence position 0 (strip index 1)"
+            );
+            assert_eq!((state.clips[0].from, state.clips[0].to), (1, 2));
+        });
+
+        // Clicking the second sequence thumbnail selects its frame.
+        cx.run_until_parked();
+        let seq1 = cx
+            .debug_bounds("ggo-sprite-seq-1")
+            .expect("the extended sequence paints two thumbs");
+        cx.simulate_click(seq1.center(), gpui::Modifiers::default());
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).selected_frame,
+                2,
+                "sequence position 1 is strip frame 2 -- selected and previewed"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_rendered_strip_drag_reorders_frames(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
