@@ -26,6 +26,7 @@
 mod canvas;
 mod inspector;
 mod loader;
+mod world_canvas_item;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -310,12 +311,59 @@ fn intercept_world_open(
     if split_world_path(&rel).is_none() {
         return false;
     }
-    ggo_common::open_in_panel(
+    // Dock first: the panel owns the document (inspector/entity editing
+    // stays there); the center pane gets the canvas viewport plus the
+    // `.toml` itself as an adjacent tab, canvas tab active.
+    let claimed = ggo_common::open_in_panel(
         workspace,
         window,
         cx,
         move |panel: &mut WorldPanel, window, cx| panel.open_rel_path(&rel, window, cx),
-    )
+    );
+    if !claimed {
+        return false;
+    }
+    let canvas_item = workspace
+        .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+        .next();
+    let canvas_item = match canvas_item {
+        Some(item) => item,
+        None => {
+            let panel = workspace.panel::<WorldPanel>(cx);
+            let item = cx.new(|cx| {
+                world_canvas_item::WorldCanvasItem::new(
+                    panel.map_or_else(WeakEntity::new_invalid, |panel| panel.downgrade()),
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        }
+    };
+    // The toml tab opens asynchronously and activates itself on landing,
+    // so the canvas re-activation has to be chained AFTER it -- a
+    // synchronous activate here would lose to the open's completion.
+    let open_toml = workspace.open_path(path.clone(), None, false, window, cx);
+    let weak_workspace = workspace.weak_handle();
+    let weak_canvas = canvas_item.downgrade();
+    window
+        .spawn(cx, async move |cx| {
+            if let Err(e) = open_toml.await {
+                log::error!("GGO: failed to open the world's toml tab: {e}");
+            }
+            cx.update(|window, cx| {
+                weak_workspace
+                    .update(cx, |workspace, cx| {
+                        if let Some(canvas) = weak_canvas.upgrade() {
+                            workspace.activate_item(&canvas, true, true, window, cx);
+                        }
+                    })
+                    .ok();
+            })
+            .ok();
+        })
+        .detach();
+    true
 }
 
 /// `workspace::ContextMenuContributor` for `**/worlds/**/*.toml`: the world
@@ -1200,14 +1248,8 @@ impl WorldPanel {
             return false;
         };
         workspace.update(cx, |workspace, cx| {
-            ggo_common::open_in_panel(
-                workspace,
-                window,
-                cx,
-                move |panel: &mut ggo_sprite_panel::SpritePanel, window, cx| {
-                    panel.open_rel_path(&rel, window, cx);
-                },
-            )
+            ggo_sprite_panel::open_sprite_item(workspace, rel, window, cx);
+            true
         })
     }
 
@@ -1502,6 +1544,37 @@ impl WorldPanel {
         drop(v);
         cx.notify();
         true
+    }
+
+    /// Cursor-anchored wheel zoom over the canvas: one ladder step per
+    /// wheel notch, with the pan adjusted so the world point under the
+    /// cursor stays under it ([`canvas::zoom_at`]). A zero delta, a ladder
+    /// end, or a canvas that hasn't laid out yet is a no-op.
+    fn wheel_zoom(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let mut v = open.view.borrow_mut();
+        let (Some(pan), Some(canvas_bounds)) = (v.pan, v.last_bounds) else {
+            return;
+        };
+        let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
+        if dy == 0.0 {
+            return;
+        }
+        let dir = if dy > 0.0 { 1 } else { -1 };
+        let new_zoom = canvas::zoom_step(v.zoom, dir);
+        if new_zoom == v.zoom {
+            return;
+        }
+        let cursor = [
+            f64::from(event.position.x - canvas_bounds.origin.x),
+            f64::from(event.position.y - canvas_bounds.origin.y),
+        ];
+        v.pan = Some(canvas::zoom_at(pan, v.zoom, cursor, new_zoom));
+        v.zoom = new_zoom;
+        drop(v);
+        cx.notify();
     }
 
     /// Canvas-relative position for an in-flight placement drag's move
@@ -2466,30 +2539,7 @@ impl WorldPanel {
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                let ViewerState::Ready(open) = &this.state else {
-                    return;
-                };
-                let mut v = open.view.borrow_mut();
-                let (Some(pan), Some(canvas_bounds)) = (v.pan, v.last_bounds) else {
-                    return;
-                };
-                let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
-                if dy == 0.0 {
-                    return;
-                }
-                let dir = if dy > 0.0 { 1 } else { -1 };
-                let new_zoom = canvas::zoom_step(v.zoom, dir);
-                if new_zoom == v.zoom {
-                    return;
-                }
-                let cursor = [
-                    f64::from(event.position.x - canvas_bounds.origin.x),
-                    f64::from(event.position.y - canvas_bounds.origin.y),
-                ];
-                v.pan = Some(canvas::zoom_at(pan, v.zoom, cursor, new_zoom));
-                v.zoom = new_zoom;
-                drop(v);
-                cx.notify();
+                this.wheel_zoom(event, cx);
             }))
             .into_any_element()
     }
@@ -2878,6 +2928,10 @@ impl WorldPanel {
         )
     }
 
+    /// The dock's Ready layout: toolbar, view controls, and the inspector
+    /// at full width. The CANVAS is deliberately absent -- it lives in the
+    /// center-pane `WorldCanvasItem` (spec 2026-08-20), which calls
+    /// [`Self::render_canvas`] against this same entity's state.
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let inspector = self.render_inspector(window, cx);
         let toolbar = self.render_toolbar(window, cx);
@@ -2890,13 +2944,6 @@ impl WorldPanel {
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(self.render_canvas(cx)),
-                    )
                     .children(inspector),
             )
             .into_any_element()
@@ -3747,6 +3794,54 @@ mod tests {
         );
     }
 
+    /// A failed write must be VISIBLE (`save_error` set, which the dock
+    /// banner renders) and must not `mark_saved` -- the document keeps its
+    /// edits and stays dirty for the next attempt.
+    #[gpui::test]
+    async fn test_save_failure_sets_the_error_and_keeps_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let before = std::fs::read_to_string(dir.path().join("worlds/test.toml")).unwrap();
+
+        // The save resolves against the OPEN document's captured root;
+        // repointing that root at a regular file makes the write's
+        // parent-dir creation fail deterministically.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [50.0, 60.0],
+                    gesture: None,
+                },
+                cx,
+            );
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.root = blocker;
+
+            panel.save_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(
+                open.save_error.is_some(),
+                "the failed write must surface as save_error"
+            );
+            assert!(
+                open.store.state().dirty,
+                "a failed save must not mark the document saved"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("worlds/test.toml")).unwrap(),
+            before,
+            "the real file must be untouched by the failed write"
+        );
+    }
+
     /// Field commits map inspector text to ops against the LIVE panel
     /// store: an int field edit applies SetField; undo restores it.
     #[gpui::test]
@@ -3784,11 +3879,149 @@ mod tests {
         });
     }
 
+    /// The inspector's bool checkbox commits through the same funnel every
+    /// editor mutation uses: `apply_op` with a `SetField` carrying
+    /// `Value::Bool` (the exact op the checkbox's `on_click` builds), and
+    /// undo restores the stored value. The `field_kind` assertion pins that
+    /// `Camera.is_active` really is the checkbox arm's case.
+    #[gpui::test]
+    async fn test_inspector_bool_checkbox_commits_set_field(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.selected = Some(Selection::Entity(2));
+            assert_eq!(
+                inspector::field_kind(&open.schemas, "Camera", "is_active"),
+                Some(&FieldKind::Bool),
+                "the field must render as the checkbox arm"
+            );
+            assert_eq!(
+                open.store.state().entities[2].components["Camera"]["is_active"],
+                json!(true)
+            );
+            panel.apply_op(
+                WorldOp::SetField {
+                    entity: 2,
+                    component: "Camera".to_string(),
+                    field: "is_active".to_string(),
+                    value: Value::Bool(false),
+                },
+                cx,
+            );
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[2].components["Camera"]["is_active"],
+                json!(false),
+                "the toggle must land in the store"
+            );
+            assert!(open.store.state().dirty, "a toggle is an unsaved edit");
+
+            panel.undo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[2].components["Camera"]["is_active"],
+                json!(true),
+                "undo must restore the stored value"
+            );
+        });
+    }
+
+    /// The Add-component menu's op (`AddComponent` seeded by
+    /// `defaults_for`) and the remove-trash button's (`RemoveComponent`)
+    /// -- both funnel through `apply_op` on the selected entity, and both
+    /// are undoable.
+    #[gpui::test]
+    async fn test_add_and_remove_component_ops(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.selected = Some(Selection::Entity(0));
+            assert!(
+                !open.store.state().entities[0]
+                    .components
+                    .contains_key("Camera"),
+                "the fixture entity must not already carry the component"
+            );
+            let schema = open
+                .schemas
+                .iter()
+                .find(|s| s.name == "Camera")
+                .expect("builtin schemas offer Camera")
+                .clone();
+            panel.apply_op(
+                WorldOp::AddComponent {
+                    entity: 0,
+                    name: "Camera".to_string(),
+                    defaults: defaults_for(&schema),
+                },
+                cx,
+            );
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["Camera"],
+                json!({ "is_active": true, "is_centered": true }),
+                "the component must appear with its schema defaults"
+            );
+
+            panel.apply_op(
+                WorldOp::RemoveComponent {
+                    entity: 0,
+                    name: "Camera".to_string(),
+                },
+                cx,
+            );
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(
+                !open.store.state().entities[0]
+                    .components
+                    .contains_key("Camera"),
+                "remove must take the component off the entity"
+            );
+
+            panel.undo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["Camera"],
+                json!({ "is_active": true, "is_centered": true }),
+                "undoing the remove must restore the component"
+            );
+
+            panel.undo_impl(cx);
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(
+                !open.store.state().entities[0]
+                    .components
+                    .contains_key("Camera"),
+                "undoing the add must return to the original entity"
+            );
+        });
+    }
+
     /// Load `worlds/test` into a panel that is the root view of a real
     /// test window, with Entity(0) selected so the inspector editors
     /// exist. Rendering in a window is what drives gpui's draw/focus
     /// cycle, which the blur-commit ordering tests below depend on.
-    async fn ready_panel_in_window<'a>(
+    pub(crate) async fn ready_panel_in_window<'a>(
         cx: &'a mut TestAppContext,
         root: &std::path::Path,
     ) -> (gpui::Entity<WorldPanel>, &'a mut gpui::VisualTestContext) {
@@ -3822,6 +4055,28 @@ mod tests {
         });
         cx.run_until_parked();
         (panel, cx)
+    }
+
+    /// Spec 2026-08-20: the canvas moved to the center-pane item, so the
+    /// DOCK render must not paint it (no recorded bounds), while
+    /// `render_canvas` stays composable for the item to call.
+    #[gpui::test]
+    async fn test_dock_render_has_no_canvas_but_render_canvas_still_composes(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(
+                open.view.borrow().last_bounds.is_none(),
+                "the dock layout must not have painted the canvas"
+            );
+            let _element = panel.render_canvas(cx);
+        });
     }
 
     fn field_editor(
@@ -5002,37 +5257,22 @@ mod tests {
         });
         assert_eq!(rel, "sprites/hero.spr");
 
-        // No sprite panel in this workspace yet: decline, don't panic.
-        let claimed = panel.update_in(cx, |panel, window, cx| {
-            panel.goto_sprite(rel.clone(), window, cx)
-        });
-        assert!(!claimed, "no sprite panel docked => not claimed");
-        assert!(
-            !workspace.read_with(cx, |workspace, cx| workspace
-                .panel::<ggo_sprite_panel::SpritePanel>(cx)
-                .is_some()),
-            "precondition: the sprite panel really was absent"
-        );
-
-        // Dock one (its own `init` is what does that in production) and the
-        // same jump is claimed.
-        cx.update(|_window, cx| ggo_sprite_panel::init(cx));
-        cx.update(|window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                let sprite = cx.new(|cx| {
-                    ggo_sprite_panel::SpritePanel::new(Some(workspace.weak_handle()), cx)
-                });
-                workspace.add_panel(sprite, window, cx);
-            });
+        // Dock era over: the jump opens a center-pane sprite tab.
+        let before = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_pane().read(cx).items_len()
         });
         let claimed = panel.update_in(cx, |panel, window, cx| panel.goto_sprite(rel, window, cx));
         cx.run_until_parked();
-        assert!(claimed, "a docked sprite panel claims the jump");
+        assert!(claimed, "the jump is always claimed now");
+        let after = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_pane().read(cx).items_len()
+        });
+        assert_eq!(after, before + 1, "the jump opened a sprite tab");
     }
 
     /// Dirty the open world so the close guard has something to protect,
     /// without going through the canvas.
-    fn dirty_the_world(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) {
+    pub(crate) fn dirty_the_world(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) {
         panel.update(cx, |panel, cx| {
             panel.apply_op(
                 WorldOp::MoveEntity {
@@ -5173,6 +5413,42 @@ mod tests {
             json!([50, 60]),
             "Save must have written the edit"
         );
+    }
+
+    /// Answering "Save" when the write FAILS must cancel the close --
+    /// letting it proceed would discard the very edits the user just asked
+    /// to keep.
+    #[gpui::test]
+    async fn test_close_guard_save_failure_cancels_the_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_world(&panel, cx);
+
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.root = blocker;
+        });
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        cx.simulate_prompt_answer("Save");
+        assert!(!close.await, "a failed save must cancel the close");
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.save_error.is_some(), "the failure must be surfaced");
+            assert!(
+                open.store.state().dirty,
+                "the edits must survive the failed save"
+            );
+        });
     }
 
     /// "Don't Save" closes and deliberately drops the edits -- the file on
@@ -5364,6 +5640,10 @@ mod tests {
         write_fixture(root);
         cx.update(|cx| {
             AppState::test(cx);
+            // The routing test asserts the world's `.toml` opens as a
+            // text tab; without editor::init there is no project-item
+            // builder for buffers and open_path fails silently.
+            editor::init(cx);
             if run_init {
                 init(cx);
             }
@@ -5521,6 +5801,49 @@ mod tests {
             );
         });
 
+        // Spec 2026-08-20: the same claim also opens the center-pane
+        // canvas item AND the world's own `.toml` as an adjacent tab,
+        // with the canvas tab active.
+        workspace.read_with(cx, |workspace, cx| {
+            let canvas_items = workspace
+                .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                .count();
+            assert_eq!(canvas_items, 1, "one canvas item");
+            let pane = workspace.active_pane().read(cx);
+            assert_eq!(
+                pane.items_len(),
+                2,
+                "canvas tab plus the toml editor tab"
+            );
+            assert!(
+                pane.active_item()
+                    .and_then(|item| item
+                        .downcast::<world_canvas_item::WorldCanvasItem>())
+                    .is_some(),
+                "the canvas tab ends active"
+            );
+        });
+
+        // A second claim re-activates instead of duplicating.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "worlds/test.toml"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                    .count(),
+                1,
+                "re-claim must not duplicate the canvas item"
+            );
+            assert_eq!(workspace.active_pane().read(cx).items_len(), 2);
+        });
+
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(&project_path(worktree_id, "Cargo.toml"), window, cx)
         });
@@ -5641,6 +5964,62 @@ mod tests {
             on_disk.entities[0].components["Transform"]["pos"],
             json!([4, 4]),
             "Cancel must not have written the file"
+        );
+    }
+
+    /// The other two prompt branches of a dirty document switch: "Save"
+    /// writes the edit and then switches, "Don't Save" switches without
+    /// writing anything.
+    #[gpui::test]
+    async fn test_open_rel_path_save_and_discard_branches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_world(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("worlds/sub.toml", window, cx)
+            })
+        });
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready after the switch");
+            };
+            assert_eq!(open.listing.rel_path, "worlds/sub.toml", "Save then switch");
+            assert!(!open.store.state().dirty, "the new document starts clean");
+        });
+        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([50, 60]),
+            "Save must have written the abandoned document's edit"
+        );
+
+        // Don't Save: dirty the (now open) sub world, switch back, discard.
+        dirty_the_world(&panel, cx);
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("worlds/test.toml", window, cx)
+            })
+        });
+        cx.simulate_prompt_answer("Don't Save");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready after the switch");
+            };
+            assert_eq!(open.listing.rel_path, "worlds/test.toml");
+        });
+        let on_disk = read_world(dir.path(), "worlds/sub.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([0, 0]),
+            "Don't Save must not write the abandoned document"
         );
     }
 
@@ -5868,6 +6247,384 @@ mod tests {
                     .contains(&"worlds/sub".to_string()),
                 "a deleted world must stop being an + Instance candidate"
             );
+        });
+    }
+
+    // ----------------------------------------------- keystroke dispatch
+
+    /// The panel-scoped bindings only fire while the panel's own focus
+    /// handle has focus -- the same focus the canvas click handler takes
+    /// in production -- so each keystroke test takes it explicitly.
+    fn focus_the_panel(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) {
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn entity0_pos(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) -> [f64; 2] {
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            inspector::entity_pos(&open.store.state(), 0).expect("entity 0 has a Transform")
+        })
+    }
+
+    /// `ctrl-z`/`ctrl-shift-z` reach `undo_impl`/`redo_impl` through the
+    /// keymap (the method-level history semantics have their own tests;
+    /// this pins the KEYSTROKE wiring over a real `MoveEntity`).
+    #[gpui::test]
+    async fn test_undo_redo_keystrokes_step_a_real_move(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        dirty_the_world(&panel, cx);
+        focus_the_panel(&panel, cx);
+
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(
+            entity0_pos(&panel, cx),
+            [4.0, 4.0],
+            "ctrl-z must undo the move back to the fixture position"
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-z");
+        assert_eq!(
+            entity0_pos(&panel, cx),
+            [50.0, 60.0],
+            "ctrl-shift-z must redo the move"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_save_keystroke_writes_the_file(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        dirty_the_world(&panel, cx);
+        focus_the_panel(&panel, cx);
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([50, 60]),
+            "ctrl-s must write the edited position to disk"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.dirty_world_name().is_none(), "save clears dirty");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_keystroke_removes_the_selection(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        focus_the_panel(&panel, cx);
+
+        cx.simulate_keystrokes("delete");
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities.len(),
+                2,
+                "delete must remove the selected entity"
+            );
+            assert_eq!(open.selected, None, "nothing is left selected");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_arrow_keystrokes_nudge_the_selection(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        focus_the_panel(&panel, cx);
+
+        cx.simulate_keystrokes("right down");
+        assert_eq!(
+            entity0_pos(&panel, cx),
+            [5.0, 5.0],
+            "plain arrows nudge the selected entity one pixel"
+        );
+
+        cx.simulate_keystrokes("shift-left");
+        assert_eq!(
+            entity0_pos(&panel, cx),
+            [-11.0, 5.0],
+            "shift-arrow nudges one tile (16 px)"
+        );
+    }
+
+    /// The same arrows with NOTHING selected pan the camera instead --
+    /// opposite the key's direction (arrow right slides content left) --
+    /// and leave the document alone.
+    #[gpui::test]
+    async fn test_arrow_keystrokes_pan_the_camera_when_nothing_is_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.selected = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        focus_the_panel(&panel, cx);
+
+        cx.simulate_keystrokes("right");
+        cx.simulate_keystrokes("up");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).view.borrow().pan,
+                Some([-CAMERA_PAN_STEP_PX, CAMERA_PAN_STEP_PX]),
+                "arrows pan opposite the content with nothing selected"
+            );
+            assert!(
+                panel.dirty_world_name().is_none(),
+                "a camera pan must not touch the document"
+            );
+        });
+    }
+
+    /// Enter inside a focused inspector editor resolves through the
+    /// `GgoWorldPanel > Editor` binding to `CommitField`: the typed buffer
+    /// lands in the doc, and the single-line editor gets no newline.
+    #[gpui::test]
+    async fn test_enter_commits_the_focused_field_via_commit_field(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        let w_editor = field_editor(&panel, cx, "Text", "max_width");
+
+        w_editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+        w_editor.update_in(cx, |editor, window, cx| editor.set_text("21", window, cx));
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[0].components["Text"]["max_width"],
+                json!(21),
+                "enter must commit the typed value"
+            );
+        });
+        assert_eq!(
+            w_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "21",
+            "the field keeps the committed value -- no newline"
+        );
+        assert!(
+            w_editor.update_in(cx, |editor, window, cx| editor
+                .focus_handle(cx)
+                .is_focused(window)),
+            "commit leaves focus in the field"
+        );
+    }
+
+    // -------------------------------------------- canvas gesture methods
+
+    fn move_event(x: f32, y: f32, button: Option<MouseButton>) -> MouseMoveEvent {
+        MouseMoveEvent {
+            position: gpui::point(px(x), px(y)),
+            pressed_button: button,
+            modifiers: gpui::Modifiers::default(),
+        }
+    }
+
+    /// Middle-drag pan: the move handler applies the cursor delta to the
+    /// drag's starting pan, a release elsewhere cancels the drag (while
+    /// still claiming the event), and with no drag in flight the move is
+    /// not this handler's to consume.
+    #[gpui::test]
+    async fn test_handle_pan_move_pans_by_the_cursor_delta_and_cancels_on_release(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            open_of(panel).view.borrow_mut().drag = Some(Drag {
+                start_cursor: [10.0, 10.0],
+                start_pan: [5.0, 5.0],
+            });
+
+            let held = move_event(30.0, 25.0, Some(MouseButton::Middle));
+            assert!(
+                panel.handle_pan_move(&held, cx),
+                "an in-flight pan owns the move"
+            );
+            assert_eq!(open_of(panel).view.borrow().pan, Some([25.0, 20.0]));
+
+            let released = move_event(40.0, 40.0, None);
+            assert!(
+                panel.handle_pan_move(&released, cx),
+                "the cancelling move still belongs to the pan"
+            );
+            assert!(
+                open_of(panel).view.borrow().drag.is_none(),
+                "a move without the middle button held cancels the drag"
+            );
+            assert_eq!(
+                open_of(panel).view.borrow().pan,
+                Some([25.0, 20.0]),
+                "cancelling must not move the pan again"
+            );
+
+            assert!(
+                !panel.handle_pan_move(&held, cx),
+                "with no drag in flight the move is not a pan event"
+            );
+        });
+    }
+
+    /// The placement drag's window->canvas-local mapping goes through the
+    /// stamped `last_bounds`; without bounds there is no local position
+    /// (but the drag survives), and a move without the left button held
+    /// cancels the drag.
+    #[gpui::test]
+    async fn test_edit_drag_local_maps_through_bounds_and_cancels_on_release(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.edit_drag = Some(EditDrag {
+                gesture_id: "g1".to_string(),
+                start_pos: [0.0, 0.0],
+                start_world: [0.0, 0.0],
+            });
+
+            let held = move_event(52.0, 30.0, Some(MouseButton::Left));
+            assert_eq!(
+                panel.edit_drag_local(&held),
+                None,
+                "before the first layout there are no bounds to map through"
+            );
+            assert!(
+                open_of(panel).edit_drag.is_some(),
+                "a missing layout must not kill the drag"
+            );
+
+            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
+                gpui::point(px(20.), px(10.)),
+                gpui::size(px(400.), px(300.)),
+            ));
+            assert_eq!(
+                panel.edit_drag_local(&held),
+                Some([32.0, 20.0]),
+                "window coords map through the canvas origin"
+            );
+
+            let released = move_event(52.0, 30.0, None);
+            assert_eq!(panel.edit_drag_local(&released), None);
+            assert!(
+                open_of(panel).edit_drag.is_none(),
+                "a move without the left button held cancels the drag"
+            );
+        });
+    }
+
+    // --------------------------------------------------------- wheel zoom
+
+    fn wheel_event(x: f32, y: f32, dy: f32) -> ScrollWheelEvent {
+        ScrollWheelEvent {
+            position: gpui::point(px(x), px(y)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(dy))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        }
+    }
+
+    /// One wheel notch steps the zoom ladder, anchored on the cursor: the
+    /// world point under the cursor before the zoom is under it after
+    /// ([`canvas::zoom_at`]'s invariant, here through the event plumbing).
+    #[gpui::test]
+    async fn test_wheel_zoom_steps_the_ladder_anchored_on_the_cursor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
+                gpui::point(px(100.), px(50.)),
+                gpui::size(px(400.), px(300.)),
+            ));
+
+            // Window (132, 66) is canvas-local [32, 16].
+            panel.wheel_zoom(&wheel_event(132.0, 66.0, 4.0), cx);
+            {
+                let v = open_of(panel).view.borrow();
+                assert_eq!(v.zoom, 2.0, "one notch up is the next ladder step");
+                assert_eq!(
+                    v.pan,
+                    Some([-32.0, -16.0]),
+                    "the world point under the cursor stays under it"
+                );
+            }
+
+            panel.wheel_zoom(&wheel_event(132.0, 66.0, -4.0), cx);
+            let v = open_of(panel).view.borrow();
+            assert_eq!(v.zoom, 1.0);
+            assert_eq!(
+                v.pan,
+                Some([0.0, 0.0]),
+                "zooming back out at the same cursor returns home"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_wheel_zoom_no_ops_at_ladder_ends_zero_delta_and_before_layout(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Before the first layout there are no bounds to anchor on.
+            panel.wheel_zoom(&wheel_event(10.0, 10.0, 4.0), cx);
+            assert_eq!(open_of(panel).view.borrow().zoom, canvas::ZOOM_DEFAULT);
+
+            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(400.), px(300.)),
+            ));
+
+            panel.wheel_zoom(&wheel_event(10.0, 10.0, 0.0), cx);
+            {
+                let v = open_of(panel).view.borrow();
+                assert_eq!(v.zoom, canvas::ZOOM_DEFAULT, "zero delta is a no-op");
+                assert_eq!(v.pan, Some([0.0, 0.0]));
+            }
+
+            open_of(panel).view.borrow_mut().zoom = canvas::ZOOM_MAX;
+            panel.wheel_zoom(&wheel_event(10.0, 10.0, 4.0), cx);
+            {
+                let v = open_of(panel).view.borrow();
+                assert_eq!(v.zoom, canvas::ZOOM_MAX, "the top of the ladder holds");
+                assert_eq!(v.pan, Some([0.0, 0.0]), "a ladder end must not move the pan");
+            }
+
+            open_of(panel).view.borrow_mut().zoom = canvas::ZOOM_MIN;
+            panel.wheel_zoom(&wheel_event(10.0, 10.0, -4.0), cx);
+            let v = open_of(panel).view.borrow();
+            assert_eq!(v.zoom, canvas::ZOOM_MIN, "the bottom of the ladder holds");
+            assert_eq!(v.pan, Some([0.0, 0.0]));
         });
     }
 }

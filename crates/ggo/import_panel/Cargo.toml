@@ -22,9 +22,16 @@ workspace.workspace = true
 ggo-asset-formats.workspace = true # GGO
 ggo-worldlib.workspace = true # GGO
 ggo_common.workspace = true
+ggo_sprite_panel.workspace = true
 ggo_tileset_panel.workspace = true
 
 [dev-dependencies]
+# `project`'s test-support turns on `remote/test-support`, which adds a
+# `RemoteConnectionOptions` variant that `remote_connection`'s lib only
+# matches on under ITS `test-support` -- same dance `ggo_sprite_panel`'s
+# dev-deps document (`remote_connection` enters this crate's test graph
+# through `ggo_sprite_panel`).
+remote_connection = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 image.workspace = true
 path = { workspace = true, features = ["test-support"] }

@@ -333,6 +333,28 @@ mod tests {
         assert_eq!(*detail.console, lines);
     }
 
+    /// The other half of the fatal/degrade asymmetry
+    /// [`a_prior_run_query_failure_degrades_to_no_overlay`] pins: the
+    /// SAMPLES' failure is fatal. A corrupt db makes
+    /// `loader::load_run_samples` fail, and [`load`] must carry that
+    /// `Err` out of the off-thread pass verbatim -- not degrade it into
+    /// an empty `Detail` the way it does for the overlay -- so
+    /// `select_run`'s error state shows the loader's message.
+    #[test]
+    fn load_propagates_a_samples_failure_out_of_the_off_thread_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("not_a_database.db");
+        std::fs::write(&junk, b"this is not a SQLite file, not even close").unwrap();
+
+        let expected = loader::load_run_samples(&junk, 1)
+            .expect_err("the fixture has to actually fail, or this proves nothing");
+        assert_eq!(
+            load(&junk, 1),
+            Err(expected),
+            "the loader's error reaches the caller unchanged"
+        );
+    }
+
     #[test]
     fn load_of_a_missing_db_file_is_an_empty_detail_not_an_error() {
         let dir = tempfile::tempdir().unwrap();

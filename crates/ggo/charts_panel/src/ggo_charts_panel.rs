@@ -124,6 +124,24 @@ const PROFILE_TABLE_SELECTOR: &str = "ggo-charts-profile-table";
 const FRAME_INSPECT_SELECTOR: &str = "ggo-charts-frame-inspect";
 const PROFILE_SORT_SELECTOR: &str = "ggo-charts-profile-sort";
 const HISTORIC_TOGGLE_SELECTOR: &str = "ggo-charts-historic-toggle";
+// The four navigation/dismissal buttons, each wrapped in a selector-bearing
+// div (the `PROFILE_SORT_SELECTOR` pattern) so a render test can click the
+// button itself rather than reaching past it to the handler.
+const BACK_BUTTON_SELECTOR: &str = "ggo-charts-back-button";
+const DEVICE_BACK_SELECTOR: &str = "ggo-charts-device-back-button";
+const RERUN_BUTTON_SELECTOR: &str = "ggo-charts-rerun-button";
+const INSPECT_CLOSE_SELECTOR: &str = "ggo-charts-inspect-close-button";
+
+/// The picker row for perf run at list index `ix` -- one selector per row,
+/// so a test can aim a real click at a specific run.
+fn run_row_selector(ix: usize) -> String {
+    format!("ggo-charts-run-{ix}")
+}
+
+/// The history rail row for the device run at list index `ix`.
+fn device_run_row_selector(ix: usize) -> String {
+    format!("ggo-charts-device-run-{ix}")
+}
 
 /// The historic overlay has nothing to draw.
 ///
@@ -960,9 +978,7 @@ impl ChartsPanel {
         let body = match &self.state {
             LoadState::Empty => Self::note("Select the panel to load runs").into_any_element(),
             LoadState::Loading => Self::note("Loading runs…").into_any_element(),
-            LoadState::Error(e) => {
-                Self::note(format!("Failed to load runs: {e}")).into_any_element()
-            }
+            LoadState::Error(e) => Self::note(Self::runs_error_message(e)).into_any_element(),
             LoadState::Ready(runs) if runs.is_empty() => {
                 Self::note("No perf runs recorded yet").into_any_element()
             }
@@ -972,6 +988,7 @@ impl ChartsPanel {
                     let run = run.clone();
                     h_flex()
                         .id(("ggo-charts-run", ix))
+                        .debug_selector(move || run_row_selector(ix))
                         .w_full()
                         .justify_between()
                         .gap_2()
@@ -1021,6 +1038,7 @@ impl ChartsPanel {
                         let summary = run.clone();
                         v_flex()
                             .id(("ggo-charts-device-run", ix))
+                            .debug_selector(move || device_run_row_selector(ix))
                             .w_full()
                             .px_2()
                             .py_1()
@@ -1071,7 +1089,7 @@ impl ChartsPanel {
         let body = match &self.device_log {
             None | Some(DeviceLogState::Loading) => self.render_message("Loading log…", cx),
             Some(DeviceLogState::Error(e)) => {
-                self.render_message(format!("Failed to load log: {e}"), cx)
+                self.render_message(Self::device_log_error_message(e), cx)
             }
             Some(DeviceLogState::Ready(lines)) => v_flex()
                 .id("ggo-charts-device-body")
@@ -1097,14 +1115,21 @@ impl ChartsPanel {
                             .w_full()
                             .gap_2()
                             .child(
-                                IconButton::new("ggo-charts-device-back", IconName::ArrowLeft)
-                                    .tooltip(Tooltip::text("Back to runs"))
-                                    .on_click(Self::guarded_listener(
-                                        cx,
-                                        |this, _event, _window, cx| {
-                                            this.clear_selection(cx);
-                                        },
-                                    )),
+                                div()
+                                    .debug_selector(|| DEVICE_BACK_SELECTOR.to_string())
+                                    .child(
+                                        IconButton::new(
+                                            "ggo-charts-device-back",
+                                            IconName::ArrowLeft,
+                                        )
+                                        .tooltip(Tooltip::text("Back to runs"))
+                                        .on_click(Self::guarded_listener(
+                                            cx,
+                                            |this, _event, _window, cx| {
+                                                this.clear_selection(cx);
+                                            },
+                                        )),
+                                    ),
                             )
                             .child(Label::new(run.started_at.clone()).size(LabelSize::Small)),
                     )
@@ -1134,7 +1159,7 @@ impl ChartsPanel {
         let body = match &self.detail {
             None | Some(DetailState::Loading) => self.render_message("Loading samples…", cx),
             Some(DetailState::Error(e)) => {
-                self.render_message(format!("Failed to load samples: {e}"), cx)
+                self.render_message(Self::samples_error_message(e), cx)
             }
             Some(DetailState::Ready(detail)) => {
                 let (charts, report) = (&detail.charts, &detail.report);
@@ -1223,14 +1248,18 @@ impl ChartsPanel {
                             .w_full()
                             .gap_2()
                             .child(
-                                IconButton::new("ggo-charts-back", IconName::ArrowLeft)
-                                    .tooltip(Tooltip::text("Back to runs"))
-                                    .on_click(Self::guarded_listener(
-                                        cx,
-                                        |this, _event, _window, cx| {
-                                            this.clear_selection(cx);
-                                        },
-                                    )),
+                                div()
+                                    .debug_selector(|| BACK_BUTTON_SELECTOR.to_string())
+                                    .child(
+                                        IconButton::new("ggo-charts-back", IconName::ArrowLeft)
+                                            .tooltip(Tooltip::text("Back to runs"))
+                                            .on_click(Self::guarded_listener(
+                                                cx,
+                                                |this, _event, _window, cx| {
+                                                    this.clear_selection(cx);
+                                                },
+                                            )),
+                                    ),
                             )
                             .child(self.render_rerun_button(cx))
                             .child(Label::new(title).size(LabelSize::Small))
@@ -1275,12 +1304,16 @@ impl ChartsPanel {
             Some(rel) => format!("Re-run {rel} in the emulator"),
             None => NO_RERUN_PATH.to_string(),
         };
-        IconButton::new("ggo-charts-rerun", IconName::RotateCcw)
-            .disabled(rel.is_none())
-            .tooltip(Tooltip::text(tooltip))
-            .on_click(Self::guarded_listener(cx, |this, _event, window, cx| {
-                this.rerun_selected(window, cx);
-            }))
+        div()
+            .debug_selector(|| RERUN_BUTTON_SELECTOR.to_string())
+            .child(
+                IconButton::new("ggo-charts-rerun", IconName::RotateCcw)
+                    .disabled(rel.is_none())
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(Self::guarded_listener(cx, |this, _event, window, cx| {
+                        this.rerun_selected(window, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -1344,6 +1377,27 @@ impl ChartsPanel {
     /// A muted caption -- an empty state, a reason, a hint.
     fn note(text: impl Into<SharedString>) -> Label {
         Label::new(text).size(LabelSize::XSmall).color(Color::Muted)
+    }
+
+    // The three load-failure sentences, exactly as the renderer prints
+    // them. Named methods rather than literals at the render sites for
+    // `LogKind::empty_state`'s reason: a sentence handed over as a literal
+    // at the call site is a sentence no test can read, and these are the
+    // sentences the error-state tests assert on.
+
+    /// What the picker says when the runs list itself failed to load.
+    fn runs_error_message(error: &str) -> String {
+        format!("Failed to load runs: {error}")
+    }
+
+    /// What the detail view says when the selected run's samples failed.
+    fn samples_error_message(error: &str) -> String {
+        format!("Failed to load samples: {error}")
+    }
+
+    /// What a device run's view says when its pipeline log failed.
+    fn device_log_error_message(error: &str) -> String {
+        format!("Failed to load log: {error}")
     }
 
     /// The KPI tile row above the plots -- ggo-ide's `kpi_row`, wrapped
@@ -1571,16 +1625,20 @@ impl ChartsPanel {
                             .size(LabelSize::Small),
                     )
                     .child(
-                        IconButton::new("ggo-charts-inspect-close", IconName::Close)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Close the frame inspector"))
-                            .on_click(Self::guarded_listener(
-                                cx,
-                                |this, _event: &gpui::ClickEvent, _window, cx| {
-                                    this.frame_inspect = None;
-                                    cx.notify();
-                                },
-                            )),
+                        div()
+                            .debug_selector(|| INSPECT_CLOSE_SELECTOR.to_string())
+                            .child(
+                                IconButton::new("ggo-charts-inspect-close", IconName::Close)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Close the frame inspector"))
+                                    .on_click(Self::guarded_listener(
+                                        cx,
+                                        |this, _event: &gpui::ClickEvent, _window, cx| {
+                                            this.frame_inspect = None;
+                                            cx.notify();
+                                        },
+                                    )),
+                            ),
                     ),
             )
             // ggo-ide's subtitle verbatim: `evicted` is the column most
@@ -4969,6 +5027,519 @@ mod tests {
                     "chart {ix}'s cached scene must equal a fresh build of it"
                 );
             }
+        });
+    }
+
+    // ----------------------- W3: the wiring the audit found untested --
+    // Every test above that exercises selection, Back, dismissal or
+    // Re-run reaches the METHOD directly; these reach each one through
+    // the painted element it is wired to, with a real click.
+
+    /// A device run selected and painted, the way [`drawn_detail_window`]
+    /// does for a perf run: through `refresh_history`'s real clone and
+    /// `select_device_run`'s real off-thread load.
+    async fn drawn_device_detail_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        gpui::Entity<ChartsPanel>,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let diag_path = dir.path().join("diag.db");
+        seed_device_run(&diag_path, "dev-1", "2026-08-02T00:00:00Z", "PASS");
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path);
+            panel.diag_db_path_override = Some(diag_path);
+            panel
+        });
+        panel.update(cx, |panel, cx| panel.refresh_history(cx));
+        cx.executor().run_until_parked();
+        let summary = panel.update(cx, |panel, _cx| history_of(panel).runs[0].clone());
+        panel.update(cx, |panel, cx| panel.select_device_run(summary, cx));
+        cx.executor().run_until_parked();
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(800.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        (dir, panel, cx)
+    }
+
+    /// A real click on a picker row reaches `select_run` for THAT row's
+    /// run -- with two runs listed, so a click wired to the wrong row (or
+    /// to the whole list) cannot pass by coincidence.
+    #[gpui::test]
+    async fn test_clicking_a_picker_row_selects_that_run(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_second_run(&db_path);
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path);
+            panel
+        });
+        panel.update(cx, |panel, cx| panel.refresh_runs(cx));
+        cx.executor().run_until_parked();
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(800.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        // Newest first, so row 0 is run 2 (2026-08-03) and row 1 is run 1
+        // -- the literal here is `run_row_selector(1)`, spelled out
+        // because `debug_bounds` takes `&'static str`.
+        assert_eq!(run_row_selector(1), "ggo-charts-run-1");
+        let row = cx
+            .debug_bounds("ggo-charts-run-1")
+            .expect("the picker paints one selector-bearing row per run");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            match &panel.selected {
+                Some(Selection::Perf(run)) => {
+                    assert_eq!(run.id, 1, "row 1 is the older run, run 1")
+                }
+                _ => panic!("the row click must select a perf run"),
+            }
+            assert_eq!(
+                panel.chart_specs()[0].x,
+                vec![1.0, 2.0, 3.0, 4.0],
+                "and the detail that loaded is run 1's, not run 2's (10..=12)"
+            );
+        });
+    }
+
+    /// The same, one section down: a real click on a history-rail row
+    /// reaches `select_device_run` for that row's device run.
+    #[gpui::test]
+    async fn test_clicking_a_history_rail_row_selects_that_device_run(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let diag_path = dir.path().join("diag.db");
+        seed_device_run(&diag_path, "run-older", "2026-08-01T00:00:00Z", "PASS");
+        seed_device_run(&diag_path, "run-newer", "2026-08-02T00:00:00Z", "FAIL");
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path);
+            panel.diag_db_path_override = Some(diag_path);
+            panel
+        });
+        panel.update(cx, |panel, cx| panel.refresh_history(cx));
+        cx.executor().run_until_parked();
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(800.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        assert_eq!(device_run_row_selector(1), "ggo-charts-device-run-1");
+        let row = cx
+            .debug_bounds("ggo-charts-device-run-1")
+            .expect("the rail paints one selector-bearing row per device run");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            match &panel.selected {
+                Some(Selection::Device(run)) => {
+                    assert_eq!(run.id, "run-older", "row 1 is the older device run")
+                }
+                _ => panic!("the row click must select a device run"),
+            }
+            match &panel.device_log {
+                Some(DeviceLogState::Ready(lines)) => {
+                    assert_eq!(**lines, vec!["==> compile", "RESULT: PASS"]);
+                }
+                _ => panic!("and its pipeline log must have loaded"),
+            }
+        });
+    }
+
+    /// The Back button on a perf run's detail, clicked for real: back to
+    /// the picker, through the same `clear_selection` the method tests
+    /// drive directly.
+    #[gpui::test]
+    async fn test_clicking_back_returns_to_the_picker(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let back = cx
+            .debug_bounds(BACK_BUTTON_SELECTOR)
+            .expect("the detail header paints its Back button");
+        cx.simulate_click(back.center(), gpui::Modifiers::default());
+
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.selected.is_none(), "the click clears the selection");
+            assert!(panel.detail.is_none());
+        });
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(800.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(HISTORY_RAIL_SELECTOR).is_some(),
+            "what paints now is the picker"
+        );
+        assert!(
+            cx.debug_bounds(BACK_BUTTON_SELECTOR).is_none(),
+            "and the detail header is gone with the run"
+        );
+    }
+
+    /// ...and the Back button on a device run's detail, which is a
+    /// separate render path (`render_device_detail`) wiring the same
+    /// `clear_selection`.
+    #[gpui::test]
+    async fn test_clicking_back_on_a_device_run_returns_to_the_picker(cx: &mut TestAppContext) {
+        let (_dir, panel, cx) = drawn_device_detail_window(cx).await;
+        let back = cx
+            .debug_bounds(DEVICE_BACK_SELECTOR)
+            .expect("the device header paints its Back button");
+        cx.simulate_click(back.center(), gpui::Modifiers::default());
+
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.selected.is_none());
+            assert!(panel.device_log.is_none());
+        });
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(800.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(HISTORY_RAIL_SELECTOR).is_some(),
+            "what paints now is the picker"
+        );
+        assert!(cx.debug_bounds(DEVICE_BACK_SELECTOR).is_none());
+    }
+
+    /// The inspect pane's Close button -- the one dismissal
+    /// `test_clicking_the_selected_frame_again_clears_it` does not cover,
+    /// clicked for real.
+    #[gpui::test]
+    async fn test_clicking_the_inspect_close_button_dismisses_the_pane(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let at = panel.update(cx, |panel, _cx| {
+            point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, _cx| assert!(panel.frame_inspect.is_some()));
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        let close = cx
+            .debug_bounds(INSPECT_CLOSE_SELECTOR)
+            .expect("the pane paints its Close button");
+        cx.simulate_click(close.center(), gpui::Modifiers::default());
+
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                panel.frame_inspect.is_none(),
+                "the Close button dismisses the pane"
+            );
+        });
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(cx.debug_bounds(FRAME_INSPECT_SELECTOR).is_none());
+    }
+
+    /// The Re-run entry, clicked for real: the three tests above drive
+    /// `rerun_selected` directly, so this is the one that pins the
+    /// button's `on_click` to it.
+    ///
+    /// The panel is its own window root here (the [`drawn_detail_window`]
+    /// shape) rather than living in the workspace window `rerun_panel`
+    /// builds: dispatching a click into a window whose real root is the
+    /// workspace redraws THAT root first, wiping the frame the test drew.
+    /// The workspace the Re-run needs still exists -- in its own window,
+    /// handed to the panel as the same `WeakEntity` `init` hands over.
+    #[gpui::test]
+    async fn test_clicking_rerun_routes_to_the_cart_runner(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+
+        cx.update(|cx| {
+            AppState::test(cx);
+            ggo_common::register_cart_runner(cx, recording_cart_runner);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(Some(workspace.downgrade()), cx);
+            panel.db_path_override = Some(db_path);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("carts/green.cart".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        let button = cx
+            .debug_bounds(RERUN_BUTTON_SELECTOR)
+            .expect("the detail header paints the Re-run entry");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+
+        assert_eq!(
+            cx.update(|_window, cx| cx.default_global::<Reran>().0.clone()),
+            vec!["carts/green.cart".to_string()],
+            "the CLICK reaches rerun_selected and hands the cart path on"
+        );
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.rerun_note, None, "a claimed Re-run reports nothing");
+        });
+    }
+
+    /// A device run has no cart in the perf-run sense, so its header
+    /// offers no Re-run entry at all -- and the method behind the entry
+    /// refuses a device selection silently rather than picking one of
+    /// the perf-side refusal notes.
+    #[gpui::test]
+    async fn test_rerun_is_absent_from_a_device_run(cx: &mut TestAppContext) {
+        let (_dir, panel, cx) = drawn_device_detail_window(cx).await;
+        assert!(
+            cx.debug_bounds(RERUN_BUTTON_SELECTOR).is_none(),
+            "the device header paints no Re-run entry"
+        );
+
+        panel.update_in(cx, |panel, window, cx| panel.rerun_selected(window, cx));
+        panel.update(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.selected, Some(Selection::Device(_))),
+                "the selection is untouched"
+            );
+            assert_eq!(
+                panel.rerun_note, None,
+                "no note either: NO_RERUN_PATH and NO_CART_RUNNER are both \
+                 claims about a PERF run, and a device selection supports \
+                 neither"
+            );
+        });
+    }
+
+    /// `resolve_gesture`'s doc: a keyboard-dispatched click has no cursor
+    /// and must select nothing rather than the hitbox's corner. The
+    /// fixture opens the pane on frame 3 first, so a handler that mapped
+    /// the keyboard click onto any position at all would show up as the
+    /// pane toggling off (same frame), moving (another frame), or a zoom
+    /// -- an untouched panel is only reachable by refusing the event.
+    #[gpui::test]
+    async fn test_a_keyboard_click_selects_nothing(cx: &mut TestAppContext) {
+        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (ix, at) = panel.update(cx, |panel, _cx| {
+            let ix = chart_index(panel, "Cache misses per frame");
+            (ix, point_of(panel, ix, 3.0))
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.frame_inspect.as_ref().map(|s| s.frame), Some(3));
+
+            let event = gpui::ClickEvent::Keyboard(gpui::KeyboardClickEvent::default());
+            panel.resolve_gesture(ix, true, true, &event, cx);
+
+            assert_eq!(
+                panel.frame_inspect.as_ref().map(|s| s.frame),
+                Some(3),
+                "a keyboard click selects nothing, toggles nothing"
+            );
+            assert!(panel.zoom.is_empty(), "and zooms nothing");
+        });
+    }
+
+    /// The three error states, reached through a db that exists but is
+    /// not a database, and read via the same named methods the renderer
+    /// prints -- `runs_error_message` and friends exist so these
+    /// sentences are readable at all (`LogKind::empty_state`'s lesson).
+    #[gpui::test]
+    async fn test_a_corrupt_db_lands_every_load_in_its_error_state(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        std::fs::write(&db_path, b"this is not a database").unwrap();
+
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = ChartsPanel::new(None, cx);
+                panel.db_path_override = Some(db_path);
+                panel
+            })
+        });
+
+        panel.update(cx, |panel, cx| panel.refresh_runs(cx));
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let LoadState::Error(e) = &panel.state else {
+                panic!("a corrupt db must land the runs list in Error");
+            };
+            let message = ChartsPanel::runs_error_message(e);
+            assert!(message.contains("Failed to load runs"), "{message}");
+            assert!(
+                !e.is_empty(),
+                "the underlying cause rides along rather than being swallowed"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: None,
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let Some(DetailState::Error(e)) = &panel.detail else {
+                panic!("a corrupt db must land the run detail in Error");
+            };
+            let message = ChartsPanel::samples_error_message(e);
+            assert!(message.contains("Failed to load samples"), "{message}");
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.select_device_run(
+                RunSummary {
+                    id: "dev-1".to_string(),
+                    started_at: "2026-08-02T00:00:00Z".to_string(),
+                    state: "done".to_string(),
+                    verdict: Some("pass".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let Some(DeviceLogState::Error(e)) = &panel.device_log else {
+                panic!("a corrupt db must land the device log in Error");
+            };
+            let message = ChartsPanel::device_log_error_message(e);
+            assert!(message.contains("Failed to load log"), "{message}");
+        });
+    }
+
+    /// Two rapid refreshes with the db repointed between them: the first
+    /// (stale) result must never stomp the second. Two mechanisms defend
+    /// this -- replacing `_load_task` cancels the first load, and the
+    /// generation guard drops its result if it lands anyway -- and the
+    /// iterations run the executor's schedules over both.
+    #[gpui::test(iterations = 10)]
+    async fn test_a_stale_runs_refresh_does_not_stomp_the_fresh_one(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first_db = dir.path().join("first.db");
+        let second_db = dir.path().join("second.db");
+        seed_run_with_samples(&first_db, 4);
+        seed_run_with_samples(&second_db, 4);
+        seed_second_run(&second_db);
+
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = ChartsPanel::new(None, cx);
+                panel.db_path_override = Some(first_db);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_runs(cx);
+            // Repointed and refreshed again with the first load still in
+            // flight -- the rapid double-activation case.
+            panel.db_path_override = Some(second_db);
+            panel.refresh_runs(cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| match &panel.state {
+            LoadState::Ready(runs) => {
+                assert_eq!(
+                    runs.len(),
+                    2,
+                    "the second db's two runs, not the first db's one"
+                );
+                assert_eq!(runs[0].id, 2);
+            }
+            _ => panic!("expected Ready with the second db's runs"),
+        });
+    }
+
+    /// The same race on the history rail's own generation counter.
+    /// Separate (ide, diag) pairs per refresh, because `history::load`
+    /// clones diag rows INTO the ide db -- a shared target would let the
+    /// stale clone's rows leak into the fresh listing and mask a stomp.
+    #[gpui::test(iterations = 10)]
+    async fn test_a_stale_history_refresh_does_not_stomp_the_fresh_one(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first_ide = dir.path().join("first_ide.db");
+        let first_diag = dir.path().join("first_diag.db");
+        let second_ide = dir.path().join("second_ide.db");
+        let second_diag = dir.path().join("second_diag.db");
+        seed_device_run(&first_diag, "run-a", "2026-08-01T00:00:00Z", "PASS");
+        seed_device_run(&second_diag, "run-b", "2026-08-02T00:00:00Z", "FAIL");
+
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = ChartsPanel::new(None, cx);
+                panel.db_path_override = Some(first_ide);
+                panel.diag_db_path_override = Some(first_diag);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_history(cx);
+            panel.db_path_override = Some(second_ide);
+            panel.diag_db_path_override = Some(second_diag);
+            panel.refresh_history(cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let history = history_of(panel);
+            let ids: Vec<&str> = history.runs.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["run-b"],
+                "the second pair's run, not the stale first's"
+            );
         });
     }
 

@@ -601,6 +601,48 @@ mod tests {
         );
     }
 
+    /// The EXACT top-to-bottom order of the full 13-chart set with every
+    /// gate tripped at once (syscalls, tile working set, profile rows,
+    /// PPU, APU, a budget, prior runs). The membership tests around this
+    /// each admit any ordering; this is the one place the reports page's
+    /// vertical layout is pinned -- the per-function charts between the
+    /// tile-working-set chart and the histograms, the PPU pair after
+    /// them, instructions last.
+    #[test]
+    fn the_fully_gated_chart_set_is_in_the_reports_pages_exact_order() {
+        let mut samples = plain_samples();
+        samples.frames[1].sc_upload = 3;
+        samples.frames[1].bg_tiles_distinct = 12;
+        samples.frames[1].bg_evictions = 1;
+        samples.frames[1].apu_fetch_wire = 8;
+        samples.profile = vec![ProfileRow {
+            frame: 1,
+            caller: String::new(),
+            func: "update".to_string(),
+            misses: 4,
+            evicted: 1,
+        }];
+        let charts = build_charts(&samples, &prior_runs());
+        assert_eq!(
+            titles(&charts),
+            vec![
+                "Wire cycles per frame vs budget",
+                "Wire breakdown per frame",
+                "Cache misses per frame",
+                "Syscalls per frame",
+                "Tile working set vs cache capacity",
+                "I$ misses by function",
+                "I$ eviction victims by function",
+                "i_misses distribution",
+                "d_misses distribution",
+                "PPU tile-cache evictions per frame",
+                "Tile-load wire per frame",
+                "APU fetch wire per frame",
+                "Instructions per frame",
+            ]
+        );
+    }
+
     /// Each gate, one at a time, on top of the always-on set.
     #[test]
     fn each_gate_adds_exactly_its_own_charts() {

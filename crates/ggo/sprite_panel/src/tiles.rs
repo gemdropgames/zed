@@ -41,32 +41,109 @@ pub fn cell_at(
     Some(row * w_tiles + col)
 }
 
-/// Which pool tile a click at `(local_x, local_y)` inside the tile
-/// picker's sheet lands on. The sheet is a `cols`-wide grid of
-/// `cell_px`-square cells (`loader::compose_pool_strip` composes it,
-/// `render_tile_picker` scales it so one tile is exactly `cell_px` CSS
-/// px), row-major -- the same shape [`cell_at`] walks, but sized by a
-/// per-cell edge rather than by a fit box, and bounded by `tile_count`
-/// instead of the grid: the last row of a sheet whose tile count isn't a
-/// multiple of `cols` is zero-padded, and a click on that padding must
-/// select nothing rather than a tile the pool doesn't have.
-pub fn picker_tile_at(
-    local_x: f32,
-    local_y: f32,
-    cell_px: f32,
-    cols: usize,
-    tile_count: usize,
-) -> Option<u16> {
-    if cell_px <= 0.0 || cols == 0 || local_x < 0.0 || local_y < 0.0 {
+/// Where the tile picker sheet's zero-fill padding starts, as `(col,
+/// row)` of the first pad cell -- `None` when the last row is full (or
+/// the grid is degenerate). The sheet is composed `cols` wide with a
+/// zero-filled partial last row (`compose_tile_grid`); those cells are
+/// not tiles and must not be dressed as ones, so the picker overlay
+/// blanks everything from this cell to the sheet's corner.
+pub fn picker_pad_region(tile_count: usize, cols: usize) -> Option<(usize, usize)> {
+    if tile_count == 0 || cols == 0 {
         return None;
     }
-    let col = (local_x / cell_px) as usize;
-    let row = (local_y / cell_px) as usize;
-    if col >= cols {
-        return None;
+    let rem = tile_count % cols;
+    (rem != 0).then(|| (rem, tile_count / cols))
+}
+
+/// A rectangular multi-tile selection from the picker sheet: the
+/// marquee's normalized rect plus the pool tiles under it, row-major.
+/// Pad cells (sheet slots past the pool's tile count) select `None` --
+/// they stamp nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileBlock {
+    /// Top-left of the normalized rect, `(col, row)` in sheet cells.
+    pub origin: (usize, usize),
+    pub cols: usize,
+    pub rows: usize,
+    /// Row-major, `cols * rows` entries.
+    pub tiles: Vec<Option<u16>>,
+}
+
+impl TileBlock {
+    /// The single selected tile, when the block is exactly one real tile
+    /// -- the shape every pre-marquee code path (and toggle-deselect)
+    /// still works in.
+    pub fn single(&self) -> Option<u16> {
+        match (self.cols, self.rows, self.tiles.as_slice()) {
+            (1, 1, [tile]) => *tile,
+            _ => None,
+        }
     }
-    let index = row * cols + col;
-    (index < tile_count).then(|| index as u16)
+}
+
+/// The block between two marquee corners `a`/`b` (each `(col, row)`, any
+/// order) over a `sheet_cols`-wide sheet whose cells show the POOL tiles
+/// in `display` (blank tiles are excluded from the sheet, so a sheet
+/// index maps through this table rather than being a pool index itself).
+pub fn marquee_block(
+    a: (usize, usize),
+    b: (usize, usize),
+    sheet_cols: usize,
+    display: &[u16],
+) -> TileBlock {
+    let (c0, c1) = (a.0.min(b.0), a.0.max(b.0));
+    let (r0, r1) = (a.1.min(b.1), a.1.max(b.1));
+    let cols = c1 - c0 + 1;
+    let rows = r1 - r0 + 1;
+    let mut tiles = Vec::with_capacity(cols * rows);
+    for row in r0..=r1 {
+        for col in c0..=c1 {
+            tiles.push(display.get(row * sheet_cols + col).copied());
+        }
+    }
+    TileBlock {
+        origin: (c0, r0),
+        cols,
+        rows,
+        tiles,
+    }
+}
+
+/// The `(cell, tile)` pairs a block stamp writes: `anchor_cell` is the
+/// clicked frame cell (the block's top-left), the block is clipped at the
+/// frame's right/bottom edges, pad (`None`) entries stamp nothing, and
+/// already-matching cells are dropped so an empty batch means "no op to
+/// push" (undo-stack hygiene).
+pub fn stamp_sets(
+    block: &TileBlock,
+    anchor_cell: usize,
+    w_tiles: usize,
+    h_tiles: usize,
+    map: &[u16],
+) -> Vec<(usize, u16)> {
+    if w_tiles == 0 {
+        return Vec::new();
+    }
+    let anchor_col = anchor_cell % w_tiles;
+    let anchor_row = anchor_cell / w_tiles;
+    let mut sets = Vec::new();
+    for row in 0..block.rows {
+        for col in 0..block.cols {
+            let Some(Some(tile)) = block.tiles.get(row * block.cols + col) else {
+                continue;
+            };
+            let (target_col, target_row) = (anchor_col + col, anchor_row + row);
+            if target_col >= w_tiles || target_row >= h_tiles {
+                continue;
+            }
+            let cell = target_row * w_tiles + target_col;
+            if map.get(cell) == Some(tile) {
+                continue;
+            }
+            sets.push((cell, *tile));
+        }
+    }
+    sets
 }
 
 /// The hardware-budget meter line for the open sprite: `Pool`
@@ -149,44 +226,64 @@ mod tests {
         assert_eq!(cell_at(239.9, 239.9, 240.0, 240.0, 1, 1), Some(0));
     }
 
-    // ----------------------------------------------------- picker_tile_at
+    // -------------------------------------------------------- marquee_block
 
     #[test]
-    fn picker_tile_at_is_row_major_over_the_sheet_grid() {
-        // 4 columns of 24px cells, 6 tiles => two rows, the second half
-        // full.
-        assert_eq!(picker_tile_at(0.0, 0.0, 24.0, 4, 6), Some(0));
-        assert_eq!(picker_tile_at(23.9, 23.9, 24.0, 4, 6), Some(0));
-        assert_eq!(picker_tile_at(24.0, 0.0, 24.0, 4, 6), Some(1));
-        assert_eq!(picker_tile_at(72.0, 0.0, 24.0, 4, 6), Some(3));
-        assert_eq!(picker_tile_at(0.0, 24.0, 24.0, 4, 6), Some(4));
-        assert_eq!(picker_tile_at(24.0, 24.0, 24.0, 4, 6), Some(5));
-    }
-
-    #[test]
-    fn picker_tile_at_rejects_the_padded_tail_of_a_partial_last_row() {
-        // 6 tiles at 4 cols: cells 6 and 7 are zero-fill, not tiles.
-        assert_eq!(picker_tile_at(48.0, 24.0, 24.0, 4, 6), None);
-        assert_eq!(picker_tile_at(72.0, 24.0, 24.0, 4, 6), None);
-    }
-
-    #[test]
-    fn picker_tile_at_rejects_clicks_outside_the_sheet() {
-        assert_eq!(picker_tile_at(-0.1, 0.0, 24.0, 4, 6), None);
-        assert_eq!(picker_tile_at(0.0, -0.1, 24.0, 4, 6), None);
+    fn marquee_block_normalizes_the_rect_and_reads_tiles_row_major() {
+        // 4-col sheet, 8 tiles; drag from (2,1) up-left to (1,0).
+        let block = marquee_block((2, 1), (1, 0), 4, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!((block.origin, block.cols, block.rows), ((1, 0), 2, 2));
         assert_eq!(
-            picker_tile_at(96.0, 0.0, 24.0, 4, 6),
-            None,
-            "past the last column"
+            block.tiles,
+            vec![Some(1), Some(2), Some(5), Some(6)],
+            "sheet indices row-major from the normalized top-left"
         );
-        assert_eq!(picker_tile_at(0.0, 96.0, 24.0, 4, 6), None, "past the rows");
     }
 
     #[test]
-    fn picker_tile_at_rejects_degenerate_geometry() {
-        assert_eq!(picker_tile_at(0.0, 0.0, 0.0, 4, 6), None);
-        assert_eq!(picker_tile_at(0.0, 0.0, 24.0, 0, 6), None);
-        assert_eq!(picker_tile_at(0.0, 0.0, 24.0, 4, 0), None, "empty pool");
+    fn marquee_block_of_a_single_cell_is_a_1x1_block() {
+        let block = marquee_block((3, 0), (3, 0), 4, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!((block.cols, block.rows), (1, 1));
+        assert_eq!(block.tiles, vec![Some(3)]);
+    }
+
+    #[test]
+    fn marquee_block_marks_pad_cells_as_none() {
+        // 6 tiles at 4 cols: rect over the ragged last row includes the
+        // two zero-fill pad cells, which must select nothing.
+        let block = marquee_block((1, 1), (3, 1), 4, &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(block.tiles, vec![Some(5), None, None]);
+    }
+
+    // ---------------------------------------------------------- stamp_sets
+
+    #[test]
+    fn stamp_sets_anchors_the_block_and_skips_unchanged_cells() {
+        let block = marquee_block((0, 0), (1, 1), 4, &[0, 1, 2, 3, 4, 5, 6, 7]); // tiles 0,1,4,5
+        // 3x3 frame, cell 7 already holds tile 5 (the block's
+        // bottom-right lands there and must be dropped as unchanged).
+        let map = vec![9, 9, 9, 9, 9, 9, 9, 5, 9];
+        let sets = stamp_sets(&block, 3, 3, 3, &map);
+        assert_eq!(
+            sets,
+            vec![(3, 0), (4, 1), (6, 4)],
+            "anchor cell 3 = block top-left; (7 -> 5) dropped as unchanged"
+        );
+    }
+
+    #[test]
+    fn stamp_sets_clips_the_block_at_the_frame_edges() {
+        let block = marquee_block((0, 0), (1, 1), 4, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        // 2x2 frame, anchored at bottom-right cell: only the block's
+        // top-left lands.
+        let sets = stamp_sets(&block, 3, 2, 2, &[9, 9, 9, 9]);
+        assert_eq!(sets, vec![(3, 0)]);
+    }
+
+    #[test]
+    fn stamp_sets_skips_pad_cells_and_empty_batches() {
+        let block = marquee_block((2, 1), (3, 1), 4, &[0, 1, 2, 3, 4, 5]); // [None, None]
+        assert!(stamp_sets(&block, 0, 2, 2, &[9, 9, 9, 9]).is_empty());
     }
 
     // ------------------------------------------------------ hw_meter_line

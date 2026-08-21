@@ -302,6 +302,35 @@ impl IngestStatus {
     }
 }
 
+/// The ingest half of [`EmuPanel::finish_run`]'s background task: what a
+/// finished run becomes on the panel's ingest row. BLOCKING (it writes a
+/// SQLite database), so callers stay off the UI thread. Named rather than
+/// inline in the spawn so the failure paths -- malformed perf JSON, an
+/// unopenable database -- are testable without a real session to end.
+fn ingest_finished_run(
+    finished: &drive::FinishedRun,
+    db_path_override: Option<PathBuf>,
+    label: &str,
+) -> IngestStatus {
+    match &finished.perf {
+        // ggo-ide's "no frames recorded (cart never reached vsync)"
+        // guard, and the only case for a cart that failed to load:
+        // writing a zero-frame run row would just be noise in the charts
+        // picker.
+        None => IngestStatus::NoFrames,
+        Some(perf) if perf.frames == 0 => IngestStatus::NoFrames,
+        Some(perf) => match db_path_override.or_else(ggo_common::default_db_path) {
+            None => IngestStatus::Failed("no HOME to resolve ~/.ggo".into()),
+            Some(db_path) => {
+                match ingest::ingest_run(&db_path, &perf.perf_json, &finished.uart, Some(label)) {
+                    Ok(run) => IngestStatus::Done(run.run_id),
+                    Err(e) => IngestStatus::Failed(e),
+                }
+            }
+        },
+    }
+}
+
 pub struct EmuPanel {
     focus_handle: FocusHandle,
     position: DockPosition,
@@ -659,26 +688,7 @@ impl EmuPanel {
         let db_path_override = self.db_path_override.clone();
         let finish = cx.background_spawn(async move {
             let finished = session.wait();
-            let status = match &finished.perf {
-                // ggo-ide's "no frames recorded (cart never reached
-                // vsync)" guard, and the only case for a cart that failed
-                // to load: writing a zero-frame run row would just be
-                // noise in the charts picker.
-                None => IngestStatus::NoFrames,
-                Some(perf) if perf.frames == 0 => IngestStatus::NoFrames,
-                Some(perf) => match db_path_override.or_else(ggo_common::default_db_path) {
-                    None => IngestStatus::Failed("no HOME to resolve ~/.ggo".into()),
-                    Some(db_path) => match ingest::ingest_run(
-                        &db_path,
-                        &perf.perf_json,
-                        &finished.uart,
-                        Some(&label),
-                    ) {
-                        Ok(run) => IngestStatus::Done(run.run_id),
-                        Err(e) => IngestStatus::Failed(e),
-                    },
-                },
-            };
+            let status = ingest_finished_run(&finished, db_path_override, &label);
             (finished.reason, status)
         });
         cx.spawn(async move |this, cx| {
@@ -3853,6 +3863,316 @@ mod tests {
                 console.peek_tail(10).iter().any(|l| l.contains("GEMOS")),
                 "the transcript must reach the console: {:?}",
                 console.peek_tail(10)
+            );
+        });
+    }
+
+    // ------------------------------- wave 3: input + transport, as the user
+
+    /// [`windowed_panel`] with the panel focused in an ACTIVE window, so
+    /// keystrokes and key events dispatch along the panel's focus path
+    /// (an inactive window's focus paths are blanked in the draw's focus
+    /// phase, same note as `ggo_world_panel`'s windowed tests carry).
+    fn focused_panel(cx: &mut TestAppContext) -> (Entity<EmuPanel>, &mut gpui::VisualTestContext) {
+        let (panel, cx) = windowed_panel(cx);
+        cx.update(|window, _| window.activate_window());
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// Select the green fixture cart the way the explorer does, off a real
+    /// temp `root`, with the ingest pointed at a temp database.
+    fn select_green_cart(
+        panel: &Entity<EmuPanel>,
+        cx: &mut gpui::VisualTestContext,
+        root: &std::path::Path,
+    ) {
+        std::fs::write(root.join("green.cart"), drive::fixture::green_screen_cart()).unwrap();
+        panel.update(cx, |panel, _cx| {
+            panel.root_override = Some(root.to_path_buf());
+            panel.db_path_override = Some(root.join("ggo_ide.db"));
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+    }
+
+    /// Click the element `debug_selector` names in the rendered window.
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} must be rendered"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    /// **The registered transport keybindings, end to end.** `init` binds
+    /// `ctrl-alt-r`/`ctrl-alt-s`/`ctrl-alt-m` in the panel's key context;
+    /// typing them into the focused pane must start, stop and mute through
+    /// the SAME handlers the `run`/`stop`/`toggle_mute` tests cover -- if
+    /// this fails, `bind_panel_keys` (or the `on_action` wiring in
+    /// `render`) is gone.
+    #[gpui::test]
+    async fn test_transport_keybindings_run_stop_and_mute_the_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
+        cx.update(|window, _| window.activate_window());
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+        select_green_cart(&panel, cx, dir.path());
+
+        // Mute before running -- the pane must be mutable while idle, and
+        // during a run the device may (on a headless CI box) be
+        // Unavailable, where the toggle is deliberately inert.
+        cx.simulate_keystrokes("ctrl-alt-m");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.audio.is_muted(), "ctrl-alt-m must mute the pane");
+        });
+        cx.simulate_keystrokes("ctrl-alt-m");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.audio.is_muted(), "and toggle back");
+        });
+
+        cx.simulate_keystrokes("ctrl-alt-r");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.is_running(),
+                "ctrl-alt-r must start the selected cart"
+            );
+        });
+        await_first_frame(&panel, cx);
+
+        cx.simulate_keystrokes("ctrl-alt-s");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_running(), "ctrl-alt-s must stop the run");
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.status.as_deref(), Some("stopped"));
+            assert!(
+                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                "the keybinding-stopped run still ingests: {:?}",
+                panel.ingest_status
+            );
+        });
+    }
+
+    /// **The pad listeners on the rendered root, end to end.** The unit
+    /// test above (`test_key_handling_latches_and_releases_the_pad`) calls
+    /// `on_key` directly; this pins the `on_key_down`/`on_key_up`/
+    /// `on_modifiers_changed` wiring in `render` by dispatching real
+    /// platform events at a focused pane with a live run: press latches,
+    /// release clears, and a modifiers change routes shift-as-SELECT.
+    #[gpui::test]
+    async fn test_platform_key_events_drive_the_pad_through_the_element_listeners(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = focused_panel(cx);
+        select_green_cart(&panel, cx, dir.path());
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("z").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.input.mask() & (1 << 0),
+                1 << 0,
+                "a real key-down must latch A through the rendered listener"
+            );
+        });
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("left").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.input.mask(), (1 << 0) | (1 << 6));
+        });
+
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("z").unwrap(),
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.input.mask(),
+                1 << 6,
+                "a real key-up must clear exactly the released button"
+            );
+        });
+
+        // SELECT rides the modifier state, not a keystroke -- the
+        // `on_modifiers_changed` listener is the only path.
+        cx.simulate_modifiers_change(gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.input.mask(), (1 << 6) | input::SELECT_BIT);
+        });
+        cx.simulate_modifiers_change(gpui::Modifiers::default());
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.input.mask(),
+                1 << 6,
+                "releasing shift must clear SELECT and nothing else"
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
+    }
+
+    /// **The transport buttons, as clicks on the rendered pane.** The
+    /// `IconButton`s register `ICON-<name>` debug bounds; clicking those
+    /// bounds must run, stop and mute through the listeners `render_
+    /// transport`/`render_mute_button` wire -- the same handlers every
+    /// method-level test covers, now reached the way a user reaches them.
+    #[gpui::test]
+    async fn test_transport_button_clicks_run_stop_and_mute_the_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = focused_panel(cx);
+        select_green_cart(&panel, cx, dir.path());
+
+        // Mute first (see the keybinding test for why: while idle the
+        // toggle is guaranteed live), and the icon must flip to the
+        // crossed-out speaker.
+        click(cx, "ICON-AudioOn");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.audio.is_muted(), "clicking the speaker must mute");
+        });
+        assert!(
+            cx.debug_bounds("ICON-AudioOff").is_some(),
+            "the mute button must now show the muted icon"
+        );
+        click(cx, "ICON-AudioOff");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.audio.is_muted(), "and clicking again unmutes");
+        });
+
+        click(cx, "ICON-PlayFilled");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_running(), "the Run button must start the cart");
+        });
+        await_first_frame(&panel, cx);
+
+        click(cx, "ICON-Stop");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_running(), "the Stop button must end the run");
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.status.as_deref(), Some("stopped"));
+            assert!(
+                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                "a click-stopped run still ingests: {:?}",
+                panel.ingest_status
+            );
+        });
+    }
+
+    // ------------------------------------------- wave 3: the failed ingest
+
+    /// Malformed perf JSON fails the ingest -- with a reason, and before
+    /// the database is touched. Driven through the same named function
+    /// `finish_run`'s background task calls, with a hand-built
+    /// `FinishedRun` (the real emulator can only emit well-formed perf, so
+    /// this seam is the only way to reach the parse failure).
+    #[test]
+    fn a_malformed_perf_json_fails_the_ingest_before_touching_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        let finished = drive::FinishedRun {
+            reason: "cart exited".to_string(),
+            perf: Some(drive::PerfSnapshot {
+                cart: "Green Fix".to_string(),
+                perf_json: "this is not perf json".to_string(),
+                frames: 3,
+            }),
+            uart: vec!["[run] green.cart".to_string()],
+        };
+
+        let status = ingest_finished_run(&finished, Some(db_path.clone()), "green.cart");
+
+        let IngestStatus::Failed(reason) = &status else {
+            panic!("malformed perf output must fail the ingest: {status:?}");
+        };
+        assert!(!reason.is_empty(), "the failure must carry emd's reason");
+        let label = status.label().expect("a failed ingest has a row to show");
+        assert!(
+            label.starts_with("perf ingest failed:"),
+            "the row must read as a failure: {label}"
+        );
+        assert!(
+            !db_path.exists(),
+            "a run that cannot be parsed must not create (or dirty) the db"
+        );
+    }
+
+    /// A run whose ingest fails must SAY so on the pane: the whole
+    /// end-of-run path, with the database made unopenable (a directory
+    /// where the file must go), ends in `IngestStatus::Failed` and the
+    /// error row `render` shows for it.
+    #[gpui::test]
+    async fn test_a_failed_ingest_surfaces_on_the_panel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        std::fs::create_dir(&db_path).unwrap();
+
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, _cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.db_path_override = Some(db_path);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            let IngestStatus::Failed(reason) = &panel.ingest_status else {
+                panic!(
+                    "an unopenable db must surface a failed ingest: {:?}",
+                    panel.ingest_status
+                );
+            };
+            assert!(!reason.is_empty());
+            let label = panel
+                .ingest_status
+                .label()
+                .expect("the failed ingest renders a row");
+            assert!(label.starts_with("perf ingest failed:"), "{label}");
+            assert_eq!(
+                panel.status.as_deref(),
+                Some("stopped"),
+                "the run itself ended normally -- only the ingest failed"
             );
         });
     }

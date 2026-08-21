@@ -36,8 +36,10 @@
 //! new name -- raise a [`PanelForm`] here rather than a dialog, per the
 //! spec's rule that forms live in the panel that owns the domain.
 
+mod editor_meta;
 mod edits;
 mod loader;
+mod sprite_item;
 mod onion;
 mod playback;
 mod tiles;
@@ -51,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable,
     IntoElement, KeyBinding, KeyContext, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Render, RenderImage, Styled, Subscription, Task, WeakEntity, Window, actions, div, img, px,
 };
@@ -59,12 +61,12 @@ use project::ProjectPath;
 use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState};
 use workspace::Workspace;
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::sprites::cow::{ClipEdit, SpriteState};
 use ggo_worldlib::sprites::io::{self, open_sprite, save_sprite};
 use ggo_worldlib::sprites::sprite_doc::{
-    DocOp, SpriteDocStore, blank_sprite_state, clamp_clip_name_bytes,
+    Anchor, DocOp, MAX_SPRITE_TILES, MIN_SPRITE_TILES, SpriteDocStore, blank_sprite_state,
+    clamp_clip_name_bytes,
 };
 use ggo_worldlib::sprites::tileset_doc::pack_indices_to_til;
 use ggo_worldlib::sprites::timeline_ops::{playback_frame_at, playback_total_ms};
@@ -72,8 +74,6 @@ use ggo_worldlib::sprites::timeline_ops::{playback_frame_at, playback_total_ms};
 actions!(
     ggo_sprite,
     [
-        /// Toggles focus on the GGO sprite panel.
-        ToggleFocus,
         /// Toggles playback of the open sprite's active clip range.
         PlayPause,
         /// Undoes the last edit to the open sprite.
@@ -90,7 +90,6 @@ actions!(
     ]
 );
 
-const GGO_SPRITE_PANEL_KEY: &str = "GGOSpritePanel";
 
 /// The panel's key-dispatch context identifier. [`dispatch_context`]
 /// additionally stamps `editing`/`not_editing` (project_panel's pattern)
@@ -100,10 +99,6 @@ const GGO_SPRITE_PANEL_KEY: &str = "GGOSpritePanel";
 /// [`dispatch_context`]: SpritePanel::dispatch_context
 const KEY_CONTEXT: &str = "GgoSpritePanel";
 
-/// Fixed default width until the panel grows real settings persistence.
-/// Wider than the other panels' 360px since F5.2: the middle row now
-/// carries three columns -- preview, tile picker, clips.
-const DEFAULT_WIDTH: Pixels = px(480.);
 
 /// Frame-strip thumbnail box (px, square -- frames fit inside it via
 /// `playback::fit_size`).
@@ -116,6 +111,10 @@ const PREVIEW_PX: f32 = 240.0;
 /// always `TILE_PX` square, so the sheet only needs a uniform scale, no
 /// fit math). Also the unit `tiles::picker_tile_at` divides a click by.
 const PICKER_CELL_PX: f32 = 24.0;
+
+/// Upper bound for the picker-cols stepper -- wide enough to mirror any
+/// plausible source sheet, small enough that the side column stays usable.
+const MAX_PICKER_COLS: usize = 32;
 
 /// The tile picker column's width: [`loader::PICKER_COLS`] cells plus the
 /// column's own padding.
@@ -151,20 +150,6 @@ pub fn init(cx: &mut App) {
     // not just copy bytes) and Delete.
     workspace::register_context_menu_contributor(cx, contribute_sprite_menu);
 
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(window) = window else {
-            return;
-        };
-
-        let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| SpritePanel::new(Some(weak_workspace), cx));
-        workspace.add_panel(panel, window, cx);
-
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<SpritePanel>(window, cx);
-        });
-    })
-    .detach();
 }
 
 /// The sprite extension this panel claims from the file explorer.
@@ -263,12 +248,29 @@ fn intercept_sprite_open(
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return false;
     };
-    ggo_common::open_in_panel(
-        workspace,
-        window,
-        cx,
-        move |panel: &mut SpritePanel, window, cx| panel.open_rel_path(&rel, window, cx),
-    )
+    open_sprite_item(workspace, rel, window, cx);
+    true
+}
+
+/// Open (or focus) the center-pane sprite tab for worktree-relative `rel`
+/// -- one item per file, activate on re-open. Public: the world panel's
+/// Sprite-goto and the import panel's post-import handoff land here.
+pub fn open_sprite_item(
+    workspace: &mut Workspace,
+    rel: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace
+        .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+        .find(|item| item.read(cx).rel() == rel);
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return;
+    }
+    let weak = workspace.weak_handle();
+    let item = cx.new(|cx| sprite_item::SpriteEditorItem::new(rel, weak, window, cx));
+    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
 }
 
 /// `workspace::ContextMenuContributor` for `*.spr`: the sprite file ops the
@@ -420,16 +422,68 @@ fn new_sprite_commit(
     dir_rel: String,
 ) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
     move |typed, window, cx| {
-        (ggo_common::panel_entry_handler(
-            workspace,
-            move |panel: &Entity<SpritePanel>, window, cx| {
-                let typed = typed.clone();
-                let dir_rel = dir_rel.clone();
-                panel.update(cx, |panel, cx| {
-                    panel.new_sprite_named(kind, &dir_rel, typed, window, cx)
-                });
-            },
-        ))(window, cx);
+        (sprite_item_entry_handler(workspace, None, move |panel, window, cx| {
+            let typed = typed.clone();
+            let dir_rel = dir_rel.clone();
+            panel.update(cx, |panel, cx| {
+                panel.new_sprite_named(kind, &dir_rel, typed, window, cx)
+            });
+        }))(window, cx);
+    }
+}
+
+/// Find-or-open the [`sprite_item::SpriteEditorItem`] for `target_rel` and
+/// run `f` on its inner panel -- the item-era replacement for
+/// `ggo_common::panel_entry_handler` (which reveals a dock panel that no
+/// longer exists). `target_rel: None` always creates a fresh EMPTY item
+/// (the "New Sprite…" form's host -- its document doesn't exist yet).
+fn sprite_item_entry_handler(
+    workspace: WeakEntity<Workspace>,
+    target_rel: Option<String>,
+    f: impl Fn(&Entity<SpritePanel>, &mut Window, &mut App) + 'static,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    move |window, cx| {
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+        // Find/create inside the workspace update, but run `f` (and the
+        // root refresh) OUTSIDE it: panel ops read the workspace entity,
+        // which panics re-entrantly while it is being updated.
+        let panel = workspace.update(cx, |workspace, cx| {
+            let existing = target_rel.as_ref().and_then(|rel| {
+                workspace
+                    .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                    .find(|item| item.read(cx).rel() == *rel)
+            });
+            let item = match existing {
+                Some(item) => {
+                    workspace.activate_item(&item, true, true, window, cx);
+                    item
+                }
+                None => {
+                    let weak = workspace.weak_handle();
+                    let item = match target_rel.clone() {
+                        Some(rel) => cx.new(|cx| {
+                            sprite_item::SpriteEditorItem::new(rel, weak, window, cx)
+                        }),
+                        None => cx.new(|cx| sprite_item::SpriteEditorItem::new_empty(weak, cx)),
+                    };
+                    workspace.add_item_to_active_pane(
+                        Box::new(item.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    item
+                }
+            };
+            item.read(cx).panel().clone()
+        });
+        // A freshly created panel's root only resolves asynchronously via
+        // `open_rel_path`; the op in `f` may need it right now.
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        f(&panel, window, cx);
     }
 }
 
@@ -438,7 +492,8 @@ fn rename_sprite_handler(
     workspace: WeakEntity<Workspace>,
     rel: String,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<SpritePanel>, window, cx| {
+    let target = rel.clone();
+    sprite_item_entry_handler(workspace, Some(target), move |panel, window, cx| {
         let rel = rel.clone();
         panel.update(cx, |panel, cx| panel.begin_rename(rel, window, cx));
     })
@@ -452,13 +507,11 @@ fn duplicate_sprite_handler(
     workspace: WeakEntity<Workspace>,
     rel: String,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(
-        workspace,
-        move |panel: &Entity<SpritePanel>, _window, cx| {
-            let rel = rel.clone();
-            panel.update(cx, |panel, cx| panel.duplicate_sprite(&rel, cx));
-        },
-    )
+    let target = rel.clone();
+    sprite_item_entry_handler(workspace, Some(target), move |panel, _window, cx| {
+        let rel = rel.clone();
+        panel.update(cx, |panel, cx| panel.duplicate_sprite(&rel, cx));
+    })
 }
 
 /// The "Delete Sprite" entry's handler -- see [`duplicate_sprite_handler`]
@@ -467,7 +520,8 @@ fn delete_sprite_handler(
     workspace: WeakEntity<Workspace>,
     rel: String,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<SpritePanel>, window, cx| {
+    let target = rel.clone();
+    sprite_item_entry_handler(workspace, Some(target), move |panel, window, cx| {
         let rel = rel.clone();
         panel
             .update(cx, |panel, cx| panel.delete_sprite(rel, window, cx))
@@ -924,14 +978,35 @@ struct OpenSprite {
     /// The bound tileset composed as the tile picker's sheet; same
     /// invalidation as `frames`.
     pool_strip: Option<loader::PoolStrip>,
+    /// The tile picker's wrap width in tiles -- session-only (the `.til`
+    /// format has no layout field), so a user can match the picker's
+    /// wraparound to the source sheet's. Every recompose of `pool_strip`
+    /// honors it.
+    picker_cols: usize,
+    /// Editor-only frame names, index-parallel to the doc's frames --
+    /// persisted in the sidecar, never in the `.spr`. Kept in sync by the
+    /// panel's frame ops; `refresh_after_doc_change` re-pads it to the
+    /// frame count as a safety net (undo/redo of adds and deletes can
+    /// shift alignment -- names are best-effort metadata, not doc state).
+    frame_names: Vec<String>,
     /// The tile picker sheet's on-screen bounds, recorded at prepaint --
     /// same overlay-canvas idiom as [`Self::preview_bounds`].
     picker_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
-    /// The active pool tile: while `Some`, a preview-cell click assigns
-    /// it (`FrameTileSet`); `None` means clicks don't mutate. Cleared by
-    /// re-clicking the tile, Escape, or the tile vanishing under an
+    /// The active selection: a 1x1 block from a plain picker click, or a
+    /// larger block from a marquee drag. While `Some`, a preview-cell
+    /// click stamps the block anchored there (`FrameTilesSet`); `None`
+    /// means clicks don't mutate. Cleared by re-clicking a selected
+    /// single tile, Escape, or a selected tile vanishing under an
     /// undo/fold-back.
-    selected_tile: Option<u16>,
+    selection: Option<tiles::TileBlock>,
+    /// An in-flight picker marquee: `(anchor, far)` in sheet cells,
+    /// armed on mouse-down, updated while dragging, resolved into
+    /// `selection` on mouse-up.
+    picker_drag: Option<((usize, usize), (usize, usize))>,
+    /// The Eraser tool: while on, preview clicks blank the cell instead
+    /// of stamping the selection. Cleared by Escape alongside the
+    /// selection.
+    eraser: bool,
     /// The preview image's on-screen bounds, recorded at prepaint by the
     /// overlay canvas so the click handler can map window coords to cell
     /// hits (world_panel's `last_bounds` idiom). `None` until the first
@@ -976,8 +1051,16 @@ impl OpenSprite {
             frames: loaded.frames,
             ghost_cache: RefCell::new(HashMap::new()),
             pool_strip: loaded.pool_strip,
+            picker_cols: loaded
+                .meta
+                .picker_cols
+                .unwrap_or(loader::PICKER_COLS)
+                .clamp(1, MAX_PICKER_COLS),
+            frame_names: loaded.meta.frame_names,
             picker_bounds: Rc::new(RefCell::new(None)),
-            selected_tile: None,
+            selection: None,
+            picker_drag: None,
+            eraser: false,
             preview_bounds: Rc::new(RefCell::new(None)),
             selected_frame: 0,
             active_clip: None,
@@ -1086,11 +1169,15 @@ enum PanelForm {
         editor: Entity<Editor>,
         error: Option<String>,
     },
+    /// Name a frame (editor-only metadata; double-click a strip cell).
+    NameFrame {
+        index: usize,
+        editor: Entity<Editor>,
+    },
 }
 
 pub struct SpritePanel {
     focus_handle: FocusHandle,
-    position: DockPosition,
     workspace: Option<WeakEntity<Workspace>>,
     /// Test hook: bypass workspace worktree discovery.
     root_override: Option<PathBuf>,
@@ -1106,7 +1193,6 @@ impl SpritePanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            position: DockPosition::Right,
             workspace,
             root_override: None,
             project_root: None,
@@ -1531,6 +1617,39 @@ impl SpritePanel {
         cx.notify();
     }
 
+    /// Open the name-frame form for strip cell `index`, prefilled with
+    /// the stored name (empty when unnamed -- seeding the "Frame N"
+    /// fallback would commit it as a literal name).
+    fn begin_name_frame(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        if index >= open.store.state().frames.len() {
+            return;
+        }
+        let seed = open.frame_names.get(index).cloned().unwrap_or_default();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(seed, window, cx);
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        self.form = Some(PanelForm::NameFrame { index, editor });
+        cx.notify();
+    }
+
+    /// Commit the name-frame form into the sidecar-backed name list.
+    fn confirm_name_frame(&mut self, cx: &mut Context<Self>) {
+        let Some(PanelForm::NameFrame { index, editor }) = &self.form else {
+            return;
+        };
+        let index = *index;
+        let name = editor.read(cx).text(cx).trim().to_string();
+        self.form = None;
+        self.set_frame_name(index, name, cx);
+        cx.notify();
+    }
+
     /// Dismiss whichever form is open, writing nothing.
     fn cancel_form(&mut self, cx: &mut Context<Self>) -> bool {
         let had = self.form.take().is_some();
@@ -1743,7 +1862,7 @@ impl SpritePanel {
             return;
         };
         let frames = loader::compose_frames(open.store.state()).unwrap_or_default();
-        let pool_strip = loader::compose_pool_strip(open.store.state());
+        let pool_strip = loader::compose_pool_strip(open.store.state(), open.picker_cols);
         let frame_count = open.store.state().frames.len();
         let clip_count = open.store.state().clips.len();
         let tile_count = open.store.state().tile_count;
@@ -1751,14 +1870,24 @@ impl SpritePanel {
         open.ghost_cache.borrow_mut().clear();
         open.pool_strip = pool_strip;
         open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
+        // Undo/redo of frame adds/deletes can leave the editor-only name
+        // list misaligned; re-pad to the frame count so indexing stays
+        // safe (names are best-effort metadata).
+        open.frame_names.resize(frame_count, String::new());
         if open.active_clip.is_some_and(|c| c >= clip_count) {
             open.active_clip = None;
         }
-        if open.selected_tile.is_some_and(|t| t as usize >= tile_count) {
-            // The tile went away (undo past a COW clone, dedup fold-back
-            // on save) -- drop the selection rather than repointing cells
-            // at whatever tile inherits the index.
-            open.selected_tile = None;
+        if open.selection.as_ref().is_some_and(|block| {
+            block
+                .tiles
+                .iter()
+                .flatten()
+                .any(|&t| t as usize >= tile_count)
+        }) {
+            // A selected tile went away (undo past a COW clone, dedup
+            // fold-back on save) -- drop the selection rather than
+            // stamping whatever tile inherits the index.
+            open.selection = None;
         }
         open.clip_error = None;
         open.op_error = None;
@@ -1839,6 +1968,7 @@ impl SpritePanel {
             }
         };
         if saved {
+            self.write_sidecar();
             // Fold-back may have re-identified pool tiles; recompose from
             // the state the store now actually holds.
             self.refresh_after_doc_change(cx);
@@ -1856,6 +1986,8 @@ impl SpritePanel {
             return;
         };
         let at = open.store.state().frames.len();
+        // No explicit name sync: the new frame appends at the end, which
+        // is exactly what `refresh_after_doc_change`'s name pad produces.
         self.apply_doc(
             DocOp::FrameAdd {
                 at,
@@ -1873,9 +2005,14 @@ impl SpritePanel {
             return;
         };
         let i = open.selected_frame;
-        if i >= open.store.state().frames.len() {
+        let pre_len = open.store.state().frames.len();
+        if i >= pre_len {
             return;
         }
+        // Snapshot BEFORE the op: `apply_doc`'s refresh re-pads the live
+        // list at the tail, which is the wrong position for an insert.
+        let mut names = open.frame_names.clone();
+        names.resize(pre_len, String::new());
         if self.apply_doc(
             DocOp::FrameAdd {
                 at: i + 1,
@@ -1886,6 +2023,8 @@ impl SpritePanel {
         ) && let ViewerState::Ready(open) = &mut self.state
         {
             open.selected_frame = i + 1;
+            names.insert(i + 1, names[i].clone());
+            open.frame_names = names;
         }
     }
 
@@ -1902,10 +2041,14 @@ impl SpritePanel {
             return; // always keep at least one frame
         }
         let next = edits::selection_after_frame_delete(i, i, len);
+        let mut names = open.frame_names.clone();
+        names.resize(len, String::new());
         if self.apply_doc(DocOp::FrameDelete { at: i }, cx)
             && let ViewerState::Ready(open) = &mut self.state
         {
             open.selected_frame = next;
+            names.remove(i);
+            open.frame_names = names;
         }
     }
 
@@ -1934,14 +2077,111 @@ impl SpritePanel {
             && let ViewerState::Ready(open) = &mut self.state
         {
             open.selected_frame = to;
+            move_name(&mut open.frame_names, i, to);
+        }
+    }
+
+    /// Drop a dragged frame thumbnail onto strip position `to` --
+    /// `DocOp::FrameMove`'s splice semantics land the frame AT `to` for
+    /// drops in either direction, so the drop index needs no conversion.
+    /// The selection and the frame's editor-only name travel with it.
+    fn move_frame_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let len = open.store.state().frames.len();
+        if from == to || from >= len || to >= len {
+            return;
+        }
+        if self.apply_doc(DocOp::FrameMove { from, to }, cx)
+            && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.selected_frame = to;
+            move_name(&mut open.frame_names, from, to);
+        }
+    }
+
+    /// Drop a dragged strip frame onto clip `clip_ix`'s "Drop frame"
+    /// slot: append a COPY of the frame right after the clip's last
+    /// frame and extend the range by one. Two doc ops (add, range) --
+    /// two undo steps; a composite op is the known upgrade if that
+    /// grates. Stale indices vanish as no-ops.
+    fn drop_frame_on_clip(&mut self, clip_ix: usize, frame_ix: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let state = open.store.state();
+        let Some(clip) = state.clips.get(clip_ix).cloned() else {
+            return;
+        };
+        if frame_ix >= state.frames.len() {
+            return;
+        }
+        let at = clip.to + 1;
+        let mut names = open.frame_names.clone();
+        names.resize(state.frames.len(), String::new());
+        if !self.apply_doc(
+            DocOp::FrameAdd {
+                at,
+                copy_of: Some(frame_ix),
+                map: None,
+            },
+            cx,
+        ) {
+            return;
+        }
+        if let ViewerState::Ready(open) = &mut self.state {
+            names.insert(at, names.get(frame_ix).cloned().unwrap_or_default());
+            open.frame_names = names;
+        }
+        self.apply_doc(
+            DocOp::ClipSet {
+                at: clip_ix,
+                clip: Some(ClipEdit { to: at, ..clip }),
+            },
+            cx,
+        );
+    }
+
+    /// Set frame `ix`'s editor-only name and persist the sidecar right
+    /// away -- names aren't doc state, so there is no dirty flag to defer
+    /// the write behind.
+    fn set_frame_name(&mut self, ix: usize, name: String, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if ix >= open.store.state().frames.len() {
+            return;
+        }
+        if open.frame_names.len() <= ix {
+            open.frame_names.resize(ix + 1, String::new());
+        }
+        open.frame_names[ix] = name;
+        self.write_sidecar();
+        cx.notify();
+    }
+
+    /// Write the editor-settings sidecar for the open sprite. Failures
+    /// are logged, not surfaced -- losing a wrap preference must never
+    /// block or noise up a save.
+    fn write_sidecar(&self) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let meta = editor_meta::EditorMeta {
+            picker_cols: Some(open.picker_cols),
+            frame_names: open.frame_names.clone(),
+        };
+        if let Err(e) = editor_meta::save(&open.root, &open.rel_path, &meta) {
+            log::error!("GGO: failed to write editor sidecar for {}: {e}", open.rel_path);
         }
     }
 
     // ----------------------------------------------------------- tile ops
 
-    /// Click a tile-palette thumbnail: select it as the active tile, or
-    /// deselect on a re-click of the already-active tile (the brief's
-    /// "clicks don't always mutate" affordance, alongside Escape).
+    /// Select `tile` as a 1x1 block, or deselect on a re-select of the
+    /// already-active single tile (the brief's "clicks don't always
+    /// mutate" affordance, alongside Escape).
     fn select_tile(&mut self, tile: u16, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -1949,45 +2189,170 @@ impl SpritePanel {
         if (tile as usize) >= open.store.state().tile_count {
             return; // stale click racing an undo
         }
-        open.selected_tile = if open.selected_tile == Some(tile) {
+        // Position the 1x1 block at the tile's DISPLAY cell -- sheet
+        // order excludes blanks, so pool index != sheet index.
+        let Some(strip) = open.pool_strip.as_ref() else {
+            return;
+        };
+        let Some(display_ix) = strip.tiles.iter().position(|&t| t == tile) else {
+            return; // blank or vanished tile -- not pickable
+        };
+        let rc = (display_ix % strip.cols, display_ix / strip.cols);
+        open.selection = if open
+            .selection
+            .as_ref()
+            .and_then(tiles::TileBlock::single)
+            == Some(tile)
+        {
             None
         } else {
-            Some(tile)
+            Some(tiles::marquee_block(rc, rc, strip.cols, &strip.tiles))
         };
         cx.notify();
     }
 
-    /// The tile picker's left-click body: map the click through the
-    /// recorded sheet bounds onto a pool index (`tiles::picker_tile_at`)
-    /// and select it. A click on the padded tail of a partial last row
-    /// selects nothing rather than the nearest tile.
-    fn on_picker_click(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    /// The picker sheet cell under `position`, clamped into the sheet's
+    /// grid (pad cells included -- the marquee resolves those to `None`
+    /// tiles itself).
+    fn picker_cell_rc(&self, position: gpui::Point<Pixels>) -> Option<(usize, usize)> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let strip = open.pool_strip.as_ref()?;
+        let bounds = (*open.picker_bounds.borrow())?;
+        let local_x = f32::from(position.x - bounds.origin.x);
+        let local_y = f32::from(position.y - bounds.origin.y);
+        let col = ((local_x / PICKER_CELL_PX).floor().max(0.) as usize).min(strip.cols - 1);
+        let row = ((local_y / PICKER_CELL_PX).floor().max(0.) as usize)
+            .min(strip.rows.saturating_sub(1));
+        Some((col, row))
+    }
+
+    /// Arm a marquee at the pressed cell. Strict hit test: a press
+    /// OUTSIDE the sheet arms nothing (matching the old click contract),
+    /// unlike move/up which clamp so a drag can leave the sheet.
+    fn on_picker_down(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        {
+            let ViewerState::Ready(open) = &self.state else {
+                return;
+            };
+            let Some(bounds) = *open.picker_bounds.borrow() else {
+                return;
+            };
+            if !bounds.contains(&position) {
+                return;
+            }
+        }
+        let Some(rc) = self.picker_cell_rc(position) else {
+            return;
+        };
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.picker_drag = Some((rc, rc));
+            cx.notify();
+        }
+    }
+
+    /// Widen the in-flight marquee to the hovered cell.
+    fn on_picker_move(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(rc) = self.picker_cell_rc(position) else {
+            return;
+        };
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some((_, far)) = &mut open.picker_drag
+            && *far != rc
+        {
+            *far = rc;
+            cx.notify();
+        }
+    }
+
+    /// Resolve the marquee: a no-drag press-release toggles a single
+    /// tile (pad cells select nothing); a dragged rect becomes the block
+    /// selection (dropped entirely when it covers only pad cells).
+    fn on_picker_up(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let rc = self.picker_cell_rc(position);
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some((anchor, far)) = open.picker_drag.take() else {
+            return;
+        };
+        let far = rc.unwrap_or(far);
+        let Some(strip) = open.pool_strip.as_ref() else {
+            cx.notify();
+            return;
+        };
+        let (cols, display) = (strip.cols, strip.tiles.clone());
+        if anchor == far {
+            match display.get(anchor.1 * cols + anchor.0).copied() {
+                Some(tile) => self.select_tile(tile, cx),
+                None => cx.notify(),
+            }
+            return;
+        }
+        let block = tiles::marquee_block(anchor, far, cols, &display);
+        open.selection = block.tiles.iter().any(Option::is_some).then_some(block);
+        cx.notify();
+    }
+
+    /// The W/H steppers' body: one tile grid step per click, clamped to
+    /// worldlib's sprite range -- an at-bound step drops without an op
+    /// (M5's undo-stack hygiene rule), an in-range one goes through
+    /// `apply_doc` as `DocOp::Resize` with a top-left anchor, so undo,
+    /// recompose, and error surfacing come with it.
+    fn step_size(&mut self, dw: i32, dh: i32, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let Some(strip) = open.pool_strip.as_ref() else {
+        let state = open.store.state();
+        let range = MIN_SPRITE_TILES as i32..=MAX_SPRITE_TILES as i32;
+        let w = (state.w_tiles as i32 + dw).clamp(*range.start(), *range.end()) as u8;
+        let h = (state.h_tiles as i32 + dh).clamp(*range.start(), *range.end()) as u8;
+        if (w, h) == (state.w_tiles, state.h_tiles) {
             return;
-        };
-        let Some(bounds) = *open.picker_bounds.borrow() else {
-            return;
-        };
-        let tile = tiles::picker_tile_at(
-            f32::from(position.x - bounds.origin.x),
-            f32::from(position.y - bounds.origin.y),
-            PICKER_CELL_PX,
-            strip.cols,
-            strip.tile_count,
-        );
-        if let Some(tile) = tile {
-            self.select_tile(tile, cx);
         }
+        self.apply_doc(
+            DocOp::Resize {
+                w_tiles: w,
+                h_tiles: h,
+                anchor: Anchor::TopLeft,
+            },
+            cx,
+        );
+    }
+
+    /// The picker-cols stepper's body: adjust the session wrap width
+    /// (clamped to 1..=[`MAX_PICKER_COLS`]) and recompose the sheet at
+    /// the new wrap. Not a doc op -- the `.til` has no layout field, so
+    /// this never dirties the store or lands on the undo stack.
+    fn step_picker_cols(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let next = (open.picker_cols as i32 + delta).clamp(1, MAX_PICKER_COLS as i32) as usize;
+        if next == open.picker_cols {
+            return;
+        }
+        open.picker_cols = next;
+        open.pool_strip = loader::compose_pool_strip(open.store.state(), next);
+        cx.notify();
     }
 
     fn deselect_tile(&mut self, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state
-            && open.selected_tile.is_some()
+            && (open.selection.is_some() || open.picker_drag.is_some() || open.eraser)
         {
-            open.selected_tile = None;
+            open.selection = None;
+            open.picker_drag = None;
+            open.eraser = false;
+            cx.notify();
+        }
+    }
+
+    /// The Eraser toggle: while on, preview clicks blank cells.
+    fn toggle_eraser(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.eraser = !open.eraser;
             cx.notify();
         }
     }
@@ -2018,20 +2383,43 @@ impl SpritePanel {
         }
     }
 
-    /// Click a cell of the selected-frame preview with a tile active:
-    /// repoint that cell at the tile (`DocOp::FrameTileSet`, M1's op)
-    /// through the same `apply_doc` path as every other edit -- undo,
-    /// thumbnail recompose, and error surfacing come with it. Targets the
-    /// SELECTED frame -- which, on a click during playback, was just
-    /// synced to the transport's shown frame by
-    /// [`Self::pause_playback_on_edit`]. No-tile-selected and
-    /// unchanged-cell clicks are dropped without an op (M5's undo-stack
-    /// hygiene rule).
+    /// Click a cell of the selected-frame preview with a selection
+    /// active: stamp the block anchored at that cell, clipped at the
+    /// frame's edges, as ONE `DocOp::FrameTilesSet` through the same
+    /// `apply_doc` path as every other edit -- undo, thumbnail recompose,
+    /// and error surfacing come with it. Targets the SELECTED frame --
+    /// which, on a click during playback, was just synced to the
+    /// transport's shown frame by [`Self::pause_playback_on_edit`].
+    /// No-selection and all-unchanged clicks are dropped without an op
+    /// (M5's undo-stack hygiene rule).
     fn set_tile_on_cell(&mut self, cell: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let Some(tile) = open.selected_tile else {
+        if open.eraser {
+            let frame = open.selected_frame;
+            let state = open.store.state();
+            let Some(&current) = state.frames.get(frame).and_then(|f| f.map.get(cell)) else {
+                return;
+            };
+            let off = current as usize * ggo_worldlib::sprites::hw::TILE_BYTES;
+            let already_blank = state
+                .pool
+                .get(off..off + ggo_worldlib::sprites::hw::TILE_BYTES)
+                .is_some_and(|tile| tile.iter().all(|&b| b == 0));
+            if already_blank {
+                return; // erasing a blank cell -- no op to push
+            }
+            self.apply_doc(
+                DocOp::FrameCellsErase {
+                    frame,
+                    cells: vec![cell],
+                },
+                cx,
+            );
+            return;
+        }
+        let Some(block) = open.selection.as_ref() else {
             return;
         };
         let frame = open.selected_frame;
@@ -2039,13 +2427,26 @@ impl SpritePanel {
         let Some(f) = state.frames.get(frame) else {
             return;
         };
-        if cell >= f.map.len() || (tile as usize) >= state.tile_count {
+        if cell >= f.map.len()
+            || block
+                .tiles
+                .iter()
+                .flatten()
+                .any(|&t| t as usize >= state.tile_count)
+        {
             return; // stale geometry/selection racing an undo
         }
-        if f.map[cell] == tile {
-            return; // already that tile -- don't push a no-op undo entry
+        let sets = tiles::stamp_sets(
+            block,
+            cell,
+            state.w_tiles as usize,
+            state.h_tiles as usize,
+            &f.map,
+        );
+        if sets.is_empty() {
+            return; // nothing would change -- don't push a no-op undo entry
         }
-        self.apply_doc(DocOp::FrameTileSet { frame, cell, tile }, cx);
+        self.apply_doc(DocOp::FrameTilesSet { frame, sets }, cx);
     }
 
     /// The preview click handler's window->cell mapping: local coords
@@ -2339,6 +2740,12 @@ impl SpritePanel {
             self.confirm_rename(cx);
             return;
         }
+        if let Some(PanelForm::NameFrame { editor, .. }) = &self.form
+            && editor.focus_handle(cx).is_focused(window)
+        {
+            self.confirm_name_frame(cx);
+            return;
+        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -2361,7 +2768,8 @@ impl SpritePanel {
         key_context.add(KEY_CONTEXT);
         let form_editing = matches!(
             &self.form,
-            Some(PanelForm::Rename { editor, .. }) if editor.focus_handle(cx).is_focused(window)
+            Some(PanelForm::Rename { editor, .. } | PanelForm::NameFrame { editor, .. })
+                if editor.focus_handle(cx).is_focused(window)
         );
         let editing = form_editing
             || match &self.state {
@@ -2430,6 +2838,24 @@ impl SpritePanel {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
             )
             .child(DropdownMenu::new("ggo-sprite-clip", clip_label, menu))
+            .child(Self::stepper(
+                "ggo-sprite-w",
+                format!("W {}", state.w_tiles),
+                state.w_tiles > MIN_SPRITE_TILES,
+                state.w_tiles < MAX_SPRITE_TILES,
+                "Sprite width in tiles",
+                |this, d, cx| this.step_size(d, 0, cx),
+                cx,
+            ))
+            .child(Self::stepper(
+                "ggo-sprite-h",
+                format!("H {}", state.h_tiles),
+                state.h_tiles > MIN_SPRITE_TILES,
+                state.h_tiles < MAX_SPRITE_TILES,
+                "Sprite height in tiles",
+                |this, d, cx| this.step_size(0, d, cx),
+                cx,
+            ))
             .child(div().flex_1())
             .child(
                 Label::new(SharedString::from(title))
@@ -2461,6 +2887,42 @@ impl SpritePanel {
             .into_any_element()
     }
 
+    /// A `-`/`+` stepper with a small label between the buttons, disabled
+    /// at its clamps so the row shows its own limits (the import panel's
+    /// zoom-stepper idiom). Shared by the onion row, the transport's W/H
+    /// size steppers, and the tile picker's cols stepper.
+    fn stepper(
+        id: &'static str,
+        label: String,
+        can_dec: bool,
+        can_inc: bool,
+        tooltip: &'static str,
+        step: fn(&mut SpritePanel, i32, &mut Context<SpritePanel>),
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        h_flex()
+            .gap_0p5()
+            .child(
+                IconButton::new(SharedString::from(format!("{id}-minus")), IconName::Dash)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text(tooltip))
+                    .disabled(!can_dec)
+                    .on_click(cx.listener(move |this, _, _, cx| step(this, -1, cx))),
+            )
+            .child(
+                Label::new(SharedString::from(label))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                IconButton::new(SharedString::from(format!("{id}-plus")), IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text(tooltip))
+                    .disabled(!can_inc)
+                    .on_click(cx.listener(move |this, _, _, cx| step(this, 1, cx))),
+            )
+    }
+
     /// The onion-skin control row: the toggle, a `-`/`+` stepper for the
     /// back and forward ghost counts, and one for the opacity -- ggo-ide's
     /// `timeline::State::transport_row` onion group, minus its slider (see
@@ -2472,39 +2934,15 @@ impl SpritePanel {
             unreachable!("render_onion is only called in the Ready state");
         };
         let o = open.onion;
-        let stepper =
-            |id: &'static str,
-             label: String,
-             can_dec: bool,
-             can_inc: bool,
-             tooltip: &'static str,
-             step: fn(&mut SpritePanel, i32, &mut Context<SpritePanel>)| {
-                h_flex()
-                    .gap_0p5()
-                    .child(
-                        IconButton::new(SharedString::from(format!("{id}-minus")), IconName::Dash)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(ui::Tooltip::text(tooltip))
-                            .disabled(!can_dec)
-                            .on_click(cx.listener(move |this, _, _, cx| step(this, -1, cx))),
-                    )
-                    .child(
-                        Label::new(SharedString::from(label))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        IconButton::new(SharedString::from(format!("{id}-plus")), IconName::Plus)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(ui::Tooltip::text(tooltip))
-                            .disabled(!can_inc)
-                            .on_click(cx.listener(move |this, _, _, cx| step(this, 1, cx))),
-                    )
-            };
         h_flex()
             .gap_1()
             .px_1()
             .pb_1()
+            .child(
+                Checkbox::new("ggo-sprite-eraser", ToggleState::from(open.eraser))
+                    .label("Eraser")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_eraser(cx))),
+            )
             .child(
                 Checkbox::new("ggo-sprite-onion", ToggleState::from(o.on))
                     .label("Onion")
@@ -2512,29 +2950,32 @@ impl SpritePanel {
                         this.update_onion(onion::OnionState::toggle, cx)
                     })),
             )
-            .child(stepper(
+            .child(Self::stepper(
                 "ggo-sprite-onion-back",
                 format!("back {}", o.back),
                 o.can_step_back(-1),
                 o.can_step_back(1),
                 "Ghost frames behind",
                 |this, d, cx| this.update_onion(|s| s.step_back(d), cx),
+                cx,
             ))
-            .child(stepper(
+            .child(Self::stepper(
                 "ggo-sprite-onion-fwd",
                 format!("fwd {}", o.fwd),
                 o.can_step_fwd(-1),
                 o.can_step_fwd(1),
                 "Ghost frames ahead",
                 |this, d, cx| this.update_onion(|s| s.step_fwd(d), cx),
+                cx,
             ))
-            .child(stepper(
+            .child(Self::stepper(
                 "ggo-sprite-onion-opacity",
                 format!("{}%", (o.opacity * 100.0).round() as i32),
                 o.can_step_opacity(-1),
                 o.can_step_opacity(1),
                 "Ghost opacity",
                 |this, d, cx| this.update_onion(|s| s.step_opacity(d), cx),
+                cx,
             ))
             .into_any_element()
     }
@@ -2563,13 +3004,25 @@ impl SpritePanel {
             let (w, h) = image_px_size(image);
             let (fit_w, fit_h) = playback::fit_size(w, h, PREVIEW_PX);
             let bounds_cell = open.preview_bounds.clone();
+            let state = open.store.state();
+            let (grid_cols, grid_rows) = (state.w_tiles as usize, state.h_tiles as usize);
+            let grid_color = cx.theme().colors().border;
+            // `.top_0().left_0()` matters: an absolute child with auto
+            // insets sits at its STATIC position -- after the in-flow img
+            // sibling, one image-height below the box -- so the recorded
+            // bounds (and every click mapped against them) were shifted by
+            // exactly the image and silently missed.
             let overlay = gpui::canvas(
                 move |bounds, _window, _cx| {
                     *bounds_cell.borrow_mut() = Some(bounds);
                 },
-                |_, (), _, _| {},
+                move |bounds, (), window, _cx| {
+                    paint_tile_grid(bounds, grid_cols, grid_rows, grid_color, window);
+                },
             )
             .absolute()
+            .top_0()
+            .left_0()
             .size_full();
             // Onion ghosts, farthest first, each absolutely positioned over
             // the same box as the real frame and drawn BEFORE it (so the
@@ -2635,39 +3088,100 @@ impl SpritePanel {
         };
         let border = cx.theme().colors().border;
         let accent = cx.theme().colors().border_focused;
+        // Wide enough for the sheet at the chosen wrap, never narrower
+        // than the default column (the header row needs the room).
+        let sheet_cols = open
+            .pool_strip
+            .as_ref()
+            .map_or(loader::PICKER_COLS, |strip| strip.cols);
+        let width = px(
+            (PICKER_CELL_PX * sheet_cols as f32 + 12.).max(f32::from(PICKER_WIDTH)),
+        );
+        let picker_cols = open.picker_cols;
         let mut column = v_flex()
             .flex_none()
-            .w(PICKER_WIDTH)
+            .w(width)
             .h_full()
             .border_l_1()
             .border_color(border)
             .child(
-                div().px_1().pt_1().child(
-                    Label::new("Tiles")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
+                h_flex()
+                    .px_1()
+                    .pt_1()
+                    .justify_between()
+                    .child(
+                        Label::new("Tiles")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::stepper(
+                        "ggo-sprite-picker-cols",
+                        format!("{picker_cols} col"),
+                        picker_cols > 1,
+                        picker_cols < MAX_PICKER_COLS,
+                        "Tile picker columns",
+                        |this, d, cx| this.step_picker_cols(d, cx),
+                        cx,
+                    )),
             );
         if let Some(strip) = open.pool_strip.as_ref() {
             let sheet_w = px(PICKER_CELL_PX * strip.cols as f32);
             let sheet_h = px(PICKER_CELL_PX * strip.rows as f32);
             let bounds_cell = open.picker_bounds.clone();
+            let (grid_cols, grid_rows) = (strip.cols, strip.rows);
+            let pad = tiles::picker_pad_region(strip.tiles.len(), strip.cols);
+            let background = cx.theme().colors().panel_background;
+            // Same static-position trap as the preview overlay: without
+            // explicit insets this canvas would record bounds one
+            // sheet-height below the image it must cover.
             let overlay = gpui::canvas(
                 move |bounds, _window, _cx| {
                     *bounds_cell.borrow_mut() = Some(bounds);
                 },
-                |_, (), _, _| {},
+                move |bounds, (), window, _cx| {
+                    paint_tile_grid(bounds, grid_cols, grid_rows, border, window);
+                    // The sheet's zero-filled partial last row is padding,
+                    // not tiles -- cover its grid lines and interior so it
+                    // reads as empty space, keeping only the 1px edges
+                    // shared with real tiles.
+                    if let Some((pad_col, pad_row)) = pad {
+                        let line = px(1.);
+                        window.paint_quad(gpui::fill(
+                            Bounds::from_corners(
+                                gpui::point(
+                                    bounds.origin.x + px(pad_col as f32 * PICKER_CELL_PX) + line,
+                                    bounds.origin.y + px(pad_row as f32 * PICKER_CELL_PX) + line,
+                                ),
+                                bounds.bottom_right(),
+                            ),
+                            background,
+                        ));
+                    }
+                },
             )
             .absolute()
+            .top_0()
+            .left_0()
             .size_full();
-            let selection = open.selected_tile.map(|tile| {
-                let ix = tile as usize;
+            // One rect outline serves both the locked-in block selection
+            // and the in-flight marquee (the marquee wins while dragging
+            // so the user sees what a release would select).
+            let rect = open
+                .picker_drag
+                .map(|(a, b)| (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)))
+                .or_else(|| {
+                    open.selection.as_ref().map(|block| {
+                        let (c, r) = block.origin;
+                        (c, r, c + block.cols - 1, r + block.rows - 1)
+                    })
+                });
+            let selection = rect.map(|(c0, r0, c1, r1)| {
                 div()
                     .absolute()
-                    .left(px((ix % strip.cols) as f32 * PICKER_CELL_PX))
-                    .top(px((ix / strip.cols) as f32 * PICKER_CELL_PX))
-                    .w(px(PICKER_CELL_PX))
-                    .h(px(PICKER_CELL_PX))
+                    .left(px(c0 as f32 * PICKER_CELL_PX))
+                    .top(px(r0 as f32 * PICKER_CELL_PX))
+                    .w(px((c1 - c0 + 1) as f32 * PICKER_CELL_PX))
+                    .h(px((r1 - r0 + 1) as f32 * PICKER_CELL_PX))
                     .border_1()
                     .border_color(accent)
             });
@@ -2690,7 +3204,20 @@ impl SpritePanel {
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                                     window.focus(&this.focus_handle, cx);
-                                    this.on_picker_click(event.position, cx);
+                                    this.on_picker_down(event.position, cx);
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                    if event.pressed_button == Some(MouseButton::Left) {
+                                        this.on_picker_move(event.position, cx);
+                                    }
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                                    this.on_picker_up(event.position, cx);
                                 }),
                             ),
                     ),
@@ -2805,6 +3332,26 @@ impl SpritePanel {
                 )
                 .into_any_element(),
             ),
+            PanelForm::NameFrame { index, editor } => Some(
+                row.child(
+                    Label::new(format!("Name frame {}", index + 1))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Self::editor_input(editor.clone(), cx))
+                .child(
+                    Button::new("ggo-sprite-name-frame-apply", "Set")
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm_name_frame(cx))),
+                )
+                .child(
+                    Button::new("ggo-sprite-name-frame-cancel", "Cancel").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.cancel_form(cx);
+                        },
+                    )),
+                )
+                .into_any_element(),
+            ),
         }
     }
 
@@ -2886,6 +3433,32 @@ impl SpritePanel {
                             })
                         }),
                 );
+            // The drop target the drag-a-frame flow lands on: a
+            // frame-sized dashed slot at the end of the clip.
+            row = row.child(
+                div()
+                    .id(("ggo-sprite-clip-drop", i))
+                    .w(px(THUMB_PX))
+                    .h(px(THUMB_PX / 2.))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .border_1()
+                    .border_dashed()
+                    .rounded_sm()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Label::new("Drop frame")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .drag_over::<DraggedFrame>(|slot, _, _, cx| {
+                        slot.bg(cx.theme().colors().drop_target_background)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
+                        this.drop_frame_on_clip(i, dragged.ix, cx);
+                    })),
+            );
             if let Some((at, message)) = &open.clip_error
                 && *at == i
             {
@@ -2995,7 +3568,9 @@ impl SpritePanel {
         let selected = open.selected_frame;
         let border = cx.theme().colors().border;
         let accent = cx.theme().colors().border_focused;
+        let drop_bg = cx.theme().colors().drop_target_background;
         let state = open.store.state();
+        let names = &open.frame_names;
         div()
             .id("ggo-sprite-strip")
             .flex_none()
@@ -3012,8 +3587,13 @@ impl SpritePanel {
                             let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
                             img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
                         });
+                        let label = editor_meta::frame_label(names, ix);
                         v_flex()
                             .id(("ggo-sprite-frame", ix))
+                            // Test-only bounds hook (a no-op in release
+                            // builds): the drag-reorder test aims real
+                            // mouse events at the cells.
+                            .debug_selector(|| format!("ggo-sprite-frame-{ix}"))
                             .items_center()
                             .gap_0p5()
                             .p_0p5()
@@ -3030,11 +3610,38 @@ impl SpritePanel {
                                     .children(thumb),
                             )
                             .child(
+                                Label::new(label.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(if names.get(ix).is_some_and(|n| !n.is_empty()) {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    }),
+                            )
+                            .child(
                                 Label::new(format!("{} ms", frame.duration_ms))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| this.select_frame(ix, cx)))
+                            // Single click selects; double click names.
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                                if event.click_count() > 1 {
+                                    this.begin_name_frame(ix, window, cx);
+                                } else {
+                                    this.select_frame(ix, cx);
+                                }
+                            }))
+                            .on_drag(
+                                DraggedFrame {
+                                    ix,
+                                    label: label.into(),
+                                },
+                                |frame, _, _, cx| cx.new(|_| frame.clone()),
+                            )
+                            .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
+                                this.move_frame_to(dragged.ix, ix, cx);
+                            }))
                     })),
             )
             .into_any_element()
@@ -3060,11 +3667,83 @@ impl SpritePanel {
     }
 }
 
+/// A frame thumbnail mid-drag: the strip reorders via `DocOp::FrameMove`
+/// on drop (workspace's `DraggedTab` shape -- the entity IS the drag
+/// ghost).
+#[derive(Clone)]
+struct DraggedFrame {
+    ix: usize,
+    label: SharedString,
+}
+
+impl Render for DraggedFrame {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_1()
+            .py_0p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Label::new(self.label.clone()).size(LabelSize::XSmall))
+    }
+}
+
+/// Reorder an editor-name list the way `DocOp::FrameMove`'s splice
+/// reorders frames: remove at `from`, insert at `to`. No-op when either
+/// index is past the list (names may lag the frame count; the refresh
+/// pad squares that up).
+fn move_name(names: &mut Vec<String>, from: usize, to: usize) {
+    if from < names.len() && to < names.len() {
+        let name = names.remove(from);
+        names.insert(to, name);
+    }
+}
+
 /// A `RenderImage`'s pixel size (frame 0 -- worldlib composes are always
 /// single-frame).
 fn image_px_size(image: &Arc<RenderImage>) -> (u32, u32) {
     let size = image.size(0);
     (size.width.0 as u32, size.height.0 as u32)
+}
+
+/// Paint 1px lines over `bounds` marking every tile-cell boundary of a
+/// `cols x rows` grid, outer edges included -- the preview and picker
+/// overlays share it so both surfaces show where one tile ends and the
+/// next begins. The `min` clamps keep the far edges' lines inside the box.
+fn paint_tile_grid(
+    bounds: Bounds<Pixels>,
+    cols: usize,
+    rows: usize,
+    color: gpui::Hsla,
+    window: &mut Window,
+) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let line = px(1.);
+    for i in 0..=cols {
+        let x = (bounds.origin.x + bounds.size.width * (i as f32 / cols as f32))
+            .min(bounds.origin.x + bounds.size.width - line);
+        window.paint_quad(gpui::fill(
+            Bounds::new(
+                gpui::point(x, bounds.origin.y),
+                gpui::size(line, bounds.size.height),
+            ),
+            color,
+        ));
+    }
+    for i in 0..=rows {
+        let y = (bounds.origin.y + bounds.size.height * (i as f32 / rows as f32))
+            .min(bounds.origin.y + bounds.size.height - line);
+        window.paint_quad(gpui::fill(
+            Bounds::new(
+                gpui::point(bounds.origin.x, y),
+                gpui::size(bounds.size.width, line),
+            ),
+            color,
+        ));
+    }
 }
 
 impl Render for SpritePanel {
@@ -3109,97 +3788,125 @@ impl Focusable for SpritePanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for SpritePanel {}
 
-impl Panel for SpritePanel {
-    fn persistent_name() -> &'static str {
-        "GGO Sprite"
+/// The `.spr`/`.til`/`.pal` fixture trio the crate's tests (and
+/// `sprite_item`'s) write to a real-fs temp project: a 1x1-tile,
+/// 2-frame, 2-tile sprite with one clip.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use ggo_worldlib::sprites::cow::{ClipEdit, Frame, SpriteState};
+    use ggo_worldlib::sprites::hw::TILE_BYTES;
+    use ggo_worldlib::sprites::io::save_sprite;
+
+    pub(crate) fn write_sprite_fixture(root: &std::path::Path) {
+        write_sprite_fixture_named(root, "hero");
     }
 
-    fn panel_key() -> &'static str {
-        GGO_SPRITE_PANEL_KEY
+    /// [`write_sprite_fixture`] under an arbitrary stem, so a test can hold
+    /// two distinct sprites (the routing tests switch between them).
+    pub(crate) fn write_sprite_fixture_named(root: &std::path::Path, stem: &str) {
+        write_sprite_fixture_at(root, &format!("sprites/{stem}"));
     }
 
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
+    /// [`write_sprite_fixture`] at an arbitrary root-relative stem, so a
+    /// test can put the trio DIRECTLY at an asset root (stem `hh` ->
+    /// `hh.spr`/`hh.til`/`hh.pal`) rather than under `sprites/`. That is
+    /// the wilds layout, and the one where a wrong root is unrecoverable:
+    /// with no subdirectory there is no sibling for `resolve_sidecar` to
+    /// fall back to.
+    pub(crate) fn write_sprite_fixture_at(root: &std::path::Path, stem: &str) {
+        save_fixture(
+            root,
+            &format!("{stem}.spr"),
+            &format!("{stem}.til"),
+            &format!("{stem}.pal"),
+        );
     }
 
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        // Same call as `ggo_world_panel`: no settings persistence yet, and
-        // Bottom isn't a sensible spot for a sprite/frame editor sidebar.
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
+    /// The fixture trio with each of the three rels named INDEPENDENTLY, so
+    /// a test can reproduce a `.spr` whose stored sidecars don't match the
+    /// root they'll later be read against -- i.e. the exact corruption this
+    /// change exists to stop, produced by the exact call that caused it
+    /// (`save_sprite` handed a PROJECT root where the asset root belonged).
+    /// A trio with TWO pickable tiles: pool = [blank, red 0x11, green
+    /// 0x22], one 1x1 frame on tile 0. The picker hides blanks, so tests
+    /// that need a real multi-tile sheet (marquee, wrap) use this.
+    pub(crate) fn write_multi_tile_fixture(root: &std::path::Path) {
+        use ggo_worldlib::sprites::cow::{Frame, SpriteState};
+        use ggo_worldlib::sprites::hw::TILE_BYTES;
+        use ggo_worldlib::sprites::io::save_sprite;
 
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        DEFAULT_WIDTH
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        // `IconName` has no Film/animation glyph in this fork; `Image`
-        // reads closest to a sprite/frame asset (checked against
-        // crates/icons/src/icons.rs -- Sparkle was the other candidate but
-        // reads as "AI/magic", not sprites).
-        Some(IconName::Image)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO Sprite")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8 (grep activation_priority across
-        // crates/).
-        9
-    }
-
-    /// The open sprite lives in panel state, not in a workspace `Item`, so
-    /// nothing else in the close flow knows it can be dirty. Same guard as
-    /// `ggo_world_panel`: Save/Don't-Save/Cancel, and a failed write
-    /// cancels the close rather than dropping the edits.
-    fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
-        ggo_common::prepare_to_close_dirty(
-            self.dirty_sprite_name(),
-            window,
-            cx,
-            Self::save_for_close,
-        )
-    }
-
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if active {
-            // Deferred: `set_active` fires inside the workspace's own
-            // update (dock toggle), and `refresh_root` needs to READ the
-            // workspace to find the project root -- reading it
-            // re-entrantly panics (same as `ggo_world_panel`).
-            let this = cx.weak_entity();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_root(cx)).ok();
-            });
+        let mut pool = vec![0u8; 3 * TILE_BYTES];
+        for b in &mut pool[TILE_BYTES..2 * TILE_BYTES] {
+            *b = 0x11;
         }
+        for b in &mut pool[2 * TILE_BYTES..] {
+            *b = 0x22;
+        }
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800;
+        palette[2] = 0x07E0;
+        let state = SpriteState {
+            pool,
+            tile_count: 3,
+            session_tiles: std::collections::HashSet::new(),
+            palette,
+            frames: vec![Frame {
+                map: vec![0],
+                duration_ms: 100,
+            }],
+            clips: vec![],
+            w_tiles: 1,
+            h_tiles: 1,
+            pool_shared: false,
+        };
+        save_sprite(root, "sprites/multi.spr", &state, "sprites/multi.til", "sprites/multi.pal")
+            .unwrap();
+    }
+
+    pub(crate) fn save_fixture(root: &std::path::Path, spr_rel: &str, til_rel: &str, pal_rel: &str) {
+        let mut pool = vec![0u8; 2 * TILE_BYTES];
+        for b in &mut pool[TILE_BYTES..] {
+            *b = 0x11; // both nibbles = palette index 1
+        }
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800; // pure 565 red
+        let state = SpriteState {
+            pool,
+            tile_count: 2,
+            session_tiles: std::collections::HashSet::new(),
+            palette,
+            frames: vec![
+                Frame {
+                    map: vec![0],
+                    duration_ms: 100,
+                },
+                Frame {
+                    map: vec![1],
+                    duration_ms: 200,
+                },
+            ],
+            clips: vec![ClipEdit {
+                name: "walk".to_string(),
+                from: 1,
+                to: 1,
+                loop_: false,
+            }],
+            w_tiles: 1,
+            h_tiles: 1,
+            pool_shared: false,
+        };
+        save_sprite(root, spr_rel, &state, til_rel, pal_rel).unwrap();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::{save_fixture, write_sprite_fixture, write_sprite_fixture_at, write_sprite_fixture_named};
     use super::*;
-    use ggo_worldlib::sprites::cow::{ClipEdit, Frame};
+    use ggo_worldlib::sprites::cow::ClipEdit;
     use ggo_worldlib::sprites::hw::{TILE_BYTES, TILE_PX};
-    use ggo_worldlib::sprites::io::{open_sprite, save_sprite, save_tileset};
+    use ggo_worldlib::sprites::io::{open_sprite, save_tileset};
     use ggo_worldlib::sprites::sprite_doc::DEFAULT_FRAME_DURATION_MS;
     use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
     use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
@@ -3234,51 +3941,6 @@ mod tests {
         init(cx);
     }
 
-    /// Proves the panel is registered on a real workspace, and that
-    /// dispatching `ToggleFocus` opens the right dock and focuses the
-    /// panel. Goes through `MultiWorkspace::test_new` rather than a bare
-    /// `Workspace::test_new`, because `register_action` handlers (like
-    /// `ToggleFocus`) are only mounted into the dispatch tree once
-    /// something renders `Workspace::actions`, which in production is
-    /// `MultiWorkspace`'s render (same lesson as `ggo_world_panel`'s test).
-    #[gpui::test]
-    async fn test_toggle_focus_opens_panel(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            AppState::test(cx);
-            init(cx);
-        });
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        workspace.update(cx, |workspace, cx| {
-            assert!(
-                workspace.panel::<SpritePanel>(cx).is_some(),
-                "SpritePanel should have been added to the workspace by init()"
-            );
-            assert!(
-                !workspace.right_dock().read(cx).is_open(),
-                "right dock should start closed"
-            );
-        });
-
-        cx.dispatch_action(ToggleFocus);
-
-        workspace.update(cx, |workspace, cx| {
-            let panel = workspace
-                .panel::<SpritePanel>(cx)
-                .expect("SpritePanel should still be registered");
-            assert_eq!(panel.read(cx).position, DockPosition::Right);
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "ToggleFocus should have opened the right dock"
-            );
-        });
-    }
-
     /// Author a real 2-frame sprite trio (`.spr`/`.til`/`.pal`) via
     /// worldlib's own `save_sprite` -- one call persists all three files
     /// (the pool IS the tileset; `save_tileset` would only rewrite the
@@ -3286,69 +3948,26 @@ mod tests {
     /// all-transparent tile 0; frame 1 shows tile 1, filled with palette
     /// index 1 (red) -- distinguishable thumbnails. One non-looping
     /// single-frame clip exercises the clip selector path.
-    fn write_sprite_fixture(root: &std::path::Path) {
-        write_sprite_fixture_named(root, "hero");
-    }
-
-    /// [`write_sprite_fixture`] under an arbitrary stem, so a test can hold
-    /// two distinct sprites (the routing tests switch between them).
-    fn write_sprite_fixture_named(root: &std::path::Path, stem: &str) {
-        write_sprite_fixture_at(root, &format!("sprites/{stem}"));
-    }
-
-    /// [`write_sprite_fixture`] at an arbitrary root-relative stem, so a
-    /// test can put the trio DIRECTLY at an asset root (stem `hh` ->
-    /// `hh.spr`/`hh.til`/`hh.pal`) rather than under `sprites/`. That is
-    /// the wilds layout, and the one where a wrong root is unrecoverable:
-    /// with no subdirectory there is no sibling for `resolve_sidecar` to
-    /// fall back to.
-    fn write_sprite_fixture_at(root: &std::path::Path, stem: &str) {
-        save_fixture(
-            root,
-            &format!("{stem}.spr"),
-            &format!("{stem}.til"),
-            &format!("{stem}.pal"),
-        );
-    }
-
-    /// The fixture trio with each of the three rels named INDEPENDENTLY, so
-    /// a test can reproduce a `.spr` whose stored sidecars don't match the
-    /// root they'll later be read against -- i.e. the exact corruption this
-    /// change exists to stop, produced by the exact call that caused it
-    /// (`save_sprite` handed a PROJECT root where the asset root belonged).
-    fn save_fixture(root: &std::path::Path, spr_rel: &str, til_rel: &str, pal_rel: &str) {
-        let mut pool = vec![0u8; 2 * TILE_BYTES];
-        for b in &mut pool[TILE_BYTES..] {
-            *b = 0x11; // both nibbles = palette index 1
-        }
-        let mut palette = [0u16; 16];
-        palette[1] = 0xF800; // pure 565 red
-        let state = SpriteState {
-            pool,
-            tile_count: 2,
-            session_tiles: std::collections::HashSet::new(),
-            palette,
-            frames: vec![
-                Frame {
-                    map: vec![0],
-                    duration_ms: 100,
-                },
-                Frame {
-                    map: vec![1],
-                    duration_ms: 200,
-                },
-            ],
-            clips: vec![ClipEdit {
-                name: "walk".to_string(),
-                from: 1,
-                to: 1,
-                loop_: false,
-            }],
-            w_tiles: 1,
-            h_tiles: 1,
-            pool_shared: false,
-        };
-        save_sprite(root, spr_rel, &state, til_rel, pal_rel).unwrap();
+    /// [`ready_panel`] for the multi-tile trio (two pickable tiles).
+    async fn ready_multi_panel(
+        cx: &mut TestAppContext,
+        root: &std::path::Path,
+    ) -> gpui::Entity<SpritePanel> {
+        super::test_fixtures::write_multi_tile_fixture(root);
+        let root = root.to_path_buf();
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = SpritePanel::new(None, cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("sprites/multi.spr", cx);
+        });
+        cx.executor().run_until_parked();
+        panel
     }
 
     /// Load the fixture sprite into a fresh panel and return it Ready.
@@ -3371,6 +3990,36 @@ mod tests {
         });
         cx.executor().run_until_parked();
         panel
+    }
+
+    /// [`ready_panel`] drawn in a real test window with the crate's
+    /// keybindings installed, for tests that drive rendered gestures and
+    /// keystrokes (world_panel's `ready_panel_in_window` shape).
+    async fn ready_panel_in_window<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (gpui::Entity<SpritePanel>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        write_sprite_fixture(root);
+        let root = root.to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = SpritePanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        // Focus in/out events only fire while the window is ACTIVE -- an
+        // inactive window's focus paths are blanked in the draw's focus
+        // phase (world_panel's rule).
+        cx.update(|window, _| window.activate_window());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("sprites/hero.spr", cx);
+        });
+        cx.run_until_parked();
+        (panel, cx)
     }
 
     /// End-to-end viewer load against a real-fs temp project: opening the
@@ -3456,6 +4105,12 @@ mod tests {
         });
     }
 
+    /// The single selected tile, in the shape the pre-marquee tests
+    /// asserted -- `None` when nothing (or a bigger block) is selected.
+    fn selected_single(panel: &SpritePanel) -> Option<u16> {
+        ready(panel).selection.as_ref().and_then(tiles::TileBlock::single)
+    }
+
     fn ready(panel: &SpritePanel) -> &OpenSprite {
         match &panel.state {
             ViewerState::Ready(open) => open,
@@ -3533,142 +4188,6 @@ mod tests {
         open_sprite(root, "sprites/hero.spr").unwrap().state.frames[0].duration_ms
     }
 
-    /// A clean panel must be invisible to the close flow.
-    #[gpui::test]
-    async fn test_close_guard_lets_a_clean_panel_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        assert!(
-            !cx.has_pending_prompt(),
-            "a clean sprite must not prompt on close"
-        );
-        assert!(close.await, "a clean panel must not block the close");
-    }
-
-    /// Cancel aborts the close and leaves the document dirty and unwritten.
-    #[gpui::test]
-    async fn test_close_guard_cancel_aborts_the_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-        dirty_the_sprite(&panel, cx);
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        assert_eq!(
-            cx.pending_prompt().map(|(msg, _)| msg),
-            Some("sprites/hero.spr contains unsaved edits. Do you want to save it?".to_string()),
-        );
-        cx.simulate_prompt_answer("Cancel");
-        assert!(!close.await, "Cancel must veto the close");
-
-        panel.update(cx, |panel, _cx| {
-            assert!(
-                panel.dirty_sprite_name().is_some(),
-                "Cancel must leave the edits in place"
-            );
-        });
-        assert_eq!(
-            on_disk_duration(dir.path()),
-            100,
-            "Cancel must not have written the file"
-        );
-    }
-
-    /// Save writes through the panel's own save path and then allows the
-    /// close.
-    #[gpui::test]
-    async fn test_close_guard_save_writes_then_allows_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-        dirty_the_sprite(&panel, cx);
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        cx.simulate_prompt_answer("Save");
-        assert!(close.await, "a successful save must allow the close");
-
-        panel.update(cx, |panel, _cx| {
-            assert!(panel.dirty_sprite_name().is_none(), "save clears dirty");
-        });
-        assert_eq!(
-            on_disk_duration(dir.path()),
-            500,
-            "Save must have written the edit"
-        );
-    }
-
-    /// "Don't Save" closes and deliberately drops the edits.
-    #[gpui::test]
-    async fn test_close_guard_discard_allows_close_without_writing(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-        dirty_the_sprite(&panel, cx);
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        cx.simulate_prompt_answer("Don't Save");
-        assert!(close.await, "Don't Save must allow the close");
-
-        assert_eq!(
-            on_disk_duration(dir.path()),
-            100,
-            "Don't Save must not write the file"
-        );
-    }
-
-    /// The wiring test: a dirty panel docked in a REAL workspace makes
-    /// `Workspace::prepare_to_close` (the single funnel for window close,
-    /// quit and restart) prompt and, on Cancel, report `false`.
-    #[gpui::test]
-    async fn test_dirty_panel_vetoes_workspace_prepare_to_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        write_sprite_fixture(dir.path());
-        cx.update(|cx| {
-            AppState::test(cx);
-            init(cx);
-        });
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<SpritePanel>(cx)
-                .expect("init() adds the panel")
-        });
-
-        panel.update(cx, |panel, cx| {
-            panel.root_override = Some(dir.path().to_path_buf());
-            panel.refresh_root(cx);
-            panel.load_rel_path("sprites/hero.spr", cx);
-        });
-        cx.run_until_parked();
-        dirty_the_sprite(&panel, cx);
-
-        let close = workspace.update_in(cx, |workspace, window, cx| {
-            workspace.prepare_to_close(workspace::CloseIntent::CloseWindow, window, cx)
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.has_pending_prompt(),
-            "the docked dirty panel must be polled by Workspace::prepare_to_close"
-        );
-        cx.simulate_prompt_answer("Cancel");
-        assert!(
-            !close.await.unwrap(),
-            "Cancel in the panel guard must cancel the whole close"
-        );
-    }
-
     // ------------------------------------------ explorer-driven routing
 
     /// A fake-fs project with one visible worktree holding the same file
@@ -3689,16 +4208,20 @@ mod tests {
             }
         });
 
+        // Mount the fake worktree AT the real-fs fixture root: interceptors
+        // read rel paths off the worktree, while item-created panels
+        // resolve their project root from the worktree's abs path and then
+        // do real `std::fs` work there -- one path serves both.
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
-            "/proj",
+            root.to_str().expect("utf8 tempdir path"),
             serde_json::json!({
                 "sprites": { "hero.spr": "", "other.spr": "", "hero.til": "" },
                 "notes.txt": "",
             }),
         )
         .await;
-        Project::test(fs, ["/proj".as_ref()], cx).await
+        Project::test(fs, [root], cx).await
     }
 
     fn worktree_id(project: &Entity<Project>, cx: &mut gpui::VisualTestContext) -> WorktreeId {
@@ -3748,20 +4271,22 @@ mod tests {
     /// panel opens NO pane item for it), opens the dock, and loads the
     /// sprite. A non-`.spr` in the same worktree is declined.
     #[gpui::test]
-    async fn test_spr_click_routes_into_the_panel_and_is_claimed(cx: &mut TestAppContext) {
+    async fn test_spr_click_opens_one_item_per_file_and_refocuses(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let project = routed_project(cx, dir.path(), true).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<SpritePanel>(cx)
-                .expect("init() adds the panel")
-        });
-        let root = dir.path().to_path_buf();
-        panel.update(cx, |panel, _| panel.root_override = Some(root));
+
+        let open_rels = |workspace: &Entity<Workspace>, cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                    .map(|item| item.read(cx).rel().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(
@@ -3770,16 +4295,48 @@ mod tests {
                 cx,
             )
         });
-        assert!(claimed, "a .spr must be claimed, suppressing the pane item");
+        assert!(claimed, "a .spr must be claimed, suppressing the raw editor");
         cx.run_until_parked();
+        assert_eq!(open_rels(&workspace, cx), vec!["sprites/hero.spr"]);
 
-        panel.update(cx, |panel, _cx| {
-            assert_eq!(ready(panel).rel_path, "sprites/hero.spr");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "sprites/other.spr"),
+                window,
+                cx,
+            );
         });
+        cx.run_until_parked();
+        assert_eq!(
+            open_rels(&workspace, cx),
+            vec!["sprites/hero.spr", "sprites/other.spr"],
+            "a second sprite opens a second tab"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "sprites/hero.spr"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            open_rels(&workspace, cx).len(),
+            2,
+            "re-opening an open sprite must not duplicate its tab"
+        );
         workspace.read_with(cx, |workspace, cx| {
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "routing must open the panel's dock even if it was closed"
+            let active_rel = workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<sprite_item::SpriteEditorItem>())
+                .map(|item| item.read(cx).rel().to_string());
+            assert_eq!(
+                active_rel.as_deref(),
+                Some("sprites/hero.spr"),
+                "re-open focuses the existing tab"
             );
         });
 
@@ -3891,6 +4448,45 @@ mod tests {
             100,
             "Cancel must not have written the file"
         );
+    }
+
+    /// The prompt's middle path: answering "Save" writes the dirty
+    /// document FIRST and only then proceeds with the open -- the hero
+    /// trio on disk carries the edit, and the panel lands on the new
+    /// sprite clean.
+    #[gpui::test]
+    async fn test_open_rel_path_save_prompt_writes_then_switches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture_named(dir.path(), "other");
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_sprite(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("sprites/other.spr", window, cx)
+            })
+        });
+        assert!(
+            cx.has_pending_prompt(),
+            "switching away from a dirty sprite must prompt first"
+        );
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            500,
+            "\"Save\" must have written the edit before switching"
+        );
+        panel.update(cx, |panel, _cx| {
+            let open = ready(panel);
+            assert_eq!(
+                open.rel_path, "sprites/other.spr",
+                "the open proceeds once the save landed"
+            );
+            assert!(!open.store.dirty(), "the fresh document starts clean");
+        });
     }
 
     /// Clip CRUD round trip through the store: add with ggo-ide's
@@ -4180,38 +4776,26 @@ mod tests {
             {
                 let open = ready(panel);
                 let strip = open.pool_strip.as_ref().expect("picker sheet composed");
-                assert_eq!(strip.tile_count, 2);
-                assert_eq!(
-                    (strip.cols, strip.rows),
-                    (2, 1),
-                    "a 2-tile pool is one row, clamped below PICKER_COLS"
-                );
-                // One sheet, tile 0 then tile 1 side by side: every row is
-                // 16 transparent pixels followed by 16 opaque red ones.
+                // The fixture's tile 0 is all-zero: the picker hides it,
+                // showing ONLY the red tile 1.
+                assert_eq!(strip.tiles, vec![1], "blank tile 0 is not offered");
+                assert_eq!((strip.cols, strip.rows), (1, 1));
                 let sheet = strip.image.as_bytes(0).unwrap();
-                assert_eq!(sheet.len(), 2 * TILE_PX * TILE_PX * 4);
-                for row in sheet.chunks_exact(2 * TILE_PX * 4) {
-                    assert!(
-                        row[..TILE_PX * 4].chunks_exact(4).all(|p| p[3] == 0),
-                        "tile 0 (all index 0) must compose fully transparent"
-                    );
-                    assert!(
-                        row[TILE_PX * 4..]
-                            .chunks_exact(4)
-                            .all(|p| p == [0, 0, 255, 255]),
-                        "tile 1 (palette red) must compose opaque red in BGRA"
-                    );
-                }
-                assert_eq!(open.selected_tile, None);
+                assert_eq!(sheet.len(), TILE_PX * TILE_PX * 4);
+                assert!(
+                    sheet.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
+                    "the sole shown tile composes opaque red in BGRA"
+                );
+                assert_eq!(open.selection, None);
             }
 
             // Selection toggles; stale indices are ignored.
             panel.select_tile(1, cx);
-            assert_eq!(ready(panel).selected_tile, Some(1));
+            assert_eq!(selected_single(panel), Some(1));
             panel.select_tile(1, cx);
-            assert_eq!(ready(panel).selected_tile, None, "re-click deselects");
+            assert_eq!(selected_single(panel), None, "re-click deselects");
             panel.select_tile(9, cx);
-            assert_eq!(ready(panel).selected_tile, None, "stale tile index ignored");
+            assert_eq!(selected_single(panel), None, "stale tile index ignored");
             panel.select_tile(1, cx);
 
             // Guarded clicks leave the store untouched: out-of-range
@@ -4239,7 +4823,7 @@ mod tests {
             // Escape's action body; with nothing selected, clicks stop
             // mutating.
             panel.deselect_tile(cx);
-            assert_eq!(ready(panel).selected_tile, None);
+            assert_eq!(selected_single(panel), None);
             panel.set_tile_on_cell(0, cx);
             assert_eq!(ready(panel).store.state().frames[0].map, vec![1]);
 
@@ -4277,6 +4861,155 @@ mod tests {
         });
     }
 
+    /// Marquee multi-select: press-drag-release over the picker selects a
+    /// BLOCK of tiles (down/move/up through the real handler bodies over
+    /// stamped bounds), and a preview click stamps the whole block through
+    /// ONE `FrameTilesSet` -- a single undo reverts the stamp.
+    #[gpui::test]
+    async fn test_marquee_selects_a_block_and_stamps_it_in_one_undo(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_multi_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Display shows the two NON-blank tiles: pool 1 (red), 2
+            // (green); 1x1 sprite -> 2x1 so the block has room to land.
+            assert_eq!(
+                ready(panel).pool_strip.as_ref().expect("sheet").tiles,
+                vec![1, 2]
+            );
+            panel.step_size(1, 0, cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![0, 0]);
+
+            *ready(panel).picker_bounds.borrow_mut() = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX)),
+            ));
+
+            // Drag across both sheet cells: (0,0) -> (1,0).
+            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_move(gpui::point(px(PICKER_CELL_PX + 2.), px(2.)), cx);
+            panel.on_picker_up(gpui::point(px(PICKER_CELL_PX + 2.), px(2.)), cx);
+            {
+                let open = ready(panel);
+                let block = open.selection.as_ref().expect("marquee selected a block");
+                assert_eq!((block.cols, block.rows), (2, 1));
+                assert_eq!(
+                    block.tiles,
+                    vec![Some(1), Some(2)],
+                    "sheet cells map through the display table to POOL tiles"
+                );
+            }
+
+            // Stamp anchored at cell 0: both cells repoint in one op.
+            panel.set_tile_on_cell(0, cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![1, 2]);
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().frames[0].map,
+                vec![0, 0],
+                "one undo reverts the whole stamp"
+            );
+
+            // Press-release on one cell still toggles a 1x1 selection.
+            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_up(gpui::point(px(2.), px(2.)), cx);
+            assert_eq!(
+                ready(panel).selection.as_ref().and_then(tiles::TileBlock::single),
+                Some(1),
+                "plain click selects the single POOL tile under the cell"
+            );
+            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_up(gpui::point(px(2.), px(2.)), cx);
+            assert!(
+                ready(panel).selection.is_none(),
+                "re-click of the same single tile deselects"
+            );
+        });
+    }
+
+    /// The clip row's "Drop frame" slot: dropping a strip frame appends
+    /// a COPY of it right after the clip's last frame and extends the
+    /// clip's range by one -- the dragged frame itself stays put, and
+    /// its editor-only name travels onto the copy.
+    #[gpui::test]
+    async fn test_dropping_a_frame_on_a_clip_appends_a_copy_and_extends_the_range(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.set_frame_name(0, "idle".to_string(), cx);
+            // Fixture clip "walk" spans 1..=1. Drop frame 0 on its slot.
+            panel.drop_frame_on_clip(0, 0, cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(state.frames.len(), 3, "a copy was appended");
+                assert_eq!(
+                    state.frames[2].map, state.frames[0].map,
+                    "the copy shows the dropped frame"
+                );
+                assert_eq!(
+                    (state.clips[0].from, state.clips[0].to),
+                    (1, 2),
+                    "the clip range now covers the copy"
+                );
+                assert_eq!(open.frame_names, vec!["idle", "", "idle"]);
+            }
+
+            // A stale clip index is a no-op, not a panic.
+            panel.drop_frame_on_clip(9, 0, cx);
+            assert_eq!(ready(panel).store.state().frames.len(), 3);
+        });
+    }
+
+    /// The Eraser tool: toggled on, a preview click blanks the cell
+    /// (one undoable `FrameCellsErase`, allocating the hidden blank tile
+    /// when the pool lacks one); Escape turns it off along with any
+    /// selection; toggling it back off restores stamp behavior.
+    #[gpui::test]
+    async fn test_eraser_blanks_cells_and_escape_clears_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_frame(1, cx); // map [1]
+            panel.toggle_eraser(cx);
+            assert!(ready(panel).eraser);
+
+            *ready(panel).preview_bounds.borrow_mut() = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(240.), px(240.)),
+            ));
+            panel.on_preview_click(gpui::point(px(10.), px(10.)), cx);
+            {
+                let state = ready(panel).store.state();
+                let blanked = state.frames[1].map[0];
+                let off = blanked as usize * TILE_BYTES;
+                assert!(
+                    state.pool[off..off + TILE_BYTES].iter().all(|&b| b == 0),
+                    "the cell now points at a blank tile"
+                );
+            }
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().frames[1].map,
+                vec![1],
+                "one undo reverts the erase"
+            );
+
+            panel.deselect_tile(cx);
+            assert!(!ready(panel).eraser, "Escape's path clears the eraser");
+
+            // Eraser off + a selection: clicks stamp again.
+            panel.select_tile(1, cx);
+            panel.select_frame(0, cx); // map [0]
+            panel.on_preview_click(gpui::point(px(10.), px(10.)), cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![1]);
+        });
+    }
+
     /// The picker's own click path -- the SOURCE half of "click a tile,
     /// then click a frame cell to place it" -- over manually stamped
     /// sheet bounds (the headless panel never paints). The 2-tile fixture
@@ -4289,18 +5022,19 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
+            // Bounds match the REAL sheet: one displayed tile, one cell.
             *ready(panel).picker_bounds.borrow_mut() = Some(gpui::bounds(
                 gpui::point(px(10.), px(20.)),
-                gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX)),
+                gpui::size(px(PICKER_CELL_PX), px(PICKER_CELL_PX)),
             ));
 
-            panel.on_picker_click(gpui::point(px(12.), px(22.)), cx);
-            assert_eq!(ready(panel).selected_tile, Some(0));
+            // The hero fixture's only pickable tile is pool tile 1 (tile
+            // 0 is blank and hidden): sheet cell 0 selects it.
+            panel.on_picker_down(gpui::point(px(12.), px(22.)), cx);
+            panel.on_picker_up(gpui::point(px(12.), px(22.)), cx);
+            assert_eq!(selected_single(panel), Some(1), "first cell = pool tile 1");
 
-            panel.on_picker_click(gpui::point(px(10. + PICKER_CELL_PX), px(22.)), cx);
-            assert_eq!(ready(panel).selected_tile, Some(1), "second cell, tile 1");
-
-            // Placing it is the already-shipped `FrameTileSet` path.
+            // Placing it is the already-shipped tile-set path.
             panel.select_frame(0, cx);
             panel.set_tile_on_cell(0, cx);
             assert_eq!(ready(panel).store.state().frames[0].map, vec![1]);
@@ -4308,11 +5042,590 @@ mod tests {
             assert_eq!(ready(panel).store.state().frames[0].map, vec![0]);
             assert!(!ready(panel).store.dirty());
 
-            // Outside the two tiles: no selection change at all.
-            panel.on_picker_click(gpui::point(px(9.), px(22.)), cx);
-            assert_eq!(ready(panel).selected_tile, Some(1));
-            panel.on_picker_click(gpui::point(px(10. + PICKER_CELL_PX * 2.), px(22.)), cx);
-            assert_eq!(ready(panel).selected_tile, Some(1));
+            // Outside the sheet on either side: no selection change.
+            panel.on_picker_down(gpui::point(px(9.), px(22.)), cx);
+            panel.on_picker_up(gpui::point(px(9.), px(22.)), cx);
+            assert_eq!(selected_single(panel), Some(1));
+            panel.on_picker_down(gpui::point(px(10. + PICKER_CELL_PX + 1.), px(22.)), cx);
+            panel.on_picker_up(gpui::point(px(10. + PICKER_CELL_PX + 1.), px(22.)), cx);
+            assert_eq!(
+                selected_single(panel),
+                Some(1),
+                "a press past the sheet selects nothing new"
+            );
+        });
+    }
+
+    /// The editor sidecar round trip: settings written by an earlier
+    /// session apply at open (picker wrap, frame names), and a save
+    /// writes the current settings back.
+    #[gpui::test]
+    async fn test_editor_sidecar_applies_at_open_and_writes_on_save(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        editor_meta::save(
+            dir.path(),
+            "sprites/hero.spr",
+            &editor_meta::EditorMeta {
+                picker_cols: Some(1),
+                frame_names: vec!["walk-a".to_string(), "walk-b".to_string()],
+            },
+        )
+        .unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                assert_eq!(open.picker_cols, 1, "sidecar wrap applied at open");
+                let strip = open.pool_strip.as_ref().expect("sheet");
+                assert_eq!(strip.cols, 1, "sheet composed at the sidecar wrap");
+                assert_eq!(open.frame_names, vec!["walk-a", "walk-b"]);
+            }
+
+            panel.set_frame_name(0, "idle".to_string(), cx);
+            panel.step_picker_cols(1, cx);
+            panel.save_impl(cx);
+        });
+        let meta = editor_meta::load(dir.path(), "sprites/hero.spr");
+        assert_eq!(meta.picker_cols, Some(2));
+        assert_eq!(meta.frame_names, vec!["idle", "walk-b"]);
+    }
+
+    /// Frame names stay index-parallel to the strip across every frame
+    /// op: add appends unnamed, duplicate copies the name, delete
+    /// removes, and a drag move reorders.
+    #[gpui::test]
+    async fn test_frame_names_follow_frame_ops(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.set_frame_name(0, "a".to_string(), cx);
+            panel.set_frame_name(1, "b".to_string(), cx);
+
+            panel.add_blank_frame(cx);
+            assert_eq!(ready(panel).frame_names, vec!["a", "b", ""]);
+
+            panel.select_frame(0, cx);
+            panel.duplicate_selected_frame(cx);
+            assert_eq!(ready(panel).frame_names, vec!["a", "a", "b", ""]);
+
+            panel.delete_selected_frame(cx);
+            assert_eq!(ready(panel).frame_names, vec!["a", "b", ""]);
+
+            panel.move_frame_to(0, 2, cx);
+            assert_eq!(ready(panel).frame_names, vec!["b", "", "a"]);
+            assert_eq!(
+                ready(panel).store.state().frames[2].map,
+                vec![0],
+                "the moved frame's map traveled with it"
+            );
+        });
+    }
+
+    /// The name-frame form's UI path end to end: `begin_name_frame` opens
+    /// the form with an EMPTY editor for an unnamed frame (seeding the
+    /// "Frame N" fallback would commit it as a literal name), and
+    /// `confirm_name_frame` lands the typed name in `frame_names`, closes
+    /// the form, and writes the sidecar -- the only persistence frame
+    /// names have (the `.spr` has no name field).
+    #[gpui::test]
+    async fn test_name_frame_form_commits_through_the_ui_path(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = SpritePanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("sprites/hero.spr", cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.begin_name_frame(0, window, cx);
+            let Some(PanelForm::NameFrame { index, editor }) = &panel.form else {
+                panic!("begin_name_frame must open the name form");
+            };
+            assert_eq!(*index, 0);
+            assert_eq!(editor.read(cx).text(cx), "", "an unnamed frame seeds empty");
+            editor
+                .clone()
+                .update(cx, |editor, cx| editor.set_text("idle", window, cx));
+            panel.confirm_name_frame(cx);
+        });
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(ready(panel).frame_names[0], "idle");
+            assert!(panel.form.is_none(), "the commit closes the form");
+        });
+        assert_eq!(
+            editor_meta::load(dir.path(), "sprites/hero.spr").frame_names,
+            vec!["idle"],
+            "the name landed in the sidecar"
+        );
+    }
+
+    /// The W/H steppers' body: each step applies `DocOp::Resize` with a
+    /// top-left anchor through `apply_doc` (undo/redo and recompose come
+    /// with it), clamped to worldlib's 1..=16 tile range -- at-bound
+    /// steps are dropped without an op.
+    #[gpui::test]
+    async fn test_size_steppers_resize_the_sprite_with_undo_and_clamps(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Grow the 1x1 fixture to 2x1: every frame map gains a cell.
+            panel.step_size(1, 0, cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!((state.w_tiles, state.h_tiles), (2, 1));
+                assert_eq!(state.frames[0].map.len(), 2);
+                assert!(open.store.dirty());
+            }
+
+            // Undo restores the old grid in one step.
+            panel.undo_impl(cx);
+            {
+                let state = ready(panel).store.state();
+                assert_eq!((state.w_tiles, state.h_tiles), (1, 1));
+                assert_eq!(state.frames[0].map.len(), 1);
+                assert!(!ready(panel).store.dirty());
+            }
+
+            // Min clamp: shrinking a 1-tile side is a no-op, not an error.
+            panel.step_size(-1, 0, cx);
+            panel.step_size(0, -1, cx);
+            assert!(!ready(panel).store.dirty(), "at-min steps drop the op");
+
+            // Max clamp: walk height to 16, then one more step no-ops.
+            for _ in 0..15 {
+                panel.step_size(0, 1, cx);
+            }
+            assert_eq!(ready(panel).store.state().h_tiles, 16);
+            panel.step_size(0, 1, cx);
+            assert_eq!(
+                ready(panel).store.state().h_tiles,
+                16,
+                "at-max step drops the op"
+            );
+        });
+    }
+
+    /// The picker-cols stepper: `picker_cols` starts at the
+    /// [`loader::PICKER_COLS`] default, each step recomposes the sheet at
+    /// the new wrap (clamped at 1), and the setting survives a doc edit's
+    /// wholesale pool-strip recompose.
+    #[gpui::test]
+    async fn test_picker_cols_stepper_rewraps_the_sheet(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_multi_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Two pickable tiles at the default 4-col setting: one row.
+            {
+                let strip = ready(panel).pool_strip.as_ref().expect("sheet");
+                assert_eq!((strip.cols, strip.rows), (2, 1));
+            }
+
+            // Step down to 1 column: the 2 tiles wrap onto 2 rows.
+            for _ in 0..3 {
+                panel.step_picker_cols(-1, cx);
+            }
+            {
+                let open = ready(panel);
+                assert_eq!(open.picker_cols, 1);
+                let strip = open.pool_strip.as_ref().expect("sheet");
+                assert_eq!((strip.cols, strip.rows), (1, 2));
+            }
+
+            // Min clamp.
+            panel.step_picker_cols(-1, cx);
+            assert_eq!(ready(panel).picker_cols, 1, "cols clamp at 1");
+
+            // A doc edit recomposes the strip wholesale -- at the chosen
+            // wrap, not the default.
+            panel.select_tile(1, cx);
+            panel.set_tile_on_cell(0, cx);
+            {
+                let strip = ready(panel).pool_strip.as_ref().expect("sheet");
+                assert_eq!(
+                    (strip.cols, strip.rows),
+                    (1, 2),
+                    "picker_cols survives refresh_after_doc_change"
+                );
+            }
+        });
+    }
+
+    /// The full RENDERED click path -- the one every other tile test
+    /// bypasses by stamping bounds by hand: draw the panel in a real test
+    /// window (the overlay canvases record picker/preview bounds at
+    /// prepaint), then drive platform mouse events at those bounds. A
+    /// picker click must select the tile under the cursor and a preview
+    /// click must repoint the selected frame's cell through the same
+    /// listeners a user's clicks go through.
+    #[gpui::test]
+    async fn test_rendered_clicks_select_a_tile_and_repoint_the_cell(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = SpritePanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("sprites/hero.spr", cx);
+        });
+        cx.run_until_parked();
+
+        let picker = panel
+            .read_with(cx, |panel, _| *ready(panel).picker_bounds.borrow())
+            .expect("picker bounds recorded at prepaint");
+        // The sheet's sole cell: pool tile 1 (blank tile 0 is hidden).
+        let target = picker.origin + gpui::point(px(PICKER_CELL_PX / 2.), px(PICKER_CELL_PX / 2.));
+        cx.simulate_mouse_move(target, None, gpui::Modifiers::default());
+        // Full press-release: selection resolves on mouse-up now that a
+        // held press is a marquee in flight.
+        cx.simulate_click(target, gpui::Modifiers::default());
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                selected_single(panel),
+                Some(1),
+                "rendered picker click selects the tile under the cursor"
+            );
+        });
+
+        let preview = panel
+            .read_with(cx, |panel, _| *ready(panel).preview_bounds.borrow())
+            .expect("preview bounds recorded at prepaint");
+        cx.simulate_mouse_down(
+            preview.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).store.state().frames[0].map,
+                vec![1],
+                "rendered preview click repoints frame 0's sole cell"
+            );
+        });
+    }
+
+    /// The clip-name editor for clip 0, out of the rendered panel's
+    /// editor set (built by `ensure_editors` on first draw).
+    fn clip_name_editor(
+        panel: &gpui::Entity<SpritePanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> gpui::Entity<Editor> {
+        panel.read_with(cx, |panel, _| {
+            ready(panel)
+                .editors
+                .iter()
+                .find(|e| e.target == EditTarget::ClipName(0))
+                .expect("the rendered panel has a clip-name editor")
+                .editor
+                .clone()
+        })
+    }
+
+    /// The space keybinding's `not_editing` guard, end to end through
+    /// real keystroke dispatch: with the panel focused, space toggles the
+    /// transport on and off again; with a clip-name editor focused, the
+    /// `editing` stamp in [`SpritePanel::dispatch_context`] keeps the
+    /// panel-depth binding from matching, so playback must NOT start and
+    /// the editor must receive the space as plain text.
+    #[gpui::test]
+    async fn test_space_keystroke_toggles_playback_only_when_not_editing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("space");
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert!(open.playing.is_some(), "space starts the transport");
+            assert!(open._tick_task.is_some(), "the tick loop is armed");
+        });
+        cx.simulate_keystrokes("space");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                ready(panel).playing.is_none(),
+                "space again stops the transport"
+            );
+        });
+
+        let editor = clip_name_editor(&panel, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        // The focus subscription notifies; the re-render re-reads
+        // `dispatch_context` and stamps `editing`.
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("space");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                ready(panel).playing.is_none(),
+                "space while a field editor is focused must not start playback"
+            );
+        });
+        let text = editor.read_with(cx, |editor, cx| editor.text(cx));
+        assert!(
+            text.contains(' ') && text.trim() == "walk",
+            "the space fell through to the editor as text, got {text:?}"
+        );
+    }
+
+    /// Ctrl-z / ctrl-shift-z through real keystroke dispatch step a real
+    /// edit back and forward (the `KEY_CONTEXT`-scoped Undo/Redo
+    /// bindings reach `undo_impl`/`redo_impl`).
+    #[gpui::test]
+    async fn test_undo_redo_keystrokes_step_a_real_edit(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+            panel.commit_edit(EditTarget::Duration, "40".into(), cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(ready(panel).store.state().frames[0].duration_ms, 40);
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(
+                open.store.state().frames[0].duration_ms,
+                100,
+                "ctrl-z undoes the duration edit"
+            );
+            assert!(!open.store.dirty(), "undo back to the saved state");
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-z");
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(
+                open.store.state().frames[0].duration_ms,
+                40,
+                "ctrl-shift-z redoes it"
+            );
+            assert!(open.store.dirty());
+        });
+    }
+
+    /// Ctrl-s through real keystroke dispatch runs the save: the store
+    /// goes clean and the `.spr` on disk carries the edit.
+    #[gpui::test]
+    async fn test_ctrl_s_keystroke_writes_the_sprite_to_disk(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+            panel.commit_edit(EditTarget::Duration, "40".into(), cx);
+        });
+        assert_eq!(on_disk_duration(dir.path()), 100, "not saved yet");
+
+        cx.simulate_keystrokes("ctrl-s");
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert!(!open.store.dirty(), "ctrl-s saves the document");
+            assert!(open.save_error.is_none());
+        });
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            40,
+            "the edit reached the file on disk"
+        );
+    }
+
+    /// Escape through real keystroke dispatch clears the active tile
+    /// selection AND the eraser flag (the `DeselectTile` binding's
+    /// click-doesn't-mutate affordance).
+    #[gpui::test]
+    async fn test_escape_keystroke_clears_selection_and_eraser(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+            panel.select_tile(1, cx);
+            panel.toggle_eraser(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(selected_single(panel), Some(1));
+            assert!(ready(panel).eraser);
+        });
+
+        cx.simulate_keystrokes("escape");
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert!(open.selection.is_none(), "escape drops the tile selection");
+            assert!(!open.eraser, "escape clears the eraser flag");
+        });
+    }
+
+    /// The transport at panel level: `toggle_play` arms the tick loop,
+    /// a real tick (driven by advancing the test executor's clock across
+    /// the parked [`TICK`] timer) recomputes the shown frame, and
+    /// `toggle_play` again drops the loop and falls back to the
+    /// selection. The transport is wall-clock anchored and a parked
+    /// test's wall clock barely moves, so the test seeds
+    /// `start_offset_ms` into frame 1's window (100..300ms) and lets the
+    /// REAL tick path do the recompute.
+    #[gpui::test]
+    async fn test_toggle_play_runs_the_transport_and_advances_on_ticks(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| panel.toggle_play(cx));
+        // Let the tick loop start and park on its first timer.
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.playing.is_some(), "toggle_play starts the transport");
+            assert!(open._tick_task.is_some(), "the tick task is armed");
+            assert_eq!(open.shown_frame(), 0, "playback starts on the selection");
+            open.playing
+                .as_mut()
+                .expect("checked playing above")
+                .start_offset_ms += 150;
+        });
+
+        cx.executor().advance_clock(TICK);
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).shown_frame(),
+                1,
+                "the tick recomputed the shown frame from elapsed time"
+            );
+        });
+
+        panel.update(cx, |panel, cx| panel.toggle_play(cx));
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert!(open.playing.is_none(), "toggle_play again stops it");
+            assert!(open._tick_task.is_none(), "the tick loop is dropped");
+            assert_eq!(open.shown_frame(), 0, "the preview falls back to the selection");
+        });
+    }
+
+    /// Rendered strip drag-reorder, through gpui's real drag machinery:
+    /// mouse-down on frame 0's cell, drag onto frame 1's cell (the
+    /// `debug_selector` bounds), release -- `DocOp::FrameMove` lands
+    /// (frames swap, the editor-only names travel, the moved frame stays
+    /// selected) and a single undo restores the strip, proving it was
+    /// ONE op.
+    #[gpui::test]
+    async fn test_rendered_strip_drag_reorders_frames(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_frame_name(0, "walk-a".into(), cx);
+            panel.set_frame_name(1, "walk-b".into(), cx);
+        });
+        cx.run_until_parked();
+
+        let cell0 = cx
+            .debug_bounds("ggo-sprite-frame-0")
+            .expect("frame 0's strip cell is painted");
+        let cell1 = cx
+            .debug_bounds("ggo-sprite-frame-1")
+            .expect("frame 1's strip cell is painted");
+
+        cx.simulate_mouse_move(cell0.center(), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(cell0.center(), MouseButton::Left, gpui::Modifiers::default());
+        // The first held move (past the 2px threshold) starts the drag
+        // and refreshes; the second hovers frame 1's freshly painted
+        // hitbox so the release lands on its drop listener.
+        cx.simulate_mouse_move(cell1.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(cell1.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(cell1.center(), MouseButton::Left, gpui::Modifiers::default());
+
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            let state = open.store.state();
+            assert_eq!(
+                state.frames[0].map,
+                vec![1],
+                "the drop moved frame 0 past frame 1"
+            );
+            assert_eq!(state.frames[0].duration_ms, 200);
+            assert_eq!(state.frames[1].map, vec![0]);
+            assert_eq!(state.frames[1].duration_ms, 100);
+            assert_eq!(
+                open.frame_names,
+                ["walk-b", "walk-a"],
+                "the editor-only names traveled with the frames"
+            );
+            assert_eq!(open.selected_frame, 1, "the moved frame stays selected");
+            assert!(open.store.dirty());
+        });
+
+        panel.update(cx, |panel, cx| panel.undo_impl(cx));
+        panel.read_with(cx, |panel, _| {
+            let state = ready(panel).store.state();
+            assert_eq!(
+                (state.frames[0].duration_ms, state.frames[1].duration_ms),
+                (100, 200),
+                "one undo restores the order => the drop was a single FrameMove"
+            );
+        });
+    }
+
+    /// Enter ([`CommitField`], bound at `KEY_CONTEXT > Editor`) on a
+    /// focused clip-name editor commits the typed text into the doc.
+    #[gpui::test]
+    async fn test_enter_commits_a_focused_clip_name_editor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        let editor = clip_name_editor(&panel, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+            editor.set_text("", window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("r u n enter");
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(
+                open.store.state().clips[0].name,
+                "run",
+                "enter commits the typed clip name"
+            );
+            assert!(open.store.dirty());
         });
     }
 
@@ -4329,16 +5642,17 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            // Tile 0 active; frame 0 selected (map [0] -- a click on it
-            // would be a same-tile no-op); the transport is showing
-            // frame 1 (map [1]).
-            panel.select_tile(0, cx);
+            // Tile 1 active (the only pickable tile -- 0 is blank and
+            // hidden); frame 1 selected (map [1] -- a click on it would
+            // be a same-tile no-op); the transport is showing frame 0
+            // (map [0]).
+            panel.select_tile(1, cx);
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.selected_frame = 0;
+                open.selected_frame = 1;
                 open.playing = Some(Playing {
                     started: Instant::now(),
                     start_offset_ms: 0,
-                    frame: 1,
+                    frame: 0,
                 });
                 // Arm a (dummy) tick task so the drop assertion below
                 // is not vacuously true.
@@ -4355,31 +5669,31 @@ mod tests {
                 assert!(open.playing.is_none(), "the click pauses the transport");
                 assert!(open._tick_task.is_none(), "the tick loop is dropped");
                 assert_eq!(
-                    open.selected_frame, 1,
+                    open.selected_frame, 0,
                     "selection adopts the transport's shown frame"
                 );
                 assert_eq!(
-                    open.store.state().frames[1].map,
-                    vec![0],
+                    open.store.state().frames[0].map,
+                    vec![1],
                     "the edit hit the DISPLAYED frame"
                 );
                 assert_eq!(
-                    open.store.state().frames[0].map,
-                    vec![0],
+                    open.store.state().frames[1].map,
+                    vec![1],
                     "the stale pre-playback selection is untouched"
                 );
-                assert_eq!(open.shown_frame(), 1, "preview stays on the edited frame");
+                assert_eq!(open.shown_frame(), 0, "preview stays on the edited frame");
             }
 
             // Not playing: the same click path edits the selected frame
             // directly (undo the playback edit first so the cell click
             // isn't a same-tile drop).
             panel.undo_impl(cx);
-            panel.select_frame(1, cx);
+            panel.select_frame(0, cx);
             panel.on_preview_click(gpui::point(px(10.), px(10.)), cx);
             assert_eq!(
-                ready(panel).store.state().frames[1].map,
-                vec![0],
+                ready(panel).store.state().frames[0].map,
+                vec![1],
                 "a click with no transport running still edits the selected frame"
             );
         });
@@ -4432,6 +5746,36 @@ mod tests {
                 assert!(open.store.dirty(), "undo past the save point re-dirties");
             }
         });
+    }
+
+    /// A failed write must leave the document recoverable: `save_error`
+    /// surfaced, `dirty` STILL set -- `set_saved_state` only on success --
+    /// so the close guards keep protecting the edits, and the file on
+    /// disk untouched.
+    #[gpui::test]
+    async fn test_save_failure_keeps_the_document_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        // A root pointing at a regular FILE makes `save_sprite`'s
+        // create-parent-dirs step fail deterministically, where a merely
+        // missing directory would just be created.
+        let bad_root = dir.path().join("sprites/hero.spr");
+        panel.update(cx, |panel, cx| {
+            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.root = bad_root;
+            }
+            panel.save_impl(cx);
+            let open = ready(panel);
+            assert!(open.save_error.is_some(), "the failure must be surfaced");
+            assert!(open.store.dirty(), "a failed save must not clear dirty");
+        });
+        assert_eq!(
+            on_disk_duration(dir.path()),
+            100,
+            "the failed save must not have written the sprite"
+        );
     }
 
     // ------------------------------------------------- asset-root resolution
@@ -4671,11 +6015,11 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<SpritePanel>(cx)
-                .expect("init() adds the panel")
-        });
+        // Dock era over: tests that drive panel methods directly get a
+        // standalone entity (menu handlers create their own item panels,
+        // which resolve the same root through the worktree).
+        let weak = workspace.downgrade();
+        let panel = cx.update(|_, cx| cx.new(|cx| SpritePanel::new(Some(weak), cx)));
         let root = root.to_path_buf();
         panel.update(cx, |panel, _| panel.root_override = Some(root));
         (workspace, panel, worktree_id, cx)
@@ -4692,6 +6036,46 @@ mod tests {
             panel.load_rel_path(rel, cx);
         });
         cx.run_until_parked();
+    }
+
+    /// The panel inside the newest `SpriteEditorItem` -- where the menu
+    /// handlers land their forms and documents now that the dock is gone.
+    fn newest_item_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<SpritePanel> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                .last()
+                .expect("a menu handler should have opened an item")
+                .read(cx)
+                .panel()
+                .clone()
+        })
+    }
+
+    /// Open (or focus) the item for `rel` through the production entry
+    /// plumbing and hand back its inner panel, loaded and parked.
+    fn item_panel_for(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        rel: &str,
+    ) -> Entity<SpritePanel> {
+        let handler =
+            sprite_item_entry_handler(workspace.downgrade(), Some(rel.to_string()), |_, _, _| {});
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let rel = rel.to_string();
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                .find(|item| item.read(cx).rel() == rel)
+                .expect("the entry handler opened an item for the rel")
+                .read(cx)
+                .panel()
+                .clone()
+        })
     }
 
     /// The file entries are offered for a `.spr` and for NOTHING else --
@@ -4830,8 +6214,8 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+        let (workspace, _panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        let panel = item_panel_for(&workspace, cx, "sprites/hero.spr");
 
         let handler = delete_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
         cx.update(|window, cx| handler(window, cx));
@@ -4862,8 +6246,8 @@ mod tests {
     #[gpui::test]
     async fn test_delete_sprite_prompt_names_unsaved_edits(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+        let (workspace, _panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        let panel = item_panel_for(&workspace, cx, "sprites/hero.spr");
         dirty_the_sprite(&panel, cx);
 
         // A different sprite, while the OPEN one is dirty: those edits are
@@ -4898,8 +6282,8 @@ mod tests {
     #[gpui::test]
     async fn test_duplicate_sprite_copies_the_live_document_not_the_disk(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "sprites/hero.spr");
+        let (workspace, _panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        let panel = item_panel_for(&workspace, cx, "sprites/hero.spr");
         dirty_the_sprite(&panel, cx);
         assert_eq!(on_disk_duration(dir.path()), 100, "the edit is unsaved");
 
@@ -5023,11 +6407,9 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<SpritePanel>(cx)
-                .expect("init() adds the panel")
-        });
+        // Standalone panel: see `menu_workspace`'s note.
+        let weak = workspace.downgrade();
+        let panel = cx.update(|_, cx| cx.new(|cx| SpritePanel::new(Some(weak), cx)));
         let root = root.to_path_buf();
         panel.update(cx, |panel, _| panel.root_override = Some(root));
         // The inline "New Sprite…"/"New Metasprite…" entries seed the
@@ -5125,18 +6507,21 @@ mod tests {
     /// who never touches the dropdown takes. Deliberate: that default is
     /// the thing fix round 1 BLOCKING 1 was about, so every caller of
     /// this helper is asserting what an untouched dropdown binds to.
+    /// Returns the ITEM panel that hosted the form and now holds the
+    /// created document (the handler opens a fresh empty item per "New").
     fn new_via_menu(
         workspace: &Entity<Workspace>,
-        panel: &Entity<SpritePanel>,
         kind: NewKind,
         dir_rel: &str,
         dir_abs: std::path::PathBuf,
         name: &str,
         cx: &mut gpui::VisualTestContext,
-    ) {
+    ) -> Entity<SpritePanel> {
         name_inline(workspace, kind, dir_rel, dir_abs, name, cx);
+        let panel = newest_item_panel(workspace, cx);
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
+        panel
     }
 
     /// "New Sprite…" writes a real, BOUND `.spr`: it round-trips through
@@ -5150,10 +6535,10 @@ mod tests {
     async fn test_new_sprite_creates_a_bound_single_frame_sprite(cx: &mut TestAppContext) {
         let dir = emerald_with_tileset();
         let assets = dir.path().join("assets");
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        // Naming inline opens the form with the project's tilesets and
-        // writes nothing.
+        // Naming inline opens the form (on a fresh item's panel) with the
+        // project's tilesets and writes nothing.
         name_inline(
             &workspace,
             NewKind::Sprite,
@@ -5162,6 +6547,7 @@ mod tests {
             "hero_idle",
             cx,
         );
+        let panel = newest_item_panel(&workspace, cx);
         panel.update(cx, |panel, _| {
             let Some(PanelForm::New {
                 kind,
@@ -5222,16 +6608,18 @@ mod tests {
             assert!(!open.store.dirty(), "creating it is not an unsaved edit");
             let strip = open.pool_strip.as_ref().expect("picker sheet composed");
             assert_eq!(
-                strip.tile_count, FIXTURE_TILES,
-                "the picker offers the bound tileset's tiles"
+                strip.tiles,
+                vec![1, 2],
+                "the picker offers the bound tileset's non-blank tiles \
+                 (fixture tile 0 is all index 0 -> hidden)"
             );
             assert!(panel.form.is_none(), "the form closes on Create");
         });
 
-        // A second sprite with its own name lands beside the first.
-        new_via_menu(
+        // A second sprite with its own name lands beside the first, in its
+        // own item.
+        let second = new_via_menu(
             &workspace,
-            &panel,
             NewKind::Sprite,
             "assets/sprites",
             assets.join("sprites"),
@@ -5239,7 +6627,7 @@ mod tests {
             cx,
         );
         assert!(assets.join("sprites/hero_run.spr").is_file());
-        panel.update(cx, |panel, _| {
+        second.update(cx, |panel, _| {
             assert_eq!(ready(panel).source_rel, "assets/sprites/hero_run.spr");
         });
     }
@@ -5252,11 +6640,10 @@ mod tests {
     async fn test_new_metasprite_seeds_frames_and_a_first_clip(cx: &mut TestAppContext) {
         let dir = emerald_with_tileset();
         let assets = dir.path().join("assets");
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        new_via_menu(
+        let panel = new_via_menu(
             &workspace,
-            &panel,
             NewKind::Metasprite,
             "assets",
             assets.clone(),
@@ -5303,16 +6690,19 @@ mod tests {
         let assets = dir.path().join("assets");
         let before_til = std::fs::read(assets.join("tiles/world.til")).unwrap();
         let before_pal = std::fs::read(assets.join("tiles/world.pal")).unwrap();
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
         new_via_menu(
             &workspace,
-            &panel,
             NewKind::Sprite,
             "assets/sprites",
             assets.join("sprites"),
             "fresh",
             cx,
+        );
+        assert!(
+            assets.join("sprites/fresh.spr").is_file(),
+            "the form's Create actually wrote the sprite"
         );
 
         assert_eq!(
@@ -5326,22 +6716,19 @@ mod tests {
         );
     }
 
-    /// **The M2 lesson, structurally.** "New …" runs the unsaved-edits
-    /// guard BEFORE it opens the form, and the form is the only thing that
-    /// writes -- so a Cancel at the prompt leaves no orphaned file, no
-    /// form, and the dirty document exactly as it was.
+    /// Per-file tabs retire the M2 displacement guard: "New …" opens its
+    /// form on a FRESH item, so a dirty sprite in another tab is never at
+    /// stake -- no prompt, no writes to it, its edits untouched.
     #[gpui::test]
-    async fn test_new_sprite_cancel_with_a_dirty_document_writes_nothing(cx: &mut TestAppContext) {
+    async fn test_new_sprite_leaves_a_dirty_open_sprite_untouched(cx: &mut TestAppContext) {
         let dir = emerald_with_tileset();
         let assets = dir.path().join("assets");
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "assets/sprites/hero.spr");
-        panel.update(cx, |panel, cx| {
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let hero = item_panel_for(&workspace, cx, "assets/sprites/hero.spr");
+        hero.update(cx, |panel, cx| {
             assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
         });
 
-        // Naming happens in the project panel's inline editor and writes
-        // nothing; the guard fires when the name is COMMITTED.
         name_inline(
             &workspace,
             NewKind::Sprite,
@@ -5350,23 +6737,16 @@ mod tests {
             "fresh",
             cx,
         );
-        assert_eq!(
-            cx.pending_prompt().map(|(msg, _)| msg),
-            Some(
-                "assets/sprites/hero.spr contains unsaved edits. Do you want to save it?"
-                    .to_string()
-            ),
-            "creating a sprite while the open one is dirty must prompt FIRST"
+        assert!(
+            !cx.has_pending_prompt(),
+            "the form opens in its own tab; the dirty sprite is not displaced"
         );
-        cx.simulate_prompt_answer("Cancel");
+        let form_panel = newest_item_panel(&workspace, cx);
+        cx.update(|window, cx| form_panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
         cx.run_until_parked();
 
-        assert!(
-            !assets.join("sprites/fresh.spr").exists(),
-            "Cancel must not leave a file behind"
-        );
-        panel.update(cx, |panel, _| {
-            assert!(panel.form.is_none(), "and no form is left open");
+        assert!(assets.join("sprites/fresh.spr").is_file());
+        hero.update(cx, |panel, _| {
             let open = ready(panel);
             assert_eq!(open.source_rel, "assets/sprites/hero.spr");
             assert!(open.store.dirty(), "the edits stay put");
@@ -5378,7 +6758,7 @@ mod tests {
                 .frames[0]
                 .duration_ms,
             100,
-            "and nothing was written for them either"
+            "and nothing was written for them"
         );
     }
 
@@ -5432,7 +6812,7 @@ mod tests {
     async fn test_new_sprite_form_defaults_to_an_unshared_tileset(cx: &mut TestAppContext) {
         let dir = emerald_with_tileset();
         let assets = dir.path().join("assets");
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
         name_inline(
             &workspace,
@@ -5442,6 +6822,7 @@ mod tests {
             "fresh",
             cx,
         );
+        let panel = newest_item_panel(&workspace, cx);
         panel.update(cx, |panel, _| {
             let Some(PanelForm::New {
                 tilesets, selected, ..
@@ -5486,75 +6867,6 @@ mod tests {
         );
     }
 
-    /// **Fix round 1, BLOCKING 2.** The viewer stays live under the form
-    /// bar, so an edit made AFTER the form opened must still be guarded --
-    /// the form-open guard is too early to see it. Cancelling keeps the
-    /// edit, the old document, and the form; Don't-Save discards it and
-    /// goes through.
-    #[gpui::test]
-    async fn test_edits_made_while_the_new_form_is_open_are_guarded(cx: &mut TestAppContext) {
-        let dir = emerald_with_tileset();
-        let assets = dir.path().join("assets");
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "assets/sprites/hero.spr");
-
-        // Open the form CLEAN -- no prompt at this point by construction.
-        name_inline(
-            &workspace,
-            NewKind::Sprite,
-            "assets/sprites",
-            assets.join("sprites"),
-            "fresh",
-            cx,
-        );
-        assert!(!cx.has_pending_prompt(), "a clean document must not prompt");
-
-        // ...then edit the still-live document under the form.
-        panel.update(cx, |panel, cx| {
-            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
-        });
-
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
-        assert_eq!(
-            cx.pending_prompt().map(|(msg, _)| msg),
-            Some(
-                "assets/sprites/hero.spr contains unsaved edits. Do you want to save it?"
-                    .to_string()
-            ),
-            "Create must not replace the document without asking"
-        );
-        cx.simulate_prompt_answer("Cancel");
-        cx.run_until_parked();
-
-        assert!(
-            !assets.join("sprites/fresh.spr").exists(),
-            "Cancel writes nothing"
-        );
-        panel.update(cx, |panel, _| {
-            assert!(panel.form.is_some(), "the form stays open to retry");
-            let open = ready(panel);
-            assert_eq!(open.source_rel, "assets/sprites/hero.spr");
-            assert!(open.store.dirty(), "and the edit is still there");
-        });
-
-        // Going through with Save writes the edit before replacing.
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
-        cx.simulate_prompt_answer("Save");
-        cx.run_until_parked();
-        assert_eq!(
-            open_sprite(&assets, "sprites/hero.spr")
-                .unwrap()
-                .state
-                .frames[0]
-                .duration_ms,
-            500,
-            "the edit made under the form was saved, not discarded"
-        );
-        panel.update(cx, |panel, _| {
-            assert_eq!(ready(panel).source_rel, "assets/sprites/fresh.spr");
-        });
-    }
-
     /// Binding to a `.til` with no readable `.pal` adopts worldlib's
     /// 16-gray fallback and `save_sprite` writes it -- so creating the
     /// sprite also creates the missing `.pal`. Wanted (a sprite needs a
@@ -5568,11 +6880,10 @@ mod tests {
         let dir = emerald_with_tileset();
         let assets = dir.path().join("assets");
         std::fs::remove_file(assets.join("tiles/world.pal")).unwrap();
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
         new_via_menu(
             &workspace,
-            &panel,
             NewKind::Sprite,
             "assets/sprites",
             assets.join("sprites"),
@@ -5633,8 +6944,8 @@ mod tests {
     ) {
         let dir = emerald_with_tileset();
         let assets = dir.path().join("assets");
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "assets/sprites/hero.spr");
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let panel = item_panel_for(&workspace, cx, "assets/sprites/hero.spr");
 
         let handler =
             rename_sprite_handler(workspace.downgrade(), "assets/sprites/hero.spr".to_string());
@@ -5702,11 +7013,13 @@ mod tests {
         let dir = emerald_with_tileset();
         let assets = dir.path().join("assets");
         write_sprite_fixture_at(&assets, "sprites/other");
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
         let handler =
             rename_sprite_handler(workspace.downgrade(), "assets/sprites/hero.spr".to_string());
         cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let panel = newest_item_panel(&workspace, cx);
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
                 let Some(PanelForm::Rename { editor, .. }) = &panel.form else {

@@ -966,6 +966,106 @@ mod tests {
         });
     }
 
+    /// REAL root discovery, with no `root_override`: the panel wired into a
+    /// workspace whose (fake) worktree is mounted AT the real-fs fixture
+    /// root must find that root through `set_active`'s deferred
+    /// `refresh_root` -- the branch every other test bypasses -- and then
+    /// load the fixture through it to Ready.
+    #[gpui::test]
+    async fn test_set_active_discovers_the_root_through_the_workspace(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_tileset_fixture(dir.path(), "world");
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+
+        // Mount the fake worktree AT the real-fs fixture root (the
+        // `ggo_sprite_panel::routed_project` trick): the workspace hands the
+        // panel this abs path as its root, and the loader then does real
+        // `std::fs` work there -- one path serves both.
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            dir.path().to_str().expect("utf8 tempdir path"),
+            serde_json::json!({ "tiles": { "world.til": "" } }),
+        )
+        .await;
+        let project = Project::test(fs, [dir.path()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<TilesetPanel>(cx)
+                .expect("init() adds the panel")
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.root_override.is_none(), "discovery must be real");
+            assert!(
+                panel.project_root.is_none(),
+                "no root before the panel is first activated"
+            );
+            panel.set_active(true, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.project_root.is_some(),
+                "set_active's deferred refresh must discover the worktree root"
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("tiles/world.til", window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).rel_path,
+                "tiles/world.til",
+                "the discovered root must be the one the loader reads from"
+            );
+        });
+    }
+
+    /// Two loads issued back to back: whatever order the executor completes
+    /// them in (hence the iterations), the SECOND is the one that must land
+    /// -- a completed stale first load can never overwrite it.
+    #[gpui::test(iterations = 10)]
+    async fn test_a_stale_load_is_dropped_by_the_generation_guard(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_tileset_fixture(dir.path(), "world");
+        write_tileset_fixture(dir.path(), "other");
+        let root = dir.path().to_path_buf();
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = TilesetPanel::new(None, cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("tiles/world.til", cx);
+            panel.load_rel_path("tiles/other.til", cx);
+            assert!(
+                matches!(&panel.state, ViewerState::Loading { rel_path } if rel_path == "tiles/other.til"),
+                "the second load owns the Loading state immediately"
+            );
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                ready(panel).rel_path,
+                "tiles/other.til",
+                "the superseded first load must never win, whichever finishes last"
+            );
+        });
+    }
+
     /// Sanity: the fixture really is on disk in the format worldlib reads
     /// back (guards the test fixture itself, mirroring worldlib's own
     /// `save_tileset` round-trip).

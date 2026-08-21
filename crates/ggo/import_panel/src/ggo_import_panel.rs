@@ -7,12 +7,14 @@
 //! `ggo_map_panel`. Nothing in the fork paints pixels; this panel is where
 //! pixels arrive.
 //!
-//! **Tileset-only, by explicit user decision.** ggo-ide's `ImportWizard.tsx`
-//! had three modes (Tileset / Sprite / Metasprite); only Tileset is ported.
-//! Frames are assembled from imported TILES in the sprite panel, never
-//! sliced out of a PNG, so `import::sprite_import` -- which exists in
-//! worldlib and is tested there -- is deliberately not called from anywhere
-//! in this fork. See the module's "Not ported" section below.
+//! **Tileset by default, sprite on request.** ggo-ide's `ImportWizard.tsx`
+//! had three modes (Tileset / Sprite / Metasprite); Tileset is the ported
+//! default, and an "Import as sprite" toggle additionally writes a `.spr`
+//! via worldlib's `import::sprite_import` -- frames cut on a user-set
+//! frame W/H grid inside the crop, defaulting to ONE frame at the crop
+//! bounds. There is still no separate Sprite/Metasprite wizard mode: the
+//! wizard stays pinned to [`Mode::Tileset`] (its crop/preview machinery is
+//! what the panel renders), and the sprite cut is applied at commit time.
 //!
 //! **No import logic lives here.** Decode, crop, quantize, preview
 //! composition, tile slicing, destination-path joining, collision detection
@@ -55,18 +57,21 @@
 //!
 //! ## Not ported from ggo-ide's wizard (deliberate, not oversight)
 //!
-//! - **Sprite and Metasprite modes** -- the user decision above.
+//! - **Sprite and Metasprite as wizard MODES** -- folded into the one
+//!   "Import as sprite" toggle above instead.
 //! - **The `{cols}` JSON sidecar** an imported tileset used to get. worldlib
 //!   already declined to port it (`import`'s module doc, deviation #2: this
 //!   native tool banned new sidecars) and `ggo_tileset_panel` resolves an
 //!   imported sheet's columns exactly like a brand-new one's.
 //! - **Legacy `.meta.json` import** -- staying dropped (spec, "Staying
 //!   dropped").
-//! - **An in-panel file picker / drag-and-drop.** The entry point is the
-//!   project panel's "Import as tileset…" on a `.png`, which is strictly
-//!   better than ggo-ide's native file dialog: the source is already a
-//!   project path, so the destination and the delete-source offer both
-//!   derive from it with nothing to type.
+//! - **Drag-and-drop.** The entry points are the project panel's "Import as
+//!   tileset…" on a `.png` (the source is already a project path, so the
+//!   destination and the delete-source offer both derive from it with
+//!   nothing to type) and the panel's own "Choose PNG…" native file dialog,
+//!   which exists so source art can live OUTSIDE the repo -- imported
+//!   pixels land as `.til`/`.pal` without the PNG ever entering git
+//!   history.
 //! - **Manual palette surgery** (slot edits, ramps, sort/swap) has no
 //!   replacement anywhere in the fork; the palette is whatever quantization
 //!   derives. The spec calls this out as an honest, permanent loss.
@@ -83,8 +88,9 @@ use editor::Editor;
 use gpui::{
     Action, App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Task,
-    WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb, rgba, size,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent,
+    Styled, Task, WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb,
+    rgba, size,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -95,7 +101,7 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 use ggo_tileset_panel::TilesetPanel;
 use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, join_dest_path, slice_to_tiles,
-    source_rel_if_in_project,
+    source_rel_if_in_project, sprite_import, uniform_rects,
 };
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::{PAL_SLOTS, slot_rgba};
@@ -130,8 +136,13 @@ const PNG_EXT: &str = "png";
 /// project-root walk itself is `ggo_common::emerald_project_root`.
 const ASSETS_DIR: &str = "assets";
 
-/// Empty-state text. The panel has no picker of its own by design: sources
-/// arrive by right-clicking a `.png` in the project panel.
+/// The conventional sprites subdirectory under `assets/` -- where `.spr`s
+/// and their tileset trios live (`assets/sprites/gg_icon.{spr,til,pal}`),
+/// and where a picked-from-disk import defaults when it exists.
+const SPRITES_DIR: &str = "sprites";
+
+/// Empty-state text. Sources arrive by right-clicking a `.png` in the
+/// project panel, or via the picker button for a PNG outside the project.
 const EMPTY_MESSAGE: &str = "Right-click a .png in the project panel → Import as tileset…";
 
 /// The quantized preview strip's height.
@@ -331,6 +342,31 @@ fn parent_dir(rel: &str) -> String {
     }
 }
 
+/// A frame-size field's value: blank (or unparseable, or zero) means
+/// "default", i.e. the crop's own extent on that axis.
+fn parse_frame_dim(text: &str) -> Option<usize> {
+    text.trim().parse::<usize>().ok().filter(|&v| v > 0)
+}
+
+/// The sprite cut: `crop` tiled row-major into `frame_w x frame_h` frames
+/// (worldlib's own `uniform_rects`, offset to the crop's origin), each axis
+/// defaulting to the crop's extent -- so no input at all is exactly ONE
+/// frame at the crop bounds. Whole frames only, same rule `uniform_rects`
+/// applies; a frame bigger than the crop yields no frames, which the
+/// commit refuses loudly rather than importing an empty sprite.
+fn frame_rects(crop: Region, cut: (Option<usize>, Option<usize>)) -> Vec<Region> {
+    let frame_w = cut.0.unwrap_or(crop.w);
+    let frame_h = cut.1.unwrap_or(crop.h);
+    uniform_rects(crop.w, crop.h, frame_w, frame_h)
+        .into_iter()
+        .map(|r| Region {
+            x: r.x + crop.x,
+            y: r.y + crop.y,
+            ..r
+        })
+        .collect()
+}
+
 /// The WORKTREE-relative path of an asset written at asset-root-relative
 /// `asset_rel` under `asset_root`.
 ///
@@ -398,22 +434,30 @@ struct PanDrag {
     start_pan: [f32; 2],
 }
 
-/// The two form fields: destination directory + stem.
+/// The form fields: destination directory + stem, and the sprite cut's
+/// frame size (px). The frame fields are blank by default -- blank (or
+/// unparseable) means "one frame at the crop bounds" ([`frame_rects`]).
 struct Fields {
     dir: Entity<Editor>,
     stem: Entity<Editor>,
+    frame_w: Entity<Editor>,
+    frame_h: Entity<Editor>,
 }
 
 /// What a committed import wrote and what to do next with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Imported {
-    /// The `.til`'s ASSET-ROOT-relative rel -- the name downstream binders
-    /// will hold (see [`split_png_path`]).
+    /// The written asset's ASSET-ROOT-relative rel (the `.spr` for a sprite
+    /// import, the `.til` otherwise) -- the name downstream binders will
+    /// hold (see [`split_png_path`]).
     asset_rel: String,
-    /// The same file's WORKTREE-relative path, for the tileset panel
-    /// handoff (see [`worktree_rel_for`]).
+    /// The same file's WORKTREE-relative path, for the panel handoff (see
+    /// [`worktree_rel_for`]).
     worktree_rel: Option<String>,
     tile_count: usize,
+    /// A sprite import hands off to the sprite panel; a tileset import to
+    /// the tileset panel.
+    sprite: bool,
 }
 
 /// A loaded source PNG plus everything the view needs.
@@ -437,6 +481,12 @@ struct OpenImport {
     pan_drag: Option<PanDrag>,
     /// True between the canvas's primary-down and its matching up.
     cropping: bool,
+    /// "Import as sprite": also write a `.spr` whose frames are cut on the
+    /// [`frame_rects`] grid. Off = plain tileset import.
+    as_sprite: bool,
+    /// The sprite cut parsed off the frame fields every render -- `None`
+    /// per axis means "the crop's own extent".
+    frame_cut: (Option<usize>, Option<usize>),
     /// The canvas element's on-screen bounds, recorded at prepaint so the
     /// mouse handlers can map window coords to image pixels
     /// (`ggo_world_panel`'s `last_bounds` idiom).
@@ -471,6 +521,8 @@ impl OpenImport {
             pan: [0.0, 0.0],
             pan_drag: None,
             cropping: false,
+            as_sprite: false,
+            frame_cut: (None, None),
             canvas_bounds: Rc::new(RefCell::new(None)),
             fields: None,
         }
@@ -519,7 +571,11 @@ impl OpenImport {
     /// rel that re-rooting exists to remove.
     fn dest_targets(&self) -> Vec<String> {
         let (_, stem) = self.dest();
-        vec![format!("{stem}.til"), format!("{stem}.pal")]
+        let mut targets = vec![format!("{stem}.til"), format!("{stem}.pal")];
+        if self.as_sprite {
+            targets.push(format!("{stem}.spr"));
+        }
+        targets
     }
 }
 
@@ -617,6 +673,86 @@ impl ImportPanel {
         // returned a different one (fix round 1, FOLD IN 3).
         let (root, under) = split_png_path(&project_root, &source_rel);
         let dest_dir = parent_dir(&under);
+        self.start_load(source_rel, source_abs, root, dest_dir, cx);
+    }
+
+    /// The "Choose PNG…" button: pick a source off disk -- possibly OUTSIDE
+    /// the project, which is the point (source art stays out of the repo's
+    /// git history; only the written `.til`/`.pal` land in the worktree).
+    fn pick_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Same reason as `open_source`: the picker is reachable before the
+        // panel has ever been activated.
+        self.refresh_root(cx);
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = paths.await
+                && let Some(abs) = paths.pop()
+            {
+                this.update(cx, |this, cx| this.open_abs_source(abs, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Load an ABSOLUTE path from the native file dialog. An in-project pick
+    /// is routed through [`Self::load_source`] so it behaves exactly like the
+    /// context-menu entry (asset-root derivation, delete-source offer and
+    /// all); an out-of-project pick is rooted at the worktree, with the
+    /// destination defaulted into `assets/sprites` (or `assets/` when no
+    /// sprites dir exists) for an emerald worktree -- `resolve_dest` re-roots
+    /// the commit from there.
+    fn open_abs_source(&mut self, abs: PathBuf, cx: &mut Context<Self>) {
+        let Some(project_root) = self.project_root.clone() else {
+            self.status = Some("Open a project first".to_string());
+            cx.notify();
+            return;
+        };
+        if let Ok(under) = abs.strip_prefix(&project_root) {
+            let rel = under
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            self.load_source(&rel, cx);
+            return;
+        }
+        let assets = project_root.join(ASSETS_DIR);
+        let dest_dir = if project_root.join(ggo_common::EMERALD_MANIFEST).is_file()
+            && assets.is_dir()
+        {
+            // `assets/sprites` is where the sprite pipeline's trios live, so
+            // an imported tileset defaults beside them rather than at the
+            // asset-tree root.
+            if assets.join(SPRITES_DIR).is_dir() {
+                format!("{ASSETS_DIR}/{SPRITES_DIR}")
+            } else {
+                ASSETS_DIR.to_string()
+            }
+        } else {
+            String::new()
+        };
+        // The full path is the display name: "hero.png" alone would not say
+        // which of five out-of-repo hero.pngs is open.
+        let source_rel = abs
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        self.start_load(source_rel, abs, project_root, dest_dir, cx);
+    }
+
+    /// The shared load tail: decode `source_abs` off-thread and land it as
+    /// the Ready state, writing against `root` with the destination
+    /// defaulted to `dest_dir`.
+    fn start_load(
+        &mut self,
+        source_rel: String,
+        source_abs: PathBuf,
+        root: PathBuf,
+        dest_dir: String,
+        cx: &mut Context<Self>,
+    ) {
         self.load_generation += 1;
         let generation = self.load_generation;
         self.state = ViewerState::Loading {
@@ -751,6 +887,33 @@ impl ImportPanel {
         }
     }
 
+    fn set_as_sprite(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.as_sprite = on;
+            cx.notify();
+        }
+    }
+
+    /// Middle-mouse down on the canvas: arm a pan drag anchored at the
+    /// cursor. Its own method (rather than an inline listener body) for the
+    /// same reason as [`Self::crop_down`]: a test cannot reach an
+    /// `on_mouse_down` closure any other way.
+    fn pan_down(&mut self, position: gpui::Point<Pixels>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.pan_drag = Some(PanDrag {
+                start_cursor: [f32::from(position.x), f32::from(position.y)],
+                start_pan: open.pan,
+            });
+        }
+    }
+
+    /// Middle-mouse up: the pan drag (if any) ends where it is.
+    fn pan_up(&mut self) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.pan_drag = None;
+        }
+    }
+
     /// Middle-mouse pan handling for a move event. Returns true if the event
     /// belonged to an in-flight pan (handled or cancelled).
     fn handle_pan_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
@@ -815,6 +978,8 @@ impl ImportPanel {
         let fields = Fields {
             dir: Self::new_field(&dir, window, cx),
             stem: Self::new_field(&stem, window, cx),
+            frame_w: Self::new_field("", window, cx),
+            frame_h: Self::new_field("", window, cx),
         };
         if let ViewerState::Ready(open) = &mut self.state {
             open.fields = Some(fields);
@@ -838,17 +1003,27 @@ impl ImportPanel {
     /// are plain assignments (no requantize, no disk), and this keeps one
     /// source of truth -- the editors -- instead of two that can drift.
     fn sync_dest_fields(&mut self, cx: &mut Context<Self>) {
-        let Some((dir, stem)) = self
-            .ready()
-            .and_then(|open| open.fields.as_ref())
-            .map(|fields| (fields.dir.clone(), fields.stem.clone()))
+        let Some((dir, stem, frame_w, frame_h)) =
+            self.ready().and_then(|open| open.fields.as_ref()).map(|f| {
+                (
+                    f.dir.clone(),
+                    f.stem.clone(),
+                    f.frame_w.clone(),
+                    f.frame_h.clone(),
+                )
+            })
         else {
             return;
         };
         let (dir, stem) = (dir.read(cx).text(cx), stem.read(cx).text(cx));
+        let cut = (
+            parse_frame_dim(&frame_w.read(cx).text(cx)),
+            parse_frame_dim(&frame_h.read(cx).text(cx)),
+        );
         if let ViewerState::Ready(open) = &mut self.state {
             open.wizard.set_dest_dir(dir);
             open.wizard.set_dest_stem(stem);
+            open.frame_cut = cut;
         }
     }
 
@@ -908,20 +1083,25 @@ impl ImportPanel {
             // (`open_in_panel` returns false), same graceful degradation
             // every other GGO handoff makes.
             if let (Some(workspace), Some(rel)) = (workspace, imported.worktree_rel) {
+                let sprite = imported.sprite;
                 // Same reason as `offer_source_delete`'s: route through the
                 // window this task was spawned in rather than through an
                 // entity's associated window.
                 cx.update(|window, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
-                            ggo_common::open_in_panel(
-                                workspace,
-                                window,
-                                cx,
-                                move |panel: &mut TilesetPanel, window, cx| {
-                                    panel.open_rel_path(&rel, window, cx)
-                                },
-                            );
+                            if sprite {
+                                ggo_sprite_panel::open_sprite_item(workspace, rel, window, cx);
+                            } else {
+                                ggo_common::open_in_panel(
+                                    workspace,
+                                    window,
+                                    cx,
+                                    move |panel: &mut TilesetPanel, window, cx| {
+                                        panel.open_rel_path(&rel, window, cx)
+                                    },
+                                );
+                            }
                         })
                         .ok();
                 })
@@ -946,22 +1126,65 @@ impl ImportPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return None;
         };
-        let preview = open.wizard.preview.as_ref()?;
         // The root the bytes go under is re-derived from the DESTINATION, not
         // inherited from the source -- see `resolve_dest`. `til_rel` is
         // therefore asset-root-relative even when the source was not in an
         // `assets/` tree at all.
         let (dest_root, dest_stem) = open.dest();
         let til_rel = format!("{dest_stem}.til");
-        let (indices, tile_count) = slice_to_tiles(&preview.indices, preview.w, preview.h);
-        if let Err(e) =
-            io::save_tileset(&dest_root, &til_rel, &indices, tile_count, &preview.palette)
-        {
-            self.status = Some(format!("Import failed: {e}"));
-            self.last_import = None;
-            cx.notify();
-            return None;
-        }
+        let written = if open.as_sprite {
+            let rects = frame_rects(open.crop(), open.frame_cut);
+            if rects.is_empty() {
+                self.status =
+                    Some("Nothing to import: the frame size exceeds the crop".to_string());
+                cx.notify();
+                return None;
+            }
+            // The sprite path quantizes the WHOLE source (worldlib's own
+            // `sprite_import` rule, ported from ggo-ide) and writes the
+            // `.spr`/`.til`/`.pal` trio in one call; the wizard's tileset
+            // preview is not consulted.
+            sprite_import(
+                &open.wizard.rgba,
+                open.wizard.src_w,
+                open.wizard.src_h,
+                open.wizard.reserve_transparent,
+                &rects,
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|state| {
+                let spr_rel = format!("{dest_stem}.spr");
+                io::save_sprite(
+                    &dest_root,
+                    &spr_rel,
+                    &state,
+                    &til_rel,
+                    &format!("{dest_stem}.pal"),
+                )
+                .map(|saved| (spr_rel, saved.tile_count))
+                .map_err(|e| e.to_string())
+            })
+        } else {
+            match open.wizard.preview.as_ref() {
+                Some(preview) => {
+                    let (indices, tile_count) =
+                        slice_to_tiles(&preview.indices, preview.w, preview.h);
+                    io::save_tileset(&dest_root, &til_rel, &indices, tile_count, &preview.palette)
+                        .map(|()| (til_rel.clone(), tile_count))
+                        .map_err(|e| e.to_string())
+                }
+                None => return None,
+            }
+        };
+        let (asset_rel, tile_count) = match written {
+            Ok(written) => written,
+            Err(e) => {
+                self.status = Some(format!("Import failed: {e}"));
+                self.last_import = None;
+                cx.notify();
+                return None;
+            }
+        };
         // Offered only for a source inside a REAL emerald asset root --
         // ggo-ide's own `assetsPrefix` guard, ported: a PNG outside
         // `assets/` was never going to collide with the packer on a
@@ -977,11 +1200,12 @@ impl ImportPanel {
             .map(|rel| (open.source_abs.clone(), rel));
         let worktree_rel = project_root
             .as_deref()
-            .and_then(|project_root| worktree_rel_for(project_root, &dest_root, &til_rel));
+            .and_then(|project_root| worktree_rel_for(project_root, &dest_root, &asset_rel));
         let imported = Imported {
-            asset_rel: til_rel,
+            asset_rel,
             worktree_rel,
             tile_count,
+            sprite: open.as_sprite,
         };
         self.status = None;
         self.last_import = Some(imported.clone());
@@ -1052,6 +1276,17 @@ impl ImportPanel {
             .items_center()
             .gap_1()
             .child(Label::new(message).color(Color::Muted))
+            .when(
+                !matches!(self.state, ViewerState::Loading { .. }),
+                |el| {
+                    el.child(
+                        Button::new("ggo-import-pick", "Choose PNG…")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_source(window, cx)
+                            })),
+                    )
+                },
+            )
             .children(self.import_summary().map(|summary| {
                 Label::new(summary)
                     .size(LabelSize::XSmall)
@@ -1099,6 +1334,14 @@ impl ImportPanel {
                             .color(Color::Muted),
                     )
                     .child(div().flex_1())
+                    .child(
+                        IconButton::new("ggo-import-pick-other", IconName::FolderOpen)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Choose another PNG…"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_source(window, cx)
+                            })),
+                    )
                     .child(
                         Button::new("ggo-import-clear-crop", "Clear crop")
                             .disabled(open.wizard.region.is_none())
@@ -1184,24 +1427,12 @@ impl ImportPanel {
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
-                    if let ViewerState::Ready(open) = &mut this.state {
-                        open.pan_drag = Some(PanDrag {
-                            start_cursor: [
-                                f32::from(event.position.x),
-                                f32::from(event.position.y),
-                            ],
-                            start_pan: open.pan,
-                        });
-                    }
+                    this.pan_down(event.position);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Middle,
-                cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
-                    if let ViewerState::Ready(open) = &mut this.state {
-                        open.pan_drag = None;
-                    }
-                }),
+                cx.listener(|this, _: &MouseUpEvent, _window, _cx| this.pan_up()),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                 let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
@@ -1306,7 +1537,10 @@ impl ImportPanel {
         let targets = open.dest_targets().join(", ");
         let can_commit = open.wizard.can_commit();
         let reserve = open.wizard.reserve_transparent;
+        let as_sprite = open.as_sprite;
+        let frame_count = frame_rects(crop, open.frame_cut).len();
         let weak = cx.weak_entity();
+        let weak_sprite = weak.clone();
 
         v_flex()
             .gap_1()
@@ -1321,16 +1555,53 @@ impl ImportPanel {
                     .child(Self::field("Name", 96., &fields.stem, cx)),
             )
             .child(
-                h_flex().gap_1().flex_wrap().items_center().child(
-                    Checkbox::new("ggo-import-reserve", ToggleState::from(reserve))
-                        .label("Slot 0 transparent")
-                        .on_click(move |toggle, _window, cx| {
-                            let on = matches!(toggle, ToggleState::Selected);
-                            weak.update(cx, |this, cx| this.set_reserve_transparent(on, cx))
-                                .ok();
-                        }),
-                ),
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .items_center()
+                    .child(
+                        Checkbox::new("ggo-import-reserve", ToggleState::from(reserve))
+                            .label("Slot 0 transparent")
+                            .on_click(move |toggle, _window, cx| {
+                                let on = matches!(toggle, ToggleState::Selected);
+                                weak.update(cx, |this, cx| this.set_reserve_transparent(on, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Checkbox::new("ggo-import-as-sprite", ToggleState::from(as_sprite))
+                            .label("Import as sprite")
+                            .on_click(move |toggle, _window, cx| {
+                                let on = matches!(toggle, ToggleState::Selected);
+                                weak_sprite
+                                    .update(cx, |this, cx| this.set_as_sprite(on, cx))
+                                    .ok();
+                            }),
+                    ),
             )
+            .when(as_sprite, |el| {
+                el.child(
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .items_center()
+                        .child(Self::field("Frame W", 48., &fields.frame_w, cx))
+                        .child(Self::field("Frame H", 48., &fields.frame_h, cx))
+                        .child(
+                            Label::new(if frame_count == 0 {
+                                "frame size exceeds the crop".to_string()
+                            } else {
+                                format!("{frame_count} frames (px, blank = whole crop)")
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(if frame_count == 0 {
+                                Color::Warning
+                            } else {
+                                Color::Muted
+                            }),
+                        ),
+                )
+            })
             .child(
                 Label::new(readout)
                     .size(LabelSize::XSmall)
@@ -1703,6 +1974,25 @@ mod tests {
         }
     }
 
+    /// Stamp the canvas bounds by hand, the way prepaint records them, so
+    /// the mouse-mapping methods can be driven without drawing a frame.
+    fn stamp_canvas(panel: &ImportPanel, origin: (f32, f32)) {
+        *ready(panel).canvas_bounds.borrow_mut() = Some(bounds(
+            point(px(origin.0), px(origin.1)),
+            size(px(400.), px(300.)),
+        ));
+    }
+
+    /// Set the camera directly -- the tests below pick zoom/pan pairs the
+    /// gestures are then asserted against.
+    fn set_camera(panel: &mut ImportPanel, zoom: usize, pan: [f32; 2]) {
+        let ViewerState::Ready(open) = &mut panel.state else {
+            panic!("expected Ready")
+        };
+        open.zoom = zoom;
+        open.pan = pan;
+    }
+
     // --------------------------------------------------------- pure rules
 
     /// **The `ggo-sprfix` contract.** The asset root is derived ON DISK (a
@@ -1935,6 +2225,139 @@ mod tests {
         panel.update(cx, |panel, _| {
             assert!(matches!(&panel.state, ViewerState::Error(_)));
         });
+    }
+
+    /// The file-picker entry point: a PNG OUTSIDE the worktree loads,
+    /// defaults its destination into `assets/`, and commits with an
+    /// asset-root-relative rel -- the whole point being that the source PNG
+    /// itself never has to enter the repo. An in-project pick must route
+    /// through the same derivation the context-menu entry uses.
+    #[gpui::test]
+    async fn test_picked_external_png_defaults_into_assets(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let assets = write_project(root);
+        std::fs::create_dir(assets.join(SPRITES_DIR)).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let png = outside.path().join("hero.png");
+        write_png_fixture(
+            &png,
+            SRC_W as u32,
+            SRC_H as u32,
+            &two_tone_rgba(SRC_W, SRC_H),
+        );
+
+        let panel = new_panel(cx, root);
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.open_abs_source(png.clone(), cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, cx| {
+            let open = ready(panel);
+            assert_eq!(open.source_abs, png);
+            assert_eq!(open.root, root, "external sources root at the worktree");
+            assert_eq!(open.wizard.dest_dir, "assets/sprites");
+            assert_eq!(open.wizard.dest_stem, "hero");
+            let (dest_root, dest_stem) = open.dest();
+            assert_eq!(
+                (dest_root, dest_stem),
+                (assets.clone(), "sprites/hero".to_string()),
+                "the commit re-roots into the emerald asset tree"
+            );
+
+            let (imported, source) = panel.commit(cx).expect("commit succeeds");
+            assert_eq!(imported.asset_rel, "sprites/hero.til");
+            assert_eq!(
+                imported.worktree_rel.as_deref(),
+                Some("assets/sprites/hero.til")
+            );
+            assert_eq!(source, None, "no delete offer for an out-of-repo source");
+        });
+        assert!(assets.join("sprites/hero.til").is_file());
+        assert!(png.is_file(), "the external source is untouched");
+
+        // An in-project absolute pick routes through the rel path, so the
+        // asset root and delete-offer rules match the context-menu entry.
+        panel.update(cx, |panel, cx| {
+            panel.open_abs_source(root.join("assets/art/hero.png"), cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.source_rel, "assets/art/hero.png");
+            assert_eq!(open.root, assets);
+        });
+    }
+
+    /// The sprite cut's default is ONE frame at the crop bounds; a set
+    /// frame size tiles the crop (whole frames only, crop-origin offset);
+    /// an oversize frame yields no frames.
+    #[test]
+    fn frame_rects_defaults_to_one_frame_at_the_crop() {
+        let crop = Region {
+            x: 4,
+            y: 2,
+            w: 32,
+            h: 16,
+        };
+        assert_eq!(frame_rects(crop, (None, None)), vec![crop]);
+        assert_eq!(
+            frame_rects(crop, (Some(16), None)),
+            vec![
+                Region {
+                    x: 4,
+                    y: 2,
+                    w: 16,
+                    h: 16
+                },
+                Region {
+                    x: 20,
+                    y: 2,
+                    w: 16,
+                    h: 16
+                },
+            ]
+        );
+        assert!(frame_rects(crop, (Some(64), None)).is_empty());
+    }
+
+    #[test]
+    fn parse_frame_dim_treats_blank_and_junk_as_default() {
+        assert_eq!(parse_frame_dim(" 16 "), Some(16));
+        assert_eq!(parse_frame_dim(""), None);
+        assert_eq!(parse_frame_dim("0"), None);
+        assert_eq!(parse_frame_dim("x"), None);
+    }
+
+    /// "Import as sprite" writes the `.spr`/`.til`/`.pal` trio, frames cut
+    /// at the given size (the 32x16 fixture at a 16px frame W = 2 frames),
+    /// and hands off the `.spr`.
+    #[gpui::test]
+    async fn test_sprite_import_writes_the_spr_trio(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.as_sprite = true;
+                open.frame_cut = (Some(TILE_PX), None);
+            }
+            let (imported, _source) = panel.commit(cx).expect("commit succeeds");
+            assert_eq!(imported.asset_rel, "art/hero.spr");
+            assert_eq!(
+                imported.worktree_rel.as_deref(),
+                Some("assets/art/hero.spr")
+            );
+            assert!(imported.sprite);
+        });
+        for ext in ["spr", "til", "pal"] {
+            assert!(assets.join(format!("art/hero.{ext}")).is_file(), "{ext}");
+        }
+        let opened = io::open_sprite(&assets, "art/hero.spr").expect("spr round-trips");
+        assert_eq!(opened.state.frames.len(), 2);
+        assert_eq!((opened.state.w_tiles, opened.state.h_tiles), (1, 1));
     }
 
     /// **The headline test.** A real PNG imports to a `.til`/`.pal` that
@@ -2314,6 +2737,514 @@ mod tests {
             assert!(panel.status.is_some(), "and the refusal is said out loud");
         });
         assert!(!dir.path().join("assets/art/.til").exists());
+    }
+
+    // ------------------------------------------------- canvas interaction
+
+    /// The crop gesture's window→image mapping at identity: with the canvas
+    /// bounds stamped where prepaint would record them, a down/move/up in
+    /// WINDOW coordinates lands the crop on the image pixels under the
+    /// cursor. Before the first paint (no bounds recorded) the gesture is
+    /// inert rather than anchored at a garbage coordinate.
+    #[gpui::test]
+    async fn test_crop_gestures_map_window_coords_at_identity(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+
+        // No bounds recorded yet: a down cannot name an image pixel.
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.crop_down(point(px(5.), px(5.)), window, cx);
+                assert!(!ready(panel).cropping, "no paint yet, no gesture");
+                assert!(ready(panel).wizard.region.is_none());
+            })
+        });
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                set_camera(panel, 1, [0.0, 0.0]);
+                stamp_canvas(panel, (40.0, 60.0));
+                // Image pixel (2, 3): the canvas origin plus 2/3 CSS px.
+                panel.crop_down(point(px(40.0 + 2.5), px(60.0 + 3.5)), window, cx);
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            assert!(ready(panel).cropping);
+            // Drag to image pixel (12, 7); the outline tracks the move but
+            // the preview does NOT requantize mid-drag.
+            panel.crop_move(point(px(40.0 + 12.9), px(60.0 + 7.5)), cx);
+            {
+                let open = ready(panel);
+                assert_eq!(
+                    open.wizard.region,
+                    Some(Region {
+                        x: 2,
+                        y: 3,
+                        w: 11,
+                        h: 5
+                    })
+                );
+                assert_eq!(
+                    open.wizard.preview.as_ref().map(|p| (p.w, p.h)),
+                    Some((SRC_W, SRC_H)),
+                    "mid-drag the preview is still the whole image's"
+                );
+            }
+            panel.crop_up(cx);
+            let open = ready(panel);
+            assert!(!open.cropping);
+            assert_eq!(
+                open.crop(),
+                Region {
+                    x: 2,
+                    y: 3,
+                    w: 11,
+                    h: 5
+                }
+            );
+            assert_eq!(
+                open.wizard.preview.as_ref().map(|p| (p.w, p.h)),
+                Some((11, 5)),
+                "the crop settled and requantized on release"
+            );
+        });
+    }
+
+    /// The same gesture at a non-1 zoom with a pan: window position =
+    /// canvas origin + pan + image px * zoom, and a drag that leaves the
+    /// image clamps to its far edge instead of missing.
+    #[gpui::test]
+    async fn test_crop_gestures_map_window_coords_under_zoom_and_pan(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+
+        let (zoom, pan, origin) = (4.0f32, [6.0f32, 8.0f32], (100.0f32, 50.0f32));
+        let at = |ix: f32, iy: f32| {
+            point(
+                px(origin.0 + pan[0] + ix * zoom),
+                px(origin.1 + pan[1] + iy * zoom),
+            )
+        };
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                set_camera(panel, zoom as usize, pan);
+                stamp_canvas(panel, (origin.0, origin.1));
+                // Anchor inside image pixel (4, 2) -- half a zoomed pixel in.
+                panel.crop_down(at(4.5, 2.5), window, cx);
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.crop_move(at(11.5, 9.5), cx);
+            assert_eq!(
+                ready(panel).wizard.region,
+                Some(Region {
+                    x: 4,
+                    y: 2,
+                    w: 8,
+                    h: 8
+                }),
+                "the drag maps through zoom 4 and the pan offset"
+            );
+            // Way off the canvas: the crop extends to the image's far
+            // corner, the clamp `geom::image_coord` promises.
+            panel.crop_move(point(px(10_000.), px(10_000.)), cx);
+            assert_eq!(
+                ready(panel).wizard.region,
+                Some(Region {
+                    x: 4,
+                    y: 2,
+                    w: SRC_W - 4,
+                    h: SRC_H - 2
+                })
+            );
+            panel.crop_up(cx);
+            let open = ready(panel);
+            assert_eq!(
+                open.wizard.preview.as_ref().map(|p| (p.w, p.h)),
+                Some((SRC_W - 4, SRC_H - 2)),
+                "the clamped crop is what settles"
+            );
+        });
+    }
+
+    /// Middle-drag pan: the down arms the drag at the cursor, every move
+    /// offsets the pan by the delta FROM THE ANCHOR, a move without the
+    /// button (released off-canvas) cancels exactly once, and the canvas's
+    /// own Middle-up clears the drag.
+    #[gpui::test]
+    async fn test_middle_drag_pans_by_the_cursor_delta(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            set_camera(panel, geom::DEFAULT_ZOOM, [10.0, 20.0]);
+            let move_to = |x: f32, y: f32, button: Option<MouseButton>| MouseMoveEvent {
+                position: point(px(x), px(y)),
+                pressed_button: button,
+                modifiers: gpui::Modifiers::default(),
+            };
+
+            // No drag armed: the move is not a pan's, crop handling takes it.
+            assert!(!panel.handle_pan_move(&move_to(50.0, 50.0, None), cx));
+            assert_eq!(ready(panel).pan, [10.0, 20.0]);
+
+            panel.pan_down(point(px(100.), px(100.)));
+            assert!(ready(panel).pan_drag.is_some());
+
+            let held = Some(MouseButton::Middle);
+            assert!(panel.handle_pan_move(&move_to(115.0, 94.0, held), cx));
+            assert_eq!(ready(panel).pan, [25.0, 14.0]);
+            // Anchor-relative, not move-to-move: a second move re-derives
+            // from the down position, so no drift accumulates.
+            assert!(panel.handle_pan_move(&move_to(90.0, 130.0, held), cx));
+            assert_eq!(ready(panel).pan, [0.0, 50.0]);
+
+            // The button came up off-canvas: the buttonless move cancels
+            // (and is swallowed) once, without moving the pan.
+            let release = move_to(200.0, 200.0, None);
+            assert!(panel.handle_pan_move(&release, cx));
+            assert!(ready(panel).pan_drag.is_none());
+            assert_eq!(ready(panel).pan, [0.0, 50.0]);
+            assert!(
+                !panel.handle_pan_move(&release, cx),
+                "no drag left to swallow the next move"
+            );
+
+            // The canvas's own Middle-up path.
+            panel.pan_down(point(px(0.), px(0.)));
+            assert!(ready(panel).pan_drag.is_some());
+            panel.pan_up();
+            assert!(ready(panel).pan_drag.is_none());
+        });
+    }
+
+    /// Wheel zoom through the panel: with stamped bounds, the image pixel
+    /// under the cursor before the zoom is the pixel under it after -- the
+    /// `geom::zoom_at` invariant, pinned through the PANEL's plumbing
+    /// (`canvas_local` -> `zoom_at_cursor` -> `image_coord_at`). A zoom
+    /// already at the ladder's end must not move the pan.
+    #[gpui::test]
+    async fn test_zoom_at_cursor_keeps_the_pixel_under_the_cursor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            set_camera(panel, 2, [7.0, -3.0]);
+            stamp_canvas(panel, (30.0, 40.0));
+            let cursor_window = point(px(30.0 + 25.0), px(40.0 + 21.0));
+            let local = ready(panel)
+                .canvas_local(cursor_window)
+                .expect("bounds stamped");
+            assert_eq!(local, [25.0, 21.0], "canvas_local strips the origin");
+
+            let before = ready(panel).image_coord_at(cursor_window);
+            panel.zoom_at_cursor(1, local, cx);
+            assert_eq!(ready(panel).zoom, 3);
+            assert_eq!(ready(panel).image_coord_at(cursor_window), before);
+
+            panel.zoom_at_cursor(-1, local, cx);
+            assert_eq!(ready(panel).zoom, 2);
+            assert_eq!(ready(panel).image_coord_at(cursor_window), before);
+            assert_eq!(ready(panel).pan, [7.0, -3.0], "a round trip restores the pan");
+
+            // At the top of the ladder the zoom clamps AND the pan stays.
+            set_camera(panel, geom::MAX_ZOOM, [7.0, -3.0]);
+            panel.zoom_at_cursor(1, local, cx);
+            assert_eq!(ready(panel).zoom, geom::MAX_ZOOM);
+            assert_eq!(
+                ready(panel).pan,
+                [7.0, -3.0],
+                "a clamped zoom must not move the camera"
+            );
+        });
+    }
+
+    /// The +/- buttons step the integer ladder one rung at a time and clamp
+    /// at both ends.
+    #[gpui::test]
+    async fn test_step_zoom_steps_and_clamps_the_ladder(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(ready(panel).zoom, geom::DEFAULT_ZOOM);
+            panel.step_zoom(1, cx);
+            assert_eq!(ready(panel).zoom, geom::DEFAULT_ZOOM + 1);
+            panel.step_zoom(-1, cx);
+            assert_eq!(ready(panel).zoom, geom::DEFAULT_ZOOM);
+
+            for _ in 0..(geom::MAX_ZOOM * 2) {
+                panel.step_zoom(1, cx);
+            }
+            assert_eq!(ready(panel).zoom, geom::MAX_ZOOM);
+            panel.step_zoom(1, cx);
+            assert_eq!(ready(panel).zoom, geom::MAX_ZOOM, "clamped at the top");
+
+            for _ in 0..(geom::MAX_ZOOM * 2) {
+                panel.step_zoom(-1, cx);
+            }
+            assert_eq!(ready(panel).zoom, geom::MIN_ZOOM);
+            panel.step_zoom(-1, cx);
+            assert_eq!(ready(panel).zoom, geom::MIN_ZOOM, "clamped at the bottom");
+        });
+    }
+
+    /// "Clear crop" drops the region -- even mid-drag -- and rebuilds the
+    /// preview at the full image.
+    #[gpui::test]
+    async fn test_clear_crop_restores_the_whole_image_preview(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // A settled one-tile crop, drawn the way the canvas draws it.
+            {
+                let ViewerState::Ready(open) = &mut panel.state else {
+                    panic!("expected Ready")
+                };
+                open.cropping = true;
+                open.wizard.on_primary_down(0, 0);
+                open.wizard
+                    .on_moved((TILE_PX - 1) as i32, (TILE_PX - 1) as i32);
+            }
+            panel.crop_up(cx);
+            assert_eq!(
+                ready(panel).wizard.preview.as_ref().map(|p| (p.w, p.h)),
+                Some((TILE_PX, TILE_PX))
+            );
+
+            // Cleared mid-drag: the drag dies with the crop.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.cropping = true;
+                open.wizard.on_primary_down(2, 2);
+            }
+            panel.clear_crop(cx);
+            let open = ready(panel);
+            assert!(open.wizard.region.is_none(), "the region is gone");
+            assert!(!open.cropping, "and so is the in-flight drag");
+            assert_eq!(
+                open.wizard.preview.as_ref().map(|p| (p.w, p.h)),
+                Some((SRC_W, SRC_H)),
+                "the preview rebuilt at the full image"
+            );
+            assert!(open.preview_image.is_some());
+        });
+    }
+
+    /// The "Import as sprite" checkbox METHOD path: `set_as_sprite(true)`
+    /// adds the `.spr` to the targets, and a real commit with the default
+    /// frame cut writes the trio as ONE frame at the crop bounds. Toggling
+    /// back off drops the `.spr` again.
+    #[gpui::test]
+    async fn test_set_as_sprite_toggle_writes_the_spr_trio(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+
+        panel.update(cx, |panel, cx| {
+            panel.set_as_sprite(true, cx);
+            let open = ready(panel);
+            assert!(open.as_sprite);
+            assert_eq!(
+                open.dest_targets(),
+                vec![
+                    "art/hero.til".to_string(),
+                    "art/hero.pal".to_string(),
+                    "art/hero.spr".to_string()
+                ]
+            );
+
+            let (imported, _source) = panel.commit(cx).expect("commit succeeds");
+            assert!(imported.sprite);
+            assert_eq!(imported.asset_rel, "art/hero.spr");
+        });
+        for ext in ["spr", "til", "pal"] {
+            assert!(assets.join(format!("art/hero.{ext}")).is_file(), "{ext}");
+        }
+        // No frame size typed: exactly ONE frame at the crop bounds, i.e.
+        // the whole 32x16 fixture (2x1 tiles).
+        let opened = io::open_sprite(&assets, "art/hero.spr").expect("spr round-trips");
+        assert_eq!(opened.state.frames.len(), 1);
+        assert_eq!((opened.state.w_tiles, opened.state.h_tiles), (2, 1));
+
+        panel.update(cx, |panel, cx| {
+            panel.set_as_sprite(false, cx);
+            assert_eq!(
+                ready(panel).dest_targets(),
+                vec!["art/hero.til".to_string(), "art/hero.pal".to_string()],
+                "off drops the .spr from the targets"
+            );
+        });
+    }
+
+    /// The "Slot 0 transparent" checkbox METHOD path: toggling requantizes
+    /// immediately. Reserved, no pixel of the fully-opaque fixture may map
+    /// to slot 0 (it draws transparent); released, slot 0 becomes a real
+    /// palette entry the quantizer uses -- and the preview image is rebuilt,
+    /// not left stale.
+    #[gpui::test]
+    async fn test_set_reserve_transparent_requantizes_slot_zero(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                assert!(open.wizard.reserve_transparent, "reserved by default");
+                let preview = open.wizard.preview.as_ref().expect("a live preview");
+                assert!(
+                    preview.indices.iter().all(|&i| i != 0),
+                    "opaque pixels stay out of the reserved slot"
+                );
+                assert_eq!(
+                    slot_rgba(&preview.palette, 0)[3],
+                    0,
+                    "slot 0 draws transparent"
+                );
+            }
+            let image_before = ready(panel).preview_image.clone().expect("an image");
+
+            panel.set_reserve_transparent(false, cx);
+            {
+                let open = ready(panel);
+                assert!(!open.wizard.reserve_transparent);
+                let preview = open.wizard.preview.as_ref().expect("requantized");
+                assert!(
+                    preview.indices.contains(&0),
+                    "slot 0 is a real color once the reservation lifts"
+                );
+                let image_after = open.preview_image.as_ref().expect("rebuilt");
+                assert!(
+                    !Arc::ptr_eq(image_after, &image_before),
+                    "the preview image was recomposed, not left stale"
+                );
+            }
+
+            panel.set_reserve_transparent(true, cx);
+            let open = ready(panel);
+            assert!(open.wizard.reserve_transparent);
+            assert!(
+                open.wizard
+                    .preview
+                    .as_ref()
+                    .expect("requantized again")
+                    .indices
+                    .iter()
+                    .all(|&i| i != 0),
+                "toggling back re-reserves the slot"
+            );
+        });
+    }
+
+    /// The Frame W/H fields sync into `frame_cut` through the REAL editors
+    /// and `sync_dest_fields` -- typed numbers parse (whitespace and all),
+    /// junk and zero fall back to "the crop's own extent", i.e. one frame.
+    #[gpui::test]
+    async fn test_frame_fields_sync_typed_text_into_the_frame_cut(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        // The form fields are real `Editor`s, which need the settings store.
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.ensure_fields(window, cx)));
+        let (frame_w, frame_h) = panel.read_with(cx, |panel, _| {
+            let fields = ready(panel).fields.as_ref().expect("fields built");
+            (fields.frame_w.clone(), fields.frame_h.clone())
+        });
+
+        cx.update(|window, cx| {
+            frame_w.update(cx, |editor, cx| editor.set_text("16", window, cx));
+            frame_h.update(cx, |editor, cx| editor.set_text(" 8 ", window, cx));
+        });
+        panel.update(cx, |panel, cx| {
+            panel.sync_dest_fields(cx);
+            assert_eq!(ready(panel).frame_cut, (Some(16), Some(8)));
+        });
+
+        cx.update(|window, cx| {
+            frame_w.update(cx, |editor, cx| editor.set_text("junk", window, cx));
+            frame_h.update(cx, |editor, cx| editor.set_text("0", window, cx));
+        });
+        panel.update(cx, |panel, cx| {
+            panel.sync_dest_fields(cx);
+            assert_eq!(ready(panel).frame_cut, (None, None), "junk means default");
+            assert_eq!(
+                frame_rects(ready(panel).crop(), ready(panel).frame_cut),
+                vec![ready(panel).crop()],
+                "which is one frame at the crop bounds"
+            );
+        });
+    }
+
+    /// The full RENDERED path, `ggo_sprite_panel`'s template: draw the
+    /// panel in a real test window (the canvas records its bounds at
+    /// prepaint), then drive platform mouse events at those bounds. The
+    /// drag must land a crop through the same listeners a user's does.
+    #[gpui::test]
+    async fn test_rendered_drag_records_bounds_and_draws_a_crop(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = ImportPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.run_until_parked();
+
+        let canvas = panel
+            .read_with(cx, |panel, _| *ready(panel).canvas_bounds.borrow())
+            .expect("canvas bounds recorded at prepaint");
+        let zoom = panel.read_with(cx, |panel, _| ready(panel).zoom) as f32;
+        // Fresh camera: pan [0, 0], so image pixel (x, y) sits at the canvas
+        // origin plus (x, y) * zoom; +1px lands inside the pixel.
+        let at = |x: usize, y: usize| {
+            canvas.origin + point(px(x as f32 * zoom + 1.), px(y as f32 * zoom + 1.))
+        };
+        cx.simulate_mouse_down(at(0, 0), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            at(TILE_PX - 1, TILE_PX - 1),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            at(TILE_PX - 1, TILE_PX - 1),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert!(!open.cropping, "the up settled the drag");
+            assert_eq!(
+                open.crop(),
+                Region {
+                    x: 0,
+                    y: 0,
+                    w: TILE_PX,
+                    h: TILE_PX
+                },
+                "the rendered drag drew a one-tile crop"
+            );
+            assert_eq!(
+                open.wizard.preview.as_ref().map(|p| (p.w, p.h)),
+                Some((TILE_PX, TILE_PX)),
+                "and it requantized on the real mouse-up"
+            );
+        });
     }
 
     // ---------------------------------------------- explorer-driven entry

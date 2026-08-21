@@ -7622,6 +7622,7 @@ dependencies = [
  "ggo-asset-formats",
  "ggo-worldlib",
  "ggo_common",
+ "ggo_sprite_panel",
  "ggo_tileset_panel",
  "gpui",
  "image",
@@ -7629,6 +7630,7 @@ dependencies = [
  "log",
  "path",
  "project",
+ "remote_connection",
  "serde_json",
  "tempfile",
  "ui",
@@ -7674,6 +7676,7 @@ dependencies = [
 name = "ggo_sprite_panel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "editor",
  "ggo-worldlib",
  "ggo_common",
@@ -7684,6 +7687,7 @@ dependencies = [
  "project",
  "project_panel",
  "remote_connection",
+ "serde",
  "serde_json",
  "tempfile",
  "ui",
@@ -7711,6 +7715,7 @@ dependencies = [
 name = "ggo_world_panel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "editor",
  "ggo-asset-formats",
  "ggo-worldlib",

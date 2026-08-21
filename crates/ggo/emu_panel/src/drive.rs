@@ -1007,6 +1007,44 @@ mod tests {
         assert_eq!(finished.reason, "stopped");
     }
 
+    /// Dropping a live Session -- no `wait`, no explicit `stop` -- must
+    /// end the emulator thread promptly. This is the panel-close path:
+    /// `Drop` signals the stop flag, the thread breaks at the top of its
+    /// next turn, writes its terminal console line, and returns (dropping
+    /// its channel sender on the way out). Without it, closing the pane
+    /// mid-run would orphan an emulator thread spinning at 60 Hz forever.
+    #[test]
+    fn dropping_a_live_session_stops_the_emulator_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("green.cart");
+        std::fs::write(&path, green_screen_cart()).unwrap();
+
+        let (session, rx) = start(path, "green.cart".to_string(), None);
+        // Prove the run is genuinely live before dropping the handle.
+        rx.recv_blocking().expect("the emulator thread must run");
+
+        let uart = session.uart().clone();
+        drop(session);
+
+        // The sender is owned by the thread's closure and dropped only
+        // when it returns, so the channel closing IS the thread ending.
+        // The deadline is what bounds the wait: a thread that ignored the
+        // drop would keep presenting frames at 60 Hz, and each of those
+        // frames re-checks the clock -- a failure, never a hang.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rx.recv_blocking().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the emulator thread kept presenting frames after the Session was dropped"
+            );
+        }
+        assert_eq!(
+            uart.lines().last().map(String::as_str),
+            Some("[run ended] stopped"),
+            "the thread ran its normal end-of-run path, not a panic"
+        );
+    }
+
     /// The perf half: a stopped run carries a real `perfsim::perf_json`
     /// snapshot identified by the cart header's own title, with one
     /// recorded frame per presented frame.

@@ -532,6 +532,43 @@ mod tests {
         assert_eq!(value_of(&tiles, "Sprite working set"), Some("70 tiles"));
     }
 
+    /// The working-set tiles' boundary, pinned against the constant
+    /// rather than a literal, and over the run's WORST frame: the tile
+    /// summarises the max across frames, and the comparison is strictly
+    /// `>` `kpi::TILE_CACHE_TILES` -- a run whose worst frame sits
+    /// exactly AT the capacity (64) fits the cache and renders no tile;
+    /// one tile over (65) is guaranteed thrash and renders one.
+    #[test]
+    fn the_working_set_tiles_boundary_is_the_runs_worst_frame_strictly_over_capacity() {
+        let cap = kpi::TILE_CACHE_TILES;
+        let at_capacity: Vec<FrameRow> = (1..=3)
+            .map(|n| FrameRow {
+                n,
+                // The worst frame (2) lands exactly on the capacity; the
+                // others sit below so the max is what decides.
+                bg_tiles_distinct: if n == 2 { cap } else { cap - 10 },
+                spr_tiles_distinct: if n == 2 { cap } else { 5 },
+                ..FrameRow::default()
+            })
+            .collect();
+        let tiles = kpi_tiles(&at_capacity, None);
+        assert_eq!(value_of(&tiles, "BG working set"), None);
+        assert_eq!(value_of(&tiles, "Sprite working set"), None);
+
+        let mut one_over = at_capacity;
+        one_over[1].bg_tiles_distinct = cap + 1;
+        one_over[1].spr_tiles_distinct = cap + 1;
+        let tiles = kpi_tiles(&one_over, None);
+        assert_eq!(
+            value_of(&tiles, "BG working set"),
+            Some(format!("{} tiles", cap + 1).as_str())
+        );
+        assert_eq!(
+            value_of(&tiles, "Sprite working set"),
+            Some(format!("{} tiles", cap + 1).as_str())
+        );
+    }
+
     /// A device run has no wire model, so there is no budget to be a
     /// percentage of -- a dash, never a 0.0%.
     #[test]

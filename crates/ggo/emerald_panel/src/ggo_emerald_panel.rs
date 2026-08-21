@@ -54,8 +54,9 @@ use std::path::{Path, PathBuf};
 
 use editor::Editor;
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
-    Pixels, Render, SharedString, Styled, Task, WeakEntity, Window, actions, div, px,
+    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, KeyBinding, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window,
+    actions, div, px,
 };
 
 use project::ProjectPath;
@@ -184,53 +185,105 @@ fn new_project(
         workspace.app_state().fs.clone(),
     );
     let dest = workspace.prompt_for_new_path(lister, Some("my-game".to_string()), window, cx);
+    // The panel's runner is the same injected `emd` seam every other run
+    // in this crate goes through, so tests can stub the scaffold the way
+    // they stub every mutation. In production it is `system_runner`
+    // either way.
+    let runner = workspace
+        .panel::<EmeraldPanel>(cx)
+        .map(|panel| panel.read(cx).runner.clone())
+        .unwrap_or_else(system_runner);
     cx.spawn_in(window, async move |workspace, cx| {
         // A dropped or cancelled dialog is a plain "never mind".
         let Some(dest) = dest.await.ok().flatten().and_then(|paths| paths.into_iter().next())
         else {
             return anyhow::Ok(());
         };
-        let Some((request, project_dir)) = new_project_request(&dest) else {
-            return Ok(());
-        };
-        let outcome = cx.background_spawn(runner::run_emd(request)).await;
-        if outcome.ok {
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.open_workspace_for_paths(
-                        workspace::OpenMode::default(),
-                        vec![project_dir],
-                        window,
-                        cx,
-                    )
-                })?
-                .await?;
-        } else {
-            workspace.update(cx, |workspace, cx| {
-                // Same priority ggo-ide's onCreate used: the transcript's
-                // last non-empty line, else the fixed fallback.
-                let message = outcome
-                    .output
-                    .lines()
-                    .rev()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .unwrap_or(NEW_PROJECT_FALLBACK)
-                    .to_string();
-                workspace.show_toast(
-                    workspace::Toast::new(
-                        workspace::notifications::NotificationId::named(
-                            "ggo-new-project-failed".into(),
-                        ),
-                        format!("New GGO project: {message}"),
-                    ),
-                    cx,
-                );
-            })?;
-        }
-        Ok(())
+        create_project_at(workspace, dest, runner, Box::new(open_project_workspace), cx).await
     })
     .detach_and_log_err(cx);
+}
+
+/// The workspace-open half of [`create_project_at`], as a seam:
+/// production passes [`open_project_workspace`], tests pass a recorder --
+/// `open_workspace_for_paths` reaches straight for the real
+/// window-management machinery, which a headless test can neither drive
+/// nor observe.
+type OpenProject = Box<
+    dyn FnOnce(
+        &mut Workspace,
+        PathBuf,
+        &mut Window,
+        &mut Context<Workspace>,
+    ) -> Task<anyhow::Result<()>>,
+>;
+
+/// The production [`OpenProject`]: open the scaffolded folder as a
+/// workspace (swapping the current one when it is non-empty, per
+/// `OpenMode::default`).
+fn open_project_workspace(
+    workspace: &mut Workspace,
+    project_dir: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    let open = workspace.open_workspace_for_paths(
+        workspace::OpenMode::default(),
+        vec![project_dir],
+        window,
+        cx,
+    );
+    cx.spawn(async move |_, _| {
+        open.await?;
+        Ok(())
+    })
+}
+
+/// [`new_project`]'s post-dialog body: run `emd new` for `dest` through
+/// `runner`, then either hand the scaffolded dir to `open_project` or
+/// toast the failure. Named (and seamed on both the spawn and the open)
+/// so the whole flow after the native dialog runs under test.
+async fn create_project_at(
+    workspace: WeakEntity<Workspace>,
+    dest: PathBuf,
+    runner: EmdRunner,
+    open_project: OpenProject,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let Some((request, project_dir)) = new_project_request(&dest) else {
+        return Ok(());
+    };
+    let outcome = cx.background_spawn(runner(request)).await;
+    if outcome.ok {
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                open_project(workspace, project_dir, window, cx)
+            })?
+            .await?;
+    } else {
+        workspace.update(cx, |workspace, cx| {
+            // Same priority ggo-ide's onCreate used: the transcript's
+            // last non-empty line, else the fixed fallback.
+            let message = outcome
+                .output
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or(NEW_PROJECT_FALLBACK)
+                .to_string();
+            workspace.show_toast(
+                workspace::Toast::new(
+                    workspace::notifications::NotificationId::named(
+                        "ggo-new-project-failed".into(),
+                    ),
+                    format!("New GGO project: {message}"),
+                ),
+                cx,
+            );
+        })?;
+    }
+    Ok(())
 }
 
 /// The `emd new` invocation and resulting project dir for a save-dialog
@@ -2019,8 +2072,10 @@ impl EmeraldPanel {
                 );
             }
             col = col.child(
-                Button::new("ggo-emerald-field-add", "+ Field")
-                    .on_click(cx.listener(|this, _, window, cx| this.add_field(window, cx))),
+                div().debug_selector(|| "ggo-emerald-field-add".into()).child(
+                    Button::new("ggo-emerald-field-add", "+ Field")
+                        .on_click(cx.listener(|this, _, window, cx| this.add_field(window, cx))),
+                ),
             );
         }
         if let Some(error) = error
@@ -2037,8 +2092,10 @@ impl EmeraldPanel {
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                 )
                 .child(
-                    Button::new("ggo-emerald-cancel", "Cancel")
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
+                    div().debug_selector(|| "ggo-emerald-cancel".into()).child(
+                        Button::new("ggo-emerald-cancel", "Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
+                    ),
                 ),
         )
         .into_any_element()
@@ -2141,9 +2198,13 @@ impl EmeraldPanel {
         let mut row = h_flex().gap_1().p_1();
         for tab in BrowseTab::ALL {
             row = row.child(
-                Button::new(("ggo-emerald-tab", tab as usize), tab.label())
-                    .toggle_state(self.tab == tab)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx))),
+                div()
+                    .debug_selector(|| format!("ggo-emerald-tab-{}", tab.label()))
+                    .child(
+                        Button::new(("ggo-emerald-tab", tab as usize), tab.label())
+                            .toggle_state(self.tab == tab)
+                            .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx))),
+                    ),
             );
         }
         row.into_any_element()
@@ -5245,5 +5306,472 @@ mod tests {
             Some("assets/worlds/arena.toml".to_string()),
             "the generated world still opens in the world panel"
         );
+    }
+
+    // ------------------------------------------- File → New GGO Project…
+
+    /// A real workspace in a real window -- what [`create_project_at`]
+    /// updates and toasts on. `init` runs so the workspace carries the
+    /// panel (and its runner seam), exactly as production wires it.
+    async fn new_project_workspace(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        (workspace, cx)
+    }
+
+    /// An [`OpenProject`] that never touches the window-management
+    /// machinery, plus the log of every dir it was asked to open.
+    fn recording_open_project() -> (OpenProject, Arc<Mutex<Vec<PathBuf>>>) {
+        let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let open_project: OpenProject = Box::new({
+            let opened = opened.clone();
+            move |_, project_dir, _, _| {
+                opened.lock().unwrap().push(project_dir);
+                Task::ready(Ok(()))
+            }
+        });
+        (open_project, opened)
+    }
+
+    /// Drive [`create_project_at`] for `dest` to completion.
+    async fn create_project(
+        workspace: &Entity<Workspace>,
+        dest: &str,
+        runner: EmdRunner,
+        open_project: OpenProject,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let task = cx.update(|window, cx| {
+            let workspace = workspace.downgrade();
+            let dest = PathBuf::from(dest);
+            window.spawn(cx, async move |cx| {
+                create_project_at(workspace, dest, runner, open_project, cx).await
+            })
+        });
+        task.await.expect("create_project_at must not error");
+    }
+
+    /// The post-dialog flow, success half: the runner actually receives
+    /// the `emd new <name>`-in-the-parent-dir invocation
+    /// [`new_project_request`] built (the argv-shape test above pins the
+    /// builder; this pins that the built request is what gets spawned),
+    /// and the scaffolded dir -- `emd`'s own output dir, not the dialog
+    /// path verbatim -- is what the workspace is asked to open.
+    #[gpui::test]
+    async fn test_create_project_at_spawns_emd_new_then_opens_the_scaffolded_dir(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = new_project_workspace(cx).await;
+        let (runner, calls) = fake_runner(|_| ok_outcome("/home/me/games/my-game"));
+        let (open_project, opened) = recording_open_project();
+
+        create_project(&workspace, "/home/me/games/my-game", runner, open_project, cx).await;
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one emd spawn");
+        assert_eq!(calls[0].args, vec!["new".to_string(), "my-game".to_string()]);
+        assert_eq!(calls[0].cwd, PathBuf::from("/home/me/games"));
+        drop(calls);
+
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            &[PathBuf::from("/home/me/games/my-game")],
+            "success must request exactly the scaffolded dir as the new workspace"
+        );
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(
+                workspace.notification_ids(),
+                Vec::new(),
+                "a successful scaffold shows no failure toast"
+            );
+        });
+    }
+
+    /// The failure half: `emd new` failing surfaces as the failure toast
+    /// on the workspace, and the workspace is NOT swapped.
+    #[gpui::test]
+    async fn test_create_project_at_failure_toasts_and_does_not_open(cx: &mut TestAppContext) {
+        let (workspace, cx) = new_project_workspace(cx).await;
+        let (runner, calls) = fake_runner(|_| err_outcome("destination already exists"));
+        let (open_project, opened) = recording_open_project();
+
+        create_project(&workspace, "/home/me/games/my-game", runner, open_project, cx).await;
+
+        assert_eq!(calls.lock().unwrap().len(), 1, "the spawn still happened");
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "a failed scaffold must not open (or swap) any workspace"
+        );
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(
+                workspace.notification_ids(),
+                vec![workspace::notifications::NotificationId::named(
+                    "ggo-new-project-failed".into()
+                )],
+                "the failure must surface as the new-project toast"
+            );
+        });
+    }
+
+    /// The action wiring above [`create_project_at`]: dispatching
+    /// `NewProject` prompts for a destination and runs the chosen path
+    /// through THE PANEL'S runner seam -- which is what entitles every
+    /// other test here to stub the scaffold. Exercised through the
+    /// failure arm so the real `open_workspace_for_paths` machinery is
+    /// never reached from a headless test.
+    #[gpui::test]
+    async fn test_new_project_action_runs_the_dialog_path_through_the_panels_runner(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = new_project_workspace(cx).await;
+        let (runner, calls) = fake_runner(|_| err_outcome("destination already exists"));
+        let panel = workspace.update(cx, |workspace, cx| {
+            workspace
+                .panel::<EmeraldPanel>(cx)
+                .expect("init() docked the panel")
+        });
+        panel.update(cx, |panel, _| panel.runner = runner);
+
+        cx.dispatch_action(NewProject);
+        // The prompt is pending only after the action's spawn has run.
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(PathBuf::from("/home/me/games/my-game")));
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the dialog's choice reached the panel's runner");
+        assert_eq!(calls[0].args, vec!["new".to_string(), "my-game".to_string()]);
+        assert_eq!(calls[0].cwd, PathBuf::from("/home/me/games"));
+        drop(calls);
+
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(
+                workspace.notification_ids(),
+                vec![workspace::notifications::NotificationId::named(
+                    "ggo-new-project-failed".into()
+                )],
+            );
+        });
+    }
+
+    // ---------------------------- wave 3: the form + browser, as the user
+
+    /// The panel RENDERED as the root of a real test window, so clicks
+    /// travel gpui's real event path into the `on_click` listeners.
+    /// [`lone_panel`]'s seeding (root override, injected runner, settled
+    /// version lock), in a window of its own -- every other harness here
+    /// keeps the panel off-screen.
+    fn rendered_panel<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+    ) -> (Entity<EmeraldPanel>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let root = root.to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = EmeraldPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel.runner = runner;
+            panel.lock = LockCheck::Reached(EXPECTED_EMD_VERSION.to_string());
+            panel.emd_probe = settled_probe();
+            panel.probe = Arc::new(settled_probe);
+            panel
+        });
+        cx.update(|window, _| window.activate_window());
+        (panel, cx)
+    }
+
+    /// Click the element `debug_selector` names in the rendered window.
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} must be rendered"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    /// `cancel_form` drops the open form -- typed text and all -- and
+    /// spawns nothing: cancelling is the one form exit that must never
+    /// reach the runner.
+    #[gpui::test]
+    async fn test_cancel_form_closes_the_form_and_spawns_nothing(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let panel = lone_panel(cx, dir.path(), runner);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.new_item(GenKind::Component, "manifests", window, cx)
+            })
+        });
+        let (name, _module) = generate_form(&panel, cx);
+        type_into(&name, "hero_unit", cx);
+
+        panel.update(cx, |panel, cx| panel.cancel_form(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.form.is_none(), "cancel must close the form");
+            assert!(
+                matches!(panel.run_state, RunState::Idle),
+                "and leave no run state behind"
+            );
+        });
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a cancelled form must never reach the runner"
+        );
+    }
+
+    /// The same exit through the RENDERED Cancel button: the click lands
+    /// on the real element, routes through the button's `on_click`, and
+    /// ends in the same place -- form gone, nothing spawned.
+    #[gpui::test]
+    async fn test_the_rendered_cancel_button_closes_the_form_and_spawns_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = emerald_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_item(GenKind::Component, "manifests", window, cx)
+        });
+        cx.run_until_parked();
+
+        click(cx, "ggo-emerald-cancel");
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.form.is_none(), "the Cancel click must close the form");
+        });
+        assert!(
+            cx.debug_bounds("ggo-emerald-cancel").is_none(),
+            "the closed form's buttons must leave the screen"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "cancelling by click must never reach the runner"
+        );
+    }
+
+    /// `select_kind` on an open form switches the draft's kind in place --
+    /// keeping what is typed -- and with it which rows render: a System
+    /// takes no fields, so the Component's field rows leave the screen,
+    /// and come back (kept, not rebuilt) when the kind switches back.
+    #[gpui::test]
+    async fn test_select_kind_switches_the_draft_kind_and_its_field_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = emerald_project();
+        let (runner, _calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_item(GenKind::Component, "manifests", window, cx);
+            panel.add_field(window, cx);
+        });
+        cx.run_until_parked();
+        let field_name = panel.read_with(cx, |panel, _| match &panel.form {
+            Some(PanelForm::Generate(form)) => form.fields[0].name.clone(),
+            _ => panic!("expected a generate form"),
+        });
+        type_into(&field_name, "hp", cx);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ICON-Trash").is_some(),
+            "a component form renders its field row (with its trash button)"
+        );
+
+        panel.update(cx, |panel, cx| panel.select_kind(GenKind::System, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            let draft = panel.draft(cx).expect("the form stays open");
+            assert_eq!(draft.kind, GenKind::System, "the draft kind switched");
+            assert_eq!(
+                draft.fields.len(),
+                1,
+                "the typed field row is kept in the draft"
+            );
+        });
+        assert!(
+            cx.debug_bounds("ICON-Trash").is_none(),
+            "a system form must not render field rows"
+        );
+        assert!(
+            cx.debug_bounds("ggo-emerald-field-add").is_none(),
+            "nor the + Field button"
+        );
+
+        panel.update(cx, |panel, cx| panel.select_kind(GenKind::Component, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ICON-Trash").is_some(),
+            "switching back shows the kept row again"
+        );
+        panel.read_with(cx, |panel, cx| {
+            let draft = panel.draft(cx).expect("still open");
+            assert_eq!(draft.fields[0].name, "hp", "with its typed name intact");
+        });
+    }
+
+    /// `remove_field` drops exactly the named row from the draft, and an
+    /// out-of-range index is a no-op rather than a panic.
+    #[gpui::test]
+    async fn test_remove_field_drops_the_row_from_the_draft(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let cx = empty_window(cx);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let panel = lone_panel(cx, dir.path(), runner);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.new_item(GenKind::Component, "manifests", window, cx);
+                panel.add_field(window, cx);
+                panel.add_field(window, cx);
+            })
+        });
+        let fields = panel.read_with(cx, |panel, _| match &panel.form {
+            Some(PanelForm::Generate(form)) => {
+                form.fields.iter().map(|row| row.name.clone()).collect::<Vec<_>>()
+            }
+            _ => panic!("expected a generate form"),
+        });
+        type_into(&fields[0], "hp", cx);
+        type_into(&fields[1], "art", cx);
+
+        panel.update(cx, |panel, cx| panel.remove_field(0, cx));
+        panel.read_with(cx, |panel, cx| {
+            let draft = panel.draft(cx).expect("the form stays open");
+            assert_eq!(draft.fields.len(), 1, "one row was removed");
+            assert_eq!(draft.fields[0].name, "art", "and it was the FIRST row");
+        });
+
+        panel.update(cx, |panel, cx| panel.remove_field(5, cx));
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.draft(cx).expect("still open").fields.len(),
+                1,
+                "an out-of-range remove is a no-op"
+            );
+        });
+        assert!(calls.lock().unwrap().is_empty(), "editing rows spawns nothing");
+    }
+
+    /// The form row's rendered trash button: with one field row open, a
+    /// click on the row's `ICON-Trash` bounds must remove that row through
+    /// the button's own listener (which captures the row index).
+    #[gpui::test]
+    async fn test_the_rendered_field_trash_button_removes_its_row(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_item(GenKind::Component, "manifests", window, cx);
+            panel.add_field(window, cx);
+        });
+        cx.run_until_parked();
+
+        click(cx, "ICON-Trash");
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel
+                    .draft(cx)
+                    .expect("the form stays open")
+                    .fields
+                    .is_empty(),
+                "the trash click must drop the row"
+            );
+        });
+        assert!(
+            cx.debug_bounds("ICON-Trash").is_none(),
+            "and the row leaves the screen"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// A rendered tab click drives `select_tab` through the button's
+    /// `on_click`: the browser switches manifests and the old tab's
+    /// selection is dropped (names are only unique within one manifest).
+    #[gpui::test]
+    async fn test_a_rendered_tab_click_switches_the_browser(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.select_item("HeroUnit", cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.tab, BrowseTab::Components, "the browser opens on Components");
+            assert_eq!(panel.selected.as_deref(), Some("HeroUnit"));
+        });
+
+        click(cx, "ggo-emerald-tab-Systems");
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.tab, BrowseTab::Systems, "the click must switch the tab");
+            assert_eq!(
+                panel.selected, None,
+                "a selection never survives a tab change"
+            );
+        });
+
+        click(cx, "ggo-emerald-tab-Schedules");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.tab, BrowseTab::Schedules);
+        });
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "browsing tabs must never spawn emd"
+        );
+    }
+
+    /// The generate form's rendered "+ Field" button drives `add_field`
+    /// through its `on_click`: each click appends one (empty) row.
+    #[gpui::test]
+    async fn test_the_rendered_add_field_button_appends_a_row(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_item(GenKind::Component, "manifests", window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.draft(cx).expect("form open").fields.is_empty(),
+                "a fresh component form has no field rows"
+            );
+        });
+
+        click(cx, "ggo-emerald-field-add");
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.draft(cx).expect("form open").fields.len(), 1);
+        });
+
+        click(cx, "ggo-emerald-field-add");
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.draft(cx).expect("form open").fields.len(),
+                2,
+                "each click appends another row"
+            );
+        });
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

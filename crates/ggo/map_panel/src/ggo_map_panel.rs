@@ -1284,13 +1284,7 @@ impl MapPanel {
                     .icon_size(IconSize::Small)
                     .toggle_state(tool == t)
                     .tooltip(Tooltip::text(t.label()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let ViewerState::Ready(open) = &mut this.state {
-                            open.tool = t;
-                            open.rect_pending = None;
-                            cx.notify();
-                        }
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tool(t, cx)))
             }))
             .child(
                 IconButton::new("ggo-map-hflip", IconName::ArrowRightLeft)
@@ -1362,6 +1356,18 @@ impl MapPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.step_zoom(1, cx))),
             )
             .into_any_element()
+    }
+
+    /// Switch the active tool (the toolbar buttons). Always discards a
+    /// pending rect-fill preview: a half-dragged rect must not survive into
+    /// another tool's gesture, nor arm the next RectFill click with a stale
+    /// anchor.
+    fn set_tool(&mut self, tool: MapTool, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.tool = tool;
+            open.rect_pending = None;
+            cx.notify();
+        }
     }
 
     fn step_zoom(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1619,51 +1625,72 @@ impl MapPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                    let Some(cell) = this
-                        .ready_map()
-                        .and_then(|o| o.strip_cell_at(event.position))
-                    else {
-                        return;
-                    };
-                    if let ViewerState::Ready(open) = &mut this.state {
-                        open.pal_dragging = true;
-                        open.pal_anchor = cell;
-                        open.pal_far = cell;
-                        cx.notify();
-                    }
+                    this.strip_primary_down(event.position, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                let Some((dragging, cell)) = this
-                    .ready_map()
-                    .map(|open| (open.pal_dragging, open.strip_cell_at(event.position)))
-                else {
-                    return;
-                };
-                if !dragging {
-                    return;
-                }
-                let ViewerState::Ready(open) = &mut this.state else {
-                    return;
-                };
-                if event.pressed_button != Some(MouseButton::Left) {
-                    open.pal_dragging = false;
-                    return;
-                }
-                if let Some(cell) = cell {
-                    open.pal_far = cell;
-                    cx.notify();
-                }
+                this.strip_drag_move(event, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
-                    if let ViewerState::Ready(open) = &mut this.state {
-                        open.pal_dragging = false;
-                    }
+                    this.strip_primary_up();
                 }),
             )
             .into_any_element()
+    }
+
+    /// Strip primary-down at window-space `position`: arm a drag-select
+    /// anchored on the hit tile. A miss -- off the strip, or in the sheet's
+    /// zero-filled partial-row padding -- arms nothing.
+    fn strip_primary_down(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(cell) = self
+            .ready_map()
+            .and_then(|open| open.strip_cell_at(position))
+        else {
+            return;
+        };
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.pal_dragging = true;
+            open.pal_anchor = cell;
+            open.pal_far = cell;
+            cx.notify();
+        }
+    }
+
+    /// Extend an in-flight strip drag-select to the tile under the cursor.
+    /// The drag ends when the left button is no longer held (it came up
+    /// outside the strip); a miss while dragging leaves the selection where
+    /// it was rather than smearing it to the edge.
+    fn strip_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some((dragging, cell)) = self
+            .ready_map()
+            .map(|open| (open.pal_dragging, open.strip_cell_at(event.position)))
+        else {
+            return;
+        };
+        if !dragging {
+            return;
+        }
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            open.pal_dragging = false;
+            return;
+        }
+        if let Some(cell) = cell {
+            open.pal_far = cell;
+            cx.notify();
+        }
+    }
+
+    /// Release over the strip: the drag-select is finished, keeping its
+    /// selection.
+    fn strip_primary_up(&mut self) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.pal_dragging = false;
+        }
     }
 
     /// The bind picker + the resize fields.
@@ -2919,6 +2946,98 @@ mod tests {
         );
     }
 
+    /// Answering "Save" when the write FAILS must cancel the close --
+    /// letting it proceed would discard the very edits the user just asked
+    /// to keep.
+    #[gpui::test]
+    async fn test_close_guard_save_failure_cancels_the_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let cx = cx.add_empty_window();
+        dirty_the_map(&panel, cx);
+
+        // The save resolves against the OPEN document's captured root;
+        // repointing that root at a regular file makes the write's
+        // parent-dir creation fail deterministically.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.root = blocker;
+        });
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        cx.simulate_prompt_answer("Save");
+        assert!(!close.await, "a failed save must cancel the close");
+
+        panel.update(cx, |panel, _| {
+            let open = ready(panel);
+            assert!(open.save_error.is_some(), "the failure must be surfaced");
+            assert!(open.store.dirty(), "the edits must survive the failed save");
+        });
+    }
+
+    /// "Don't Save" closes and deliberately drops the edits -- the file on
+    /// disk keeps its loaded contents.
+    #[gpui::test]
+    async fn test_close_guard_discard_allows_close_without_writing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+        let cx = cx.add_empty_window();
+        dirty_the_map(&panel, cx);
+
+        let close = cx
+            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
+        cx.simulate_prompt_answer("Don't Save");
+        assert!(close.await, "Don't Save must allow the close");
+        assert_eq!(
+            io::open_map(&assets, "maps/level.map").unwrap().cells,
+            blank_cells(),
+            "Don't Save must not write the file"
+        );
+    }
+
+    /// A failed write must be VISIBLE (`save_error` set, which the panel
+    /// banner renders) and must not `mark_saved` -- the document keeps its
+    /// edits and stays dirty for the next attempt.
+    #[gpui::test]
+    async fn test_save_failure_sets_the_error_and_keeps_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.paint_at((0, 0), cx);
+            assert!(panel.dirty_map_name().is_some());
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.root = blocker;
+
+            panel.save_impl(cx);
+            let open = ready(panel);
+            assert!(
+                open.save_error.is_some(),
+                "the failed write must surface as save_error"
+            );
+            assert!(
+                open.store.dirty(),
+                "a failed save must not mark the document saved"
+            );
+        });
+        assert_eq!(
+            io::open_map(&assets, "maps/level.map").unwrap().cells,
+            blank_cells(),
+            "the real file must be untouched by the failed write"
+        );
+    }
+
     /// The wiring test: a dirty panel docked in a REAL workspace makes
     /// `Workspace::prepare_to_close` prompt and, on Cancel, report `false`.
     #[gpui::test]
@@ -2999,6 +3118,52 @@ mod tests {
             blank_cells(),
             "Don't Save must not write the abandoned document"
         );
+    }
+
+    /// The "Save" branch of a dirty switch writes the edit, then loads the
+    /// new document -- and once the panel is clean, switching back neither
+    /// prompts nor blocks.
+    #[gpui::test]
+    async fn test_open_rel_path_save_branch_writes_then_switches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+        let cx = cx.add_empty_window();
+        dirty_the_map(&panel, cx);
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("assets/maps/other.map", window, cx)
+            })
+        });
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.source_rel, "assets/maps/other.map", "Save then switch");
+            assert!(!open.store.dirty(), "the new document starts clean");
+        });
+        assert_ne!(
+            io::open_map(&assets, "maps/level.map").unwrap().cells,
+            blank_cells(),
+            "Save must have written the abandoned document's edit"
+        );
+
+        // A clean panel switches straight back, no prompt.
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.open_rel_path("assets/maps/level.map", window, cx)
+            })
+        });
+        assert!(
+            !cx.has_pending_prompt(),
+            "a clean panel must switch without asking"
+        );
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(ready(panel).source_rel, "assets/maps/level.map");
+        });
     }
 
     /// **Regression, fix round 1 BLOCKING 2.** "New Map…" must run the
@@ -3314,5 +3479,388 @@ mod tests {
                 "a duplicate name is refused in the editor"
             );
         });
+    }
+
+    // ------------------------------------------------------ strip mapping
+
+    /// `strip_local`/`strip_cell_at` map a WINDOW position through the
+    /// stamped strip bounds onto a tile -- with the fixture's 4x1 sheet at
+    /// [`geom::STRIP_ZOOM`] a cell is 32 px -- and the `tile_count` gate
+    /// keeps a wide sheet's zero-filled partial-row padding unpickable.
+    #[gpui::test]
+    async fn test_strip_cell_at_maps_through_stamped_bounds_and_gates_padding(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                *open.strip_bounds.borrow_mut() =
+                    Some(bounds(point(px(50.), px(400.)), size(px(256.), px(64.))));
+                assert_eq!(
+                    open.strip_local(point(px(82.), px(410.))),
+                    Some([32.0, 10.0]),
+                    "strip-local px are window px minus the strip origin"
+                );
+                assert_eq!(open.strip_cell_at(point(px(83.), px(401.))), Some((1, 0)));
+                assert_eq!(
+                    open.strip_cell_at(point(px(49.), px(400.))),
+                    None,
+                    "left of the strip is a miss, not cell 0"
+                );
+                assert_eq!(
+                    open.strip_cell_at(point(px(50. + 4. * 32.), px(400.))),
+                    None,
+                    "past the 4-column sheet is a miss"
+                );
+                assert_eq!(
+                    open.strip_cell_at(point(px(50.), px(432.))),
+                    None,
+                    "below the single row is a miss"
+                );
+            }
+
+            // The wide sheet: 9 tiles across the 8-column fallback, so row
+            // 1 holds one real tile and 7 padding cells.
+            panel.bind_tileset("tiles/wide.til".to_string(), cx);
+            let open = ready(panel);
+            assert_eq!(
+                open.strip_cell_at(point(px(51.), px(433.))),
+                Some((0, 1)),
+                "tile 8 -- the last real tile -- is pickable"
+            );
+            assert_eq!(
+                open.strip_cell_at(point(px(83.), px(433.))),
+                None,
+                "the padding cell after it is not"
+            );
+        });
+    }
+
+    fn move_event(x: f32, y: f32, button: Option<MouseButton>) -> MouseMoveEvent {
+        MouseMoveEvent {
+            position: point(px(x), px(y)),
+            pressed_button: button,
+            modifiers: gpui::Modifiers::default(),
+        }
+    }
+
+    /// The strip's mouse trio: down arms the drag and anchors both
+    /// corners, a held move extends the far corner (misses don't smear
+    /// it), up finishes keeping the selection -- and the picked rect plus
+    /// the live palSub is exactly what the stamp folds in.
+    #[gpui::test]
+    async fn test_strip_mouse_trio_arms_extends_and_clears(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            *ready(panel).strip_bounds.borrow_mut() =
+                Some(bounds(point(px(0.), px(0.)), size(px(128.), px(32.))));
+
+            // A down on a miss (off the 4x1 sheet) arms nothing.
+            panel.strip_primary_down(point(px(0.), px(200.)), cx);
+            assert!(!ready(panel).pal_dragging);
+
+            panel.strip_primary_down(point(px(33.), px(1.)), cx);
+            {
+                let open = ready(panel);
+                assert!(open.pal_dragging, "down arms the drag");
+                assert_eq!(open.pal_anchor, (1, 0));
+                assert_eq!(open.pal_far, (1, 0), "both corners start on the hit tile");
+            }
+
+            panel.strip_drag_move(&move_event(65., 1., Some(MouseButton::Left)), cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.pal_anchor, (1, 0), "the anchor holds");
+                assert_eq!(open.pal_far, (2, 0), "the held move extends the far corner");
+                assert!(open.pal_dragging);
+            }
+
+            panel.strip_drag_move(&move_event(300., 300., Some(MouseButton::Left)), cx);
+            {
+                let open = ready(panel);
+                assert_eq!(
+                    open.pal_far,
+                    (2, 0),
+                    "a miss while dragging leaves the selection put"
+                );
+                assert!(open.pal_dragging, "and the drag stays alive");
+            }
+
+            panel.strip_primary_up();
+            {
+                let open = ready(panel);
+                assert!(!open.pal_dragging, "up finishes the drag");
+                assert_eq!((open.pal_anchor, open.pal_far), ((1, 0), (2, 0)));
+            }
+
+            // The selection + the live palSub is what the brush stamps.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.pal_sub = 5;
+            }
+            let stamp = ready(panel).current_stamp();
+            assert_eq!(
+                stamp.cells,
+                vec![pack_cell(1, 5, false, false), pack_cell(2, 5, false, false)],
+                "the picked tiles carry the palSub"
+            );
+
+            // A button that came up outside the strip cancels the next
+            // drag on its first move.
+            panel.strip_primary_down(point(px(1.), px(1.)), cx);
+            panel.strip_drag_move(&move_event(65., 1., None), cx);
+            let open = ready(panel);
+            assert!(!open.pal_dragging, "a move without the button ends the drag");
+            assert_eq!(open.pal_far, (0, 0), "without extending the selection");
+        });
+    }
+
+    // ----------------------------------------------------- canvas gestures
+
+    /// Middle-drag pan, mirroring `ggo_world_panel`'s: the move handler
+    /// applies the cursor delta to the drag's starting pan, a release
+    /// elsewhere cancels (while still claiming the event), and with no
+    /// drag in flight the move is not this handler's to consume.
+    #[gpui::test]
+    async fn test_handle_pan_move_pans_by_the_cursor_delta_and_cancels_on_release(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.pan_drag = Some(PanDrag {
+                    start_cursor: [10.0, 10.0],
+                    start_pan: [5.0, 5.0],
+                });
+            }
+
+            let held = move_event(30., 25., Some(MouseButton::Middle));
+            assert!(
+                panel.handle_pan_move(&held, cx),
+                "an in-flight pan owns the move"
+            );
+            assert_eq!(ready(panel).pan, [25.0, 20.0]);
+
+            assert!(
+                panel.handle_pan_move(&move_event(40., 40., None), cx),
+                "the cancelling move still belongs to the pan"
+            );
+            {
+                let open = ready(panel);
+                assert!(open.pan_drag.is_none(), "release elsewhere cancels the drag");
+                assert_eq!(open.pan, [25.0, 20.0], "without moving the pan again");
+            }
+
+            assert!(
+                !panel.handle_pan_move(&held, cx),
+                "with no drag in flight the move is not a pan event"
+            );
+        });
+    }
+
+    /// Wheel zoom anchored on the cursor over the integer ladder: the pan
+    /// keeps the map pixel under the cursor fixed ([`geom::zoom_at`]), and
+    /// the ladder ends are no-ops for both zoom and pan.
+    #[gpui::test]
+    async fn test_zoom_at_cursor_steps_the_ladder_and_no_ops_at_the_ends(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.pan = [8.0, 4.0];
+            }
+            panel.zoom_at_cursor(1, [40.0, 20.0], cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.zoom, geom::DEFAULT_ZOOM + 1);
+                assert_eq!(
+                    open.pan,
+                    geom::zoom_at([8.0, 4.0], geom::DEFAULT_ZOOM, [40.0, 20.0], geom::DEFAULT_ZOOM + 1),
+                    "the pan is the cursor-anchored adjustment"
+                );
+            }
+
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.zoom = geom::MAX_ZOOM;
+                open.pan = [8.0, 4.0];
+            }
+            panel.zoom_at_cursor(1, [40.0, 20.0], cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.zoom, geom::MAX_ZOOM, "the top of the ladder holds");
+                assert_eq!(open.pan, [8.0, 4.0], "a ladder end must not move the pan");
+            }
+
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.zoom = geom::MIN_ZOOM;
+            }
+            panel.zoom_at_cursor(-1, [40.0, 20.0], cx);
+            let open = ready(panel);
+            assert_eq!(open.zoom, geom::MIN_ZOOM, "the bottom of the ladder holds");
+            assert_eq!(open.pan, [8.0, 4.0]);
+        });
+    }
+
+    // ------------------------------------------------------- tool buttons
+
+    /// Switching tools discards a pending rect-fill preview -- the rule
+    /// the toolbar buttons' click closures route through `set_tool` for: a
+    /// half-dragged rect must not survive into another tool's gesture.
+    #[gpui::test]
+    async fn test_switching_tools_clears_the_pending_rect(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(MapTool::RectFill, cx);
+            panel.paint_at((1, 1), cx);
+            assert_eq!(ready(panel).rect_pending, Some((1, 1, 1, 1)));
+
+            panel.set_tool(MapTool::Eraser, cx);
+            let open = ready(panel);
+            assert_eq!(open.tool, MapTool::Eraser);
+            assert!(
+                open.rect_pending.is_none(),
+                "the pending rect must not survive the tool switch"
+            );
+        });
+    }
+
+    // ----------------------------------------------- keystroke dispatch
+
+    /// Load the fixture map into a panel that is the root view of a real
+    /// test window -- what keystroke dispatch needs -- modeled on
+    /// `ggo_world_panel`'s `ready_panel_in_window`.
+    async fn ready_panel_in_window<'a>(
+        cx: &'a mut TestAppContext,
+        root: &Path,
+    ) -> (Entity<MapPanel>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        write_project(root);
+        let root = root.to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = MapPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        // Focus only routes keystrokes while the window is ACTIVE (the
+        // same note as the world panel's helper).
+        cx.update(|window, _| window.activate_window());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("assets/maps/level.map", cx);
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// The panel-scoped bindings only fire while the panel's own focus
+    /// handle has focus -- the focus `canvas_primary_down` takes in
+    /// production.
+    fn focus_the_panel(panel: &Entity<MapPanel>, cx: &mut gpui::VisualTestContext) {
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// `ctrl-z`/`ctrl-shift-z` reach `undo_impl`/`redo_impl` through the
+    /// keymap over a real paint (the history semantics have their own
+    /// method-level tests; this pins the keystroke wiring).
+    #[gpui::test]
+    async fn test_undo_redo_keystrokes_step_a_real_paint(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| panel.paint_at((1, 1), cx));
+        focus_the_panel(&panel, cx);
+
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(cells(panel), blank_cells(), "ctrl-z must undo the paint");
+            assert!(!ready(panel).store.dirty());
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                cells(panel)[FIXTURE_W as usize + 1],
+                pack_cell(0, 0, false, false),
+                "ctrl-shift-z must redo it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_save_keystroke_writes_the_file(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| panel.paint_at((1, 2), cx));
+        focus_the_panel(&panel, cx);
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        let on_disk = io::open_map(&dir.path().join(ASSETS_DIR), "maps/level.map").unwrap();
+        assert_eq!(
+            on_disk.cells[2 * FIXTURE_W as usize + 1],
+            pack_cell(0, 0, false, false),
+            "ctrl-s must write the painted cell to disk"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(!ready(panel).store.dirty(), "save clears dirty");
+        });
+    }
+
+    /// Enter inside a focused size field resolves through the
+    /// `GgoMapPanel > Editor` binding to `ApplyResize`: the typed size
+    /// lands in the document, and the field shows the applied value.
+    #[gpui::test]
+    async fn test_enter_in_a_focused_size_field_applies_the_resize(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        let w_editor = panel.read_with(cx, |panel, _| {
+            ready(panel)
+                .resize
+                .as_ref()
+                .expect("the windowed render created the resize fields")
+                .w
+                .clone()
+        });
+
+        w_editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+        w_editor.update_in(cx, |editor, window, cx| editor.set_text("6", window, cx));
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = ready(panel).store.state();
+            assert_eq!(
+                (state.w, state.h),
+                (6, FIXTURE_H),
+                "enter must apply the typed width"
+            );
+            assert_eq!(state.cells.len(), 6 * FIXTURE_H as usize);
+        });
+        assert_eq!(
+            w_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "6",
+            "the field shows the applied value"
+        );
     }
 }

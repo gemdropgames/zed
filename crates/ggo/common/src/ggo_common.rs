@@ -842,6 +842,127 @@ mod tests {
         );
     }
 
+    // ------------------------------------------- unsaved-document guard
+
+    use gpui::TestAppContext;
+
+    /// The minimal panel stand-in [`prepare_to_close_dirty`] needs: just
+    /// somewhere for the `save` callback to record that it ran.
+    struct GuardedDoc {
+        save_calls: usize,
+    }
+
+    /// Start the guard on a fresh entity in `cx`'s window, with the `save`
+    /// callback counting its calls and returning `save_result`.
+    fn start_close(
+        cx: &mut gpui::VisualTestContext,
+        dirty_name: Option<&str>,
+        save_result: bool,
+    ) -> (gpui::Entity<GuardedDoc>, Task<bool>) {
+        let doc = cx.update(|_, cx| cx.new(|_| GuardedDoc { save_calls: 0 }));
+        let close = cx.update(|window, cx| {
+            doc.update(cx, |_, cx| {
+                prepare_to_close_dirty(
+                    dirty_name.map(str::to_string),
+                    window,
+                    cx,
+                    move |doc, _cx| {
+                        doc.save_calls += 1;
+                        save_result
+                    },
+                )
+            })
+        });
+        (doc, close)
+    }
+
+    /// A clean panel must be invisible to the close flow: no prompt, ready
+    /// `true`, and the save callback never runs.
+    #[gpui::test]
+    async fn test_close_guard_lets_a_clean_document_close_without_prompting(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let (doc, close) = start_close(cx, None, true);
+        assert!(!cx.has_pending_prompt(), "a clean document must not prompt");
+        assert!(close.await, "a clean document must not block the close");
+        doc.read_with(cx, |doc, _| assert_eq!(doc.save_calls, 0));
+    }
+
+    /// Cancel vetoes the close and must not write anything.
+    #[gpui::test]
+    async fn test_close_guard_cancel_vetoes_the_close(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message),
+            Some(dirty_message("worlds/test.toml")),
+        );
+        cx.simulate_prompt_answer("Cancel");
+        assert!(!close.await, "Cancel must veto the close");
+        doc.read_with(cx, |doc, _| {
+            assert_eq!(doc.save_calls, 0, "Cancel must not save")
+        });
+    }
+
+    /// "Don't Save" allows the close WITHOUT running the save callback.
+    #[gpui::test]
+    async fn test_close_guard_discard_closes_without_saving(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        cx.simulate_prompt_answer("Don't Save");
+        assert!(close.await, "Don't Save must allow the close");
+        doc.read_with(cx, |doc, _| {
+            assert_eq!(doc.save_calls, 0, "Don't Save must not write")
+        });
+    }
+
+    /// Save runs the callback and closes when the write succeeds.
+    #[gpui::test]
+    async fn test_close_guard_save_success_allows_the_close(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        cx.simulate_prompt_answer("Save");
+        assert!(close.await, "a successful save must allow the close");
+        doc.read_with(cx, |doc, _| assert_eq!(doc.save_calls, 1));
+    }
+
+    /// The data-loss case: Save whose write FAILS must cancel the close --
+    /// otherwise the window goes away with the document neither on disk nor
+    /// alive in the panel.
+    #[gpui::test]
+    async fn test_close_guard_failed_save_vetoes_the_close(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (doc, close) = start_close(cx, Some("worlds/test.toml"), false);
+        cx.simulate_prompt_answer("Save");
+        assert!(
+            !close.await,
+            "a failed save must veto the close, or the unsaved edits are lost"
+        );
+        doc.read_with(cx, |doc, _| {
+            assert_eq!(doc.save_calls, 1, "the save was attempted exactly once")
+        });
+    }
+
+    /// The entity going away mid-prompt (its panel was dropped) resolves
+    /// the guard to `false` -- the fail-safe direction -- rather than
+    /// panicking or pretending a save happened.
+    #[gpui::test]
+    async fn test_close_guard_resolves_false_when_the_entity_is_dropped_mid_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        drop(doc);
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Save");
+        assert!(
+            !close.await,
+            "Save against a dropped entity cannot have written anything, so \
+             the close must be vetoed"
+        );
+    }
+
     // ---------------------------------------------- emerald project roots
 
     #[test]

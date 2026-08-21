@@ -407,6 +407,53 @@ mod tests {
         assert_eq!(runs[1].label.as_deref(), Some("first"));
     }
 
+    /// A file that EXISTS but is not a database (garbage bytes, or a db
+    /// from a schema so old the `run`/`cart` tables aren't there) must
+    /// read as `Err`, not as an empty picker: this is the only producer
+    /// of the panel's `LoadState::Error`, and silently showing "no runs"
+    /// over a real, corrupt `ggo_ide.db` would hide the one signal the
+    /// user has that something is wrong with it.
+    #[test]
+    fn list_runs_of_a_corrupt_db_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("ggo_ide.db");
+        std::fs::write(&junk, b"this is not a SQLite file, not even close").unwrap();
+        assert!(list_runs(&junk).is_err());
+    }
+
+    /// Two runs ingested with the SAME `started_at` (a batch replay, or a
+    /// producer with second-granularity timestamps) order by `id DESC` --
+    /// the `ORDER BY r.started_at DESC, r.id DESC` tie-break
+    /// `perf.rs::cart_runs_async` uses, so the panel's picker and
+    /// ggo-ide's run list agree on which of the two is "newer". The
+    /// lower id is inserted first, so a scan without the ORDER BY would
+    /// come back ascending and fail this.
+    #[test]
+    fn list_runs_breaks_a_started_at_tie_by_id_descending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ggo_ide.db");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(&path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'demo')", ())
+                .await
+                .unwrap();
+            for id in [1i64, 2] {
+                conn.execute(
+                    "INSERT INTO run (id, cart_id, started_at, frames)
+                     VALUES (?1, 1, '2026-08-01T00:00:00Z', 1)",
+                    [id],
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let ids: Vec<i64> = list_runs(&path).unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 1], "equal started_at ties break by id DESC");
+    }
+
     #[test]
     fn list_runs_is_empty_for_a_freshly_migrated_db_with_no_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -445,6 +492,35 @@ mod tests {
     // What remains this crate's business is the fan-out below -- that
     // `load_run_samples` asks for all four pieces against the real
     // migrated schema, and that a missing db reads as empty, not an error.
+
+    /// The `{e:#}` stringification is load-bearing: `perf_db` wraps its
+    /// failures in `.context(..)` layers whose plain `Display` shows ONLY
+    /// the outermost context ("opening <path>" -- true but useless), and
+    /// the alternate form appends the chain, which is where the actual
+    /// turso failure lives. A regression to `{e}` here keeps every test
+    /// that only checks `is_err()` green while the panel's error banner
+    /// stops saying what went wrong.
+    #[test]
+    fn load_run_samples_errors_carry_the_context_chain_and_the_root_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("ggo_ide.db");
+        std::fs::write(&junk, b"this is not a SQLite file, not even close").unwrap();
+
+        let message = load_run_samples(&junk, 1).unwrap_err();
+        assert!(
+            message.contains("opening") && message.contains("ggo_ide.db"),
+            "the context layer names the failing step and file: {message}"
+        );
+        let root_cause = message
+            .split_once("ggo_ide.db: ")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        assert!(
+            !root_cause.is_empty(),
+            "the chain continues past the context into turso's own failure \
+             (e.g. \"I/O error: short read on page 1\"): {message}"
+        );
+    }
 
     #[test]
     fn load_run_samples_returns_nothing_for_a_missing_db_file() {

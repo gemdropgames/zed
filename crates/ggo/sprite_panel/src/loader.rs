@@ -13,14 +13,16 @@ use std::sync::Arc;
 
 use ggo_common::to_render_image;
 use ggo_worldlib::sprites::cow::SpriteState;
+use ggo_worldlib::sprites::hw;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::indices_to_rgba;
 use ggo_worldlib::sprites::preview::compose_frame_rgba;
 use ggo_worldlib::sprites::tileset_doc::{
-    compose_tile_grid, tile_grid_layout, unpack_til_to_indices,
+    TILE_PIXELS, compose_tile_grid, tile_grid_layout, unpack_til_to_indices,
 };
 use gpui::RenderImage;
 
+use crate::editor_meta::{self, EditorMeta};
 use crate::onion;
 
 /// Everything the panel needs to enter its Ready state, assembled
@@ -45,6 +47,8 @@ pub struct LoadedSprite {
     /// save, undo across it). `None` only if the sheet came out with
     /// dimensions gpui can't build an image from.
     pub pool_strip: Option<PoolStrip>,
+    /// The per-sprite editor-settings sidecar (defaults when absent).
+    pub meta: EditorMeta,
 }
 
 /// How many tiles wide the tile picker lays the bound tileset out. Fixed
@@ -60,7 +64,12 @@ pub struct PoolStrip {
     pub image: Arc<RenderImage>,
     pub cols: usize,
     pub rows: usize,
-    pub tile_count: usize,
+    /// Sheet cells in display order, each naming the POOL index it
+    /// shows. All-zero (blank) pool tiles are excluded outright: the doc
+    /// needs them for empty cells, but they are never the user's to pick
+    /// -- erasing is the Eraser tool's job, and showing them reads as a
+    /// stray extra tile.
+    pub tiles: Vec<u16>,
 }
 
 /// Compose every frame of `state` into a BGRA [`RenderImage`] (no LCD
@@ -81,7 +90,8 @@ pub fn compose_frames(state: &SpriteState) -> Result<Vec<Arc<RenderImage>>, Stri
 /// Compose the sprite's pool -- which IS its bound `.til`, byte for byte
 /// (`io::open_sprite` reads the tileset file straight into
 /// `SpriteState::pool`) -- into the tile picker's single sheet image,
-/// [`PICKER_COLS`] tiles wide.
+/// `cols` tiles wide (clamped to at least 1 and at most the pool's tile
+/// count; [`PICKER_COLS`] is the panel's default wrap).
 ///
 /// Deliberately the SAME three worldlib calls `ggo_tileset_panel::loader`
 /// makes for its own sheet -- `unpack_til_to_indices` ->
@@ -94,18 +104,34 @@ pub fn compose_frames(state: &SpriteState) -> Result<Vec<Arc<RenderImage>>, Stri
 /// by repointing the sole cell of a 1x1-tile `SpriteState` VIEW at each
 /// pool tile in turn and running `compose_frame_rgba` over it -- a
 /// workaround for an entry point that now exists.
-pub fn compose_pool_strip(state: &SpriteState) -> Option<PoolStrip> {
-    let cols = PICKER_COLS.min(state.tile_count.max(1));
+pub fn compose_pool_strip(state: &SpriteState, cols: usize) -> Option<PoolStrip> {
     let indices = unpack_til_to_indices(&state.pool, state.tile_count);
-    let (sheet, w, h) = compose_tile_grid(&indices, state.tile_count, cols);
+    // Display order = pool order minus the blanks.
+    let tiles: Vec<u16> = (0..state.tile_count)
+        .filter(|&t| {
+            let off = t * hw::TILE_BYTES;
+            !state.pool[off..off + hw::TILE_BYTES].iter().all(|&b| b == 0)
+        })
+        .map(|t| t as u16)
+        .collect();
+    if tiles.is_empty() {
+        return None;
+    }
+    let mut shown = Vec::with_capacity(tiles.len() * TILE_PIXELS);
+    for &t in &tiles {
+        let off = t as usize * TILE_PIXELS;
+        shown.extend_from_slice(&indices[off..off + TILE_PIXELS]);
+    }
+    let cols = cols.max(1).min(tiles.len());
+    let (sheet, w, h) = compose_tile_grid(&shown, tiles.len(), cols);
     let rgba = indices_to_rgba(&sheet, &state.palette);
     let image = to_render_image(&rgba, w as u32, h as u32)?;
-    let (_, rows) = tile_grid_layout(state.tile_count, cols);
+    let (_, rows) = tile_grid_layout(tiles.len(), cols);
     Some(PoolStrip {
         image,
         cols,
         rows: rows.max(1),
-        tile_count: state.tile_count,
+        tiles,
     })
 }
 
@@ -163,13 +189,15 @@ pub fn compose_ghost(state: &SpriteState, idx: usize, dist: i32) -> Option<Arc<R
 pub fn load_sprite(project_dir: &Path, rel: &str) -> Result<LoadedSprite, String> {
     let opened = io::open_sprite(project_dir, rel).map_err(|e| e.to_string())?;
     let frames = compose_frames(&opened.state)?;
-    let pool_strip = compose_pool_strip(&opened.state);
+    let meta = editor_meta::load(project_dir, rel);
+    let pool_strip = compose_pool_strip(&opened.state, meta.picker_cols.unwrap_or(PICKER_COLS));
     Ok(LoadedSprite {
         state: opened.state,
         til_path: opened.til_path,
         pal_path: opened.pal_path,
         frames,
         pool_strip,
+        meta,
     })
 }
 
@@ -178,6 +206,37 @@ mod tests {
     use super::*;
     use ggo_worldlib::sprites::cow::{PixelWrite, write_pixels};
     use ggo_worldlib::sprites::sprite_doc::blank_sprite_state;
+
+    // ----------------------------------------------- compose_pool_strip
+
+    #[test]
+    fn compose_pool_strip_excludes_blank_tiles_from_the_sheet() {
+        let mut s = blank_sprite_state(1, 1).expect("1x1 sprite");
+        // Tile 0 is worldlib's blank; append non-blank tile 1, a second
+        // blank tile 2, and non-blank tile 3. The picker must show ONLY
+        // the two non-blank tiles -- the blanks the doc needs for empty
+        // cells are never the user's to pick (Eraser covers erasing).
+        s.pool.extend(std::iter::repeat_n(0x11u8, 128));
+        s.pool.extend(std::iter::repeat_n(0u8, 128));
+        s.pool.extend(std::iter::repeat_n(0x22u8, 128));
+        s.tile_count = 4;
+        let strip = compose_pool_strip(&s, 4).expect("sheet composes");
+        assert_eq!(
+            strip.tiles,
+            vec![1, 3],
+            "display order maps sheet cells to pool indices, blanks gone"
+        );
+        assert_eq!((strip.cols, strip.rows), (2, 1), "layout fits 2 tiles");
+    }
+
+    #[test]
+    fn compose_pool_strip_of_an_all_blank_pool_is_none() {
+        let s = blank_sprite_state(1, 1).expect("1x1 sprite");
+        assert!(
+            compose_pool_strip(&s, 4).is_none(),
+            "nothing pickable -> no sheet"
+        );
+    }
 
     // ------------------------------------------------------- tint_rgba
 

@@ -1711,6 +1711,26 @@ mod tests {
         assert_eq!(top.fract(), 0.0);
     }
 
+    /// A negative max falls into `ticks_for`'s `!(max > 0)` fallback, so
+    /// the domain tops out at 1 -- the same answer an all-zero series
+    /// gets. Pinned as CURRENT behavior: every y value a chart feeds this
+    /// is a count or a cycle total, non-negative today, so the fallback is
+    /// unreachable in practice -- but if a signed metric ever arrives,
+    /// this is the (possibly surprising) top it would get.
+    #[test]
+    fn nice_top_of_a_negative_max_falls_back_to_one() {
+        assert_eq!(nice_top(-5.0, Y_TICK_TARGET, false), 1.0);
+        assert_eq!(nice_top(-5.0, HISTOGRAM_Y_TICK_TARGET, true), 1.0);
+    }
+
+    /// An empty frame axis must not panic and must yield `line.rs`'s
+    /// documented `(0.0, 1.0)` fallback -- the degenerate-but-drawable
+    /// domain a chart with no samples scales against.
+    #[test]
+    fn full_x_domain_of_an_empty_axis_is_the_unit_fallback() {
+        assert_eq!(full_x_domain(&[]), (0.0, 1.0));
+    }
+
     #[test]
     fn y_scale_inverts_so_larger_values_draw_higher() {
         let plot = Rect {
@@ -2632,6 +2652,82 @@ mod tests {
     #[test]
     fn bins_of_nothing_is_empty() {
         assert!(bins(&[], HISTOGRAM_BIN_TARGET).is_empty());
+    }
+
+    /// A wide all-integer range: `nice_step(990 / 20) = 50`, already
+    /// whole, so the `step.ceil()` branch stays untouched. The first bin
+    /// starts at `(lo/step).floor()*step` -- 0, at or below the min of 7
+    /// -- and every one of the 991 values lands in a bin, the max in the
+    /// last one.
+    #[test]
+    fn bins_over_a_wide_integer_range_use_the_nice_step_width() {
+        let values: Vec<f32> = (7..=997).map(|v| v as f32).collect();
+        let b = bins(&values, HISTOGRAM_BIN_TARGET);
+        assert_eq!(b.len(), 20);
+        assert_eq!(b[0].lo, 0.0, "start snaps DOWN to a step multiple");
+        assert!(b[0].lo <= 7.0);
+        for bin in &b {
+            assert_eq!(bin.hi - bin.lo, 50.0, "the nice-step width");
+        }
+        assert_eq!(b[0].count, 43, "7..=49 in the first bin");
+        let last = b[19];
+        assert_eq!(last.count, 48, "950..=997 in the last bin");
+        assert!(last.lo <= 997.0 && 997.0 < last.hi, "the max is in range");
+        assert_eq!(
+            b.iter().map(|bin| bin.count).sum::<u32>(),
+            values.len() as u32,
+            "no value fell out of the bin range"
+        );
+    }
+
+    /// Integers whose rough step lands on a FRACTIONAL nice step:
+    /// `nice_step(49 / 20) = 2.5`, which the all-integer branch ceils to
+    /// 3 -- a histogram of whole-number counts never gets a `2.5`-wide
+    /// bin. The max (49) sits at `floor(49 / 3) = 16 = nbins - 1`, the
+    /// `min(nbins - 1)` clamp's edge, so it lands in the final bin.
+    #[test]
+    fn bins_of_integers_force_a_fractional_step_up_to_a_whole_width() {
+        let values: Vec<f32> = (0..=49).map(|v| v as f32).collect();
+        let b = bins(&values, HISTOGRAM_BIN_TARGET);
+        assert_eq!(b.len(), 17);
+        for bin in &b {
+            assert_eq!(bin.hi - bin.lo, 3.0, "2.5 ceiled to a whole width");
+        }
+        let last = b[16];
+        assert_eq!(last.count, 2, "48 and 49 land in the final bin");
+        assert!(last.lo <= 49.0 && 49.0 < last.hi);
+        assert_eq!(b.iter().map(|bin| bin.count).sum::<u32>(), 50);
+    }
+
+    /// Negative and mixed-sign values: the `(lo/step).floor()*step` start
+    /// must round toward negative infinity (a truncating division would
+    /// start ABOVE the min and lose it), so the minimum lands in bin 0 and
+    /// every value stays in range.
+    #[test]
+    fn bins_of_negative_and_mixed_sign_values_place_the_min_in_bin_zero() {
+        // All negative: -50..=-1, range 49 -> step 3, start floor(-50/3)*3.
+        let negative: Vec<f32> = (-50..=-1).map(|v| v as f32).collect();
+        let b = bins(&negative, HISTOGRAM_BIN_TARGET);
+        assert_eq!(b[0].lo, -51.0);
+        assert!(b[0].lo <= -50.0 && -50.0 < b[0].hi, "the min is in bin 0");
+        assert!(b[0].count >= 1);
+        assert_eq!(
+            b.iter().map(|bin| bin.count).sum::<u32>(),
+            negative.len() as u32,
+            "no value out of range"
+        );
+
+        // Mixed sign: -25..=24, same 3-wide step, start at -27.
+        let mixed: Vec<f32> = (-25..=24).map(|v| v as f32).collect();
+        let b = bins(&mixed, HISTOGRAM_BIN_TARGET);
+        assert_eq!(b[0].lo, -27.0);
+        assert!(b[0].lo <= -25.0 && -25.0 < b[0].hi, "the min is in bin 0");
+        let last = b.last().expect("mixed input yields bins");
+        assert!(last.lo <= 24.0 && 24.0 < last.hi, "the max is in range too");
+        assert_eq!(
+            b.iter().map(|bin| bin.count).sum::<u32>(),
+            mixed.len() as u32
+        );
     }
 
     #[test]
