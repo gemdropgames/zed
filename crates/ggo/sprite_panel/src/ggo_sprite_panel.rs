@@ -3414,7 +3414,22 @@ impl SpritePanel {
                 .find(|e| e.target == target)
                 .map(|e| e.editor.clone())
         };
-        let mut cards = h_flex().p_1().gap_1().items_start();
+        // The selected frame's duration editor lives HERE: click a frame
+        // in a sequence, adjust its ms right next to it. Each sequence
+        // entry is its own frame copy, so this is per-entry timing.
+        let mut cards = h_flex()
+            .p_1()
+            .gap_1()
+            .items_start()
+            .child(
+                v_flex()
+                    .flex_none()
+                    .gap_0p5()
+                    .child(Label::new("ms").size(LabelSize::XSmall).color(Color::Muted))
+                    .child(div().w(px(56.)).flex_none().children(
+                        editor_for(EditTarget::Duration).map(|e| Self::editor_input(e, cx)),
+                    )),
+            );
         for (i, clip) in state.clips.iter().enumerate() {
             let mut row = v_flex()
                 .id(("ggo-sprite-clip", i))
@@ -3534,15 +3549,6 @@ impl SpritePanel {
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
-            .child(Label::new("ms").size(LabelSize::Small).color(Color::Muted))
-            .child(
-                div().w(px(56.)).flex_none().children(
-                    open.editors
-                        .iter()
-                        .find(|e| e.target == EditTarget::Duration)
-                        .map(|e| Self::editor_input(e.editor.clone(), cx)),
-                ),
-            )
             .children(open.op_error.as_ref().map(|e| {
                 Label::new(SharedString::from(e.clone()))
                     .size(LabelSize::XSmall)
@@ -3576,19 +3582,31 @@ impl SpritePanel {
                 let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
                 img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
             });
+            let duration_ms = state.frames[ix].duration_ms;
             row = row.child(
-                div()
+                v_flex()
                     .id(("ggo-sprite-seq", clip_ix * 1000 + seq_pos))
-                    .w(px(THUMB_PX))
-                    .h(px(THUMB_PX))
-                    .flex()
-                    .justify_center()
                     .items_center()
+                    .gap_0p5()
+                    .p_0p5()
                     .border_1()
                     .rounded_sm()
                     .border_color(if open.selected_frame == ix { accent } else { border })
                     .debug_selector(|| format!("ggo-sprite-seq-{clip_ix}-{seq_pos}"))
-                    .children(thumb)
+                    .child(
+                        div()
+                            .w(px(THUMB_PX))
+                            .h(px(THUMB_PX))
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .children(thumb),
+                    )
+                    .child(
+                        Label::new(format!("{duration_ms} ms"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.select_frame(ix, cx)))
                     .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
                     .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
@@ -3671,7 +3689,7 @@ impl SpritePanel {
             .child(
                 v_flex()
                     .gap_1()
-                    .children(state.frames.iter().enumerate().map(|(ix, frame)| {
+                    .children(edits::library_indices(&state.frames).into_iter().map(|ix| {
                         let thumb = open.frames.get(ix).map(|image| {
                             let (w, h) = image_px_size(image);
                             let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
@@ -3707,11 +3725,6 @@ impl SpritePanel {
                                     } else {
                                         Color::Muted
                                     }),
-                            )
-                            .child(
-                                Label::new(format!("{} ms", frame.duration_ms))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
                             )
                             // Single click selects; double click names.
                             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
@@ -5104,6 +5117,26 @@ mod tests {
             panel.insert_frame_in_clip(0, 0, 9, cx);
             panel.insert_frame_in_clip(0, 9, 0, cx);
             assert_eq!(ready(panel).store.state().frames.len(), 4);
+        });
+    }
+
+    /// Adding a frame to a clip physically copies it (range clips), but
+    /// the FRAMES library must keep showing only the unique frames --
+    /// the copy is a clip-sequence detail, not a new library entry.
+    #[gpui::test]
+    async fn test_library_stays_unique_after_a_clip_drop(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.drop_frame_on_clip(0, 0, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 3, "the copy exists physically");
+            assert_eq!(
+                edits::library_indices(&state.frames),
+                vec![0, 1],
+                "the library still lists only the two unique frames"
+            );
         });
     }
 

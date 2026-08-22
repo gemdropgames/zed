@@ -82,8 +82,49 @@ pub fn active_clip_after_clip_delete(active: Option<usize>, deleted: usize) -> O
     }
 }
 
+/// The FRAMES library's display list: one strip index per unique tile
+/// map, first occurrence wins. Range clips duplicate frames physically
+/// when a sequence reuses one; the library hides those copies so it
+/// reads as "the sprite's unique frames" (durations are per-copy and
+/// live in the clip editor, not here).
+pub fn library_indices(frames: &[ggo_worldlib::sprites::cow::Frame]) -> Vec<usize> {
+    let mut seen: Vec<&[u16]> = Vec::new();
+    let mut out = Vec::new();
+    for (ix, frame) in frames.iter().enumerate() {
+        if seen.contains(&frame.map.as_slice()) {
+            continue;
+        }
+        seen.push(&frame.map);
+        out.push(ix);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use ggo_worldlib::sprites::cow::Frame;
+
+    fn frame(map: Vec<u16>) -> Frame {
+        Frame {
+            map,
+            duration_ms: 100,
+        }
+    }
+
+    #[test]
+    fn library_indices_keep_the_first_of_each_unique_map() {
+        // Range clips duplicate frames physically; the LIBRARY shows one
+        // entry per unique tile map, first occurrence wins.
+        let frames = vec![frame(vec![0]), frame(vec![1]), frame(vec![0]), frame(vec![1])];
+        assert_eq!(super::library_indices(&frames), vec![0, 1]);
+    }
+
+    #[test]
+    fn library_indices_of_all_distinct_frames_is_identity() {
+        let frames = vec![frame(vec![0]), frame(vec![1])];
+        assert_eq!(super::library_indices(&frames), vec![0, 1]);
+    }
+
     use super::*;
 
     #[test]
