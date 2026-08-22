@@ -3400,6 +3400,9 @@ impl SpritePanel {
     /// The clip-CRUD side column: per clip a name row (+ delete) and a
     /// from/to/loop row, an inline range error under the offending clip,
     /// and an add button.
+    /// The clips as a horizontal card row along the BOTTOM (where the
+    /// sequence has room to breathe); click a card to activate its clip,
+    /// whose sequence renders in the row beneath.
     fn render_clips(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_clips is only called in the Ready state");
@@ -3411,9 +3414,12 @@ impl SpritePanel {
                 .find(|e| e.target == target)
                 .map(|e| e.editor.clone())
         };
-        let mut col = v_flex().p_1().gap_1();
+        let mut cards = h_flex().p_1().gap_1().items_start();
         for (i, clip) in state.clips.iter().enumerate() {
             let mut row = v_flex()
+                .id(("ggo-sprite-clip", i))
+                .w(CLIPS_WIDTH)
+                .flex_none()
                 .gap_0p5()
                 .p_0p5()
                 .border_1()
@@ -3423,6 +3429,10 @@ impl SpritePanel {
                 } else {
                     cx.theme().colors().border_variant
                 })
+                // Click anywhere on the card to make the clip active
+                // (clicks inside its editors bubble here too -- selecting
+                // the clip being edited is a no-op).
+                .on_click(cx.listener(move |this, _, _, cx| this.select_clip(Some(i), cx)))
                 .child(
                     h_flex()
                         .gap_0p5()
@@ -3470,21 +3480,19 @@ impl SpritePanel {
                         .color(Color::Error),
                 );
             }
-            col = col.child(row);
+            cards = cards.child(row);
         }
-        col = col.child(
+        cards = cards.child(
             Button::new("ggo-sprite-clip-add", "+ Clip")
                 .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
         );
         div()
             .id("ggo-sprite-clips")
-            .w(CLIPS_WIDTH)
-            .h_full()
             .flex_none()
-            .border_l_1()
+            .border_t_1()
             .border_color(cx.theme().colors().border)
-            .overflow_y_scroll()
-            .child(col)
+            .overflow_x_scroll()
+            .child(cards)
             .into_any_element()
     }
 
@@ -3626,10 +3634,11 @@ impl SpritePanel {
         row.into_any_element()
     }
 
-    /// The frames LIBRARY: one thumbnail + name + duration per frame,
-    /// click to select (and preview), double-click to name, drag out to
-    /// reorder or to build a clip sequence. Its header carries the
-    /// create/duplicate/delete buttons so the area is self-contained.
+    /// The frames LIBRARY, a right-dock column beside the tile picker:
+    /// one thumbnail + name + duration per frame, click to select (and
+    /// preview), double-click to name, drag out to reorder or to build a
+    /// clip sequence. Its header carries the create/duplicate/delete
+    /// buttons so the area is self-contained.
     fn render_strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_strip is only called in the Ready state");
@@ -3668,11 +3677,12 @@ impl SpritePanel {
             );
         let strip = div()
             .id("ggo-sprite-strip")
-            .flex_none()
+            .flex_1()
+            .min_h_0()
             .p_1()
-            .overflow_x_scroll()
+            .overflow_y_scroll()
             .child(
-                h_flex()
+                v_flex()
                     .gap_1()
                     .children(state.frames.iter().enumerate().map(|(ix, frame)| {
                         let thumb = open.frames.get(ix).map(|image| {
@@ -3739,7 +3749,9 @@ impl SpritePanel {
             );
         v_flex()
             .flex_none()
-            .border_t_1()
+            .w(CLIPS_WIDTH)
+            .h_full()
+            .border_l_1()
             .border_color(border)
             .child(header)
             .child(strip)
@@ -3758,11 +3770,11 @@ impl SpritePanel {
                     .items_stretch()
                     .child(self.render_preview(cx))
                     .child(self.render_tile_picker(cx))
-                    .child(self.render_clips(cx)),
+                    .child(self.render_strip(cx)),
             )
-            .child(self.render_clip_sequence(cx))
             .child(self.render_frame_ops(cx))
-            .child(self.render_strip(cx))
+            .child(self.render_clips(cx))
+            .child(self.render_clip_sequence(cx))
             .into_any_element()
     }
 }
