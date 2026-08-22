@@ -59,6 +59,30 @@ pub fn fit_size(w: u32, h: u32, max_px: f32) -> (f32, f32) {
     (w as f32 * scale, h as f32 * scale)
 }
 
+
+/// The on-screen size for the big preview's image: the FRAME's
+/// dimensions pick the fit scale (into `box_px`), and the image -- which
+/// may be the transform composer's doubled canvas -- displays at that
+/// same pixels-per-texel scale. A rotated frame therefore keeps its
+/// on-screen size and simply owns a larger canvas, instead of being
+/// shrunk to squeeze the doubled bounds into the box.
+pub fn preview_display_size(
+    image_w: u32,
+    image_h: u32,
+    frame_w: u32,
+    frame_h: u32,
+    box_px: f32,
+) -> (f32, f32) {
+    let (fit_w, fit_h) = fit_size(frame_w, frame_h, box_px);
+    if frame_w == 0 || frame_h == 0 {
+        return (fit_w, fit_h);
+    }
+    (
+        fit_w * image_w as f32 / frame_w as f32,
+        fit_h * image_h as f32 / frame_h as f32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +190,16 @@ mod tests {
         assert_eq!(fit_size(32, 16, 48.0), (48.0, 24.0)); // wide
         assert_eq!(fit_size(16, 64, 32.0), (8.0, 32.0)); // tall
         assert_eq!(fit_size(0, 16, 48.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn preview_display_size_keeps_the_texel_scale_constant() {
+        // Identity: image == frame -> the plain fit.
+        assert_eq!(preview_display_size(16, 16, 16, 16, 240.0), fit_size(16, 16, 240.0));
+        // A doubled (transformed) canvas shows at exactly TWICE the
+        // identity fit -- same pixels-per-texel, bigger canvas -- rather
+        // than being squeezed into the same box at half scale.
+        let (fw, fh) = fit_size(16, 16, 240.0);
+        assert_eq!(preview_display_size(32, 32, 16, 16, 240.0), (fw * 2.0, fh * 2.0));
     }
 }

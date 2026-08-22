@@ -3201,7 +3201,14 @@ impl SpritePanel {
         let show_grid = open.shown_frame_is_identity();
         if let Some(image) = open.preview_image() {
             let (w, h) = image_px_size(&image);
-            let (fit_w, fit_h) = playback::fit_size(w, h, PREVIEW_PX);
+            let state = open.store.state();
+            let (fit_w, fit_h) = playback::preview_display_size(
+                w,
+                h,
+                state.w_tiles as u32 * ggo_worldlib::sprites::hw::TILE_PX as u32,
+                state.h_tiles as u32 * ggo_worldlib::sprites::hw::TILE_PX as u32,
+                PREVIEW_PX,
+            );
             let bounds_cell = open.preview_bounds.clone();
             let state = open.store.state();
             let (grid_cols, grid_rows) = (state.w_tiles as usize, state.h_tiles as usize);
