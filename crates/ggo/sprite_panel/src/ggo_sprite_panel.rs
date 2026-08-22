@@ -3418,7 +3418,7 @@ impl SpritePanel {
         for (i, clip) in state.clips.iter().enumerate() {
             let mut row = v_flex()
                 .id(("ggo-sprite-clip", i))
-                .w(CLIPS_WIDTH)
+                .min_w(CLIPS_WIDTH)
                 .flex_none()
                 .gap_0p5()
                 .p_0p5()
@@ -3470,7 +3470,8 @@ impl SpritePanel {
                                     .ok();
                             })
                         }),
-                );
+                )
+                .child(self.render_sequence_for(i, cx));
             if let Some((at, message)) = &open.clip_error
                 && *at == i
             {
@@ -3550,38 +3551,24 @@ impl SpritePanel {
             .into_any_element()
     }
 
-    /// The ACTIVE clip's play sequence as thumbnails, with positional
-    /// drops: a library frame dropped on a thumbnail inserts a copy at
-    /// that position, the trailing dashed slot appends. Clicking a
-    /// thumbnail selects (and previews) that frame. Without an active
-    /// clip the row is a hint.
-    fn render_clip_sequence(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// One clip's play sequence as a thumbnail row, embedded in its own
+    /// card -- every clip is directly editable, no activation step. A
+    /// library frame dropped on a thumbnail inserts a copy at that
+    /// position, the trailing dashed slot appends, clicking a thumbnail
+    /// selects (and previews) that frame. The transport's clip dropdown
+    /// is playback-range only and never gates this.
+    fn render_sequence_for(&self, clip_ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_clip_sequence is only called in the Ready state");
+            unreachable!("render_sequence_for is only called in the Ready state");
         };
         let border = cx.theme().colors().border;
         let accent = cx.theme().colors().border_focused;
         let drop_bg = cx.theme().colors().drop_target_background;
-        let row = h_flex()
-            .gap_1()
-            .p_1()
-            .border_t_1()
-            .border_color(border)
-            .items_center();
         let state = open.store.state();
-        let clip = open.active_clip.and_then(|i| state.clips.get(i).map(|c| (i, c)));
-        let Some((clip_ix, clip)) = clip else {
-            return row
-                .child(
-                    Label::new("Select a clip to edit its sequence")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .into_any_element();
+        let Some(clip) = state.clips.get(clip_ix) else {
+            return div().into_any_element();
         };
-        let mut row = row.child(
-            Label::new(format!("Clip: {}", clip.name)).size(LabelSize::Small),
-        );
+        let mut row = h_flex().gap_0p5().items_center();
         let last = clip.to.min(state.frames.len().saturating_sub(1));
         for (seq_pos, ix) in (clip.from..=last).enumerate() {
             let thumb = open.frames.get(ix).map(|image| {
@@ -3591,7 +3578,7 @@ impl SpritePanel {
             });
             row = row.child(
                 div()
-                    .id(("ggo-sprite-seq", seq_pos))
+                    .id(("ggo-sprite-seq", clip_ix * 1000 + seq_pos))
                     .w(px(THUMB_PX))
                     .h(px(THUMB_PX))
                     .flex()
@@ -3600,7 +3587,7 @@ impl SpritePanel {
                     .border_1()
                     .rounded_sm()
                     .border_color(if open.selected_frame == ix { accent } else { border })
-                    .debug_selector(|| format!("ggo-sprite-seq-{seq_pos}"))
+                    .debug_selector(|| format!("ggo-sprite-seq-{clip_ix}-{seq_pos}"))
                     .children(thumb)
                     .on_click(cx.listener(move |this, _, _, cx| this.select_frame(ix, cx)))
                     .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
@@ -3611,7 +3598,7 @@ impl SpritePanel {
         }
         row = row.child(
             div()
-                .id("ggo-sprite-seq-append")
+                .id(("ggo-sprite-seq-append", clip_ix))
                 .w(px(THUMB_PX))
                 .h(px(THUMB_PX / 2.))
                 .flex()
@@ -3774,7 +3761,6 @@ impl SpritePanel {
             )
             .child(self.render_frame_ops(cx))
             .child(self.render_clips(cx))
-            .child(self.render_clip_sequence(cx))
             .into_any_element()
     }
 }
@@ -5704,25 +5690,29 @@ mod tests {
     /// selected) and a single undo restores the strip, proving it was
     /// ONE op.
     #[gpui::test]
-    /// The clip sequence row end to end: with a clip active it paints
-    /// the range's thumbnails, a real drag from the FRAMES library onto
-    /// a sequence thumbnail inserts a copy at that position, and
-    /// clicking a sequence thumbnail selects (previews) that frame.
+    /// Every clip card paints its own sequence WITHOUT any activation
+    /// step (the transport's clip dropdown is playback-range only): a
+    /// real drag from the FRAMES library onto a sequence thumbnail
+    /// inserts a copy at that position, and clicking a sequence
+    /// thumbnail selects (previews) that frame.
     #[gpui::test]
     async fn test_rendered_sequence_drop_inserts_and_click_selects(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
-        panel.update(cx, |panel, cx| {
-            panel.select_clip(Some(0), cx); // fixture clip spans 1..=1
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).active_clip,
+                None,
+                "precondition: no clip is active -- the sequence must paint anyway"
+            );
         });
-        cx.run_until_parked();
 
         let library0 = cx
             .debug_bounds("ggo-sprite-frame-0")
             .expect("library frame 0 painted");
         let seq0 = cx
-            .debug_bounds("ggo-sprite-seq-0")
-            .expect("the active clip's sequence is painted");
+            .debug_bounds("ggo-sprite-seq-0-0")
+            .expect("clip 0's sequence is painted with no activation step");
 
         cx.simulate_mouse_move(library0.center(), None, gpui::Modifiers::default());
         cx.simulate_mouse_down(library0.center(), MouseButton::Left, gpui::Modifiers::default());
@@ -5743,7 +5733,7 @@ mod tests {
         // Clicking the second sequence thumbnail selects its frame.
         cx.run_until_parked();
         let seq1 = cx
-            .debug_bounds("ggo-sprite-seq-1")
+            .debug_bounds("ggo-sprite-seq-0-1")
             .expect("the extended sequence paints two thumbs");
         cx.simulate_click(seq1.center(), gpui::Modifiers::default());
         panel.read_with(cx, |panel, _| {
