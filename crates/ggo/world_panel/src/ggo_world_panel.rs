@@ -4254,6 +4254,7 @@ mod tests {
                 frames: vec![Frame {
                     map: vec![1],
                     duration_ms: 100,
+                    transform: ggo_worldlib::sprites::cow::FrameTransform::IDENTITY,
                 }],
                 clips: vec![],
                 w_tiles: 1,

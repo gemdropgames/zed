@@ -146,21 +146,42 @@ pub fn stamp_sets(
     sets
 }
 
+/// The hardware's shared sprite affine parameter-set budget (ggo
+/// `docs/ppu-contract.md` §9: `pidx[4:0]` picks one of 32 sets). Not in
+/// worldlib's `hw` module yet, so pinned here where the meter needs it.
+pub const AFFINE_PARAM_SETS: usize = 32;
+
 /// The hardware-budget meter line for the open sprite: `Pool`
 /// (`tile_count` / `VRAM_TILE_CAP`), `OAM` (greedy [`hw::oam_split`]
 /// entry count / `OAM_ENTRIES`), `Scanline` (worst-case per-scanline OAM
-/// coverage / `SPRITE_LINE_CAP`), and `Cache` (the shown frame's
-/// worst-row distinct-tile working set / `SPRITE_CACHE_TILES`; 0 without
-/// a frame). Same inputs, same order as ggo-ide `hw_meter::rows`.
+/// coverage / `SPRITE_LINE_CAP`), `Cache` (the shown frame's worst-row
+/// distinct-tile working set / `SPRITE_CACHE_TILES`; 0 without a frame),
+/// and `Sets` (distinct non-identity transform MATRICES across the
+/// sprite's frames / [`AFFINE_PARAM_SETS`] -- counted on the composed
+/// `matrix()`, the value the runtime's dedup allocator actually keys
+/// sets by, so two transforms that collapse to one matrix cost one
+/// set). Same inputs, same order as ggo-ide `hw_meter::rows` plus the
+/// affine budget.
 pub fn hw_meter_line(state: &SpriteState, frame: Option<&Frame>) -> String {
     let w = state.w_tiles as usize;
     let h = state.h_tiles as usize;
     let oam = hw::oam_split(w, h).len();
     let scanline = hw::scanline_coverage(w, h);
     let cache = frame.map_or(0, |f| hw::cache_pressure(&f.map, w, h));
+    let mut matrices: Vec<(u32, u32)> = Vec::new();
+    for f in &state.frames {
+        if f.transform.is_identity() {
+            continue;
+        }
+        let matrix = f.transform.matrix();
+        if !matrices.contains(&matrix) {
+            matrices.push(matrix);
+        }
+    }
     format!(
-        "Pool {}/{VRAM_TILE_CAP} · OAM {oam}/{OAM_ENTRIES} · Scanline {scanline}/{SPRITE_LINE_CAP} · Cache {cache}/{SPRITE_CACHE_TILES}",
-        state.tile_count
+        "Pool {}/{VRAM_TILE_CAP} · OAM {oam}/{OAM_ENTRIES} · Scanline {scanline}/{SPRITE_LINE_CAP} · Cache {cache}/{SPRITE_CACHE_TILES} · Sets {}/{AFFINE_PARAM_SETS}",
+        state.tile_count,
+        matrices.len()
     )
 }
 
@@ -292,11 +313,12 @@ mod tests {
     fn hw_meter_line_matches_the_hw_calculators_for_a_4x4_sprite() {
         let s = blank_sprite_state(4, 4).unwrap();
         // 4x4 -> one 4x4 OAM square -> scanline coverage 1; the blank
-        // frame is a single tile everywhere -> cache pressure 1.
+        // frame is a single tile everywhere -> cache pressure 1; every
+        // transform is identity -> no affine sets.
         assert_eq!(
             hw_meter_line(&s, s.frames.first()),
             format!(
-                "Pool 1/{VRAM_TILE_CAP} · OAM 1/{OAM_ENTRIES} · Scanline 1/{SPRITE_LINE_CAP} · Cache 1/{SPRITE_CACHE_TILES}"
+                "Pool 1/{VRAM_TILE_CAP} · OAM 1/{OAM_ENTRIES} · Scanline 1/{SPRITE_LINE_CAP} · Cache 1/{SPRITE_CACHE_TILES} · Sets 0/{AFFINE_PARAM_SETS}"
             )
         );
     }
@@ -306,7 +328,33 @@ mod tests {
         let s = blank_sprite_state(2, 2).unwrap();
         let line = hw_meter_line(&s, None);
         assert!(
-            line.ends_with(&format!("Cache 0/{SPRITE_CACHE_TILES}")),
+            line.contains(&format!("Cache 0/{SPRITE_CACHE_TILES}")),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn hw_meter_counts_distinct_non_identity_transforms() {
+        use ggo_worldlib::sprites::cow::FrameTransform;
+        let mut s = blank_sprite_state(1, 1).unwrap();
+        let base = s.frames[0].clone();
+        s.frames = vec![base.clone(), base.clone(), base.clone(), base];
+        let quarter = FrameTransform {
+            angle256: 64,
+            ..FrameTransform::IDENTITY
+        };
+        let doubled = FrameTransform {
+            sx: 0x0200,
+            ..FrameTransform::IDENTITY
+        };
+        // Frame 0 stays identity (not counted); 1 and 2 share a matrix
+        // (one set); 3 is distinct (a second set).
+        s.frames[1].transform = quarter;
+        s.frames[2].transform = quarter;
+        s.frames[3].transform = doubled;
+        let line = hw_meter_line(&s, s.frames.first());
+        assert!(
+            line.ends_with(&format!("Sets 2/{AFFINE_PARAM_SETS}")),
             "{line}"
         );
     }

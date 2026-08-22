@@ -16,7 +16,7 @@ use ggo_worldlib::sprites::cow::SpriteState;
 use ggo_worldlib::sprites::hw;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::indices_to_rgba;
-use ggo_worldlib::sprites::preview::compose_frame_rgba;
+use ggo_worldlib::sprites::preview::{compose_frame_rgba, compose_frame_rgba_transformed};
 use ggo_worldlib::sprites::tileset_doc::{
     TILE_PIXELS, compose_tile_grid, tile_grid_layout, unpack_til_to_indices,
 };
@@ -85,6 +85,22 @@ pub fn compose_frames(state: &SpriteState) -> Result<Vec<Arc<RenderImage>>, Stri
         frames.push(image);
     }
     Ok(frames)
+}
+
+/// Compose frame `idx` with its affine transform applied, for the big
+/// preview: worldlib's `compose_frame_rgba_transformed` (identity
+/// delegates to the legacy composer; non-identity renders onto the
+/// doubled DOUBLE_SIZE canvas), bridged to a [`RenderImage`] exactly
+/// like [`compose_frames`]. The strip thumbnails deliberately stay
+/// legacy-composed -- transforms are per-copy PLAY data, and a rotated
+/// thumbnail would hide which tiles the frame actually edits. Callers
+/// cache the result per shown frame (`OpenSprite::transformed_preview`,
+/// the ghost-cache idiom): pixels only change on doc mutations, which
+/// clear the cache.
+pub fn compose_transformed_frame(state: &SpriteState, idx: usize) -> Option<Arc<RenderImage>> {
+    let rgba = compose_frame_rgba_transformed(state, idx, false);
+    let (w, h) = rgba.dimensions();
+    to_render_image(rgba.as_raw(), w, h)
 }
 
 /// Compose the sprite's pool -- which IS its bound `.til`, byte for byte

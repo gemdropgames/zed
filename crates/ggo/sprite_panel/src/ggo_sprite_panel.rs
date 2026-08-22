@@ -62,7 +62,7 @@ use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState};
 use workspace::Workspace;
 
-use ggo_worldlib::sprites::cow::{ClipEdit, SpriteState};
+use ggo_worldlib::sprites::cow::{ClipEdit, FrameTransform, SpriteState};
 use ggo_worldlib::sprites::io::{self, open_sprite, save_sprite};
 use ggo_worldlib::sprites::sprite_doc::{
     Anchor, DocOp, MAX_SPRITE_TILES, MIN_SPRITE_TILES, SpriteDocStore, blank_sprite_state,
@@ -909,13 +909,20 @@ fn bind_panel_keys(cx: &mut App) {
 /// What one panel text input edits. `Duration` deliberately carries no
 /// frame index -- there is ONE duration editor, always bound to the
 /// currently selected frame, so a selection change re-syncs its text
-/// instead of rebuilding the editor set.
+/// instead of rebuilding the editor set. The five transform fields
+/// (rotation in degrees, 8.8 scales and shears as decimals) follow the
+/// same single-editor rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditTarget {
     ClipName(usize),
     ClipFrom(usize),
     ClipTo(usize),
     Duration,
+    Rot,
+    ScaleX,
+    ScaleY,
+    ShearX,
+    ShearY,
 }
 
 /// One panel text input: the target it edits and the single-line editor
@@ -975,6 +982,15 @@ struct OpenSprite {
     /// `refresh_after_doc_change`: a doc mutation can change any frame's
     /// pixels, and the key doesn't carry a generation to invalidate by.
     ghost_cache: RefCell<HashMap<(i32, usize), Arc<RenderImage>>>,
+    /// The big preview's transformed compose for one frame, keyed by
+    /// frame index -- the ghost-cache idiom, single-slot because only
+    /// the SHOWN frame is ever composed transformed
+    /// (`loader::compose_transformed_frame` is pure in the doc state,
+    /// so a slot is stale only after a doc mutation, which clears it in
+    /// `refresh_after_doc_change` alongside `frames`). `RefCell` for the
+    /// same reason as [`Self::ghost_cache`]: filled from
+    /// [`Self::preview_image`] under `&self` during render.
+    transformed_preview: RefCell<Option<(usize, Arc<RenderImage>)>>,
     /// The bound tileset composed as the tile picker's sheet; same
     /// invalidation as `frames`.
     pool_strip: Option<loader::PoolStrip>,
@@ -1050,6 +1066,7 @@ impl OpenSprite {
             store: SpriteDocStore::new(loaded.state),
             frames: loaded.frames,
             ghost_cache: RefCell::new(HashMap::new()),
+            transformed_preview: RefCell::new(None),
             pool_strip: loaded.pool_strip,
             picker_cols: loaded
                 .meta
@@ -1081,6 +1098,43 @@ impl OpenSprite {
         self.playing
             .as_ref()
             .map_or(self.selected_frame, |p| p.frame)
+    }
+
+    /// The image the big preview draws: the shown frame's LEGACY compose
+    /// (the same Arc the strip thumbnail uses) while its transform is
+    /// identity, else the transformed compose on the doubled canvas,
+    /// cached per shown frame until the next doc mutation.
+    fn preview_image(&self) -> Option<Arc<RenderImage>> {
+        let shown = self.shown_frame();
+        let state = self.store.state();
+        if state
+            .frames
+            .get(shown)
+            .is_none_or(|f| f.transform.is_identity())
+        {
+            return self.frames.get(shown).cloned();
+        }
+        if let Some((idx, image)) = self.transformed_preview.borrow().as_ref()
+            && *idx == shown
+        {
+            return Some(image.clone());
+        }
+        let image = loader::compose_transformed_frame(state, shown)?;
+        *self.transformed_preview.borrow_mut() = Some((shown, image.clone()));
+        Some(image)
+    }
+
+    /// Whether the shown frame renders through the legacy identity path
+    /// -- the only case the preview's tile grid and cell-click editing
+    /// are geometrically meaningful in (the transformed canvas is
+    /// doubled and rotated, so cell math over it would stamp the wrong
+    /// tiles).
+    fn shown_frame_is_identity(&self) -> bool {
+        self.store
+            .state()
+            .frames
+            .get(self.shown_frame())
+            .is_none_or(|f| f.transform.is_identity())
     }
 
     fn durations(&self) -> Vec<u16> {
@@ -1868,6 +1922,7 @@ impl SpritePanel {
         let tile_count = open.store.state().tile_count;
         open.frames = frames;
         open.ghost_cache.borrow_mut().clear();
+        *open.transformed_preview.borrow_mut() = None;
         open.pool_strip = pool_strip;
         open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
         // Undo/redo of frame adds/deletes can leave the editor-only name
@@ -2484,6 +2539,12 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
+        // A transformed frame's preview is the doubled, rotated canvas:
+        // the cell math below would land on the wrong tiles, so clicks
+        // there edit nothing (the click still pauses playback/focuses).
+        if !open.shown_frame_is_identity() {
+            return None;
+        }
         let bounds = (*open.preview_bounds.borrow())?;
         let state = open.store.state();
         tiles::cell_at(
@@ -2635,6 +2696,45 @@ impl SpritePanel {
                 }
                 self.apply_doc(DocOp::FrameDuration { at, ms }, cx);
             }
+            EditTarget::Rot
+            | EditTarget::ScaleX
+            | EditTarget::ScaleY
+            | EditTarget::ShearX
+            | EditTarget::ShearY => {
+                let frame = open.selected_frame;
+                let Some(current) = open.store.state().frames.get(frame).map(|f| f.transform)
+                else {
+                    return;
+                };
+                // One field parsed and merged into the frame's CURRENT
+                // transform; unparsable input is dropped and the editor
+                // re-syncs from the doc (the duration editor's revert).
+                let merged = match target {
+                    EditTarget::Rot => edits::parse_angle_deg(&text).map(|angle256| {
+                        FrameTransform {
+                            angle256,
+                            ..current
+                        }
+                    }),
+                    EditTarget::ScaleX => edits::parse_fixed88(&text)
+                        .map(|sx| FrameTransform { sx, ..current }),
+                    EditTarget::ScaleY => edits::parse_fixed88(&text)
+                        .map(|sy| FrameTransform { sy, ..current }),
+                    EditTarget::ShearX => edits::parse_fixed88(&text)
+                        .map(|shear_x| FrameTransform { shear_x, ..current }),
+                    _ => edits::parse_fixed88(&text)
+                        .map(|shear_y| FrameTransform { shear_y, ..current }),
+                };
+                let Some(transform) = merged else {
+                    cx.notify(); // dropped, not committed -- editor re-syncs
+                    return;
+                };
+                if transform == current {
+                    cx.notify();
+                    return;
+                }
+                self.apply_doc(DocOp::FrameTransformSet { frame, transform }, cx);
+            }
         }
     }
 
@@ -2661,6 +2761,26 @@ impl SpritePanel {
                 .frames
                 .get(selected_frame)
                 .map_or_else(String::new, |f| f.duration_ms.to_string()),
+            EditTarget::Rot => state
+                .frames
+                .get(selected_frame)
+                .map_or_else(String::new, |f| {
+                    edits::format_angle_deg(f.transform.angle256)
+                }),
+            EditTarget::ScaleX | EditTarget::ScaleY | EditTarget::ShearX | EditTarget::ShearY => {
+                state
+                    .frames
+                    .get(selected_frame)
+                    .map_or_else(String::new, |f| {
+                        let value = match target {
+                            EditTarget::ScaleX => f.transform.sx,
+                            EditTarget::ScaleY => f.transform.sy,
+                            EditTarget::ShearX => f.transform.shear_x,
+                            _ => f.transform.shear_y,
+                        };
+                        edits::format_fixed88(value)
+                    })
+            }
         }
     }
 
@@ -2674,13 +2794,18 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let mut targets = Vec::with_capacity(open.store.state().clips.len() * 3 + 1);
+        let mut targets = Vec::with_capacity(open.store.state().clips.len() * 3 + 6);
         for i in 0..open.store.state().clips.len() {
             targets.push(EditTarget::ClipName(i));
             targets.push(EditTarget::ClipFrom(i));
             targets.push(EditTarget::ClipTo(i));
         }
         targets.push(EditTarget::Duration);
+        targets.push(EditTarget::Rot);
+        targets.push(EditTarget::ScaleX);
+        targets.push(EditTarget::ScaleY);
+        targets.push(EditTarget::ShearX);
+        targets.push(EditTarget::ShearY);
 
         let same_targets = open.editors.len() == targets.len()
             && open
@@ -3019,7 +3144,6 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_preview is only called in the Ready state");
         };
-        let shown = open.shown_frame();
         let mut preview = div()
             .flex_1()
             .min_w_0()
@@ -3028,8 +3152,14 @@ impl SpritePanel {
             .justify_center()
             .items_center()
             .bg(cx.theme().colors().editor_background);
-        if let Some(image) = open.frames.get(shown) {
-            let (w, h) = image_px_size(image);
+        // The shown frame with its transform applied (identity = the
+        // strip's legacy image); a transformed frame's grid overlay is
+        // suppressed -- the doubled, rotated canvas has no meaningful
+        // cell geometry (clicks are guarded the same way in
+        // `preview_cell_at`).
+        let show_grid = open.shown_frame_is_identity();
+        if let Some(image) = open.preview_image() {
+            let (w, h) = image_px_size(&image);
             let (fit_w, fit_h) = playback::fit_size(w, h, PREVIEW_PX);
             let bounds_cell = open.preview_bounds.clone();
             let state = open.store.state();
@@ -3045,7 +3175,9 @@ impl SpritePanel {
                     *bounds_cell.borrow_mut() = Some(bounds);
                 },
                 move |bounds, (), window, _cx| {
-                    paint_tile_grid(bounds, grid_cols, grid_rows, grid_color, window);
+                    if show_grid {
+                        paint_tile_grid(bounds, grid_cols, grid_rows, grid_color, window);
+                    }
                 },
             )
             .absolute()
@@ -3082,7 +3214,7 @@ impl SpritePanel {
                     .w(px(fit_w))
                     .h(px(fit_h))
                     .children(ghosts)
-                    .child(img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h)))
+                    .child(img(image).nearest(true).w(px(fit_w)).h(px(fit_h)))
                     .child(overlay)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3414,22 +3546,32 @@ impl SpritePanel {
                 .find(|e| e.target == target)
                 .map(|e| e.editor.clone())
         };
-        // The selected frame's duration editor lives HERE: click a frame
-        // in a sequence, adjust its ms right next to it. Each sequence
-        // entry is its own frame copy, so this is per-entry timing.
+        // The selected frame's duration and transform editors live HERE:
+        // click a frame in a sequence, adjust its ms/rot/scale/shear
+        // right next to it. Each sequence entry is its own frame copy,
+        // so all six are per-entry data.
+        let labelled_field = |label: &'static str, width: f32, target: EditTarget| {
+            v_flex()
+                .flex_none()
+                .gap_0p5()
+                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    div()
+                        .w(px(width))
+                        .flex_none()
+                        .children(editor_for(target).map(|e| Self::editor_input(e, cx))),
+                )
+        };
         let mut cards = h_flex()
             .p_1()
             .gap_1()
             .items_start()
-            .child(
-                v_flex()
-                    .flex_none()
-                    .gap_0p5()
-                    .child(Label::new("ms").size(LabelSize::XSmall).color(Color::Muted))
-                    .child(div().w(px(56.)).flex_none().children(
-                        editor_for(EditTarget::Duration).map(|e| Self::editor_input(e, cx)),
-                    )),
-            );
+            .child(labelled_field("ms", 56., EditTarget::Duration))
+            .child(labelled_field("rot", 40., EditTarget::Rot))
+            .child(labelled_field("sx", 48., EditTarget::ScaleX))
+            .child(labelled_field("sy", 48., EditTarget::ScaleY))
+            .child(labelled_field("shx", 48., EditTarget::ShearX))
+            .child(labelled_field("shy", 48., EditTarget::ShearY));
         for (i, clip) in state.clips.iter().enumerate() {
             let mut row = v_flex()
                 .id(("ggo-sprite-clip", i))
@@ -3905,7 +4047,7 @@ impl Focusable for SpritePanel {
 /// 2-frame, 2-tile sprite with one clip.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    use ggo_worldlib::sprites::cow::{ClipEdit, Frame, SpriteState};
+    use ggo_worldlib::sprites::cow::{ClipEdit, Frame, FrameTransform, SpriteState};
     use ggo_worldlib::sprites::hw::TILE_BYTES;
     use ggo_worldlib::sprites::io::save_sprite;
 
@@ -3965,6 +4107,7 @@ pub(crate) mod test_fixtures {
             frames: vec![Frame {
                 map: vec![0],
                 duration_ms: 100,
+                transform: FrameTransform::IDENTITY,
             }],
             clips: vec![],
             w_tiles: 1,
@@ -3991,10 +4134,12 @@ pub(crate) mod test_fixtures {
                 Frame {
                     map: vec![0],
                     duration_ms: 100,
+                    transform: FrameTransform::IDENTITY,
                 },
                 Frame {
                     map: vec![1],
                     duration_ms: 200,
+                    transform: FrameTransform::IDENTITY,
                 },
             ],
             clips: vec![ClipEdit {
@@ -4213,6 +4358,112 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(open.active_clip, None);
+        });
+    }
+
+    /// The five transform editors follow the Duration editor's plumbing:
+    /// a parsed commit merges ONE field into the selected frame's current
+    /// transform through `DocOp::FrameTransformSet` (one undo step per
+    /// commit), junk and unchanged commits push no op, and the unfocused
+    /// display text reads back from the doc.
+    #[gpui::test]
+    async fn test_transform_editors_commit_through_the_doc(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.commit_edit(EditTarget::Rot, "90".into(), cx);
+            assert_eq!(ready(panel).store.state().frames[0].transform.angle256, 64);
+            panel.commit_edit(EditTarget::ScaleX, "2.5".into(), cx);
+            {
+                let t = ready(panel).store.state().frames[0].transform;
+                assert_eq!(t.sx, 0x0280);
+                assert_eq!(t.angle256, 64, "a field commit merges, not replaces");
+            }
+            assert_eq!(
+                SpritePanel::edit_display_text(&EditTarget::Rot, ready(panel).store.state(), 0),
+                "90"
+            );
+            assert_eq!(
+                SpritePanel::edit_display_text(&EditTarget::ScaleX, ready(panel).store.state(), 0),
+                "2.50"
+            );
+
+            // Only the SELECTED frame's transform moves.
+            panel.select_frame(1, cx);
+            panel.commit_edit(EditTarget::ShearY, "-0.25".into(), cx);
+            {
+                let state = ready(panel).store.state();
+                assert_eq!(state.frames[1].transform.shear_y, -0x0040);
+                assert_eq!(state.frames[0].transform.sx, 0x0280);
+            }
+
+            // Junk reverts like the duration editor: no op, doc untouched.
+            panel.commit_edit(EditTarget::ScaleY, "junk".into(), cx);
+            panel.commit_edit(EditTarget::Rot, "junk".into(), cx);
+            // An unchanged commit pushes no undo entry either.
+            panel.commit_edit(EditTarget::ShearY, "-0.25".into(), cx);
+
+            // Undo unwinds exactly the three real commits, latest first.
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().frames[1].transform.shear_y, 0);
+            panel.undo_impl(cx);
+            {
+                let t = ready(panel).store.state().frames[0].transform;
+                assert_eq!(t.sx, 0x0100, "scale commit undone");
+                assert_eq!(t.angle256, 64, "one field per op");
+            }
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().frames[0].transform,
+                FrameTransform::IDENTITY
+            );
+        });
+    }
+
+    /// The big preview composes the SHOWN frame through the transformed
+    /// composer: a rotated frame renders on the doubled (DOUBLE_SIZE)
+    /// canvas and is served from the per-shown-frame cache on repeat
+    /// paints, while identity frames keep the legacy thumbnail image
+    /// (same Arc as the strip).
+    #[gpui::test]
+    async fn test_preview_shows_the_transformed_frame(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                let image = open.preview_image().expect("identity preview");
+                assert!(
+                    Arc::ptr_eq(&image, &open.frames[0]),
+                    "identity frames reuse the legacy composed image"
+                );
+                assert_eq!(image_px_size(&image), (TILE_PX as u32, TILE_PX as u32));
+            }
+            panel.commit_edit(EditTarget::Rot, "90".into(), cx);
+            {
+                let open = ready(panel);
+                let image = open.preview_image().expect("transformed preview");
+                assert_eq!(
+                    image_px_size(&image),
+                    (2 * TILE_PX as u32, 2 * TILE_PX as u32),
+                    "non-identity -> the doubled canvas"
+                );
+                assert_eq!(
+                    image_px_size(&open.frames[0]),
+                    (TILE_PX as u32, TILE_PX as u32),
+                    "the strip thumbnail stays legacy-composed"
+                );
+                let again = open.preview_image().expect("cached recompose");
+                assert!(Arc::ptr_eq(&image, &again), "repeat paints hit the cache");
+            }
+            // Selecting an identity frame drops back to legacy dims.
+            panel.select_frame(1, cx);
+            assert_eq!(
+                image_px_size(&ready(panel).preview_image().expect("identity again")),
+                (TILE_PX as u32, TILE_PX as u32)
+            );
         });
     }
 
