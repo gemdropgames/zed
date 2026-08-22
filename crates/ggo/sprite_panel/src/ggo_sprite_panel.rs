@@ -1023,6 +1023,11 @@ struct OpenSprite {
     /// of stamping the selection. Cleared by Escape alongside the
     /// selection.
     eraser: bool,
+    /// An open per-frame settings popup: `(owning clip, anchor position)`.
+    /// The frame it edits is `selected_frame` (opening it selects the
+    /// frame, so the preview and the popup agree). Dismissed by
+    /// click-away or Escape.
+    frame_settings: Option<(usize, gpui::Point<Pixels>)>,
     /// The preview image's on-screen bounds, recorded at prepaint by the
     /// overlay canvas so the click handler can map window coords to cell
     /// hits (world_panel's `last_bounds` idiom). `None` until the first
@@ -1078,6 +1083,7 @@ impl OpenSprite {
             selection: None,
             picker_drag: None,
             eraser: false,
+            frame_settings: None,
             preview_bounds: Rc::new(RefCell::new(None)),
             selected_frame: 0,
             active_clip: None,
@@ -1932,6 +1938,10 @@ impl SpritePanel {
         if open.active_clip.is_some_and(|c| c >= clip_count) {
             open.active_clip = None;
         }
+        if open.frame_settings.is_some_and(|(clip, _)| clip >= clip_count) {
+            // The popup's owning clip vanished under an undo/delete.
+            open.frame_settings = None;
+        }
         if open.selection.as_ref().is_some_and(|block| {
             block
                 .tiles
@@ -2423,11 +2433,42 @@ impl SpritePanel {
 
     fn deselect_tile(&mut self, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state
-            && (open.selection.is_some() || open.picker_drag.is_some() || open.eraser)
+            && (open.selection.is_some()
+                || open.picker_drag.is_some()
+                || open.eraser
+                || open.frame_settings.is_some())
         {
             open.selection = None;
             open.picker_drag = None;
             open.eraser = false;
+            open.frame_settings = None;
+            cx.notify();
+        }
+    }
+
+    /// Open the per-frame settings popup for sequence frame `frame_ix`
+    /// of clip `clip_ix`, anchored at `position` (the "..." click).
+    /// Selects the frame so the preview and the popup's editors (which
+    /// target the selected frame) both point at it.
+    fn open_frame_settings(
+        &mut self,
+        clip_ix: usize,
+        frame_ix: usize,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_frame(frame_ix, cx);
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.frame_settings = Some((clip_ix, position));
+            cx.notify();
+        }
+    }
+
+    fn close_frame_settings(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.frame_settings.is_some()
+        {
+            open.frame_settings = None;
             cx.notify();
         }
     }
@@ -3546,32 +3587,7 @@ impl SpritePanel {
                 .find(|e| e.target == target)
                 .map(|e| e.editor.clone())
         };
-        // The selected frame's duration and transform editors live HERE:
-        // click a frame in a sequence, adjust its ms/rot/scale/shear
-        // right next to it. Each sequence entry is its own frame copy,
-        // so all six are per-entry data.
-        let labelled_field = |label: &'static str, width: f32, target: EditTarget| {
-            v_flex()
-                .flex_none()
-                .gap_0p5()
-                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
-                .child(
-                    div()
-                        .w(px(width))
-                        .flex_none()
-                        .children(editor_for(target).map(|e| Self::editor_input(e, cx))),
-                )
-        };
-        let mut cards = h_flex()
-            .p_1()
-            .gap_1()
-            .items_start()
-            .child(labelled_field("ms", 56., EditTarget::Duration))
-            .child(labelled_field("rot", 40., EditTarget::Rot))
-            .child(labelled_field("sx", 48., EditTarget::ScaleX))
-            .child(labelled_field("sy", 48., EditTarget::ScaleY))
-            .child(labelled_field("shx", 48., EditTarget::ShearX))
-            .child(labelled_field("shy", 48., EditTarget::ShearY));
+        let mut cards = h_flex().p_1().gap_1().items_start();
         for (i, clip) in state.clips.iter().enumerate() {
             let mut row = v_flex()
                 .id(("ggo-sprite-clip", i))
@@ -3596,24 +3612,6 @@ impl SpritePanel {
                         .children(
                             editor_for(EditTarget::ClipName(i)).map(|e| Self::editor_input(e, cx)),
                         )
-                        .child(
-                            IconButton::new(("ggo-sprite-clip-delete", i), IconName::Trash)
-                                .icon_size(IconSize::Small)
-                                .tooltip(ui::Tooltip::text("Delete clip"))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.delete_clip(i, cx)),
-                                ),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_0p5()
-                        .children(
-                            editor_for(EditTarget::ClipFrom(i)).map(|e| Self::editor_input(e, cx)),
-                        )
-                        .children(
-                            editor_for(EditTarget::ClipTo(i)).map(|e| Self::editor_input(e, cx)),
-                        )
                         .child({
                             let weak = cx.weak_entity();
                             Checkbox::new(
@@ -3626,7 +3624,15 @@ impl SpritePanel {
                                 weak.update(cx, |this, cx| this.set_clip_loop(i, on, cx))
                                     .ok();
                             })
-                        }),
+                        })
+                        .child(
+                            IconButton::new(("ggo-sprite-clip-delete", i), IconName::Trash)
+                                .icon_size(IconSize::Small)
+                                .tooltip(ui::Tooltip::text("Delete clip"))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.delete_clip(i, cx)),
+                                ),
+                        ),
                 )
                 .child(self.render_sequence_for(i, cx));
             if let Some((at, message)) = &open.clip_error
@@ -3745,9 +3751,30 @@ impl SpritePanel {
                             .children(thumb),
                     )
                     .child(
-                        Label::new(format!("{duration_ms} ms"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_0p5()
+                            .items_center()
+                            .child(
+                                Label::new(format!("{duration_ms} ms"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                IconButton::new(
+                                    ("ggo-sprite-frame-settings", clip_ix * 1000 + seq_pos),
+                                    IconName::Ellipsis,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(ui::Tooltip::text("Frame settings"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_frame_settings(
+                                        clip_ix,
+                                        ix,
+                                        window.mouse_position(),
+                                        cx,
+                                    );
+                                })),
+                            ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.select_frame(ix, cx)))
                     .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
@@ -3900,6 +3927,79 @@ impl SpritePanel {
             .into_any_element()
     }
 
+    /// The per-frame settings popup: an anchored card at the "..."
+    /// click, hosting the SELECTED frame's duration and affine transform
+    /// editors plus the owning clip's From/To range. Click-away or
+    /// Escape dismisses it (pending editor text blur-commits as the
+    /// editors leave focus).
+    fn render_frame_settings(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let (clip_ix, position) = open.frame_settings?;
+        let editor_for = |target: EditTarget| {
+            open.editors
+                .iter()
+                .find(|e| e.target == target)
+                .map(|e| e.editor.clone())
+        };
+        let labelled = |label: &'static str, width: f32, target: EditTarget| {
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    div().w(px(28.)).child(
+                        Label::new(label).size(LabelSize::XSmall).color(Color::Muted),
+                    ),
+                )
+                .child(
+                    div()
+                        .w(px(width))
+                        .flex_none()
+                        .children(editor_for(target).map(|e| Self::editor_input(e, cx))),
+                )
+        };
+        let card = v_flex()
+            .id("ggo-sprite-frame-settings-popup")
+            .debug_selector(|| "ggo-sprite-frame-settings-popup".into())
+            .occlude()
+            .p_1()
+            .gap_0p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .shadow_md()
+            .child(
+                Label::new(format!("Frame {}", open.selected_frame + 1))
+                    .size(LabelSize::XSmall),
+            )
+            .child(labelled("ms", 56., EditTarget::Duration))
+            .child(labelled("rot", 48., EditTarget::Rot))
+            .child(labelled("sx", 56., EditTarget::ScaleX))
+            .child(labelled("sy", 56., EditTarget::ScaleY))
+            .child(labelled("shx", 56., EditTarget::ShearX))
+            .child(labelled("shy", 56., EditTarget::ShearY))
+            .child(
+                Label::new("Clip range")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(labelled("from", 40., EditTarget::ClipFrom(clip_ix)))
+            .child(labelled("to", 40., EditTarget::ClipTo(clip_ix)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_frame_settings(cx)));
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         v_flex()
             .size_full()
@@ -3916,6 +4016,7 @@ impl SpritePanel {
             )
             .child(self.render_frame_ops(cx))
             .child(self.render_clips(cx))
+            .children(self.render_frame_settings(cx))
             .into_any_element()
     }
 }
@@ -5323,6 +5424,55 @@ mod tests {
             // A stale clip index is a no-op, not a panic.
             panel.drop_frame_on_clip(9, 0, cx);
             assert_eq!(ready(panel).store.state().frames.len(), 3);
+        });
+    }
+
+
+    /// The per-frame "..." settings popup: opening selects the frame
+    /// (preview and editors agree), Escape's path and click-away close
+    /// it, and a vanished owning clip closes it on refresh.
+    #[gpui::test]
+    async fn test_frame_settings_popup_opens_selects_and_dismisses(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.open_frame_settings(0, 1, gpui::point(px(50.), px(50.)), cx);
+            let open = ready(panel);
+            assert_eq!(open.selected_frame, 1, "opening selects the frame");
+            assert_eq!(open.frame_settings.map(|(c, _)| c), Some(0));
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-sprite-frame-settings-popup").is_some(),
+            "the popup paints anchored"
+        );
+
+        // Click-away dismisses (mouse down outside the occluded card).
+        cx.simulate_mouse_down(
+            gpui::point(px(400.), px(400.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(ready(panel).frame_settings.is_none(), "click-away closes");
+        });
+
+        // Escape's shared clear path closes it too.
+        panel.update(cx, |panel, cx| {
+            panel.open_frame_settings(0, 0, gpui::point(px(50.), px(50.)), cx);
+            panel.deselect_tile(cx);
+            assert!(ready(panel).frame_settings.is_none(), "Escape closes");
+        });
+
+        // A vanished owning clip closes it on the next doc refresh.
+        panel.update(cx, |panel, cx| {
+            panel.open_frame_settings(0, 0, gpui::point(px(50.), px(50.)), cx);
+            panel.delete_clip(0, cx);
+            assert!(
+                ready(panel).frame_settings.is_none(),
+                "stale clip index cannot survive the refresh"
+            );
         });
     }
 
