@@ -76,6 +76,7 @@
 //! further render will come.
 
 mod audio;
+mod emu_item;
 mod drive;
 mod ingest;
 mod input;
@@ -88,7 +89,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    Action, AnyWindowHandle, App, Context, EventEmitter, FocusHandle, Focusable,
+    AnyWindowHandle, App, Context, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
     Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription, Task,
     WeakEntity, Window, actions, div, px,
@@ -98,18 +99,17 @@ use ui::Tooltip;
 use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::Workspace;
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use drive::{Frame, Session};
 use input::InputState;
 use stats::RunStats;
 use uart::UartLog;
 
+pub use emu_item::EmulatorItem;
+
 actions!(
     ggo_emu,
     [
-        /// Toggles focus on the GGO emulator panel.
-        ToggleFocus,
         /// Runs the selected cart in the emulator pane.
         Run,
         /// Stops the running cart.
@@ -119,18 +119,11 @@ actions!(
     ]
 );
 
-const GGO_EMU_PANEL_KEY: &str = "GGOEmuPanel";
-
 /// The panel's key-dispatch context. Everything the pane binds is scoped
 /// to it, so the pad keys and the transport bindings are inert unless the
 /// pane itself has focus -- typing `z` into an editor must never reach a
 /// cart. See [`bind_panel_keys`].
 const KEY_CONTEXT: &str = "GgoEmuPanel";
-
-/// Fixed default width until the panel grows real settings persistence
-/// (the same call the other three GGO panels made). Wide enough for the
-/// 320px screen plus the dock's padding.
-const DEFAULT_WIDTH: Pixels = px(360.);
 
 /// How many of the newest console lines the expanded console shows.
 /// `ggo-ide`'s `pages/emulator.rs::LIVE_CONSOLE_TAIL_LINES` verbatim, for
@@ -174,7 +167,7 @@ pub fn init(cx: &mut App) {
     // started from the charts panel ends where a Re-run started from the
     // explorer does.
     ggo_common::register_cart_runner(cx, |workspace, rel, window, cx| {
-        ggo_common::open_in_panel(workspace, window, cx, |emu: &mut EmuPanel, window, cx| {
+        open_emu_item(workspace, window, cx, move |emu, window, cx| {
             emu.rerun(rel, window, cx);
         })
     });
@@ -191,20 +184,36 @@ pub fn init(cx: &mut App) {
         true
     });
 
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(window) = window else {
-            return;
-        };
+}
 
-        let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| EmuPanel::new(Some(weak_workspace), Some(window), cx));
-        workspace.add_panel(panel, window, cx);
-
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<EmuPanel>(window, cx);
-        });
-    })
-    .detach();
+/// Open (or focus) THE center-pane emulator tab and run `f` against its
+/// panel -- the emulator is a singleton item, so every entry point
+/// (explorer `.cart` click, the run menu, the charts panel's Re-run, the
+/// world panel's Emulate) lands in the same tab. The center pane is
+/// where a 320x240 frame can actually scale up; the old right-dock home
+/// capped it at a sidebar's width.
+pub fn open_emu_item(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    f: impl FnOnce(&mut EmuPanel, &mut Window, &mut Context<EmuPanel>),
+) -> bool {
+    let existing = workspace.items_of_type::<EmulatorItem>(cx).next();
+    let item = match existing {
+        Some(item) => {
+            workspace.activate_item(&item, true, true, window, cx);
+            item
+        }
+        None => {
+            let weak = workspace.weak_handle();
+            let item = cx.new(|cx| EmulatorItem::new(weak, window, cx));
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        }
+    };
+    let panel = item.read(cx).panel().clone();
+    panel.update(cx, |panel, cx| f(panel, window, cx));
+    true
 }
 
 /// The cart extension this panel claims from the file explorer. The
@@ -238,12 +247,9 @@ fn intercept_cart_open(
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return false;
     };
-    ggo_common::open_in_panel(
-        workspace,
-        window,
-        cx,
-        move |panel: &mut EmuPanel, window, cx| panel.open_rel_path(&rel, window, cx),
-    )
+    open_emu_item(workspace, window, cx, move |panel, window, cx| {
+        panel.open_rel_path(&rel, window, cx)
+    })
 }
 
 /// Transport bindings only. The 18 pad keys are deliberately NOT
@@ -333,7 +339,6 @@ fn ingest_finished_run(
 
 pub struct EmuPanel {
     focus_handle: FocusHandle,
-    position: DockPosition,
     workspace: Option<WeakEntity<Workspace>>,
     /// Test hook: bypass workspace worktree discovery
     /// (`ggo_world_panel::root_override`'s analog).
@@ -474,7 +479,6 @@ impl EmuPanel {
 
         Self {
             focus_handle,
-            position: DockPosition::Right,
             workspace,
             root_override: None,
             db_path_override: None,
@@ -734,13 +738,11 @@ impl EmuPanel {
                         .update(cx, |_root, window, cx| {
                             workspace
                                 .update(cx, |workspace, cx| {
-                                    ggo_common::open_in_panel(
+                                    ggo_charts_panel::open_charts_item(
                                         workspace,
                                         window,
                                         cx,
-                                        |charts: &mut ggo_charts_panel::ChartsPanel,
-                                         _window,
-                                         cx| {
+                                        |charts, _window, cx| {
                                             charts.open_run(run_id, cx);
                                         },
                                     );
@@ -1408,85 +1410,15 @@ impl Focusable for EmuPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for EmuPanel {}
-
-impl Panel for EmuPanel {
-    fn persistent_name() -> &'static str {
-        "GGO Emulator"
-    }
-
-    fn panel_key() -> &'static str {
-        GGO_EMU_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        // Same call the other three GGO panels made: no settings
-        // persistence yet, and Bottom would squash a 4:3 screen.
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        DEFAULT_WIDTH
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        // `PlayOutlined` over `PlayFilled`: dock icons in this fork are
-        // outline glyphs (see `IconName::Debug`/`Terminal` usage), and
-        // the filled play is already spoken for by this panel's own Run
-        // button, where the weight difference reads as "the action" vs
-        // "the panel". `DebugPause`/`Stop` are the other transport
-        // glyphs available; neither names a panel.
-        Some(IconName::PlayOutlined)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO Emulator")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
-        // `ggo_charts_panel` 10 (grep activation_priority across
-        // crates/).
-        11
-    }
-
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if active {
-            // Deferred for the same reason `ggo_world_panel::set_active`
-            // defers its own refresh: `set_active` fires inside the
-            // workspace's own update (dock toggle), and `refresh_root`
-            // reads the project's worktrees -- a re-entrant read of the
-            // entity currently being updated. Still worth doing with the
-            // picker gone: the root can change under the panel (a folder
-            // opened after the panel was first shown), and `run` needs it.
-            let this = cx.weak_entity();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_root(cx)).ok();
-            });
-        }
-    }
-}
-
 impl EmuPanel {
+    /// The selected cart's file stem, for the tab title.
+    pub fn selected_cart_stem(&self) -> Option<String> {
+        let rel = self.selected.as_ref()?;
+        std::path::Path::new(rel)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    }
+
     /// A workspace-less panel in a real test window -- the shape
     /// `TestAppContext::add_window_view` wants. Tests that don't need a
     /// window call `Self::new(None, None, cx)` directly.
@@ -1496,17 +1428,18 @@ impl EmuPanel {
     }
 }
 
-/// Where the framebuffer lands inside `panel`: the largest INTEGER
-/// multiple of 320x240 that fits both axes, centered on floored
-/// whole-pixel origins -- or, in a panel smaller than one framebuffer,
-/// a fractional aspect-fit shrink (downscale blur beats clipping).
+/// Where the framebuffer lands inside `panel`: the largest aspect-true
+/// fit of 320x240, centered on floored whole-pixel origins -- the screen
+/// fills the center pane it now lives in. Fractional scale by choice:
+/// with the emulator as a full center tab, an integer snap could leave a
+/// third of the area as letterbox, and filling the pane is worth the
+/// slight sampling softness (nearest sampling keeps edges serviceable).
 fn scaled_frame_bounds(panel: gpui::Bounds<Pixels>) -> gpui::Bounds<Pixels> {
     let frame_w = drive::WIDTH as f32;
     let frame_h = drive::HEIGHT as f32;
     let panel_w = f32::from(panel.size.width);
     let panel_h = f32::from(panel.size.height);
-    let fit = (panel_w / frame_w).min(panel_h / frame_h);
-    let scale = if fit >= 1.0 { fit.floor() } else { fit };
+    let scale = (panel_w / frame_w).min(panel_h / frame_h);
     let w = frame_w * scale;
     let h = frame_h * scale;
     let x = ((panel_w - w) / 2.0).floor();
@@ -1528,16 +1461,16 @@ mod tests {
     /// multiple that fits both axes, centered on whole-pixel origins --
     /// integer scale on aligned bounds is what keeps sprites crisp.
     #[test]
-    fn scaled_frame_bounds_snaps_to_the_largest_integer_fit() {
+    fn scaled_frame_bounds_fills_the_pane_preserving_aspect() {
         let panel = gpui::Bounds::new(
             gpui::point(gpui::px(0.), gpui::px(0.)),
             gpui::size(gpui::px(1000.), gpui::px(800.)),
         );
         let b = scaled_frame_bounds(panel);
-        assert_eq!(b.size.width, gpui::px(960.), "3x of 320");
-        assert_eq!(b.size.height, gpui::px(720.), "3x of 240");
-        assert_eq!(b.origin.x, gpui::px(20.), "(1000-960)/2");
-        assert_eq!(b.origin.y, gpui::px(40.), "(800-720)/2");
+        assert_eq!(b.size.width, gpui::px(1000.), "width-limited: 3.125x of 320");
+        assert_eq!(b.size.height, gpui::px(750.), "3.125x of 240 keeps 4:3");
+        assert_eq!(b.origin.x, gpui::px(0.));
+        assert_eq!(b.origin.y, gpui::px(25.), "(800-750)/2");
     }
 
     /// The panel's own origin offsets the centered frame.
@@ -1555,7 +1488,7 @@ mod tests {
     }
 
     /// A fractional centering remainder is floored to a whole pixel so
-    /// the texel grid stays aligned with the device grid.
+    /// the frame sits on the device grid.
     #[test]
     fn scaled_frame_bounds_floors_the_centering_offset() {
         let panel = gpui::Bounds::new(
@@ -1563,8 +1496,10 @@ mod tests {
             gpui::size(gpui::px(645.), gpui::px(485.)),
         );
         let b = scaled_frame_bounds(panel);
-        assert_eq!(b.origin.x, gpui::px(2.), "floor(5/2)");
-        assert_eq!(b.origin.y, gpui::px(2.), "floor(5/2)");
+        // Width-limited: scale 645/320, height 483.75, remainder 1.25.
+        assert_eq!(b.origin.x, gpui::px(0.));
+        assert_eq!(b.origin.y, gpui::px(0.), "floor(1.25/2)");
+        assert_eq!(b.size.width, gpui::px(645.));
     }
 
     /// A panel smaller than one framebuffer falls back to a fractional
@@ -1580,7 +1515,7 @@ mod tests {
         assert_eq!(b.size.height, gpui::px(120.), "aspect preserved");
     }
     use project::{FakeFs, Project, WorktreeId};
-    use workspace::dock::DockPosition;
+    use workspace::dock::{DockPosition, Panel as _};
     use workspace::{AppState, MultiWorkspace};
 
     /// A panel in a real (workspace-less) test window. `AppState::test`
@@ -1600,15 +1535,31 @@ mod tests {
         init(cx);
     }
 
-    /// Proves the panel is registered on a real workspace, and that
-    /// dispatching `ToggleFocus` opens the right dock. Goes through
-    /// `MultiWorkspace::test_new` rather than a bare `Workspace::test_new`
-    /// -- `register_action` handlers are only mounted into the dispatch
-    /// tree once something renders `Workspace::actions`, which in
-    /// production is `MultiWorkspace`'s render (the other three GGO
-    /// panels' tests carry the same note).
+    /// Get (creating on first call) THE center-pane emulator item's
+    /// panel -- what the tests below configure `root_override` on before
+    /// driving routing, mirroring how production reuses the singleton
+    /// tab.
+    fn emu_panel_via_item(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<EmuPanel> {
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_emu_item(workspace, window, cx, |_, _, _| {});
+            workspace
+                .items_of_type::<EmulatorItem>(cx)
+                .next()
+                .expect("open_emu_item adds the item")
+                .read(cx)
+                .panel()
+                .clone()
+        })
+    }
+
+    /// The emulator is a SINGLETON center tab: `open_emu_item` creates it
+    /// once and every later call activates the same item instead of
+    /// stacking a second emulator.
     #[gpui::test]
-    async fn test_toggle_focus_opens_panel(cx: &mut TestAppContext) {
+    async fn test_open_emu_item_is_a_singleton_center_tab(cx: &mut TestAppContext) {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
@@ -1620,27 +1571,18 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
-        workspace.update(cx, |workspace, cx| {
-            assert!(
-                workspace.panel::<EmuPanel>(cx).is_some(),
-                "EmuPanel should have been added to the workspace by init()"
-            );
-            assert!(
-                !workspace.right_dock().read(cx).is_open(),
-                "right dock should start closed"
-            );
-        });
-
-        cx.dispatch_action(ToggleFocus);
-
-        workspace.update(cx, |workspace, cx| {
-            let panel = workspace
-                .panel::<EmuPanel>(cx)
-                .expect("EmuPanel should still be registered");
-            assert_eq!(panel.read(cx).position, DockPosition::Right);
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "ToggleFocus should have opened the right dock"
+        let first = emu_panel_via_item(&workspace, cx);
+        let second = emu_panel_via_item(&workspace, cx);
+        assert_eq!(
+            first.entity_id(),
+            second.entity_id(),
+            "one emulator, re-focused"
+        );
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<EmulatorItem>(cx).count(),
+                1,
+                "exactly one emulator tab"
             );
         });
     }
@@ -2369,11 +2311,7 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<EmuPanel>(cx)
-                .expect("init() adds the panel")
-        });
+        let panel = emu_panel_via_item(&workspace, cx);
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(
@@ -2396,9 +2334,10 @@ mod tests {
             );
         });
         workspace.read_with(cx, |workspace, cx| {
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "routing must open the panel's dock even if it was closed"
+            assert_eq!(
+                workspace.items_of_type::<EmulatorItem>(cx).count(),
+                1,
+                "routing must open the emulator tab"
             );
         });
 
@@ -2570,11 +2509,7 @@ mod tests {
             .await
             .expect("the project panel loads");
 
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<EmuPanel>(cx)
-                .expect("init() adds the emu panel")
-        });
+        let panel = emu_panel_via_item(&workspace, cx);
         let worktree_id = worktree_id(&project, cx);
 
         fn entry_id(
@@ -2613,9 +2548,10 @@ mod tests {
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
                 workspace.active_pane().read(cx).items().count(),
-                0,
-                "a claimed path must open no editor tab"
+                1,
+                "a claimed path opens the emulator tab and nothing else"
             );
+            assert_eq!(workspace.items_of_type::<EmulatorItem>(cx).count(), 1);
         });
 
         // Control: an unclaimed path DOES open a tab, so the assertion
@@ -2632,8 +2568,8 @@ mod tests {
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
                 workspace.active_pane().read(cx).items().count(),
-                1,
-                "an unclaimed path still opens the normal way"
+                2,
+                "an unclaimed path still opens the normal way, beside the emulator tab"
             );
         });
     }
@@ -2664,11 +2600,7 @@ mod tests {
             .await
             .expect("the project panel loads");
 
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<EmuPanel>(cx)
-                .expect("init() adds the emu panel")
-        });
+        let panel = emu_panel_via_item(&workspace, cx);
         let worktree_id = worktree_id(&project, cx);
 
         fn entry_id(
@@ -2708,9 +2640,10 @@ mod tests {
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
                 workspace.active_pane().read(cx).items().count(),
-                0,
-                "a claimed path must open no editor tab, split or not"
+                1,
+                "a claimed path opens the emulator tab and nothing else, split or not"
             );
+            assert_eq!(workspace.items_of_type::<EmulatorItem>(cx).count(), 1);
         });
 
         // Control: an unclaimed path DOES split-open a tab, so the assertion
@@ -3174,11 +3107,7 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<EmuPanel>(cx)
-                .expect("init() adds the emu panel")
-        });
+        let panel = emu_panel_via_item(&workspace, cx);
         let root = root.to_path_buf();
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(root.clone());
@@ -3325,9 +3254,10 @@ mod tests {
             );
         });
         workspace.read_with(cx, |workspace, cx| {
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "the emu dock must come forward"
+            assert_eq!(
+                workspace.items_of_type::<EmulatorItem>(cx).count(),
+                1,
+                "the emulator tab must come forward"
             );
         });
     }
@@ -3442,10 +3372,15 @@ mod tests {
         .unwrap();
 
         let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
-        let charts = workspace.read_with(cx, |workspace, cx| {
+        let charts = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
             workspace
-                .panel::<ggo_charts_panel::ChartsPanel>(cx)
-                .expect("ggo_charts_panel::init adds its panel")
+                .items_of_type::<ggo_charts_panel::ChartsItem>(cx)
+                .next()
+                .expect("open_charts_item adds the reports tab")
+                .read(cx)
+                .panel()
+                .clone()
         });
         // Both panels on ONE temp database, so the run this test ingests is
         // the run the charts panel then reads back.
@@ -3547,10 +3482,15 @@ mod tests {
         )
         .unwrap();
         let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
-        let charts = workspace.read_with(cx, |workspace, cx| {
+        let charts = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
             workspace
-                .panel::<ggo_charts_panel::ChartsPanel>(cx)
-                .expect("ggo_charts_panel::init adds its panel")
+                .items_of_type::<ggo_charts_panel::ChartsItem>(cx)
+                .next()
+                .expect("open_charts_item adds the reports tab")
+                .read(cx)
+                .panel()
+                .clone()
         });
         let db_path = dir.path().join("ggo_ide.db");
         charts.update(cx, |charts, _cx| {
@@ -3837,9 +3777,10 @@ mod tests {
             assert!(status.contains(menu::DIAG_TTY_ENV), "{status}");
         });
         workspace.read_with(cx, |workspace, cx| {
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "the dock holding that message must be open"
+            assert_eq!(
+                workspace.items_of_type::<EmulatorItem>(cx).count(),
+                1,
+                "the tab holding that message must be open"
             );
         });
     }

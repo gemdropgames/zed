@@ -406,7 +406,7 @@ fn emu_panel_handler(
             return;
         };
         workspace.update(cx, |workspace, cx| {
-            ggo_common::open_in_panel(workspace, window, cx, |panel: &mut EmuPanel, window, cx| {
+            crate::open_emu_item(workspace, window, cx, |panel: &mut EmuPanel, window, cx| {
                 action(panel, window, cx)
             });
         });

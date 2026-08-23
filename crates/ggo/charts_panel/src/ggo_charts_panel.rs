@@ -54,6 +54,7 @@
 //! is still wired up now rather than added later).
 
 mod chart_geom;
+mod charts_item;
 mod chart_paint;
 mod chart_set;
 mod detail;
@@ -66,34 +67,27 @@ mod inspect;
 pub mod loader;
 mod report;
 
+pub use charts_item::ChartsItem;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    Action, App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
-    MouseMoveEvent, Pixels, Render, Styled, Task, WeakEntity, Window, actions, div, px,
+    App, Bounds, Context, FocusHandle, Focusable, IntoElement,
+    MouseMoveEvent, Pixels, Render, Styled, Task, WeakEntity, Window, div, px,
     uniform_list,
 };
 use ui::prelude::*;
 use ui::{Checkbox, Tooltip};
 use workspace::Workspace;
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use chart_geom::{ChartSpec, build_chart_scene};
 use history::RunSummary;
 use loader::RunListing;
 
-actions!(
-    ggo_charts,
-    [
-        /// Toggles focus on the GGO charts panel.
-        ToggleFocus
-    ]
-);
 
-const GGO_CHARTS_PANEL_KEY: &str = "GGOChartsPanel";
 
 /// The panel's key-dispatch context identifier. No bindings are scoped to
 /// it yet (see `bind_panel_keys`) -- chart interaction is pointer-only so
@@ -102,10 +96,6 @@ const GGO_CHARTS_PANEL_KEY: &str = "GGOChartsPanel";
 /// `init`/`Render` wiring.
 const KEY_CONTEXT: &str = "GgoChartsPanel";
 
-/// Fixed default width until the panel grows real settings persistence
-/// (same call `ggo_world_panel`/`ggo_sprite_panel` made at their own
-/// skeleton stage).
-const DEFAULT_WIDTH: Pixels = px(360.);
 
 /// Height of one chart canvas, matching ggo-ide's `CHART_HEIGHT` (240).
 const CHART_HEIGHT: Pixels = px(240.);
@@ -247,24 +237,39 @@ pub fn init(cx: &mut App) {
     cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
         .detach();
 
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(window) = window else {
-            return;
-        };
+}
 
-        // The weak handle is what the Re-run entry routes through -- see
-        // `ChartsPanel::rerun_selected`. Taken here, the way
-        // `ggo_emu_panel::init` takes its own, because a panel cannot
-        // recover its workspace from a `Context<Self>`.
-        let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| ChartsPanel::new(Some(weak_workspace), cx));
-        workspace.add_panel(panel, window, cx);
-
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<ChartsPanel>(window, cx);
-        });
-    })
-    .detach();
+/// Open (or focus) THE center-pane reports tab and run `f` against its
+/// panel -- the reports view is a singleton item, so the emulator's
+/// finished-run hop and any later entry land in the same tab, with the
+/// center area's real screen space. Refreshes the runs/history lists on
+/// every open (the job the dock's `set_active` used to do).
+pub fn open_charts_item(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    f: impl FnOnce(&mut ChartsPanel, &mut Window, &mut Context<ChartsPanel>),
+) -> bool {
+    let existing = workspace.items_of_type::<ChartsItem>(cx).next();
+    let item = match existing {
+        Some(item) => {
+            workspace.activate_item(&item, true, true, window, cx);
+            item
+        }
+        None => {
+            let weak = workspace.weak_handle();
+            let item = cx.new(|cx| ChartsItem::new(weak, cx));
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        }
+    };
+    let panel = item.read(cx).panel().clone();
+    panel.update(cx, |panel, cx| {
+        panel.refresh_runs(cx);
+        panel.refresh_history(cx);
+        f(panel, window, cx)
+    });
+    true
 }
 
 /// No panel-specific keybinds exist yet: run selection is a click and
@@ -414,7 +419,6 @@ struct Drag {
 
 pub struct ChartsPanel {
     focus_handle: FocusHandle,
-    position: DockPosition,
     /// The workspace this panel was added to, for the Re-run handoff --
     /// `None` in the unit tests that build a bare panel with no workspace
     /// at all, which is exactly when Re-run has nowhere to go anyway.
@@ -492,7 +496,6 @@ impl ChartsPanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            position: DockPosition::Right,
             workspace,
             db_path_override: None,
             diag_db_path_override: None,
@@ -2324,112 +2327,26 @@ impl Focusable for ChartsPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for ChartsPanel {}
-
-impl Panel for ChartsPanel {
-    fn persistent_name() -> &'static str {
-        "GGO Charts"
-    }
-
-    fn panel_key() -> &'static str {
-        GGO_CHARTS_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        // Same call as `ggo_world_panel`/`ggo_sprite_panel`: no
-        // settings persistence yet, and Bottom isn't a sensible spot for
-        // a charts sidebar.
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        DEFAULT_WIDTH
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        // `IconName` has no dedicated Chart/Graph/BarChart glyph in this
-        // fork (checked against crates/icons/src/icons.rs). `SignalHigh`
-        // is chosen over `GitGraph` (the other chart-ish candidate):
-        // `assets/icons/signal_high.svg` draws four ascending vertical
-        // bars -- literally a small bar chart -- while `git_graph.svg` is
-        // a commit-graph glyph (nodes + branch lines), which reads as
-        // version control, not perf data.
-        Some(IconName::SignalHigh)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO Charts")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_sprite_panel` took 9 (grep
-        // activation_priority across crates/).
-        10
-    }
-
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if active {
-            // Deferred for the same reason `ggo_world_panel::set_active`
-            // defers its own refresh: `set_active` fires inside the
-            // workspace's own update (dock toggle), and a re-entrant read
-            // isn't needed here today (this loader doesn't touch the
-            // workspace/project at all) -- kept deferred anyway so this
-            // stays structurally identical to the two panels it mirrors,
-            // in case a later task adds a project-relative read.
-            let this = cx.weak_entity();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| {
-                    this.refresh_runs(cx);
-                    this.refresh_history(cx);
-                })
-                .ok();
-            });
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
-    use workspace::dock::DockPosition;
     use workspace::{AppState, MultiWorkspace};
+
+    /// The dock-era default width, kept as the tests' viewport width so
+    /// the layout-sensitive assertions keep their historical geometry.
+    const DEFAULT_WIDTH: Pixels = px(360.);
 
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
     }
 
-    /// Proves the panel is registered on a real workspace, and that
-    /// dispatching `ToggleFocus` opens the right dock and focuses the
-    /// panel. Goes through `MultiWorkspace::test_new` rather than a bare
-    /// `Workspace::test_new` -- `register_action` handlers (like
-    /// `ToggleFocus`) are only mounted into the dispatch tree once
-    /// something renders `Workspace::actions`, which in production is
-    /// `MultiWorkspace`'s render (`ggo_world_panel`'s test carries the
-    /// same note).
+    /// The reports view is a SINGLETON center tab: `open_charts_item`
+    /// creates it once and every later call activates the same item.
     #[gpui::test]
-    async fn test_toggle_focus_opens_panel(cx: &mut TestAppContext) {
+    async fn test_open_charts_item_is_a_singleton_center_tab(cx: &mut TestAppContext) {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
@@ -2441,30 +2358,36 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
-        workspace.update(cx, |workspace, cx| {
-            assert!(
-                workspace.panel::<ChartsPanel>(cx).is_some(),
-                "ChartsPanel should have been added to the workspace by init()"
-            );
-            assert!(
-                !workspace.right_dock().read(cx).is_open(),
-                "right dock should start closed"
-            );
+        let first = workspace.update_in(cx, |workspace, window, cx| {
+            open_charts_item(workspace, window, cx, |_, _, _| {});
+            workspace
+                .items_of_type::<ChartsItem>(cx)
+                .next()
+                .expect("open_charts_item adds the item")
+                .read(cx)
+                .panel()
+                .clone()
         });
-
-        cx.dispatch_action(ToggleFocus);
-
-        workspace.update(cx, |workspace, cx| {
-            let panel = workspace
-                .panel::<ChartsPanel>(cx)
-                .expect("ChartsPanel should still be registered");
-            assert_eq!(panel.read(cx).position, DockPosition::Right);
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "ToggleFocus should have opened the right dock"
-            );
+        let second = workspace.update_in(cx, |workspace, window, cx| {
+            open_charts_item(workspace, window, cx, |_, _, _| {});
+            workspace
+                .items_of_type::<ChartsItem>(cx)
+                .next()
+                .expect("still there")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        assert_eq!(
+            first.entity_id(),
+            second.entity_id(),
+            "one reports view, re-focused"
+        );
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<ChartsItem>(cx).count(), 1);
         });
     }
+
 
     /// A fixture db authored through `ggo_db::migrate` plus one inserted
     /// run (same pattern `ggo-ide`'s `backend/perf.rs` tests and
@@ -3880,10 +3803,15 @@ mod tests {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            open_charts_item(workspace, window, cx, |_, _, _| {});
             workspace
-                .panel::<ChartsPanel>(cx)
-                .expect("init() adds the charts panel")
+                .items_of_type::<ChartsItem>(cx)
+                .next()
+                .expect("open_charts_item adds the item")
+                .read(cx)
+                .panel()
+                .clone()
         });
         panel.update(cx, |panel, cx| {
             panel.db_path_override = Some(db_path);
