@@ -44,7 +44,7 @@ use workspace::Workspace;
 
 use ggo_worldlib::sprites::io::save_tileset;
 use ggo_worldlib::sprites::palette565::PAL_SLOTS;
-use ggo_worldlib::sprites::tileset_doc::{TILE_PX, TilesetDocStore, TilesetOp};
+use ggo_worldlib::sprites::tileset_doc::{TILE_PX, TilesetDocStore};
 
 use loader::LoadedTileset;
 pub use palette_widget::SmallPaletteEditor;
@@ -470,9 +470,10 @@ impl TilesetPanel {
         Some((tile, sx % TILE_PX, sy % TILE_PX))
     }
 
-    /// Paint the pixel under `pos` with the current tool. Same-color
-    /// paints are no-ops inside the store (no undo entry), so
-    /// drag-painting over already-painted ground is free.
+    /// Paint the pixel under `pos` with the current tool, folding into
+    /// the open stroke -- one whole drag is one undo step. Same-color
+    /// paints are no-ops inside the store, so drag-painting over
+    /// already-painted ground is free.
     fn paint_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let Some((tile, x, y)) = self.pixel_at(pos) else {
             return;
@@ -481,7 +482,7 @@ impl TilesetPanel {
             return;
         };
         let color = open.paint_color();
-        open.store.apply(TilesetOp::Paint { tile, x, y, color });
+        open.store.apply_stroke_paint(tile, x, y, color);
         self.recompose_grid(cx);
     }
 
@@ -501,6 +502,9 @@ impl TilesetPanel {
     }
 
     fn on_sheet_mouse_down(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.store.begin_stroke();
+        }
         self.paint_at(pos, cx);
         if let ViewerState::Ready(open) = &mut self.state {
             open.painting = true;
@@ -518,6 +522,7 @@ impl TilesetPanel {
         if let ViewerState::Ready(open) = &mut self.state
             && open.painting
         {
+            open.store.end_stroke();
             open.painting = false;
             cx.notify();
         }
@@ -619,7 +624,8 @@ impl TilesetPanel {
         cx: &mut Context<Self>,
     ) {
         if let ViewerState::Ready(open) = &mut self.state {
-            open.store.apply(TilesetOp::Paint { tile, x, y, color });
+            open.store
+                .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::Paint { tile, x, y, color });
             self.recompose_grid(cx);
         }
     }
@@ -1257,6 +1263,23 @@ mod tests {
             assert_eq!(state.indices[0], 1, "the mouse-down pixel painted");
             assert_eq!(state.indices[1], 1, "the dragged-over pixel painted");
             assert_eq!(state.indices[2], 0, "a move after release paints nothing");
+
+            // The whole drag is ONE undo step.
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[0], 0, "one undo reverts the whole stroke");
+            assert_eq!(state.indices[1], 0);
+            assert!(!state.dirty);
+
+            // Two separate clicks are two steps.
+            panel.on_sheet_mouse_down(down, cx);
+            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_down(drag, cx);
+            panel.on_sheet_mouse_up(cx);
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[0], 1, "the first click survives");
+            assert_eq!(state.indices[1], 0, "the second click undone alone");
         });
     }
 
