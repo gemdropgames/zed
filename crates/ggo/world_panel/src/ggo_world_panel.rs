@@ -44,7 +44,7 @@ use gpui::{
 use serde_json::Value;
 use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, Divider, DropdownMenu, ToggleState};
-use workspace::Workspace;
+use workspace::{SplitDirection, Workspace};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::backgrounds::MergedBackground;
@@ -311,9 +311,56 @@ fn intercept_world_open(
     if split_world_path(&rel).is_none() {
         return false;
     }
-    // Dock first: the panel owns the document (inspector/entity editing
-    // stays there); the center pane gets the canvas viewport plus the
-    // `.toml` itself as an adjacent tab, canvas tab active.
+    // A SECOND click on the world that is already open AND active splits
+    // its `.toml` out to a right pane (world view left, toml text right,
+    // toml focused). The first click never opens the toml.
+    let second_click = {
+        let canvas = workspace
+            .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+            .next();
+        let showing = workspace
+            .panel::<WorldPanel>(cx)
+            .and_then(|panel| panel.read(cx).open_rel_path_now().map(str::to_string));
+        match canvas {
+            Some(canvas) if showing.as_deref() == Some(rel.as_str()) => workspace
+                .active_item(cx)
+                .is_some_and(|item| item.item_id() == canvas.entity_id()),
+            _ => false,
+        }
+    };
+    if second_click {
+        // Reuse the pane already holding this toml (a third click must
+        // not stack more splits); otherwise split the canvas pane right.
+        let existing_pane = workspace
+            .panes()
+            .iter()
+            .find(|pane| {
+                pane.read(cx)
+                    .items()
+                    .any(|item| item.project_path(cx).as_ref() == Some(path))
+            })
+            .cloned();
+        let target = match existing_pane {
+            Some(pane) => pane,
+            None => {
+                let active = workspace.active_pane().clone();
+                workspace.split_pane(active, SplitDirection::Right, window, cx)
+            }
+        };
+        let open_toml = workspace.open_path(path.clone(), Some(target.downgrade()), true, window, cx);
+        window
+            .spawn(cx, async move |_| {
+                if let Err(e) = open_toml.await {
+                    log::error!("GGO: failed to open the world's toml split: {e}");
+                }
+            })
+            .detach();
+        return true;
+    }
+
+    // FIRST click: dock first (the panel owns the document --
+    // inspector/entity editing stays there), then the center-pane canvas
+    // viewport, focused.
     let claimed = ggo_common::open_in_panel(
         workspace,
         window,
@@ -326,8 +373,10 @@ fn intercept_world_open(
     let canvas_item = workspace
         .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
         .next();
-    let canvas_item = match canvas_item {
-        Some(item) => item,
+    match canvas_item {
+        Some(item) => {
+            workspace.activate_item(&item, true, true, window, cx);
+        }
         None => {
             let panel = workspace.panel::<WorldPanel>(cx);
             let item = cx.new(|cx| {
@@ -336,33 +385,9 @@ fn intercept_world_open(
                     cx,
                 )
             });
-            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
-            item
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
         }
-    };
-    // The toml tab opens asynchronously and activates itself on landing,
-    // so the canvas re-activation has to be chained AFTER it -- a
-    // synchronous activate here would lose to the open's completion.
-    let open_toml = workspace.open_path(path.clone(), None, false, window, cx);
-    let weak_workspace = workspace.weak_handle();
-    let weak_canvas = canvas_item.downgrade();
-    window
-        .spawn(cx, async move |cx| {
-            if let Err(e) = open_toml.await {
-                log::error!("GGO: failed to open the world's toml tab: {e}");
-            }
-            cx.update(|window, cx| {
-                weak_workspace
-                    .update(cx, |workspace, cx| {
-                        if let Some(canvas) = weak_canvas.upgrade() {
-                            workspace.activate_item(&canvas, true, true, window, cx);
-                        }
-                    })
-                    .ok();
-            })
-            .ok();
-        })
-        .detach();
+    }
     true
 }
 
@@ -5802,20 +5827,16 @@ mod tests {
             );
         });
 
-        // Spec 2026-08-20: the same claim also opens the center-pane
-        // canvas item AND the world's own `.toml` as an adjacent tab,
-        // with the canvas tab active.
+        // The FIRST claim opens ONLY the center-pane canvas item, focused
+        // -- the toml stays closed until the world is clicked again.
         workspace.read_with(cx, |workspace, cx| {
             let canvas_items = workspace
                 .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
                 .count();
             assert_eq!(canvas_items, 1, "one canvas item");
+            assert_eq!(workspace.panes().len(), 1, "no split on first click");
             let pane = workspace.active_pane().read(cx);
-            assert_eq!(
-                pane.items_len(),
-                2,
-                "canvas tab plus the toml editor tab"
-            );
+            assert_eq!(pane.items_len(), 1, "the canvas tab alone");
             assert!(
                 pane.active_item()
                     .and_then(|item| item
@@ -5825,7 +5846,8 @@ mod tests {
             );
         });
 
-        // A second claim re-activates instead of duplicating.
+        // A SECOND claim on the already-open, active world splits its
+        // toml out to a right pane (world view left, toml text right).
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(
                 &project_path(worktree_id, "worlds/test.toml"),
@@ -5842,7 +5864,35 @@ mod tests {
                 1,
                 "re-claim must not duplicate the canvas item"
             );
-            assert_eq!(workspace.active_pane().read(cx).items_len(), 2);
+            assert_eq!(workspace.panes().len(), 2, "the toml split opened");
+            let toml_in_a_pane = workspace.panes().iter().any(|pane| {
+                pane.read(cx).items().any(|item| {
+                    item.project_path(cx)
+                        .is_some_and(|p| p == project_path(worktree_id, "worlds/test.toml"))
+                })
+            });
+            assert!(toml_in_a_pane, "the toml editor lives in the new pane");
+        });
+
+        // A THIRD claim reuses the existing toml pane instead of
+        // stacking more splits.
+        workspace.update_in(cx, |workspace, window, cx| {
+            // The canvas must be the active item again for the re-click
+            // semantics to trigger (the toml split took focus).
+            let canvas = workspace
+                .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                .next()
+                .expect("canvas item");
+            workspace.activate_item(&canvas, true, true, window, cx);
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "worlds/test.toml"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _cx| {
+            assert_eq!(workspace.panes().len(), 2, "no third pane");
         });
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
