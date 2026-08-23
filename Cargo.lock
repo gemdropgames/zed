@@ -7698,6 +7698,7 @@ dependencies = [
 name = "ggo_tileset_panel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ggo-asset-formats",
  "ggo-worldlib",
  "ggo_common",
