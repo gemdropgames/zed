@@ -7555,6 +7555,7 @@ dependencies = [
  "project",
  "smol",
  "tempfile",
+ "ui",
  "workspace",
 ]
 
