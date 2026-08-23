@@ -22,6 +22,45 @@ use gpui::RenderImage;
 /// so a tileset laid out there and here reads identically.
 pub const GRID_COLS_FALLBACK: usize = 8;
 
+/// Per-tileset view-settings sidecar: things the user tunes in the
+/// editor that the `.til`/`.pal` pair has no field for (zoom, grid
+/// columns). Written on every change, read once at open; a missing or
+/// corrupt file is simply the defaults. Lives at
+/// `.ggo-ide/<rel>.editor.json` -- the same hidden-dir convention as
+/// `ggo_sprite_panel::editor_meta`, keeping editor droppings out of the
+/// asset tree.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ViewMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<usize>,
+}
+
+fn meta_path(root: &Path, rel: &str) -> std::path::PathBuf {
+    root.join(format!(".ggo-ide/{rel}.editor.json"))
+}
+
+/// Read the view sidecar for `rel`, or the defaults when missing or
+/// unreadable -- view settings are never worth failing an open over.
+pub fn load_view_meta(root: &Path, rel: &str) -> ViewMeta {
+    match std::fs::read(meta_path(root, rel)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => ViewMeta::default(),
+    }
+}
+
+/// Write the view sidecar for `rel`, creating `.ggo-ide/` subdirs as
+/// needed.
+pub fn save_view_meta(root: &Path, rel: &str, meta: &ViewMeta) -> Result<(), String> {
+    let path = meta_path(root, rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
 /// Everything the panel needs to enter its Ready state, assembled
 /// entirely off the UI thread.
 pub struct LoadedTileset {
@@ -45,6 +84,9 @@ pub struct LoadedTileset {
     /// `grid`'s pixel size, kept alongside it so the zoom math doesn't
     /// have to go back through `RenderImage::size`.
     pub grid_size: (u32, u32),
+    /// The sidecar's stored zoom, if any -- the panel clamps it to its
+    /// own zoom bounds.
+    pub zoom: Option<usize>,
 }
 
 /// Compose the whole sheet into one BGRA image -- the load-time pass and
@@ -93,7 +135,10 @@ pub fn grid_pixel_size(tile_count: usize, cols: usize) -> (u32, u32) {
 /// Open `rel` (a project-relative `.til`) and compose its whole sheet.
 pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, String> {
     let opened = io::open_tileset(project_dir, rel).map_err(|e| e.to_string())?;
-    let cols = grid_cols(opened.tile_count);
+    let meta = load_view_meta(project_dir, rel);
+    // The sidecar's stored cols wins when valid for this sheet
+    // (`resolve_cols` rejects 0 and > tile_count), else the fallback.
+    let cols = resolve_cols(meta.cols, None, opened.tile_count, grid_cols(opened.tile_count));
     // Size comes from [`grid_pixel_size`] rather than `compose_tile_grid`'s
     // own returned `(w, h)` so the panel's geometry fn is the ONE definition
     // of the grid's dimensions (the two agreeing is pinned by
@@ -111,6 +156,7 @@ pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, Stri
         pal_path: opened.pal_path,
         grid,
         grid_size,
+        zoom: meta.zoom,
     })
 }
 

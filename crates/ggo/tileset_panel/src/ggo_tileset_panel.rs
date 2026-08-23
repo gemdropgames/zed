@@ -1,8 +1,9 @@
 //! GGO Tileset editor: a center-pane tab per `.til` (mirroring
 //! `ggo_sprite_panel`'s architecture) with the composed tile sheet as the
-//! editing canvas and ALL tooling -- pencil/eraser, the 16-slot palette
-//! the sheet is drawn through, zoom, undo/redo/save -- in a column on the
-//! panel's right side.
+//! editing canvas, the transient tools -- pencil/eraser, zoom,
+//! undo/redo/save -- in a toolbar across the top, and the document
+//! sections (file info, the 16-slot palette the sheet is drawn through)
+//! in a column on the panel's right side.
 //!
 //! Editing goes through worldlib's op surface end to end:
 //! `tileset_doc::TilesetDocStore` + `TilesetOp::Paint`, saved by
@@ -35,7 +36,7 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage,
-    Styled, Task, WeakEntity, Window, actions, div, img, px,
+    ScrollHandle, Styled, Task, WeakEntity, Window, actions, div, img, point, px,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -57,7 +58,15 @@ actions!(
         /// Redoes the last undone tileset edit.
         Redo,
         /// Saves the tileset (.til + .pal).
-        Save
+        Save,
+        /// Scrolls the tileset view left.
+        ScrollLeft,
+        /// Scrolls the tileset view right.
+        ScrollRight,
+        /// Scrolls the tileset view up.
+        ScrollUp,
+        /// Scrolls the tileset view down.
+        ScrollDown
     ]
 );
 
@@ -103,6 +112,10 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
+        KeyBinding::new("left", ScrollLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("right", ScrollRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", ScrollUp, Some(KEY_CONTEXT)),
+        KeyBinding::new("down", ScrollDown, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -192,6 +205,9 @@ struct OpenTileset {
     /// True between mouse-down on the sheet and mouse-up anywhere --
     /// drag-painting is live.
     painting: bool,
+    /// The sheet scroll container's handle -- arrow-key camera panning
+    /// goes through it.
+    scroll: ScrollHandle,
 }
 
 impl OpenTileset {
@@ -204,12 +220,16 @@ impl OpenTileset {
             store: TilesetDocStore::new(loaded.indices, loaded.tile_count, loaded.palette),
             grid: loaded.grid,
             grid_size: loaded.grid_size,
-            zoom: DEFAULT_ZOOM,
+            zoom: loaded
+                .zoom
+                .unwrap_or(DEFAULT_ZOOM)
+                .clamp(MIN_ZOOM, MAX_ZOOM),
             tool: Tool::Pencil,
             slot: 1,
             save_error: None,
             sheet_bounds: Rc::new(RefCell::new(None)),
             painting: false,
+            scroll: ScrollHandle::new(),
         }
     }
 
@@ -363,6 +383,60 @@ impl TilesetPanel {
         if next != open.zoom {
             open.zoom = next;
             cx.notify();
+            self.write_view_meta();
+        }
+    }
+
+    /// Set the grid's column count, clamped to `1..=tile_count` --
+    /// recomposes the sheet at the new width and persists the choice.
+    fn set_cols(&mut self, cols: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let tile_count = open.store.state().tile_count;
+        let next = cols.clamp(1, tile_count.max(1));
+        if next == open.cols {
+            return;
+        }
+        open.cols = next;
+        open.grid_size = loader::grid_pixel_size(tile_count, next);
+        self.recompose_grid(cx);
+        self.write_view_meta();
+    }
+
+    /// Pan the sheet's scroll container by (`dx`, `dy`) tiles -- the
+    /// arrow-key camera. Offsets grow NEGATIVE as the view scrolls
+    /// right/down (gpui's convention); the paint pass clamps to the
+    /// content, so only the zero edge needs guarding here.
+    fn scroll_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let step = (TILE_PX * open.zoom) as f32;
+        let offset = open.scroll.offset();
+        open.scroll.set_offset(point(
+            (offset.x - px(dx * step)).min(px(0.)),
+            (offset.y - px(dy * step)).min(px(0.)),
+        ));
+        cx.notify();
+    }
+
+    /// Persist the per-tileset view settings (zoom, cols) to the
+    /// `.ggo-ide` sidecar. Best-effort: a failed write is logged, never
+    /// surfaced -- view settings are not document data.
+    fn write_view_meta(&self) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(root) = &self.project_root else {
+            return;
+        };
+        let meta = loader::ViewMeta {
+            zoom: Some(open.zoom),
+            cols: Some(open.cols),
+        };
+        if let Err(e) = loader::save_view_meta(root, &open.rel_path, &meta) {
+            log::error!("GGO: failed to write view sidecar for {}: {e}", open.rel_path);
         }
     }
 
@@ -481,7 +555,7 @@ impl TilesetPanel {
         if slot == 0 || slot >= PAL_SLOTS || open.store.state().palette[slot] == rgb565 {
             return;
         }
-        open.store.apply(TilesetOp::SetPalette { slot, rgb565 });
+        open.store.apply_palette_coalesced(slot, rgb565);
         self.recompose_grid(cx);
     }
 
@@ -572,6 +646,8 @@ impl TilesetPanel {
         };
         let (w, h) = open.zoomed_size();
         let bounds_cell = open.sheet_bounds.clone();
+        let (cols, rows) = (open.cols, open.grid_size.1 as usize / TILE_PX);
+        let line_color = cx.theme().colors().border_variant;
         // `.top_0().left_0()` matters: an absolute child with auto insets
         // sits at its STATIC position -- after the in-flow img sibling --
         // so the recorded bounds would be shifted by exactly the image
@@ -580,7 +656,9 @@ impl TilesetPanel {
             move |bounds, _window, _cx| {
                 *bounds_cell.borrow_mut() = Some(bounds);
             },
-            |_, (), _, _| {},
+            move |bounds, (), window, _cx| {
+                paint_tile_borders(bounds, cols, rows, line_color, window);
+            },
         )
         .absolute()
         .top_0()
@@ -592,6 +670,7 @@ impl TilesetPanel {
             .min_w_0()
             .min_h_0()
             .overflow_scroll()
+            .track_scroll(&open.scroll)
             .child(
                 div().p_2().child(
                     div()
@@ -649,82 +728,98 @@ impl TilesetPanel {
             .into_any_element()
     }
 
-    /// The tool row: pencil/eraser toggle, undo/redo, save, zoom.
-    fn render_tools(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The toolbar across the top of the center view: pencil/eraser
+    /// toggle and zoom on the left, undo/redo/save on the right.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_tools is only called in the Ready state");
+            unreachable!("render_toolbar is only called in the Ready state");
         };
         let zoom_label = format!("{}x", open.zoom);
-        v_flex()
-            .gap_0p5()
+        h_flex()
+            .gap_1()
+            .items_center()
             .p_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        IconButton::new("ggo-tileset-pencil", IconName::Pencil)
-                            .icon_size(IconSize::Small)
-                            .toggle_state(open.tool == Tool::Pencil)
-                            .tooltip(ui::Tooltip::text("Pencil"))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.set_tool(Tool::Pencil, cx)),
-                            ),
-                    )
-                    .child(
-                        IconButton::new("ggo-tileset-eraser", IconName::Eraser)
-                            .icon_size(IconSize::Small)
-                            .toggle_state(open.tool == Tool::Eraser)
-                            .tooltip(ui::Tooltip::text("Eraser (paints transparent)"))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.set_tool(Tool::Eraser, cx)),
-                            ),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("ggo-tileset-undo", IconName::Undo)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(ui::Tooltip::text("Undo"))
-                            .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
-                    )
-                    .child(
-                        IconButton::new("ggo-tileset-redo", IconName::RotateCw)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(ui::Tooltip::text("Redo"))
-                            .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
-                    )
-                    .child(
-                        Button::new("ggo-tileset-save", "Save")
-                            .disabled(!open.store.dirty())
-                            .tooltip(ui::Tooltip::text("Save (.til + .pal)"))
-                            .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
-                    ),
+                IconButton::new("ggo-tileset-pencil", IconName::Pencil)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Pencil)
+                    .tooltip(ui::Tooltip::text("Pencil"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Pencil, cx))),
             )
             .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        Label::new("Zoom")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("ggo-tileset-zoom-out", IconName::Dash)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(open.zoom <= MIN_ZOOM)
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom_by(-1, cx))),
-                    )
-                    .child(Label::new(zoom_label).size(LabelSize::XSmall))
-                    .child(
-                        IconButton::new("ggo-tileset-zoom-in", IconName::Plus)
-                            .icon_size(IconSize::XSmall)
-                            .disabled(open.zoom >= MAX_ZOOM)
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1, cx))),
-                    ),
+                IconButton::new("ggo-tileset-eraser", IconName::Eraser)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Eraser)
+                    .tooltip(ui::Tooltip::text("Eraser (paints transparent)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Eraser, cx))),
+            )
+            .child(div().w_2())
+            .child(
+                IconButton::new("ggo-tileset-zoom-out", IconName::Dash)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(open.zoom <= MIN_ZOOM)
+                    .tooltip(ui::Tooltip::text("Zoom out"))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(-1, cx))),
+            )
+            .child(Label::new(zoom_label).size(LabelSize::XSmall))
+            .child(
+                IconButton::new("ggo-tileset-zoom-in", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(open.zoom >= MAX_ZOOM)
+                    .tooltip(ui::Tooltip::text("Zoom in"))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1, cx))),
+            )
+            .child(div().w_2())
+            .child(
+                Label::new("Cols")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                IconButton::new("ggo-tileset-cols-down", IconName::Dash)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(open.cols <= 1)
+                    .tooltip(ui::Tooltip::text("Narrower grid"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let ViewerState::Ready(open) = &this.state {
+                            let cols = open.cols;
+                            this.set_cols(cols.saturating_sub(1), cx);
+                        }
+                    })),
+            )
+            .child(Label::new(format!("{}", open.cols)).size(LabelSize::XSmall))
+            .child(
+                IconButton::new("ggo-tileset-cols-up", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(open.cols >= open.store.state().tile_count.max(1))
+                    .tooltip(ui::Tooltip::text("Wider grid"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let ViewerState::Ready(open) = &this.state {
+                            let cols = open.cols;
+                            this.set_cols(cols + 1, cx);
+                        }
+                    })),
+            )
+            .child(div().flex_1())
+            .child(
+                IconButton::new("ggo-tileset-undo", IconName::Undo)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Undo"))
+                    .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-redo", IconName::RotateCw)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Redo"))
+                    .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
+            )
+            .child(
+                Button::new("ggo-tileset-save", "Save")
+                    .disabled(!open.store.dirty())
+                    .tooltip(ui::Tooltip::text("Save (.til + .pal)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
             )
             .into_any_element()
     }
@@ -757,8 +852,8 @@ impl TilesetPanel {
             .into_any_element()
     }
 
-    /// The tooling column on the editor's right side: info, tools,
-    /// palette, and any save error.
+    /// The document column on the editor's right side: file info, the
+    /// palette editor, and any save error.
     fn render_tooling(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_tooling is only called in the Ready state");
@@ -770,7 +865,6 @@ impl TilesetPanel {
             .border_l_1()
             .border_color(cx.theme().colors().border)
             .child(self.render_info(cx))
-            .child(self.render_tools(cx))
             .child(self.render_palette(cx))
             .when_some(save_error, |this, e| {
                 this.child(
@@ -785,11 +879,17 @@ impl TilesetPanel {
     }
 
     fn render_ready(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        h_flex()
+        v_flex()
             .size_full()
-            .items_stretch()
-            .child(self.render_sheet(cx))
-            .child(self.render_tooling(cx))
+            .child(self.render_toolbar(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .child(self.render_sheet(cx))
+                    .child(self.render_tooling(cx)),
+            )
             .into_any_element()
     }
 
@@ -818,6 +918,10 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
+            .on_action(cx.listener(|this, _: &ScrollLeft, _window, cx| this.scroll_by(-1.0, 0.0, cx)))
+            .on_action(cx.listener(|this, _: &ScrollRight, _window, cx| this.scroll_by(1.0, 0.0, cx)))
+            .on_action(cx.listener(|this, _: &ScrollUp, _window, cx| this.scroll_by(0.0, -1.0, cx)))
+            .on_action(cx.listener(|this, _: &ScrollDown, _window, cx| this.scroll_by(0.0, 1.0, cx)))
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -833,6 +937,44 @@ impl Focusable for TilesetPanel {
 pub enum TilesetPanelEvent {}
 
 impl EventEmitter<TilesetPanelEvent> for TilesetPanel {}
+
+/// Paint 1px lines along every tile boundary of the zoomed sheet -- the
+/// editing-canvas orientation aid (`ggo_sprite_panel::paint_tile_grid`'s
+/// idiom, over the tileset's cols x rows).
+fn paint_tile_borders(
+    bounds: Bounds<Pixels>,
+    cols: usize,
+    rows: usize,
+    color: gpui::Hsla,
+    window: &mut Window,
+) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let line = px(1.);
+    for i in 0..=cols {
+        let x = (bounds.origin.x + bounds.size.width * (i as f32 / cols as f32))
+            .min(bounds.origin.x + bounds.size.width - line);
+        window.paint_quad(gpui::fill(
+            Bounds::new(
+                gpui::point(x, bounds.origin.y),
+                gpui::size(line, bounds.size.height),
+            ),
+            color,
+        ));
+    }
+    for i in 0..=rows {
+        let y = (bounds.origin.y + bounds.size.height * (i as f32 / rows as f32))
+            .min(bounds.origin.y + bounds.size.height - line);
+        window.paint_quad(gpui::fill(
+            Bounds::new(
+                gpui::point(bounds.origin.x, y),
+                gpui::size(bounds.size.width, line),
+            ),
+            color,
+        ));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1206,6 +1348,18 @@ mod tests {
                 "the edit is one undo step"
             );
 
+            // A run of edits to the SAME slot (slider drag, +/- mashing)
+            // coalesces: one undo spans the whole transition.
+            panel.set_palette_slot(1, 0x0100, cx);
+            panel.set_palette_slot(1, 0x0200, cx);
+            panel.set_palette_slot(1, 0x07E0, cx);
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().palette[1],
+                0xF800,
+                "one undo spans the whole slider run"
+            );
+
             panel.set_palette_slot(0, 0xFFFF, cx);
             assert_eq!(
                 ready(panel).store.state().palette[0],
@@ -1249,6 +1403,87 @@ mod tests {
             let open = ready(panel);
             assert!(open.save_error.is_some(), "a failed write must surface");
             assert!(open.store.dirty(), "and the document must stay dirty");
+        });
+    }
+
+
+    /// The grid-width setting: recomposes the sheet at the new column
+    /// count, clamps to `1..=tile_count`, and persists -- a fresh panel
+    /// on the same rel comes back with the stored cols AND zoom.
+    #[gpui::test]
+    async fn test_cols_setting_recomposes_clamps_and_persists(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(1, cx);
+            let open = ready(panel);
+            assert_eq!(open.cols, 1);
+            assert_eq!(
+                open.grid_size,
+                (TILE_PX as u32, (FIXTURE_TILES * TILE_PX) as u32),
+                "one column stacks the three tiles vertically"
+            );
+            let bytes = open.grid.as_bytes(0).unwrap();
+            assert_eq!(bytes.len(), FIXTURE_TILES * TILE_PIXELS * 4);
+            // Row 0 is now tile 0 alone: fully transparent.
+            assert!(
+                bytes[..TILE_PX * 4].chunks_exact(4).all(|p| p[3] == 0),
+                "the recomposed layout puts only tile 0 on row 0"
+            );
+
+            panel.set_cols(99, cx);
+            assert_eq!(ready(panel).cols, FIXTURE_TILES, "clamped to tile_count");
+            panel.set_cols(0, cx);
+            assert_eq!(ready(panel).cols, 1, "clamped to 1");
+
+            panel.set_cols(2, cx);
+            panel.zoom_by(3, cx);
+        });
+
+        // A fresh panel on the same rel restores the stored view settings.
+        let root = dir.path().to_path_buf();
+        let second = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = TilesetPanel::new(None, cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+        second.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("tiles/world.til", cx);
+        });
+        cx.executor().run_until_parked();
+        second.update(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.cols, 2, "cols came back from the sidecar");
+            assert_eq!(open.zoom, DEFAULT_ZOOM + 3, "zoom came back from the sidecar");
+        });
+    }
+
+    /// Arrow-key camera panning: each step moves the scroll offset one
+    /// tile at the current zoom, more negative as the view moves
+    /// right/down, and clamps at the zero edge.
+    #[gpui::test]
+    async fn test_arrow_scroll_steps_one_tile_and_clamps_at_origin(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let step = (TILE_PX * ready(panel).zoom) as f32;
+            panel.scroll_by(1.0, 0.0, cx);
+            panel.scroll_by(0.0, 2.0, cx);
+            let offset = ready(panel).scroll.offset();
+            assert_eq!(f32::from(offset.x), -step, "right = one tile negative x");
+            assert_eq!(f32::from(offset.y), -2.0 * step, "down twice = two tiles");
+
+            for _ in 0..10 {
+                panel.scroll_by(-1.0, -1.0, cx);
+            }
+            let offset = ready(panel).scroll.offset();
+            assert_eq!(f32::from(offset.x), 0.0, "clamped at the left edge");
+            assert_eq!(f32::from(offset.y), 0.0, "clamped at the top edge");
         });
     }
 

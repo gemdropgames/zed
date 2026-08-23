@@ -18,7 +18,10 @@ ggo-worldlib.workspace = true # GGO
 ggo_common.workspace = true
 gpui.workspace = true
 keymap_editor.workspace = true
+log.workspace = true
 project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 ui.workspace = true
 workspace.workspace = true
 
@@ -26,6 +29,5 @@ workspace.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
-serde_json.workspace = true
 tempfile.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

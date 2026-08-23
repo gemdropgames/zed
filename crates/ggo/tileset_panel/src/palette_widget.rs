@@ -11,9 +11,13 @@
 //! through `on_select` / `on_change` callbacks (the tileset editor turns
 //! `on_change` into an undoable `TilesetOp::SetPalette`).
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{App, Window, div, px, rgb, rgba};
+use gpui::{
+    App, Bounds, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Window, canvas, div, px, rgb,
+    rgba,
+};
 use ui::prelude::*;
 
 use ggo_worldlib::sprites::palette565::{PAL_SLOTS, Pal, slot_rgba};
@@ -54,6 +58,12 @@ pub fn with_g6(color: u16, value: i32) -> u16 {
 pub fn with_b5(color: u16, value: i32) -> u16 {
     let v = value.clamp(0, 0x1F) as u16;
     (color & !0x1F) | v
+}
+
+/// The channel value a click at horizontal fraction `frac` of the slider
+/// track means, rounded to the nearest step and clamped to `0..=max`.
+pub fn value_at_fraction(frac: f32, max: u16) -> i32 {
+    (frac.clamp(0.0, 1.0) * max as f32).round() as i32
 }
 
 // --------------------------------------------------------------- widget
@@ -105,19 +115,39 @@ impl SmallPaletteEditor {
         self
     }
 
-    /// One `[-] value [+]` stepper row for a channel of the selected
-    /// slot's color.
+    /// One `name [====|  ] [-] value [+]` row for a channel of the
+    /// selected slot's color: a click/drag-to-set slider track, then the
+    /// numeric value with fine-step buttons.
     fn channel_row(
         &self,
         name: &'static str,
         value: u16,
         max: u16,
         apply: fn(u16, i32) -> u16,
+        cx: &mut App,
     ) -> gpui::AnyElement {
         let slot = self.selected;
         let color = self.palette[slot];
         let on_change_minus = self.on_change.clone();
         let on_change_plus = self.on_change.clone();
+        let on_change_track = self.on_change.clone();
+        let on_change_drag = self.on_change.clone();
+        // Recorded fresh every frame by the canvas prepaint below;
+        // prepaint runs before this frame's mouse events dispatch, so the
+        // listeners always see the current track geometry (the same
+        // bounds-recording idiom as the sheet canvas, scoped per render
+        // because a RenderOnce widget owns no persistent state).
+        let track_bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
+        let bounds_for_prepaint = track_bounds.clone();
+        let bounds_for_down = track_bounds.clone();
+        let bounds_for_drag = track_bounds;
+        let value_from = move |pos_x: Pixels, bounds: &Bounds<Pixels>| {
+            let width = f32::from(bounds.size.width).max(1.0);
+            value_at_fraction(f32::from(pos_x - bounds.origin.x) / width, max)
+        };
+        let fill = cx.theme().colors().border_focused;
+        let track_bg = cx.theme().colors().element_background;
+        let frac = value as f32 / max as f32;
         h_flex()
             .gap_1()
             .items_center()
@@ -126,7 +156,58 @@ impl SmallPaletteEditor {
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
-            .child(div().flex_1())
+            .child(
+                div()
+                    .id(("ggo-pal-slider", slot * 8 + name.len()))
+                    .flex_1()
+                    .h(px(10.))
+                    .rounded_sm()
+                    .bg(track_bg)
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(frac))
+                            .rounded_sm()
+                            .bg(fill),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                *bounds_for_prepaint.borrow_mut() = Some(bounds);
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        move |event: &MouseDownEvent, window, cx| {
+                            if let (Some(handler), Some(bounds)) =
+                                (&on_change_track, *bounds_for_down.borrow())
+                            {
+                                let next = value_from(event.position.x, &bounds);
+                                handler(slot, apply(color, next), window, cx);
+                            }
+                        },
+                    )
+                    .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            return;
+                        }
+                        if let (Some(handler), Some(bounds)) =
+                            (&on_change_drag, *bounds_for_drag.borrow())
+                        {
+                            let next = value_from(event.position.x, &bounds);
+                            handler(slot, apply(color, next), window, cx);
+                        }
+                    }),
+            )
             .child(
                 IconButton::new(("ggo-pal-minus", slot * 8 + name.len()), IconName::Dash)
                     .icon_size(IconSize::XSmall)
@@ -226,9 +307,9 @@ impl RenderOnce for SmallPaletteEditor {
                                     .color(Color::Muted),
                             ),
                     )
-                    .child(self.channel_row("R", r5(color), 0x1F, with_r5))
-                    .child(self.channel_row("G", g6(color), 0x3F, with_g6))
-                    .child(self.channel_row("B", b5(color), 0x1F, with_b5))
+                    .child(self.channel_row("R", r5(color), 0x1F, with_r5, cx))
+                    .child(self.channel_row("G", g6(color), 0x3F, with_g6, cx))
+                    .child(self.channel_row("B", b5(color), 0x1F, with_b5, cx))
                 }
             })
     }
@@ -264,5 +345,16 @@ mod tests {
         assert_eq!(with_r5(0, 0x1F), 0xF800);
         assert_eq!(with_g6(0, 0x3F), 0x07E0);
         assert_eq!(with_b5(0, 0x1F), 0x001F);
+    }
+
+    /// The slider track math: endpoints land on 0 and max, the midpoint
+    /// rounds to the nearest step, and off-track fractions clamp.
+    #[test]
+    fn value_at_fraction_rounds_and_clamps() {
+        assert_eq!(value_at_fraction(0.0, 0x1F), 0);
+        assert_eq!(value_at_fraction(1.0, 0x1F), 0x1F);
+        assert_eq!(value_at_fraction(0.5, 0x3E), 0x1F);
+        assert_eq!(value_at_fraction(-0.4, 0x1F), 0);
+        assert_eq!(value_at_fraction(1.7, 0x3F), 0x3F);
     }
 }
