@@ -2243,6 +2243,58 @@ impl SpritePanel {
         );
     }
 
+    /// Duplicate the frame at sequence position `seq_pos` of clip
+    /// `clip_ix` in place: a copy lands right after it and the clip
+    /// range grows by one (the sequence cell's duplicate button).
+    fn duplicate_frame_in_clip(&mut self, clip_ix: usize, seq_pos: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(clip) = open.store.state().clips.get(clip_ix) else {
+            return;
+        };
+        let seq_len = clip.to.saturating_sub(clip.from) + 1;
+        if seq_pos >= seq_len {
+            return;
+        }
+        let frame_ix = clip.from + seq_pos;
+        self.insert_frame_in_clip(clip_ix, seq_pos + 1, frame_ix, cx);
+    }
+
+    /// Delete the frame at sequence position `seq_pos` of clip `clip_ix`
+    /// (the sequence cell's delete button). One doc op: the store remaps
+    /// every clip's range itself, dropping a clip whose sole frame died.
+    /// Refuses to drop the document's last frame, like
+    /// [`Self::delete_selected_frame`].
+    fn delete_frame_in_clip(&mut self, clip_ix: usize, seq_pos: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let state = open.store.state();
+        let len = state.frames.len();
+        let Some(clip) = state.clips.get(clip_ix) else {
+            return;
+        };
+        let seq_len = clip.to.saturating_sub(clip.from) + 1;
+        if seq_pos >= seq_len || len <= 1 {
+            return;
+        }
+        let at = clip.from + seq_pos;
+        if at >= len {
+            return;
+        }
+        let next = edits::selection_after_frame_delete(open.selected_frame, at, len);
+        let mut names = open.frame_names.clone();
+        names.resize(len, String::new());
+        if self.apply_doc(DocOp::FrameDelete { at }, cx)
+            && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.selected_frame = next;
+            names.remove(at);
+            open.frame_names = names;
+        }
+    }
+
     /// Set frame `ix`'s editor-only name and persist the sidecar right
     /// away -- names aren't doc state, so there is no dirty flag to defer
     /// the write behind.
@@ -3772,6 +3824,28 @@ impl SpritePanel {
                                 Label::new(format!("{duration_ms} ms"))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
+                            )
+                            .child(
+                                IconButton::new(
+                                    ("ggo-sprite-frame-dup", clip_ix * 1000 + seq_pos),
+                                    IconName::Copy,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(ui::Tooltip::text("Duplicate frame"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.duplicate_frame_in_clip(clip_ix, seq_pos, cx);
+                                })),
+                            )
+                            .child(
+                                IconButton::new(
+                                    ("ggo-sprite-frame-del", clip_ix * 1000 + seq_pos),
+                                    IconName::Trash,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(ui::Tooltip::text("Delete frame"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_frame_in_clip(clip_ix, seq_pos, cx);
+                                })),
                             )
                             .child(
                                 IconButton::new(
@@ -5441,6 +5515,59 @@ mod tests {
         });
     }
 
+
+
+    /// The per-frame duplicate/delete buttons on the clip sequence:
+    /// duplicate inserts a copy right after its frame (extending the
+    /// clip), delete removes the frame (the store remaps the clip; a
+    /// clip whose sole frame died vanishes), names follow both ways,
+    /// and stale clip indices are no-ops.
+    #[gpui::test]
+    async fn test_duplicate_and_delete_buttons_edit_the_clip_sequence(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.set_frame_name(1, "step".to_string(), cx);
+            // Fixture clip "walk" spans 1..=1: duplicate its only frame.
+            panel.duplicate_frame_in_clip(0, 0, cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(state.frames.len(), 3, "a copy was inserted");
+                assert_eq!(
+                    state.frames[2].map, state.frames[1].map,
+                    "the copy sits right after its source"
+                );
+                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 2));
+                assert_eq!(open.frame_names, vec!["", "step", "step"]);
+            }
+
+            // Delete the copy (sequence position 1 -> physical frame 2).
+            panel.delete_frame_in_clip(0, 1, cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(state.frames.len(), 2);
+                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 1));
+                assert_eq!(open.frame_names, vec!["", "step"]);
+            }
+
+            // Deleting the clip's sole frame drops the clip itself.
+            panel.delete_frame_in_clip(0, 0, cx);
+            {
+                let state = ready(panel).store.state();
+                assert_eq!(state.frames.len(), 1);
+                assert!(state.clips.is_empty(), "an empty clip vanishes");
+            }
+
+            // Stale indices: no-ops, not panics.
+            panel.duplicate_frame_in_clip(9, 0, cx);
+            panel.delete_frame_in_clip(9, 0, cx);
+            panel.delete_frame_in_clip(0, 0, cx);
+            assert_eq!(ready(panel).store.state().frames.len(), 1);
+        });
+    }
 
     /// The per-frame "..." settings popup: opening selects the frame
     /// (preview and editors agree), Escape's path and click-away close
