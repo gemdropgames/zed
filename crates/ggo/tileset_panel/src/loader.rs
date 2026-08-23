@@ -35,6 +35,9 @@ pub struct ViewMeta {
     pub zoom: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cols: Option<usize>,
+    /// Whether the tile-boundary lines draw; `None` = on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<bool>,
 }
 
 fn meta_path(root: &Path, rel: &str) -> std::path::PathBuf {
@@ -87,6 +90,8 @@ pub struct LoadedTileset {
     /// The sidecar's stored zoom, if any -- the panel clamps it to its
     /// own zoom bounds.
     pub zoom: Option<usize>,
+    /// The sidecar's stored tile-boundary-lines toggle.
+    pub lines: Option<bool>,
 }
 
 /// Compose the whole sheet into one BGRA image -- the load-time pass and
@@ -157,6 +162,7 @@ pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, Stri
         grid,
         grid_size,
         zoom: meta.zoom,
+        lines: meta.lines,
     })
 }
 

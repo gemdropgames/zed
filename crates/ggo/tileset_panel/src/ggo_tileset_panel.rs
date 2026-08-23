@@ -70,7 +70,13 @@ actions!(
         /// Copies the selected pixel region.
         CopySelection,
         /// Pastes the copied pixel region at the selection.
-        PasteSelection
+        PasteSelection,
+        /// Zooms the tileset view in one step.
+        ZoomIn,
+        /// Zooms the tileset view out one step.
+        ZoomOut,
+        /// Selects the whole sheet with the Select tool.
+        SelectWholeSheet
     ]
 );
 
@@ -88,6 +94,9 @@ const DEFAULT_ZOOM: usize = 4;
 
 /// The tooling column's width.
 const TOOLS_COL_PX: f32 = 280.0;
+
+/// The edge "+" bars' thickness.
+const EDGE_BAR_PX: f32 = 18.0;
 
 /// The tileset extension this editor claims from the file explorer.
 const TILESET_EXT: &str = "til";
@@ -225,6 +234,8 @@ struct OpenTileset {
     selection: Option<((usize, usize), (usize, usize))>,
     /// The copy buffer: `(w, h, indices)` row-major, sheet-space.
     clipboard: Option<(usize, usize, Vec<u8>)>,
+    /// Whether the tile-boundary lines draw over the sheet.
+    show_lines: bool,
 }
 
 impl OpenTileset {
@@ -249,6 +260,7 @@ impl OpenTileset {
             scroll: ScrollHandle::new(),
             selection: None,
             clipboard: None,
+            show_lines: loaded.lines.unwrap_or(true),
         }
     }
 
@@ -454,6 +466,7 @@ impl TilesetPanel {
         let meta = loader::ViewMeta {
             zoom: Some(open.zoom),
             cols: Some(open.cols),
+            lines: Some(open.show_lines),
         };
         if let Err(e) = loader::save_view_meta(root, &open.rel_path, &meta) {
             log::error!("GGO: failed to write view sidecar for {}: {e}", open.rel_path);
@@ -682,15 +695,59 @@ impl TilesetPanel {
         self.recompose_grid(cx);
     }
 
-    /// Append one blank tile to the sheet (the edge "+" cell) --
-    /// `TilesetOp::AppendTile`, one undo step.
-    fn append_tile(&mut self, cx: &mut Context<Self>) {
+    /// Insert a blank row at the sheet's top or bottom (the edge "+"
+    /// bars) -- one undo step; the store pads a partial last row first.
+    fn insert_row(&mut self, at_top: bool, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        let cols = open.cols;
         open.store
-            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::AppendTile);
+            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::InsertRow { cols, at_top });
         self.recompose_grid(cx);
+    }
+
+    /// Insert a blank column at the sheet's left or right (the edge "+"
+    /// bars) -- one undo step in the doc; the view's column count grows
+    /// with it (and persists). NOTE the asymmetry with undo: ctrl-z
+    /// restores the strip but the view keeps the wider cols, so the last
+    /// column's tiles rewrap -- doc state and view settings are separate
+    /// by design.
+    fn insert_column(&mut self, at_left: bool, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let cols = open.cols;
+        open.store
+            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::InsertColumn { cols, at_left });
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.cols = cols + 1;
+        }
+        self.recompose_grid(cx);
+        self.write_view_meta();
+    }
+
+    /// Toggle the tile-boundary lines (persisted per view).
+    fn toggle_lines(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.show_lines = !open.show_lines;
+            cx.notify();
+            self.write_view_meta();
+        }
+    }
+
+    /// Ctrl-A: equip the Select tool and select the whole sheet.
+    fn select_whole_sheet(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let (w, h) = open.grid_size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        open.tool = Tool::Select;
+        open.selection = Some(((0, 0), (w as usize - 1, h as usize - 1)));
+        cx.notify();
     }
 
     fn on_sheet_mouse_up(&mut self, cx: &mut Context<Self>) {
@@ -828,18 +885,10 @@ impl TilesetPanel {
         let (w, h) = open.zoomed_size();
         let bounds_cell = open.sheet_bounds.clone();
         let (cols, rows) = (open.cols, open.grid_size.1 as usize / TILE_PX);
-        let line_color = cx.theme().colors().border_variant;
+        let show_lines = open.show_lines;
         let accent = cx.theme().colors().border_focused;
         let zoom = open.zoom as f32;
         let selection = self.selection_rect();
-        // The edge "+" cell sits at the NEXT tile slot in grid flow --
-        // beside the last tile, or opening a fresh row when the last row
-        // is full (which is when the container needs the extra height).
-        let tile_count = open.store.state().tile_count;
-        let cell = TILE_PX as f32 * zoom;
-        let plus_x = (tile_count % cols) as f32 * cell;
-        let plus_y = (tile_count / cols) as f32 * cell;
-        let container_h = h.max(plus_y + cell);
         // `.top_0().left_0()` matters: an absolute child with auto insets
         // sits at its STATIC position -- after the in-flow img sibling --
         // so the recorded bounds would be shifted by exactly the image
@@ -849,7 +898,9 @@ impl TilesetPanel {
                 *bounds_cell.borrow_mut() = Some(bounds);
             },
             move |bounds, (), window, _cx| {
-                paint_tile_borders(bounds, cols, rows, line_color, window);
+                if show_lines {
+                    paint_tile_borders(bounds, cols, rows, window);
+                }
                 if let Some((x0, y0, x1, y1)) = selection {
                     let rect = Bounds::new(
                         gpui::point(
@@ -878,59 +929,97 @@ impl TilesetPanel {
             .track_scroll(&open.scroll)
             .child(
                 div().p_2().child(
-                    div()
-                        .relative()
-                        .w(px(w))
-                        .h(px(container_h))
+                    v_flex()
+                        .gap_1()
+                        .child(self.edge_bar("ggo-tileset-add-top", px(w), true, true, cx))
                         .child(
-                            div()
-                                .relative()
-                                .w(px(w))
-                                .h(px(h))
-                                .child(img(open.grid.clone()).nearest(true).w(px(w)).h(px(h)))
-                                .child(overlay)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                        // Take focus so undo/save bindings apply.
-                                        window.focus(&this.focus_handle, cx);
-                                        this.on_sheet_mouse_down(event.position, cx);
-                                    }),
+                            h_flex()
+                                .gap_1()
+                                .items_stretch()
+                                .child(self.edge_bar("ggo-tileset-add-left", px(h), false, true, cx))
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w(px(w))
+                                        .h(px(h))
+                                        .child(
+                                            img(open.grid.clone()).nearest(true).w(px(w)).h(px(h)),
+                                        )
+                                        .child(overlay)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, event: &MouseDownEvent, window, cx| {
+                                                    // Take focus so undo/save bindings apply.
+                                                    window.focus(&this.focus_handle, cx);
+                                                    this.on_sheet_mouse_down(event.position, cx);
+                                                },
+                                            ),
+                                        )
+                                        .on_mouse_move(cx.listener(
+                                            |this, event: &MouseMoveEvent, _, cx| {
+                                                this.on_sheet_mouse_move(event.position, cx);
+                                            },
+                                        ))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                this.on_sheet_mouse_up(cx);
+                                            }),
+                                        ),
                                 )
-                                .on_mouse_move(cx.listener(
-                                    |this, event: &MouseMoveEvent, _, cx| {
-                                        this.on_sheet_mouse_move(event.position, cx);
-                                    },
-                                ))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                        this.on_sheet_mouse_up(cx);
-                                    }),
-                                ),
+                                .child(self.edge_bar(
+                                    "ggo-tileset-add-right",
+                                    px(h),
+                                    false,
+                                    false,
+                                    cx,
+                                )),
                         )
-                        .child(
-                            div()
-                                .id("ggo-tileset-append")
-                                .absolute()
-                                .left(px(plus_x))
-                                .top(px(plus_y))
-                                .w(px(cell))
-                                .h(px(cell))
-                                .flex()
-                                .justify_center()
-                                .items_center()
-                                .border_1()
-                                .border_dashed()
-                                .rounded_sm()
-                                .border_color(cx.theme().colors().border_variant)
-                                .cursor_pointer()
-                                .tooltip(ui::Tooltip::text("Add tile"))
-                                .child(Label::new("+").size(LabelSize::Small).color(Color::Muted))
-                                .on_click(cx.listener(|this, _, _, cx| this.append_tile(cx))),
-                        ),
+                        .child(self.edge_bar("ggo-tileset-add-bottom", px(w), true, false, cx)),
                 ),
             )
+            .into_any_element()
+    }
+
+    /// One dashed "+" bar along a sheet edge: clicking it grows the grid
+    /// on that side (a row for the horizontal bars, a column for the
+    /// vertical ones).
+    fn edge_bar(
+        &self,
+        id: &'static str,
+        length: Pixels,
+        horizontal: bool,
+        at_start: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let tooltip = match (horizontal, at_start) {
+            (true, true) => "Add row above",
+            (true, false) => "Add row below",
+            (false, true) => "Add column left",
+            (false, false) => "Add column right",
+        };
+        div()
+            .id(id)
+            .flex()
+            .justify_center()
+            .items_center()
+            .border_1()
+            .border_dashed()
+            .rounded_sm()
+            .border_color(cx.theme().colors().border_variant)
+            .cursor_pointer()
+            .when(horizontal, |el| el.w(length).h(px(EDGE_BAR_PX)))
+            .when(!horizontal, |el| el.w(px(EDGE_BAR_PX)).h(length))
+            .tooltip(ui::Tooltip::text(tooltip))
+            .child(Label::new("+").size(LabelSize::Small).color(Color::Muted))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if horizontal {
+                    this.insert_row(at_start, cx);
+                } else {
+                    this.insert_column(at_start, cx);
+                }
+            }))
             .into_any_element()
     }
 
@@ -1017,6 +1106,13 @@ impl TilesetPanel {
                     .disabled(open.zoom >= MAX_ZOOM)
                     .tooltip(ui::Tooltip::text("Zoom in"))
                     .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1, cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-lines", IconName::Hash)
+                    .icon_size(IconSize::XSmall)
+                    .toggle_state(open.show_lines)
+                    .tooltip(ui::Tooltip::text("Toggle tile boundary lines"))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_lines(cx))),
             )
             .child(div().w_2())
             .child(
@@ -1173,6 +1269,11 @@ impl Render for TilesetPanel {
             .on_action(
                 cx.listener(|this, _: &PasteSelection, _window, cx| this.paste_clipboard(cx)),
             )
+            .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.zoom_by(1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.zoom_by(-1, cx)))
+            .on_action(
+                cx.listener(|this, _: &SelectWholeSheet, _window, cx| this.select_whole_sheet(cx)),
+            )
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -1189,40 +1290,49 @@ pub enum TilesetPanelEvent {}
 
 impl EventEmitter<TilesetPanelEvent> for TilesetPanel {}
 
-/// Paint 1px lines along every tile boundary of the zoomed sheet -- the
-/// editing-canvas orientation aid (`ggo_sprite_panel::paint_tile_grid`'s
-/// idiom, over the tileset's cols x rows).
-fn paint_tile_borders(
-    bounds: Bounds<Pixels>,
-    cols: usize,
-    rows: usize,
-    color: gpui::Hsla,
-    window: &mut Window,
-) {
+/// Paint tile-boundary lines over the zoomed sheet: a 1px white line
+/// centered in a 3px black one, so the boundary reads against any tile
+/// art (`ggo_sprite_panel::paint_tile_grid`'s idiom, thickened).
+fn paint_tile_borders(bounds: Bounds<Pixels>, cols: usize, rows: usize, window: &mut Window) {
     if cols == 0 || rows == 0 {
         return;
     }
-    let line = px(1.);
+    let thick = px(3.);
+    let thin = px(1.);
     for i in 0..=cols {
         let x = (bounds.origin.x + bounds.size.width * (i as f32 / cols as f32))
-            .min(bounds.origin.x + bounds.size.width - line);
+            .min(bounds.origin.x + bounds.size.width - thin);
+        window.paint_quad(gpui::fill(
+            Bounds::new(
+                gpui::point((x - thin).max(bounds.origin.x), bounds.origin.y),
+                gpui::size(thick, bounds.size.height),
+            ),
+            gpui::black(),
+        ));
         window.paint_quad(gpui::fill(
             Bounds::new(
                 gpui::point(x, bounds.origin.y),
-                gpui::size(line, bounds.size.height),
+                gpui::size(thin, bounds.size.height),
             ),
-            color,
+            gpui::white(),
         ));
     }
     for i in 0..=rows {
         let y = (bounds.origin.y + bounds.size.height * (i as f32 / rows as f32))
-            .min(bounds.origin.y + bounds.size.height - line);
+            .min(bounds.origin.y + bounds.size.height - thin);
+        window.paint_quad(gpui::fill(
+            Bounds::new(
+                gpui::point(bounds.origin.x, (y - thin).max(bounds.origin.y)),
+                gpui::size(bounds.size.width, thick),
+            ),
+            gpui::black(),
+        ));
         window.paint_quad(gpui::fill(
             Bounds::new(
                 gpui::point(bounds.origin.x, y),
-                gpui::size(bounds.size.width, line),
+                gpui::size(bounds.size.width, thin),
             ),
-            color,
+            gpui::white(),
         ));
     }
 }
@@ -1842,38 +1952,110 @@ mod tests {
         });
     }
 
-    /// The edge "+" cell: appending grows the sheet by one blank tile
-    /// (grid size follows, including the fresh-row case) and undoes as
-    /// one step.
+    /// The edge "+" bars: rows grow the sheet top/bottom, columns grow
+    /// it left/right (bumping the view's cols), each as one undo step.
     #[gpui::test]
-    async fn test_append_tile_grows_the_sheet_and_undoes(cx: &mut TestAppContext) {
+    async fn test_edge_bars_grow_the_grid_on_each_side(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            // Fixture: 3 tiles at 3 cols -- the next slot opens row 2.
-            panel.append_tile(cx);
+            // Fixture: 3 tiles at 3 cols. Bottom row first.
+            panel.insert_row(false, cx);
+            {
+                let open = ready(panel);
+                assert_eq!(open.store.state().tile_count, 6);
+                assert_eq!(
+                    open.grid_size,
+                    ((3 * TILE_PX) as u32, (2 * TILE_PX) as u32),
+                    "a second row appeared"
+                );
+            }
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().tile_count, FIXTURE_TILES);
+
+            // Top row: tile 0's red neighbors shift down one row.
+            panel.insert_row(true, cx);
+            {
+                let state = ready(panel).store.state();
+                assert_eq!(state.tile_count, 6);
+                assert_eq!(state.indices[3 * TILE_PIXELS], 0, "row 0 is blank");
+                assert_eq!(
+                    state.indices[4 * TILE_PIXELS],
+                    1,
+                    "old tile 1 now sits in row 1"
+                );
+            }
+            panel.undo_impl(cx);
+
+            // Right column: view cols follows the wider grid.
+            panel.insert_column(false, cx);
             {
                 let open = ready(panel);
                 let state = open.store.state();
-                assert_eq!(state.tile_count, FIXTURE_TILES + 1);
-                assert!(state.dirty);
+                assert_eq!(open.cols, 4, "the view widened with the sheet");
+                assert_eq!(state.tile_count, 4);
+                assert_eq!(state.indices[3 * TILE_PIXELS], 0, "the new column is blank");
                 assert_eq!(
                     open.grid_size,
-                    ((FIXTURE_TILES * TILE_PX) as u32, (2 * TILE_PX) as u32),
-                    "the composed grid grew a second row"
+                    ((4 * TILE_PX) as u32, TILE_PX as u32)
                 );
-                let bytes = open.grid.as_bytes(0).unwrap();
-                assert_eq!(bytes.len(), FIXTURE_TILES * TILE_PX * 2 * TILE_PX * 4);
             }
 
-            panel.undo_impl(cx);
+            // Left column on the widened grid.
+            panel.insert_column(true, cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(open.cols, 5);
+                assert_eq!(state.tile_count, 5);
+                assert_eq!(state.indices[0], 0, "slot 0 is the new blank column");
+                assert_eq!(state.indices[TILE_PIXELS], 0, "old tile 0 was blank too");
+                assert_eq!(state.indices[2 * TILE_PIXELS], 1, "old tile 1 shifted right");
+            }
+        });
+    }
+
+    /// Ctrl-A equips the Select tool and selects the whole sheet; the
+    /// lines toggle flips and persists to the view sidecar.
+    #[gpui::test]
+    async fn test_select_all_and_lines_toggle(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_whole_sheet(cx);
             let open = ready(panel);
-            assert_eq!(open.store.state().tile_count, FIXTURE_TILES);
+            assert_eq!(open.tool, Tool::Select);
             assert_eq!(
-                open.grid_size,
-                ((FIXTURE_TILES * TILE_PX) as u32, TILE_PX as u32),
-                "undo shrinks the grid back"
+                panel.selection_rect(),
+                Some((0, 0, FIXTURE_TILES * TILE_PX - 1, TILE_PX - 1)),
+                "the whole sheet is selected"
+            );
+
+            assert!(ready(panel).show_lines, "lines default on");
+            panel.toggle_lines(cx);
+            assert!(!ready(panel).show_lines);
+        });
+
+        // A fresh panel restores the stored toggle.
+        let root = dir.path().to_path_buf();
+        let second = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = TilesetPanel::new(None, cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+        second.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("tiles/world.til", cx);
+        });
+        cx.executor().run_until_parked();
+        second.update(cx, |panel, _| {
+            assert!(
+                !ready(panel).show_lines,
+                "the lines toggle came back from the sidecar"
             );
         });
     }
