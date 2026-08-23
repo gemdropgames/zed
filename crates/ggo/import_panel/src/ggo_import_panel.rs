@@ -98,7 +98,6 @@ use ui::{Checkbox, ToggleState, Tooltip};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
-use ggo_tileset_panel::TilesetPanel;
 use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, join_dest_path, slice_to_tiles,
     source_rel_if_in_project, sprite_import, uniform_rects,
@@ -1079,9 +1078,8 @@ impl ImportPanel {
             if let Some((abs, rel)) = source {
                 Self::offer_source_delete(&this, abs, rel, cx).await;
             }
-            // Show what was just made. A missing tileset panel is a no-op
-            // (`open_in_panel` returns false), same graceful degradation
-            // every other GGO handoff makes.
+            // Show what was just made -- both formats open as center-pane
+            // editor tabs now.
             if let (Some(workspace), Some(rel)) = (workspace, imported.worktree_rel) {
                 let sprite = imported.sprite;
                 // Same reason as `offer_source_delete`'s: route through the
@@ -1093,14 +1091,7 @@ impl ImportPanel {
                             if sprite {
                                 ggo_sprite_panel::open_sprite_item(workspace, rel, window, cx);
                             } else {
-                                ggo_common::open_in_panel(
-                                    workspace,
-                                    window,
-                                    cx,
-                                    move |panel: &mut TilesetPanel, window, cx| {
-                                        panel.open_rel_path(&rel, window, cx)
-                                    },
-                                );
+                                ggo_tileset_panel::open_tileset_item(workspace, rel, window, cx);
                             }
                         })
                         .ok();
@@ -3402,19 +3393,18 @@ mod tests {
         cx.simulate_prompt_answer("Cancel"); // keep the source
         cx.run_until_parked();
 
-        let tileset = workspace
-            .read_with(cx, |workspace, cx| workspace.panel::<TilesetPanel>(cx))
-            .expect("the tileset panel is docked");
-        assert_eq!(
-            tileset.read_with(cx, |tileset, _| tileset
-                .open_rel_path_now()
-                .map(str::to_string)),
-            Some("assets/art/hero.til".to_string()),
-            "the handoff uses the WORKTREE rel, not the asset rel -- the asset \
-             rel `art/hero.til` names no file in the worktree"
-        );
-        workspace.read_with(cx, |workspace, cx| {
-            assert!(workspace.right_dock().read(cx).is_open());
+        let rels: Vec<_> = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_tileset_panel::TilesetEditorItem>(cx)
+                .map(|item| item.read(cx).rel().to_string())
+                .collect()
         });
+        assert_eq!(
+            rels,
+            vec!["assets/art/hero.til".to_string()],
+            "the handoff opens a center editor tab with the WORKTREE rel, not \
+             the asset rel -- the asset rel `art/hero.til` names no file in \
+             the worktree"
+        );
     }
 }

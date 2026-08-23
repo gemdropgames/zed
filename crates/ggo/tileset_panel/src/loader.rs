@@ -28,6 +28,9 @@ pub const GRID_COLS_FALLBACK: usize = 8;
 /// Everything the panel needs to enter its Ready state, assembled
 /// entirely off the UI thread.
 pub struct LoadedTileset {
+    /// The unpacked per-pixel palette indices -- the editor seeds its
+    /// `TilesetDocStore` with these.
+    pub indices: Vec<u8>,
     pub tile_count: usize,
     /// Columns the grid was composed at ([`grid_cols`]).
     pub cols: usize,
@@ -37,16 +40,29 @@ pub struct LoadedTileset {
     /// UI, since the colors on screen then aren't the asset's own.
     pub missing_pal: bool,
     /// The `.pal` rel worldlib derived from the `.til` rel (shown next to
-    /// the source path; this panel never writes it).
+    /// the source path; saves write it back alongside the `.til`).
     pub pal_path: String,
-    /// The whole tile sheet as ONE composed BGRA image. Built once at
-    /// load: nothing in this panel mutates the tileset, so there is no
-    /// invalidation point at all (contrast `ggo_sprite_panel`'s
-    /// rebuild-after-every-op).
+    /// The whole tile sheet as ONE composed BGRA image. Rebuilt by the
+    /// panel via [`compose_grid`] after every doc op.
     pub grid: Arc<RenderImage>,
     /// `grid`'s pixel size, kept alongside it so the zoom math doesn't
     /// have to go back through `RenderImage::size`.
     pub grid_size: (u32, u32),
+}
+
+/// Compose the whole sheet into one BGRA image -- the load-time pass and
+/// the after-every-op rebuild share this. `None` only for dimensions
+/// gpui can't build an image from (never for a well-formed doc).
+pub fn compose_grid(
+    indices: &[u8],
+    tile_count: usize,
+    cols: usize,
+    palette: &Pal,
+) -> Option<Arc<RenderImage>> {
+    let (buf, ..) = compose_tile_grid(indices, tile_count, cols);
+    let rgba = indices_to_rgba(&buf, palette);
+    let (w, h) = grid_pixel_size(tile_count, cols);
+    to_render_image(&rgba, w, h)
 }
 
 /// How many columns to lay a `tile_count`-tile sheet out in.
@@ -98,24 +114,23 @@ pub fn swatch_rgba(palette: &Pal, slot: usize) -> [u8; 4] {
 pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, String> {
     let opened = io::open_tileset(project_dir, rel).map_err(|e| e.to_string())?;
     let cols = grid_cols(opened.tile_count);
-    let (buf, ..) = compose_tile_grid(&opened.indices, opened.tile_count, cols);
-    let rgba = indices_to_rgba(&buf, &opened.palette);
     // Size comes from [`grid_pixel_size`] rather than `compose_tile_grid`'s
     // own returned `(w, h)` so the panel's geometry fn is the ONE definition
     // of the grid's dimensions (the two agreeing is pinned by
     // `grid_pixel_size_matches_the_composed_buffer`; a drift would fail here
     // as a dimension/length mismatch, not as a silently skewed image).
-    let (w, h) = grid_pixel_size(opened.tile_count, cols);
-    let grid = to_render_image(&rgba, w, h)
+    let grid = compose_grid(&opened.indices, opened.tile_count, cols, &opened.palette)
         .ok_or_else(|| "composed tile grid had invalid dimensions".to_string())?;
+    let grid_size = grid_pixel_size(opened.tile_count, cols);
     Ok(LoadedTileset {
+        indices: opened.indices,
         tile_count: opened.tile_count,
         cols,
         palette: opened.palette,
         missing_pal: opened.missing_pal,
         pal_path: opened.pal_path,
         grid,
-        grid_size: (w, h),
+        grid_size,
     })
 }
 

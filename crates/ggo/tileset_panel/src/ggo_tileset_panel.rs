@@ -1,140 +1,122 @@
-//! GGO Tileset panel (F4 task X2): a READ-ONLY viewer for a `.til` tile
-//! sheet -- the composed tile grid, the tile count, the 16-slot palette
-//! the sheet is drawn through, and the source `.til`/`.pal` rels.
+//! GGO Tileset editor: a center-pane tab per `.til` (mirroring
+//! `ggo_sprite_panel`'s architecture) with the composed tile sheet as the
+//! editing canvas and ALL tooling -- pencil/eraser, the 16-slot palette
+//! the sheet is drawn through, zoom, undo/redo/save -- in a column on the
+//! panel's right side.
 //!
-//! Deliberately read-only. worldlib exposes a full editing surface for
-//! tilesets (`tileset_doc::TilesetDocStore` + `TilesetOp::Paint`/`Fill`/
-//! `SetPalette`/... and `io::save_tileset`), and NONE of it is wired up
-//! here: no store, no ops, no save, no dirty state. That is a product
-//! decision, not an oversight -- pixel authoring was scoped out of the
-//! migration entirely. This comment used to say "pixel editing stays in
-//! ggo-ide for now"; ggo-ide was deleted in ggo `281fd557` (F5.5), so there
-//! is no "for now" and no fallback -- pixel editing happens in an external
-//! editor plus the `.png` import path (`ggo_import_panel`).
-//! The direct consequence for this module: there is nothing this panel
-//! can lose, so unlike `ggo_world_panel`/`ggo_sprite_panel` it has no
-//! `Panel::prepare_to_close` override and never calls
-//! `ggo_common::prepare_to_close_dirty`. If a `TilesetOp` is ever applied
-//! from this panel, BOTH must come back with it.
+//! Editing goes through worldlib's op surface end to end:
+//! `tileset_doc::TilesetDocStore` + `TilesetOp::Paint`, saved by
+//! `io::save_tileset` (which writes the `.til` and its companion `.pal`
+//! in one call). The eraser is `Paint` with color 0 -- palette slot 0 IS
+//! the transparent index (PPU contract §1), so there is no separate
+//! erase op to invent. Dirty state reaches the workspace through
+//! [`tileset_item::TilesetEditorItem`]'s `Item::is_dirty`/`save`, which
+//! is what puts the dot on the tab and routes Ctrl-S/close prompts.
 //!
-//! Which tileset is open is driven ENTIRELY by the file explorer (F4 X1):
-//! clicking a `.til` there routes here through [`intercept_tileset_open`];
-//! the panel has no picker of its own.
+//! Which tileset is open is driven ENTIRELY by the file explorer:
+//! clicking a `.til` there routes here through [`intercept_tileset_open`],
+//! one tab per file ([`open_tileset_item`]); the panel has no picker of
+//! its own.
 //!
-//! Structural mirror of `ggo_charts_panel`/`ggo_sprite_panel`: `Panel`
-//! impl, `ToggleFocus`, `observe_new` registration into every new
-//! workspace, a `KeymapEventChannel` observer scaffold, and off-thread
-//! loading behind a load-generation staleness guard. `loader` owns
-//! everything off the UI thread (the `.til` open, the grid compose) plus
-//! the pure grid geometry; this module owns the panel entity and the gpui
-//! glue.
+//! Structural mirror of `ggo_sprite_panel`: the panel entity keeps ALL
+//! document logic and `tileset_item` only adapts it to the workspace's
+//! tab machinery; `loader` owns everything off the UI thread (the `.til`
+//! open, the grid compose) plus the pure grid geometry.
 
 mod loader;
+mod tileset_item;
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    Action, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render,
+    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage,
     Styled, Task, WeakEntity, Window, actions, div, img, px, rgb, rgba,
 };
 use project::ProjectPath;
 use ui::prelude::*;
 use workspace::Workspace;
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 
+use ggo_worldlib::sprites::io::save_tileset;
 use ggo_worldlib::sprites::palette565::PAL_SLOTS;
+use ggo_worldlib::sprites::tileset_doc::{TILE_PX, TilesetDocStore, TilesetOp};
 
 use loader::LoadedTileset;
+pub use tileset_item::TilesetEditorItem;
 
 actions!(
     ggo_tileset,
     [
-        /// Toggles focus on the GGO tileset panel.
-        ToggleFocus
+        /// Undoes the last tileset edit.
+        Undo,
+        /// Redoes the last undone tileset edit.
+        Redo,
+        /// Saves the tileset (.til + .pal).
+        Save
     ]
 );
 
-const GGO_TILESET_PANEL_KEY: &str = "GGOTilesetPanel";
-
-/// The panel's key-dispatch context identifier. No bindings are scoped to
-/// it yet (see [`bind_panel_keys`]) -- zoom is button-only so far -- but
-/// it exists so a later keyboard affordance lands in a context without
-/// touching this module's `init`/`Render` wiring.
+/// The panel's key-dispatch context identifier -- undo/redo/save bind
+/// here, scoped so they only fire while the editor has focus.
 const KEY_CONTEXT: &str = "GgoTilesetPanel";
 
-/// Fixed default width until the panel grows real settings persistence
-/// (same call every other GGO panel made at this stage).
-const DEFAULT_WIDTH: Pixels = px(360.);
-
-/// Integer zoom bounds for the grid view. Integer only: the sheet is
+/// Integer zoom bounds for the sheet canvas. Integer only: the sheet is
 /// pixel art, and a non-integer scale would resample 16x16 tiles into
-/// blur. 1x is unreadably small on a HiDPI panel, so the default is 2x.
+/// blur. 1x is unreadably small on a HiDPI display; pixel editing wants
+/// room, so the default is 4x.
 const MIN_ZOOM: usize = 1;
-const MAX_ZOOM: usize = 8;
-const DEFAULT_ZOOM: usize = 2;
+const MAX_ZOOM: usize = 16;
+const DEFAULT_ZOOM: usize = 4;
 
 /// Palette swatch box (px, square).
-const SWATCH_PX: f32 = 16.0;
+const SWATCH_PX: f32 = 18.0;
 
-/// The tileset extension this panel claims from the file explorer.
+/// The tooling column's width.
+const TOOLS_COL_PX: f32 = 280.0;
+
+/// The tileset extension this editor claims from the file explorer.
 const TILESET_EXT: &str = "til";
-
-/// Empty-state text. The panel has no picker of its own by design (F4 X1):
-/// tilesets arrive by clicking a `.til` in the project panel.
-const EMPTY_MESSAGE: &str = "Open a .til file from the project panel";
 
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
     // Same rule as every other GGO panel's `init`: `zed::reload_keymaps`
     // clears and rebuilds ALL key bindings on every keymap/settings change
-    // (including once at startup), and keymap assets are upstream files
-    // this fork doesn't edit. Re-running `bind_panel_keys` on
-    // `KeymapEventChannel` keeps the panel's bindings alive across
-    // reloads -- required scaffolding for any panel with keybinds, kept
-    // now rather than retrofitted when the first one lands.
+    // (including once at startup), so re-running `bind_panel_keys` on
+    // `KeymapEventChannel` keeps the editor's bindings alive across
+    // reloads.
     cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
         .detach();
 
-    // Explorer-driven routing: clicking a `.til` in the project panel loads
-    // it HERE instead of opening a (binary, unreadable) editor tab. This is
-    // the panel's only way in -- there is no in-panel file picker.
+    // Explorer-driven routing: clicking a `.til` in the project panel opens
+    // the tileset editor tab instead of a (binary, unreadable) text buffer.
     workspace::register_path_open_interceptor(cx, intercept_tileset_open);
-
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(window) = window else {
-            return;
-        };
-
-        let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| TilesetPanel::new(Some(weak_workspace), cx));
-        workspace.add_panel(panel, window, cx);
-
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<TilesetPanel>(window, cx);
-        });
-    })
-    .detach();
 }
 
-/// No panel-specific keybinds exist yet: the viewer's only interaction is
-/// the zoom pair, both clickable. Kept as its own fn (rather than inlined
-/// into `init`) so it matches the other GGO panels' shape exactly: `init`
-/// calls it once at startup AND the `KeymapEventChannel` observer calls it
-/// again on every reload.
 fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([]);
+    // Ctrl-z/ctrl-s need no `not_editing` guard: the editor hosts no
+    // field editors, so nothing deeper ever shadows these.
+    cx.bind_keys([
+        KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
+    ]);
 }
 
-/// `workspace::PathOpenInterceptor` for `*.til`: claim the path, open the
-/// panel, and load it. Declines (so the normal open path runs) for any other
-/// file, for a path outside the primary worktree, and when no panel is
-/// docked.
+/// `workspace::PathOpenInterceptor` for `*.til`: claim the path and open
+/// (or focus) its center-pane editor tab. Declines (so the normal open
+/// path runs) for any other file and for a path outside the primary
+/// worktree.
 ///
 /// Note the extension split with `ggo_sprite_panel`: a sprite's `.til`
 /// is its tile POOL and is opened through the `.spr` that names it, so
-/// clicking the `.til` itself lands here (the sheet, read-only) rather than
-/// in the sprite editor. Both interceptors key off disjoint extensions, so
-/// registration order between them doesn't matter.
+/// clicking the `.til` itself lands here (the sheet editor) rather than
+/// in the sprite editor. Both interceptors key off disjoint extensions,
+/// so registration order between them doesn't matter.
 fn intercept_tileset_open(
     workspace: &mut Workspace,
     path: &ProjectPath,
@@ -151,42 +133,104 @@ fn intercept_tileset_open(
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return false;
     };
-    ggo_common::open_in_panel(
-        workspace,
-        window,
-        cx,
-        move |panel: &mut TilesetPanel, window, cx| panel.open_rel_path(&rel, window, cx),
-    )
+    open_tileset_item(workspace, rel, window, cx);
+    true
+}
+
+/// Open (or focus) the center-pane tileset tab for worktree-relative
+/// `rel` -- one item per file, activate on re-open. Public: the import
+/// panel's post-import hand-off lands here.
+pub fn open_tileset_item(
+    workspace: &mut Workspace,
+    rel: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace
+        .items_of_type::<TilesetEditorItem>(cx)
+        .find(|item| item.read(cx).rel() == rel);
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return;
+    }
+    let weak = workspace.weak_handle();
+    let item = cx.new(|cx| TilesetEditorItem::new(rel, weak, window, cx));
+    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
 }
 
 // ------------------------------------------------------------- view state
 
-/// The open tileset: worldlib's snapshot plus the view state (zoom) that
-/// must survive a re-click on the already-open file.
+/// The two painting tools. The eraser is not its own op: it paints
+/// palette index 0, the transparent slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tool {
+    Pencil,
+    Eraser,
+}
+
+/// The open tileset: worldlib's doc store plus the view state that must
+/// survive a re-click on the already-open file.
 struct OpenTileset {
     rel_path: String,
-    loaded: LoadedTileset,
+    pal_path: String,
+    missing_pal: bool,
+    cols: usize,
+    store: TilesetDocStore,
+    /// The composed sheet, rebuilt after every doc op
+    /// ([`TilesetPanel::recompose_grid`]).
+    grid: Arc<RenderImage>,
+    grid_size: (u32, u32),
     zoom: usize,
+    tool: Tool,
+    /// The selected palette slot the pencil paints with.
+    slot: usize,
+    save_error: Option<String>,
+    /// The sheet image's on-screen bounds, recorded at prepaint by the
+    /// canvas overlay -- the same idiom as `ggo_sprite_panel`'s
+    /// `preview_bounds` (mouse positions are window-absolute, so pixel
+    /// hit-testing needs them).
+    sheet_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// True between mouse-down on the sheet and mouse-up anywhere --
+    /// drag-painting is live.
+    painting: bool,
 }
 
 impl OpenTileset {
     fn new(rel_path: String, loaded: LoadedTileset) -> Self {
         Self {
             rel_path,
-            loaded,
+            pal_path: loaded.pal_path,
+            missing_pal: loaded.missing_pal,
+            cols: loaded.cols,
+            store: TilesetDocStore::new(loaded.indices, loaded.tile_count, loaded.palette),
+            grid: loaded.grid,
+            grid_size: loaded.grid_size,
             zoom: DEFAULT_ZOOM,
+            tool: Tool::Pencil,
+            slot: 1,
+            save_error: None,
+            sheet_bounds: Rc::new(RefCell::new(None)),
+            painting: false,
         }
     }
 
-    /// The grid's on-screen size at the current zoom.
+    /// The sheet's on-screen size at the current zoom.
     fn zoomed_size(&self) -> (f32, f32) {
-        let (w, h) = self.loaded.grid_size;
+        let (w, h) = self.grid_size;
         let z = self.zoom as f32;
         (w as f32 * z, h as f32 * z)
     }
+
+    /// The color the current tool paints with.
+    fn paint_color(&self) -> u8 {
+        match self.tool {
+            Tool::Pencil => self.slot as u8,
+            Tool::Eraser => 0,
+        }
+    }
 }
 
-enum ViewerState {
+pub(crate) enum ViewerState {
     /// Nothing opened yet.
     Empty,
     Loading {
@@ -198,12 +242,11 @@ enum ViewerState {
 
 pub struct TilesetPanel {
     focus_handle: FocusHandle,
-    position: DockPosition,
     workspace: Option<WeakEntity<Workspace>>,
     /// Test hook: bypass workspace worktree discovery.
-    root_override: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-    state: ViewerState,
+    pub(crate) root_override: Option<PathBuf>,
+    pub(crate) project_root: Option<PathBuf>,
+    pub(crate) state: ViewerState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
 }
@@ -212,7 +255,6 @@ impl TilesetPanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            position: DockPosition::Right,
             workspace,
             root_override: None,
             project_root: None,
@@ -222,10 +264,16 @@ impl TilesetPanel {
         }
     }
 
+    /// Whether the open document holds unsaved edits -- the item's
+    /// `is_dirty` source.
+    pub(crate) fn dirty(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.store.dirty())
+    }
+
     /// Re-discover the project root (the workspace's first visible
     /// worktree). MUST NOT run while the workspace itself is mid-update
-    /// (it reads the workspace entity) -- see the deferral in `set_active`
-    /// and in [`Self::open_rel_path`].
+    /// (it reads the workspace entity) -- see the deferral in
+    /// [`Self::open_rel_path`].
     fn refresh_root(&mut self, cx: &mut Context<Self>) {
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
@@ -236,25 +284,16 @@ impl TilesetPanel {
         cx.notify();
     }
 
-    /// Load the project-relative `.til` path `rel`. This is the panel's
-    /// entry point from the file explorer ([`intercept_tileset_open`]);
-    /// there is no in-panel picker.
+    /// Load the project-relative `.til` path `rel`. This is the entry
+    /// point from the item wrapper; there is no in-panel picker.
     ///
-    /// No unsaved-document guard, unlike the world/sprite panels: this
-    /// viewer holds no edits (see the module doc), so there is nothing a
-    /// switch could discard.
-    ///
-    /// The load runs on a spawned task, deliberately: the interceptor calls
-    /// this from INSIDE the workspace's own update, and [`Self::refresh_root`]
-    /// has to read that same workspace entity.
+    /// The load runs on a spawned task, deliberately: the item is
+    /// constructed from INSIDE the workspace's own update, and
+    /// [`Self::refresh_root`] has to read that same workspace entity.
     pub fn open_rel_path(&mut self, rel: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        // Clicking the file that is ALREADY open is how you bring the panel
-        // back into focus, and upstream's semantics for that click on a tab
-        // are "activate the existing item", not "reload it". The interceptor
-        // has already revealed and focused the dock by the time we get here,
-        // so there is nothing left to do -- and reloading would drop the
-        // view state (zoom, and the scroll position gpui keeps per element
-        // id) for no reason.
+        // Clicking the file that is ALREADY open focuses the existing tab
+        // upstream of this call; reloading here would drop the view state
+        // (zoom, tool, undo stack) for no reason.
         if let ViewerState::Ready(open) = &self.state
             && open.rel_path == rel
         {
@@ -305,15 +344,9 @@ impl TilesetPanel {
         }));
     }
 
-    /// The `.til` currently open, as the worktree-relative path it was opened
-    /// WITH -- `None` unless the viewer is Ready.
-    ///
-    /// Public purely as an observation point for the panels that hand a
-    /// tileset OFF to this one: `ggo_import_panel` opens the sheet it just
-    /// wrote here, and the rel it passes has to be the worktree-relative one
-    /// (an asset-root-relative rel names no file in the worktree -- the F4
-    /// `ggo-sprfix` distinction). Without this, that hand-off could only be
-    /// asserted from inside this crate, which is not where the bug would be.
+    /// The `.til` currently open, as the worktree-relative path it was
+    /// opened WITH -- `None` unless the editor is Ready. Public as the
+    /// observation point for the import panel's hand-off assertions.
     pub fn open_rel_path_now(&self) -> Option<&str> {
         match &self.state {
             ViewerState::Ready(open) => Some(open.rel_path.as_str()),
@@ -334,6 +367,175 @@ impl TilesetPanel {
         }
     }
 
+    // ------------------------------------------------------------ editing
+
+    /// Map a window-absolute mouse position to the sheet pixel under it:
+    /// `(tile, x, y)` in doc coordinates. `None` outside the sheet (the
+    /// composed grid floors at one row, so its trailing pad cells past
+    /// `tile_count` must be rejected here, not painted).
+    fn pixel_at(&self, pos: Point<Pixels>) -> Option<(usize, usize, usize)> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let bounds = (*open.sheet_bounds.borrow())?;
+        if !bounds.contains(&pos) {
+            return None;
+        }
+        let z = open.zoom as f32;
+        let lx = f32::from(pos.x - bounds.origin.x) / z;
+        let ly = f32::from(pos.y - bounds.origin.y) / z;
+        let (grid_w, grid_h) = open.grid_size;
+        if lx < 0.0 || ly < 0.0 || lx >= grid_w as f32 || ly >= grid_h as f32 {
+            return None;
+        }
+        let sx = lx as usize;
+        let sy = ly as usize;
+        let tile = (sy / TILE_PX) * open.cols + sx / TILE_PX;
+        if tile >= open.store.state().tile_count {
+            return None;
+        }
+        Some((tile, sx % TILE_PX, sy % TILE_PX))
+    }
+
+    /// Paint the pixel under `pos` with the current tool. Same-color
+    /// paints are no-ops inside the store (no undo entry), so
+    /// drag-painting over already-painted ground is free.
+    fn paint_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((tile, x, y)) = self.pixel_at(pos) else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let color = open.paint_color();
+        open.store.apply(TilesetOp::Paint { tile, x, y, color });
+        self.recompose_grid(cx);
+    }
+
+    /// Rebuild the composed sheet image from the store's current state --
+    /// after every op, undo, and redo.
+    fn recompose_grid(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let state = open.store.state();
+        if let Some(grid) =
+            loader::compose_grid(&state.indices, state.tile_count, open.cols, &state.palette)
+        {
+            open.grid = grid;
+        }
+        cx.notify();
+    }
+
+    fn on_sheet_mouse_down(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        self.paint_at(pos, cx);
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.painting = true;
+        }
+    }
+
+    fn on_sheet_mouse_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let painting = matches!(&self.state, ViewerState::Ready(open) if open.painting);
+        if painting {
+            self.paint_at(pos, cx);
+        }
+    }
+
+    fn on_sheet_mouse_up(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.painting
+        {
+            open.painting = false;
+            cx.notify();
+        }
+    }
+
+    fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.tool != tool
+        {
+            open.tool = tool;
+            cx.notify();
+        }
+    }
+
+    fn select_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if slot < PAL_SLOTS && open.slot != slot {
+            open.slot = slot;
+            // Picking a color is an intent to draw with it.
+            open.tool = Tool::Pencil;
+            cx.notify();
+        }
+    }
+
+    fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if open.store.undo() {
+            self.recompose_grid(cx);
+        }
+    }
+
+    fn redo_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if open.store.redo() {
+            self.recompose_grid(cx);
+        }
+    }
+
+    /// Write the `.til` + `.pal` pair back through worldlib's atomic
+    /// save. Synchronous by choice, same reasoning as the sprite panel's
+    /// save. A failure keeps the document dirty and surfaces on the panel
+    /// (and as the item's save Err).
+    pub(crate) fn save_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let state = open.store.state();
+        match save_tileset(
+            &root,
+            &open.rel_path,
+            &state.indices,
+            state.tile_count,
+            &state.palette,
+        ) {
+            Ok(()) => {
+                open.store.mark_saved();
+                open.save_error = None;
+            }
+            Err(e) => {
+                open.save_error = Some(e.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Test-only: apply one Paint op directly (the item test drives dirty
+    /// state without window-level mouse simulation).
+    #[cfg(test)]
+    pub(crate) fn apply_paint_for_test(
+        &mut self,
+        tile: usize,
+        x: usize,
+        y: usize,
+        color: u8,
+        cx: &mut Context<Self>,
+    ) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.store.apply(TilesetOp::Paint { tile, x, y, color });
+            self.recompose_grid(cx);
+        }
+    }
+
     // ------------------------------------------------------------- render
 
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -347,18 +549,73 @@ impl TilesetPanel {
             .into_any_element()
     }
 
-    /// Header: the source rels, tile count / grid geometry, and the zoom
-    /// pair.
-    fn render_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The editing canvas: the composed sheet at the integer zoom,
+    /// scrollable both ways, with the bounds-recording overlay and the
+    /// paint mouse handlers.
+    fn render_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_header is only called in the Ready state");
+            unreachable!("render_sheet is only called in the Ready state");
         };
-        let (w, h) = open.loaded.grid_size;
-        let summary = format!(
-            "{} tiles · {}x{} px · {} cols",
-            open.loaded.tile_count, w, h, open.loaded.cols
-        );
-        let zoom_label = format!("{}x", open.zoom);
+        let (w, h) = open.zoomed_size();
+        let bounds_cell = open.sheet_bounds.clone();
+        // `.top_0().left_0()` matters: an absolute child with auto insets
+        // sits at its STATIC position -- after the in-flow img sibling --
+        // so the recorded bounds would be shifted by exactly the image
+        // (the `ggo_sprite_panel` preview-overlay lesson).
+        let overlay = gpui::canvas(
+            move |bounds, _window, _cx| {
+                *bounds_cell.borrow_mut() = Some(bounds);
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        div()
+            .id("ggo-tileset-sheet")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_scroll()
+            .child(
+                div().p_2().child(
+                    div()
+                        .relative()
+                        .w(px(w))
+                        .h(px(h))
+                        .child(img(open.grid.clone()).nearest(true).w(px(w)).h(px(h)))
+                        .child(overlay)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                // Take focus so undo/save bindings apply.
+                                window.focus(&this.focus_handle, cx);
+                                this.on_sheet_mouse_down(event.position, cx);
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                            this.on_sheet_mouse_move(event.position, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                this.on_sheet_mouse_up(cx);
+                            }),
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The tooling column's header: source rels and the sheet summary.
+    fn render_info(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_info is only called in the Ready state");
+        };
+        let (w, h) = open.grid_size;
+        let state = open.store.state();
+        let summary = format!("{} tiles · {}x{} px · {} cols", state.tile_count, w, h, open.cols);
         v_flex()
             .gap_0p5()
             .p_1()
@@ -366,16 +623,77 @@ impl TilesetPanel {
             .border_color(cx.theme().colors().border)
             .child(Label::new(open.rel_path.clone()).size(LabelSize::Small))
             .child(
-                Label::new(open.loaded.pal_path.clone())
+                Label::new(open.pal_path.clone())
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
+            )
+            .child(
+                Label::new(summary)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    /// The tool row: pencil/eraser toggle, undo/redo, save, zoom.
+    fn render_tools(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_tools is only called in the Ready state");
+        };
+        let zoom_label = format!("{}x", open.zoom);
+        v_flex()
+            .gap_0p5()
+            .p_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        IconButton::new("ggo-tileset-pencil", IconName::Pencil)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(open.tool == Tool::Pencil)
+                            .tooltip(ui::Tooltip::text("Pencil"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.set_tool(Tool::Pencil, cx)),
+                            ),
+                    )
+                    .child(
+                        IconButton::new("ggo-tileset-eraser", IconName::Eraser)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(open.tool == Tool::Eraser)
+                            .tooltip(ui::Tooltip::text("Eraser (paints transparent)"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.set_tool(Tool::Eraser, cx)),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new("ggo-tileset-undo", IconName::Undo)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(ui::Tooltip::text("Undo"))
+                            .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
+                    )
+                    .child(
+                        IconButton::new("ggo-tileset-redo", IconName::RotateCw)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(ui::Tooltip::text("Redo"))
+                            .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
+                    )
+                    .child(
+                        Button::new("ggo-tileset-save", "Save")
+                            .disabled(!open.store.dirty())
+                            .tooltip(ui::Tooltip::text("Save (.til + .pal)"))
+                            .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
+                    ),
             )
             .child(
                 h_flex()
                     .gap_1()
                     .items_center()
                     .child(
-                        Label::new(summary)
+                        Label::new("Zoom")
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
@@ -397,15 +715,21 @@ impl TilesetPanel {
             .into_any_element()
     }
 
-    /// The 16-slot palette row. Slot 0 is the locked transparent entry, so
-    /// it renders as an outlined empty box rather than whatever color the
-    /// `.pal` happens to store there -- matching how the grid draws it.
+    /// The 16-slot palette. Slot 0 is the locked transparent entry, so it
+    /// renders as an outlined empty box rather than whatever color the
+    /// `.pal` happens to store there -- matching how the sheet draws it.
+    /// Clicking a swatch selects it as the pencil color (pointer cursor
+    /// on hover, selection ring on the active slot).
     fn render_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_palette is only called in the Ready state");
         };
-        let palette = open.loaded.palette;
-        let note = if open.loaded.missing_pal {
+        let state = open.store.state();
+        let palette = state.palette;
+        let selected = open.slot;
+        let accent = cx.theme().colors().border_focused;
+        let border = cx.theme().colors().border;
+        let note = if open.missing_pal {
             "Palette (no .pal found — 16-gray fallback)"
         } else {
             "Palette"
@@ -413,8 +737,6 @@ impl TilesetPanel {
         v_flex()
             .gap_0p5()
             .p_1()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
             .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
             .child(
                 h_flex()
@@ -427,9 +749,10 @@ impl TilesetPanel {
                             .id(("ggo-tileset-swatch", slot))
                             .w(px(SWATCH_PX))
                             .h(px(SWATCH_PX))
-                            .border_1()
-                            .border_color(cx.theme().colors().border)
+                            .border_2()
+                            .border_color(if slot == selected { accent } else { border })
                             .rounded_sm()
+                            .cursor_pointer()
                             // Slot 0 is transparent: show the panel through
                             // it instead of painting a misleading color.
                             .when(a != 0, |el| el.bg(rgb(color)))
@@ -439,43 +762,55 @@ impl TilesetPanel {
                                 palette[slot],
                                 if a == 0 { " (transparent)" } else { "" }
                             )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_slot(slot, cx);
+                            }))
                     })),
             )
             .into_any_element()
     }
 
-    /// The composed tile sheet, scaled by the integer zoom and scrollable
-    /// in both axes (an 8-col sheet at 8x is far wider than a dock).
-    fn render_grid(&self) -> gpui::AnyElement {
+    /// The tooling column on the editor's right side: info, tools,
+    /// palette, and any save error.
+    fn render_tooling(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_grid is only called in the Ready state");
+            unreachable!("render_tooling is only called in the Ready state");
         };
-        let (w, h) = open.zoomed_size();
-        div()
-            .id("ggo-tileset-grid")
-            .flex_1()
-            .min_h_0()
-            .overflow_scroll()
-            .child(
-                div()
-                    .p_1()
-                    .child(img(open.loaded.grid.clone()).nearest(true).w(px(w)).h(px(h))),
-            )
+        let save_error = open.save_error.clone();
+        v_flex()
+            .w(px(TOOLS_COL_PX))
+            .h_full()
+            .border_l_1()
+            .border_color(cx.theme().colors().border)
+            .child(self.render_info(cx))
+            .child(self.render_tools(cx))
+            .child(self.render_palette(cx))
+            .when_some(save_error, |this, e| {
+                this.child(
+                    div().p_1().child(
+                        Label::new(format!("Save failed: {e}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
     fn render_ready(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        v_flex()
+        h_flex()
             .size_full()
-            .child(self.render_header(cx))
-            .child(self.render_grid())
-            .child(self.render_palette(cx))
+            .items_stretch()
+            .child(self.render_sheet(cx))
+            .child(self.render_tooling(cx))
             .into_any_element()
     }
 
     fn render_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         match &self.state {
-            ViewerState::Empty => self.render_message(EMPTY_MESSAGE.to_string(), cx),
+            ViewerState::Empty => {
+                self.render_message("Open a .til file from the project panel".to_string(), cx)
+            }
             ViewerState::Loading { rel_path } => {
                 self.render_message(format!("Loading {rel_path}…"), cx)
             }
@@ -493,6 +828,9 @@ impl Render for TilesetPanel {
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
+            .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
+            .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
+            .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -503,140 +841,24 @@ impl Focusable for TilesetPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for TilesetPanel {}
+/// Kept for the item wrapper's observe plumbing (the panel emits nothing
+/// itself; `cx.observe` drives tab updates).
+pub enum TilesetPanelEvent {}
 
-impl Panel for TilesetPanel {
-    fn persistent_name() -> &'static str {
-        "GGO Tileset"
-    }
-
-    fn panel_key() -> &'static str {
-        GGO_TILESET_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        // Same call as every other GGO panel: no settings persistence yet,
-        // and Bottom isn't a sensible spot for a tall tile sheet.
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        DEFAULT_WIDTH
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        // `Blocks` is the only tile/grid-shaped glyph in this checkout
-        // (`assets/icons/blocks.svg` -- interlocking rectangles; grep for
-        // grid/table/tile in assets/icons finds nothing else), and no
-        // other panel uses it as its dock icon. `Image` is taken by
-        // `ggo_sprite_panel`.
-        Some(IconName::Blocks)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO Tileset")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
-        // `ggo_charts_panel` 10, `ggo_emu_panel` 11 (grep
-        // activation_priority across crates/).
-        12
-    }
-
-    // No `prepare_to_close`: this panel is read-only and holds nothing
-    // unsaved -- see the module doc.
-
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if active {
-            // Deferred: `set_active` fires inside the workspace's own
-            // update (dock toggle), and `refresh_root` needs to READ the
-            // workspace to find the project root -- reading it
-            // re-entrantly panics (same as every other GGO panel).
-            let this = cx.weak_entity();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_root(cx)).ok();
-            });
-        }
-    }
-}
+impl EventEmitter<TilesetPanelEvent> for TilesetPanel {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ggo_worldlib::sprites::io::{open_tileset, save_tileset};
-    use ggo_worldlib::sprites::tileset_doc::{TILE_PIXELS, TILE_PX};
-    use gpui::{Entity, TestAppContext};
+    use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+    use gpui::{Entity, TestAppContext, point, size};
     use project::{FakeFs, Project, WorktreeId};
     use workspace::{AppState, MultiWorkspace};
 
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
-    }
-
-    /// Proves the panel is registered on a real workspace, and that
-    /// dispatching `ToggleFocus` opens the right dock and focuses the
-    /// panel. Goes through `MultiWorkspace::test_new` rather than a bare
-    /// `Workspace::test_new`, because `register_action` handlers (like
-    /// `ToggleFocus`) are only mounted into the dispatch tree once
-    /// something renders `Workspace::actions`, which in production is
-    /// `MultiWorkspace`'s render (same lesson as the other GGO panels').
-    #[gpui::test]
-    async fn test_toggle_focus_opens_panel(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            AppState::test(cx);
-            init(cx);
-        });
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        workspace.update(cx, |workspace, cx| {
-            assert!(
-                workspace.panel::<TilesetPanel>(cx).is_some(),
-                "TilesetPanel should have been added to the workspace by init()"
-            );
-            assert!(
-                !workspace.right_dock().read(cx).is_open(),
-                "right dock should start closed"
-            );
-        });
-
-        cx.dispatch_action(ToggleFocus);
-
-        workspace.update(cx, |workspace, cx| {
-            let panel = workspace
-                .panel::<TilesetPanel>(cx)
-                .expect("TilesetPanel should still be registered");
-            assert_eq!(panel.read(cx).position, DockPosition::Right);
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "ToggleFocus should have opened the right dock"
-            );
-        });
     }
 
     /// The fixture tile count: 3 tiles is deliberately NOT a multiple of
@@ -692,12 +914,33 @@ mod tests {
         }
     }
 
-    /// End-to-end viewer load against a real-fs temp project: opening the
+    /// Record sheet bounds as if the sheet were painted at the window
+    /// origin at the CURRENT zoom -- what the canvas overlay does in a
+    /// real window, minus the window.
+    fn place_sheet_at_origin(panel: &Entity<TilesetPanel>, cx: &mut TestAppContext) {
+        panel.update(cx, |panel, _| {
+            let open = ready(panel);
+            let (w, h) = open.zoomed_size();
+            *open.sheet_bounds.borrow_mut() =
+                Some(gpui::bounds(point(px(0.), px(0.)), size(px(w), px(h))));
+        });
+    }
+
+    /// The window position of doc pixel `(tile, x, y)`'s center, for a
+    /// sheet placed at the origin.
+    fn pixel_pos(open: &OpenTileset, tile: usize, x: usize, y: usize) -> Point<Pixels> {
+        let z = open.zoom as f32;
+        let sx = ((tile % open.cols) * TILE_PX + x) as f32;
+        let sy = ((tile / open.cols) * TILE_PX + y) as f32;
+        point(px((sx + 0.5) * z), px((sy + 0.5) * z))
+    }
+
+    /// End-to-end load against a real-fs temp project: opening the
     /// fixture `.til` by rel path runs the off-thread loader and the panel
-    /// reaches Ready with the expected tile count, the clamped column
+    /// reaches Ready with the expected doc state, the clamped column
     /// count, the fixture's own palette (not the grayscale fallback), the
-    /// derived `.pal` rel, and a non-empty composed grid whose pixels prove
-    /// tile 0 transparent / tile 1 red through the BGRA bridge.
+    /// derived `.pal` rel, and a non-empty composed grid whose pixels
+    /// prove tile 0 transparent / tile 1 red through the BGRA bridge.
     #[gpui::test]
     async fn test_open_til_reaches_ready_with_a_composed_grid(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -705,22 +948,26 @@ mod tests {
 
         panel.update(cx, |panel, _cx| {
             let open = ready(panel);
+            let state = open.store.state();
             assert_eq!(open.rel_path, "tiles/world.til");
-            assert_eq!(open.loaded.pal_path, "tiles/world.pal");
-            assert_eq!(open.loaded.tile_count, FIXTURE_TILES);
-            assert!(!open.loaded.missing_pal, "the fixture wrote a .pal");
-            assert_eq!(open.loaded.palette[1], 0xF800);
+            assert_eq!(open.pal_path, "tiles/world.pal");
+            assert_eq!(state.tile_count, FIXTURE_TILES);
+            assert!(!open.missing_pal, "the fixture wrote a .pal");
+            assert_eq!(state.palette[1], 0xF800);
+            assert!(!state.dirty, "freshly opened is clean");
             assert_eq!(
-                open.loaded.cols, FIXTURE_TILES,
+                open.cols, FIXTURE_TILES,
                 "a sheet shorter than one 8-col row lays out at its own width"
             );
             assert_eq!(
-                open.loaded.grid_size,
+                open.grid_size,
                 ((FIXTURE_TILES * TILE_PX) as u32, TILE_PX as u32)
             );
             assert_eq!(open.zoom, DEFAULT_ZOOM);
+            assert_eq!(open.tool, Tool::Pencil);
+            assert_eq!(open.slot, 1);
 
-            let bytes = open.loaded.grid.as_bytes(0).unwrap();
+            let bytes = open.grid.as_bytes(0).unwrap();
             assert_eq!(
                 bytes.len(),
                 FIXTURE_TILES * TILE_PIXELS * 4,
@@ -742,7 +989,8 @@ mod tests {
     }
 
     /// A `.til` with no companion `.pal` still loads -- worldlib swaps in
-    /// its 16-gray fallback and flags it, which the header surfaces.
+    /// its 16-gray fallback and flags it, which the tooling column
+    /// surfaces.
     #[gpui::test]
     async fn test_missing_pal_still_loads_with_the_fallback_palette(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -764,8 +1012,8 @@ mod tests {
 
         panel.update(cx, |panel, _cx| {
             let open = ready(panel);
-            assert!(open.loaded.missing_pal);
-            assert_eq!(open.loaded.tile_count, FIXTURE_TILES);
+            assert!(open.missing_pal);
+            assert_eq!(open.store.state().tile_count, FIXTURE_TILES);
         });
     }
 
@@ -808,16 +1056,168 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.zoom_by(1, cx);
             assert_eq!(ready(panel).zoom, DEFAULT_ZOOM + 1);
-            for _ in 0..20 {
+            for _ in 0..40 {
                 panel.zoom_by(1, cx);
             }
             assert_eq!(ready(panel).zoom, MAX_ZOOM);
             let (w, _) = ready(panel).zoomed_size();
             assert_eq!(w, (FIXTURE_TILES * TILE_PX * MAX_ZOOM) as f32);
-            for _ in 0..20 {
+            for _ in 0..40 {
                 panel.zoom_by(-1, cx);
             }
             assert_eq!(ready(panel).zoom, MIN_ZOOM);
+        });
+    }
+
+    // --------------------------------------------------------- painting
+
+    /// The pencil paints the selected palette slot at the pixel under the
+    /// mouse, through the doc store (dirty flips, undo works) and into
+    /// the recomposed sheet image. The zoom scales the hit-test.
+    #[gpui::test]
+    async fn test_pencil_paints_the_selected_slot_under_the_mouse(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            // Paint tile 0's pixel (3, 2) with slot 1 (red).
+            let pos = pixel_pos(ready(panel), 0, 3, 2);
+            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_up(cx);
+
+            let open = ready(panel);
+            let state = open.store.state();
+            assert_eq!(state.indices[2 * TILE_PX + 3], 1, "the doc pixel landed");
+            assert!(state.dirty, "painting dirties the document");
+            let bytes = open.grid.as_bytes(0).unwrap();
+            let px_off = (2 * (FIXTURE_TILES * TILE_PX) + 3) * 4;
+            assert_eq!(
+                &bytes[px_off..px_off + 4],
+                &[0, 0, 255, 255],
+                "the recomposed sheet shows the painted pixel"
+            );
+
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[2 * TILE_PX + 3], 0, "undo reverts the paint");
+            assert!(!state.dirty, "undo back to saved is clean");
+            panel.redo_impl(cx);
+            assert_eq!(ready(panel).store.state().indices[2 * TILE_PX + 3], 1);
+        });
+    }
+
+    /// Drag-painting: pixels visited while the button is held are painted;
+    /// after mouse-up, moves paint nothing.
+    #[gpui::test]
+    async fn test_drag_paints_and_release_stops(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            let down = pixel_pos(ready(panel), 0, 0, 0);
+            let drag = pixel_pos(ready(panel), 0, 1, 0);
+            let after = pixel_pos(ready(panel), 0, 2, 0);
+            panel.on_sheet_mouse_down(down, cx);
+            panel.on_sheet_mouse_move(drag, cx);
+            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_move(after, cx);
+
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[0], 1, "the mouse-down pixel painted");
+            assert_eq!(state.indices[1], 1, "the dragged-over pixel painted");
+            assert_eq!(state.indices[2], 0, "a move after release paints nothing");
+        });
+    }
+
+    /// The eraser paints index 0 (transparent) whatever slot is selected,
+    /// and clicking a swatch selects that slot AND switches back to the
+    /// pencil.
+    #[gpui::test]
+    async fn test_eraser_paints_transparent_and_swatch_click_selects(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            // Tile 1 is solid index 1 in the fixture; erase one pixel.
+            panel.set_tool(Tool::Eraser, cx);
+            let pos = pixel_pos(ready(panel), 1, 5, 5);
+            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_up(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(
+                state.indices[TILE_PIXELS + 5 * TILE_PX + 5],
+                0,
+                "the eraser writes index 0"
+            );
+
+            panel.select_slot(3, cx);
+            let open = ready(panel);
+            assert_eq!(open.slot, 3);
+            assert_eq!(
+                open.tool,
+                Tool::Pencil,
+                "picking a color switches back to the pencil"
+            );
+            // Out-of-range slot is a no-op.
+            panel.select_slot(PAL_SLOTS + 5, cx);
+            assert_eq!(ready(panel).slot, 3);
+        });
+    }
+
+    /// Positions outside the sheet -- past its edge, or over the composed
+    /// grid's trailing pad cells beyond `tile_count` -- paint nothing and
+    /// never panic (`TilesetOp::Paint` indexes the buffer raw, so the
+    /// guard lives in `pixel_at`).
+    #[gpui::test]
+    async fn test_positions_off_the_sheet_paint_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            let (w, h) = ready(panel).zoomed_size();
+            panel.on_sheet_mouse_down(point(px(w + 10.), px(h + 10.)), cx);
+            panel.on_sheet_mouse_up(cx);
+            let state = ready(panel).store.state();
+            assert!(!state.dirty, "off-sheet clicks must not paint");
+        });
+    }
+
+    /// Save writes the `.til` + `.pal` pair through worldlib and clears
+    /// the dirty flag; a reopen sees the painted pixel. A failed save
+    /// keeps the document dirty and surfaces the error.
+    #[gpui::test]
+    async fn test_save_round_trips_and_failures_surface(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            let pos = pixel_pos(ready(panel), 0, 0, 0);
+            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_up(cx);
+            panel.save_impl(cx);
+            let open = ready(panel);
+            assert!(open.save_error.is_none(), "the fixture root is writable");
+            assert!(!open.store.dirty(), "a landed save clears dirty");
+        });
+        let reopened = open_tileset(dir.path(), "tiles/world.til").unwrap();
+        assert_eq!(reopened.indices[0], 1, "the painted pixel reached disk");
+
+        // Break the save target: a root pointing at a regular FILE makes
+        // the atomic write's create-parent-dirs step fail deterministically.
+        panel.update(cx, |panel, cx| {
+            let pos = pixel_pos(ready(panel), 0, 1, 0);
+            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_up(cx);
+            panel.project_root = Some(dir.path().join("tiles/world.til"));
+            panel.save_impl(cx);
+            let open = ready(panel);
+            assert!(open.save_error.is_some(), "a failed write must surface");
+            assert!(open.store.dirty(), "and the document must stay dirty");
         });
     }
 
@@ -825,8 +1225,8 @@ mod tests {
 
     /// A fake-fs project with one visible worktree holding the same file
     /// names the real-fs `root` fixture does: the interceptor only needs a
-    /// worktree id and a rel path, while the panel loads the actual tileset
-    /// bytes through `std::fs` from `root` (`root_override`).
+    /// worktree id and a rel path, while the item's panel loads the actual
+    /// tileset bytes through `std::fs` from `root` (`root_override`).
     async fn routed_project(
         cx: &mut TestAppContext,
         root: &std::path::Path,
@@ -869,39 +1269,41 @@ mod tests {
     }
 
     /// The registered `.til` predicate claims the path (so the project
-    /// panel opens NO pane item for it), opens the dock, and loads the
-    /// tileset. A non-`.til` in the same worktree is declined.
+    /// panel opens NO text buffer for it) and adds ONE center-pane editor
+    /// tab; a re-click activates the existing tab instead of adding a
+    /// second. A non-`.til` in the same worktree is declined.
     #[gpui::test]
-    async fn test_til_click_routes_into_the_panel_and_is_claimed(cx: &mut TestAppContext) {
+    async fn test_til_click_opens_a_center_editor_tab(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let project = routed_project(cx, dir.path(), true).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<TilesetPanel>(cx)
-                .expect("init() adds the panel")
-        });
-        let root = dir.path().to_path_buf();
-        panel.update(cx, |panel, _| panel.root_override = Some(root));
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(&project_path(worktree_id, "tiles/world.til"), window, cx)
         });
-        assert!(claimed, "a .til must be claimed, suppressing the pane item");
+        assert!(claimed, "a .til must be claimed, suppressing the text item");
         cx.run_until_parked();
 
-        panel.update(cx, |panel, _cx| {
-            assert_eq!(ready(panel).rel_path, "tiles/world.til");
+        let items: Vec<_> = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<TilesetEditorItem>(cx)
+                .map(|item| item.read(cx).rel().to_string())
+                .collect()
         });
-        workspace.read_with(cx, |workspace, cx| {
-            assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "routing must open the panel's dock even if it was closed"
-            );
+        assert_eq!(items, vec!["tiles/world.til"], "one editor tab opened");
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(&project_path(worktree_id, "tiles/world.til"), window, cx)
         });
+        assert!(claimed);
+        cx.run_until_parked();
+        let count = workspace.read_with(cx, |workspace, cx| {
+            workspace.items_of_type::<TilesetEditorItem>(cx).count()
+        });
+        assert_eq!(count, 1, "a re-click activates, never duplicates");
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(&project_path(worktree_id, "notes.txt"), window, cx)
@@ -909,34 +1311,10 @@ mod tests {
         assert!(!claimed, "everything but .til opens the normal way");
     }
 
-    /// Switching documents just loads the new one -- there is no dirty
-    /// state to prompt about.
-    #[gpui::test]
-    async fn test_open_rel_path_switches_documents_without_prompting(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        write_tileset_fixture(dir.path(), "other");
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-
-        cx.update(|window, cx| {
-            panel.update(cx, |panel, cx| {
-                panel.open_rel_path("tiles/other.til", window, cx)
-            })
-        });
-        assert!(
-            !cx.has_pending_prompt(),
-            "a read-only viewer must never prompt on switch"
-        );
-        cx.run_until_parked();
-        panel.update(cx, |panel, _cx| {
-            assert_eq!(ready(panel).rel_path, "tiles/other.til");
-        });
-    }
-
-    /// Clicking the file that is ALREADY open must be a pure focus/reveal:
-    /// no reload, so the view state survives. The zoom assertion is the
-    /// load-bearing one -- a reload would rebuild `OpenTileset` and snap
-    /// the zoom back to its default.
+    /// Clicking the file that is ALREADY open in the panel must be a pure
+    /// focus/reveal: no reload, so the view state survives. The zoom
+    /// assertion is the load-bearing one -- a reload would rebuild
+    /// `OpenTileset` and snap the zoom back to its default.
     #[gpui::test]
     async fn test_open_rel_path_on_the_open_tileset_does_not_reload(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -962,69 +1340,6 @@ mod tests {
                 ready(panel).zoom,
                 DEFAULT_ZOOM + 3,
                 "the view state must survive an already-open click"
-            );
-        });
-    }
-
-    /// REAL root discovery, with no `root_override`: the panel wired into a
-    /// workspace whose (fake) worktree is mounted AT the real-fs fixture
-    /// root must find that root through `set_active`'s deferred
-    /// `refresh_root` -- the branch every other test bypasses -- and then
-    /// load the fixture through it to Ready.
-    #[gpui::test]
-    async fn test_set_active_discovers_the_root_through_the_workspace(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        write_tileset_fixture(dir.path(), "world");
-        cx.update(|cx| {
-            AppState::test(cx);
-            init(cx);
-        });
-
-        // Mount the fake worktree AT the real-fs fixture root (the
-        // `ggo_sprite_panel::routed_project` trick): the workspace hands the
-        // panel this abs path as its root, and the loader then does real
-        // `std::fs` work there -- one path serves both.
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            dir.path().to_str().expect("utf8 tempdir path"),
-            serde_json::json!({ "tiles": { "world.til": "" } }),
-        )
-        .await;
-        let project = Project::test(fs, [dir.path()], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<TilesetPanel>(cx)
-                .expect("init() adds the panel")
-        });
-
-        panel.update_in(cx, |panel, window, cx| {
-            assert!(panel.root_override.is_none(), "discovery must be real");
-            assert!(
-                panel.project_root.is_none(),
-                "no root before the panel is first activated"
-            );
-            panel.set_active(true, window, cx);
-        });
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                panel.project_root.is_some(),
-                "set_active's deferred refresh must discover the worktree root"
-            );
-        });
-
-        panel.update_in(cx, |panel, window, cx| {
-            panel.open_rel_path("tiles/world.til", window, cx)
-        });
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                ready(panel).rel_path,
-                "tiles/world.til",
-                "the discovered root must be the one the loader reads from"
             );
         });
     }

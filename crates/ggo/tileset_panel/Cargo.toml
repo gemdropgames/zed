@@ -12,6 +12,7 @@ workspace = true
 path = "src/ggo_tileset_panel.rs"
 
 [dependencies]
+anyhow.workspace = true
 ggo-asset-formats.workspace = true # GGO
 ggo-worldlib.workspace = true # GGO
 ggo_common.workspace = true
