@@ -66,7 +66,11 @@ actions!(
         /// Scrolls the tileset view up.
         ScrollUp,
         /// Scrolls the tileset view down.
-        ScrollDown
+        ScrollDown,
+        /// Copies the selected pixel region.
+        CopySelection,
+        /// Pastes the copied pixel region at the selection.
+        PasteSelection
     ]
 );
 
@@ -116,6 +120,10 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("right", ScrollRight, Some(KEY_CONTEXT)),
         KeyBinding::new("up", ScrollUp, Some(KEY_CONTEXT)),
         KeyBinding::new("down", ScrollDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-c", CopySelection, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-c", CopySelection, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteSelection, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-v", PasteSelection, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -172,12 +180,15 @@ pub fn open_tileset_item(
 
 // ------------------------------------------------------------- view state
 
-/// The two painting tools. The eraser is not its own op: it paints
-/// palette index 0, the transparent slot.
+/// The editing tools. The eraser is not its own op: it paints palette
+/// index 0, the transparent slot. The picker samples the palette slot
+/// under the click; Select drags a marquee for copy/paste.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
     Pencil,
     Eraser,
+    Picker,
+    Select,
 }
 
 /// The open tileset: worldlib's doc store plus the view state that must
@@ -208,6 +219,12 @@ struct OpenTileset {
     /// The sheet scroll container's handle -- arrow-key camera panning
     /// goes through it.
     scroll: ScrollHandle,
+    /// The Select tool's marquee, in SHEET pixel coordinates: (anchor,
+    /// head), both inclusive, unnormalized (head may sit any side of the
+    /// anchor).
+    selection: Option<((usize, usize), (usize, usize))>,
+    /// The copy buffer: `(w, h, indices)` row-major, sheet-space.
+    clipboard: Option<(usize, usize, Vec<u8>)>,
 }
 
 impl OpenTileset {
@@ -230,6 +247,8 @@ impl OpenTileset {
             sheet_bounds: Rc::new(RefCell::new(None)),
             painting: false,
             scroll: ScrollHandle::new(),
+            selection: None,
+            clipboard: None,
         }
     }
 
@@ -240,10 +259,11 @@ impl OpenTileset {
         (w as f32 * z, h as f32 * z)
     }
 
-    /// The color the current tool paints with.
+    /// The color the current tool paints with. Only meaningful for the
+    /// painting tools -- Picker/Select never reach `paint_at`.
     fn paint_color(&self) -> u8 {
         match self.tool {
-            Tool::Pencil => self.slot as u8,
+            Tool::Pencil | Tool::Picker | Tool::Select => self.slot as u8,
             Tool::Eraser => 0,
         }
     }
@@ -442,11 +462,10 @@ impl TilesetPanel {
 
     // ------------------------------------------------------------ editing
 
-    /// Map a window-absolute mouse position to the sheet pixel under it:
-    /// `(tile, x, y)` in doc coordinates. `None` outside the sheet (the
-    /// composed grid floors at one row, so its trailing pad cells past
-    /// `tile_count` must be rejected here, not painted).
-    fn pixel_at(&self, pos: Point<Pixels>) -> Option<(usize, usize, usize)> {
+    /// Map a window-absolute mouse position to SHEET pixel coordinates
+    /// (over the whole composed grid, trailing pad cells included).
+    /// `None` outside the sheet.
+    fn sheet_px_at(&self, pos: Point<Pixels>) -> Option<(usize, usize)> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
@@ -461,13 +480,29 @@ impl TilesetPanel {
         if lx < 0.0 || ly < 0.0 || lx >= grid_w as f32 || ly >= grid_h as f32 {
             return None;
         }
-        let sx = lx as usize;
-        let sy = ly as usize;
+        Some((lx as usize, ly as usize))
+    }
+
+    /// The doc pixel `(tile, x, y)` at sheet coordinates `(sx, sy)`, or
+    /// `None` over the composed grid's trailing pad cells past
+    /// `tile_count` -- the store's paint ops index the buffer raw, so the
+    /// guard lives here.
+    fn doc_pixel(&self, sx: usize, sy: usize) -> Option<(usize, usize, usize)> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
         let tile = (sy / TILE_PX) * open.cols + sx / TILE_PX;
         if tile >= open.store.state().tile_count {
             return None;
         }
         Some((tile, sx % TILE_PX, sy % TILE_PX))
+    }
+
+    /// [`Self::sheet_px_at`] + [`Self::doc_pixel`]: the doc pixel under a
+    /// window-absolute mouse position.
+    fn pixel_at(&self, pos: Point<Pixels>) -> Option<(usize, usize, usize)> {
+        let (sx, sy) = self.sheet_px_at(pos)?;
+        self.doc_pixel(sx, sy)
     }
 
     /// Paint the pixel under `pos` with the current tool, folding into
@@ -498,24 +533,164 @@ impl TilesetPanel {
         {
             open.grid = grid;
         }
+        open.grid_size = loader::grid_pixel_size(state.tile_count, open.cols);
         cx.notify();
     }
 
     fn on_sheet_mouse_down(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.store.begin_stroke();
+        let tool = match &self.state {
+            ViewerState::Ready(open) => open.tool,
+            _ => return,
+        };
+        match tool {
+            Tool::Pencil | Tool::Eraser => {
+                if let ViewerState::Ready(open) = &mut self.state {
+                    open.store.begin_stroke();
+                }
+                self.paint_at(pos, cx);
+            }
+            Tool::Picker => {
+                self.pick_at(pos, cx);
+                return; // a pick is instantaneous, no drag state
+            }
+            Tool::Select => {
+                let anchor = self.sheet_px_at(pos);
+                if let ViewerState::Ready(open) = &mut self.state {
+                    open.selection = anchor.map(|p| (p, p));
+                    cx.notify();
+                }
+            }
         }
-        self.paint_at(pos, cx);
         if let ViewerState::Ready(open) = &mut self.state {
             open.painting = true;
         }
     }
 
     fn on_sheet_mouse_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        let painting = matches!(&self.state, ViewerState::Ready(open) if open.painting);
-        if painting {
-            self.paint_at(pos, cx);
+        let (tool, painting) = match &self.state {
+            ViewerState::Ready(open) => (open.tool, open.painting),
+            _ => return,
+        };
+        if !painting {
+            return;
         }
+        match tool {
+            Tool::Pencil | Tool::Eraser => self.paint_at(pos, cx),
+            Tool::Select => {
+                let head = self.sheet_px_at(pos);
+                if let (ViewerState::Ready(open), Some(head)) = (&mut self.state, head)
+                    && let Some((anchor, _)) = open.selection
+                {
+                    open.selection = Some((anchor, head));
+                    cx.notify();
+                }
+            }
+            Tool::Picker => {}
+        }
+    }
+
+    /// The Picker tool: sample the palette slot under the click, make it
+    /// the pencil color, and switch back to the pencil.
+    fn pick_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((tile, x, y)) = self.pixel_at(pos) else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let state = open.store.state();
+        let idx = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + y * TILE_PX + x;
+        if let Some(&slot) = state.indices.get(idx) {
+            open.slot = slot as usize;
+            open.tool = Tool::Pencil;
+            cx.notify();
+        }
+    }
+
+    /// The selection's normalized inclusive rect `(x0, y0, x1, y1)`.
+    fn selection_rect(&self) -> Option<(usize, usize, usize, usize)> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let ((ax, ay), (hx, hy)) = open.selection?;
+        Some((ax.min(hx), ay.min(hy), ax.max(hx), ay.max(hy)))
+    }
+
+    /// Copy the selected region into the internal clipboard, sampling the
+    /// doc through sheet coordinates (pad cells copy as 0).
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((x0, y0, x1, y1)) = self.selection_rect() else {
+            return;
+        };
+        let state = match &self.state {
+            ViewerState::Ready(open) => open.store.state(),
+            _ => return,
+        };
+        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut data = vec![0u8; w * h];
+        for dy in 0..h {
+            for dx in 0..w {
+                if let Some((tile, px_x, px_y)) = self.doc_pixel(x0 + dx, y0 + dy) {
+                    let idx =
+                        tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + px_y * TILE_PX + px_x;
+                    if let Some(&v) = state.indices.get(idx) {
+                        data[dy * w + dx] = v;
+                    }
+                }
+            }
+        }
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.clipboard = Some((w, h, data));
+            cx.notify();
+        }
+    }
+
+    /// Paste the clipboard at the selection's top-left as ONE stroke (one
+    /// undo step). Pixels landing on pad cells are skipped; the selection
+    /// moves to the pasted rect.
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some((x0, y0, ..)) = self.selection_rect() else {
+            return;
+        };
+        let clipboard = match &self.state {
+            ViewerState::Ready(open) => open.clipboard.clone(),
+            _ => return,
+        };
+        let Some((w, h, data)) = clipboard else {
+            return;
+        };
+        let mut writes = Vec::new();
+        for dy in 0..h {
+            for dx in 0..w {
+                if let Some((tile, px_x, px_y)) = self.doc_pixel(x0 + dx, y0 + dy) {
+                    writes.push((tile, px_x, px_y, data[dy * w + dx]));
+                }
+            }
+        }
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if writes.is_empty() {
+            return;
+        }
+        open.store.begin_stroke();
+        for (tile, px_x, px_y, color) in writes {
+            open.store.apply_stroke_paint(tile, px_x, px_y, color);
+        }
+        open.store.end_stroke();
+        open.selection = Some(((x0, y0), (x0 + w - 1, y0 + h - 1)));
+        self.recompose_grid(cx);
+    }
+
+    /// Append one blank tile to the sheet (the edge "+" cell) --
+    /// `TilesetOp::AppendTile`, one undo step.
+    fn append_tile(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.store
+            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::AppendTile);
+        self.recompose_grid(cx);
     }
 
     fn on_sheet_mouse_up(&mut self, cx: &mut Context<Self>) {
@@ -654,6 +829,17 @@ impl TilesetPanel {
         let bounds_cell = open.sheet_bounds.clone();
         let (cols, rows) = (open.cols, open.grid_size.1 as usize / TILE_PX);
         let line_color = cx.theme().colors().border_variant;
+        let accent = cx.theme().colors().border_focused;
+        let zoom = open.zoom as f32;
+        let selection = self.selection_rect();
+        // The edge "+" cell sits at the NEXT tile slot in grid flow --
+        // beside the last tile, or opening a fresh row when the last row
+        // is full (which is when the container needs the extra height).
+        let tile_count = open.store.state().tile_count;
+        let cell = TILE_PX as f32 * zoom;
+        let plus_x = (tile_count % cols) as f32 * cell;
+        let plus_y = (tile_count / cols) as f32 * cell;
+        let container_h = h.max(plus_y + cell);
         // `.top_0().left_0()` matters: an absolute child with auto insets
         // sits at its STATIC position -- after the in-flow img sibling --
         // so the recorded bounds would be shifted by exactly the image
@@ -664,6 +850,19 @@ impl TilesetPanel {
             },
             move |bounds, (), window, _cx| {
                 paint_tile_borders(bounds, cols, rows, line_color, window);
+                if let Some((x0, y0, x1, y1)) = selection {
+                    let rect = Bounds::new(
+                        gpui::point(
+                            bounds.origin.x + px(x0 as f32 * zoom),
+                            bounds.origin.y + px(y0 as f32 * zoom),
+                        ),
+                        gpui::size(
+                            px((x1 - x0 + 1) as f32 * zoom),
+                            px((y1 - y0 + 1) as f32 * zoom),
+                        ),
+                    );
+                    window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                }
             },
         )
         .absolute()
@@ -682,25 +881,53 @@ impl TilesetPanel {
                     div()
                         .relative()
                         .w(px(w))
-                        .h(px(h))
-                        .child(img(open.grid.clone()).nearest(true).w(px(w)).h(px(h)))
-                        .child(overlay)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                // Take focus so undo/save bindings apply.
-                                window.focus(&this.focus_handle, cx);
-                                this.on_sheet_mouse_down(event.position, cx);
-                            }),
+                        .h(px(container_h))
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(w))
+                                .h(px(h))
+                                .child(img(open.grid.clone()).nearest(true).w(px(w)).h(px(h)))
+                                .child(overlay)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        // Take focus so undo/save bindings apply.
+                                        window.focus(&this.focus_handle, cx);
+                                        this.on_sheet_mouse_down(event.position, cx);
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    |this, event: &MouseMoveEvent, _, cx| {
+                                        this.on_sheet_mouse_move(event.position, cx);
+                                    },
+                                ))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                        this.on_sheet_mouse_up(cx);
+                                    }),
+                                ),
                         )
-                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                            this.on_sheet_mouse_move(event.position, cx);
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                this.on_sheet_mouse_up(cx);
-                            }),
+                        .child(
+                            div()
+                                .id("ggo-tileset-append")
+                                .absolute()
+                                .left(px(plus_x))
+                                .top(px(plus_y))
+                                .w(px(cell))
+                                .h(px(cell))
+                                .flex()
+                                .justify_center()
+                                .items_center()
+                                .border_1()
+                                .border_dashed()
+                                .rounded_sm()
+                                .border_color(cx.theme().colors().border_variant)
+                                .cursor_pointer()
+                                .tooltip(ui::Tooltip::text("Add tile"))
+                                .child(Label::new("+").size(LabelSize::Small).color(Color::Muted))
+                                .on_click(cx.listener(|this, _, _, cx| this.append_tile(cx))),
                         ),
                 ),
             )
@@ -760,6 +987,20 @@ impl TilesetPanel {
                     .toggle_state(open.tool == Tool::Eraser)
                     .tooltip(ui::Tooltip::text("Eraser (paints transparent)"))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Eraser, cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-picker", IconName::Crosshair)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Picker)
+                    .tooltip(ui::Tooltip::text("Pick color from the sheet"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Picker, cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-select", IconName::SquareDot)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Select)
+                    .tooltip(ui::Tooltip::text("Select region (ctrl-c copy, ctrl-v paste)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Select, cx))),
             )
             .child(div().w_2())
             .child(
@@ -928,6 +1169,10 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &ScrollRight, _window, cx| this.scroll_by(1.0, 0.0, cx)))
             .on_action(cx.listener(|this, _: &ScrollUp, _window, cx| this.scroll_by(0.0, -1.0, cx)))
             .on_action(cx.listener(|this, _: &ScrollDown, _window, cx| this.scroll_by(0.0, 1.0, cx)))
+            .on_action(cx.listener(|this, _: &CopySelection, _window, cx| this.copy_selection(cx)))
+            .on_action(
+                cx.listener(|this, _: &PasteSelection, _window, cx| this.paste_clipboard(cx)),
+            )
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -1507,6 +1752,129 @@ mod tests {
             let offset = ready(panel).scroll.offset();
             assert_eq!(f32::from(offset.x), 0.0, "clamped at the left edge");
             assert_eq!(f32::from(offset.y), 0.0, "clamped at the top edge");
+        });
+    }
+
+
+    /// The Picker tool: clicking a pixel makes its palette slot the
+    /// pencil color and switches back to the pencil.
+    #[gpui::test]
+    async fn test_picker_samples_the_slot_under_the_click(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(3, cx);
+            panel.set_tool(Tool::Picker, cx);
+            // Tile 1 is solid index 1 in the fixture.
+            let pos = pixel_pos(ready(panel), 1, 4, 4);
+            panel.on_sheet_mouse_down(pos, cx);
+            let open = ready(panel);
+            assert_eq!(open.slot, 1, "picked the slot under the click");
+            assert_eq!(open.tool, Tool::Pencil, "picking returns to the pencil");
+        });
+    }
+
+    /// Select tool marquee + copy/paste: drag selects a sheet-space rect,
+    /// ctrl-c samples it, ctrl-v blits it at the selection anchor as ONE
+    /// undo step, and the pasted pixels land in the doc.
+    #[gpui::test]
+    async fn test_marquee_copy_paste_is_one_undo_step(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            // Select tile 1's top-left 2x2 (solid index 1).
+            panel.set_tool(Tool::Select, cx);
+            let from = pixel_pos(ready(panel), 1, 0, 0);
+            let to = pixel_pos(ready(panel), 1, 1, 1);
+            panel.on_sheet_mouse_down(from, cx);
+            panel.on_sheet_mouse_move(to, cx);
+            panel.on_sheet_mouse_up(cx);
+            assert_eq!(
+                panel.selection_rect(),
+                Some((TILE_PX, 0, TILE_PX + 1, 1)),
+                "the marquee is a sheet-space rect over tile 1"
+            );
+
+            panel.copy_selection(cx);
+            assert_eq!(
+                ready(panel).clipboard,
+                Some((2, 2, vec![1, 1, 1, 1])),
+                "copy sampled the region"
+            );
+
+            // Move the selection onto tile 0 (all transparent) and paste.
+            let target_from = pixel_pos(ready(panel), 0, 2, 2);
+            panel.on_sheet_mouse_down(target_from, cx);
+            panel.on_sheet_mouse_up(cx);
+            panel.paste_clipboard(cx);
+            {
+                let state = ready(panel).store.state();
+                assert_eq!(state.indices[2 * TILE_PX + 2], 1);
+                assert_eq!(state.indices[2 * TILE_PX + 3], 1);
+                assert_eq!(state.indices[3 * TILE_PX + 2], 1);
+                assert_eq!(state.indices[3 * TILE_PX + 3], 1);
+            }
+            assert_eq!(
+                panel.selection_rect(),
+                Some((2, 2, 3, 3)),
+                "the selection follows the pasted rect"
+            );
+
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[2 * TILE_PX + 2], 0, "one undo reverts the paste");
+            assert_eq!(state.indices[3 * TILE_PX + 3], 0);
+            assert!(!state.dirty);
+
+            // Paste with no clipboard or no selection: no-ops.
+            panel.paste_clipboard(cx);
+            panel.undo_impl(cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = None;
+                open.clipboard = Some((1, 1, vec![5]));
+            }
+            panel.paste_clipboard(cx);
+            assert!(!ready(panel).store.state().dirty);
+        });
+    }
+
+    /// The edge "+" cell: appending grows the sheet by one blank tile
+    /// (grid size follows, including the fresh-row case) and undoes as
+    /// one step.
+    #[gpui::test]
+    async fn test_append_tile_grows_the_sheet_and_undoes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Fixture: 3 tiles at 3 cols -- the next slot opens row 2.
+            panel.append_tile(cx);
+            {
+                let open = ready(panel);
+                let state = open.store.state();
+                assert_eq!(state.tile_count, FIXTURE_TILES + 1);
+                assert!(state.dirty);
+                assert_eq!(
+                    open.grid_size,
+                    ((FIXTURE_TILES * TILE_PX) as u32, (2 * TILE_PX) as u32),
+                    "the composed grid grew a second row"
+                );
+                let bytes = open.grid.as_bytes(0).unwrap();
+                assert_eq!(bytes.len(), FIXTURE_TILES * TILE_PX * 2 * TILE_PX * 4);
+            }
+
+            panel.undo_impl(cx);
+            let open = ready(panel);
+            assert_eq!(open.store.state().tile_count, FIXTURE_TILES);
+            assert_eq!(
+                open.grid_size,
+                ((FIXTURE_TILES * TILE_PX) as u32, TILE_PX as u32),
+                "undo shrinks the grid back"
+            );
         });
     }
 
