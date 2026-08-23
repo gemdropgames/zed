@@ -982,15 +982,14 @@ struct OpenSprite {
     /// `refresh_after_doc_change`: a doc mutation can change any frame's
     /// pixels, and the key doesn't carry a generation to invalidate by.
     ghost_cache: RefCell<HashMap<(i32, usize), Arc<RenderImage>>>,
-    /// The big preview's transformed compose for one frame, keyed by
-    /// frame index -- the ghost-cache idiom, single-slot because only
-    /// the SHOWN frame is ever composed transformed
+    /// Transformed composes keyed by frame index, shared by the big
+    /// preview and the clip sequence thumbnails
     /// (`loader::compose_transformed_frame` is pure in the doc state,
-    /// so a slot is stale only after a doc mutation, which clears it in
-    /// `refresh_after_doc_change` alongside `frames`). `RefCell` for the
-    /// same reason as [`Self::ghost_cache`]: filled from
-    /// [`Self::preview_image`] under `&self` during render.
-    transformed_preview: RefCell<Option<(usize, Arc<RenderImage>)>>,
+    /// so an entry is stale only after a doc mutation, which clears the
+    /// map in `refresh_after_doc_change` alongside `frames`). `RefCell`
+    /// for the same reason as [`Self::ghost_cache`]: filled from
+    /// [`Self::frame_image`] under `&self` during render.
+    transformed_frames: RefCell<HashMap<usize, Arc<RenderImage>>>,
     /// The bound tileset composed as the tile picker's sheet; same
     /// invalidation as `frames`.
     pool_strip: Option<loader::PoolStrip>,
@@ -1071,7 +1070,7 @@ impl OpenSprite {
             store: SpriteDocStore::new(loaded.state),
             frames: loaded.frames,
             ghost_cache: RefCell::new(HashMap::new()),
-            transformed_preview: RefCell::new(None),
+            transformed_frames: RefCell::new(HashMap::new()),
             pool_strip: loaded.pool_strip,
             picker_cols: loaded
                 .meta
@@ -1111,22 +1110,30 @@ impl OpenSprite {
     /// identity, else the transformed compose on the doubled canvas,
     /// cached per shown frame until the next doc mutation.
     fn preview_image(&self) -> Option<Arc<RenderImage>> {
-        let shown = self.shown_frame();
+        self.frame_image(self.shown_frame())
+    }
+
+    /// The image any frame draws with (big preview and sequence thumbs
+    /// alike): the LEGACY compose (the same Arc the strip thumbnail
+    /// uses) while the frame's transform is identity, else the
+    /// transformed compose on the doubled canvas, cached per frame
+    /// until the next doc mutation.
+    fn frame_image(&self, idx: usize) -> Option<Arc<RenderImage>> {
         let state = self.store.state();
         if state
             .frames
-            .get(shown)
+            .get(idx)
             .is_none_or(|f| f.transform.is_identity())
         {
-            return self.frames.get(shown).cloned();
+            return self.frames.get(idx).cloned();
         }
-        if let Some((idx, image)) = self.transformed_preview.borrow().as_ref()
-            && *idx == shown
-        {
+        if let Some(image) = self.transformed_frames.borrow().get(&idx) {
             return Some(image.clone());
         }
-        let image = loader::compose_transformed_frame(state, shown)?;
-        *self.transformed_preview.borrow_mut() = Some((shown, image.clone()));
+        let image = loader::compose_transformed_frame(state, idx)?;
+        self.transformed_frames
+            .borrow_mut()
+            .insert(idx, image.clone());
         Some(image)
     }
 
@@ -1928,7 +1935,7 @@ impl SpritePanel {
         let tile_count = open.store.state().tile_count;
         open.frames = frames;
         open.ghost_cache.borrow_mut().clear();
-        *open.transformed_preview.borrow_mut() = None;
+        open.transformed_frames.borrow_mut().clear();
         open.pool_strip = pool_strip;
         open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
         // Undo/redo of frame adds/deletes can leave the editor-only name
@@ -3732,10 +3739,10 @@ impl SpritePanel {
         let mut row = h_flex().gap_0p5().items_center();
         let last = clip.to.min(state.frames.len().saturating_sub(1));
         for (seq_pos, ix) in (clip.from..=last).enumerate() {
-            let thumb = open.frames.get(ix).map(|image| {
-                let (w, h) = image_px_size(image);
+            let thumb = open.frame_image(ix).map(|image| {
+                let (w, h) = image_px_size(&image);
                 let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
-                img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
+                img(image).nearest(true).w(px(fit_w)).h(px(fit_h))
             });
             let duration_ms = state.frames[ix].duration_ms;
             row = row.child(
@@ -5479,6 +5486,35 @@ mod tests {
             assert!(
                 ready(panel).frame_settings.is_none(),
                 "stale clip index cannot survive the refresh"
+            );
+        });
+    }
+
+
+    /// Sequence thumbnails render the frame's TRANSFORM, not the legacy
+    /// composite: a rotated frame's thumb image is the doubled canvas
+    /// (cached per frame until the next doc mutation), identity frames
+    /// reuse the strip's exact Arc.
+    #[gpui::test]
+    async fn test_sequence_thumbs_render_the_transform(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_frame(1, cx);
+            panel.commit_edit(EditTarget::Rot, "90".into(), cx);
+            let open = ready(panel);
+            let legacy = open.frames[1].clone();
+            let transformed = open.frame_image(1).expect("composes");
+            let (w, h) = image_px_size(&transformed);
+            let (lw, lh) = image_px_size(&legacy);
+            assert_eq!((w, h), (lw * 2, lh * 2), "rotated thumb is the doubled canvas");
+            let again = open.frame_image(1).expect("composes");
+            assert!(Arc::ptr_eq(&transformed, &again), "cached per frame");
+            let identity = open.frame_image(0).expect("identity frame");
+            assert!(
+                Arc::ptr_eq(&identity, &open.frames[0]),
+                "identity thumbs reuse the strip image"
             );
         });
     }

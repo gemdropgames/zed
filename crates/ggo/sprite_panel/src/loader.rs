@@ -94,7 +94,7 @@ pub fn compose_frames(state: &SpriteState) -> Result<Vec<Arc<RenderImage>>, Stri
 /// like [`compose_frames`]. The strip thumbnails deliberately stay
 /// legacy-composed -- transforms are per-copy PLAY data, and a rotated
 /// thumbnail would hide which tiles the frame actually edits. Callers
-/// cache the result per shown frame (`OpenSprite::transformed_preview`,
+/// cache the result per frame (`OpenSprite::transformed_frames`,
 /// the ghost-cache idiom): pixels only change on doc mutations, which
 /// clear the cache.
 pub fn compose_transformed_frame(state: &SpriteState, idx: usize) -> Option<Arc<RenderImage>> {
