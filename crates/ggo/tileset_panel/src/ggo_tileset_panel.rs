@@ -24,6 +24,7 @@
 //! open, the grid compose) plus the pure grid geometry.
 
 mod loader;
+mod palette_widget;
 mod tileset_item;
 
 use std::cell::RefCell;
@@ -34,7 +35,7 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage,
-    Styled, Task, WeakEntity, Window, actions, div, img, px, rgb, rgba,
+    Styled, Task, WeakEntity, Window, actions, div, img, px,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -45,6 +46,7 @@ use ggo_worldlib::sprites::palette565::PAL_SLOTS;
 use ggo_worldlib::sprites::tileset_doc::{TILE_PX, TilesetDocStore, TilesetOp};
 
 use loader::LoadedTileset;
+pub use palette_widget::SmallPaletteEditor;
 pub use tileset_item::TilesetEditorItem;
 
 actions!(
@@ -70,9 +72,6 @@ const KEY_CONTEXT: &str = "GgoTilesetPanel";
 const MIN_ZOOM: usize = 1;
 const MAX_ZOOM: usize = 16;
 const DEFAULT_ZOOM: usize = 4;
-
-/// Palette swatch box (px, square).
-const SWATCH_PX: f32 = 18.0;
 
 /// The tooling column's width.
 const TOOLS_COL_PX: f32 = 280.0;
@@ -471,6 +470,21 @@ impl TilesetPanel {
         }
     }
 
+    /// Set palette slot `slot` to `rgb565` -- an undoable
+    /// `TilesetOp::SetPalette`, recoloring the whole sheet. Slot 0 is the
+    /// transparent index and is locked; out-of-range slots are rejected
+    /// here because the store's `SetPalette` arm indexes the palette raw.
+    fn set_palette_slot(&mut self, slot: usize, rgb565: u16, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if slot == 0 || slot >= PAL_SLOTS || open.store.state().palette[slot] == rgb565 {
+            return;
+        }
+        open.store.apply(TilesetOp::SetPalette { slot, rgb565 });
+        self.recompose_grid(cx);
+    }
+
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -715,58 +729,31 @@ impl TilesetPanel {
             .into_any_element()
     }
 
-    /// The 16-slot palette. Slot 0 is the locked transparent entry, so it
-    /// renders as an outlined empty box rather than whatever color the
-    /// `.pal` happens to store there -- matching how the sheet draws it.
-    /// Clicking a swatch selects it as the pencil color (pointer cursor
-    /// on hover, selection ring on the active slot).
+    /// The 16-slot palette section: [`SmallPaletteEditor`], the compact
+    /// side-column widget -- swatch selection plus per-channel steppers
+    /// for the selected slot, whose changes land as undoable
+    /// `SetPalette` ops through [`Self::set_palette_slot`].
     fn render_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_palette is only called in the Ready state");
         };
-        let state = open.store.state();
-        let palette = state.palette;
-        let selected = open.slot;
-        let accent = cx.theme().colors().border_focused;
-        let border = cx.theme().colors().border;
-        let note = if open.missing_pal {
-            "Palette (no .pal found — 16-gray fallback)"
-        } else {
-            "Palette"
-        };
-        v_flex()
-            .gap_0p5()
-            .p_1()
-            .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_0p5()
-                    .children((0..PAL_SLOTS).map(|slot| {
-                        let [r, g, b, a] = loader::swatch_rgba(&palette, slot);
-                        let color = u32::from_be_bytes([0, r, g, b]);
-                        div()
-                            .id(("ggo-tileset-swatch", slot))
-                            .w(px(SWATCH_PX))
-                            .h(px(SWATCH_PX))
-                            .border_2()
-                            .border_color(if slot == selected { accent } else { border })
-                            .rounded_sm()
-                            .cursor_pointer()
-                            // Slot 0 is transparent: show the panel through
-                            // it instead of painting a misleading color.
-                            .when(a != 0, |el| el.bg(rgb(color)))
-                            .when(a == 0, |el| el.bg(rgba(0x00000000)))
-                            .tooltip(ui::Tooltip::text(format!(
-                                "{slot}: #{:04X}{}",
-                                palette[slot],
-                                if a == 0 { " (transparent)" } else { "" }
-                            )))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_slot(slot, cx);
-                            }))
-                    })),
-            )
+        let select_target = cx.weak_entity();
+        let change_target = cx.weak_entity();
+        let mut editor = SmallPaletteEditor::new(open.store.state().palette, open.slot);
+        if open.missing_pal {
+            editor = editor.note("no .pal found — 16-gray fallback");
+        }
+        editor
+            .on_select(move |slot, _, cx| {
+                select_target
+                    .update(cx, |this, cx| this.select_slot(slot, cx))
+                    .ok();
+            })
+            .on_change(move |slot, rgb565, _, cx| {
+                change_target
+                    .update(cx, |this, cx| this.set_palette_slot(slot, rgb565, cx))
+                    .ok();
+            })
             .into_any_element()
     }
 
@@ -1183,6 +1170,50 @@ mod tests {
             panel.on_sheet_mouse_up(cx);
             let state = ready(panel).store.state();
             assert!(!state.dirty, "off-sheet clicks must not paint");
+        });
+    }
+
+
+    /// Palette editing: a `SetPalette` op recolors the sheet (undoably),
+    /// slot 0 is locked, and out-of-range slots are rejected instead of
+    /// panicking (the store indexes the palette raw).
+    #[gpui::test]
+    async fn test_palette_edits_recolor_the_sheet_and_slot_zero_is_locked(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Tiles 1-2 are solid index 1 (red). Turn slot 1 green.
+            panel.set_palette_slot(1, 0x07E0, cx);
+            let open = ready(panel);
+            let state = open.store.state();
+            assert_eq!(state.palette[1], 0x07E0);
+            assert!(state.dirty, "a palette edit dirties the document");
+            let bytes = open.grid.as_bytes(0).unwrap();
+            let px_off = TILE_PX * 4; // tile 1's first pixel, row 0
+            assert_eq!(
+                &bytes[px_off..px_off + 4],
+                &[0, 255, 0, 255],
+                "the sheet recomposed through the edited palette (BGRA green)"
+            );
+
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().palette[1],
+                0xF800,
+                "the edit is one undo step"
+            );
+
+            panel.set_palette_slot(0, 0xFFFF, cx);
+            assert_eq!(
+                ready(panel).store.state().palette[0],
+                0,
+                "slot 0 is locked"
+            );
+            panel.set_palette_slot(PAL_SLOTS + 3, 0xFFFF, cx);
+            assert!(!ready(panel).store.state().dirty, "no stray dirt from no-ops");
         });
     }
 

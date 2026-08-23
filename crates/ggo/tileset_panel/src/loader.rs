@@ -1,20 +1,17 @@
-//! Off-thread tileset loading + the pure grid geometry the viewer needs:
+//! Off-thread tileset loading + the pure grid geometry the editor needs:
 //! open one `.til` (worldlib resolves its companion `.pal` itself) and
 //! compose the whole tile sheet into a single BGRA [`RenderImage`] -- the
 //! tileset-panel analog of `ggo_sprite_panel::loader` (same one-shot
 //! background pass; the panel guards staleness with a load-generation
-//! counter).
-//!
-//! Read-only: nothing here writes, and there is no `TilesetDocStore` --
-//! `open_tileset`'s snapshot is composed once and then only READ, so the
-//! panel never needs the store's undo/dirty machinery.
+//! counter). The panel seeds its `TilesetDocStore` from the loaded
+//! indices and calls [`compose_grid`] again after every doc op.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use ggo_common::to_render_image;
 use ggo_worldlib::sprites::io;
-use ggo_worldlib::sprites::palette565::{Pal, indices_to_rgba, slot_rgba};
+use ggo_worldlib::sprites::palette565::{Pal, indices_to_rgba};
 use ggo_worldlib::sprites::tileset_doc::{
     TILE_PX, compose_tile_grid, resolve_cols, tile_grid_layout,
 };
@@ -93,23 +90,6 @@ pub fn grid_pixel_size(tile_count: usize, cols: usize) -> (u32, u32) {
     ((cols * TILE_PX) as u32, (rows.max(1) * TILE_PX) as u32)
 }
 
-/// One palette slot as straight-alpha RGBA8, for the swatch row.
-///
-/// Thin wrapper over worldlib's [`slot_rgba`] purely to keep the swatch
-/// row's `usize` slot index (it iterates `0..PAL_SLOTS`) from having to
-/// cast at every call site. The RULE -- 565->888, with slot 0 forced
-/// alpha-0 whatever colour the `.pal` stored there (PPU contract §1) --
-/// is worldlib's, not this crate's, as of ggo PR #80.
-///
-/// This module used to own that rule AND its buffer-wide twin
-/// `indices_to_rgba`; the doc here said worldlib "has no
-/// indexed-buffer->RGBA entry point for a bare tile sheet", which was
-/// true and is the gap PR #80 closed (after `ggo_map_panel` grew a third
-/// copy of the same loop).
-pub fn swatch_rgba(palette: &Pal, slot: usize) -> [u8; 4] {
-    slot_rgba(palette, slot as u8)
-}
-
 /// Open `rel` (a project-relative `.til`) and compose its whole sheet.
 pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, String> {
     let opened = io::open_tileset(project_dir, rel).map_err(|e| e.to_string())?;
@@ -137,7 +117,6 @@ pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggo_worldlib::sprites::palette565::PAL_SLOTS;
 
     /// The fallback clamp: a full-or-larger sheet gets the standard 8
     /// columns, a short one gets exactly its own tile count (no padded
@@ -173,16 +152,4 @@ mod tests {
         );
     }
 
-    /// The swatch wrapper still hands slot 0 back transparent regardless
-    /// of the colour stored in it -- the rule now lives in worldlib
-    /// (which tests it directly), so this only pins that the `usize`
-    /// wrapper doesn't lose it on the way through.
-    #[test]
-    fn swatch_rgba_keeps_slot_zero_transparent() {
-        let mut palette = [0u16; PAL_SLOTS];
-        palette[0] = 0xFFFF; // an opaque-looking white the rule must ignore
-        palette[1] = 0xF800; // pure 565 red
-        assert_eq!(swatch_rgba(&palette, 0), [255, 255, 255, 0]);
-        assert_eq!(swatch_rgba(&palette, 1), [255, 0, 0, 255]);
-    }
 }
