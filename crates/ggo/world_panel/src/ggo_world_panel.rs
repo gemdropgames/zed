@@ -314,47 +314,84 @@ fn intercept_world_open(
     // A SECOND click on the world that is already open AND active splits
     // its `.toml` out to a right pane (world view left, toml text right,
     // toml focused). The first click never opens the toml.
-    let second_click = {
+    let second_click_canvas = {
         let canvas = workspace
             .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
             .next();
         let showing = workspace
             .panel::<WorldPanel>(cx)
             .and_then(|panel| panel.read(cx).open_rel_path_now().map(str::to_string));
-        match canvas {
-            Some(canvas) if showing.as_deref() == Some(rel.as_str()) => workspace
-                .active_item(cx)
-                .is_some_and(|item| item.item_id() == canvas.entity_id()),
-            _ => false,
-        }
+        canvas.filter(|canvas| {
+            showing.as_deref() == Some(rel.as_str())
+                && workspace
+                    .active_item(cx)
+                    .is_some_and(|item| item.item_id() == canvas.entity_id())
+        })
     };
-    if second_click {
-        // Reuse the pane already holding this toml (a third click must
-        // not stack more splits); otherwise split the canvas pane right.
-        let existing_pane = workspace
-            .panes()
+    if let Some(canvas) = second_click_canvas {
+        let panes: Vec<_> = workspace.panes().to_vec();
+        let canvas_pane = panes
             .iter()
             .find(|pane| {
                 pane.read(cx)
                     .items()
-                    .any(|item| item.project_path(cx).as_ref() == Some(path))
+                    .any(|item| item.item_id() == canvas.entity_id())
             })
             .cloned();
-        let target = match existing_pane {
-            Some(pane) => pane,
-            None => {
-                let active = workspace.active_pane().clone();
-                workspace.split_pane(active, SplitDirection::Right, window, cx)
+        // Where does the toml already live, if anywhere?
+        let toml_location = panes.iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find(|item| item.project_path(cx).as_ref() == Some(path))
+                .map(|item| (pane.clone(), item.item_id()))
+        });
+        match (toml_location, canvas_pane) {
+            // The toml sits as a tab in the CANVAS's own pane: activating
+            // it there would just swap the world view away. MOVE it out
+            // into a fresh right split instead.
+            (Some((pane, item_id)), Some(canvas_pane)) if pane == canvas_pane => {
+                let new_pane =
+                    workspace.split_pane(canvas_pane.clone(), SplitDirection::Right, window, cx);
+                workspace::move_item(&canvas_pane, &new_pane, item_id, 0, true, window, cx);
             }
-        };
-        let open_toml = workspace.open_path(path.clone(), Some(target.downgrade()), true, window, cx);
-        window
-            .spawn(cx, async move |_| {
-                if let Err(e) = open_toml.await {
-                    log::error!("GGO: failed to open the world's toml split: {e}");
-                }
-            })
-            .detach();
+            // Already open in some OTHER pane: focus it there.
+            (Some((pane, _)), _) => {
+                let open_toml =
+                    workspace.open_path(path.clone(), Some(pane.downgrade()), true, window, cx);
+                window
+                    .spawn(cx, async move |_| {
+                        if let Err(e) = open_toml.await {
+                            log::error!("GGO: failed to focus the world's toml: {e}");
+                        }
+                    })
+                    .detach();
+            }
+            // Not open anywhere: open it in a pane BESIDE the canvas --
+            // an existing other pane if one is there, else a fresh right
+            // split (never stacking extra panes).
+            (None, canvas_pane) => {
+                let other = panes
+                    .iter()
+                    .find(|pane| canvas_pane.as_ref() != Some(*pane))
+                    .cloned();
+                let target = match other {
+                    Some(pane) => pane,
+                    None => {
+                        let active = workspace.active_pane().clone();
+                        workspace.split_pane(active, SplitDirection::Right, window, cx)
+                    }
+                };
+                let open_toml =
+                    workspace.open_path(path.clone(), Some(target.downgrade()), true, window, cx);
+                window
+                    .spawn(cx, async move |_| {
+                        if let Err(e) = open_toml.await {
+                            log::error!("GGO: failed to open the world's toml split: {e}");
+                        }
+                    })
+                    .detach();
+            }
+        }
         return true;
     }
 
@@ -5893,6 +5930,89 @@ mod tests {
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, _cx| {
             assert_eq!(workspace.panes().len(), 2, "no third pane");
+        });
+
+        // The regression: the toml open as a tab in the CANVAS's own pane
+        // must not be "focused in place" (that swaps the world view away)
+        // -- the re-click MOVES it out to the right split.
+        // Rebuild the trap: collapse back to one pane holding canvas+toml.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panes: Vec<_> = workspace.panes().to_vec();
+            let canvas = workspace
+                .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                .next()
+                .expect("canvas item");
+            let canvas_pane = panes
+                .iter()
+                .find(|pane| {
+                    pane.read(cx)
+                        .items()
+                        .any(|item| item.item_id() == canvas.entity_id())
+                })
+                .cloned()
+                .expect("canvas pane");
+            let toml_path = project_path(worktree_id, "worlds/test.toml");
+            let (toml_pane, toml_id) = panes
+                .iter()
+                .find_map(|pane| {
+                    pane.read(cx)
+                        .items()
+                        .find(|item| item.project_path(cx).as_ref() == Some(&toml_path))
+                        .map(|item| (pane.clone(), item.item_id()))
+                })
+                .expect("toml item");
+            workspace::move_item(&toml_pane, &canvas_pane, toml_id, 0, false, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.panes().len(),
+                1,
+                "moving the toml back collapsed the empty split"
+            );
+            let canvas = workspace
+                .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                .next()
+                .expect("canvas item");
+            workspace.activate_item(&canvas, true, true, window, cx);
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "worlds/test.toml"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 2, "the toml split back out");
+            let toml_path = project_path(worktree_id, "worlds/test.toml");
+            let canvas = workspace
+                .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                .next()
+                .expect("canvas item");
+            let canvas_pane = workspace
+                .panes()
+                .iter()
+                .find(|pane| {
+                    pane.read(cx)
+                        .items()
+                        .any(|item| item.item_id() == canvas.entity_id())
+                })
+                .expect("canvas pane");
+            assert!(
+                !canvas_pane
+                    .read(cx)
+                    .items()
+                    .any(|item| item.project_path(cx).as_ref() == Some(&toml_path)),
+                "the toml LEFT the canvas pane instead of swapping over it"
+            );
+            assert!(
+                canvas_pane
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<world_canvas_item::WorldCanvasItem>())
+                    .is_some(),
+                "the world view stays visible on the left"
+            );
         });
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
