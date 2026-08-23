@@ -864,6 +864,22 @@ impl TilesetPanel {
 
     // ------------------------------------------------------------- render
 
+    /// [`Self::render_message`] for FAILURES: same centered layout, but
+    /// the text is copyable so the error can be pasted into a report.
+    fn render_load_error(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_center()
+            .child(
+                ggo_common::CopyableText::new("ggo-tileset-load-error-copy", message)
+                    .size(LabelSize::Default),
+            )
+            .bg(cx.theme().colors().panel_background)
+            .into_any_element()
+    }
+
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .size_full()
@@ -1210,13 +1226,12 @@ impl TilesetPanel {
             .child(self.render_info(cx))
             .child(self.render_palette(cx))
             .when_some(save_error, |this, e| {
-                this.child(
-                    div().p_1().child(
-                        Label::new(format!("Save failed: {e}"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error),
+                this.child(div().p_1().child(
+                    ggo_common::CopyableText::new(
+                        "ggo-tileset-save-error-copy",
+                        format!("Save failed: {e}"),
                     ),
-                )
+                ))
             })
             .into_any_element()
     }
@@ -1244,7 +1259,7 @@ impl TilesetPanel {
             ViewerState::Loading { rel_path } => {
                 self.render_message(format!("Loading {rel_path}…"), cx)
             }
-            ViewerState::Error(e) => self.render_message(format!("Failed to load: {e}"), cx),
+            ViewerState::Error(e) => self.render_load_error(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(cx),
         }
     }

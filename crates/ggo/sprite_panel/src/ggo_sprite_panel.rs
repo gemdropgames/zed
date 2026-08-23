@@ -3038,6 +3038,22 @@ impl SpritePanel {
 
     // ------------------------------------------------------------- render
 
+    /// [`Self::render_message`] for FAILURES: same centered layout, but
+    /// the text is copyable so the error can be pasted into a report.
+    fn render_load_error(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_center()
+            .child(
+                ggo_common::CopyableText::new("ggo-sprite-load-error-copy", message)
+                    .size(LabelSize::Default),
+            )
+            .bg(cx.theme().colors().panel_background)
+            .into_any_element()
+    }
+
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .size_full()
@@ -3133,9 +3149,11 @@ impl SpritePanel {
                     .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
             )
             .children(open.save_error.as_ref().map(|e| {
-                Label::new(format!("save failed: {e}"))
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
+                ggo_common::CopyableText::new(
+                    "ggo-sprite-save-error-copy",
+                    format!("save failed: {e}"),
+                )
+                .size(LabelSize::Small)
             }))
             .into_any_element()
     }
@@ -3565,7 +3583,10 @@ impl SpritePanel {
                                     "no .til in this project -- import a tileset first".to_string()
                                 })
                             })
-                            .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+                            .map(|e| {
+                                ggo_common::CopyableText::new("ggo-sprite-form-error-copy", e)
+                                    .size(LabelSize::Small)
+                            }),
                     )
                     .into_any_element(),
                 )
@@ -3592,11 +3613,10 @@ impl SpritePanel {
                         },
                     )),
                 )
-                .children(
-                    error
-                        .clone()
-                        .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
-                )
+                .children(error.clone().map(|e| {
+                    ggo_common::CopyableText::new("ggo-sprite-rename-error-copy", e)
+                        .size(LabelSize::Small)
+                }))
                 .into_any_element(),
             ),
             PanelForm::NameFrame { index, editor } => Some(
@@ -3705,9 +3725,11 @@ impl SpritePanel {
                 && *at == i
             {
                 row = row.child(
-                    Label::new(SharedString::from(message.clone()))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Error),
+                    ggo_common::CopyableText::new(
+                        "ggo-sprite-clip-error-copy",
+                        SharedString::from(message.clone()),
+                    )
+                    .size(LabelSize::XSmall),
                 );
             }
             cards = cards.child(row);
@@ -3764,9 +3786,11 @@ impl SpritePanel {
                     .color(Color::Muted),
             )
             .children(open.op_error.as_ref().map(|e| {
-                Label::new(SharedString::from(e.clone()))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error)
+                ggo_common::CopyableText::new(
+                    "ggo-sprite-op-error-copy",
+                    SharedString::from(e.clone()),
+                )
+                .size(LabelSize::XSmall)
             }))
             .into_any_element()
     }
@@ -4196,7 +4220,7 @@ impl Render for SpritePanel {
             ViewerState::Loading { rel_path } => {
                 self.render_message(format!("Loading {rel_path}…"), cx)
             }
-            ViewerState::Error(e) => self.render_message(format!("Failed to load: {e}"), cx),
+            ViewerState::Error(e) => self.render_load_error(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
         let form = self.render_form(window, cx);

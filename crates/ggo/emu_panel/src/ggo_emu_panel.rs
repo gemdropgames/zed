@@ -1298,6 +1298,19 @@ impl EmuPanel {
             this.console_expanded = !this.console_expanded;
             cx.notify();
         }));
+        // Copy the WHOLE held log (not just the rendered tail) so a
+        // failure's full context can be pasted anywhere.
+        let copy_all = {
+            let log = log.clone();
+            IconButton::new("ggo-emu-console-copy", IconName::Copy)
+                .icon_size(IconSize::XSmall)
+                .tooltip(ui::Tooltip::text("Copy console log"))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                        log.lines().join("\n"),
+                    ));
+                })
+        };
 
         let body = self.console_expanded.then(|| {
             v_flex()
@@ -1317,7 +1330,13 @@ impl EmuPanel {
             v_flex()
                 .border_t_1()
                 .border_color(cx.theme().colors().border)
-                .child(toggle)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .child(toggle)
+                        .child(div().flex_1())
+                        .child(copy_all),
+                )
                 .children(body)
                 .into_any_element(),
         )
@@ -1360,7 +1379,7 @@ impl Render for EmuPanel {
             .child(div().flex_1().min_h_0().child(self.render_screen(cx)))
             .children(self.render_stats())
             .children(self.status.as_ref().map(|status| {
-                Label::new(status.clone())
+                ggo_common::CopyableText::new("ggo-emu-status-copy", status.clone())
                     .size(LabelSize::Small)
                     .color(if self.status_is_error {
                         Color::Error
@@ -1369,13 +1388,15 @@ impl Render for EmuPanel {
                     })
             }))
             .children(self.ingest_status.label().map(|label| {
-                Label::new(label).size(LabelSize::XSmall).color(
-                    if matches!(self.ingest_status, IngestStatus::Failed(_)) {
-                        Color::Error
-                    } else {
-                        Color::Muted
-                    },
-                )
+                ggo_common::CopyableText::new("ggo-emu-ingest-copy", label)
+                    .size(LabelSize::XSmall)
+                    .color(
+                        if matches!(self.ingest_status, IngestStatus::Failed(_)) {
+                            Color::Error
+                        } else {
+                            Color::Muted
+                        },
+                    )
             }))
             .children(self.render_console(cx))
     }

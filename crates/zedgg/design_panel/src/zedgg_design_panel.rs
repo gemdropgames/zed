@@ -939,9 +939,8 @@ impl Render for DesignPanel {
             .when_some(self.error.clone(), |this, error| {
                 this.child(
                     div().px_2().py_1().child(
-                        Label::new(error)
-                            .size(LabelSize::Small)
-                            .color(Color::Error),
+                        ggo_common::CopyableText::new("zedgg-design-error-copy", error)
+                            .size(LabelSize::Small),
                     ),
                 )
             })

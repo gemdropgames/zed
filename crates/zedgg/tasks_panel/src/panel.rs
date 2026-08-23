@@ -514,9 +514,8 @@ impl Render for TasksPanel {
             .when_some(self.error.clone(), |this, error| {
                 this.child(
                     div().px_2().py_1().child(
-                        Label::new(error)
-                            .size(LabelSize::Small)
-                            .color(Color::Error),
+                        ggo_common::CopyableText::new("zedgg-tasks-error-copy", error)
+                            .size(LabelSize::Small),
                     ),
                 )
             })

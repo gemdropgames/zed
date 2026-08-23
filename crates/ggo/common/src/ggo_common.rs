@@ -1126,3 +1126,64 @@ mod tests {
         assert!(marker.exists(), "the script itself works");
     }
 }
+
+// ---------------------------------------------------------- failure text
+
+/// A failure message every GGO panel can render the same way: the text
+/// plus a copy button that puts the EXACT string on the clipboard, so
+/// any logged failure can be pasted into a bug report or chat. gpui has
+/// no selectable static text (real highlight-selection needs an Editor
+/// or Markdown entity per site); one-click copy is the working
+/// equivalent, applied uniformly.
+#[derive(gpui::IntoElement)]
+pub struct CopyableText {
+    id: gpui::ElementId,
+    text: gpui::SharedString,
+    color: ui::Color,
+    size: ui::LabelSize,
+}
+
+impl CopyableText {
+    pub fn new(id: impl Into<gpui::ElementId>, text: impl Into<gpui::SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            text: text.into(),
+            color: ui::Color::Error,
+            size: ui::LabelSize::XSmall,
+        }
+    }
+
+    pub fn color(mut self, color: ui::Color) -> Self {
+        self.color = color;
+        self
+    }
+
+    pub fn size(mut self, size: ui::LabelSize) -> Self {
+        self.size = size;
+        self
+    }
+}
+
+impl ui::prelude::RenderOnce for CopyableText {
+    fn render(self, _window: &mut gpui::Window, _cx: &mut App) -> impl gpui::IntoElement {
+        use ui::prelude::*;
+        let text = self.text.clone();
+        h_flex()
+            .gap_1()
+            .items_start()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(self.text).size(self.size).color(self.color)),
+            )
+            .child(
+                ui::IconButton::new(self.id, ui::IconName::Copy)
+                    .icon_size(ui::IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Copy message"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
+                    }),
+            )
+    }
+}

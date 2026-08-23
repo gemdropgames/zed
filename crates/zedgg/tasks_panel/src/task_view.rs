@@ -859,7 +859,8 @@ impl Render for TaskView {
             .when_some(self.error.clone(), |parent, error| {
                 parent.child(
                     div().px_2().py_1().child(
-                        Label::new(error).size(LabelSize::Small).color(Color::Error),
+                        ggo_common::CopyableText::new("zedgg-task-error-copy", error)
+                            .size(LabelSize::Small),
                     ),
                 )
             })

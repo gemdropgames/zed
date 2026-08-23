@@ -562,7 +562,10 @@ impl Render for TaskBoard {
                     div()
                         .px_2()
                         .py_1()
-                        .child(Label::new(error).size(LabelSize::Small).color(Color::Error)),
+                        .child(
+                            ggo_common::CopyableText::new("zedgg-board-error-copy", error)
+                                .size(LabelSize::Small),
+                        ),
                 )
             })
             .child({

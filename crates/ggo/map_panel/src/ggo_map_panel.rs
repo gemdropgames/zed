@@ -1204,6 +1204,22 @@ impl MapPanel {
 
     // ------------------------------------------------------------- render
 
+    /// [`Self::render_message`] for FAILURES: same centered layout, but
+    /// the text is copyable so the error can be pasted into a report.
+    fn render_load_error(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_center()
+            .child(
+                ggo_common::CopyableText::new("ggo-map-load-error-copy", message)
+                    .size(LabelSize::Default),
+            )
+            .bg(cx.theme().colors().panel_background)
+            .into_any_element()
+    }
+
     fn render_message(&self, message: String, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .size_full()
@@ -1733,12 +1749,11 @@ impl MapPanel {
                     .on_click(cx.listener(|this, _, window, cx| this.resize_impl(window, cx))),
             )
             .children(open.save_error.as_ref().map(|e| {
-                Label::new(format!("save failed: {e}"))
+                ggo_common::CopyableText::new("ggo-map-save-error-copy", format!("save failed: {e}"))
                     .size(LabelSize::Small)
-                    .color(Color::Error)
             }))
             .children(open.tileset_error.as_ref().map(|e| {
-                Label::new(e.clone())
+                ggo_common::CopyableText::new("ggo-map-tileset-error-copy", e.clone())
                     .size(LabelSize::XSmall)
                     .color(Color::Muted)
             }))
@@ -1929,7 +1944,7 @@ impl Render for MapPanel {
             ViewerState::Loading { rel_path } => {
                 self.render_message(format!("Loading {rel_path}…"), cx)
             }
-            ViewerState::Error(e) => self.render_message(format!("Failed to load: {e}"), cx),
+            ViewerState::Error(e) => self.render_load_error(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
         v_flex()

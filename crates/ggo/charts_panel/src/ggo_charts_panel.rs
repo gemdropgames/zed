@@ -978,7 +978,11 @@ impl ChartsPanel {
         let body = match &self.state {
             LoadState::Empty => Self::note("Select the panel to load runs").into_any_element(),
             LoadState::Loading => Self::note("Loading runs…").into_any_element(),
-            LoadState::Error(e) => Self::note(Self::runs_error_message(e)).into_any_element(),
+            LoadState::Error(e) => {
+                ggo_common::CopyableText::new("ggo-charts-runs-error-copy", Self::runs_error_message(e))
+                    .color(Color::Muted)
+                    .into_any_element()
+            }
             LoadState::Ready(runs) if runs.is_empty() => {
                 Self::note("No perf runs recorded yet").into_any_element()
             }
@@ -1089,7 +1093,7 @@ impl ChartsPanel {
         let body = match &self.device_log {
             None | Some(DeviceLogState::Loading) => self.render_message("Loading log…", cx),
             Some(DeviceLogState::Error(e)) => {
-                self.render_message(Self::device_log_error_message(e), cx)
+                self.render_load_error("ggo-charts-log-error-copy", Self::device_log_error_message(e), cx)
             }
             Some(DeviceLogState::Ready(lines)) => v_flex()
                 .id("ggo-charts-device-body")
@@ -1159,7 +1163,7 @@ impl ChartsPanel {
         let body = match &self.detail {
             None | Some(DetailState::Loading) => self.render_message("Loading samples…", cx),
             Some(DetailState::Error(e)) => {
-                self.render_message(Self::samples_error_message(e), cx)
+                self.render_load_error("ggo-charts-samples-error-copy", Self::samples_error_message(e), cx)
             }
             Some(DetailState::Ready(detail)) => {
                 let (charts, report) = (&detail.charts, &detail.report);
@@ -2257,6 +2261,28 @@ impl ChartsPanel {
         if self.drag.take_if(|d| d.chart == ix).is_some() {
             cx.notify();
         }
+    }
+
+    /// [`Self::render_message`] for FAILURES: same centered layout, but
+    /// the text is copyable so the error can be pasted into a report.
+    fn render_load_error(
+        &self,
+        id: &'static str,
+        message: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_center()
+            .child(
+                ggo_common::CopyableText::new(id, message)
+                    .size(LabelSize::Default)
+                    .color(Color::Muted),
+            )
+            .bg(cx.theme().colors().panel_background)
+            .into_any_element()
     }
 
     fn render_message(

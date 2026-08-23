@@ -2081,7 +2081,10 @@ impl EmeraldPanel {
         if let Some(error) = error
             && !draft.pristine()
         {
-            col = col.child(Label::new(error).size(LabelSize::Small).color(Color::Error));
+            col = col.child(
+                ggo_common::CopyableText::new("ggo-emerald-draft-error-copy", error)
+                    .size(LabelSize::Small),
+            );
         }
         col.child(
             h_flex()
@@ -2135,11 +2138,18 @@ impl EmeraldPanel {
                 .gap_0p5()
                 .p_1()
                 .overflow_scroll()
-                .child(Label::new(message).size(LabelSize::Small).color(color))
+                .child(
+                    ggo_common::CopyableText::new("ggo-emerald-run-message-copy", message)
+                        .size(LabelSize::Small)
+                        .color(color),
+                )
                 .children((!transcript.is_empty()).then(|| {
-                    Label::new(transcript.to_string())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
+                    ggo_common::CopyableText::new(
+                        "ggo-emerald-run-transcript-copy",
+                        transcript.to_string(),
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
                 }))
                 .into_any_element(),
         )

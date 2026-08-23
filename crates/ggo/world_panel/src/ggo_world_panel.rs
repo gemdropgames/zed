@@ -2204,9 +2204,8 @@ impl WorldPanel {
         }
         if let Some(error) = &picker.error {
             block = block.child(
-                Label::new(error.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Error),
+                ggo_common::CopyableText::new("ggo-world-picker-error-copy", error.clone())
+                    .size(LabelSize::Small),
             );
         }
         block.into_any_element()
@@ -2308,9 +2307,11 @@ impl WorldPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
             )
             .children(open.save_error.as_ref().map(|e| {
-                Label::new(format!("save failed: {e}"))
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
+                ggo_common::CopyableText::new(
+                    "ggo-world-save-error-copy",
+                    format!("save failed: {e}"),
+                )
+                .size(LabelSize::Small)
             }))
             .into_any_element()
     }
@@ -2877,9 +2878,8 @@ impl WorldPanel {
         if let Some(error) = &instance.error {
             if !error.is_null() {
                 col = col.child(
-                    Label::new(error.to_string())
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
+                    ggo_common::CopyableText::new("ggo-world-instance-error-copy", error.to_string())
+                        .size(LabelSize::Small),
                 );
             }
         }
