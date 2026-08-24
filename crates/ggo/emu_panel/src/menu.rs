@@ -48,12 +48,10 @@ pub const RUNNABLE_EXTS: [&str; 2] = ["cart", "ggo"];
 /// cart mode" entry has the full list of what differs.
 pub const EMULATE_LABEL: &str = "Emulate this world (cart)";
 
-/// Where a world's built cartridge is written, relative to the emerald
-/// project root. Under `target/` because that is the directory every
-/// emerald project already gitignores (`emd new`'s scaffold) and the one
-/// `emd pack-ggo` itself stages its intermediate card into
-/// (`target/emd-ggo-card`), so a build here adds nothing new to ignore.
-pub const PACK_OUT_DIR: &str = "target/ggo-emulate";
+// Moved to `ggo_common` so the world panel's popout Emulate can build the
+// same argv without a dependency cycle; re-exported to keep this module
+// the home of "what would we run" for the emu panel.
+pub use ggo_common::{PACK_OUT_DIR, failure_reason, pack_out_name, world_pack_args};
 
 /// Env var naming a non-default `ggo-diag` binary -- ggo-ide's Device page
 /// reads the same one (`pages::device::DIAG_BIN_ENV`).
@@ -91,43 +89,6 @@ pub fn is_runnable_cart(rel: &str) -> bool {
 
 // ------------------------------------------------------- world -> cartridge
 
-/// `emd pack-ggo`'s argv for booting `world_stem`, writing to `out`.
-///
-/// This is the fork's port of ggo-ide's world-Emulate invocation
-/// (`pages/world` -> `Message::EmulateWorld` -> `EmuMsg::BuildAndRunWorld`
-/// -> `backend::emubuild::build_full_system_with_world`), reduced to the
-/// half this fork's emulator can consume. Two deliberate differences from
-/// that function, both forced by what `ggo_emu_panel` actually is:
-///
-/// - **`--world <stem>` instead of `EMERALD_DEFAULT_WORLD=<stem>` on the
-///   child's environment.** `emd` gained the flag as documented sugar for
-///   exactly that env var (`emd build --help`: "Sets
-///   `EMERALD_DEFAULT_WORLD` on the cargo build"), and a flag is
-///   inspectable in a [`ProcRequest`] where an environment is not -- which
-///   is what lets the test below assert the boot world without spawning
-///   anything.
-/// - **A cartridge, not a full system image.** ggo-ide builds GemOS +
-///   a FAT card and boots the whole SoC; this panel's [`crate::drive`] is
-///   `ggo-emu`'s CART mode, so the artifact it can run is a cartridge.
-///   `pack-ggo` (not `pack`) because a world needs its ASSETS: the `.ggo`
-///   carries the compiled GGO2 asset section, a bare `.cart` does not.
-pub fn world_pack_args(out: &Path, world_stem: &str) -> Vec<String> {
-    vec![
-        "pack-ggo".to_string(),
-        "--out".to_string(),
-        out.to_string_lossy().into_owned(),
-        "--world".to_string(),
-        world_stem.to_string(),
-    ]
-}
-
-/// The file name a world's cartridge is built under: the world's full
-/// assets-relative stem with `/` flattened to `-`, so `worlds/main` and
-/// `worlds/boss/main` cannot collide in one output directory.
-pub fn pack_out_name(world_stem: &str) -> String {
-    format!("{}.ggo", world_stem.replace('/', "-"))
-}
-
 /// `abs` as a `/`-separated path relative to `root`, or `abs` itself when
 /// it lies outside `root`.
 ///
@@ -144,21 +105,6 @@ pub fn cart_selection(root: &Path, abs: &Path) -> String {
             .join("/"),
         Err(_) => abs.to_string_lossy().into_owned(),
     }
-}
-
-/// The one-line reason a build failed, for the panel's status row: the
-/// last non-blank line of the child's transcript (`emd`'s own error, or
-/// `run_capture`'s "running `emd ...`: No such file or directory" when it
-/// could not be spawned at all), or a named fallback when it printed
-/// nothing.
-pub fn failure_reason(capture: &ggo_common::ProcCapture) -> String {
-    capture
-        .lines
-        .iter()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| "no output".to_string())
 }
 
 // ----------------------------------------------------- hardware diagnostics

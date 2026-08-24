@@ -531,6 +531,21 @@ pub fn emd_bin() -> String {
     resolve_bin(std::env::var(EMD_BIN_ENV).ok(), DEFAULT_EMD_BIN)
 }
 
+/// Env var naming a non-default standalone `ggo-emu` binary -- the same
+/// convention as [`EMD_BIN_ENV`], for the same reason (no settings
+/// surface in this fork).
+pub const GGO_EMU_BIN_ENV: &str = "GGO_EMU";
+
+/// Bare-name fallback for the standalone `ggo-emu` binary, resolved
+/// against `PATH`.
+pub const DEFAULT_GGO_EMU_BIN: &str = "ggo-emu";
+
+/// The standalone `ggo-emu` binary to spawn: [`GGO_EMU_BIN_ENV`] when set
+/// and non-blank, else [`DEFAULT_GGO_EMU_BIN`].
+pub fn ggo_emu_bin() -> String {
+    resolve_bin(std::env::var(GGO_EMU_BIN_ENV).ok(), DEFAULT_GGO_EMU_BIN)
+}
+
 /// A configured binary override, with blank treated as unset (the same
 /// filter ggo-ide's `resolve_emd_bin` applies to its stored setting), so an
 /// accidentally-empty export doesn't turn into a spawn of `""`. Split out
@@ -732,6 +747,90 @@ fn capture_lines(bytes: &[u8]) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+/// The last non-blank line of a failed capture -- with `--json` implying
+/// `--quiet`, `emd`'s output on failure is the error report, and the last
+/// line is the actual message (earlier ones are cargo's progress noise).
+pub fn failure_reason(capture: &ProcCapture) -> String {
+    capture
+        .lines
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "no output".to_string())
+}
+
+/// Spawn `request` detached: no wait, no capture, and the child outlives
+/// the caller -- for launching an external app (the standalone emulator)
+/// rather than running a tool to completion. No `kill_on_drop`: dropping
+/// the [`smol::process::Child`] leaves the process running, which is the
+/// point. A spawn failure is reported as text naming the command, same as
+/// [`run_capture`]'s rule.
+pub fn spawn_detached(request: &ProcRequest) -> Result<(), String> {
+    Command::new(&request.bin)
+        .args(&request.args)
+        .current_dir(&request.cwd)
+        .spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("running `{}`: {e}", request.command_line()))
+}
+
+/// The injection seam for [`spawn_detached`], shaped like [`ProcRunner`]
+/// and existing for the same reason: a panel holds one and tests substitute
+/// a recorder.
+pub type DetachedLauncher = Arc<dyn Fn(ProcRequest) -> Result<(), String> + Send + Sync>;
+
+/// The production launcher: really spawn the child, detached.
+pub fn system_detached_launcher() -> DetachedLauncher {
+    Arc::new(|request| spawn_detached(&request))
+}
+
+// ------------------------------------------------- world -> cartridge
+
+/// Where a world's built cartridge is written, relative to the emerald
+/// project root. Under `target/` because that is the directory every
+/// emerald project already gitignores (`emd new`'s scaffold) and the one
+/// `emd pack-ggo` itself stages its intermediate card into
+/// (`target/emd-ggo-card`), so a build here adds nothing new to ignore.
+pub const PACK_OUT_DIR: &str = "target/ggo-emulate";
+
+/// `emd pack-ggo`'s argv for booting `world_stem`, writing to `out`.
+///
+/// This is the fork's port of ggo-ide's world-Emulate invocation
+/// (`pages/world` -> `Message::EmulateWorld` -> `EmuMsg::BuildAndRunWorld`
+/// -> `backend::emubuild::build_full_system_with_world`), reduced to the
+/// half this fork's emulator can consume. Two deliberate differences from
+/// that function, both forced by what `ggo_emu_panel` actually is:
+///
+/// - **`--world <stem>` instead of `EMERALD_DEFAULT_WORLD=<stem>` on the
+///   child's environment.** `emd` gained the flag as documented sugar for
+///   exactly that env var (`emd build --help`: "Sets
+///   `EMERALD_DEFAULT_WORLD` on the cargo build"), and a flag is
+///   inspectable in a [`ProcRequest`] where an environment is not -- which
+///   is what lets the tests assert the boot world without spawning
+///   anything.
+/// - **A cartridge, not a full system image.** ggo-ide builds GemOS +
+///   a FAT card and boots the whole SoC; the in-pane emulator is
+///   `ggo-emu`'s CART mode, so the artifact it can run is a cartridge.
+///   `pack-ggo` (not `pack`) because a world needs its ASSETS: the `.ggo`
+///   carries the compiled GGO2 asset section, a bare `.cart` does not.
+pub fn world_pack_args(out: &Path, world_stem: &str) -> Vec<String> {
+    vec![
+        "pack-ggo".to_string(),
+        "--out".to_string(),
+        out.to_string_lossy().into_owned(),
+        "--world".to_string(),
+        world_stem.to_string(),
+    ]
+}
+
+/// The file name a world's cartridge is built under: the world's full
+/// assets-relative stem with `/` flattened to `-`, so `worlds/main` and
+/// `worlds/boss/main` cannot collide in one output directory.
+pub fn pack_out_name(world_stem: &str) -> String {
+    format!("{}.ggo", world_stem.replace('/', "-"))
 }
 
 #[cfg(test)]

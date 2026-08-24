@@ -624,6 +624,9 @@ struct OpenWorld {
     gesture_counter: u64,
     inspector: Vec<InspectorEntry>,
     save_error: Option<String>,
+    /// Why the popout Emulate could not launch (failed build or spawn),
+    /// shown on the toolbar next to `save_error`.
+    popout_error: Option<String>,
     /// The open palette color picker, if any -- at most one, anchored to
     /// one Color565 field.
     color_picker: Option<ColorPicker>,
@@ -692,6 +695,7 @@ impl OpenWorld {
             gesture_counter: 0,
             inspector: Vec::new(),
             save_error: None,
+            popout_error: None,
             color_picker: None,
             stem_completion: None,
         }
@@ -766,6 +770,12 @@ pub struct WorldPanel {
     state: ViewerState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
+    /// Runs `emd pack-ggo` for the popout Emulate; swapped for a fake in
+    /// tests, same seam as `ggo_emu_panel`'s.
+    proc_runner: ggo_common::ProcRunner,
+    /// Launches the standalone `ggo-emu` on the built cartridge.
+    emu_launcher: ggo_common::DetachedLauncher,
+    _popout_task: Option<Task<()>>,
 }
 
 impl WorldPanel {
@@ -780,6 +790,9 @@ impl WorldPanel {
             state: ViewerState::Empty,
             load_generation: 0,
             _load_task: None,
+            proc_runner: ggo_common::system_proc_runner(),
+            emu_launcher: ggo_common::system_detached_launcher(),
+            _popout_task: None,
         }
     }
 
@@ -1901,6 +1914,83 @@ impl WorldPanel {
         });
     }
 
+    /// The toolbar's popout-Emulate button: build the cartridge exactly as
+    /// the in-pane Emulate does (save first, `emd pack-ggo --world <stem>`),
+    /// then launch the standalone `ggo-emu` on the artifact instead of
+    /// booting the in-IDE pane. No registry hop, because no emulator pane
+    /// is involved -- the whole flow is this panel's own, and its failures
+    /// land on this toolbar ([`OpenWorld::popout_error`]).
+    fn emulate_popout_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let rel = open.source_rel.clone();
+        self.set_popout_error(None, cx);
+        // Same stale-file rule as the in-pane Emulate: a failed save
+        // cancels the build (`save_error` is already on the toolbar).
+        if !self.save_if_open_and_dirty(&rel, cx) {
+            return;
+        }
+        let Some(root) = self.project_root.clone() else {
+            self.set_popout_error(Some("no project folder is open".to_string()), cx);
+            return;
+        };
+        let Some(stem) = world_stem(&rel) else {
+            self.set_popout_error(Some(format!("{rel} is not a world file")), cx);
+            return;
+        };
+        let Some(project_dir) = ggo_common::emerald_project_root(&root.join(&rel)) else {
+            self.set_popout_error(
+                Some(format!(
+                    "no {} above {rel} — emd needs an emerald project",
+                    ggo_common::EMERALD_MANIFEST
+                )),
+                cx,
+            );
+            return;
+        };
+        let out_dir = project_dir.join(ggo_common::PACK_OUT_DIR);
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.set_popout_error(Some(format!("{}: {e}", out_dir.display())), cx);
+            return;
+        }
+        let out = out_dir.join(ggo_common::pack_out_name(&stem));
+        let pack =
+            ggo_common::ProcRequest::emd(&project_dir, ggo_common::world_pack_args(&out, &stem));
+        let launch = ggo_common::ProcRequest::new(
+            ggo_common::ggo_emu_bin(),
+            project_dir,
+            vec![out.to_string_lossy().into_owned()],
+        );
+        let runner = self.proc_runner.clone();
+        let launcher = self.emu_launcher.clone();
+        self._popout_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let capture = runner(pack);
+                    if !capture.ok {
+                        return Err(format!(
+                            "build failed: {}",
+                            ggo_common::failure_reason(&capture)
+                        ));
+                    }
+                    launcher(launch)
+                })
+                .await;
+            this.update(cx, |this, cx| this.set_popout_error(result.err(), cx))
+                .ok();
+        }));
+    }
+
+    /// Set (or clear) the popout-Emulate failure on the toolbar. A no-op
+    /// when no world is open any more -- there is nowhere to show it.
+    fn set_popout_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.popout_error = error;
+            cx.notify();
+        }
+    }
+
     // ------------------------------------------------- color picker
 
     /// Open the palette picker for `target` (or close it if it is already
@@ -2334,6 +2424,12 @@ impl WorldPanel {
                     .on_click(cx.listener(|this, _, window, cx| this.emulate_impl(window, cx))),
             )
             .child(
+                IconButton::new("ggo-world-emulate-popout", IconName::ArrowUpRight)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Emulate this world in the external emulator"))
+                    .on_click(cx.listener(|this, _, _, cx| this.emulate_popout_impl(cx))),
+            )
+            .child(
                 IconButton::new("ggo-world-add-entity", IconName::Plus)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Add entity"))
@@ -2372,6 +2468,13 @@ impl WorldPanel {
                 ggo_common::CopyableText::new(
                     "ggo-world-save-error-copy",
                     format!("save failed: {e}"),
+                )
+                .size(LabelSize::Small)
+            }))
+            .children(open.popout_error.as_ref().map(|e| {
+                ggo_common::CopyableText::new(
+                    "ggo-world-popout-error-copy",
+                    format!("popout failed: {e}"),
                 )
                 .size(LabelSize::Small)
             }))
@@ -5792,6 +5895,167 @@ mod tests {
                 "the open world's rel path reaches the registered emulator"
             );
         });
+    }
+
+    /// A recording `ProcRunner` + `DetachedLauncher` pair for the popout
+    /// Emulate: the pack reply is canned (`pack_ok`), and both logs are
+    /// returned so a test can assert what was (or was not) spawned.
+    #[allow(clippy::type_complexity)]
+    fn fake_popout_seams(
+        pack_ok: bool,
+    ) -> (
+        ggo_common::ProcRunner,
+        ggo_common::DetachedLauncher,
+        Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>>,
+        Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>>,
+    ) {
+        let packs: Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let launches: Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = packs.clone();
+        let runner: ggo_common::ProcRunner = Arc::new(move |request| {
+            recorded.lock().unwrap().push(request);
+            ggo_common::ProcCapture {
+                ok: pack_ok,
+                lines: vec!["pack output".to_string()],
+            }
+        });
+        let recorded = launches.clone();
+        let launcher: ggo_common::DetachedLauncher = Arc::new(move |request| {
+            recorded.lock().unwrap().push(request);
+            Ok(())
+        });
+        (runner, launcher, packs, launches)
+    }
+
+    /// The popout button packs the OPEN world's cart (`emd pack-ggo
+    /// --world <stem>`, so the cart BOOTS to that world) and hands the
+    /// artifact to the standalone `ggo-emu` as its one positional argument
+    /// -- no in-IDE pane involved.
+    #[gpui::test]
+    async fn test_popout_builds_the_cart_then_launches_ggo_emu_on_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ggo_common::EMERALD_MANIFEST), b"").unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let (runner, launcher, packs, launches) = fake_popout_seams(true);
+        panel.update(cx, |panel, cx| {
+            panel.proc_runner = runner;
+            panel.emu_launcher = launcher;
+            panel.emulate_popout_impl(cx);
+        });
+        cx.executor().run_until_parked();
+
+        let out = dir.path().join("target/ggo-emulate/worlds-test.ggo");
+        {
+            let packs = packs.lock().unwrap();
+            assert_eq!(packs.len(), 1, "exactly one pack run");
+            assert_eq!(
+                packs[0].args,
+                vec![
+                    "pack-ggo".to_string(),
+                    "--out".to_string(),
+                    out.to_string_lossy().into_owned(),
+                    "--world".to_string(),
+                    "worlds/test".to_string(),
+                    "--json".to_string(),
+                ],
+                "the pack argv names the out path and the boot world"
+            );
+            assert_eq!(
+                packs[0].cwd,
+                dir.path().to_path_buf(),
+                "emd runs in the emerald project root"
+            );
+        }
+        {
+            let launches = launches.lock().unwrap();
+            assert_eq!(launches.len(), 1, "exactly one launch");
+            assert_eq!(launches[0].bin, ggo_common::DEFAULT_GGO_EMU_BIN);
+            assert_eq!(
+                launches[0].args,
+                vec![out.to_string_lossy().into_owned()],
+                "ggo-emu gets the built cart as its one positional argument"
+            );
+        }
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.popout_error.is_none());
+        });
+    }
+
+    /// A failed pack surfaces on the toolbar and the launch never happens.
+    #[gpui::test]
+    async fn test_popout_build_failure_is_shown_and_skips_the_launch(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ggo_common::EMERALD_MANIFEST), b"").unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let (runner, launcher, _packs, launches) = fake_popout_seams(false);
+        panel.update(cx, |panel, cx| {
+            panel.proc_runner = runner;
+            panel.emu_launcher = launcher;
+            panel.emulate_popout_impl(cx);
+        });
+        cx.executor().run_until_parked();
+
+        assert!(
+            launches.lock().unwrap().is_empty(),
+            "no launch after a failed build"
+        );
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let error = open
+                .popout_error
+                .as_deref()
+                .expect("the failure must be surfaced");
+            assert!(
+                error.contains("pack output"),
+                "{error:?} should carry emd's last line"
+            );
+        });
+    }
+
+    /// A dirty world whose save fails must NOT be built -- the popout
+    /// would boot the stale file on disk (the same rule the in-pane
+    /// Emulate enforces via `save_if_open_and_dirty`).
+    #[gpui::test]
+    async fn test_popout_is_cancelled_when_the_save_fails(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ggo_common::EMERALD_MANIFEST), b"").unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let (runner, launcher, packs, launches) = fake_popout_seams(true);
+        // Same deterministic write failure as the save tests: repoint the
+        // doc's root at a regular file.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.proc_runner = runner;
+            panel.emu_launcher = launcher;
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [50.0, 60.0],
+                    gesture: None,
+                },
+                cx,
+            );
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.root = blocker;
+            panel.emulate_popout_impl(cx);
+        });
+        cx.executor().run_until_parked();
+
+        assert!(
+            packs.lock().unwrap().is_empty(),
+            "a failed save cancels the build"
+        );
+        assert!(launches.lock().unwrap().is_empty());
     }
 
     /// With nothing registered, `intercept_path_open` claims nothing --
