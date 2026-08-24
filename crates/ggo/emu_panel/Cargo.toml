@@ -29,6 +29,7 @@ keymap_editor.workspace = true
 log.workspace = true # GGO -- R6: the cpal stream-error callback runs on a realtime audio thread, so it reports rather than panics
 project.workspace = true
 serde_json.workspace = true
+smol.workspace = true # GGO -- `yield_now` between pumped frames, see `EmuPanel::run`
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # Same pure-Rust SQLite engine ggo-db's migrate() takes a connection from.
 # Mirrors ggo_charts_panel's Cargo.toml (and ggo-ide's own): the ingest

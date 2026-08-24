@@ -7607,6 +7607,7 @@ dependencies = [
  "rpc",
  "semver",
  "serde_json",
+ "smol",
  "tempfile",
  "tokio",
  "turso",

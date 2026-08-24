@@ -618,6 +618,16 @@ impl EmuPanel {
                 {
                     return;
                 }
+                // Give the executor a turn after EVERY frame. `recv` only
+                // suspends on an empty channel, and the emulator thread
+                // refills it every ~16ms -- so whenever one frame's update
+                // (a redraw, in a test window synchronously) takes longer
+                // than that, the next `recv` is ready immediately and this
+                // loop never yields: one poll of this task runs for the
+                // whole life of the cart, starving every other foreground
+                // task. Observed as a permanent hang in the debug-build
+                // tests, where a full workspace draw is slower than a frame.
+                smol::future::yield_now().await;
             }
             // The emulator thread dropped its sender: the run is over on
             // its own terms (cart exit, CPU fault, or a stop flag it has
@@ -2480,16 +2490,23 @@ mod tests {
     /// Drive the panel until the emulator thread delivers a frame. Bounded,
     /// so a broken pump fails the test instead of hanging it.
     fn await_first_frame(panel: &Entity<EmuPanel>, cx: &mut gpui::VisualTestContext) {
-        let mut waited = std::time::Duration::ZERO;
-        let step = std::time::Duration::from_millis(10);
+        // One task per turn (`tick`), NOT `run_until_parked`: while the
+        // cart runs, the emulator thread lands a frame every ~16ms, and on
+        // a machine where a debug-build redraw takes longer than that the
+        // executor never goes idle -- `run_until_parked` livelocks, and a
+        // sleep-counting deadline never fires because the pump never
+        // returns. Ticking re-checks the exit condition between tasks, and
+        // the deadline is wall-clock so it fires no matter where the time
+        // actually went.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while panel.read_with(cx, |panel, _| panel.latest_frame.is_none()) {
             assert!(
-                waited < std::time::Duration::from_secs(10),
+                std::time::Instant::now() < deadline,
                 "no frame reached the panel from the emulator thread"
             );
-            std::thread::sleep(step);
-            cx.run_until_parked();
-            waited += step;
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
 
