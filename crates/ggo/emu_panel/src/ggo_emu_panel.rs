@@ -198,6 +198,9 @@ pub fn open_emu_item(
     cx: &mut Context<Workspace>,
     f: impl FnOnce(&mut EmuPanel, &mut Window, &mut Context<EmuPanel>),
 ) -> bool {
+    // Starting emulation is a HEAVY action: fold every center split into
+    // one pane first, so the screen goes to the emulator.
+    ggo_common::collapse_center_splits(workspace, window, cx);
     let existing = workspace.items_of_type::<EmulatorItem>(cx).next();
     let item = match existing {
         Some(item) => {
@@ -1583,6 +1586,32 @@ mod tests {
                 workspace.items_of_type::<EmulatorItem>(cx).count(),
                 1,
                 "exactly one emulator tab"
+            );
+        });
+
+        // HEAVY action: opening the emulator folds every center split
+        // into one pane, moving (not closing) the splits' tabs.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let active = workspace.active_pane().clone();
+            let new_pane = workspace.split_pane(
+                active,
+                workspace::SplitDirection::Right,
+                window,
+                cx,
+            );
+            let extra = cx.new(workspace::item::test::TestItem::new);
+            new_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(extra), true, true, None, window, cx);
+            });
+            assert_eq!(workspace.panes().len(), 2, "split exists before the run");
+        });
+        emu_panel_via_item(&workspace, cx);
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 1, "the split folded away");
+            assert_eq!(
+                workspace.active_pane().read(cx).items_len(),
+                2,
+                "the split's tab moved into the surviving pane"
             );
         });
     }

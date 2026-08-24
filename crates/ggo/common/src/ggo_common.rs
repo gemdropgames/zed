@@ -1127,6 +1127,29 @@ mod tests {
     }
 }
 
+
+/// Collapse every center-pane split: move all items from every other
+/// pane into the FIRST pane (emptied panes remove themselves), leaving
+/// one pane. The "heavy action" prelude -- starting emulation or opening
+/// a report wants the whole center area, so the splits fold away first.
+pub fn collapse_center_splits(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let panes: Vec<_> = workspace.panes().to_vec();
+    let Some(first) = panes.first().cloned() else {
+        return;
+    };
+    for pane in panes.iter().skip(1) {
+        let item_ids: Vec<_> = pane.read(cx).items().map(|item| item.item_id()).collect();
+        for item_id in item_ids {
+            let destination_index = first.read(cx).items_len();
+            workspace::move_item(pane, &first, item_id, destination_index, false, window, cx);
+        }
+    }
+}
+
 // ---------------------------------------------------------- failure text
 
 /// A failure message every GGO panel can render the same way: the text

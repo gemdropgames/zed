@@ -250,6 +250,9 @@ pub fn open_charts_item(
     cx: &mut Context<Workspace>,
     f: impl FnOnce(&mut ChartsPanel, &mut Window, &mut Context<ChartsPanel>),
 ) -> bool {
+    // Opening a report is a HEAVY action: fold every center split into
+    // one pane first, so the screen goes to the report.
+    ggo_common::collapse_center_splits(workspace, window, cx);
     let existing = workspace.items_of_type::<ChartsItem>(cx).next();
     let item = match existing {
         Some(item) => {
@@ -2385,6 +2388,34 @@ mod tests {
         );
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(workspace.items_of_type::<ChartsItem>(cx).count(), 1);
+        });
+
+        // HEAVY action: opening a report folds every center split into
+        // one pane, moving (not closing) the splits' tabs.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let active = workspace.active_pane().clone();
+            let new_pane = workspace.split_pane(
+                active,
+                workspace::SplitDirection::Right,
+                window,
+                cx,
+            );
+            let extra = cx.new(workspace::item::test::TestItem::new);
+            new_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(extra), true, true, None, window, cx);
+            });
+            assert_eq!(workspace.panes().len(), 2, "split exists before the report");
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_charts_item(workspace, window, cx, |_, _, _| {});
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 1, "the split folded away");
+            assert_eq!(
+                workspace.active_pane().read(cx).items_len(),
+                2,
+                "the split's tab moved into the surviving pane"
+            );
         });
     }
 
