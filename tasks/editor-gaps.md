@@ -151,7 +151,7 @@ Refs: GB Studio ROM export, TIC-80 cart export.
 - [ ] State machine over `ggo-diag` stdout with parsed verdicts on the emu status row
 - [ ] Export cart to a chosen path (the pack already exists; expose it without running)
 
-## 10. Editor chrome consistency — `medium`
+## 10. Editor chrome consistency — `partial 2026-08-25` (emerald + charts items open)
 
 Map, emerald, import are right-dock panels; sprite, tileset, emu, charts are
 center tabs; world is both. Keybindings are bound imperatively, not in
@@ -159,10 +159,10 @@ center tabs; world is both. Keybindings are bound imperatively, not in
 `ui` has no slider primitive so every continuous control is a stepper.
 Refs: Godot 4.6 movable/floatable docks.
 
-- [ ] Move the map editor to a center tab per `.map` (same shape as tileset)
-- [ ] Move the import wizard to a center tab (or a modal) — decide, then do
-- [ ] Declare all `ggo_*` keybindings in `assets/keymaps/default-*.json` so the keymap editor sees and rebinds them; keep the reload tripwire test
-- [ ] `ui::Slider` primitive; replace steppers for onion opacity, zoom, palSub, preview size
+- [x] Map editor is a center tab per `.map` (2026-08-25)
+- [x] Import wizard is a singleton center tab (2026-08-25)
+- [x] All `ggo_*` keybindings declared in `assets/keymaps/default-{linux,macos}.json`; panel keystroke tests bind the asset (the tripwire) (2026-08-25)
+- [x] `ui::Slider`; zoom (tileset/map/import/world), palSub, onion opacity are sliders — there was no preview-size stepper to replace (2026-08-25)
 - [ ] Emerald: free numeric cadence field instead of the fixed picker (`MIGRATION.md:179`); drag-to-reorder schedule rows
 - [ ] Emerald: undo for schedule edits (or a visible "revert to manifest" that isn't only the error path)
 - [ ] Charts: frame-0 ignore-set editor + "N of M excluded" readout (`MIGRATION.md:585`)
