@@ -142,6 +142,9 @@ pub fn compose_strip(tileset: &Tileset) -> Option<Arc<RenderImage>> {
 /// which is what the tileset editor keys its sidecar by. `None` when the
 /// asset root is not inside `project_root`.
 pub fn tileset_meta_rel(asset_root: &Path, project_root: &Path, til_rel: &str) -> Option<String> {
+    if til_rel.is_empty() {
+        return None;
+    }
     let under = asset_root.strip_prefix(project_root).ok()?;
     let under = under.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
     Some(if under.is_empty() {
@@ -224,6 +227,23 @@ pub fn load_map(root: &Path, rel: &str, project_root: &Path) -> Result<LoadedMap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tileset_meta_rel_is_worktree_relative_or_none() {
+        let project = Path::new("/p");
+        let assets = Path::new("/p/assets");
+        assert_eq!(
+            tileset_meta_rel(assets, project, "tiles/a.til").as_deref(),
+            Some("assets/tiles/a.til")
+        );
+        assert_eq!(tileset_meta_rel(project, project, "a.til").as_deref(), Some("a.til"));
+        assert_eq!(tileset_meta_rel(assets, project, ""), None, "an unbound map has no sidecar");
+        assert_eq!(
+            tileset_meta_rel(Path::new("/elsewhere"), project, "a.til"),
+            None,
+            "outside the worktree"
+        );
+    }
     use ggo_worldlib::sprites::map_doc::{CELL_BLANK, MapDocStore, pack_cell};
     use ggo_worldlib::sprites::palette565::PAL_SLOTS;
     use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;

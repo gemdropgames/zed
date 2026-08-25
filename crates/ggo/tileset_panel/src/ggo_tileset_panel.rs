@@ -1834,6 +1834,19 @@ mod tests {
             panel.set_cols(2, cx);
             panel.zoom_by(3, cx);
         });
+        // The map panel keeps its terrains in the same sidecar; a later
+        // view write must not wipe them.
+        let mut meta = loader::load_view_meta(dir.path(), "tiles/world.til");
+        meta.terrains = vec![ggo_worldlib::sprites::terrain::Terrain {
+            name: "grass".into(),
+            tiles: vec![],
+        }];
+        loader::save_view_meta(dir.path(), "tiles/world.til", &meta).unwrap();
+        panel.update(cx, |panel, cx| panel.zoom_by(-1, cx));
+        assert_eq!(
+            loader::load_view_meta(dir.path(), "tiles/world.til").terrains[0].name,
+            "grass"
+        );
 
         // A fresh panel on the same rel restores the stored view settings.
         let root = dir.path().to_path_buf();
@@ -1852,7 +1865,11 @@ mod tests {
         second.update(cx, |panel, _| {
             let open = ready(panel);
             assert_eq!(open.cols, 2, "cols came back from the sidecar");
-            assert_eq!(open.zoom, DEFAULT_ZOOM + 3, "zoom came back from the sidecar");
+            assert_eq!(
+                open.zoom,
+                DEFAULT_ZOOM + 2,
+                "zoom came back from the sidecar (3 up, then the 1 down above)"
+            );
         });
     }
 

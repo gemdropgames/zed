@@ -1314,6 +1314,11 @@ impl MapPanel {
         }
         let (x, y) = Self::paste_origin(open);
         let (w, h) = (stamp.w as i32, stamp.h as i32);
+        if let ViewerState::Ready(open) = &mut self.state {
+            // A paste is its own undo step, never part of a drag that
+            // ended off-canvas.
+            open.store.end_stroke();
+        }
         self.apply_op(MapOp::Brush { x, y, stamp }, cx);
         if let ViewerState::Ready(open) = &mut self.state {
             open.selection = Some((x, y, x + w - 1, y + h - 1));
@@ -1321,7 +1326,11 @@ impl MapPanel {
     }
 
     fn delete_selection_impl(&mut self, cx: &mut Context<Self>) {
-        let Some((x0, y0, x1, y1)) = self.ready_map().and_then(|open| open.selection) else {
+        let Some((x0, y0, x1, y1)) = self
+            .ready_map()
+            .filter(|open| open.tileset.is_some())
+            .and_then(|open| open.selection)
+        else {
             return;
         };
         self.apply_op(
@@ -1363,7 +1372,9 @@ impl MapPanel {
         if name.is_empty() {
             return;
         }
-        if let ViewerState::Ready(open) = &mut self.state {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.tileset.is_some()
+        {
             open.terrains.push(Terrain { name, tiles: vec![] });
             open.terrain = Some(open.terrains.len() - 1);
         }
@@ -1469,12 +1480,14 @@ impl MapPanel {
                         .gap_1()
                         .flex_wrap()
                         .children(name_field)
-                        .child(Button::new("ggo-map-terrain-add", "Add").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                let name = this.terrain_name_text(cx);
-                                this.add_terrain(name, cx);
-                            },
-                        )))
+                        .child(
+                            Button::new("ggo-map-terrain-add", "Add")
+                                .disabled(open.tileset.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let name = this.terrain_name_text(cx);
+                                    this.add_terrain(name, cx);
+                                })),
+                        )
                         .child(
                             Button::new("ggo-map-terrain-rename", "Rename")
                                 .disabled(selected.is_none())
@@ -1930,6 +1943,11 @@ impl MapPanel {
                     this.end_paint(cx);
                     return;
                 }
+                // A flood fill is a click, not a drag: refilling per move
+                // would stack one undo entry per region crossed.
+                if this.ready_map().is_some_and(|open| open.tool == MapTool::Fill) {
+                    return;
+                }
                 let Some(cell) = cell else { return };
                 this.paint_at(cell, cx);
             }))
@@ -1971,6 +1989,9 @@ impl MapPanel {
                     return;
                 };
                 this.zoom_at_cursor(if dy > 0.0 { 1 } else { -1 }, local, cx);
+                if let ViewerState::Ready(open) = &mut this.state {
+                    open.hover_cell = open.cell_at(event.position);
+                }
             }))
             .into_any_element()
     }
