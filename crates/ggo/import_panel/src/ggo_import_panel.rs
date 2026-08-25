@@ -77,8 +77,11 @@
 //!   derives. The spec calls this out as an honest, permanent loss.
 
 mod geom;
-mod thumbnails;
+mod import_item;
 mod loader;
+mod thumbnails;
+
+pub use import_item::{ImportItem, open_import_item};
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -87,7 +90,7 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    Action, App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, EventEmitter,
+    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity,
     FocusHandle, Focusable, Hsla, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
     MouseMoveEvent,
     MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent,
@@ -98,7 +101,6 @@ use project::ProjectPath;
 use ui::prelude::*;
 use ui::{Checkbox, ToggleState, Tooltip};
 use workspace::Workspace;
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, is_importable_source, join_dest_path,
@@ -114,8 +116,6 @@ use ggo_worldlib::sprites::tileset_meta::{
 actions!(
     ggo_import,
     [
-        /// Toggles focus on the GGO import panel.
-        ToggleFocus,
         /// Writes the pending import to its `.til`/`.pal`.
         Import,
         /// Clears the crop rectangle.
@@ -131,17 +131,12 @@ actions!(
     ]
 );
 
-const GGO_IMPORT_PANEL_KEY: &str = "GGOImportPanel";
 
 /// The panel's key-dispatch context (`.key_context`), which the
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoImportPanel";
 const KEY_CONTEXT_NO_EDITOR: &str = "GgoImportPanel && !Editor";
 
-/// Fixed default width until the panel grows real settings persistence
-/// (same call every other GGO panel made at this stage). As wide as the map
-/// panel: this one stacks a crop canvas, a preview and a form.
-const DEFAULT_WIDTH: Pixels = px(460.);
 
 /// The assets subdirectory hanging off an emerald project root. Hardcoded
 /// upstream -- it is NOT a configurable `emerald.toml` key. Same constant
@@ -187,30 +182,15 @@ pub fn init(cx: &mut App) {
         thumbnails::decode_thumbnail,
     );
 
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(window) = window else {
-            return;
-        };
-
-        let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| ImportPanel::new(Some(weak_workspace), cx));
-        workspace.add_panel(panel, window, cx);
-
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<ImportPanel>(window, cx);
-        });
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(
             |workspace, action: &ggo_common::ReimportTileset, window, cx| {
-                let Some(panel) = workspace.panel::<ImportPanel>(cx) else {
-                    return;
-                };
                 let til_rel = action.til_rel.clone();
                 let root = worktree_root(workspace, cx);
-                panel.update(cx, |panel, cx| {
+                open_import_item(workspace, window, cx, move |panel, _window, cx| {
                     panel.adopt_root(root, cx);
                     panel.reimport_tileset(&til_rel, cx);
                 });
-                workspace.focus_panel::<ImportPanel>(window, cx);
             },
         );
     })
@@ -260,20 +240,17 @@ fn intercept_image_drop(
     if !paths.iter().all(|path| is_importable_path(path)) {
         return false;
     }
-    let Some(panel) = workspace.panel::<ImportPanel>(cx) else {
-        return false;
-    };
     let ignored = paths.len() - 1;
     let root = worktree_root(workspace, cx);
-    panel.update(cx, |panel, cx| {
-        // The drop can land before the panel was ever activated.
+    let first = first.clone();
+    open_import_item(workspace, window, cx, move |panel, _window, cx| {
         panel.adopt_root(root, cx);
-        panel.open_abs_source(first.clone(), cx);
+        panel.open_abs_source(first, cx);
         if ignored > 0 {
-            panel.status = Some(format!("{ignored} more dropped file(s) ignored — one source at a time"));
+            panel.status =
+                Some(format!("{ignored} more dropped file(s) ignored — one source at a time"));
         }
     });
-    workspace.focus_panel::<ImportPanel>(window, cx);
     true
 }
 
@@ -341,10 +318,19 @@ fn import_png_handler(
     workspace: WeakEntity<Workspace>,
     rel: String,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<ImportPanel>, window, cx| {
+    move |window, cx| {
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
         let rel = rel.clone();
-        panel.update(cx, |panel, cx| panel.open_source(&rel, window, cx));
-    })
+        workspace.update(cx, |workspace, cx| {
+            let root = worktree_root(workspace, cx);
+            open_import_item(workspace, window, cx, move |panel, _window, cx| {
+                panel.adopt_root(root, cx);
+                panel.load_source(&rel, cx);
+            });
+        });
+    }
 }
 
 /// Walk up from `start`'s own directory to the nearest emerald project root
@@ -724,7 +710,6 @@ enum ViewerState {
 
 pub struct ImportPanel {
     focus_handle: FocusHandle,
-    position: DockPosition,
     workspace: Option<WeakEntity<Workspace>>,
     /// Test hook: bypass workspace worktree discovery.
     root_override: Option<PathBuf>,
@@ -750,7 +735,6 @@ impl ImportPanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            position: DockPosition::Right,
             workspace,
             root_override: None,
             project_root: None,
@@ -2183,86 +2167,6 @@ impl Focusable for ImportPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for ImportPanel {}
-
-impl Panel for ImportPanel {
-    fn persistent_name() -> &'static str {
-        "GGO Import"
-    }
-
-    fn panel_key() -> &'static str {
-        GGO_IMPORT_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        // Same call as every other GGO panel: no settings persistence yet,
-        // and Bottom isn't a sensible spot for a canvas + form stack.
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        DEFAULT_WIDTH
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        // `Download` -- a downward arrow into a tray -- is upstream's own
-        // glyph for "bring this in" (`agent_ui`'s thread IMPORT button uses
-        // exactly it, and `extensions_ui` uses it for installing), which is
-        // what this panel does. No panel uses it as a dock icon, and the
-        // GGO neighbours are all taken: `Blocks` is `ggo_tileset_panel`,
-        // `SquareDot` `ggo_map_panel`, `Image` `ggo_sprite_panel`,
-        // `Public` `ggo_world_panel`.
-        Some(IconName::Download)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO Import")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
-        // `ggo_charts_panel` 10, `ggo_emu_panel` 11, `ggo_tileset_panel` 12,
-        // `ggo_map_panel` 14 -- which deliberately left 13 for this panel
-        // (grep activation_priority across crates/).
-        13
-    }
-
-    // No `prepare_to_close`: a pending import is not a document and nothing
-    // it holds has ever been written -- see `open_source`'s doc.
-
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if active {
-            // Deferred: `set_active` fires inside the workspace's own update
-            // (dock toggle), and `refresh_root` needs to READ the workspace
-            // to find the project root -- reading it re-entrantly panics
-            // (same as every other GGO panel).
-            let this = cx.weak_entity();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_root(cx)).ok();
-            });
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2502,34 +2406,28 @@ mod tests {
     /// mounted into the dispatch tree once something renders
     /// `Workspace::actions` (same lesson as the other GGO panels').
     #[gpui::test]
-    async fn test_toggle_focus_opens_panel(cx: &mut TestAppContext) {
+    async fn test_open_import_item_is_a_singleton_center_tab(cx: &mut TestAppContext) {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
         });
-
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        workspace.update(cx, |workspace, cx| {
-            assert!(
-                workspace.panel::<ImportPanel>(cx).is_some(),
-                "ImportPanel should have been added to the workspace by init()"
-            );
-            assert!(!workspace.right_dock().read(cx).is_open());
+        let first = workspace.update_in(cx, |workspace, window, cx| {
+            open_import_item(workspace, window, cx, |_, _, _| {})
         });
-
-        cx.dispatch_action(ToggleFocus);
-
-        workspace.update(cx, |workspace, cx| {
-            let panel = workspace
-                .panel::<ImportPanel>(cx)
-                .expect("ImportPanel should still be registered");
-            assert_eq!(panel.read(cx).position, DockPosition::Right);
-            assert!(workspace.right_dock().read(cx).is_open());
+        let second = workspace.update_in(cx, |workspace, window, cx| {
+            open_import_item(workspace, window, cx, |_, _, _| {})
+        });
+        assert_eq!(first.entity_id(), second.entity_id(), "one wizard, re-focused");
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<ImportItem>(cx).count(), 1);
+            let item = workspace.items_of_type::<ImportItem>(cx).next().unwrap();
+            assert_eq!(workspace::item::Item::tab_content_text(item.read(cx), 0, cx).as_ref(), "Import");
+            assert!(!workspace::item::Item::is_dirty(item.read(cx), cx), "never dirty");
         });
     }
 
@@ -3654,10 +3552,10 @@ mod tests {
                 .read(cx)
                 .id()
         });
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<ImportPanel>(cx)
-                .expect("init() adds the panel")
+        // The wizard is a tab now: open it and hand its panel back, as the
+        // dock panel used to be handed back.
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            open_import_item(workspace, window, cx, |_, _, _| {})
         });
         // The tileset panel needs NO root override: the fake worktree is
         // rooted at the REAL temp path, so its own `refresh_root` resolves to
