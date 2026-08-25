@@ -89,10 +89,10 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyWindowHandle, App, Bounds, Context, FocusHandle, Focusable, InteractiveElement,
+    AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseMoveEvent,
     Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription, Task,
     WeakEntity, Window, actions, div, point, px, size,
@@ -476,6 +476,30 @@ pub struct EmuPanel {
     /// run resumed -- by the next render. A user's own pause never sets it,
     /// so it is never auto-resumed.
     auto_paused: bool,
+    /// Watch mode: a save anywhere in the project re-packs and restarts
+    /// `watched_world` (the world the last "Emulate this world" built).
+    watch: bool,
+    watched_world: Option<String>,
+    watch_rebuilds: u32,
+    /// The window the watch restarts run in -- `emulate_world` needs one
+    /// and a worktree event has none.
+    watch_window: Option<AnyWindowHandle>,
+    _watch_subscription: Option<Subscription>,
+    _watch_debounce: Option<Task<()>>,
+}
+
+/// How long after the last change the re-pack waits, so a save that
+/// writes several files (a `.til`/`.pal` pair, a sprite trio) packs once.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Does a changed worktree-relative path warrant a re-pack? The pack's
+/// own output and the editor sidecars never do (the former would loop).
+fn watch_triggers(rel: &str, change: &project::PathChange) -> bool {
+    if matches!(change, project::PathChange::Removed | project::PathChange::Loaded) {
+        return false;
+    }
+    let rel = rel.trim_start_matches('/');
+    !(rel.starts_with(menu::PACK_OUT_DIR) || rel.starts_with(".ggo-ide"))
 }
 
 impl EmuPanel {
@@ -542,7 +566,92 @@ impl EmuPanel {
             _focus_out,
             debug: debug::DebugState::new(),
             auto_paused: false,
+            watch: false,
+            watched_world: None,
+            watch_rebuilds: 0,
+            watch_window: None,
+            _watch_subscription: None,
+            _watch_debounce: None,
         }
+    }
+
+    // --------------------------------------------------------------- watch
+
+    /// Turn watch mode on/off. On requires a world to have been emulated
+    /// (a bare cart has nothing to re-pack).
+    fn set_watch(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if on && self.watched_world.is_none() {
+            return;
+        }
+        self.watch = on;
+        self.watch_window = on.then(|| window.window_handle());
+        if !on {
+            self._watch_debounce = None;
+        }
+        if on {
+            self.ensure_watch_subscription(cx);
+        }
+        cx.notify();
+    }
+
+    /// Subscribe to the project's worktree changes once. Called from the
+    /// watch toggle (outside any `Workspace` update), never from `new`,
+    /// which runs while the workspace is leased.
+    fn ensure_watch_subscription(&mut self, cx: &mut Context<Self>) {
+        if self._watch_subscription.is_some() {
+            return;
+        }
+        let Some(project) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.upgrade())
+            .map(|workspace| workspace.read(cx).project().clone())
+        else {
+            return;
+        };
+        self._watch_subscription = Some(cx.subscribe(&project, Self::on_project_event));
+    }
+
+    fn on_project_event(
+        &mut self,
+        _project: Entity<project::Project>,
+        event: &project::Event,
+        cx: &mut Context<Self>,
+    ) {
+        let project::Event::WorktreeUpdatedEntries(_, changes) = event else {
+            return;
+        };
+        if !self.watch {
+            return;
+        }
+        let relevant = changes
+            .iter()
+            .any(|(path, _, change)| watch_triggers(path.as_unix_str(), change));
+        if relevant {
+            self.schedule_watch_rebuild(cx);
+        }
+    }
+
+    /// (Re)start the debounce; the rebuild runs when it lapses.
+    fn schedule_watch_rebuild(&mut self, cx: &mut Context<Self>) {
+        let (Some(world), Some(window)) = (self.watched_world.clone(), self.watch_window) else {
+            return;
+        };
+        self._watch_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WATCH_DEBOUNCE).await;
+            window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        if !this.watch {
+                            return;
+                        }
+                        this.watch_rebuilds += 1;
+                        this.emulate_world(&world, window, cx);
+                    })
+                    .ok();
+                })
+                .ok();
+        }));
     }
 
     /// Re-discover the project root (the workspace's first visible
@@ -638,6 +747,8 @@ impl EmuPanel {
         let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()));
         self.console = Some(session.uart().clone());
         self.session = Some(session);
+        // A watch restart keeps the pad as the player holds it.
+        self.publish_input();
         self.status = None;
         self.status_is_error = false;
         self.frame = 0;
@@ -851,6 +962,7 @@ impl EmuPanel {
     /// [`Self::open_rel_path`] defers it for the interceptor.
     pub fn emulate_world(&mut self, world_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(window, cx);
+        self.watched_world = Some(world_rel.to_string());
         self.build_generation += 1;
         let generation = self.build_generation;
         let world_rel = world_rel.to_string();
@@ -1775,6 +1887,26 @@ impl EmuPanel {
             .p_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            .child(
+                Button::new("ggo-emu-watch", if self.watch { "Watching" } else { "Watch" })
+                    .toggle_state(self.watch)
+                    .disabled(self.watched_world.is_none())
+                    .tooltip(Tooltip::text(match &self.watched_world {
+                        Some(world) => format!("Re-pack and restart {world} on every save"),
+                        None => "Emulate a world first".to_string(),
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let on = !this.watch;
+                        this.set_watch(on, window, cx)
+                    })),
+            )
+            .when(self.watch && self.watch_rebuilds > 0, |el| {
+                el.child(
+                    Label::new(format!("rebuilt {}×", self.watch_rebuilds))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
             .child(
                 IconButton::new("ggo-emu-run", IconName::PlayFilled)
                     .icon_size(IconSize::Small)
@@ -5146,5 +5278,79 @@ mod tests {
                 "the run itself ended normally -- only the ingest failed"
             );
         });
+    }
+
+    // ------------------------------------------------------ watch (task 8)
+
+    #[test]
+    fn watch_triggers_skips_pack_output_sidecars_and_removals() {
+        use project::PathChange;
+        assert!(watch_triggers("assets/tiles/a.til", &PathChange::Updated));
+        assert!(watch_triggers("assets/worlds/main.toml", &PathChange::AddedOrUpdated));
+        assert!(!watch_triggers("target/ggo-emulate/worlds-main.ggo", &PathChange::Added));
+        assert!(!watch_triggers(".ggo-ide/assets/tiles/a.til.editor.json", &PathChange::Updated));
+        assert!(!watch_triggers("assets/tiles/a.til", &PathChange::Removed));
+    }
+
+    #[gpui::test]
+    async fn test_watch_mode_repacks_after_a_save_and_ignores_its_own_output(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_proc_runner(|_| ok_capture());
+        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
+        let fs = workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).fs().clone());
+        let fake_fs = fs.as_fake();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_watch(true, window, cx);
+            assert!(!panel.watch, "nothing to watch before a world was emulated");
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::emulate_world(workspace, "assets/worlds/main.toml", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        panel.update_in(cx, |panel, window, cx| panel.set_watch(true, window, cx));
+        assert!(panel.read_with(cx, |panel, _| panel.watch));
+
+        fake_fs
+            .insert_tree(
+                "/proj",
+                serde_json::json!({ "assets": { "tiles": {} }, "target": { "ggo-emulate": {} } }),
+            )
+            .await;
+        cx.run_until_parked();
+        cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let after_dirs = calls.lock().unwrap().len();
+
+        // Two quick saves collapse into one re-pack.
+        fake_fs.insert_file("/proj/assets/tiles/a.til", b"til".to_vec()).await;
+        fake_fs.insert_file("/proj/assets/tiles/a.pal", b"pal".to_vec()).await;
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), after_dirs, "still debouncing");
+        cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let after_save = calls.lock().unwrap().len();
+        assert_eq!(after_save, after_dirs + 1, "one re-pack after the debounce");
+
+        // The pack's own output landing in the worktree must not loop.
+        fake_fs.insert_file("/proj/target/ggo-emulate/worlds-main.ggo", b"cart".to_vec()).await;
+        cx.run_until_parked();
+        cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), after_save, "no rebuild for the output");
+
+        panel.update_in(cx, |panel, window, cx| panel.set_watch(false, window, cx));
+        fake_fs.insert_file("/proj/assets/tiles/b.til", b"til".to_vec()).await;
+        cx.run_until_parked();
+        cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), after_save, "off means off");
     }
 }
