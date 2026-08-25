@@ -44,6 +44,7 @@ use workspace::Workspace;
 
 use ggo_worldlib::sprites::io::save_tileset;
 use ggo_worldlib::sprites::palette565::PAL_SLOTS;
+use ggo_worldlib::sprites::pixel_tools;
 use ggo_worldlib::sprites::tileset_doc::{TILE_PX, TilesetDocStore};
 use ggo_worldlib::sprites::tileset_meta::load_tileset_meta;
 
@@ -77,9 +78,17 @@ actions!(
         /// Zooms the tileset view out one step.
         ZoomOut,
         /// Selects the whole sheet with the Select tool.
-        SelectWholeSheet
+        SelectWholeSheet,
+        /// Shrinks the brush by one pixel.
+        BrushSmaller,
+        /// Grows the brush by one pixel.
+        BrushLarger,
     ]
 );
+
+/// Brush size bounds (px, square).
+const MIN_BRUSH: usize = 1;
+const MAX_BRUSH: usize = 4;
 
 /// The panel's key-dispatch context identifier -- undo/redo/save bind
 /// here, scoped so they only fire while the editor has focus.
@@ -134,6 +143,8 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", CopySelection, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-v", PasteSelection, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-v", PasteSelection, Some(KEY_CONTEXT)),
+        KeyBinding::new("[", BrushSmaller, Some(KEY_CONTEXT)),
+        KeyBinding::new("]", BrushLarger, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -199,6 +210,18 @@ enum Tool {
     Eraser,
     Picker,
     Select,
+    /// Flood the contiguous same-colour region of the composed sheet.
+    Fill,
+    Line,
+    Rect,
+    Ellipse,
+}
+
+impl Tool {
+    /// Drag-to-shape tools: preview while dragging, commit on release.
+    fn is_shape(self) -> bool {
+        matches!(self, Tool::Line | Tool::Rect | Tool::Ellipse)
+    }
 }
 
 /// The open tileset: worldlib's doc store plus the view state that must
@@ -263,6 +286,13 @@ struct OpenTileset {
     clipboard: Option<(usize, usize, Vec<u8>)>,
     /// Whether the tile-boundary lines draw over the sheet.
     show_lines: bool,
+    /// Brush size (px, square) for the pencil, eraser and shape tools.
+    brush: usize,
+    /// Mirror every paint about the painted tile's centre lines.
+    mirror_h: bool,
+    mirror_v: bool,
+    /// An in-progress Line/Rect/Ellipse drag, sheet-space (anchor, head).
+    shape_drag: Option<((usize, usize), (usize, usize))>,
 }
 
 impl OpenTileset {
@@ -289,7 +319,33 @@ impl OpenTileset {
             selection: None,
             clipboard: None,
             show_lines: loaded.lines.unwrap_or(true),
+            brush: MIN_BRUSH,
+            mirror_h: false,
+            mirror_v: false,
+            shape_drag: None,
         }
+    }
+
+    /// Brush expansion then per-tile mirroring -- what every paint goes
+    /// through before it reaches the document.
+    fn expand_points(&self, points: &[(i32, i32)]) -> Vec<(i32, i32)> {
+        let brushed = pixel_tools::brush_expand(points, self.brush);
+        pixel_tools::mirror_in_tile(&brushed, TILE_PX, self.mirror_h, self.mirror_v)
+    }
+
+    /// The points a shape drag would paint, expanded.
+    fn shape_points(&self, filled: bool) -> Vec<(i32, i32)> {
+        let Some(((ax, ay), (hx, hy))) = self.shape_drag else {
+            return Vec::new();
+        };
+        let (a, b) = ((ax as i32, ay as i32), (hx as i32, hy as i32));
+        let raw = match self.tool {
+            Tool::Line => pixel_tools::line(a, b),
+            Tool::Rect => pixel_tools::rect(a, b, filled),
+            Tool::Ellipse => pixel_tools::ellipse(a, b, filled),
+            _ => Vec::new(),
+        };
+        self.expand_points(&raw)
     }
 
     /// The sheet's on-screen size at the current zoom.
@@ -303,8 +359,8 @@ impl OpenTileset {
     /// painting tools -- Picker/Select never reach `paint_at`.
     fn paint_color(&self) -> u8 {
         match self.tool {
-            Tool::Pencil | Tool::Picker | Tool::Select => self.slot as u8,
             Tool::Eraser => 0,
+            _ => self.slot as u8,
         }
     }
 }
@@ -557,15 +613,78 @@ impl TilesetPanel {
     /// paints are no-ops inside the store, so drag-painting over
     /// already-painted ground is free.
     fn paint_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some((tile, x, y)) = self.pixel_at(pos) else {
+        let Some((sx, sy)) = self.sheet_px_at(pos) else {
             return;
         };
+        let (points, color) = match &self.state {
+            ViewerState::Ready(open) => (
+                open.expand_points(&[(sx as i32, sy as i32)]),
+                open.paint_color(),
+            ),
+            _ => return,
+        };
+        self.write_in_stroke(&points, color, cx);
+    }
+
+    /// Paint sheet points inside the stroke the gesture already opened
+    /// (points off the sheet or over pad cells are dropped).
+    fn write_in_stroke(&mut self, points: &[(i32, i32)], color: u8, cx: &mut Context<Self>) {
+        let writes: Vec<(usize, usize, usize)> = points
+            .iter()
+            .filter(|(x, y)| *x >= 0 && *y >= 0)
+            .filter_map(|&(x, y)| self.doc_pixel(x as usize, y as usize))
+            .collect();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let color = open.paint_color();
-        open.store.apply_stroke_paint(tile, x, y, color);
+        if writes.is_empty() {
+            return;
+        }
+        for (tile, x, y) in writes {
+            open.store.apply_stroke_paint(tile, x, y, color);
+        }
         self.recompose_grid(cx);
+    }
+
+    /// Paint sheet points as ONE undo step (a whole shape, a fill).
+    fn write_points(&mut self, points: &[(i32, i32)], color: u8, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.store.begin_stroke();
+        }
+        self.write_in_stroke(points, color, cx);
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.store.end_stroke();
+        }
+    }
+
+    /// The Fill tool: flood the composed sheet from the clicked pixel.
+    fn fill_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((sx, sy)) = self.sheet_px_at(pos) else {
+            return;
+        };
+        let (state, cols, color) = match &self.state {
+            ViewerState::Ready(open) => (open.store.state(), open.cols, open.paint_color()),
+            _ => return,
+        };
+        let sample = |x: i32, y: i32| {
+            if x < 0 || y < 0 {
+                return None;
+            }
+            let (x, y) = (x as usize, y as usize);
+            if x >= cols * TILE_PX {
+                return None;
+            }
+            let tile = (y / TILE_PX) * cols + x / TILE_PX;
+            if tile >= state.tile_count {
+                return None;
+            }
+            let index = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS
+                + (y % TILE_PX) * TILE_PX
+                + x % TILE_PX;
+            state.indices.get(index).copied()
+        };
+        let region = pixel_tools::flood(sample, (sx as i32, sy as i32));
+        self.write_points(&region, color, cx);
     }
 
     /// Rebuild the composed sheet image from the store's current state --
@@ -600,6 +719,17 @@ impl TilesetPanel {
                 self.pick_at(pos, cx);
                 return; // a pick is instantaneous, no drag state
             }
+            Tool::Fill => {
+                self.fill_at(pos, cx);
+                return;
+            }
+            Tool::Line | Tool::Rect | Tool::Ellipse => {
+                let anchor = self.sheet_px_at(pos);
+                if let ViewerState::Ready(open) = &mut self.state {
+                    open.shape_drag = anchor.map(|p| (p, p));
+                    cx.notify();
+                }
+            }
             Tool::Select => {
                 let anchor = self.sheet_px_at(pos);
                 if let ViewerState::Ready(open) = &mut self.state {
@@ -623,6 +753,15 @@ impl TilesetPanel {
         }
         match tool {
             Tool::Pencil | Tool::Eraser => self.paint_at(pos, cx),
+            Tool::Line | Tool::Rect | Tool::Ellipse => {
+                let head = self.sheet_px_at(pos);
+                if let (ViewerState::Ready(open), Some(head)) = (&mut self.state, head)
+                    && let Some((anchor, _)) = open.shape_drag
+                {
+                    open.shape_drag = Some((anchor, head));
+                    cx.notify();
+                }
+            }
             Tool::Select => {
                 let head = self.sheet_px_at(pos);
                 if let (ViewerState::Ready(open), Some(head)) = (&mut self.state, head)
@@ -632,7 +771,7 @@ impl TilesetPanel {
                     cx.notify();
                 }
             }
-            Tool::Picker => {}
+            Tool::Picker | Tool::Fill => {}
         }
     }
 
@@ -784,12 +923,33 @@ impl TilesetPanel {
         cx.notify();
     }
 
-    fn on_sheet_mouse_up(&mut self, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state
-            && open.painting
-        {
-            open.store.end_stroke();
-            open.painting = false;
+    /// Release: a shape drag commits (shift = filled); any other gesture
+    /// closes its stroke.
+    fn on_sheet_mouse_up(&mut self, shift: bool, cx: &mut Context<Self>) {
+        let shape = match &mut self.state {
+            ViewerState::Ready(open) if open.painting => {
+                open.painting = false;
+                let points = open.shape_points(shift);
+                open.shape_drag = None;
+                if open.tool.is_shape() {
+                    Some((points, open.paint_color()))
+                } else {
+                    open.store.end_stroke();
+                    None
+                }
+            }
+            _ => return,
+        };
+        if let Some((points, color)) = shape {
+            self.write_points(&points, color, cx);
+        }
+        cx.notify();
+    }
+
+    fn step_brush(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.brush =
+                (open.brush as isize + delta).clamp(MIN_BRUSH as isize, MAX_BRUSH as isize) as usize;
             cx.notify();
         }
     }
@@ -939,6 +1099,9 @@ impl TilesetPanel {
         let accent = cx.theme().colors().border_focused;
         let zoom = open.zoom as f32;
         let selection = self.selection_rect();
+        // The shape preview: what a release without shift would paint.
+        let preview = open.shape_points(false);
+        let preview_color = cx.theme().colors().text_accent;
         // `.top_0().left_0()` matters: an absolute child with auto insets
         // sits at its STATIC position -- after the in-flow img sibling --
         // so the recorded bounds would be shifted by exactly the image
@@ -963,6 +1126,19 @@ impl TilesetPanel {
                         ),
                     );
                     window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                }
+                for &(x, y) in &preview {
+                    if x < 0 || y < 0 {
+                        continue;
+                    }
+                    let cell = Bounds::new(
+                        gpui::point(
+                            bounds.origin.x + px(x as f32 * zoom),
+                            bounds.origin.y + px(y as f32 * zoom),
+                        ),
+                        gpui::size(px(zoom), px(zoom)),
+                    );
+                    window.paint_quad(gpui::fill(cell, preview_color));
                 }
             },
         )
@@ -1013,8 +1189,8 @@ impl TilesetPanel {
                                         ))
                                         .on_mouse_up(
                                             MouseButton::Left,
-                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                                this.on_sheet_mouse_up(cx);
+                                            cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                                                this.on_sheet_mouse_up(event.modifiers.shift, cx);
                                             }),
                                         ),
                                 )
@@ -1140,6 +1316,61 @@ impl TilesetPanel {
                     .toggle_state(open.tool == Tool::Select)
                     .tooltip(ui::Tooltip::text("Select region (ctrl-c copy, ctrl-v paste)"))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Select, cx))),
+            )
+            .children(
+                [
+                    (Tool::Fill, "ggo-tileset-fill", IconName::Sparkle, "Fill (floods across tiles)"),
+                    (Tool::Line, "ggo-tileset-line", IconName::Dash, "Line"),
+                    (Tool::Rect, "ggo-tileset-rect", IconName::Maximize, "Rectangle (shift = filled)"),
+                    (Tool::Ellipse, "ggo-tileset-ellipse", IconName::Circle, "Ellipse (shift = filled)"),
+                ]
+                .map(|(tool, id, icon, tip)| {
+                    IconButton::new(id, icon)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(open.tool == tool)
+                        .tooltip(ui::Tooltip::text(tip))
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_tool(tool, cx)))
+                }),
+            )
+            .child(div().w_2())
+            .child(
+                IconButton::new("ggo-tileset-brush-down", IconName::Dash)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(open.brush <= MIN_BRUSH)
+                    .tooltip(ui::Tooltip::text("Smaller brush ([)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.step_brush(-1, cx))),
+            )
+            .child(Label::new(format!("{}px", open.brush)).size(LabelSize::XSmall))
+            .child(
+                IconButton::new("ggo-tileset-brush-up", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(open.brush >= MAX_BRUSH)
+                    .tooltip(ui::Tooltip::text("Larger brush (])"))
+                    .on_click(cx.listener(|this, _, _, cx| this.step_brush(1, cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-mirror-h", IconName::ArrowRightLeft)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.mirror_h)
+                    .tooltip(ui::Tooltip::text("Mirror horizontally within the tile"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let ViewerState::Ready(open) = &mut this.state {
+                            open.mirror_h = !open.mirror_h;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                IconButton::new("ggo-tileset-mirror-v", IconName::ExpandVertical)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.mirror_v)
+                    .tooltip(ui::Tooltip::text("Mirror vertically within the tile"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let ViewerState::Ready(open) = &mut this.state {
+                            open.mirror_v = !open.mirror_v;
+                            cx.notify();
+                        }
+                    })),
             )
             .child(div().w_2())
             .child(
@@ -1368,6 +1599,8 @@ impl Render for TilesetPanel {
             )
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.zoom_by(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.zoom_by(-1, cx)))
+            .on_action(cx.listener(|this, _: &BrushSmaller, _window, cx| this.step_brush(-1, cx)))
+            .on_action(cx.listener(|this, _: &BrushLarger, _window, cx| this.step_brush(1, cx)))
             .on_action(
                 cx.listener(|this, _: &SelectWholeSheet, _window, cx| this.select_whole_sheet(cx)),
             )
@@ -1671,7 +1904,7 @@ mod tests {
             // Paint tile 0's pixel (3, 2) with slot 1 (red).
             let pos = pixel_pos(ready(panel), 0, 3, 2);
             panel.on_sheet_mouse_down(pos, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
 
             let open = ready(panel);
             let state = open.store.state();
@@ -1708,7 +1941,7 @@ mod tests {
             let after = pixel_pos(ready(panel), 0, 2, 0);
             panel.on_sheet_mouse_down(down, cx);
             panel.on_sheet_mouse_move(drag, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             panel.on_sheet_mouse_move(after, cx);
 
             let state = ready(panel).store.state();
@@ -1725,9 +1958,9 @@ mod tests {
 
             // Two separate clicks are two steps.
             panel.on_sheet_mouse_down(down, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             panel.on_sheet_mouse_down(drag, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             panel.undo_impl(cx);
             let state = ready(panel).store.state();
             assert_eq!(state.indices[0], 1, "the first click survives");
@@ -1749,7 +1982,7 @@ mod tests {
             panel.set_tool(Tool::Eraser, cx);
             let pos = pixel_pos(ready(panel), 1, 5, 5);
             panel.on_sheet_mouse_down(pos, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert_eq!(
                 state.indices[TILE_PIXELS + 5 * TILE_PX + 5],
@@ -1784,7 +2017,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let (w, h) = ready(panel).zoomed_size();
             panel.on_sheet_mouse_down(point(px(w + 10.), px(h + 10.)), cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert!(!state.dirty, "off-sheet clicks must not paint");
         });
@@ -1858,7 +2091,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let pos = pixel_pos(ready(panel), 0, 0, 0);
             panel.on_sheet_mouse_down(pos, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             panel.save_impl(cx);
             let open = ready(panel);
             assert!(open.save_error.is_none(), "the fixture root is writable");
@@ -1872,7 +2105,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let pos = pixel_pos(ready(panel), 0, 1, 0);
             panel.on_sheet_mouse_down(pos, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             panel.project_root = Some(dir.path().join("tiles/world.til"));
             panel.save_impl(cx);
             let open = ready(panel);
@@ -2016,7 +2249,7 @@ mod tests {
             let to = pixel_pos(ready(panel), 1, 1, 1);
             panel.on_sheet_mouse_down(from, cx);
             panel.on_sheet_mouse_move(to, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             assert_eq!(
                 panel.selection_rect(),
                 Some((TILE_PX, 0, TILE_PX + 1, 1)),
@@ -2033,7 +2266,7 @@ mod tests {
             // Move the selection onto tile 0 (all transparent) and paste.
             let target_from = pixel_pos(ready(panel), 0, 2, 2);
             panel.on_sheet_mouse_down(target_from, cx);
-            panel.on_sheet_mouse_up(cx);
+            panel.on_sheet_mouse_up(false, cx);
             panel.paste_clipboard(cx);
             {
                 let state = ready(panel).store.state();
@@ -2387,6 +2620,106 @@ mod tests {
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert!(ready(panel).import_alert.as_ref().is_some_and(|a| a.missing));
+        });
+    }
+
+    // ------------------------------------------------- pixel tools (task 7)
+
+    fn idx(tile: usize, x: usize, y: usize) -> usize {
+        tile * TILE_PIXELS + y * TILE_PX + x
+    }
+
+    #[gpui::test]
+    async fn test_line_drag_paints_its_endpoints_as_one_undo_step(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Line, cx);
+            let a = pixel_pos(ready(panel), 0, 0, 0);
+            let b = pixel_pos(ready(panel), 0, 5, 3);
+            panel.on_sheet_mouse_down(a, cx);
+            panel.on_sheet_mouse_move(b, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(0, 0, 0)], 0, "nothing until release");
+            assert!(!ready(panel).shape_points(false).is_empty(), "preview points exist");
+            panel.on_sheet_mouse_up(false, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 0, 0)], 1);
+            assert_eq!(state.indices[idx(0, 5, 3)], 1);
+            assert!(ready(panel).shape_drag.is_none());
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().indices[idx(0, 5, 3)], 0, "one undo clears the line");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rect_is_an_outline_unless_shift_fills(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Rect, cx);
+            let a = pixel_pos(ready(panel), 0, 1, 1);
+            let b = pixel_pos(ready(panel), 0, 4, 4);
+            panel.on_sheet_mouse_down(a, cx);
+            panel.on_sheet_mouse_move(b, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 1, 1)], 1);
+            assert_eq!(state.indices[idx(0, 2, 2)], 0, "outline leaves the middle");
+            panel.on_sheet_mouse_down(a, cx);
+            panel.on_sheet_mouse_move(b, cx);
+            panel.on_sheet_mouse_up(true, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(0, 2, 2)], 1, "shift fills");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fill_floods_across_the_tile_border(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            // Tiles 1 and 2 are solid slot 1 and adjacent on the sheet; tile
+            // 0 is transparent. Filling tile 1 with slot 2 crosses into 2.
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Fill, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 3, 3), cx);
+            panel.on_sheet_mouse_up(false, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 0, 0)], 2);
+            assert_eq!(state.indices[idx(2, 7, 7)], 2, "flooded across the border");
+            assert_eq!(state.indices[idx(0, 0, 0)], 0, "tile 0 was a different colour");
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().indices[idx(2, 7, 7)], 1, "one undo step");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_brush_size_and_mirror_expand_a_pencil_dot(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.step_brush(1, cx);
+            assert_eq!(ready(panel).brush, 2);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.mirror_h = true;
+            }
+            let pos = pixel_pos(ready(panel), 0, 1, 2);
+            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            let state = ready(panel).store.state();
+            for (x, y) in [(1, 2), (2, 2), (1, 3), (2, 3)] {
+                assert_eq!(state.indices[idx(0, x, y)], 1, "brush 2x2 at ({x},{y})");
+            }
+            let m = TILE_PX - 1;
+            for (x, y) in [(m - 1, 2), (m - 2, 2), (m - 1, 3), (m - 2, 3)] {
+                assert_eq!(state.indices[idx(0, x, y)], 1, "mirrored at ({x},{y})");
+            }
+            assert_eq!(state.indices[idx(0, 3, 2)], 0, "the middle is untouched");
+            panel.step_brush(-5, cx);
+            assert_eq!(ready(panel).brush, MIN_BRUSH, "clamped");
         });
     }
 }
