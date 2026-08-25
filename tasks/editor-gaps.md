@@ -47,24 +47,24 @@ Refs: LDtk typed fields / entity refs, Godot GDScript LSP.
 - [ ] LSP code actions named in the spec: snap / center / offset
 - [ ] LSP hardware-budget diagnostics (tile/sprite counts per world)
 
-## 3. Emulator debug surfaces — `medium`
+## 3. Emulator debug surfaces — `done 2026-08-25`
 
 Run / Stop / Mute only. GB Studio 4.3's debugger shows live background +
 overlay tilemaps. The drive loop already checks a stop flag once per turn
 (`emu_panel/src/drive.rs:390`); pause and single-step are the same mechanism.
 Refs: GB Studio 4.3 debugger, Mesen/bgb-style VRAM viewers.
 
-- [ ] Pause / resume flag in `drive::run`, transport button + keybinding
-- [ ] Frame advance (single-step one vsync while paused)
-- [ ] Tilemap viewer (background + overlay) reading core state between steps
-- [ ] OAM / sprite table viewer
-- [ ] Palette viewer
-- [ ] VRAM / tile viewer
-- [ ] Integer-scale framebuffer (replace `img().w_full().h_full()` linear blur — `MIGRATION.md:187`)
-- [ ] Release the pad mask on window deactivation (stuck keys — `MIGRATION.md:579`)
-- [ ] Pause (or at least stop pumping) when the emulator tab is hidden (`MIGRATION.md:196`)
-- [ ] Truncate instead of reject runs over `MAX_FRAMES = 100_000` at ingest (`MIGRATION.md:582`)
-- [ ] Call `savefile::flush_save` so pane runs persist saves (`drive.rs:325`)
+- [x] Pause / resume flag in `drive::run`, transport button + keybinding (`ctrl-alt-p`, 2026-08-25)
+- [x] Frame advance (`ctrl-alt-.`, 2026-08-25)
+- [x] Tilemap viewer per layer with the scroll window outlined (debug column, 2026-08-25)
+- [x] OAM composite + list (2026-08-25)
+- [x] Palette grid with hover readout (2026-08-25)
+- [x] Tile sheet with bank/palette selectors (2026-08-25)
+- [x] ~~Integer-scale framebuffer~~ — stale: the pane already paints nearest-neighbour; ledger entry struck (2026-08-25)
+- [x] Release the pad mask while the window is inactive (2026-08-25)
+- [x] Hidden tab auto-pauses, resumes on return (2026-08-25)
+- [x] Runs over `MAX_FRAMES` ingest their first 100k frames with a note (2026-08-25)
+- [x] Pane runs flush saves like the standalone (`savefile` moved into the core, 2026-08-25)
 
 ## 4. World editor interaction floor — `medium`
 

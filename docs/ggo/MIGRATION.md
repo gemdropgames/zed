@@ -193,7 +193,7 @@ but `emerald.toml` itself is still read as text.
 | Stats line (fps / drops / step+blit ms) | ✓ | ✓ | |
 | Live guest UART console (collapsible, N lines, 2000-line ring) | ✓ (plus cart `log()` output, via ggo PR #75's `Peripherals::log_sink`) | ✓ | |
 | End-of-run perf ingest into `ggo_ide.db` (+ status line, + "View in Reports") | ✓, natively — Stop / cart exit / fault / restart all funnel through one `finish_run` | ✓ | Subsumes the spec's CLI-chained `ggo-emu --perf` → `ggo-cli ingest` task. |
-| Implicit pause on navigating away, resume on return | none | dropped | Docks have no page crossing; the cart keeps running when the dock is hidden. |
+| Implicit pause on navigating away, resume on return | `EmulatorItem::deactivated` → `EmuPanel::auto_pause`; the next render resumes (2026-08-25) | ✓ | A hidden emulator tab parks the cart at its next frame; only a visible item renders, so coming back is what resumes it. A pause the user made is never auto-resumed. |
 | Reports "Re-run" entry point | Re-run button in the charts panel's run-detail header (F5.4/R3), through `ggo_common`'s `CartRunner` registry into `ggo_emu_panel::rerun` | ✓ | The last of the cross-panel hops. It routes to the emu panel's **existing** run path (`stop` then `run`, the same entry S4's context menu uses), not a second one, via a registry in `ggo_common` so the charts panel never depends on the emu crate. Two named-reason disabled states rather than a dead button: `NO_RERUN_PATH` when the run's `label` carries no project-relative cart path (so `ggo-emu`, `ggo-server` and ggo-ide-ingested runs cannot be re-run — ggo-ide gates its own button the same way, on `rerun::matches_stored`), and `NO_CART_RUNNER` when no emu panel has registered. Different surface from ggo-ide's, whose button sits at the cart level; that the cart level is collapsed away is counted once, in §7's drill-down row. |
 | Build error surfaced in a scrollable read-only editor | Terminal output of the `emd:` tasks | ✓ | |
 
@@ -259,6 +259,9 @@ but `emerald.toml` itself is still read as text.
 | Native perf ingest straight from the emulator pane into `ggo_ide.db` | `ggo_emu_panel::ingest` | Replaces the spec's CLI-chained ingest task. |
 | **LSP** (diagnostics, completion, hover, code actions on worlds/manifests) | — | The pure-extension spec's central mechanism. **Deferred**: `ggo_language` registers grammar + queries only; there is no `ggo-lsp` binary and no `LspAdapter`. Every capability the old spec assigned to the LSP (world validation, hardware-budget diagnostics, snap/center/offset code actions, import diagnostics) is therefore unbuilt. |
 | Legend band on chart widgets | `chart_geom.rs` `legend_layout` (:736), `legend_height` (:766), consumed at :1001 and :1024 | ggo-ide's charts have no legends (a deliberate omission); the fork adds one. Documented as a divergence in the module doc (`chart_geom.rs:25-29`). **Stale cross-reference corrected in F5.5**: this note used to point at a "§9's 'No legends' row" that does not exist — §9 has no such row, and never did in any version of this file. There is nothing to except this from; the legend band is simply fork-only surface, not a parity gap. |
+| Emulator Pause / Resume + Step (`ctrl-alt-p`, `ctrl-alt-.`) | `drive::Session::{pause, resume, step}` (2026-08-25) | The drive loop parks after publishing a frame, feeds silence so the device stays live, and keeps the parked time out of the cart's clock. Step while running is a pause, never a skipped frame. ggo-ide had neither. |
+| Emulator debug column (`ctrl-alt-d`): tile sheet, per-layer tilemap with the scroll window outlined, OAM composite + list, palette grid, hover readouts | `ggo_emu_panel::debug` over `ggo_emu_core::ppu::PpuSnapshot` (2026-08-25) | The drive thread refills a snapshot slot every vsync; viewers decode off-thread, throttled to 10 Hz while running and immediately on pause/step, images retired through the pane's atlas discipline. Replaces the wasm data panel ggo-ide dropped. |
+| Pane runs persist saves | `drive.rs` via `ggo_emu_core::savefile` (moved from the `ggo-emu` binary, 2026-08-25) | Same rule as the standalone: `<card dir>/savs/<NAME>.sav`, flushed on a dirty frame at most once a second and at run end. |
 | Audio tab: waveform, play/stop/loop, **Source \| Baked** A/B (the blob through a standalone `ggo_emu_core::apu::Apu` into the emu pane's cpal ring), rate picker, **Import → `assets/<stem>.adp`** | `ggo_audio_panel` + `../ggo/tools/ggo-audio` (2026-08-24) | ggo-ide could only import (with a rate knob) and play the source through `<audio controls>`. The rate knob is editor-side by design: emerald packs a pre-baked `.adp` verbatim and knows nothing of the editor. No synthesis, sequencer, or PSG/ADSR/pan authoring — emerald's runtime never programs those. |
 | World toolbar `audio N / 384 KiB` readout | `ggo_world_panel::audio_budget` (2026-08-24) | Every `Music`/`Sfx` stem the world (and its resolved instances) names, sized off-thread; red when over the APU sample region, since the runtime silently skips an upload past it. Cache clears on panel refresh, so a re-imported file re-sizes when the panel is next shown. |
 | `.wav` / `.ogg` / `.adp` explorer routing | `ggo_audio_panel::intercept_audio_open` | Same interceptor pattern as `.spr` / `.til` / `.cart` / `.map` / worlds. |
@@ -575,16 +578,17 @@ guards and follow-ups that someone has to pick up:
   *every* op/undo/redo/save — neither ever calls `drop_image`, so both leak
   atlas tiles at edit frequency. Bounded by session length, not by a loop, so it
   was not an F2/F3 blocker; it is still a real leak.
-- **Linear-upscale blur in the emu pane.** The framebuffer is painted with
-  `img().w_full().h_full()`, i.e. gpui's default filtering, where ggo-ide
-  hard-coded a 2× integer nearest-neighbour scale. Violates the
-  "integer-scale pixel rendering" guardrail in the feature inventory.
-- **Stuck keys on window deactivation.** `on_focus_out` clears the pad mask,
-  but alt-tabbing away with a key held while the panel keeps focus leaves the
-  bit set until the key is pressed and released again.
-- **`MAX_FRAMES = 100_000` ingest rejection.** Ported verbatim from ggo-ide for
-  parity: a run longer than roughly 28 minutes at 60 Hz is rejected outright at
-  ingest rather than truncated.
+- **~~Linear-upscale blur in the emu pane.~~ Resolved.** The pane paints
+  through `paint_image(.., nearest = true)` at an aspect-true fit (see
+  `render_screen` / `scaled_frame_bounds`); this entry was stale.
+- **~~Stuck keys on window deactivation.~~ Resolved 2026-08-25.** Every
+  render while the window is inactive releases the pad
+  (`Window::is_window_active` in `EmuPanel::render`); frames keep the
+  renders coming, so the release is immediate.
+- **~~`MAX_FRAMES = 100_000` ingest rejection.~~ Resolved 2026-08-25.** A
+  run past ~28 minutes at 60 Hz now ingests its first 100 000 frames and
+  the ingest row says `truncated to 100000 of N frames` instead of
+  refusing the whole run.
 - **Frame-0 ignore-set editor — the reports page's one remaining gap vs
   ggo-ide (as of F5.4).** The charts panel applies ggo-ide's default (drop
   frame 0), captions it, and threads the ignore set through every derivation
