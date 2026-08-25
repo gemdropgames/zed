@@ -207,7 +207,10 @@ impl Session {
         self.pause.store(true, Ordering::Release);
     }
 
+    /// Also forgets any steps queued while paused: a resume means "run",
+    /// not "run, then park after N more frames".
     pub fn resume(&self) {
+        self.step.store(0, Ordering::Release);
         self.pause.store(false, Ordering::Release);
     }
 
@@ -441,10 +444,11 @@ fn run(
     let mut last_save_flush: Option<u32> = None;
     let mut frames_presented: u32 = 0;
     let mut paused_total = Duration::ZERO;
-    // One frame of stereo silence, pushed while parked so the device keeps
-    // its stream without charging dropouts against a run that is merely
-    // paused.
-    let silence = vec![0i16; 2 * (ggo_emu_core::apu::MIX_RATE / 60) as usize];
+    if save_file.is_none() && !p.save.is_empty() {
+        uart.push_line(
+            "[save] no save file could be resolved (every name probe is held by another cart's save); saves disabled",
+        );
+    }
 
     // Audio, last of the setup: AFTER the cart has parsed, so a cart that
     // never loads never opens a device at all, and immediately before the
@@ -533,33 +537,14 @@ fn run(
                     std::thread::sleep(hold);
                 }
                 // The debugger's park: hold here, frame complete and
-                // published, until resumed, stepped, or stopped. Silence
-                // keeps the ring fed; the pause time is kept out of the
-                // cart's clock below so it doesn't see a giant tick.
-                if pause.load(Ordering::Acquire) {
-                    let parked_at = Instant::now();
-                    let mut stop_requested = false;
-                    loop {
-                        if stop.load(Ordering::Acquire) {
-                            stop_requested = true;
-                            break;
-                        }
-                        if !pause.load(Ordering::Acquire) {
-                            break;
-                        }
-                        if step.load(Ordering::Acquire) > 0 {
-                            step.fetch_sub(1, Ordering::AcqRel);
-                            break;
-                        }
-                        if let Some(writer) = &audio_writer {
-                            writer.push(&silence);
-                        }
-                        std::thread::sleep(FRAME_TIME);
-                    }
-                    paused_total += parked_at.elapsed();
-                    if stop_requested {
-                        break "stopped".to_string();
-                    }
+                // published, until resumed, stepped, or stopped. The pause
+                // time is kept out of the cart's clock below so it doesn't
+                // see a giant tick.
+                let (parked, stop_requested) =
+                    park_while_paused(pause, step, stop, audio_writer.as_ref());
+                paused_total += parked;
+                if stop_requested {
+                    break "stopped".to_string();
                 }
                 last_present = Instant::now();
                 // AFTER the hold, not before it. `native::refresh_input`
@@ -583,6 +568,14 @@ fn run(
             // the `stop` check at the top of the loop is what keeps this
             // interruptible for a cart that never reaches vsync_wait.
             FrameEvent::Budget => {
+                // A cart that never reaches vsync_wait still honours pause
+                // (no frame to publish or snapshot, but it parks).
+                let (parked, stop_requested) =
+                    park_while_paused(pause, step, stop, audio_writer.as_ref());
+                paused_total += parked;
+                if stop_requested {
+                    break "stopped".to_string();
+                }
                 p.input_mask = input.load(Ordering::Acquire);
             }
             FrameEvent::Exit(code) => break format!("cart exited with {code}"),
@@ -639,6 +632,39 @@ fn run(
 /// is cleared here rather than by `Apu::copy_since` -- that method
 /// *appends* (`out.reserve` + `out.push`), so a caller that forgets would
 /// re-push every previous frame's samples on top of the new ones.
+/// Hold while `pause` is set: returns `(time parked, stop requested)`.
+/// Checks `stop` first on every turn so a paused run still stops within
+/// one frame time; one queued `step` releases exactly one turn. The audio
+/// ring is idled on entry (silence, no dropouts counted) and re-primes on
+/// the first push after resuming.
+fn park_while_paused(
+    pause: &AtomicBool,
+    step: &AtomicU32,
+    stop: &AtomicBool,
+    audio_writer: Option<&RingWriter>,
+) -> (Duration, bool) {
+    if !pause.load(Ordering::Acquire) {
+        return (Duration::ZERO, false);
+    }
+    let parked_at = Instant::now();
+    if let Some(writer) = audio_writer {
+        writer.idle();
+    }
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return (parked_at.elapsed(), true);
+        }
+        if !pause.load(Ordering::Acquire) {
+            return (parked_at.elapsed(), false);
+        }
+        if step.load(Ordering::Acquire) > 0 {
+            step.fetch_sub(1, Ordering::AcqRel);
+            return (parked_at.elapsed(), false);
+        }
+        std::thread::sleep(FRAME_TIME);
+    }
+}
+
 /// Refill the debugger's snapshot slot from the PPU. Reuses the previous
 /// snapshot's buffers when the pane has let go of it, so a run with no
 /// viewer open costs one ~138 KB memcpy per frame and no allocation.
@@ -769,6 +795,7 @@ pub mod fixture {
     const SYS_VSYNC_WAIT: i32 = 0x01;
     const SYS_SET_PALETTE: i32 = 0x05;
     const SYS_LOG: i32 = 0x4B;
+    const SYS_SAVE_WRITE: i32 = 0x31;
 
     /// RGB565 green -- 0x07E0, which happens to fit in a 12-bit signed
     /// immediate, so the program needs no `lui`.
@@ -826,6 +853,53 @@ pub mod fixture {
     }
 
     /// The cart header title [`logging_cart`] stamps.
+    pub const SAVING_CART_TITLE: &str = "Save Fix";
+    /// The saving cart's declared save region.
+    pub const SAVING_CART_SAVE_BYTES: u32 = 64;
+    /// How many bytes of its own code the saving cart writes at offset 0.
+    pub const SAVING_CART_WRITE_LEN: usize = 8;
+
+    /// A cart that writes the first 8 bytes of its own code into the save
+    /// region at offset 0 (`save_write(0, XIP_BASE, 8)`), then presents
+    /// green forever -- so a flushed `.sav` carries a payload the test can
+    /// predict.
+    pub fn saving_cart() -> Vec<u8> {
+        let xip_base_hi20 = super::CART_XIP_BASE >> 12;
+        let body: Vec<u32> = vec![
+            addi(A0, 0),                              // off 0
+            lui(A1, xip_base_hi20),                   // buf = CART_XIP_BASE
+            addi(A2, SAVING_CART_WRITE_LEN as i32),   // len
+            addi(A7, SYS_SAVE_WRITE),                 //
+            ECALL,                                    // save_write
+            addi(A0, 0),                              // bank 0
+            addi(A1, 0),                              // entry 0
+            addi(A2, GREEN as i32),                   // colour
+            addi(A7, SYS_SET_PALETTE),                //
+            ECALL,                                    //
+            addi(A7, SYS_PRESENT),                    // loop:
+            ECALL,                                    //
+            addi(A7, SYS_VSYNC_WAIT),                 //
+            ECALL,                                    //
+            jal_x0(-16),                              // back to `loop`
+        ];
+        let body: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut h = [0u8; HEADER_LEN];
+        h[0x00..0x04].copy_from_slice(&MAGIC);
+        h[0x04..0x06].copy_from_slice(&SUPPORTED_HEADER_VERSION.to_le_bytes());
+        h[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // required_abi
+        h[0x08..0x08 + SAVING_CART_TITLE.len()].copy_from_slice(SAVING_CART_TITLE.as_bytes());
+        h[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes()); // entry_offset
+        h[0x2C..0x30].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        h[0x30..0x34].copy_from_slice(&SAVING_CART_SAVE_BYTES.to_le_bytes());
+        h[0x34..0x38].copy_from_slice(&0u32.to_le_bytes()); // ram_needed
+        h[0x38..0x3C].copy_from_slice(&0u32.to_le_bytes()); // flags
+        let crc = crc32(&h[0x00..0x3C]);
+        h[0x3C..0x40].copy_from_slice(&crc.to_le_bytes());
+        let mut out = h.to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
     pub const LOGGING_CART_TITLE: &str = "Log Fix";
 
     /// The message [`logging_cart`]'s single `log()` call emits -- what
@@ -1431,9 +1505,15 @@ mod tests {
         }
         assert_eq!(arrived, 0, "a paused run publishes no frames");
 
+        let before_step = session.snapshot().map(|s| Arc::as_ptr(&s) as usize);
         session.step();
         let stepped = recv_within(&rx, Duration::from_secs(2)).expect("step releases exactly one frame");
         assert_eq!(stepped.number, last_number + 1, "one frame, the next one");
+        assert_ne!(
+            session.snapshot().map(|s| Arc::as_ptr(&s) as usize),
+            before_step,
+            "the stepped frame refilled the snapshot slot"
+        );
         let quiet = std::time::Instant::now();
         let mut arrived = 0;
         while quiet.elapsed() < Duration::from_millis(200) {
@@ -1466,6 +1546,49 @@ mod tests {
         session.step();
         assert_eq!(session.step.load(Ordering::Acquire), 0);
         session.wait();
+    }
+
+    /// A cart's `save_write` lands on disk the standalone's way: the run's
+    /// end-of-run flush writes `<card dir>/savs/<NAME>.sav` with the C5
+    /// header and the region's bytes.
+    #[test]
+    fn a_carts_save_write_is_flushed_to_the_card_dir_at_run_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_dir = dir.path().join("carts");
+        std::fs::create_dir_all(&card_dir).unwrap();
+        let cart_bytes = fixture::saving_cart();
+        let path = card_dir.join("save.cart");
+        std::fs::write(&path, &cart_bytes).unwrap();
+        let (session, rx) = start(path, "save.cart".to_string(), None);
+        rx.recv_blocking().expect("the cart runs");
+        rx.recv_blocking().expect("and keeps running");
+        let finished = session.wait();
+        assert_eq!(finished.reason, "stopped");
+
+        let save_path = savefile::resolve_save_path(
+            &card_dir,
+            fixture::SAVING_CART_TITLE,
+            fixture::SAVING_CART_SAVE_BYTES as usize,
+        )
+        .expect("the flushed file is this cart's own save");
+        let file = std::fs::read(&save_path).unwrap();
+        assert_eq!(
+            file.len(),
+            savefile::SAVE_HDR_BYTES + fixture::SAVING_CART_SAVE_BYTES as usize
+        );
+        let payload = &file[savefile::SAVE_HDR_BYTES..];
+        let code_start = ggo_emu_core::cart::HEADER_LEN;
+        assert_eq!(
+            &payload[..fixture::SAVING_CART_WRITE_LEN],
+            &cart_bytes[code_start..code_start + fixture::SAVING_CART_WRITE_LEN],
+            "the region's first bytes are what the cart wrote"
+        );
+        assert!(payload[fixture::SAVING_CART_WRITE_LEN..].iter().all(|b| *b == 0));
+        assert!(
+            !finished.uart.iter().any(|line| line.contains("[save]")),
+            "no save complaint on the console: {:?}",
+            finished.uart
+        );
     }
 
     #[test]

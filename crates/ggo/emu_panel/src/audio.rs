@@ -367,6 +367,18 @@ impl RingWriter {
     }
 }
 
+impl RingWriter {
+    /// The run is parked (debugger pause): nothing will feed the ring
+    /// until it resumes, so unprime it -- the callback outputs silence and
+    /// counts no dropouts against a ring nobody is writing -- and drop
+    /// what was queued so resuming doesn't replay a stale burst. The next
+    /// [`Self::push`] re-primes it.
+    pub fn idle(&self) {
+        self.primed.store(false, Ordering::Relaxed);
+        self.queue.lock().unwrap().clear();
+    }
+}
+
 impl Drop for RingWriter {
     /// The run is over -- nothing will feed this ring again, so the
     /// callback must stop draining and stop counting immediately.

@@ -496,6 +496,7 @@ impl EmuPanel {
         // the same one livekit's video view uses
         // (`remote_video_track_view.rs:32-44`).
         cx.on_release(|this, cx| {
+            this.debug.retire_all();
             for image in [
                 this.previous_rendered_frame.take(),
                 this.current_rendered_frame.take(),
@@ -503,6 +504,7 @@ impl EmuPanel {
             ]
             .into_iter()
             .flatten()
+            .chain(this.debug.take_all_retired())
             {
                 cx.drop_image(image, None);
             }
@@ -1206,8 +1208,7 @@ impl EmuPanel {
     /// (`gpui_wgpu/src/wgpu_atlas.rs:133`), so the overlap between the
     /// three slots is harmless.
     fn release_atlas_all(&mut self, window: &mut Window) {
-        self.debug.retire_all();
-        self.retire_debug_images(window);
+        self.release_debug_images(window);
         for image in [
             self.previous_rendered_frame.take(),
             self.current_rendered_frame.take(),
@@ -1225,17 +1226,33 @@ impl EmuPanel {
     fn toggle_debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.debug.open = !self.debug.open;
         if !self.debug.open {
-            self.debug.retire_all();
-            self.retire_debug_images(window);
+            self.release_debug_images(window);
+            self.debug.decoded = None;
             self.debug.hover = None;
         }
         cx.notify();
     }
 
-    /// Drop every viewer image replaced since the last render.
+    /// The per-render half of the viewers' atlas release: drop what was
+    /// retired before the previous render (see `DebugState::retired`).
     fn retire_debug_images(&mut self, window: &mut Window) {
-        for image in self.debug.retired.drain(..) {
+        for image in self.debug.take_retired_for_render() {
             window.drop_image(image).log_err();
+        }
+    }
+
+    /// The teardown half: everything, now.
+    fn release_debug_images(&mut self, window: &mut Window) {
+        self.debug.retire_all();
+        for image in self.debug.take_all_retired() {
+            window.drop_image(image).log_err();
+        }
+    }
+
+    fn set_debug_hover(&mut self, hover: String, cx: &mut Context<Self>) {
+        if self.debug.hover.as_deref() != Some(hover.as_str()) {
+            self.debug.hover = Some(hover);
+            cx.notify();
         }
     }
 
@@ -1268,11 +1285,17 @@ impl EmuPanel {
         if !self.debug.open {
             return;
         }
-        let Some(snapshot) = self.session.as_ref().and_then(|session| session.snapshot()) else {
+        // After a run ends the pane keeps the last snapshot, so a tab or
+        // selector change still re-decodes the right thing.
+        let live = self.session.as_ref().and_then(|session| session.snapshot());
+        // With no run the snapshot is static, so there is nothing to
+        // throttle: a tab or selector change decodes at once, like a pause.
+        let immediate = self.is_paused() || live.is_none();
+        let Some(snapshot) = live.or_else(|| self.debug.decoded.as_ref().map(|d| d.snapshot.clone()))
+        else {
             return;
         };
-        let paused = self.is_paused();
-        if !self.debug.decode_due(&snapshot, paused, Instant::now()) {
+        if !self.debug.decode_due(&snapshot, immediate, Instant::now()) {
             return;
         }
         self.start_debug_decode(snapshot, cx);
@@ -1320,7 +1343,7 @@ impl EmuPanel {
             let snapshot = snapshot.clone();
             async move { Self::decode_debug_tab(tab, &snapshot, bank, palette, layer) }
         });
-        self.debug._task = Some(cx.spawn(async move |this, cx| {
+        self.debug.task = Some(cx.spawn(async move |this, cx| {
             let image = decode.await;
             this.update(cx, |this, cx| {
                 if this.debug.generation != generation || !this.debug.open {
@@ -1357,11 +1380,7 @@ impl EmuPanel {
         });
     }
 
-    fn render_debug_column(
-        &self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_debug_column(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tabs = h_flex()
             .gap_1()
             .p_1()
@@ -1542,8 +1561,7 @@ impl EmuPanel {
                 if x >= 0.0 && y >= 0.0 && x < span && y < span {
                     let index = (y / tile_px) as usize * debug::SHEET_TILES_PER_ROW
                         + (x / tile_px) as usize;
-                    this.debug.hover = Some(format!("tile {index}"));
-                    cx.notify();
+                    this.set_debug_hover(format!("tile {index}"), cx);
                 }
             },
             cx,
@@ -1594,15 +1612,20 @@ impl EmuPanel {
                 let span = debug::MAP_PX as f32;
                 let sx = (scroll_x as f32) % span;
                 let sy = (scroll_y as f32) % span;
-                for dx in [0.0, -span] {
-                    for dy in [0.0, -span] {
-                        let rect = Bounds::new(
-                            point(bounds.origin.x + px(sx + dx), bounds.origin.y + px(sy + dy)),
-                            size(px(w), px(h)),
-                        );
-                        window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    for dx in [0.0, -span] {
+                        for dy in [0.0, -span] {
+                            let rect = Bounds::new(
+                                point(
+                                    bounds.origin.x + px(sx + dx),
+                                    bounds.origin.y + px(sy + dy),
+                                ),
+                                size(px(w), px(h)),
+                            );
+                            window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                        }
                     }
-                }
+                });
             },
             move |this, x, y, cx| {
                 let tile_px = ggo_emu_core::ppu::TILE_PX as f32;
@@ -1610,14 +1633,16 @@ impl EmuPanel {
                 if x >= 0.0 && y >= 0.0 && x < span && y < span {
                     let (cell_x, cell_y) = ((x / tile_px) as usize, (y / tile_px) as usize);
                     let cell = hover_snapshot.map_cell(layer, cell_x, cell_y);
-                    this.debug.hover = Some(format!(
-                        "cell ({cell_x},{cell_y})  tile {}  pal {}  {}{}",
-                        cell.tile,
-                        cell.palette,
-                        if cell.hflip { "H" } else { "-" },
-                        if cell.vflip { "V" } else { "-" }
-                    ));
-                    cx.notify();
+                    this.set_debug_hover(
+                        format!(
+                            "cell ({cell_x},{cell_y})  tile {}  pal {}  {}{}",
+                            cell.tile,
+                            cell.palette,
+                            if cell.hflip { "H" } else { "-" },
+                            if cell.vflip { "V" } else { "-" }
+                        ),
+                        cx,
+                    );
                 }
             },
             cx,
@@ -1648,8 +1673,7 @@ impl EmuPanel {
                 ggo_emu_core::peripherals::SCREEN_HEIGHT,
                 |_, _| {},
                 |this, x, y, cx| {
-                    this.debug.hover = Some(format!("({}, {})", x as i32, y as i32));
-                    cx.notify();
+                    this.set_debug_hover(format!("({}, {})", x as i32, y as i32), cx);
                 },
                 cx,
             ));
@@ -1718,16 +1742,18 @@ impl EmuPanel {
                     let y: f32 = (event.position.y - bounds.origin.y).into();
                     if let Some((bank, palette, entry)) = debug::palette_cell_at(x, y, swatch) {
                         let rgb = snapshot.palette_rgb565(bank, palette, entry);
-                        this.debug.hover = Some(format!(
-                            "{} pal {palette} slot {entry} = {}",
-                            if bank == ggo_emu_core::ppu::BANK_SPRITE {
-                                "sprite"
-                            } else {
-                                "bg/fg"
-                            },
-                            debug::rgb565_label(rgb)
-                        ));
-                        cx.notify();
+                        this.set_debug_hover(
+                            format!(
+                                "{} pal {palette} slot {entry} = {}",
+                                if bank == ggo_emu_core::ppu::BANK_SPRITE {
+                                    "sprite"
+                                } else {
+                                    "bg/fg"
+                                },
+                                debug::rgb565_label(rgb)
+                            ),
+                            cx,
+                        );
                     }
                 }
             }))
@@ -2049,9 +2075,7 @@ impl Render for EmuPanel {
                     .min_h_0()
                     .child(div().flex_1().min_w_0().size_full().child(self.render_screen(cx)))
                     .children(
-                        self.debug
-                            .open
-                            .then(|| self.render_debug_column(window, cx)),
+                        self.debug.open.then(|| self.render_debug_column(cx)),
                     ),
             )
             .children(self.render_stats())
@@ -4753,14 +4777,69 @@ mod tests {
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert!(panel.debug.retired.is_empty(), "a render drained the retire queue");
+            assert!(panel.debug.retired.is_empty(), "a render advanced the retire queue");
+            assert_eq!(
+                panel.debug.retired_previous.len(),
+                2,
+                "and holds them one more render before dropping"
+            );
         });
 
         cx.simulate_keystrokes("ctrl-alt-d");
         panel.read_with(cx, |panel, _| {
             assert!(!panel.debug.open, "ctrl-alt-d closes");
             assert!(panel.debug.decoded.is_none());
-            assert!(panel.debug.retired.is_empty(), "closing released everything at once");
+            assert!(
+                panel.debug.retired.is_empty() && panel.debug.retired_previous.is_empty(),
+                "closing released everything at once"
+            );
+        });
+    }
+
+    /// The live path: with the column open, a running cart's snapshots
+    /// are decoded off-thread into the active tab; a tab switch after the
+    /// run ends re-decodes from the kept snapshot.
+    #[gpui::test]
+    async fn test_debug_column_decodes_a_running_carts_snapshots(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
+        cx.update(|window, _| window.activate_window());
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+        select_green_cart(&panel, cx, dir.path());
+        cx.simulate_keystrokes("ctrl-alt-d");
+        cx.simulate_keystrokes("ctrl-alt-r");
+        await_first_frame(&panel, cx);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while panel.read_with(cx, |panel, _| panel.debug.decoded.is_none()) {
+            assert!(std::time::Instant::now() < deadline, "no decode landed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            panel.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+        panel.read_with(cx, |panel, _| {
+            let decoded = panel.debug.decoded.as_ref().unwrap();
+            assert_eq!(decoded.tab, debug::DebugTab::Tiles);
+            assert!(decoded.image.is_some());
+            // The green cart sets backdrop entry 0; palette 0 entry 0 is green.
+            assert_eq!(decoded.snapshot.palette_rgb565(0, 0, 0), 0x07E0);
+        });
+
+        cx.simulate_keystrokes("ctrl-alt-s");
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.set_debug_tab(debug::DebugTab::Palettes, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let decoded = panel.debug.decoded.as_ref().expect("re-decoded from the kept snapshot");
+            assert_eq!(decoded.tab, debug::DebugTab::Palettes, "the tab switch re-decoded without a session");
         });
     }
 

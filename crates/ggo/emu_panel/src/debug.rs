@@ -75,15 +75,20 @@ pub struct DebugState {
     pub layer: usize,
     /// The last decode, whose image the active tab paints.
     pub decoded: Option<Decoded>,
-    /// Images replaced since the last render; dropped there.
+    /// Images replaced since the last render. Two-stage, like the pane's
+    /// frame double buffer: a render moves these to `retired_previous`
+    /// and drops what was there -- so an image is never handed back to
+    /// the atlas while the scene that last painted it may still be in
+    /// flight.
     pub retired: Vec<Arc<RenderImage>>,
+    pub retired_previous: Vec<Arc<RenderImage>>,
     pub hover: Option<String>,
     pub generation: u64,
     pub last_decode_started: Option<Instant>,
     /// Identity of the snapshot the last decode used, so a paused run
     /// (same `Arc` every render) is decoded once, not every frame.
     pub last_decoded_ptr: usize,
-    pub _task: Option<Task<()>>,
+    pub task: Option<Task<()>>,
 }
 
 impl DebugState {
@@ -96,11 +101,12 @@ impl DebugState {
             layer: 0,
             decoded: None,
             retired: Vec::new(),
+            retired_previous: Vec::new(),
             hover: None,
             generation: 0,
             last_decode_started: None,
             last_decoded_ptr: 0,
-            _task: None,
+            task: None,
         }
     }
 
@@ -114,26 +120,44 @@ impl DebugState {
         self.decoded = Some(decoded);
     }
 
-    /// Queue everything for release (column closed, run stopped, pane
-    /// torn down). The caller drops `retired` against a window.
+    /// Queue every image for release (run stopped, column closed, pane
+    /// torn down); the caller drains [`Self::take_all_retired`]. The
+    /// snapshot itself is kept, so a tab or selector change after a run
+    /// ends still has something to decode.
     pub fn retire_all(&mut self) {
-        if let Some(old) = self.decoded.take()
-            && let Some(image) = old.image
+        if let Some(decoded) = &mut self.decoded
+            && let Some(image) = decoded.image.take()
         {
             self.retired.push(image);
         }
         self.last_decoded_ptr = 0;
     }
 
-    /// Whether a decode of `snapshot` is due now: always for a snapshot
-    /// not seen before when paused (identity changes only on step), else
-    /// at most every [`LIVE_DECODE_INTERVAL`].
-    pub fn decode_due(&self, snapshot: &Arc<PpuSnapshot>, paused: bool, now: Instant) -> bool {
+    /// Advance the two-stage queue by one render: what was retired before
+    /// the previous render is returned to be dropped now.
+    pub fn take_retired_for_render(&mut self) -> Vec<Arc<RenderImage>> {
+        let drop_now = std::mem::take(&mut self.retired_previous);
+        self.retired_previous = std::mem::take(&mut self.retired);
+        drop_now
+    }
+
+    /// Both stages at once, for teardown.
+    pub fn take_all_retired(&mut self) -> Vec<Arc<RenderImage>> {
+        let mut all = std::mem::take(&mut self.retired_previous);
+        all.append(&mut self.retired);
+        all
+    }
+
+    /// Whether a decode of `snapshot` is due now: never for the snapshot
+    /// already decoded; always when `immediate` (paused -- identity changes
+    /// only on step -- or no run at all); else at most every
+    /// [`LIVE_DECODE_INTERVAL`].
+    pub fn decode_due(&self, snapshot: &Arc<PpuSnapshot>, immediate: bool, now: Instant) -> bool {
         let ptr = Arc::as_ptr(snapshot) as usize;
         if ptr == self.last_decoded_ptr {
             return false;
         }
-        if paused {
+        if immediate {
             return true;
         }
         self.last_decode_started
@@ -432,5 +456,24 @@ mod tests {
         assert!(state.decode_due(&next, true, now), "paused: a new snapshot decodes at once");
         let labels = layer_labels(&snap);
         assert_eq!(labels[0], "BG0 (off)");
+    }
+
+    #[test]
+    fn retirement_is_two_stage_per_render_and_immediate_on_teardown() {
+        let mut state = DebugState::new();
+        let snap = Arc::new(fixture());
+        let image = |n: u32| {
+            let buffer = image::ImageBuffer::from_raw(1, 1, vec![n as u8; 4]).unwrap();
+            Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
+        };
+        state.set_decoded(Decoded { tab: DebugTab::Tiles, image: Some(image(1)), snapshot: snap.clone() });
+        state.set_decoded(Decoded { tab: DebugTab::Tiles, image: Some(image(2)), snapshot: snap });
+        assert_eq!(state.retired.len(), 1);
+        assert!(state.take_retired_for_render().is_empty(), "first render: nothing old enough");
+        assert_eq!(state.take_retired_for_render().len(), 1, "second render: drops it");
+        state.retire_all();
+        assert_eq!(state.take_all_retired().len(), 1);
+        let kept = state.decoded.as_ref().expect("the snapshot is kept");
+        assert!(kept.image.is_none(), "only the image was released");
     }
 }
