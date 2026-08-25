@@ -22,47 +22,13 @@ use gpui::RenderImage;
 /// so a tileset laid out there and here reads identically.
 pub const GRID_COLS_FALLBACK: usize = 8;
 
-/// Per-tileset view-settings sidecar: things the user tunes in the
-/// editor that the `.til`/`.pal` pair has no field for (zoom, grid
-/// columns). Written on every change, read once at open; a missing or
-/// corrupt file is simply the defaults. Lives at
-/// `.ggo-ide/<rel>.editor.json` -- the same hidden-dir convention as
-/// `ggo_sprite_panel::editor_meta`, keeping editor droppings out of the
-/// asset tree.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ViewMeta {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zoom: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cols: Option<usize>,
-    /// Whether the tile-boundary lines draw; `None` = on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lines: Option<bool>,
-}
-
-fn meta_path(root: &Path, rel: &str) -> std::path::PathBuf {
-    root.join(format!(".ggo-ide/{rel}.editor.json"))
-}
-
-/// Read the view sidecar for `rel`, or the defaults when missing or
-/// unreadable -- view settings are never worth failing an open over.
-pub fn load_view_meta(root: &Path, rel: &str) -> ViewMeta {
-    match std::fs::read(meta_path(root, rel)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => ViewMeta::default(),
-    }
-}
-
-/// Write the view sidecar for `rel`, creating `.ggo-ide/` subdirs as
-/// needed.
-pub fn save_view_meta(root: &Path, rel: &str, meta: &ViewMeta) -> Result<(), String> {
-    let path = meta_path(root, rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
-}
+/// The per-tileset editor sidecar is worldlib's `tileset_meta` now -- the
+/// map panel reads the same file for `cols` (its stamp coordinate system)
+/// and the autotile terrains, so one definition serves both panels.
+pub use ggo_worldlib::sprites::tileset_meta::{
+    load_tileset_meta as load_view_meta,
+    save_tileset_meta as save_view_meta,
+};
 
 /// Everything the panel needs to enter its Ready state, assembled
 /// entirely off the UI thread.

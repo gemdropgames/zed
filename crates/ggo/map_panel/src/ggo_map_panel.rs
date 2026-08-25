@@ -52,6 +52,8 @@ use gpui::{
 use project::ProjectPath;
 use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState, Tooltip};
+
+use ggo_worldlib::sprites::terrain::{self, Terrain};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -63,6 +65,14 @@ use ggo_worldlib::sprites::map_doc::{
 actions!(
     ggo_map,
     [
+        /// Copies the selected cells.
+        Copy,
+        /// Pastes the copied cells at the cursor (or the selection).
+        Paste,
+        /// Blanks the selected cells.
+        DeleteSelection,
+        /// Clears the cell selection.
+        ClearSelection,
         /// Toggles focus on the GGO map panel.
         ToggleFocus,
         /// Undoes the last edit to the open map.
@@ -201,6 +211,13 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-c", Copy, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-c", Copy, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", Paste, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(KEY_CONTEXT)),
+        KeyBinding::new("delete", DeleteSelection, Some(KEY_CONTEXT)),
+        KeyBinding::new("backspace", DeleteSelection, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", ClearSelection, Some(KEY_CONTEXT)),
         // Single-line editors don't bind Enter themselves (the default
         // keymap's `enter -> editor::Newline` is `mode == full` only), so
         // this fires while a resize field is focused.
@@ -425,14 +442,23 @@ enum MapTool {
     #[default]
     Brush,
     RectFill,
+    /// Flood-fill the clicked region with the stamp's first cell.
+    Fill,
+    /// Drag a cell rectangle for copy / paste / delete.
+    Select,
+    /// Paint the selected autotile terrain (shift-drag erases).
+    Terrain,
     Eyedropper,
     Eraser,
 }
 
 impl MapTool {
-    const ALL: [MapTool; 4] = [
+    const ALL: [MapTool; 7] = [
         MapTool::Brush,
         MapTool::RectFill,
+        MapTool::Fill,
+        MapTool::Select,
+        MapTool::Terrain,
         MapTool::Eyedropper,
         MapTool::Eraser,
     ];
@@ -441,6 +467,9 @@ impl MapTool {
         match self {
             MapTool::Brush => IconName::Pencil,
             MapTool::RectFill => IconName::SelectAll,
+            MapTool::Fill => IconName::Sparkle,
+            MapTool::Select => IconName::Maximize,
+            MapTool::Terrain => IconName::Blocks,
             MapTool::Eyedropper => IconName::Crosshair,
             MapTool::Eraser => IconName::Eraser,
         }
@@ -450,6 +479,9 @@ impl MapTool {
         match self {
             MapTool::Brush => "Brush",
             MapTool::RectFill => "Rect fill",
+            MapTool::Fill => "Flood fill",
+            MapTool::Select => "Select cells",
+            MapTool::Terrain => "Terrain (shift-drag erases)",
             MapTool::Eyedropper => "Eyedropper",
             MapTool::Eraser => "Eraser",
         }
@@ -459,6 +491,9 @@ impl MapTool {
         match self {
             MapTool::Brush => "ggo-map-tool-brush",
             MapTool::RectFill => "ggo-map-tool-rect",
+            MapTool::Fill => "ggo-map-tool-fill",
+            MapTool::Select => "ggo-map-tool-select",
+            MapTool::Terrain => "ggo-map-tool-terrain",
             MapTool::Eyedropper => "ggo-map-tool-eyedropper",
             MapTool::Eraser => "ggo-map-tool-eraser",
         }
@@ -527,6 +562,22 @@ struct OpenMap {
     /// Rect-fill drag preview, raw (unnormalized) corners -- ggo-ide's
     /// `rectPending`.
     rect_pending: Option<(i32, i32, i32, i32)>,
+    /// Select-tool drag, raw corners; settles into `selection` on release.
+    sel_pending: Option<(i32, i32, i32, i32)>,
+    /// The cell selection, normalized inclusive corners.
+    selection: Option<(i32, i32, i32, i32)>,
+    /// The cell under the cursor while it is over the canvas -- where a
+    /// paste lands.
+    hover_cell: Option<(i32, i32)>,
+    /// Shift was held at the gesture's start: the terrain tool erases.
+    paint_erase: bool,
+    /// The bound tileset's autotile terrains (from its editor sidecar).
+    terrains: Vec<Terrain>,
+    /// Index into `terrains` the Terrain tool paints with.
+    terrain: Option<usize>,
+    /// The sidecar key for saving terrains; `None` outside the worktree.
+    til_meta_rel: Option<String>,
+    terrain_error: Option<String>,
     /// True between the canvas's own primary-down and its matching up, for
     /// EVERY tool -- ggo-ide's single `painting` flag, ported as one flag
     /// for the same reason: it gates brush/eraser continuing to apply,
@@ -563,6 +614,14 @@ impl OpenMap {
             pal_far: (0, 0),
             pal_dragging: false,
             rect_pending: None,
+            sel_pending: None,
+            selection: None,
+            hover_cell: None,
+            paint_erase: false,
+            terrains: loaded.tileset_meta.terrains,
+            terrain: None,
+            til_meta_rel: loaded.til_meta_rel,
+            terrain_error: None,
             painting: false,
             resize: None,
             save_error: None,
@@ -661,6 +720,8 @@ pub struct MapPanel {
     /// Test hook: bypass workspace worktree discovery.
     root_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
+    /// Copied cells; panel-level so it survives switching maps.
+    clipboard: Option<Stamp>,
     state: ViewerState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
@@ -674,6 +735,7 @@ impl MapPanel {
             workspace,
             root_override: None,
             project_root: None,
+            clipboard: None,
             state: ViewerState::Empty,
             load_generation: 0,
             _load_task: None,
@@ -752,7 +814,7 @@ impl MapPanel {
 
         let load = {
             let (root, rel_path) = (root.clone(), rel_path.clone());
-            cx.background_spawn(async move { loader::load_map(&root, &rel_path) })
+            cx.background_spawn(async move { loader::load_map(&root, &rel_path, &project_root) })
         };
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
@@ -907,6 +969,7 @@ impl MapPanel {
     /// defeats an invariant this panel states in its own module doc, so it
     /// is fixed here rather than ported.)
     fn step_history(&mut self, step: fn(&mut MapDocStore) -> bool, cx: &mut Context<Self>) {
+        let project_root = self.project_root.clone();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -916,8 +979,9 @@ impl MapPanel {
         }
         let after = open.store.state().til_path;
         if before != after {
-            let resolved = loader::load_tileset(&open.root, &after);
+            let (resolved, meta) = Self::resolve_tileset(open, project_root.as_deref(), &after);
             Self::set_tileset(open, resolved);
+            Self::adopt_tileset_meta(open, meta);
         }
         Self::rebuild_image(open);
         cx.notify();
@@ -1012,6 +1076,7 @@ impl MapPanel {
     /// Synchronous, same call as `save_impl`: one tileset is a few tens of
     /// KB and the user is waiting on the result of their own click.
     fn bind_tileset(&mut self, til_rel: String, cx: &mut Context<Self>) {
+        let project_root = self.project_root.clone();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1019,7 +1084,8 @@ impl MapPanel {
         // the document (see this fn's doc). The resolved tileset then goes
         // straight into the cache via `set_tileset`, so bind and
         // undo-across-a-bind install it exactly the same way.
-        match loader::load_tileset(&open.root, &til_rel) {
+        let (resolved, meta) = Self::resolve_tileset(open, project_root.as_deref(), &til_rel);
+        match resolved {
             Ok(tileset) => {
                 let pal_path = tileset.pal_path.clone();
                 open.store.apply(MapOp::BindTileset {
@@ -1027,11 +1093,43 @@ impl MapPanel {
                     pal_path,
                 });
                 Self::set_tileset(open, Ok(tileset));
+                Self::adopt_tileset_meta(open, meta);
                 Self::rebuild_image(open);
             }
             Err(e) => open.tileset_error = Some(e),
         }
         cx.notify();
+    }
+
+    /// Load `til_rel` laid out at the sidecar's `cols`, returning the
+    /// sidecar too (its terrains follow the binding).
+    fn resolve_tileset(
+        open: &OpenMap,
+        project_root: Option<&Path>,
+        til_rel: &str,
+    ) -> (
+        Result<loader::Tileset, String>,
+        (ggo_worldlib::sprites::tileset_meta::TilesetMeta, Option<String>),
+    ) {
+        let (meta, meta_rel) = match project_root {
+            Some(project_root) => (
+                loader::tileset_meta(&open.root, project_root, til_rel),
+                loader::tileset_meta_rel(&open.root, project_root, til_rel),
+            ),
+            None => (Default::default(), None),
+        };
+        let resolved = loader::load_tileset(&open.root, til_rel, meta.cols);
+        (resolved, (meta, meta_rel))
+    }
+
+    fn adopt_tileset_meta(
+        open: &mut OpenMap,
+        (meta, meta_rel): (ggo_worldlib::sprites::tileset_meta::TilesetMeta, Option<String>),
+    ) {
+        open.terrains = meta.terrains;
+        open.til_meta_rel = meta_rel;
+        open.terrain = None;
+        open.terrain_error = None;
     }
 
     /// One eyedropper pick at cell `(x, y)` -- ggo-ide's `map_eyedrop`:
@@ -1078,6 +1176,37 @@ impl MapPanel {
                 self.apply_op(MapOp::Brush { x, y, stamp }, cx);
             }
             MapTool::Eraser => self.apply_op(MapOp::Erase { x, y }, cx),
+            MapTool::Fill => {
+                let cell = open.fill_cell();
+                self.apply_op(MapOp::Fill { x, y, cell }, cx);
+            }
+            MapTool::Select => {
+                if let ViewerState::Ready(open) = &mut self.state {
+                    match &mut open.sel_pending {
+                        Some(rect) => {
+                            rect.2 = x;
+                            rect.3 = y;
+                        }
+                        None => open.sel_pending = Some((x, y, x, y)),
+                    }
+                }
+                cx.notify();
+            }
+            MapTool::Terrain => {
+                let Some(terrain) = open.terrain.and_then(|i| open.terrains.get(i)) else {
+                    return;
+                };
+                let state = open.store.state();
+                let writes = terrain::resolve(
+                    &state.cells,
+                    state.w,
+                    state.h,
+                    &[(x, y)],
+                    terrain,
+                    !open.paint_erase,
+                );
+                self.apply_op(MapOp::SetCells(writes), cx);
+            }
             MapTool::Eyedropper => {
                 if let ViewerState::Ready(open) = &mut self.state {
                     Self::eyedrop(open, x, y);
@@ -1104,6 +1233,12 @@ impl MapPanel {
         let pending = match &mut self.state {
             ViewerState::Ready(open) => {
                 open.painting = false;
+                open.store.end_stroke();
+                if open.tool == MapTool::Select
+                    && let Some(rect) = open.sel_pending.take()
+                {
+                    open.selection = Some(normalize_rect(rect));
+                }
                 let pending = open.rect_pending.take();
                 (open.tool == MapTool::RectFill)
                     .then_some(pending)
@@ -1124,6 +1259,81 @@ impl MapPanel {
                 cx,
             ),
             None => cx.notify(),
+        }
+    }
+
+    // ------------------------------------------------- selection clipboard
+
+    /// The selected cells as a stamp, clipped to the map.
+    fn selection_stamp(open: &OpenMap) -> Option<Stamp> {
+        let (x0, y0, x1, y1) = open.selection?;
+        let state = open.store.state();
+        let (x0, y0) = (x0.max(0), y0.max(0));
+        let (x1, y1) = (x1.min(state.w as i32 - 1), y1.min(state.h as i32 - 1));
+        if x1 < x0 || y1 < y0 {
+            return None;
+        }
+        let (w, h) = ((x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16);
+        let mut cells = Vec::with_capacity(w as usize * h as usize);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                cells.push(state.cells[y as usize * state.w as usize + x as usize]);
+            }
+        }
+        Some(Stamp { w, h, cells })
+    }
+
+    fn copy_impl(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.ready_map() else { return };
+        if let Some(stamp) = Self::selection_stamp(open) {
+            self.clipboard = Some(stamp);
+            cx.notify();
+        }
+    }
+
+    /// Where a paste lands: the cell under the cursor when it is over the
+    /// canvas, else the selection's top-left, else the origin.
+    fn paste_origin(open: &OpenMap) -> (i32, i32) {
+        open.hover_cell
+            .or_else(|| open.selection.map(|(x0, y0, _, _)| (x0, y0)))
+            .unwrap_or((0, 0))
+    }
+
+    fn paste_impl(&mut self, cx: &mut Context<Self>) {
+        let Some(stamp) = self.clipboard.clone() else { return };
+        let Some(open) = self.ready_map() else { return };
+        if open.tileset.is_none() {
+            return;
+        }
+        let (x, y) = Self::paste_origin(open);
+        let (w, h) = (stamp.w as i32, stamp.h as i32);
+        self.apply_op(MapOp::Brush { x, y, stamp }, cx);
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.selection = Some((x, y, x + w - 1, y + h - 1));
+        }
+    }
+
+    fn delete_selection_impl(&mut self, cx: &mut Context<Self>) {
+        let Some((x0, y0, x1, y1)) = self.ready_map().and_then(|open| open.selection) else {
+            return;
+        };
+        self.apply_op(
+            MapOp::RectFill {
+                x0,
+                y0,
+                x1,
+                y1,
+                cell: CELL_BLANK,
+            },
+            cx,
+        );
+    }
+
+    fn clear_selection_impl(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.selection = None;
+            open.sel_pending = None;
+            cx.notify();
         }
     }
 
@@ -1382,6 +1592,7 @@ impl MapPanel {
         if let ViewerState::Ready(open) = &mut self.state {
             open.tool = tool;
             open.rect_pending = None;
+            open.sel_pending = None;
             cx.notify();
         }
     }
@@ -1421,10 +1632,14 @@ impl MapPanel {
             cols: state.w,
             rows: state.h,
             grid: open.show_grid,
-            rect: open.rect_pending,
+            // A select drag previews like a rect-fill; the settled
+            // selection keeps drawing until cleared.
+            rect: open.rect_pending.or(open.sel_pending),
+            selection: open.selection,
             background: cx.theme().colors().editor_background,
             border: cx.theme().colors().border,
             accent: gpui::rgb(0xebcb8b).into(),
+            selection_color: cx.theme().colors().border_focused,
         };
         let bounds_slot = open.canvas_bounds.clone();
         let element = gpui::canvas(
@@ -1444,10 +1659,18 @@ impl MapPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.canvas_primary_down(event.position, window, cx);
+                    this.canvas_primary_down(event.position, event.modifiers.shift, window, cx);
                 }),
             )
+            .on_hover(cx.listener(|this, hovered: &bool, _window, _cx| {
+                if !hovered && let ViewerState::Ready(open) = &mut this.state {
+                    open.hover_cell = None;
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if let ViewerState::Ready(open) = &mut this.state {
+                    open.hover_cell = open.cell_at(event.position);
+                }
                 if this.handle_pan_move(event, cx) {
                     return;
                 }
@@ -1536,6 +1759,7 @@ impl MapPanel {
     fn canvas_primary_down(
         &mut self,
         position: gpui::Point<Pixels>,
+        shift: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1547,6 +1771,10 @@ impl MapPanel {
         };
         if let ViewerState::Ready(open) = &mut self.state {
             open.painting = true;
+            open.paint_erase = shift;
+            open.sel_pending = None;
+            // Everything this gesture paints folds into one undo entry.
+            open.store.begin_stroke();
             // A NEW gesture starts from no pending rect (fix round 1,
             // BLOCKING 3). `paint_at`'s RectFill arm EXTENDS an existing
             // pending rect, so a rect whose release never reached this
@@ -1821,9 +2049,12 @@ struct MapScene {
     rows: u16,
     grid: bool,
     rect: Option<(i32, i32, i32, i32)>,
+    /// The settled cell selection, drawn in the focus colour.
+    selection: Option<(i32, i32, i32, i32)>,
     background: Hsla,
     border: Hsla,
     accent: Hsla,
+    selection_color: Hsla,
 }
 
 struct StripScene {
@@ -1921,7 +2152,17 @@ fn paint_map(scene: &MapScene, canvas: Bounds<Pixels>, window: &mut Window) {
             );
             window.paint_quad(outline(r, scene.accent, BorderStyle::default()));
         }
+        if let Some((x0, y0, x1, y1)) = scene.selection {
+            let r = cell_rect(canvas, scene.pan, scene.zoom, x0, y0, x1, y1);
+            window.paint_quad(outline(r, scene.selection_color, BorderStyle::default()));
+        }
     });
+}
+
+/// Raw drag corners → inclusive `(x0, y0, x1, y1)` with `x0 <= x1`,
+/// `y0 <= y1`.
+fn normalize_rect((x0, y0, x1, y1): (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
 }
 
 fn paint_strip(scene: &StripScene, canvas: Bounds<Pixels>, window: &mut Window) {
@@ -1954,6 +2195,14 @@ impl Render for MapPanel {
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
+            .on_action(cx.listener(|this, _: &Copy, _window, cx| this.copy_impl(cx)))
+            .on_action(cx.listener(|this, _: &Paste, _window, cx| this.paste_impl(cx)))
+            .on_action(cx.listener(|this, _: &DeleteSelection, _window, cx| {
+                this.delete_selection_impl(cx)
+            }))
+            .on_action(cx.listener(|this, _: &ClearSelection, _window, cx| {
+                this.clear_selection_impl(cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &ApplyResize, window, cx| this.resize_impl(window, cx)),
             )
@@ -2759,7 +3008,7 @@ mod tests {
             );
             cx.update(|window, cx| {
                 panel.update(cx, |panel, cx| {
-                    panel.canvas_primary_down(position, window, cx)
+                    panel.canvas_primary_down(position, false, window, cx)
                 })
             });
         };
@@ -3877,5 +4126,124 @@ mod tests {
             "6",
             "the field shows the applied value"
         );
+    }
+
+    // ------------------------------------------- sidecar cols + terrains
+
+    #[gpui::test]
+    async fn test_the_tileset_sidecar_drives_strip_cols_and_terrains(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        ggo_worldlib::sprites::tileset_meta::save_tileset_meta(
+            dir.path(),
+            "assets/tiles/wide.til",
+            &ggo_worldlib::sprites::tileset_meta::TilesetMeta {
+                cols: Some(3),
+                terrains: vec![Terrain {
+                    name: "grass".into(),
+                    tiles: vec![],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.bind_tileset("tiles/wide.til".to_string(), cx);
+            let open = ready(panel);
+            assert_eq!(open.tileset.as_ref().unwrap().cols, 3, "cols come from the sidecar");
+            assert_eq!(open.terrains[0].name, "grass");
+            assert_eq!(open.til_meta_rel.as_deref(), Some("assets/tiles/wide.til"));
+            // Undoing the bind returns to world.til, which has no sidecar.
+            panel.undo_impl(cx);
+            let open = ready(panel);
+            assert_eq!(open.tileset.as_ref().unwrap().cols, FIXTURE_TILES, "back to the default layout");
+            assert!(open.terrains.is_empty());
+        });
+    }
+
+    // ------------------------------------------ fill, strokes, selection
+
+    #[gpui::test]
+    async fn test_fill_floods_only_the_connected_region(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            for y in 0..FIXTURE_H as i32 {
+                panel.paint_at((2, y), cx);
+            }
+            panel.set_tool(MapTool::Fill, cx);
+            panel.paint_at((0, 0), cx);
+            let filled = cells(panel);
+            let tile0 = pack_cell(0, 0, false, false);
+            for y in 0..FIXTURE_H as usize {
+                let row = &filled[y * FIXTURE_W as usize..][..FIXTURE_W as usize];
+                assert_eq!(row, &[tile0, tile0, tile0, CELL_BLANK], "row {y}");
+            }
+            panel.undo_impl(cx);
+            assert_eq!(cells(panel)[0], CELL_BLANK, "fill is its own undo step");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_brush_drag_undoes_as_one_step(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.store.begin_stroke();
+            }
+            panel.paint_at((0, 0), cx);
+            panel.paint_at((1, 0), cx);
+            panel.end_paint(cx);
+            panel.undo_impl(cx);
+            assert_eq!(cells(panel), blank_cells(), "one undo reverts the whole drag");
+            panel.undo_impl(cx);
+            assert_eq!(cells(panel), blank_cells(), "a second undo has nothing to revert");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_select_copy_paste_and_delete(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let tile0 = pack_cell(0, 0, false, false);
+        let at = |x: i32, y: i32| y as usize * FIXTURE_W as usize + x as usize;
+        panel.update(cx, |panel, cx| {
+            panel.paint_at((1, 1), cx);
+            panel.set_tool(MapTool::Select, cx);
+            panel.paint_at((2, 2), cx);
+            panel.paint_at((1, 1), cx);
+            panel.end_paint(cx);
+            assert_eq!(ready(panel).selection, Some((1, 1, 2, 2)), "normalized on release");
+
+            panel.copy_impl(cx);
+            let stamp = panel.clipboard.as_ref().unwrap();
+            assert_eq!((stamp.w, stamp.h), (2, 2));
+            assert_eq!(stamp.cells, vec![tile0, CELL_BLANK, CELL_BLANK, CELL_BLANK]);
+
+            // Paste lands under the cursor when it is over the canvas...
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.hover_cell = Some((2, 0));
+            }
+            panel.paste_impl(cx);
+            let cells_now = cells(panel);
+            assert_eq!(cells_now[at(2, 0)], tile0);
+            assert_eq!(cells_now[at(3, 1)], CELL_BLANK);
+            assert_eq!(ready(panel).selection, Some((2, 0, 3, 1)), "selection follows the paste");
+
+            panel.delete_selection_impl(cx);
+            assert_eq!(cells(panel)[at(2, 0)], CELL_BLANK);
+
+            // ...and on the selection's corner otherwise.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.hover_cell = None;
+                open.selection = Some((0, 0, 0, 0));
+            }
+            panel.paste_impl(cx);
+            assert_eq!(cells(panel)[at(0, 0)], tile0);
+
+            panel.clear_selection_impl(cx);
+            assert_eq!(ready(panel).selection, None);
+        });
     }
 }

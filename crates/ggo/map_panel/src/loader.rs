@@ -36,6 +36,7 @@ use ggo_common::to_render_image;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::map_doc::{MapState, compose_map_indices};
 use ggo_worldlib::sprites::palette565::{Pal, indices_to_rgba};
+use ggo_worldlib::sprites::tileset_meta::{TilesetMeta, load_tileset_meta};
 use ggo_worldlib::sprites::tileset_doc::{compose_tile_grid, resolve_cols};
 use gpui::RenderImage;
 
@@ -76,6 +77,11 @@ impl Tileset {
 pub struct LoadedMap {
     pub data: MapData,
     pub tileset: Option<Tileset>,
+    /// The bound tileset's editor sidecar (autotile terrains live there),
+    /// and the worktree-relative path it is keyed by -- `None` when the
+    /// asset root is not inside the worktree.
+    pub tileset_meta: TilesetMeta,
+    pub til_meta_rel: Option<String>,
     /// Why there is no [`Self::tileset`]: an empty binding, or the bound
     /// `.til` failing to open. `None` when one loaded fine.
     pub tileset_error: Option<String>,
@@ -132,14 +138,36 @@ pub fn compose_strip(tileset: &Tileset) -> Option<Arc<RenderImage>> {
     to_render_image(&rgba, w as u32, h as u32)
 }
 
-/// Resolve `til_rel` against `root` into the strip's pixel data.
-pub fn load_tileset(root: &Path, til_rel: &str) -> Result<Tileset, String> {
+/// The worktree-relative path of `til_rel` (an asset-root-relative `.til`),
+/// which is what the tileset editor keys its sidecar by. `None` when the
+/// asset root is not inside `project_root`.
+pub fn tileset_meta_rel(asset_root: &Path, project_root: &Path, til_rel: &str) -> Option<String> {
+    let under = asset_root.strip_prefix(project_root).ok()?;
+    let under = under.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    Some(if under.is_empty() {
+        til_rel.to_string()
+    } else {
+        format!("{under}/{til_rel}")
+    })
+}
+
+/// The bound tileset's sidecar (defaults when there is none).
+pub fn tileset_meta(asset_root: &Path, project_root: &Path, til_rel: &str) -> TilesetMeta {
+    match tileset_meta_rel(asset_root, project_root, til_rel) {
+        Some(rel) => load_tileset_meta(project_root, &rel),
+        None => TilesetMeta::default(),
+    }
+}
+
+/// Resolve `til_rel` against `root` into the strip's pixel data, laid out
+/// at the sidecar's `cols` when it has one that fits this sheet.
+pub fn load_tileset(root: &Path, til_rel: &str, cols_hint: Option<usize>) -> Result<Tileset, String> {
     if til_rel.is_empty() {
         return Err("no tileset bound".to_string());
     }
     let opened = io::open_tileset(root, til_rel).map_err(|e| e.to_string())?;
     Ok(Tileset {
-        cols: grid_cols(opened.tile_count),
+        cols: resolve_cols(cols_hint, None, opened.tile_count, grid_cols(opened.tile_count)),
         indices: opened.indices,
         palette: opened.palette,
         tile_count: opened.tile_count,
@@ -165,9 +193,11 @@ pub fn map_stem(rel: &str) -> &str {
 
 /// Open the asset-root-relative `.map` at `rel` under `root`, resolve its
 /// bound tileset, and compose both surfaces.
-pub fn load_map(root: &Path, rel: &str) -> Result<LoadedMap, String> {
+pub fn load_map(root: &Path, rel: &str, project_root: &Path) -> Result<LoadedMap, String> {
     let data = io::open_map(root, rel).map_err(|e| e.to_string())?;
-    let (tileset, tileset_error) = match load_tileset(root, &data.til_path) {
+    let tileset_meta = tileset_meta(root, project_root, &data.til_path);
+    let til_meta_rel = tileset_meta_rel(root, project_root, &data.til_path);
+    let (tileset, tileset_error) = match load_tileset(root, &data.til_path, tileset_meta.cols) {
         Ok(tileset) => (Some(tileset), None),
         Err(e) => (None, Some(e)),
     };
@@ -182,6 +212,8 @@ pub fn load_map(root: &Path, rel: &str) -> Result<LoadedMap, String> {
     Ok(LoadedMap {
         data,
         tileset,
+        tileset_meta,
+        til_meta_rel,
         tileset_error,
         strip,
         image,
@@ -234,7 +266,7 @@ mod tests {
     fn an_unbound_map_loads_without_a_tileset() {
         let dir = tempfile::tempdir().unwrap();
         io::save_new_map(dir.path(), "maps/fresh.map", 4, 4).unwrap();
-        let loaded = load_map(dir.path(), "maps/fresh.map").unwrap();
+        let loaded = load_map(dir.path(), "maps/fresh.map", dir.path()).unwrap();
         assert!(loaded.tileset.is_none());
         assert!(loaded.tileset_error.is_some());
         assert!(loaded.image.is_none());
@@ -259,7 +291,7 @@ mod tests {
             dirty: false,
         };
         io::save_map(root, "level.map", &state).unwrap();
-        let loaded = load_map(root, "level.map").unwrap();
+        let loaded = load_map(root, "level.map", root).unwrap();
         let tileset = loaded.tileset.unwrap();
 
         let mut store = MapDocStore::new(

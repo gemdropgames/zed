@@ -463,11 +463,12 @@ impl TilesetPanel {
         let Some(root) = &self.project_root else {
             return;
         };
-        let meta = loader::ViewMeta {
-            zoom: Some(open.zoom),
-            cols: Some(open.cols),
-            lines: Some(open.show_lines),
-        };
+        // Load-modify-save: the sidecar also carries the map editor's
+        // terrains, which this panel must not wipe.
+        let mut meta = loader::load_view_meta(root, &open.rel_path);
+        meta.zoom = Some(open.zoom);
+        meta.cols = Some(open.cols);
+        meta.lines = Some(open.show_lines);
         if let Err(e) = loader::save_view_meta(root, &open.rel_path, &meta) {
             log::error!("GGO: failed to write view sidecar for {}: {e}", open.rel_path);
         }
