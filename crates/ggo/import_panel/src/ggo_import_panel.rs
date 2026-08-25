@@ -136,14 +136,12 @@ const GGO_IMPORT_PANEL_KEY: &str = "GGOImportPanel";
 /// The panel's key-dispatch context (`.key_context`), which the
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoImportPanel";
+const KEY_CONTEXT_NO_EDITOR: &str = "GgoImportPanel && !Editor";
 
 /// Fixed default width until the panel grows real settings persistence
 /// (same call every other GGO panel made at this stage). As wide as the map
 /// panel: this one stacks a crop canvas, a preview and a form.
 const DEFAULT_WIDTH: Pixels = px(460.);
-
-/// The source extension this panel's context-menu entry is offered on.
-const PNG_EXT: &str = "png";
 
 /// The assets subdirectory hanging off an emerald project root. Hardcoded
 /// upstream -- it is NOT a configurable `emerald.toml` key. Same constant
@@ -207,7 +205,11 @@ pub fn init(cx: &mut App) {
                     return;
                 };
                 let til_rel = action.til_rel.clone();
-                panel.update(cx, |panel, cx| panel.reimport_tileset(&til_rel, cx));
+                let root = worktree_root(workspace, cx);
+                panel.update(cx, |panel, cx| {
+                    panel.adopt_root(root, cx);
+                    panel.reimport_tileset(&til_rel, cx);
+                });
                 workspace.focus_panel::<ImportPanel>(window, cx);
             },
         );
@@ -227,9 +229,10 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("backspace", ClearCrop, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-o", ChooseSource, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-o", ChooseSource, Some(KEY_CONTEXT)),
-        KeyBinding::new("=", ZoomIn, Some(KEY_CONTEXT)),
-        KeyBinding::new("+", ZoomIn, Some(KEY_CONTEXT)),
-        KeyBinding::new("-", ZoomOut, Some(KEY_CONTEXT)),
+        // Not while a destination field has focus: `-`/`=` are typed there.
+        KeyBinding::new("=", ZoomIn, Some(KEY_CONTEXT_NO_EDITOR)),
+        KeyBinding::new("+", ZoomIn, Some(KEY_CONTEXT_NO_EDITOR)),
+        KeyBinding::new("-", ZoomOut, Some(KEY_CONTEXT_NO_EDITOR)),
         KeyBinding::new("ctrl-r", Reimport, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-r", Reimport, Some(KEY_CONTEXT)),
     ]);
@@ -261,9 +264,10 @@ fn intercept_image_drop(
         return false;
     };
     let ignored = paths.len() - 1;
+    let root = worktree_root(workspace, cx);
     panel.update(cx, |panel, cx| {
         // The drop can land before the panel was ever activated.
-        panel.refresh_root(cx);
+        panel.adopt_root(root, cx);
         panel.open_abs_source(first.clone(), cx);
         if ignored > 0 {
             panel.status = Some(format!("{ignored} more dropped file(s) ignored — one source at a time"));
@@ -276,11 +280,16 @@ fn intercept_image_drop(
 /// Does `path` name an importable source (PNG or Aseprite)? One rule, so
 /// the menu predicate and the tests agree.
 fn is_png_path(path: &ProjectPath) -> bool {
-    path.path.extension().is_some_and(|ext| {
-        ext.eq_ignore_ascii_case(PNG_EXT)
-            || ext.eq_ignore_ascii_case("ase")
-            || ext.eq_ignore_ascii_case("aseprite")
-    })
+    path.path.file_name().is_some_and(is_importable_source)
+}
+
+/// The primary worktree's root, read off the `Workspace` the caller
+/// already holds -- for the two entry points that run INSIDE a
+/// `Workspace` update, where `refresh_root`'s `workspace.read(cx)` would
+/// double-lease.
+fn worktree_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    let worktree = workspace.project().read(cx).visible_worktrees(cx).next()?;
+    Some(worktree.read(cx).abs_path().to_path_buf())
 }
 
 /// `workspace::ContextMenuContributor` for a `.png` FILE: "Import as
@@ -570,6 +579,9 @@ struct OpenImport {
     frames: Vec<DecodedFrame>,
     /// The palette slot picked for a swap / move (tileset mode).
     swatch_pick: Option<usize>,
+    /// The source's mtime when it was decoded -- what the import record
+    /// stores, so an edit between load and Import still shows as changed.
+    source_mtime: u64,
     /// "Import as sprite": also write a `.spr` whose frames are cut on the
     /// [`frame_rects`] grid. Off = plain tileset import.
     as_sprite: bool,
@@ -612,6 +624,7 @@ impl OpenImport {
             cropping: false,
             frames: loaded.frames,
             swatch_pick: None,
+            source_mtime: 0,
             as_sprite: false,
             frame_cut: (None, None),
             canvas_bounds: Rc::new(RefCell::new(None)),
@@ -629,7 +642,7 @@ impl OpenImport {
             .unwrap_or_else(|_| self.source_abs.to_string_lossy().to_string());
         ImportRecord {
             source,
-            mtime: source_mtime(&self.source_abs).unwrap_or(0),
+            mtime: self.source_mtime,
             crop: self.wizard.region.map(|r| (r.x, r.y, r.w, r.h)),
             reserve_transparent: self.wizard.reserve_transparent,
             as_sprite: self.as_sprite,
@@ -753,6 +766,13 @@ impl ImportPanel {
     /// Re-discover the project root (the workspace's first visible worktree).
     /// MUST NOT run while the workspace itself is mid-update (it reads the
     /// workspace entity) -- see the deferral in `set_active`.
+    /// `refresh_root` for callers that already resolved the worktree root
+    /// (see [`worktree_root`]).
+    fn adopt_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.project_root = self.root_override.clone().or(root);
+        cx.notify();
+    }
+
     fn refresh_root(&mut self, cx: &mut Context<Self>) {
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
@@ -883,11 +903,16 @@ impl ImportPanel {
             rel_path: source_rel.clone(),
         };
         self.status = None;
+        // Only the load this record was set for may apply it.
+        let pending = self.pending_record.take();
         cx.notify();
 
         let load = {
             let source_abs = source_abs.clone();
-            cx.background_spawn(async move { loader::load_png(&source_abs) })
+            cx.background_spawn(async move {
+                let mtime = source_mtime(&source_abs).unwrap_or(0);
+                loader::load_png(&source_abs).map(|loaded| (loaded, mtime))
+            })
         };
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
@@ -896,13 +921,14 @@ impl ImportPanel {
                     return;
                 }
                 this.state = match result {
-                    Ok(loaded) => {
+                    Ok((loaded, mtime)) => {
                         let mut open =
                             OpenImport::new(source_rel.clone(), source_abs, root.clone(), loaded);
+                        open.source_mtime = mtime;
                         // Default the destination to wherever the source
                         // already lives, ASSET-ROOT-relative.
                         open.wizard.set_dest_dir(dest_dir);
-                        if let Some((record, stem)) = this.pending_record.take() {
+                        if let Some((record, stem)) = pending {
                             open.apply_record(&record);
                             open.wizard.set_dest_stem(stem);
                         }
@@ -3945,5 +3971,64 @@ mod tests {
             assert_eq!(ready(panel).swatch_pick, None, "sprite mode ignores palette clicks");
         });
         assert_eq!(read_pal(), baseline, "reset re-quantized");
+    }
+
+    #[gpui::test]
+    async fn test_a_failed_reimport_load_drops_its_record(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.wizard.commit_region(Some(Region { x: 0, y: 0, w: 8, h: 8 }));
+            }
+            panel.commit(cx).expect("commit");
+        });
+        std::fs::remove_file(dir.path().join("assets/art/hero.png")).unwrap();
+        panel.update(cx, |panel, cx| panel.reimport_tileset("assets/art/hero.til", cx));
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(panel.state, ViewerState::Error(_)), "the source is gone");
+            assert!(panel.pending_record.is_none(), "not left for the next load");
+        });
+        panel.update(cx, |panel, cx| panel.load_source("art/outside.png", cx));
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(ready(panel).wizard.region, None, "no stale crop applied");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_zoom_keys_do_not_fire_inside_a_destination_field(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        write_project(dir.path());
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ImportPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        cx.update(|window, _| window.activate_window());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.run_until_parked();
+        // The fields are created on the first render; make them and focus the stem editor.
+        panel.update_in(cx, |panel, window, cx| panel.ensure_fields(window, cx));
+        let stem = panel.read_with(cx, |panel, _| ready(panel).fields.as_ref().unwrap().stem.clone());
+        stem.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+            editor.set_text("t", window, cx);
+        });
+        cx.run_until_parked();
+        let zoom_before = panel.read_with(cx, |panel, _| ready(panel).zoom);
+        cx.simulate_keystrokes("-");
+        cx.run_until_parked();
+        assert_eq!(stem.read_with(cx, |editor, cx| editor.text(cx)), "t-", "typed, not zoomed");
+        assert_eq!(panel.read_with(cx, |panel, _| ready(panel).zoom), zoom_before);
     }
 }

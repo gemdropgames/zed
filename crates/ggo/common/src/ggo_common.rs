@@ -30,6 +30,11 @@ use gpui::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use image::Frame;
+use project::ProjectPath;
+use workspace::Workspace;
+use workspace::dock::Panel;
+
 /// Replay a tileset's recorded import from its (changed) source. Lives
 /// here rather than in the import panel so the tileset panel -- which the
 /// import panel depends on -- can dispatch it without a crate cycle.
@@ -39,10 +44,6 @@ pub struct ReimportTileset {
     /// The `.til`'s worktree-relative path (the import record's sidecar key).
     pub til_rel: String,
 }
-use image::Frame;
-use project::ProjectPath;
-use workspace::Workspace;
-use workspace::dock::Panel;
 
 /// In-place RGBA8 -> BGRA8 (straight alpha in, straight alpha out --
 /// gpui's own non-SVG decode paths do exactly this `swap(0, 2)`, see
@@ -1364,5 +1365,4 @@ impl ui::prelude::RenderOnce for CopyableText {
                     }),
             )
     }
-
 }

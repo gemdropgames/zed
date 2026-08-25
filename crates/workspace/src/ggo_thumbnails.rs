@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext as _, Context, Entity, Global, RenderImage};
 
@@ -68,9 +69,13 @@ fn decoder_for(path: &Path, cx: &App) -> Option<ThumbnailDecoder> {
         .map(|registered| registered.decoder)
 }
 
+/// How long a hit is trusted before the file is stat'd again.
+const RECHECK_AFTER: Duration = Duration::from_secs(2);
+
 struct CacheEntry {
     mtime: u64,
     image: Option<Arc<RenderImage>>,
+    checked: Instant,
 }
 
 #[derive(Default)]
@@ -95,10 +100,18 @@ impl ThumbnailCache {
     /// whatever is cached meanwhile; the cache notifies when it lands.
     pub fn get(&mut self, path: &Path, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
         let decoder = decoder_for(path, cx)?;
-        let mtime = mtime_of(path)?;
+        // Rows re-render often; a stat per row per frame is the cost to
+        // avoid, so a fresh hit skips it.
         if let Some(entry) = self.entries.get(path)
+            && entry.checked.elapsed() < RECHECK_AFTER
+        {
+            return entry.image.clone();
+        }
+        let mtime = mtime_of(path)?;
+        if let Some(entry) = self.entries.get_mut(path)
             && entry.mtime == mtime
         {
+            entry.checked = Instant::now();
             return entry.image.clone();
         }
         if self.pending.insert(path.to_path_buf()) {
@@ -112,7 +125,15 @@ impl ThumbnailCache {
                     .await;
                 this.update(cx, |this, cx| {
                     this.pending.remove(&path);
-                    this.insert(path, CacheEntry { mtime, image }, cx);
+                    this.insert(
+                        path,
+                        CacheEntry {
+                            mtime,
+                            image,
+                            checked: Instant::now(),
+                        },
+                        cx,
+                    );
                     cx.notify();
                 })
                 .ok();

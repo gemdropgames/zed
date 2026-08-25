@@ -16,8 +16,9 @@ use gpui::RenderImage;
 
 pub const EXTENSIONS: &[&str] = &["til", "spr", "png"];
 pub const THUMB_PX: usize = 16;
-/// Tiles per row in a `.til` thumbnail (the first two rows are visible).
+/// A `.til` thumbnail shows its first `THUMB_COLS x THUMB_ROWS` tiles.
 const THUMB_COLS: usize = 4;
+const THUMB_ROWS: usize = 2;
 
 pub fn decode_thumbnail(path: &Path) -> Option<Arc<RenderImage>> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -30,9 +31,11 @@ pub fn decode_thumbnail(path: &Path) -> Option<Arc<RenderImage>> {
         "til" => {
             let (root, rel) = split_for_worldlib(path)?;
             let tileset = io::open_tileset(&root, &rel).ok()?;
-            let cols = THUMB_COLS.min(tileset.tile_count.max(1));
-            let (indices, ..) = compose_tile_grid(&tileset.indices, tileset.tile_count, cols);
-            let (_, rows) = tile_grid_layout(tileset.tile_count, cols);
+            let shown = tileset.tile_count.min(THUMB_COLS * THUMB_ROWS);
+            let cols = THUMB_COLS.min(shown.max(1));
+            let pixels = tileset.indices.get(..shown * TILE_PX * TILE_PX)?;
+            let (indices, ..) = compose_tile_grid(pixels, shown, cols);
+            let (_, rows) = tile_grid_layout(shown, cols);
             (
                 indices_to_rgba(&indices, &tileset.palette),
                 cols * TILE_PX,
