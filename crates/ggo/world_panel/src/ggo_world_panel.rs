@@ -23,6 +23,7 @@
 //! NOT pan (W6 chose middle-drag pan; left-click on empty is a pure
 //! deselect).
 
+mod audio_budget;
 mod canvas;
 mod inspector;
 mod loader;
@@ -627,6 +628,11 @@ struct OpenWorld {
     /// Why the popout Emulate could not launch (failed build or spawn),
     /// shown on the toolbar next to `save_error`.
     popout_error: Option<String>,
+    /// Region bytes per audio stem, filled off-thread -- see
+    /// [`audio_budget`]. Cleared by [`WorldPanel::refresh_worlds`].
+    audio_sizes: audio_budget::AudioSizes,
+    audio_size_generation: u64,
+    _audio_size_task: Option<Task<()>>,
     /// The open palette color picker, if any -- at most one, anchored to
     /// one Color565 field.
     color_picker: Option<ColorPicker>,
@@ -696,6 +702,9 @@ impl OpenWorld {
             inspector: Vec::new(),
             save_error: None,
             popout_error: None,
+            audio_sizes: HashMap::new(),
+            audio_size_generation: 0,
+            _audio_size_task: None,
             color_picker: None,
             stem_completion: None,
         }
@@ -814,6 +823,11 @@ impl WorldPanel {
     /// workspace entity) -- see the deferral in `set_active` and in
     /// [`Self::open_rel_path`].
     fn refresh_worlds(&mut self, cx: &mut Context<Self>) {
+        // Audio sizes are re-derived on the next render: a file imported
+        // since the panel was last shown gets its new size.
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.audio_sizes.clear();
+        }
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
             let project = workspace.read(cx).project().clone();
@@ -1991,6 +2005,68 @@ impl WorldPanel {
         }
     }
 
+    // ------------------------------------------------- audio budget
+
+    /// Size any audio stem the world names that has no cached size yet --
+    /// one background task at a time, generation-guarded against a world
+    /// switch. Called from `render`, so a stem committed in the inspector
+    /// is sized on the next frame.
+    fn schedule_audio_sizes(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if open._audio_size_task.is_some() {
+            return;
+        }
+        let state = open.store.state();
+        let missing: Vec<String> = audio_budget::audio_stems(&state, &open.schemas)
+            .into_iter()
+            .filter(|stem| !open.audio_sizes.contains_key(stem))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        open.audio_size_generation += 1;
+        let generation = open.audio_size_generation;
+        let root = open.root.clone();
+        let sized = cx.background_spawn(async move {
+            missing
+                .into_iter()
+                .map(|stem| {
+                    let size = audio_budget::size_stem(&root, &stem);
+                    (stem, size)
+                })
+                .collect::<Vec<_>>()
+        });
+        open._audio_size_task = Some(cx.spawn(async move |this, cx| {
+            let sized = sized.await;
+            this.update(cx, |this, cx| {
+                let ViewerState::Ready(open) = &mut this.state else {
+                    return;
+                };
+                if open.audio_size_generation != generation {
+                    return;
+                }
+                open._audio_size_task = None;
+                open.audio_sizes.extend(sized);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The toolbar's audio readout, `None` when the world names no audio.
+    fn audio_budget(&self) -> Option<audio_budget::AudioBudget> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let stems = audio_budget::audio_stems(&open.store.state(), &open.schemas);
+        if stems.is_empty() {
+            return None;
+        }
+        Some(audio_budget::summarize(&stems, &open.audio_sizes))
+    }
+
     // ------------------------------------------------- color picker
 
     /// Open the palette picker for `target` (or close it if it is already
@@ -2415,6 +2491,25 @@ impl WorldPanel {
                 Color::Modified
             } else {
                 Color::Muted
+            }))
+            .children(self.audio_budget().map(|budget| {
+                let tooltip = if budget.missing.is_empty() {
+                    "Audio this world uploads into the APU sample region".to_string()
+                } else {
+                    format!("missing: {}", budget.missing.join(", "))
+                };
+                div()
+                    .id("ggo-world-audio-budget")
+                    .tooltip(ui::Tooltip::text(tooltip))
+                    .child(
+                        Label::new(budget.label())
+                            .size(LabelSize::Small)
+                            .color(if budget.over() {
+                                Color::Error
+                            } else {
+                                Color::Muted
+                            }),
+                    )
             }))
             .child(div().flex_1())
             .child(
@@ -3119,6 +3214,7 @@ impl Render for WorldPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inspector(window, cx);
         self.refresh_stem_completion(window, cx);
+        self.schedule_audio_sizes(cx);
         let body = match &self.state {
             ViewerState::Empty => self.render_message(EMPTY_MESSAGE.to_string(), cx),
             ViewerState::Loading { stem } => self.render_message(format!("Loading {stem}…"), cx),
@@ -7060,6 +7156,52 @@ mod tests {
             let v = open_of(panel).view.borrow();
             assert_eq!(v.zoom, canvas::ZOOM_MIN, "the bottom of the ladder holds");
             assert_eq!(v.pan, Some([0.0, 0.0]));
+        });
+    }
+
+    /// The toolbar's audio readout: every `Music`/`Sfx` stem the world
+    /// names is sized against the sample region -- a baked `.adp` by its
+    /// blocks, a missing file counted as 0 and listed.
+    #[gpui::test]
+    async fn test_audio_budget_sizes_the_worlds_stems(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let world = WorldFile {
+            entities: vec![
+                entity(json!({ "Sfx": { "stem": "sfx/jump", "looping": false } })),
+                entity(json!({ "Music": { "stem": "music/theme" } })),
+            ],
+            instances: vec![],
+            backgrounds: vec![],
+        };
+        write_world(dir.path(), "worlds/audio.toml", &world).unwrap();
+        let decoded = ggo_audio::Decoded {
+            samples: vec![500; 16_000],
+            rate_hz: 16_000,
+            source_channels: 1,
+        };
+        ggo_audio::write_adp(dir.path(), "sfx/jump.adp", &ggo_audio::bake(&decoded, 16_000))
+            .unwrap();
+
+        panel.update(cx, |panel, cx| panel.load_rel_path("worlds/audio.toml", cx));
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.audio_budget().map(|b| b.pending),
+                Some(2),
+                "both stems are unsized until a render schedules them"
+            );
+            panel.schedule_audio_sizes(cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let budget = panel.audio_budget().expect("the world names audio");
+            assert_eq!(budget.used, (16_000 / 120 + 1) * 64);
+            assert_eq!(budget.missing, vec!["music/theme".to_string()]);
+            assert_eq!(budget.pending, 0);
+            assert!(!budget.over());
+            assert_eq!(budget.label(), "audio 9 / 384 KiB · 1 missing");
         });
     }
 }

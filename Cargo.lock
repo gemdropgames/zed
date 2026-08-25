@@ -7756,6 +7756,7 @@ dependencies = [
  "anyhow",
  "editor",
  "ggo-asset-formats",
+ "ggo-audio",
  "ggo-worldlib",
  "ggo_common",
  "ggo_sprite_panel",

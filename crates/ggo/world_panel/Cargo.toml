@@ -32,6 +32,7 @@ ui.workspace = true
 workspace.workspace = true
 ggo-worldlib.workspace = true # GGO
 ggo-asset-formats.workspace = true # GGO
+ggo-audio.workspace = true # GGO -- the audio budget line sizes stems against the 384 KiB sample region
 ggo_common.workspace = true
 # The "open this MetaSprite's sprite" handoff needs the sprite panel's own
 # `open_rel_path`. One-way: the sprite panel does not know about worlds.
