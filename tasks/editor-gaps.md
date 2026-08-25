@@ -99,19 +99,19 @@ Refs: Tiled terrain sets + automapping, Pixelorama 1.1 autotile.
 - [ ] Layers — only if the `.map` format grows them; otherwise document that priority lives at the world `[[background]]` level
 - [ ] Slider primitive for zoom + palSub (see §10)
 
-## 6. Asset pipeline — `medium`
+## 6. Asset pipeline — `done 2026-08-25`
 
 PNG only (`import_panel:130`), wizard has no undo, no keybindings (`:193`),
 no OS drag-and-drop (`:68`), no re-import on change, no thumbnails anywhere,
 no in-panel picker anywhere.
 Refs: Godot import dock, GB Studio assets folder.
 
-- [ ] OS file drag-and-drop onto the workspace → import wizard
-- [ ] Remember the source PNG path in the `.editor.json` sidecar; offer re-import when it changes (mtime watch)
-- [ ] Aseprite `.ase`/`.aseprite` reader → tileset + frames (documented format, small)
-- [ ] Thumbnails for `.spr` / `.til` in the project panel (or a GGO asset browser dock)
-- [ ] Palette surgery in the import preview: ramps, sort, swap (currently one-shot quantization — `import_panel:76`)
-- [ ] Keybindings for the import wizard (`bind_panel_keys` is empty)
+- [x] OS file drag-and-drop anywhere in the editor → import wizard (2026-08-25)
+- [x] Import record (source, mtime, crop, settings) in the `.editor.json` sidecar; re-import banner on open (checked on open, no watcher) (2026-08-25)
+- [x] Aseprite `.ase`/`.aseprite` reader in worldlib → tileset, or one sprite frame per source frame (2026-08-25)
+- [x] Thumbnails for `.til` / `.spr` / `.png` rows in the project panel (2026-08-25)
+- [x] Palette surgery in the import preview: swap, move, sort, reset (tileset mode) (2026-08-25)
+- [x] Keybindings for the import wizard (2026-08-25)
 
 ## 7. Pixel tools — `small each`
 
