@@ -76,6 +76,7 @@
 //! further render will come.
 
 pub mod audio;
+mod debug;
 mod emu_item;
 mod drive;
 mod ingest;
@@ -84,15 +85,17 @@ mod menu;
 mod stats;
 mod uart;
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    AnyWindowHandle, App, Context, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
+    AnyWindowHandle, App, Bounds, Context, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseMoveEvent,
     Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription, Task,
-    WeakEntity, Window, actions, div, px,
+    WeakEntity, Window, actions, div, point, px, size,
 };
 use project::ProjectPath;
 use ui::Tooltip;
@@ -115,7 +118,13 @@ actions!(
         /// Stops the running cart.
         Stop,
         /// Mutes or unmutes the emulator's audio output.
-        ToggleMute
+        ToggleMute,
+        /// Pauses the running cart at its next frame, or resumes it.
+        TogglePause,
+        /// While paused, runs exactly one more frame (pauses first if running).
+        StepFrame,
+        /// Shows or hides the debug column (tiles, tilemap, OAM, palettes).
+        ToggleDebug
     ]
 );
 
@@ -138,6 +147,11 @@ const LIVE_CONSOLE_TAIL_LINES: usize = 100;
 /// Height of the console's scroll region when expanded -- ggo-ide's
 /// `CONSOLE_HEIGHT`, itself a port of `EmulatorPage.tsx`'s `max-h-64`.
 const CONSOLE_HEIGHT: Pixels = px(200.);
+
+/// The debug column's width: the 512-px sheets scroll inside it.
+const DEBUG_COLUMN_PX: f32 = 360.0;
+/// Palette grid swatch size.
+const DEBUG_SWATCH_PX: f32 = 12.0;
 
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
@@ -274,6 +288,9 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-r", Run, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-alt-s", Stop, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-alt-m", ToggleMute, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-p", TogglePause, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-.", StepFrame, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-d", ToggleDebug, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -447,6 +464,8 @@ pub struct EmuPanel {
     /// Clears the pad mask when the pane loses focus, so a key held while
     /// the user clicks away doesn't stay latched forever.
     _focus_out: Option<Subscription>,
+    /// The debug column -- see [`debug`].
+    debug: debug::DebugState,
 }
 
 impl EmuPanel {
@@ -509,6 +528,7 @@ impl EmuPanel {
             current_rendered_frame: None,
             previous_rendered_frame: None,
             _focus_out,
+            debug: debug::DebugState::new(),
         }
     }
 
@@ -1029,6 +1049,50 @@ impl EmuPanel {
         self.session.is_some()
     }
 
+    pub(crate) fn is_paused(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| session.is_paused())
+    }
+
+    /// Pause at the next frame boundary, or resume. The flag lives on the
+    /// session, so a new run always starts unpaused.
+    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if session.is_paused() {
+            session.resume();
+        } else {
+            session.pause();
+        }
+        cx.notify();
+    }
+
+    /// One more frame while paused; a running cart is paused first (a step
+    /// from a running state is a pause, never a skipped frame).
+    fn step_frame(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if session.is_paused() {
+            session.step();
+        } else {
+            session.pause();
+        }
+        cx.notify();
+    }
+
+    /// The transport's right-hand readout.
+    pub(crate) fn transport_readout(&self) -> Option<String> {
+        self.session.as_ref().map(|session| {
+            format!(
+                "{} · frame {}{}",
+                session.cart,
+                self.frame,
+                if session.is_paused() { " · paused" } else { "" }
+            )
+        })
+    }
+
     // ----------------------------------------------------------- audio
 
     /// Mute/unmute. Takes effect on the live run within one cpal callback
@@ -1103,6 +1167,8 @@ impl EmuPanel {
     /// (`gpui_wgpu/src/wgpu_atlas.rs:133`), so the overlap between the
     /// three slots is harmless.
     fn release_atlas_all(&mut self, window: &mut Window) {
+        self.debug.retire_all();
+        self.retire_debug_images(window);
         for image in [
             self.previous_rendered_frame.take(),
             self.current_rendered_frame.take(),
@@ -1115,10 +1181,525 @@ impl EmuPanel {
         }
     }
 
+    // ----------------------------------------------------------- debug
+
+    fn toggle_debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.debug.open = !self.debug.open;
+        if !self.debug.open {
+            self.debug.retire_all();
+            self.retire_debug_images(window);
+            self.debug.hover = None;
+        }
+        cx.notify();
+    }
+
+    /// Drop every viewer image replaced since the last render.
+    fn retire_debug_images(&mut self, window: &mut Window) {
+        for image in self.debug.retired.drain(..) {
+            window.drop_image(image).log_err();
+        }
+    }
+
+    fn set_debug_tab(&mut self, tab: debug::DebugTab, cx: &mut Context<Self>) {
+        self.debug.tab = tab;
+        self.debug.hover = None;
+        self.debug.last_decoded_ptr = 0;
+        cx.notify();
+    }
+
+    fn set_debug_selector(
+        &mut self,
+        bank: usize,
+        palette: usize,
+        layer: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.debug.bank = bank & 1;
+        self.debug.palette = palette % ggo_emu_core::ppu::PALETTES;
+        self.debug.layer = layer % ggo_emu_core::ppu::LAYER_COUNT;
+        self.debug.last_decoded_ptr = 0;
+        cx.notify();
+    }
+
+    /// Called from `render`: if the column is open and a fresh snapshot is
+    /// due, decode the active tab off-thread. The identity check makes a
+    /// paused run decode once per step, and the throttle keeps a running
+    /// one at ~10 Hz.
+    fn debug_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.debug.open {
+            return;
+        }
+        let Some(snapshot) = self.session.as_ref().and_then(|session| session.snapshot()) else {
+            return;
+        };
+        let paused = self.is_paused();
+        if !self.debug.decode_due(&snapshot, paused, Instant::now()) {
+            return;
+        }
+        self.start_debug_decode(snapshot, cx);
+    }
+
+    /// The active tab's pixels for `snapshot`, with the image's size.
+    /// `None` for Palettes, which paints from the snapshot directly.
+    fn decode_debug_tab(
+        tab: debug::DebugTab,
+        snapshot: &ggo_emu_core::ppu::PpuSnapshot,
+        bank: usize,
+        palette: usize,
+        layer: usize,
+    ) -> Option<Arc<RenderImage>> {
+        let (bgra, width, height) = match tab {
+            debug::DebugTab::Tiles => (
+                debug::tile_sheet_bgra(snapshot, bank, palette),
+                debug::SHEET_PX,
+                debug::SHEET_PX,
+            ),
+            debug::DebugTab::Map => (debug::map_bgra(snapshot, layer), debug::MAP_PX, debug::MAP_PX),
+            debug::DebugTab::Oam => (
+                debug::oam_composite_bgra(snapshot),
+                ggo_emu_core::peripherals::SCREEN_WIDTH,
+                ggo_emu_core::peripherals::SCREEN_HEIGHT,
+            ),
+            debug::DebugTab::Palettes => return None,
+        };
+        image::ImageBuffer::from_raw(width as u32, height as u32, bgra)
+            .map(|buffer| Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+    }
+
+    fn start_debug_decode(
+        &mut self,
+        snapshot: Arc<ggo_emu_core::ppu::PpuSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.debug.generation += 1;
+        let generation = self.debug.generation;
+        self.debug.last_decode_started = Some(Instant::now());
+        self.debug.last_decoded_ptr = Arc::as_ptr(&snapshot) as usize;
+        let tab = self.debug.tab;
+        let (bank, palette, layer) = (self.debug.bank, self.debug.palette, self.debug.layer);
+        let decode = cx.background_spawn({
+            let snapshot = snapshot.clone();
+            async move { Self::decode_debug_tab(tab, &snapshot, bank, palette, layer) }
+        });
+        self.debug._task = Some(cx.spawn(async move |this, cx| {
+            let image = decode.await;
+            this.update(cx, |this, cx| {
+                if this.debug.generation != generation || !this.debug.open {
+                    return;
+                }
+                this.debug.set_decoded(debug::Decoded {
+                    tab,
+                    image,
+                    snapshot,
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Decode `snapshot` for the active tab synchronously -- the tests'
+    /// way to exercise the viewers without a running cart.
+    #[cfg(test)]
+    pub(crate) fn debug_decode_now(&mut self, snapshot: Arc<ggo_emu_core::ppu::PpuSnapshot>) {
+        let tab = self.debug.tab;
+        let image = Self::decode_debug_tab(
+            tab,
+            &snapshot,
+            self.debug.bank,
+            self.debug.palette,
+            self.debug.layer,
+        );
+        self.debug.last_decoded_ptr = Arc::as_ptr(&snapshot) as usize;
+        self.debug.set_decoded(debug::Decoded {
+            tab,
+            image,
+            snapshot,
+        });
+    }
+
+    fn render_debug_column(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let tabs = h_flex()
+            .gap_1()
+            .p_1()
+            .children(debug::DebugTab::ALL.into_iter().map(|tab| {
+                Button::new(
+                    SharedString::from(format!("ggo-emu-debug-tab-{}", tab.label())),
+                    tab.label(),
+                )
+                .toggle_state(self.debug.tab == tab)
+                .on_click(cx.listener(move |this, _event, _window, cx| this.set_debug_tab(tab, cx)))
+            }));
+        let decoded = self.debug.decoded.as_ref().filter(|d| d.tab == self.debug.tab);
+        let body: gpui::AnyElement = match decoded {
+            None => Label::new(if self.session.is_some() {
+                "decoding…"
+            } else {
+                "Run a cart to inspect its PPU"
+            })
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element(),
+            Some(decoded) => match self.debug.tab {
+                debug::DebugTab::Tiles => self.render_debug_tiles(decoded, cx),
+                debug::DebugTab::Map => self.render_debug_map(decoded, cx),
+                debug::DebugTab::Oam => self.render_debug_oam(decoded, cx),
+                debug::DebugTab::Palettes => self.render_debug_palettes(decoded, cx),
+            },
+        };
+        v_flex()
+            .w(px(DEBUG_COLUMN_PX))
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(cx.theme().colors().border)
+            .child(tabs)
+            .child(
+                div()
+                    .id("ggo-emu-debug-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .child(body),
+            )
+            .children(self.debug.hover.as_ref().map(|hover| {
+                Label::new(hover.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+            }))
+            .into_any_element()
+    }
+
+    /// A fixed-size image canvas whose hover position is reported back
+    /// through `on_hover` as pixel coordinates inside the image.
+    fn debug_image_canvas(
+        &self,
+        id: &'static str,
+        image: Arc<RenderImage>,
+        width: usize,
+        height: usize,
+        overlay: impl Fn(Bounds<Pixels>, &mut Window) + 'static,
+        on_hover: impl Fn(&mut Self, f32, f32, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
+        let record = bounds_cell.clone();
+        let canvas = gpui::canvas(
+            move |bounds, _window, _cx| {
+                *record.borrow_mut() = Some(bounds);
+            },
+            move |bounds, _prepaint, window, _cx| {
+                window
+                    .paint_image(
+                        bounds,
+                        bounds,
+                        gpui::Corners::default(),
+                        image.clone(),
+                        0,
+                        false,
+                        true,
+                    )
+                    .log_err();
+                overlay(bounds, window);
+            },
+        )
+        .w(px(width as f32))
+        .h(px(height as f32));
+        div()
+            .id(id)
+            .w(px(width as f32))
+            .h(px(height as f32))
+            .child(canvas)
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                if let Some(bounds) = *bounds_cell.borrow() {
+                    let x: f32 = (event.position.x - bounds.origin.x).into();
+                    let y: f32 = (event.position.y - bounds.origin.y).into();
+                    on_hover(this, x, y, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn debug_stepper(
+        &self,
+        id: &'static str,
+        label: String,
+        on_delta: impl Fn(&mut Self, isize, &mut Context<Self>) + 'static + Clone,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let down = on_delta.clone();
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                IconButton::new(SharedString::from(format!("{id}-down")), IconName::ChevronLeft)
+                    .icon_size(IconSize::XSmall)
+                    .on_click(cx.listener(move |this, _event, _window, cx| down(this, -1, cx))),
+            )
+            .child(Label::new(label).size(LabelSize::Small))
+            .child(
+                IconButton::new(SharedString::from(format!("{id}-up")), IconName::ChevronRight)
+                    .icon_size(IconSize::XSmall)
+                    .on_click(cx.listener(move |this, _event, _window, cx| on_delta(this, 1, cx))),
+            )
+            .into_any_element()
+    }
+
+    fn render_debug_tiles(
+        &self,
+        decoded: &debug::Decoded,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let bank_label = format!(
+            "bank {}",
+            if self.debug.bank == ggo_emu_core::ppu::BANK_SPRITE {
+                "sprite"
+            } else {
+                "bg/fg"
+            }
+        );
+        let palette_label = format!("palette {}", self.debug.palette);
+        let selectors = h_flex()
+            .gap_3()
+            .px_1()
+            .child(self.debug_stepper(
+                "ggo-emu-debug-bank",
+                bank_label,
+                |this, _delta, cx| {
+                    let (bank, palette, layer) =
+                        (this.debug.bank ^ 1, this.debug.palette, this.debug.layer);
+                    this.set_debug_selector(bank, palette, layer, cx)
+                },
+                cx,
+            ))
+            .child(self.debug_stepper(
+                "ggo-emu-debug-palette",
+                palette_label,
+                |this, delta, cx| {
+                    let palettes = ggo_emu_core::ppu::PALETTES as isize;
+                    let palette =
+                        (this.debug.palette as isize + delta).rem_euclid(palettes) as usize;
+                    let (bank, layer) = (this.debug.bank, this.debug.layer);
+                    this.set_debug_selector(bank, palette, layer, cx)
+                },
+                cx,
+            ));
+        let Some(image) = decoded.image.clone() else {
+            return selectors.into_any_element();
+        };
+        let sheet = self.debug_image_canvas(
+            "ggo-emu-debug-tiles",
+            image,
+            debug::SHEET_PX,
+            debug::SHEET_PX,
+            |_, _| {},
+            |this, x, y, cx| {
+                let tile_px = ggo_emu_core::ppu::TILE_PX as f32;
+                let span = debug::SHEET_PX as f32;
+                if x >= 0.0 && y >= 0.0 && x < span && y < span {
+                    let index = (y / tile_px) as usize * debug::SHEET_TILES_PER_ROW
+                        + (x / tile_px) as usize;
+                    this.debug.hover = Some(format!("tile {index}"));
+                    cx.notify();
+                }
+            },
+            cx,
+        );
+        v_flex().gap_1().child(selectors).child(sheet).into_any_element()
+    }
+
+    fn render_debug_map(
+        &self,
+        decoded: &debug::Decoded,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let labels = debug::layer_labels(&decoded.snapshot);
+        let selectors = h_flex().gap_1().px_1().children(
+            (0..ggo_emu_core::ppu::LAYER_COUNT).map(|layer| {
+                let enabled = decoded.snapshot.layer_enable[layer];
+                Button::new(
+                    SharedString::from(format!("ggo-emu-debug-layer-{layer}")),
+                    SharedString::from(labels[layer].clone()),
+                )
+                .toggle_state(self.debug.layer == layer)
+                .color(if enabled { Color::Default } else { Color::Muted })
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    let (bank, palette) = (this.debug.bank, this.debug.palette);
+                    this.set_debug_selector(bank, palette, layer, cx)
+                }))
+            }),
+        );
+        let Some(image) = decoded.image.clone() else {
+            return selectors.into_any_element();
+        };
+        let layer = self.debug.layer % ggo_emu_core::ppu::LAYER_COUNT;
+        let (scroll_x, scroll_y) = decoded.snapshot.scroll[layer];
+        let accent = cx.theme().colors().border_focused;
+        let hover_snapshot = decoded.snapshot.clone();
+        let map = self.debug_image_canvas(
+            "ggo-emu-debug-map",
+            image,
+            debug::MAP_PX,
+            debug::MAP_PX,
+            move |bounds, window| {
+                // The 320x240 window the screen shows, at the layer's
+                // scroll, wrapping at the map edge like the hardware.
+                let (w, h) = (
+                    ggo_emu_core::peripherals::SCREEN_WIDTH as f32,
+                    ggo_emu_core::peripherals::SCREEN_HEIGHT as f32,
+                );
+                let span = debug::MAP_PX as f32;
+                let sx = (scroll_x as f32) % span;
+                let sy = (scroll_y as f32) % span;
+                for dx in [0.0, -span] {
+                    for dy in [0.0, -span] {
+                        let rect = Bounds::new(
+                            point(bounds.origin.x + px(sx + dx), bounds.origin.y + px(sy + dy)),
+                            size(px(w), px(h)),
+                        );
+                        window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                    }
+                }
+            },
+            move |this, x, y, cx| {
+                let tile_px = ggo_emu_core::ppu::TILE_PX as f32;
+                let span = debug::MAP_PX as f32;
+                if x >= 0.0 && y >= 0.0 && x < span && y < span {
+                    let (cell_x, cell_y) = ((x / tile_px) as usize, (y / tile_px) as usize);
+                    let cell = hover_snapshot.map_cell(layer, cell_x, cell_y);
+                    this.debug.hover = Some(format!(
+                        "cell ({cell_x},{cell_y})  tile {}  pal {}  {}{}",
+                        cell.tile,
+                        cell.palette,
+                        if cell.hflip { "H" } else { "-" },
+                        if cell.vflip { "V" } else { "-" }
+                    ));
+                    cx.notify();
+                }
+            },
+            cx,
+        );
+        v_flex().gap_1().child(selectors).child(map).into_any_element()
+    }
+
+    fn render_debug_oam(
+        &self,
+        decoded: &debug::Decoded,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let rows = debug::oam_rows(&decoded.snapshot);
+        let enabled = rows.iter().filter(|(_, entry)| entry.enabled).count();
+        let mut column = v_flex().gap_1().child(
+            Label::new(format!(
+                "{enabled} of {} enabled",
+                ggo_emu_core::ppu::OAM_ENTRIES
+            ))
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+        );
+        if let Some(image) = decoded.image.clone() {
+            column = column.child(self.debug_image_canvas(
+                "ggo-emu-debug-oam",
+                image,
+                ggo_emu_core::peripherals::SCREEN_WIDTH,
+                ggo_emu_core::peripherals::SCREEN_HEIGHT,
+                |_, _| {},
+                |this, x, y, cx| {
+                    this.debug.hover = Some(format!("({}, {})", x as i32, y as i32));
+                    cx.notify();
+                },
+                cx,
+            ));
+        }
+        column
+            .children(rows.into_iter().map(|(index, entry)| {
+                Label::new(debug::oam_row_label(index, &entry))
+                    .size(LabelSize::XSmall)
+                    .color(if entry.enabled {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    })
+                    .buffer_font(cx)
+            }))
+            .into_any_element()
+    }
+
+    fn render_debug_palettes(
+        &self,
+        decoded: &debug::Decoded,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let snapshot = decoded.snapshot.clone();
+        let paint_snapshot = snapshot.clone();
+        let swatch = DEBUG_SWATCH_PX;
+        let width = swatch * ggo_emu_core::ppu::PAL_ENTRIES as f32;
+        let height = swatch * 2.0 * ggo_emu_core::ppu::PALETTES as f32;
+        let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
+        let record = bounds_cell.clone();
+        let grid = gpui::canvas(
+            move |bounds, _window, _cx| {
+                *record.borrow_mut() = Some(bounds);
+            },
+            move |bounds, _prepaint, window, _cx| {
+                for bank in 0..2 {
+                    for palette in 0..ggo_emu_core::ppu::PALETTES {
+                        for entry in 0..ggo_emu_core::ppu::PAL_ENTRIES {
+                            let rgb = paint_snapshot.palette_rgb565(bank, palette, entry);
+                            let argb = ggo_emu_core::peripherals::rgb565_to_argb(rgb);
+                            let color = gpui::rgb(argb & 0x00FF_FFFF);
+                            let row = bank * ggo_emu_core::ppu::PALETTES + palette;
+                            let rect = Bounds::new(
+                                point(
+                                    bounds.origin.x + px(entry as f32 * swatch),
+                                    bounds.origin.y + px(row as f32 * swatch),
+                                ),
+                                size(px(swatch), px(swatch)),
+                            );
+                            window.paint_quad(gpui::fill(rect, color));
+                        }
+                    }
+                }
+            },
+        )
+        .w(px(width))
+        .h(px(height));
+        div()
+            .id("ggo-emu-debug-palettes")
+            .w(px(width))
+            .h(px(height))
+            .child(grid)
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                if let Some(bounds) = *bounds_cell.borrow() {
+                    let x: f32 = (event.position.x - bounds.origin.x).into();
+                    let y: f32 = (event.position.y - bounds.origin.y).into();
+                    if let Some((bank, palette, entry)) = debug::palette_cell_at(x, y, swatch) {
+                        let rgb = snapshot.palette_rgb565(bank, palette, entry);
+                        this.debug.hover = Some(format!(
+                            "{} pal {palette} slot {entry} = {}",
+                            if bank == ggo_emu_core::ppu::BANK_SPRITE {
+                                "sprite"
+                            } else {
+                                "bg/fg"
+                            },
+                            debug::rgb565_label(rgb)
+                        ));
+                        cx.notify();
+                    }
+                }
+            }))
+            .into_any_element()
+    }
+
     // ---------------------------------------------------------- render
 
     fn render_transport(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let running = self.is_running();
+        let paused = self.is_paused();
         let label: SharedString = match &self.selected {
             Some(cart) => cart.clone().into(),
             None => EMPTY_MESSAGE.into(),
@@ -1143,7 +1724,25 @@ impl EmuPanel {
                     .tooltip(Tooltip::text("Stop"))
                     .on_click(cx.listener(|this, _event, window, cx| this.stop(window, cx))),
             )
+            .child(
+                Button::new("ggo-emu-pause", if paused { "Resume" } else { "Pause" })
+                    .disabled(!running)
+                    .tooltip(Tooltip::text("Pause / resume at the next frame (ctrl-alt-p)"))
+                    .on_click(cx.listener(|this, _event, _window, cx| this.toggle_pause(cx))),
+            )
+            .child(
+                Button::new("ggo-emu-step", "Step")
+                    .disabled(!running)
+                    .tooltip(Tooltip::text("Run one frame (ctrl-alt-.)"))
+                    .on_click(cx.listener(|this, _event, _window, cx| this.step_frame(cx))),
+            )
             .child(self.render_mute_button(cx))
+            .child(
+                Button::new("ggo-emu-debug", "Debug")
+                    .toggle_state(self.debug.open)
+                    .tooltip(Tooltip::text("Tiles / map / OAM / palette viewers (ctrl-alt-d)"))
+                    .on_click(cx.listener(|this, _event, window, cx| this.toggle_debug(window, cx))),
+            )
             // The selected cart, as plain text: the file explorer is the
             // picker now, so there is nothing here to click.
             .child(
@@ -1158,8 +1757,8 @@ impl EmuPanel {
             .child(div().flex_1())
             // The "is it actually running" readout: the cart's own frame
             // counter, straight off the last `EmuMsg::Frame`.
-            .children(self.session.as_ref().map(|session| {
-                Label::new(format!("{} · frame {}", session.cart, self.frame))
+            .children(self.transport_readout().map(|readout| {
+                Label::new(readout)
                     .size(LabelSize::XSmall)
                     .color(Color::Muted)
             }))
@@ -1364,6 +1963,8 @@ impl Render for EmuPanel {
         // painted becomes N, so N-2 is now safe to hand back. See the
         // module doc.
         self.retire_atlas_frames(window);
+        self.retire_debug_images(window);
+        self.debug_tick(cx);
 
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -1373,6 +1974,9 @@ impl Render for EmuPanel {
             .on_action(cx.listener(|this, _: &Run, window, cx| this.run(window, cx)))
             .on_action(cx.listener(|this, _: &Stop, window, cx| this.stop(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleMute, _window, cx| this.toggle_mute(cx)))
+            .on_action(cx.listener(|this, _: &TogglePause, _window, cx| this.toggle_pause(cx)))
+            .on_action(cx.listener(|this, _: &StepFrame, _window, cx| this.step_frame(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDebug, window, cx| this.toggle_debug(window, cx)))
             // The pad. Scoped by focus, not by keymap: these fire only
             // while the pane's focus handle owns the keyboard, so typing
             // `z` anywhere else never reaches a cart.
@@ -1391,7 +1995,17 @@ impl Render for EmuPanel {
                 },
             ))
             .child(self.render_transport(cx))
-            .child(div().flex_1().min_h_0().child(self.render_screen(cx)))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().flex_1().min_w_0().size_full().child(self.render_screen(cx)))
+                    .children(
+                        self.debug
+                            .open
+                            .then(|| self.render_debug_column(window, cx)),
+                    ),
+            )
             .children(self.render_stats())
             .children(self.status.as_ref().map(|status| {
                 ggo_common::CopyableText::new("ggo-emu-status-copy", status.clone())
@@ -3973,6 +4587,132 @@ mod tests {
                 "the keybinding-stopped run still ingests: {:?}",
                 panel.ingest_status
             );
+        });
+    }
+
+    /// `ctrl-alt-p` pauses and resumes; `ctrl-alt-.` pauses a running cart
+    /// and steps a paused one; the readout says so; Stop clears it all.
+    #[gpui::test]
+    async fn test_pause_and_step_keybindings_drive_the_session(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
+        cx.update(|window, _| window.activate_window());
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+        select_green_cart(&panel, cx, dir.path());
+
+        cx.simulate_keystrokes("ctrl-alt-p");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_paused(), "nothing to pause before a run");
+        });
+        cx.simulate_keystrokes("ctrl-alt-r");
+        await_first_frame(&panel, cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_paused(), "a run starts unpaused");
+            assert!(
+                panel.transport_readout().unwrap().starts_with("green.cart · frame "),
+                "{:?}",
+                panel.transport_readout()
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-alt-.");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_paused(), "step while running pauses");
+            assert!(panel.transport_readout().unwrap().ends_with(" · paused"));
+        });
+        cx.simulate_keystrokes("ctrl-alt-.");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_paused(), "step while paused stays paused");
+        });
+        cx.simulate_keystrokes("ctrl-alt-p");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_paused(), "ctrl-alt-p resumes");
+        });
+        cx.simulate_keystrokes("ctrl-alt-p");
+        panel.read_with(cx, |panel, _| assert!(panel.is_paused()));
+
+        cx.simulate_keystrokes("ctrl-alt-s");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_running() && !panel.is_paused());
+            assert_eq!(panel.transport_readout(), None);
+        });
+        cx.run_until_parked();
+    }
+
+    /// `ctrl-alt-d` opens the debug column; a decoded snapshot yields an
+    /// image of the tab's size; switching tabs re-decodes; closing the
+    /// column queues every image for atlas release and the next render
+    /// drains the queue.
+    #[gpui::test]
+    async fn test_debug_column_decodes_snapshots_per_tab_and_releases_on_close(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
+        cx.update(|window, _| window.activate_window());
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-alt-d");
+        panel.read_with(cx, |panel, _| assert!(panel.debug.open, "ctrl-alt-d opens"));
+
+        let mut ppu = ggo_emu_core::ppu::Ppu::new();
+        ppu.set_layer(2, true, 1);
+        ppu.oam_set(3, 5, 6, 1, 0x10);
+        let snapshot = Arc::new(ppu.snapshot());
+        panel.update(cx, |panel, _| {
+            panel.debug_decode_now(snapshot.clone());
+            let decoded = panel.debug.decoded.as_ref().expect("decoded");
+            assert_eq!(decoded.tab, debug::DebugTab::Tiles);
+            let image = decoded.image.as_ref().expect("the tile sheet is an image");
+            assert_eq!(
+                image.size(0),
+                gpui::size(
+                    gpui::DevicePixels(debug::SHEET_PX as i32),
+                    gpui::DevicePixels(debug::SHEET_PX as i32)
+                )
+            );
+        });
+        panel.update(cx, |panel, cx| {
+            panel.set_debug_tab(debug::DebugTab::Oam, cx);
+            assert_eq!(panel.debug.last_decoded_ptr, 0, "a tab switch forces a re-decode");
+            panel.debug_decode_now(snapshot.clone());
+            let decoded = panel.debug.decoded.as_ref().unwrap();
+            assert_eq!(decoded.tab, debug::DebugTab::Oam);
+            assert_eq!(panel.debug.retired.len(), 1, "the tile sheet is queued for release");
+            let image = decoded.image.as_ref().unwrap();
+            assert_eq!(
+                image.size(0),
+                gpui::size(gpui::DevicePixels(320), gpui::DevicePixels(240))
+            );
+            panel.set_debug_tab(debug::DebugTab::Palettes, cx);
+            panel.debug_decode_now(snapshot.clone());
+            assert!(panel.debug.decoded.as_ref().unwrap().image.is_none(), "palettes paint directly");
+            assert_eq!(panel.debug.retired.len(), 2);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.debug.retired.is_empty(), "a render drained the retire queue");
+        });
+
+        cx.simulate_keystrokes("ctrl-alt-d");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.debug.open, "ctrl-alt-d closes");
+            assert!(panel.debug.decoded.is_none());
+            assert!(panel.debug.retired.is_empty(), "closing released everything at once");
         });
     }
 

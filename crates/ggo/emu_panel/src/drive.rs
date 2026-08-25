@@ -71,6 +71,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ggo_emu_core::apu::Apu;
+use ggo_emu_core::ppu::PpuSnapshot;
+use ggo_emu_core::savefile;
 use ggo_emu_core::cart::Cart;
 use ggo_emu_core::cpu::Cpu;
 use ggo_emu_core::mmu::{CART_XIP_BASE, DEFAULT_MAIN_RAM_BYTES, DEFAULT_VRAM_BYTES, Mmu};
@@ -165,6 +167,17 @@ pub struct Session {
     input: Arc<AtomicU32>,
     /// Checked once per driver turn. Set by [`Self::stop`] / `Drop`.
     stop: Arc<AtomicBool>,
+    /// Debugger: while set, the thread parks at each frame boundary
+    /// (feeding silence so the audio device stays live) until cleared or
+    /// until [`Self::step`] hands it one more frame.
+    pause: Arc<AtomicBool>,
+    /// Frames still owed to [`Self::step`] while paused.
+    step: Arc<AtomicU32>,
+    /// The PPU as of the last presented frame, for the debug viewers --
+    /// written by the thread every vsync, read by the pane whenever it
+    /// renders a viewer. A slot, not a channel: the pane wants the latest,
+    /// never a backlog.
+    snapshot: Arc<Mutex<Option<Arc<PpuSnapshot>>>>,
     /// The run's diagnostic log, shared with the emulator thread. Cloned
     /// out by the panel so the console survives the session.
     uart: UartLog,
@@ -187,6 +200,34 @@ impl Session {
 
     pub fn set_input(&self, mask: u32) {
         self.input.store(mask, Ordering::Release);
+    }
+
+    /// Park at the next frame boundary. Takes effect within one turn.
+    pub fn pause(&self) {
+        self.pause.store(true, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.pause.store(false, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pause.load(Ordering::Acquire)
+    }
+
+    /// While paused, run exactly one more frame then park again. A no-op
+    /// unless paused (the pane pauses first, so Step while running is
+    /// "pause", not "skip a frame").
+    pub fn step(&self) {
+        if self.is_paused() {
+            self.step.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The PPU state as of the last presented frame, if any frame has
+    /// been presented.
+    pub fn snapshot(&self) -> Option<Arc<PpuSnapshot>> {
+        self.snapshot.lock().unwrap().clone()
     }
 
     /// The live diagnostic log, for the pane's console.
@@ -257,18 +298,27 @@ pub fn start(
     let (tx, rx) = async_channel::bounded(1);
     let input = Arc::new(AtomicU32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    let step = Arc::new(AtomicU32::new(0));
+    let snapshot: Arc<Mutex<Option<Arc<PpuSnapshot>>>> = Arc::new(Mutex::new(None));
     let uart = UartLog::new();
     let outcome: Arc<Mutex<Option<RunOutcome>>> = Arc::new(Mutex::new(None));
 
     uart.push_line(format!("[run] {cart}"));
 
     let join = {
-        let (input, stop, uart, outcome) =
-            (input.clone(), stop.clone(), uart.clone(), outcome.clone());
+        let controls = Controls {
+            input: input.clone(),
+            stop: stop.clone(),
+            pause: pause.clone(),
+            step: step.clone(),
+            snapshot: snapshot.clone(),
+        };
+        let (uart, outcome) = (uart.clone(), outcome.clone());
         std::thread::Builder::new()
             .name("ggo-emu-panel".into())
             .spawn(move || {
-                let result = run(&cart_path, &tx, &input, &stop, &uart, audio.as_ref());
+                let result = run(&cart_path, &tx, &controls, &uart, audio.as_ref());
                 uart.push_line(format!("[run ended] {}", result.reason));
                 *outcome.lock().unwrap() = Some(result);
             })
@@ -279,6 +329,9 @@ pub fn start(
         cart,
         input,
         stop,
+        pause,
+        step,
+        snapshot,
         uart,
         outcome,
         join: Some(join),
@@ -288,14 +341,42 @@ pub fn start(
 
 /// The drive loop itself -- `run_cart`'s body minus the window and the
 /// save flush.
+/// The thread's end of [`Session`]'s control surface.
+struct Controls {
+    input: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    step: Arc<AtomicU32>,
+    snapshot: Arc<Mutex<Option<Arc<PpuSnapshot>>>>,
+}
+
+/// Where a run's save file lives: the standalone's rule (`<card dir>/savs/
+/// <NAME>.sav`, C5 identity header, name probes), with the card dir being
+/// the cart's own directory as it is for asset loads. `None` when the cart
+/// declares no save region, has no parent directory, or every probed name
+/// is held by another cart's save.
+fn save_file_for(cart_path: &Path, title: &str, save_bytes: usize) -> Option<PathBuf> {
+    if save_bytes == 0 {
+        return None;
+    }
+    let card_dir = cart_path.parent()?;
+    savefile::resolve_save_path(card_dir, title, save_bytes)
+}
+
 fn run(
     cart_path: &Path,
     tx: &async_channel::Sender<Frame>,
-    input: &AtomicU32,
-    stop: &AtomicBool,
+    controls: &Controls,
     uart: &UartLog,
     audio: Option<&AudioStatus>,
 ) -> RunOutcome {
+    let Controls {
+        input,
+        stop,
+        pause,
+        step,
+        snapshot,
+    } = controls;
     let bytes = match std::fs::read(cart_path) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -350,6 +431,20 @@ fn run(
     if let Some(dir) = cart_path.parent() {
         p.assets.set_card_dir(dir.to_path_buf());
     }
+    // Save-file backing, the standalone's way (`run_cart`): load any
+    // existing save now, flush on a dirty frame at most once a second and
+    // once more on the way out.
+    let save_file = save_file_for(cart_path, &title, p.save.len());
+    if let Some(path) = &save_file {
+        savefile::load_save(path, &title, &mut p.save);
+    }
+    let mut last_save_flush: Option<u32> = None;
+    let mut frames_presented: u32 = 0;
+    let mut paused_total = Duration::ZERO;
+    // One frame of stereo silence, pushed while parked so the device keeps
+    // its stream without charging dropouts against a run that is merely
+    // paused.
+    let silence = vec![0i16; 2 * (ggo_emu_core::apu::MIX_RATE / 60) as usize];
 
     // Audio, last of the setup: AFTER the cart has parsed, so a cart that
     // never loads never opens a device at all, and immediately before the
@@ -425,8 +520,46 @@ fn run(
                 if let Some(writer) = &audio_writer {
                     audio_cursor = pump_audio(&p.apu, audio_cursor, &mut audio_scratch, writer);
                 }
+                publish_snapshot(&p.ppu, snapshot);
+                frames_presented = frames_presented.wrapping_add(1);
+                if p.save_dirty
+                    && last_save_flush
+                        .is_none_or(|f| frames_presented.wrapping_sub(f) >= savefile::FLUSH_INTERVAL_FRAMES)
+                {
+                    flush_save(&save_file, &title, &mut p, uart);
+                    last_save_flush = Some(frames_presented);
+                }
                 if let Some(hold) = pace_sleep(last_present.elapsed(), FRAME_TIME) {
                     std::thread::sleep(hold);
+                }
+                // The debugger's park: hold here, frame complete and
+                // published, until resumed, stepped, or stopped. Silence
+                // keeps the ring fed; the pause time is kept out of the
+                // cart's clock below so it doesn't see a giant tick.
+                if pause.load(Ordering::Acquire) {
+                    let parked_at = Instant::now();
+                    let mut stop_requested = false;
+                    loop {
+                        if stop.load(Ordering::Acquire) {
+                            stop_requested = true;
+                            break;
+                        }
+                        if !pause.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if step.load(Ordering::Acquire) > 0 {
+                            step.fetch_sub(1, Ordering::AcqRel);
+                            break;
+                        }
+                        if let Some(writer) = &audio_writer {
+                            writer.push(&silence);
+                        }
+                        std::thread::sleep(FRAME_TIME);
+                    }
+                    paused_total += parked_at.elapsed();
+                    if stop_requested {
+                        break "stopped".to_string();
+                    }
                 }
                 last_present = Instant::now();
                 // AFTER the hold, not before it. `native::refresh_input`
@@ -441,7 +574,8 @@ fn run(
                 // (present -> refresh_input -> set_ticks_ms), so the
                 // clock the cart reads next turn accounts for the pacing
                 // sleep it just went through.
-                p.set_ticks_ms(start.elapsed().as_millis().min(u32::MAX as u128) as u32);
+                let elapsed = start.elapsed().saturating_sub(paused_total);
+                p.set_ticks_ms(elapsed.as_millis().min(u32::MAX as u128) as u32);
             }
             // Budget exhausted mid-frame: the framebuffer is half-drawn,
             // so do NOT publish it (`run_cart` likewise refuses to
@@ -464,6 +598,9 @@ fn run(
     // (`RingWriter::drop` is still what covers the panic path -- see its
     // doc; this is only about making the clean path prompt.)
     drop(audio_writer);
+    if p.save_dirty {
+        flush_save(&save_file, &title, &mut p, uart);
+    }
 
     RunOutcome {
         reason,
@@ -502,6 +639,32 @@ fn run(
 /// is cleared here rather than by `Apu::copy_since` -- that method
 /// *appends* (`out.reserve` + `out.push`), so a caller that forgets would
 /// re-push every previous frame's samples on top of the new ones.
+/// Refill the debugger's snapshot slot from the PPU. Reuses the previous
+/// snapshot's buffers when the pane has let go of it, so a run with no
+/// viewer open costs one ~138 KB memcpy per frame and no allocation.
+fn publish_snapshot(ppu: &ggo_emu_core::ppu::Ppu, slot: &Mutex<Option<Arc<PpuSnapshot>>>) {
+    let mut slot = slot.lock().unwrap();
+    let mut snap = slot
+        .take()
+        .and_then(|arc| Arc::try_unwrap(arc).ok())
+        .unwrap_or_default();
+    ppu.snapshot_into(&mut snap);
+    *slot = Some(Arc::new(snap));
+}
+
+/// Write the save region to its file, clearing `save_dirty` on success.
+/// A failure is a console line, not a run failure -- the standalone
+/// prints and carries on the same way.
+fn flush_save(save_file: &Option<PathBuf>, title: &str, p: &mut Peripherals, uart: &UartLog) {
+    let Some(path) = save_file else {
+        return;
+    };
+    match savefile::flush_save(path, title, &p.save) {
+        Ok(()) => p.save_dirty = false,
+        Err(e) => uart.push_line(format!("[save] flush {} failed: {e}", path.display())),
+    }
+}
+
 fn pump_audio(apu: &Apu, cursor: u64, scratch: &mut Vec<i16>, writer: &RingWriter) -> u64 {
     scratch.clear();
     let next = apu.copy_since(cursor, scratch);
@@ -1217,5 +1380,101 @@ mod tests {
             rx.recv_blocking().is_ok(),
             "publishing input must not end the run"
         );
+    }
+
+    /// Poll `rx` for up to `within`; `async_channel` has no timed recv.
+    fn recv_within(rx: &async_channel::Receiver<Frame>, within: Duration) -> Option<Frame> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if let Ok(frame) = rx.try_recv() {
+                return Some(frame);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Pause parks the thread at a frame boundary (no new frames), Step
+    /// releases exactly one, Resume lets them flow again, and a paused run
+    /// still stops. The snapshot slot holds the last presented PPU state
+    /// throughout.
+    #[test]
+    fn pause_parks_step_advances_one_frame_and_resume_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("green.cart");
+        std::fs::write(&path, green_screen_cart()).unwrap();
+        let (session, rx) = start(path, "green.cart".to_string(), None);
+
+        let first = rx.recv_blocking().expect("frames flow before pause");
+        assert!(session.snapshot().is_some(), "a presented frame fills the slot");
+        session.pause();
+        assert!(session.is_paused());
+        // Drain whatever was in flight when the flag landed; then nothing
+        // more should arrive for a while.
+        let mut last_number = first.number;
+        let settle = std::time::Instant::now();
+        while settle.elapsed() < Duration::from_millis(150) {
+            if let Ok(frame) = rx.try_recv() {
+                last_number = frame.number;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let quiet = std::time::Instant::now();
+        let mut arrived = 0;
+        while quiet.elapsed() < Duration::from_millis(200) {
+            if rx.try_recv().is_ok() {
+                arrived += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(arrived, 0, "a paused run publishes no frames");
+
+        session.step();
+        let stepped = recv_within(&rx, Duration::from_secs(2)).expect("step releases exactly one frame");
+        assert_eq!(stepped.number, last_number + 1, "one frame, the next one");
+        let quiet = std::time::Instant::now();
+        let mut arrived = 0;
+        while quiet.elapsed() < Duration::from_millis(200) {
+            if rx.try_recv().is_ok() {
+                arrived += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(arrived, 0, "after the step it parks again");
+
+        session.resume();
+        assert!(!session.is_paused());
+        let resumed = recv_within(&rx, Duration::from_secs(2)).expect("resume lets frames flow");
+        assert!(resumed.number > stepped.number);
+
+        session.pause();
+        let finished = session.wait();
+        assert_eq!(finished.reason, "stopped", "a paused run still stops");
+    }
+
+    /// Step outside of pause is a no-op: the pane pauses first, so a
+    /// stray step never skips a frame of a running cart.
+    #[test]
+    fn step_while_running_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("green.cart");
+        std::fs::write(&path, green_screen_cart()).unwrap();
+        let (session, rx) = start(path, "green.cart".to_string(), None);
+        rx.recv_blocking().expect("running");
+        session.step();
+        assert_eq!(session.step.load(Ordering::Acquire), 0);
+        session.wait();
+    }
+
+    #[test]
+    fn save_file_is_only_resolved_for_carts_with_a_save_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let cart = dir.path().join("carts/game.cart");
+        assert_eq!(save_file_for(&cart, "GAME", 0), None);
+        let path = save_file_for(&cart, "GAME", 256).expect("a fresh name probe is free");
+        assert!(path.starts_with(dir.path().join("carts")));
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("sav"));
     }
 }
