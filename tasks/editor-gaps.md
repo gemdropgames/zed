@@ -10,19 +10,23 @@ Effort tags are gut calls from the code inventory, not estimates.
 
 ---
 
-## 1. Audio authoring (absent) — `large`
+## 1. Audio authoring — `done 2026-08-24` (scope narrowed)
 
-Only domain at zero. `emu_panel/src/audio.rs` is playback only (cpal stream per
-run, mute gate, dropout counter). No SFX, no music, no tracker import.
-Refs: TIC-80 sfx/music editors, GB Studio piano roll + tracker, Furnace.
+Musicians deliver `.wav` / `.ogg`; the editor's job is to hear them, hear
+what the hardware makes of them, pick the baked rate, write the `.adp` the
+cart ships, and keep a world's audio set under the 384 KiB sample region.
+Emerald is untouched (it packs a pre-baked `.adp` verbatim). Shipped as
+`../ggo/tools/ggo-audio` + `crates/ggo/audio_panel` + the world panel's
+budget line. Spec: `docs/superpowers/specs/2026-08-24-audio-preview-import-design.md`.
 
-- [ ] Decide the APU authoring model: native SFX/tracker editor vs. external-tracker import + round-trip
-- [ ] Audition surface: piano row that plays APU voices from the editor without building a cart
-- [ ] SFX editor: per-voice envelope / pitch / duty (whatever the APU exposes) with live preview
-- [ ] Import one external tracker format (Furnace `.fur` or hUGETracker `.uge`) into the cart's audio section
-- [ ] Music editor (tracker or piano roll) — second phase, after SFX + import land
-- [ ] Project-panel routing + context menu entries for audio files, same pattern as `.spr`/`.til`
-- [ ] Undo/redo via a `*DocStore` like the sprite/tileset panels
+- [x] Decide the authoring model: import wav/ogg, no synthesis, no sequencer
+- [x] Audition: audio tab plays Source or Baked (real `Apu`, ADPCM, 32 kHz mix) through the emu pane's cpal ring
+- [x] Rate picker (8/16/32 kHz) + Import → `assets/<stem>.adp`
+- [x] Project-panel routing for `.wav` / `.ogg` / `.adp`
+- [x] World toolbar `audio N / 384 KiB` readout, red when over, missing stems listed
+- [ ] `ggo-audio bake` CLI (30 lines) so scripts can bake without the editor — only if wanted
+- [ ] Re-size the world budget when a file changes without a panel refresh (mtime watch)
+- Not planned: SFX synthesis, tracker, PSG/ADSR/pan authoring (no delivery path in emerald's runtime)
 
 ## 2. Typed asset refs + world-TOML language server — `medium → large`
 
