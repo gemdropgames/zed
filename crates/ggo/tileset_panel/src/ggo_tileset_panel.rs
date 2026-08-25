@@ -597,6 +597,9 @@ impl TilesetPanel {
 
     /// Focus the tile under the marquee (its anchor), else tile 0.
     fn focus_tile_impl(&mut self, cx: &mut Context<Self>) {
+        if matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some()) {
+            return;
+        }
         let tile = self
             .selection_rect()
             .and_then(|(x0, y0, ..)| self.doc_pixel(x0, y0))
@@ -656,7 +659,7 @@ impl TilesetPanel {
         // Load-modify-save: the sidecar also carries the map editor's
         // terrains, which this panel must not wipe.
         let mut meta = loader::load_view_meta(root, &open.rel_path);
-        meta.zoom = Some(open.zoom);
+        meta.zoom = Some(open.zoom_before_focus.unwrap_or(open.zoom));
         meta.cols = Some(open.cols);
         meta.lines = Some(open.show_lines);
         if let Err(e) = loader::save_view_meta(root, &open.rel_path, &meta) {
@@ -695,7 +698,7 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        sheet_to_doc(open.focus, open.cols, open.store.state().tile_count, sx, sy)
+        sheet_to_doc(open.focus, open.cols, open.store.tile_count(), sx, sy)
     }
 
     /// [`Self::sheet_px_at`] + [`Self::doc_pixel`]: the doc pixel under a
@@ -798,6 +801,9 @@ impl TilesetPanel {
                     // to the sheet.
                     None => {
                         open.focus = None;
+                        if let Some(zoom) = open.zoom_before_focus.take() {
+                            open.zoom = zoom;
+                        }
                         (
                             loader::compose_grid(&state.indices, state.tile_count, open.cols, &state.palette),
                             loader::grid_pixel_size(state.tile_count, open.cols),
@@ -818,8 +824,14 @@ impl TilesetPanel {
     }
 
     fn on_sheet_mouse_down(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        let tool = match &self.state {
-            ViewerState::Ready(open) => open.tool,
+        let tool = match &mut self.state {
+            ViewerState::Ready(open) => {
+                // A release off the sheet may not have reached us: a new
+                // press never continues an old drag.
+                open.move_drag = None;
+                open.shape_drag = None;
+                open.tool
+            }
             _ => return,
         };
         match tool {
@@ -1015,8 +1027,18 @@ impl TilesetPanel {
         }
         self.write_cells(&cells, cx);
         if let ViewerState::Ready(open) = &mut self.state {
-            let shift = |v: usize, d: i32| (v as i32 + d).max(0) as usize;
-            open.selection = Some(((shift(x0, dx), shift(y0, dy)), (shift(x1, dx), shift(y1, dy))));
+            let (sheet_w, sheet_h) = (open.grid_size.0 as i32, open.grid_size.1 as i32);
+            let landed = x1 as i32 + dx >= 0
+                && y1 as i32 + dy >= 0
+                && x0 as i32 + dx < sheet_w
+                && y0 as i32 + dy < sheet_h;
+            let clamp = |v: usize, d: i32, max: i32| (v as i32 + d).clamp(0, max - 1) as usize;
+            open.selection = landed.then(|| {
+                (
+                    (clamp(x0, dx, sheet_w), clamp(y0, dy, sheet_h)),
+                    (clamp(x1, dx, sheet_w), clamp(y1, dy, sheet_h)),
+                )
+            });
         }
     }
 
@@ -1049,7 +1071,8 @@ impl TilesetPanel {
     }
 
     /// Remove the left or right column; the view narrows with it (the
-    /// same doc/view split as `insert_column`).
+    /// same doc/view split as `insert_column`: undo restores the strip but
+    /// the view keeps the narrower cols, so tiles rewrap).
     fn delete_column(&mut self, at_left: bool, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -1438,6 +1461,12 @@ impl TilesetPanel {
                                             },
                                         ))
                                         .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                                                this.on_sheet_mouse_up(event.modifiers.shift, cx);
+                                            }),
+                                        )
+                                        .on_mouse_up_out(
                                             MouseButton::Left,
                                             cx.listener(|this, event: &MouseUpEvent, _, cx| {
                                                 this.on_sheet_mouse_up(event.modifiers.shift, cx);
@@ -3138,6 +3167,26 @@ mod tests {
             assert_eq!(open.focus, None);
             assert_eq!(open.zoom, DEFAULT_ZOOM, "zoom restored");
             assert_eq!(open.grid_size.0, (FIXTURE_TILES * TILE_PX) as u32, "whole sheet again");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_new_press_never_continues_a_stale_drag(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (3, 3)));
+                // A drag whose release happened off the sheet.
+                open.move_drag = Some(((1, 1), (5, 1)));
+                open.painting = false;
+            }
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 2, 2), cx);
+            assert!(ready(panel).move_drag.is_none(), "the stale move drag is gone");
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(1, 0, 0)], 1, "nothing moved");
         });
     }
 }
