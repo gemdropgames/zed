@@ -82,7 +82,7 @@ Refs: LDtk, Godot 2D editor.
 - [x] Fix redo-of-add leaving the instance subtree unresolved (2026-08-25)
 - [x] Fix the world panel's atlas leak (two-stage retirement + on_release) (2026-08-25)
 
-## 5. Map editor — `medium`
+## 5. Map editor — `done 2026-08-25` (collision / layers / slider deferred)
 
 `MapTool` is exactly Brush / RectFill / Eyedropper / Eraser
 (`map_panel/src/ggo_map_panel.rs:433`). No flood fill, autotile, layers, cell
@@ -91,10 +91,10 @@ laid out 6 or 12 wide are no longer rect-selectable as one stamp
 (`MIGRATION.md:132`, `:453`) — a regression from ggo-ide.
 Refs: Tiled terrain sets + automapping, Pixelorama 1.1 autotile.
 
-- [ ] Flood fill tool (`MapOp::Fill`)
-- [ ] Cell multi-select + copy / paste / cut of regions
-- [ ] Restore per-tileset `cols` as a sidecar (`.ggo-ide/<rel>.editor.json`) read by both the map stamp picker and the tileset editor; delete the dead `tileset_cols:*` db rows
-- [ ] Autotile / terrain rules: pick a rule format (Tiled Wang sets or Pixelorama rules), rule editor, apply-on-paint
+- [x] Flood fill tool (`MapOp::Fill`) (2026-08-25)
+- [x] Cell multi-select + copy / paste / delete of regions; brush/eraser drags are one undo step (2026-08-25)
+- [x] Per-tileset `cols` as a sidecar (`.ggo-ide/<rel>.editor.json`, `ggo_worldlib::sprites::tileset_meta`) read by both panels; the dead `tileset_cols:*` db rows are left as-is, nothing reads them (2026-08-25)
+- [x] Autotile terrains: blob-47 (8-neighbour mask), in-panel terrain editor, resolve-on-paint with shift-erase; stored in the same sidecar (2026-08-25)
 - [ ] Collision flags per tile (if the `.map`/PPU contract has a bit for it; otherwise an IntGrid-style side layer)
 - [ ] Layers — only if the `.map` format grows them; otherwise document that priority lives at the world `[[background]]` level
 - [ ] Slider primitive for zoom + palSub (see §10)
