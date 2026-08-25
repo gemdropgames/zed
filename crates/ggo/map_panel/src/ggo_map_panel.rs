@@ -738,6 +738,13 @@ impl MapPanel {
     /// Everything after the guard runs on a spawned task, deliberately: the
     /// interceptor calls this from INSIDE the workspace's own update, and
     /// [`Self::refresh_root`] has to read that same workspace entity.
+    /// Load `rel`, guarding any unsaved edits first.
+    ///
+    /// Since the editor became a tab per `.map` ([`MapEditorItem`]) every
+    /// panel opens exactly one document, so in practice the guard sees a
+    /// clean panel; it stays because this is `pub` and a second open on a
+    /// live panel must not drop edits. Closing a dirty TAB is the pane's
+    /// prompt, driven by `Item::is_dirty` -- not this.
     pub fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
         // Clicking the file that is ALREADY open is how you bring the panel
         // back into focus, and upstream's semantics for that click on a tab
@@ -1802,15 +1809,21 @@ impl MapPanel {
             .child(
                 ui::Slider::new(
                     "ggo-map-pal-sub",
-                    (pal_sub - geom::PAL_SUB_MIN) as f32
-                        / (geom::PAL_SUB_MAX - geom::PAL_SUB_MIN) as f32,
+                    ui::slider_fraction(
+                        pal_sub as usize,
+                        geom::PAL_SUB_MIN as usize,
+                        geom::PAL_SUB_MAX as usize,
+                    ),
                 )
                 .width(px(64.))
                 .on_change({
                     let weak = cx.weak_entity();
                     move |value, _window, cx| {
-                        let span = (geom::PAL_SUB_MAX - geom::PAL_SUB_MIN) as f32;
-                        let pal_sub = geom::PAL_SUB_MIN + (value * span).round() as u16;
+                        let pal_sub = ui::slider_step(
+                            value,
+                            geom::PAL_SUB_MIN as usize,
+                            geom::PAL_SUB_MAX as usize,
+                        ) as u16;
                         weak.update(cx, |this, cx| this.set_pal_sub(pal_sub, cx))
                             .ok();
                     }
@@ -1834,14 +1847,13 @@ impl MapPanel {
             .child(
                 ui::Slider::new(
                     "ggo-map-zoom",
-                    (zoom - geom::MIN_ZOOM) as f32 / (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32,
+                    ui::slider_fraction(zoom, geom::MIN_ZOOM, geom::MAX_ZOOM),
                 )
                 .width(px(64.))
                 .on_change({
                     let weak = cx.weak_entity();
                     move |value, _window, cx| {
-                        let span = (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32;
-                        let zoom = geom::MIN_ZOOM + (value * span).round() as usize;
+                        let zoom = ui::slider_step(value, geom::MIN_ZOOM, geom::MAX_ZOOM);
                         weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
                     }
                 }),

@@ -26,8 +26,7 @@ pub const GRID_COLS_FALLBACK: usize = 8;
 /// map panel reads the same file for `cols` (its stamp coordinate system)
 /// and the autotile terrains, so one definition serves both panels.
 pub use ggo_worldlib::sprites::tileset_meta::{
-    load_tileset_meta as load_view_meta,
-    save_tileset_meta as save_view_meta,
+    load_tileset_meta as load_view_meta, save_tileset_meta as save_view_meta,
 };
 
 /// Everything the panel needs to enter its Ready state, assembled
@@ -109,7 +108,12 @@ pub fn load_tileset(project_dir: &Path, rel: &str) -> Result<LoadedTileset, Stri
     let meta = load_view_meta(project_dir, rel);
     // The sidecar's stored cols wins when valid for this sheet
     // (`resolve_cols` rejects 0 and > tile_count), else the fallback.
-    let cols = resolve_cols(meta.cols, None, opened.tile_count, grid_cols(opened.tile_count));
+    let cols = resolve_cols(
+        meta.cols,
+        None,
+        opened.tile_count,
+        grid_cols(opened.tile_count),
+    );
     // Size comes from [`grid_pixel_size`] rather than `compose_tile_grid`'s
     // own returned `(w, h)` so the panel's geometry fn is the ONE definition
     // of the grid's dimensions (the two agreeing is pinned by
@@ -169,5 +173,4 @@ mod tests {
             (8 * TILE_PX as u32, 2 * TILE_PX as u32)
         );
     }
-
 }

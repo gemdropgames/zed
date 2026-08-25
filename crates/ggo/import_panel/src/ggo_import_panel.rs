@@ -1613,15 +1613,13 @@ impl ImportPanel {
                     .child(
                         ui::Slider::new(
                             "ggo-import-zoom",
-                            (open.zoom - geom::MIN_ZOOM) as f32
-                                / (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32,
+                            ui::slider_fraction(open.zoom, geom::MIN_ZOOM, geom::MAX_ZOOM),
                         )
                         .width(px(72.))
                         .on_change({
                             let weak = cx.weak_entity();
                             move |value, _window, cx| {
-                                let span = (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32;
-                                let zoom = geom::MIN_ZOOM + (value * span).round() as usize;
+                                let zoom = ui::slider_step(value, geom::MIN_ZOOM, geom::MAX_ZOOM);
                                 weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
                             }
                         }),

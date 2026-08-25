@@ -34,9 +34,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage,
-    ScrollHandle, Styled, Task, WeakEntity, Window, actions, div, img, point, px,
+    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage, ScrollHandle,
+    Styled, Task, WeakEntity, Window, actions, div, img, point, px,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -127,7 +127,6 @@ pub fn init(cx: &mut App) {
     // the tileset editor tab instead of a (binary, unreadable) text buffer.
     workspace::register_path_open_interceptor(cx, intercept_tileset_open);
 }
-
 
 /// `workspace::PathOpenInterceptor` for `*.til`: claim the path and open
 /// (or focus) its center-pane editor tab. Declines (so the normal open
@@ -643,7 +642,10 @@ impl TilesetPanel {
         meta.cols = Some(open.cols);
         meta.lines = Some(open.show_lines);
         if let Err(e) = loader::save_view_meta(root, &open.rel_path, &meta) {
-            log::error!("GGO: failed to write view sidecar for {}: {e}", open.rel_path);
+            log::error!(
+                "GGO: failed to write view sidecar for {}: {e}",
+                open.rel_path
+            );
         }
     }
 
@@ -743,9 +745,12 @@ impl TilesetPanel {
             return;
         };
         let (state, cols, focus, color) = match &self.state {
-            ViewerState::Ready(open) => {
-                (open.store.state(), open.cols, open.focus, open.paint_color())
-            }
+            ViewerState::Ready(open) => (
+                open.store.state(),
+                open.cols,
+                open.focus,
+                open.paint_color(),
+            ),
             _ => return,
         };
         let sample = |x: i32, y: i32| {
@@ -776,7 +781,10 @@ impl TilesetPanel {
                     .get(tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS..)
                     .and_then(|rest| rest.get(..ggo_worldlib::sprites::tileset_doc::TILE_PIXELS));
                 match pixels {
-                    Some(pixels) => (loader::compose_grid(pixels, 1, 1, &state.palette), (TILE_PX as u32, TILE_PX as u32)),
+                    Some(pixels) => (
+                        loader::compose_grid(pixels, 1, 1, &state.palette),
+                        (TILE_PX as u32, TILE_PX as u32),
+                    ),
                     // The focused tile is gone (deleted, undone): fall back
                     // to the sheet.
                     None => {
@@ -785,7 +793,12 @@ impl TilesetPanel {
                             open.zoom = zoom;
                         }
                         (
-                            loader::compose_grid(&state.indices, state.tile_count, open.cols, &state.palette),
+                            loader::compose_grid(
+                                &state.indices,
+                                state.tile_count,
+                                open.cols,
+                                &state.palette,
+                            ),
                             loader::grid_pixel_size(state.tile_count, open.cols),
                         )
                     }
@@ -921,7 +934,10 @@ impl TilesetPanel {
     }
 
     /// The pixels of a sheet-space rect, row-major (pad cells read as 0).
-    fn region_pixels(&self, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> (usize, usize, Vec<u8>) {
+    fn region_pixels(
+        &self,
+        (x0, y0, x1, y1): (usize, usize, usize, usize),
+    ) -> (usize, usize, Vec<u8>) {
         let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
         let mut data = vec![0u8; w * h];
         let ViewerState::Ready(open) = &self.state else {
@@ -931,8 +947,9 @@ impl TilesetPanel {
         for dy in 0..h {
             for dx in 0..w {
                 if let Some((tile, px_x, px_y)) = self.doc_pixel(x0 + dx, y0 + dy) {
-                    let idx =
-                        tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + px_y * TILE_PX + px_x;
+                    let idx = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS
+                        + px_y * TILE_PX
+                        + px_x;
                     if let Some(&v) = state.indices.get(idx) {
                         data[dy * w + dx] = v;
                     }
@@ -1031,7 +1048,11 @@ impl TilesetPanel {
         let mut cells = Vec::with_capacity(w * h);
         for row in 0..h {
             for col in 0..w {
-                let (sc, sr) = if horizontal { (w - 1 - col, row) } else { (col, h - 1 - row) };
+                let (sc, sr) = if horizontal {
+                    (w - 1 - col, row)
+                } else {
+                    (col, h - 1 - row)
+                };
                 cells.push(((x0 + col) as i32, (y0 + row) as i32, data[sr * w + sc]));
             }
         }
@@ -1191,8 +1212,8 @@ impl TilesetPanel {
 
     fn step_brush(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state {
-            open.brush =
-                (open.brush as isize + delta).clamp(MIN_BRUSH as isize, MAX_BRUSH as isize) as usize;
+            open.brush = (open.brush as isize + delta).clamp(MIN_BRUSH as isize, MAX_BRUSH as isize)
+                as usize;
             cx.notify();
         }
     }
@@ -1344,7 +1365,12 @@ impl TilesetPanel {
         let (move_dx, move_dy) = open.move_offset();
         let selection = self.selection_rect().map(|(x0, y0, x1, y1)| {
             let shift = |v: usize, d: i32| (v as i32 + d).max(0) as usize;
-            (shift(x0, move_dx), shift(y0, move_dy), shift(x1, move_dx), shift(y1, move_dy))
+            (
+                shift(x0, move_dx),
+                shift(y0, move_dy),
+                shift(x1, move_dx),
+                shift(y1, move_dy),
+            )
         });
         // The shape preview: what a release without shift would paint.
         let preview = open.shape_points(false);
@@ -1409,7 +1435,13 @@ impl TilesetPanel {
                             h_flex()
                                 .gap_1()
                                 .items_stretch()
-                                .child(self.edge_bar("ggo-tileset-add-left", px(h), false, true, cx))
+                                .child(self.edge_bar(
+                                    "ggo-tileset-add-left",
+                                    px(h),
+                                    false,
+                                    true,
+                                    cx,
+                                ))
                                 .child(
                                     div()
                                         .relative()
@@ -1426,7 +1458,9 @@ impl TilesetPanel {
                                                     // Take focus so undo/save bindings apply.
                                                     window.focus(&this.focus_handle, cx);
                                                     if event.click_count >= 2 {
-                                                        if let Some((tile, ..)) = this.pixel_at(event.position) {
+                                                        if let Some((tile, ..)) =
+                                                            this.pixel_at(event.position)
+                                                        {
                                                             this.enter_focus(tile, cx);
                                                         }
                                                         return;
@@ -1507,20 +1541,24 @@ impl TilesetPanel {
             .border_dashed()
             .rounded_sm()
             .border_color(cx.theme().colors().border_variant)
-            .child(half("+", add_tip, 0).on_click(cx.listener(move |this, _, _, cx| {
-                if horizontal {
-                    this.insert_row(at_start, cx);
-                } else {
-                    this.insert_column(at_start, cx);
-                }
-            })))
-            .child(half("−", remove_tip, 1).on_click(cx.listener(move |this, _, _, cx| {
-                if horizontal {
-                    this.delete_row(at_start, cx);
-                } else {
-                    this.delete_column(at_start, cx);
-                }
-            })))
+            .child(
+                half("+", add_tip, 0).on_click(cx.listener(move |this, _, _, cx| {
+                    if horizontal {
+                        this.insert_row(at_start, cx);
+                    } else {
+                        this.insert_column(at_start, cx);
+                    }
+                })),
+            )
+            .child(
+                half("−", remove_tip, 1).on_click(cx.listener(move |this, _, _, cx| {
+                    if horizontal {
+                        this.delete_row(at_start, cx);
+                    } else {
+                        this.delete_column(at_start, cx);
+                    }
+                })),
+            )
             .into_any_element()
     }
 
@@ -1531,7 +1569,10 @@ impl TilesetPanel {
         };
         let (w, h) = open.grid_size;
         let state = open.store.state();
-        let summary = format!("{} tiles · {}x{} px · {} cols", state.tile_count, w, h, open.cols);
+        let summary = format!(
+            "{} tiles · {}x{} px · {} cols",
+            state.tile_count, w, h, open.cols
+        );
         v_flex()
             .gap_0p5()
             .p_1()
@@ -1589,15 +1630,32 @@ impl TilesetPanel {
                 IconButton::new("ggo-tileset-select", IconName::SquareDot)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Select)
-                    .tooltip(ui::Tooltip::text("Select region (ctrl-c copy, ctrl-v paste)"))
+                    .tooltip(ui::Tooltip::text(
+                        "Select region (ctrl-c copy, ctrl-v paste)",
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Select, cx))),
             )
             .children(
                 [
-                    (Tool::Fill, "ggo-tileset-fill", IconName::Sparkle, "Fill (floods across tiles)"),
+                    (
+                        Tool::Fill,
+                        "ggo-tileset-fill",
+                        IconName::Sparkle,
+                        "Fill (floods across tiles)",
+                    ),
                     (Tool::Line, "ggo-tileset-line", IconName::Dash, "Line"),
-                    (Tool::Rect, "ggo-tileset-rect", IconName::Maximize, "Rectangle (shift = filled)"),
-                    (Tool::Ellipse, "ggo-tileset-ellipse", IconName::Circle, "Ellipse (shift = filled)"),
+                    (
+                        Tool::Rect,
+                        "ggo-tileset-rect",
+                        IconName::Maximize,
+                        "Rectangle (shift = filled)",
+                    ),
+                    (
+                        Tool::Ellipse,
+                        "ggo-tileset-ellipse",
+                        IconName::Circle,
+                        "Ellipse (shift = filled)",
+                    ),
                 ]
                 .map(|(tool, id, icon, tip)| {
                     IconButton::new(id, icon)
@@ -1651,7 +1709,9 @@ impl TilesetPanel {
             .child(
                 Button::new("ggo-tileset-flip-h", "Flip H")
                     .disabled(open.selection.is_none())
-                    .tooltip(ui::Tooltip::text("Flip the selection horizontally (shift-h)"))
+                    .tooltip(ui::Tooltip::text(
+                        "Flip the selection horizontally (shift-h)",
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.flip_selection(true, cx))),
             )
             .child(
@@ -1666,21 +1726,26 @@ impl TilesetPanel {
                     .tooltip(ui::Tooltip::text("Leave focus (escape); ←/→ step tiles"))
                     .on_click(cx.listener(|this, _, _, cx| this.leave_focus(cx))),
                 None => Button::new("ggo-tileset-focus", "Focus")
-                    .tooltip(ui::Tooltip::text("Magnify one tile (f, or double-click a tile)"))
+                    .tooltip(ui::Tooltip::text(
+                        "Magnify one tile (f, or double-click a tile)",
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.focus_tile_impl(cx))),
             })
             .child(div().w_2())
             .child(Label::new(zoom_label).size(LabelSize::XSmall))
             .child(
-                ui::Slider::new("ggo-tileset-zoom", zoom_fraction(open.zoom, MIN_ZOOM, MAX_ZOOM))
-                    .width(px(72.))
-                    .on_change({
-                        let weak = cx.weak_entity();
-                        move |value, _window, cx| {
-                            let zoom = zoom_from_fraction(value, MIN_ZOOM, MAX_ZOOM);
-                            weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
-                        }
-                    }),
+                ui::Slider::new(
+                    "ggo-tileset-zoom",
+                    ui::slider_fraction(open.zoom, MIN_ZOOM, MAX_ZOOM),
+                )
+                .width(px(72.))
+                .on_change({
+                    let weak = cx.weak_entity();
+                    move |value, _window, cx| {
+                        let zoom = ui::slider_step(value, MIN_ZOOM, MAX_ZOOM);
+                        weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
+                    }
+                }),
             )
             .child(
                 IconButton::new("ggo-tileset-lines", IconName::Hash)
@@ -1785,12 +1850,10 @@ impl TilesetPanel {
             .child(self.render_info(cx))
             .child(self.render_palette(cx))
             .when_some(save_error, |this, e| {
-                this.child(div().p_1().child(
-                    ggo_common::CopyableText::new(
-                        "ggo-tileset-save-error-copy",
-                        format!("Save failed: {e}"),
-                    ),
-                ))
+                this.child(div().p_1().child(ggo_common::CopyableText::new(
+                    "ggo-tileset-save-error-copy",
+                    format!("Save failed: {e}"),
+                )))
             })
             .into_any_element()
     }
@@ -1815,7 +1878,11 @@ impl TilesetPanel {
                 .items_center()
                 .border_b_1()
                 .border_color(cx.theme().colors().border)
-                .child(Label::new(text).size(LabelSize::XSmall).color(Color::Warning))
+                .child(
+                    Label::new(text)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                )
                 .when(!alert.missing, |el| {
                     el.child(Button::new("ggo-tileset-reimport", "Re-import…").on_click(
                         move |_, window, cx| {
@@ -1883,10 +1950,16 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
-            .on_action(cx.listener(|this, _: &ScrollLeft, _window, cx| this.scroll_by(-1.0, 0.0, cx)))
-            .on_action(cx.listener(|this, _: &ScrollRight, _window, cx| this.scroll_by(1.0, 0.0, cx)))
+            .on_action(
+                cx.listener(|this, _: &ScrollLeft, _window, cx| this.scroll_by(-1.0, 0.0, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ScrollRight, _window, cx| this.scroll_by(1.0, 0.0, cx)),
+            )
             .on_action(cx.listener(|this, _: &ScrollUp, _window, cx| this.scroll_by(0.0, -1.0, cx)))
-            .on_action(cx.listener(|this, _: &ScrollDown, _window, cx| this.scroll_by(0.0, 1.0, cx)))
+            .on_action(
+                cx.listener(|this, _: &ScrollDown, _window, cx| this.scroll_by(0.0, 1.0, cx)),
+            )
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| this.copy_selection(cx)))
             .on_action(
                 cx.listener(|this, _: &PasteSelection, _window, cx| this.paste_clipboard(cx)),
@@ -1895,12 +1968,12 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.zoom_by(-1, cx)))
             .on_action(cx.listener(|this, _: &BrushSmaller, _window, cx| this.step_brush(-1, cx)))
             .on_action(cx.listener(|this, _: &BrushLarger, _window, cx| this.step_brush(1, cx)))
-            .on_action(cx.listener(|this, _: &FlipHorizontal, _window, cx| {
-                this.flip_selection(true, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FlipVertical, _window, cx| {
-                this.flip_selection(false, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &FlipHorizontal, _window, cx| this.flip_selection(true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &FlipVertical, _window, cx| this.flip_selection(false, cx)),
+            )
             .on_action(cx.listener(|this, _: &Cancel, _window, cx| this.cancel_impl(cx)))
             .on_action(cx.listener(|this, _: &FocusTile, _window, cx| this.focus_tile_impl(cx)))
             .on_action(
@@ -1989,18 +2062,6 @@ fn sheet_to_doc(
             (tile < tile_count).then_some((tile, sx % TILE_PX, sy % TILE_PX))
         }
     }
-}
-
-/// Integer range <-> slider fraction, shared by every zoom / palSub slider.
-fn zoom_fraction(value: usize, min: usize, max: usize) -> f32 {
-    if max <= min {
-        return 0.0;
-    }
-    (value.clamp(min, max) - min) as f32 / (max - min) as f32
-}
-
-fn zoom_from_fraction(fraction: f32, min: usize, max: usize) -> usize {
-    min + (fraction.clamp(0.0, 1.0) * (max - min) as f32).round() as usize
 }
 
 #[cfg(test)]
@@ -2359,14 +2420,11 @@ mod tests {
         });
     }
 
-
     /// Palette editing: a `SetPalette` op recolors the sheet (undoably),
     /// slot 0 is locked, and out-of-range slots are rejected instead of
     /// panicking (the store indexes the palette raw).
     #[gpui::test]
-    async fn test_palette_edits_recolor_the_sheet_and_slot_zero_is_locked(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_palette_edits_recolor_the_sheet_and_slot_zero_is_locked(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
@@ -2405,13 +2463,12 @@ mod tests {
             );
 
             panel.set_palette_slot(0, 0xFFFF, cx);
-            assert_eq!(
-                ready(panel).store.state().palette[0],
-                0,
-                "slot 0 is locked"
-            );
+            assert_eq!(ready(panel).store.state().palette[0], 0, "slot 0 is locked");
             panel.set_palette_slot(PAL_SLOTS + 3, 0xFFFF, cx);
-            assert!(!ready(panel).store.state().dirty, "no stray dirt from no-ops");
+            assert!(
+                !ready(panel).store.state().dirty,
+                "no stray dirt from no-ops"
+            );
         });
     }
 
@@ -2449,7 +2506,6 @@ mod tests {
             assert!(open.store.dirty(), "and the document must stay dirty");
         });
     }
-
 
     /// The grid-width setting: recomposes the sheet at the new column
     /// count, clamps to `1..=tile_count`, and persists -- a fresh panel
@@ -2548,7 +2604,6 @@ mod tests {
         });
     }
 
-
     /// The Picker tool: clicking a pixel makes its palette slot the
     /// pencil color and switches back to the pencil.
     #[gpui::test]
@@ -2619,7 +2674,11 @@ mod tests {
 
             panel.undo_impl(cx);
             let state = ready(panel).store.state();
-            assert_eq!(state.indices[2 * TILE_PX + 2], 0, "one undo reverts the paste");
+            assert_eq!(
+                state.indices[2 * TILE_PX + 2],
+                0,
+                "one undo reverts the paste"
+            );
             assert_eq!(state.indices[3 * TILE_PX + 3], 0);
             assert!(!state.dirty);
 
@@ -2679,10 +2738,7 @@ mod tests {
                 assert_eq!(open.cols, 4, "the view widened with the sheet");
                 assert_eq!(state.tile_count, 4);
                 assert_eq!(state.indices[3 * TILE_PIXELS], 0, "the new column is blank");
-                assert_eq!(
-                    open.grid_size,
-                    ((4 * TILE_PX) as u32, TILE_PX as u32)
-                );
+                assert_eq!(open.grid_size, ((4 * TILE_PX) as u32, TILE_PX as u32));
             }
 
             // Left column on the widened grid.
@@ -2694,7 +2750,11 @@ mod tests {
                 assert_eq!(state.tile_count, 5);
                 assert_eq!(state.indices[0], 0, "slot 0 is the new blank column");
                 assert_eq!(state.indices[TILE_PIXELS], 0, "old tile 0 was blank too");
-                assert_eq!(state.indices[2 * TILE_PIXELS], 1, "old tile 1 shifted right");
+                assert_eq!(
+                    state.indices[2 * TILE_PIXELS],
+                    1,
+                    "old tile 1 shifted right"
+                );
             }
         });
     }
@@ -2946,7 +3006,10 @@ mod tests {
         panel.update(cx, |panel, cx| panel.load_rel_path("tiles/world.til", cx));
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {
-            let alert = ready(panel).import_alert.clone().expect("stale mtime alerts");
+            let alert = ready(panel)
+                .import_alert
+                .clone()
+                .expect("stale mtime alerts");
             assert!(!alert.missing);
             assert_eq!(alert.source, "art/hero.png");
         });
@@ -2955,7 +3018,12 @@ mod tests {
         panel.update(cx, |panel, cx| panel.load_rel_path("tiles/world.til", cx));
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert!(ready(panel).import_alert.as_ref().is_some_and(|a| a.missing));
+            assert!(
+                ready(panel)
+                    .import_alert
+                    .as_ref()
+                    .is_some_and(|a| a.missing)
+            );
         });
     }
 
@@ -2976,15 +3044,26 @@ mod tests {
             let b = pixel_pos(ready(panel), 0, 5, 3);
             panel.on_sheet_mouse_down(a, cx);
             panel.on_sheet_mouse_move(b, cx);
-            assert_eq!(ready(panel).store.state().indices[idx(0, 0, 0)], 0, "nothing until release");
-            assert!(!ready(panel).shape_points(false).is_empty(), "preview points exist");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 0, 0)],
+                0,
+                "nothing until release"
+            );
+            assert!(
+                !ready(panel).shape_points(false).is_empty(),
+                "preview points exist"
+            );
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(0, 0, 0)], 1);
             assert_eq!(state.indices[idx(0, 5, 3)], 1);
             assert!(ready(panel).shape_drag.is_none());
             panel.undo_impl(cx);
-            assert_eq!(ready(panel).store.state().indices[idx(0, 5, 3)], 0, "one undo clears the line");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 5, 3)],
+                0,
+                "one undo clears the line"
+            );
         });
     }
 
@@ -3006,7 +3085,11 @@ mod tests {
             panel.on_sheet_mouse_down(a, cx);
             panel.on_sheet_mouse_move(b, cx);
             panel.on_sheet_mouse_up(true, cx);
-            assert_eq!(ready(panel).store.state().indices[idx(0, 2, 2)], 1, "shift fills");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 2, 2)],
+                1,
+                "shift fills"
+            );
         });
     }
 
@@ -3025,9 +3108,17 @@ mod tests {
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(1, 0, 0)], 2);
             assert_eq!(state.indices[idx(2, 7, 7)], 2, "flooded across the border");
-            assert_eq!(state.indices[idx(0, 0, 0)], 0, "tile 0 was a different colour");
+            assert_eq!(
+                state.indices[idx(0, 0, 0)],
+                0,
+                "tile 0 was a different colour"
+            );
             panel.undo_impl(cx);
-            assert_eq!(ready(panel).store.state().indices[idx(2, 7, 7)], 1, "one undo step");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(2, 7, 7)],
+                1,
+                "one undo step"
+            );
         });
     }
 
@@ -3082,7 +3173,11 @@ mod tests {
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(0, 1, 1)], 0, "source cleared");
             assert_eq!(state.indices[idx(0, 4, 1)], 1, "moved");
-            assert_eq!(ready(panel).selection, Some(((3, 0), (5, 2))), "marquee followed");
+            assert_eq!(
+                ready(panel).selection,
+                Some(((3, 0), (5, 2))),
+                "marquee followed"
+            );
             panel.undo_impl(cx);
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(0, 1, 1)], 1, "one undo restores the move");
@@ -3104,9 +3199,17 @@ mod tests {
             panel.flip_selection(true, cx);
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(0, 0, 0)], 0);
-            assert_eq!(state.indices[idx(0, 3, 0)], 1, "the dot moved to the far end");
+            assert_eq!(
+                state.indices[idx(0, 3, 0)],
+                1,
+                "the dot moved to the far end"
+            );
             panel.flip_selection(false, cx);
-            assert_eq!(ready(panel).store.state().indices[idx(0, 3, 0)], 1, "1-row flip V is identity");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 3, 0)],
+                1,
+                "1-row flip V is identity"
+            );
 
             let count = ready(panel).store.state().tile_count;
             let cols = ready(panel).cols;
@@ -3115,9 +3218,17 @@ mod tests {
             panel.delete_row(false, cx);
             assert_eq!(ready(panel).store.state().tile_count, count);
             panel.delete_row(false, cx);
-            assert_eq!(ready(panel).store.state().tile_count, count, "the only row stays");
+            assert_eq!(
+                ready(panel).store.state().tile_count,
+                count,
+                "the only row stays"
+            );
             panel.undo_impl(cx);
-            assert_eq!(ready(panel).store.state().tile_count, count + cols, "undo re-grows");
+            assert_eq!(
+                ready(panel).store.state().tile_count,
+                count + cols,
+                "undo re-grows"
+            );
 
             panel.insert_column(false, cx);
             assert_eq!(ready(panel).cols, cols + 1);
@@ -3145,7 +3256,11 @@ mod tests {
             panel.on_sheet_mouse_down(point(px(2.5 * z), px(3.5 * z)), cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).store.state().indices[idx(1, 2, 3)], 2);
-            assert_eq!(ready(panel).store.state().indices[idx(0, 2, 3)], 0, "tile 0 untouched");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 2, 3)],
+                0,
+                "tile 0 untouched"
+            );
 
             panel.scroll_by(1.0, 0.0, cx);
             assert_eq!(ready(panel).focus, Some(2), "right steps to the next tile");
@@ -3155,7 +3270,11 @@ mod tests {
             let open = ready(panel);
             assert_eq!(open.focus, None);
             assert_eq!(open.zoom, DEFAULT_ZOOM, "zoom restored");
-            assert_eq!(open.grid_size.0, (FIXTURE_TILES * TILE_PX) as u32, "whole sheet again");
+            assert_eq!(
+                open.grid_size.0,
+                (FIXTURE_TILES * TILE_PX) as u32,
+                "whole sheet again"
+            );
         });
     }
 
@@ -3173,9 +3292,16 @@ mod tests {
                 open.painting = false;
             }
             panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 2, 2), cx);
-            assert!(ready(panel).move_drag.is_none(), "the stale move drag is gone");
+            assert!(
+                ready(panel).move_drag.is_none(),
+                "the stale move drag is gone"
+            );
             panel.on_sheet_mouse_up(false, cx);
-            assert_eq!(ready(panel).store.state().indices[idx(1, 0, 0)], 1, "nothing moved");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 0, 0)],
+                1,
+                "nothing moved"
+            );
         });
     }
 }

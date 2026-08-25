@@ -151,11 +151,7 @@ impl SmallPaletteEditor {
         h_flex()
             .gap_1()
             .items_center()
-            .child(
-                Label::new(name)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
+            .child(Label::new(name).size(LabelSize::XSmall).color(Color::Muted))
             .child(
                 div()
                     .id(("ggo-pal-slider", slot * 8 + name.len()))
@@ -166,13 +162,7 @@ impl SmallPaletteEditor {
                     .border_1()
                     .border_color(cx.theme().colors().border)
                     .cursor_pointer()
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(frac))
-                            .rounded_sm()
-                            .bg(fill),
-                    )
+                    .child(div().h_full().w(relative(frac)).rounded_sm().bg(fill))
                     .child(
                         canvas(
                             move |bounds, _, _| {

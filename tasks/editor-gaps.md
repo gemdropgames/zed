@@ -140,7 +140,7 @@ Refs: Defold, Godot.
 - [x] Pane state kept across the restart: held pad re-published, mute/debug/console untouched, paused runs resume (2026-08-25)
 - [ ] True asset hot-swap: core accepts a new asset section mid-run — `large`, needs `ggo-emu-core` support
 
-## 9. Deploy to hardware — `medium`
+## 9. Deploy to hardware — `deferred indefinitely` (2026-08-25, user's call)
 
 Only "Run hardware diagnostics" (`ggo-diag --launch`). Flashing lives in the
 ggo repo's `.zed/tasks.json` with raw stdout and no verdict parsing
