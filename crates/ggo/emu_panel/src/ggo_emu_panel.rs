@@ -310,7 +310,9 @@ enum IngestStatus {
     /// writing an empty run.
     NoFrames,
     Uploading,
-    Done(i64),
+    /// The run row's id, and the original frame count when the ingest
+    /// kept only the first `ingest::MAX_FRAMES`.
+    Done(i64, Option<usize>),
     Failed(String),
 }
 
@@ -320,8 +322,12 @@ impl IngestStatus {
             IngestStatus::Idle => None,
             IngestStatus::NoFrames => Some("no frames recorded — nothing ingested".into()),
             IngestStatus::Uploading => Some("ingesting perf diagnostics…".into()),
-            IngestStatus::Done(run_id) => Some(format!(
+            IngestStatus::Done(run_id, None) => Some(format!(
                 "perf run #{run_id} ingested — see the GGO Charts panel"
+            )),
+            IngestStatus::Done(run_id, Some(frames)) => Some(format!(
+                "perf run #{run_id} ingested, truncated to {} of {frames} frames — see the GGO Charts panel",
+                ingest::MAX_FRAMES
             )),
             IngestStatus::Failed(e) => Some(format!("perf ingest failed: {e}")),
         }
@@ -349,7 +355,7 @@ fn ingest_finished_run(
             None => IngestStatus::Failed("no HOME to resolve ~/.ggo".into()),
             Some(db_path) => {
                 match ingest::ingest_run(&db_path, &perf.perf_json, &finished.uart, Some(label)) {
-                    Ok(run) => IngestStatus::Done(run.run_id),
+                    Ok(run) => IngestStatus::Done(run.run_id, run.truncated_frames),
                     Err(e) => IngestStatus::Failed(e),
                 }
             }
@@ -466,6 +472,10 @@ pub struct EmuPanel {
     _focus_out: Option<Subscription>,
     /// The debug column -- see [`debug`].
     debug: debug::DebugState,
+    /// Set by [`Self::auto_pause`] (the tab was hidden); cleared -- and the
+    /// run resumed -- by the next render. A user's own pause never sets it,
+    /// so it is never auto-resumed.
+    auto_paused: bool,
 }
 
 impl EmuPanel {
@@ -529,6 +539,7 @@ impl EmuPanel {
             previous_rendered_frame: None,
             _focus_out,
             debug: debug::DebugState::new(),
+            auto_paused: false,
         }
     }
 
@@ -607,6 +618,7 @@ impl EmuPanel {
             return;
         };
         self.stop(window, cx);
+        self.auto_paused = false;
         // AFTER `stop`, not before: `stop` -> `finish_run` reads
         // `run_generation` to tag the run it is finishing (the OLD one),
         // so it must still see the pre-bump value. This is the new
@@ -751,7 +763,7 @@ impl EmuPanel {
                     // that never reached vsync, a failed ingest) is spent,
                     // not left to fire after some later run.
                     match (&this.ingest_status, this.charts_for_run.take()) {
-                        (IngestStatus::Done(run_id), Some((armed, window)))
+                        (IngestStatus::Done(run_id, _), Some((armed, window)))
                             if armed == generation =>
                         {
                             Some((*run_id, window))
@@ -1053,12 +1065,39 @@ impl EmuPanel {
         self.session.as_ref().is_some_and(|session| session.is_paused())
     }
 
+    /// Hidden-tab pause: the emulator item was deactivated. Undone by the
+    /// next render (only a visible item renders). A run already paused by
+    /// the user is left exactly as it is.
+    pub(crate) fn auto_pause(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if session.is_paused() {
+            return;
+        }
+        session.pause();
+        self.auto_paused = true;
+        cx.notify();
+    }
+
+    fn auto_resume(&mut self) {
+        if !self.auto_paused {
+            return;
+        }
+        self.auto_paused = false;
+        if let Some(session) = &self.session {
+            session.resume();
+        }
+    }
+
     /// Pause at the next frame boundary, or resume. The flag lives on the
-    /// session, so a new run always starts unpaused.
+    /// session, so a new run always starts unpaused. A user's toggle
+    /// always ends the hidden-tab auto-pause state, whichever way it goes.
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
         };
+        self.auto_paused = false;
         if session.is_paused() {
             session.resume();
         } else {
@@ -1964,6 +2003,15 @@ impl Render for EmuPanel {
         // module doc.
         self.retire_atlas_frames(window);
         self.retire_debug_images(window);
+        // Rendering means the tab is visible again.
+        self.auto_resume();
+        // A deactivated window delivers no key-up: alt-tabbing away with a
+        // button held would otherwise leave it latched until the same key
+        // is pressed again. Every render while inactive releases the pad;
+        // frames keep the renders coming.
+        if !window.is_window_active() {
+            self.release_all_buttons(cx);
+        }
         self.debug_tick(cx);
 
         v_flex()
@@ -2877,7 +2925,7 @@ mod tests {
             assert!(!panel.is_running());
             assert_eq!(panel.status.as_deref(), Some("stopped"));
             assert!(
-                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                matches!(panel.ingest_status, IngestStatus::Done(..)),
                 "a run with frames must have ingested: {:?}",
                 panel.ingest_status
             );
@@ -3087,7 +3135,7 @@ mod tests {
             assert_eq!(panel.selected.as_deref(), Some("other.cart"));
             assert!(!panel.is_running(), "the previous run is stopped");
             assert!(
-                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                matches!(panel.ingest_status, IngestStatus::Done(..)),
                 "the stopped run's perf data must still have been ingested, \
                  not silently dropped: {:?}",
                 panel.ingest_status
@@ -4065,7 +4113,7 @@ mod tests {
 
         panel.update(cx, |panel, _cx| {
             assert!(
-                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                matches!(panel.ingest_status, IngestStatus::Done(..)),
                 "the run must have ingested: {:?}",
                 panel.ingest_status
             );
@@ -4178,7 +4226,7 @@ mod tests {
 
         panel.update(cx, |panel, _cx| {
             assert!(
-                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                matches!(panel.ingest_status, IngestStatus::Done(..)),
                 "the run must have ingested: {:?}",
                 panel.ingest_status
             );
@@ -4294,7 +4342,7 @@ mod tests {
             assert!(
                 matches!(
                     panel.ingest_status,
-                    IngestStatus::NoFrames | IngestStatus::Done(_)
+                    IngestStatus::NoFrames | IngestStatus::Done(..)
                 ),
                 "the stopped run's INGEST result is still its own and must \
                  still land: {:?}",
@@ -4583,7 +4631,7 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.status.as_deref(), Some("stopped"));
             assert!(
-                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                matches!(panel.ingest_status, IngestStatus::Done(..)),
                 "the keybinding-stopped run still ingests: {:?}",
                 panel.ingest_status
             );
@@ -4716,6 +4764,102 @@ mod tests {
         });
     }
 
+    /// Another tab taking the pane pauses the cart (the item is
+    /// deactivated and stops rendering); coming back resumes it; a pause
+    /// the user made is never auto-resumed.
+    #[gpui::test]
+    async fn test_hidden_tab_auto_pause_resumes_on_return_but_never_a_user_pause(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("green.cart", window, cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+        let emu_item = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<EmulatorItem>(cx)
+                .next()
+                .expect("the emulator tab")
+        });
+
+        let hide = |cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
+            });
+            cx.run_until_parked();
+        };
+        let show = |cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(&emu_item, true, true, window, cx);
+            });
+            cx.run_until_parked();
+        };
+
+        hide(cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_paused() && panel.auto_paused, "a hidden tab pauses");
+        });
+        show(cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_paused() && !panel.auto_paused, "coming back resumes");
+        });
+
+        panel.update(cx, |panel, cx| panel.toggle_pause(cx));
+        hide(cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_paused() && !panel.auto_paused, "a user pause is not adopted");
+        });
+        show(cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_paused(), "and coming back leaves it alone");
+        });
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
+    }
+
+    /// A window that is no longer active gets no key-up events, so the
+    /// pad is released on the next render instead of staying latched.
+    #[gpui::test]
+    async fn test_an_inactive_window_releases_the_pad(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
+        cx.update(|window, _| window.activate_window());
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            panel.on_key("z", true);
+            assert_ne!(panel.input.mask(), 0, "a held key is latched");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_ne!(panel.input.mask(), 0, "an active window keeps it held");
+        });
+
+        cx.deactivate_window();
+        panel.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.input.mask(), 0, "the render while inactive released it");
+        });
+    }
+
     /// **The pad listeners on the rendered root, end to end.** The unit
     /// test above (`test_key_handling_latches_and_releases_the_pad`) calls
     /// `on_key` directly; this pins the `on_key_down`/`on_key_up`/
@@ -4829,7 +4973,7 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.status.as_deref(), Some("stopped"));
             assert!(
-                matches!(panel.ingest_status, IngestStatus::Done(_)),
+                matches!(panel.ingest_status, IngestStatus::Done(..)),
                 "a click-stopped run still ingests: {:?}",
                 panel.ingest_status
             );

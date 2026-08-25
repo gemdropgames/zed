@@ -31,7 +31,7 @@ use serde_json::Value as Json;
 
 /// Hard cap on frames per run ("sane size": ~28 min at 60 fps).
 /// `ggo-ide::backend::ingest::MAX_FRAMES` verbatim.
-const MAX_FRAMES: usize = 100_000;
+pub const MAX_FRAMES: usize = 100_000;
 /// Hard cap on function-attribution rows per `profile`/`dprofile` section.
 const MAX_PROFILE_ROWS: usize = 500_000;
 /// Cart names come from a 32-byte header slot; anything longer is junk.
@@ -160,6 +160,10 @@ struct RunBody {
     extra_cols: Vec<Vec<i64>>,
     profile: Vec<ProfileRow>,
     dprofile: Vec<ProfileRow>,
+    /// `Some(original length)` when the frame arrays were cut to
+    /// [`MAX_FRAMES`]: a run past ~28 minutes keeps its first 100k frames
+    /// rather than losing its whole ingest.
+    truncated_frames: Option<usize>,
 }
 
 /// One function-level miss/eviction row.
@@ -279,14 +283,18 @@ fn parse_output(output: &str) -> Result<RunBody, String> {
 
     let mut cols: Vec<Vec<i64>> = Vec::with_capacity(FRAME_COLS.len());
     let mut len: Option<usize> = None;
+    let mut truncated_frames: Option<usize> = None;
     for name in FRAME_COLS {
         let arr = frames
             .get(name)
             .and_then(Json::as_array)
             .ok_or_else(|| format!("\"frames.{name}\" must be an array"))?;
-        if arr.len() > MAX_FRAMES {
-            return Err(format!("\"frames.{name}\" exceeds {MAX_FRAMES} frames"));
-        }
+        let arr = if arr.len() > MAX_FRAMES {
+            truncated_frames = Some(arr.len());
+            &arr[..MAX_FRAMES]
+        } else {
+            arr.as_slice()
+        };
         match len {
             None => len = Some(arr.len()),
             Some(l) if l != arr.len() => {
@@ -317,6 +325,11 @@ fn parse_output(output: &str) -> Result<RunBody, String> {
         match frames.get(name).and_then(Json::as_array) {
             None => extra_cols.push(vec![0; n]),
             Some(arr) => {
+                let arr = if truncated_frames.is_some() && arr.len() > n {
+                    &arr[..n]
+                } else {
+                    arr.as_slice()
+                };
                 if arr.len() != n {
                     return Err(format!(
                         "frame arrays disagree on length: \"frames.{name}\" has {} entries, expected {n}",
@@ -339,6 +352,7 @@ fn parse_output(output: &str) -> Result<RunBody, String> {
     let dprofile = parse_profile_section(obj, "dprofile")?;
 
     Ok(RunBody {
+        truncated_frames,
         cart: cart.to_owned(),
         frame_budget_cycles,
         scanout_wire_cycles,
@@ -359,6 +373,8 @@ fn parse_output(output: &str) -> Result<RunBody, String> {
 pub struct RunId {
     pub run_id: i64,
     pub cart_id: i64,
+    /// See `RunBody::truncated_frames`.
+    pub truncated_frames: Option<usize>,
 }
 
 /// Parse `output` and write it into `db_path` as a `cart`/`run`/`frame`
@@ -427,7 +443,11 @@ async fn write_run(
             conn.execute("COMMIT", ())
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(RunId { run_id, cart_id })
+            Ok(RunId {
+                run_id,
+                cart_id,
+                truncated_frames: run.truncated_frames,
+            })
         }
         Err(e) => {
             let _ = conn.execute("ROLLBACK", ()).await;
@@ -640,14 +660,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_output_rejects_oversized_runs() {
+    fn parse_output_truncates_oversized_runs_instead_of_rejecting_them() {
         let mut v: Json = serde_json::from_str(&output_for("t", 3)).unwrap();
         let big = serde_json::json!(vec![0; MAX_FRAMES + 1]);
         for name in FRAME_COLS {
             v["frames"][name] = big.clone();
         }
-        let err = parse_output(&v.to_string()).unwrap_err();
-        assert!(err.contains("exceeds"), "{err}");
+        v["frames"][EXTRA_COLS[0]] = big;
+        let body = parse_output(&v.to_string()).expect("a long run still ingests");
+        assert!(body.cols.iter().all(|c| c.len() == MAX_FRAMES));
+        assert!(body.extra_cols.iter().all(|c| c.len() == MAX_FRAMES));
+        assert_eq!(body.truncated_frames, Some(MAX_FRAMES + 1));
+        assert_eq!(parse_output(&output_for("t", 3)).unwrap().truncated_frames, None);
     }
 
     #[test]

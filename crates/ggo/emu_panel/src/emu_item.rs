@@ -62,6 +62,13 @@ impl Item for EmulatorItem {
         }
     }
 
+    /// Another tab took the pane's place: pause the cart rather than let
+    /// it run unseen. The panel resumes on its next render, which only
+    /// happens once the tab is visible again.
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.panel.update(cx, |panel, cx| panel.auto_pause(cx));
+    }
+
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         // The selected cart's stem names the tab once one is chosen; a
         // bare emulator reads as just "Emulator".
