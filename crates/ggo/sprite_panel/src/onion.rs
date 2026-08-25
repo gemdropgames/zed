@@ -141,8 +141,8 @@ impl OnionState {
 
     /// Step opacity by `steps` x [`OPACITY_STEP`], clamped to the range --
     /// the stepper standing in for ggo-ide's slider (module doc).
-    /// Set the opacity outright (a slider), quantised to [`OPACITY_STEP`]
-    /// so the readout and the stepper agree.
+    /// Set the opacity outright (the slider), quantised to
+    /// [`OPACITY_STEP`] so the readout and the key steps agree.
     pub fn set_opacity(&mut self, opacity: f32) {
         let quantized = (opacity / OPACITY_STEP).round() * OPACITY_STEP;
         self.opacity = quantized.clamp(OPACITY_MIN, OPACITY_MAX);

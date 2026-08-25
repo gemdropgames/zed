@@ -3,7 +3,9 @@
 //! A pending import is not a document, so the tab is never dirty and
 //! never saves.
 
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window,
+};
 use ui::prelude::*;
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};

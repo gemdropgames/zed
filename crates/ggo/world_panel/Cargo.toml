@@ -23,7 +23,6 @@ test-support = []
 anyhow.workspace = true
 editor.workspace = true
 gpui.workspace = true
-keymap_editor.workspace = true
 log.workspace = true
 project.workspace = true
 serde_json.workspace = true

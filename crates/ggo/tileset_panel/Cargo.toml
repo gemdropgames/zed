@@ -17,7 +17,6 @@ ggo-asset-formats.workspace = true # GGO
 ggo-worldlib.workspace = true # GGO
 ggo_common.workspace = true
 gpui.workspace = true
-keymap_editor.workspace = true
 log.workspace = true
 project.workspace = true
 serde.workspace = true

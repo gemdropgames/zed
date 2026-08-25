@@ -103,6 +103,26 @@ pub fn bind_default_keymap(cx: &mut App) {
     }
 }
 
+/// Every panel key context the fork declares in the keymap assets. The
+/// test below is the tripwire: delete a block from the JSON and it fails
+/// here rather than in whichever panel test happened to use that key.
+#[cfg(any(test, feature = "test-support"))]
+pub const GGO_KEY_CONTEXTS: &[&str] = &[
+    "GgoMapPanel",
+    "GgoMapPanel > Editor",
+    "GgoTilesetPanel",
+    "GgoImportPanel",
+    "GgoImportPanel && !Editor",
+    "GgoSpritePanel",
+    "GgoSpritePanel && not_editing",
+    "GgoSpritePanel > Editor",
+    "GgoWorldPanel",
+    "GgoWorldPanel > Editor",
+    "GgoEmuPanel",
+    "GgoAudioPanel",
+    "GgoEmeraldPanel > Editor",
+];
+
 // --------------------------------------------------------- shared db path
 
 /// Database filename under `~/.ggo/`, matching `ggo-ide`'s
@@ -888,13 +908,53 @@ pub fn pack_out_name(world_stem: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The keymap tripwire: every GGO context block must exist in each
+    /// platform asset (and the `> Editor` ones in `vim.json` too, or vim's
+    /// same-depth tab/enter bindings win the tie).
+    #[test]
+    fn every_ggo_key_context_is_declared_in_the_keymap_assets() {
+        for asset in [
+            "assets/keymaps/default-linux.json",
+            "assets/keymaps/default-macos.json",
+            "assets/keymaps/default-windows.json",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join(asset);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            for context in GGO_KEY_CONTEXTS {
+                assert!(
+                    text.contains(&format!("\"context\": \"{context}\"")),
+                    "{asset} is missing the {context} block"
+                );
+            }
+        }
+        let vim = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join("assets/keymaps/vim.json"),
+        )
+        .expect("vim.json");
+        for context in GGO_KEY_CONTEXTS.iter().filter(|c| c.contains("> Editor")) {
+            assert!(
+                vim.contains(&format!("\"context\": \"{context}\"")),
+                "vim.json must re-declare {context} or VimControl wins the tie"
+            );
+        }
+    }
+
     #[test]
     fn thumbnail_rgba_fits_and_letterboxes() {
         // 4x2 image: left half red, right half blue.
         let mut src = Vec::new();
         for _ in 0..2 {
             for x in 0..4 {
-                src.extend_from_slice(if x < 2 { &[255, 0, 0, 255] } else { &[0, 0, 255, 255] });
+                src.extend_from_slice(if x < 2 {
+                    &[255, 0, 0, 255]
+                } else {
+                    &[0, 0, 255, 255]
+                });
             }
         }
         let thumb = thumbnail_rgba(&src, 4, 2, 4);
@@ -903,7 +963,11 @@ mod tests {
         assert_eq!(px(0, 1), [255, 0, 0, 255]);
         assert_eq!(px(3, 2), [0, 0, 255, 255]);
         assert_eq!(px(0, 3), [0, 0, 0, 0]);
-        assert_eq!(thumbnail_rgba(&[], 0, 0, 2).len(), 16, "degenerate input is a blank square");
+        assert_eq!(
+            thumbnail_rgba(&[], 0, 0, 2).len(),
+            16,
+            "degenerate input is a blank square"
+        );
     }
 
     /// The classic red/blue swap bug: RGBA in, BGRA out, alpha untouched.
@@ -1294,7 +1358,6 @@ mod tests {
         assert!(marker.exists(), "the script itself works");
     }
 }
-
 
 /// Collapse every center-pane split: move all items from every other
 /// pane into the FIRST pane (emptied panes remove themselves), leaving

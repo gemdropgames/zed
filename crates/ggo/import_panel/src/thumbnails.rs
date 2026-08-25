@@ -11,7 +11,7 @@ use ggo_worldlib::sprites::import::decode_png;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::indices_to_rgba;
 use ggo_worldlib::sprites::preview::compose_frame_rgba;
-use ggo_worldlib::sprites::tileset_doc::{compose_tile_grid, tile_grid_layout, TILE_PX};
+use ggo_worldlib::sprites::tileset_doc::{TILE_PX, compose_tile_grid, tile_grid_layout};
 use gpui::RenderImage;
 
 pub const EXTENSIONS: &[&str] = &["til", "spr", "png"];
@@ -84,7 +84,10 @@ mod tests {
         let png = dir.path().join("a.png");
         write_png_fixture(&png, 32, 8, &two_tone_rgba(32, 8));
         let image = decode_thumbnail(&png).expect("png thumbnail");
-        assert_eq!(image.size(0), gpui::size(THUMB_PX as i32, THUMB_PX as i32).map(|d| d.into()));
+        assert_eq!(
+            image.size(0),
+            gpui::size(THUMB_PX as i32, THUMB_PX as i32).map(|d| d.into())
+        );
 
         let mut palette = [0u16; PAL_SLOTS];
         palette[1] = 0xF800;
@@ -108,7 +111,10 @@ mod tests {
             workspace::ggo_thumbnails::thumbnail_cache(cx).expect("a decoder is registered")
         });
         let first = cache.update(cx, |cache, cx| cache.get(&png, cx));
-        assert!(first.is_none(), "a miss starts the decode and returns nothing yet");
+        assert!(
+            first.is_none(),
+            "a miss starts the decode and returns nothing yet"
+        );
         cx.executor().run_until_parked();
         let second = cache.update(cx, |cache, cx| cache.get(&png, cx));
         assert!(second.is_some(), "the decode landed");

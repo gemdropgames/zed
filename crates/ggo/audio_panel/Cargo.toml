@@ -20,7 +20,6 @@ ggo-emu-core.workspace = true # GGO -- the standalone `Apu` behind the Baked pre
 ggo_common.workspace = true
 ggo_emu_panel.workspace = true # GGO -- the cpal ring the emulator pane already owns
 gpui.workspace = true
-keymap_editor.workspace = true
 log.workspace = true
 project.workspace = true
 ui.workspace = true

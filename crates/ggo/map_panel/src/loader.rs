@@ -36,8 +36,8 @@ use ggo_common::to_render_image;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::map_doc::{MapState, compose_map_indices};
 use ggo_worldlib::sprites::palette565::{Pal, indices_to_rgba};
-use ggo_worldlib::sprites::tileset_meta::{TilesetMeta, load_tileset_meta};
 use ggo_worldlib::sprites::tileset_doc::{compose_tile_grid, resolve_cols};
+use ggo_worldlib::sprites::tileset_meta::{TilesetMeta, load_tileset_meta};
 use gpui::RenderImage;
 
 /// Column count for the strip when nothing better is known -- ggo-ide's
@@ -146,7 +146,9 @@ pub fn tileset_meta_rel(asset_root: &Path, project_root: &Path, til_rel: &str) -
         return None;
     }
     let under = asset_root.strip_prefix(project_root).ok()?;
-    let under = under.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let under = under
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
     Some(if under.is_empty() {
         til_rel.to_string()
     } else {
@@ -164,13 +166,22 @@ pub fn tileset_meta(asset_root: &Path, project_root: &Path, til_rel: &str) -> Ti
 
 /// Resolve `til_rel` against `root` into the strip's pixel data, laid out
 /// at the sidecar's `cols` when it has one that fits this sheet.
-pub fn load_tileset(root: &Path, til_rel: &str, cols_hint: Option<usize>) -> Result<Tileset, String> {
+pub fn load_tileset(
+    root: &Path,
+    til_rel: &str,
+    cols_hint: Option<usize>,
+) -> Result<Tileset, String> {
     if til_rel.is_empty() {
         return Err("no tileset bound".to_string());
     }
     let opened = io::open_tileset(root, til_rel).map_err(|e| e.to_string())?;
     Ok(Tileset {
-        cols: resolve_cols(cols_hint, None, opened.tile_count, grid_cols(opened.tile_count)),
+        cols: resolve_cols(
+            cols_hint,
+            None,
+            opened.tile_count,
+            grid_cols(opened.tile_count),
+        ),
         indices: opened.indices,
         palette: opened.palette,
         tile_count: opened.tile_count,
@@ -236,8 +247,15 @@ mod tests {
             tileset_meta_rel(assets, project, "tiles/a.til").as_deref(),
             Some("assets/tiles/a.til")
         );
-        assert_eq!(tileset_meta_rel(project, project, "a.til").as_deref(), Some("a.til"));
-        assert_eq!(tileset_meta_rel(assets, project, ""), None, "an unbound map has no sidecar");
+        assert_eq!(
+            tileset_meta_rel(project, project, "a.til").as_deref(),
+            Some("a.til")
+        );
+        assert_eq!(
+            tileset_meta_rel(assets, project, ""),
+            None,
+            "an unbound map has no sidecar"
+        );
         assert_eq!(
             tileset_meta_rel(Path::new("/elsewhere"), project, "a.til"),
             None,

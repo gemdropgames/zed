@@ -1278,4 +1278,33 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  // GGO: re-declared so the fork's field bindings still beat vim's
+  // `VimControl && !menu` tab/enter/escape at the same editor depth
+  // (upstream does the same for SkillCreator/CommitEditor).
+  {
+    "context": "GgoMapPanel > Editor",
+    "bindings": {
+      "enter": "ggo_map::ApplyResize",
+    },
+  },
+  {
+    "context": "GgoSpritePanel > Editor",
+    "bindings": {
+      "enter": "ggo_sprite::CommitField",
+    },
+  },
+  {
+    "context": "GgoWorldPanel > Editor",
+    "bindings": {
+      "enter": "ggo_world::CommitField",
+      "tab": "ggo_world::FocusNextField",
+      "shift-tab": "ggo_world::FocusPrevField",
+    },
+  },
+  {
+    "context": "GgoEmeraldPanel > Editor",
+    "bindings": {
+      "enter": "ggo_emerald::Submit",
+    },
+  },
 ]

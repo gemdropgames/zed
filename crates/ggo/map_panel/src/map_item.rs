@@ -167,15 +167,22 @@ mod tests {
         });
 
         item.update(cx, |item, cx| {
-            item.panel().clone().update(cx, |panel, cx| panel.paint_at((0, 0), cx));
+            item.panel()
+                .clone()
+                .update(cx, |panel, cx| panel.paint_at((0, 0), cx));
         });
         cx.run_until_parked();
-        item.read_with(cx, |item, cx| assert!(item.is_dirty(cx), "edits surface as item dirt"));
+        item.read_with(cx, |item, cx| {
+            assert!(item.is_dirty(cx), "edits surface as item dirt")
+        });
 
         let save = item.update_in(cx, |item, window, cx| {
             item.save(SaveOptions::default(), project.clone(), window, cx)
         });
-        save.await.expect("saving into the fixture root must succeed");
-        item.read_with(cx, |item, cx| assert!(!item.is_dirty(cx), "a landed save is clean"));
+        save.await
+            .expect("saving into the fixture root must succeed");
+        item.read_with(cx, |item, cx| {
+            assert!(!item.is_dirty(cx), "a landed save is clean")
+        });
     }
 }

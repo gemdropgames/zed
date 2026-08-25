@@ -65,12 +65,15 @@ const THUMB: Pixels = px(10.);
 const HIT_HEIGHT: Pixels = px(16.);
 
 /// The normalised value for a pointer `x` over a track of `width`
-/// starting at `origin_x`.
+/// starting at `origin_x`. The pointer maps onto the THUMB's travel
+/// (`width - THUMB`, measured from the thumb's centre), so grabbing the
+/// thumb does not jump it and the ends are reachable.
 pub fn slider_value_at(x: Pixels, origin_x: Pixels, width: Pixels) -> f32 {
-    if width <= px(0.) {
+    let travel = f32::from(width - THUMB);
+    if travel <= 0.0 {
         return 0.0;
     }
-    (f32::from(x - origin_x) / f32::from(width)).clamp(0.0, 1.0)
+    ((f32::from(x - origin_x) - f32::from(THUMB) / 2.0) / travel).clamp(0.0, 1.0)
 }
 
 impl RenderOnce for Slider {
@@ -97,7 +100,11 @@ impl RenderOnce for Slider {
                     .h_full()
                     .w(thumb_left + THUMB / 2.0)
                     .rounded_full()
-                    .bg(if disabled { colors.element_disabled } else { fill }),
+                    .bg(if disabled {
+                        colors.element_disabled
+                    } else {
+                        fill
+                    }),
             );
         let thumb = div()
             .absolute()
@@ -105,7 +112,11 @@ impl RenderOnce for Slider {
             .top(px(f32::from(HIT_HEIGHT - THUMB) / 2.0))
             .size(THUMB)
             .rounded_full()
-            .bg(if disabled { colors.element_disabled } else { fill })
+            .bg(if disabled {
+                colors.element_disabled
+            } else {
+                fill
+            })
             .border_1()
             .border_color(colors.border);
 
@@ -139,22 +150,37 @@ impl RenderOnce for Slider {
                 let on_change_move = on_change.clone();
                 let drag_id = id.clone();
                 let drag_id_move = id.clone();
-                el.on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, window, cx| {
-                    if let (Some(b), Some(on_change)) = (*bounds_down.borrow(), &on_change_down) {
-                        on_change(slider_value_at(event.position.x, b.origin.x, b.size.width), window, cx);
-                    }
-                })
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    move |event: &MouseDownEvent, window, cx| {
+                        if let (Some(b), Some(on_change)) = (*bounds_down.borrow(), &on_change_down)
+                        {
+                            on_change(
+                                slider_value_at(event.position.x, b.origin.x, b.size.width),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                )
                 .on_drag(SliderDrag(drag_id), |drag, _offset, _window, cx| {
                     cx.new(|_| drag.clone())
                 })
-                .on_drag_move(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
-                    if event.drag(cx).0 != drag_id_move {
-                        return;
-                    }
-                    if let (Some(b), Some(on_change)) = (*bounds_move.borrow(), &on_change_move) {
-                        on_change(slider_value_at(event.event.position.x, b.origin.x, b.size.width), window, cx);
-                    }
-                })
+                .on_drag_move(
+                    move |event: &DragMoveEvent<SliderDrag>, window, cx| {
+                        if event.drag(cx).0 != drag_id_move {
+                            return;
+                        }
+                        if let (Some(b), Some(on_change)) = (*bounds_move.borrow(), &on_change_move)
+                        {
+                            on_change(
+                                slider_value_at(event.event.position.x, b.origin.x, b.size.width),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                )
             })
     }
 }
@@ -165,11 +191,29 @@ mod tests {
 
     #[test]
     fn slider_value_maps_pointer_x_onto_the_track_and_clamps() {
-        assert_eq!(slider_value_at(px(0.), px(0.), px(100.)), 0.0);
-        assert_eq!(slider_value_at(px(25.), px(0.), px(100.)), 0.25);
-        assert_eq!(slider_value_at(px(175.), px(100.), px(100.)), 0.75);
-        assert_eq!(slider_value_at(px(-10.), px(0.), px(100.)), 0.0);
-        assert_eq!(slider_value_at(px(500.), px(0.), px(100.)), 1.0);
-        assert_eq!(slider_value_at(px(5.), px(0.), px(0.)), 0.0, "a zero-width track is safe");
+        // The thumb's centre travels from THUMB/2 to width - THUMB/2.
+        assert_eq!(slider_value_at(px(5.), px(0.), px(100.)), 0.0);
+        assert_eq!(slider_value_at(px(50.), px(0.), px(100.)), 0.5);
+        assert_eq!(slider_value_at(px(95.), px(0.), px(100.)), 1.0);
+        assert_eq!(
+            slider_value_at(px(150.), px(100.), px(100.)),
+            0.5,
+            "origin offset"
+        );
+        assert_eq!(
+            slider_value_at(px(-10.), px(0.), px(100.)),
+            0.0,
+            "clamped low"
+        );
+        assert_eq!(
+            slider_value_at(px(500.), px(0.), px(100.)),
+            1.0,
+            "clamped high"
+        );
+        assert_eq!(
+            slider_value_at(px(5.), px(0.), px(0.)),
+            0.0,
+            "a track thinner than the thumb is safe"
+        );
     }
 }

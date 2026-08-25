@@ -45,7 +45,9 @@ pub fn load_png(abs: &Path) -> Result<LoadedPng, String> {
     let bytes = std::fs::read(abs).map_err(|e| format!("reading {}: {e}", abs.display()))?;
     let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let frames = decode_source(name, &bytes).map_err(|e| e.to_string())?;
-    let first = frames.first().ok_or_else(|| "the file has no frames".to_string())?;
+    let first = frames
+        .first()
+        .ok_or_else(|| "the file has no frames".to_string())?;
     let decoded: DecodedPng = first.clone().into();
     let image = to_render_image(&decoded.rgba, decoded.w as u32, decoded.h as u32)
         .ok_or_else(|| "the image has no pixels".to_string())?;

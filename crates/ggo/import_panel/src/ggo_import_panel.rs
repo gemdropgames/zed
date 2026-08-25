@@ -90,23 +90,21 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity,
-    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent,
-    Styled, Task, WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb,
-    rgba, size,
+    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, FocusHandle, Focusable, Hsla,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Task, WeakEntity,
+    Window, actions, bounds, div, fill, img, outline, point, px, rgb, rgba, size,
 };
 use project::ProjectPath;
 use ui::prelude::*;
 use ui::{Checkbox, ToggleState, Tooltip};
 use workspace::Workspace;
 
+use ggo_worldlib::sprites::import::DecodedFrame;
 use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, is_importable_source, join_dest_path,
     slice_to_tiles, source_rel_if_in_project, sprite_import, uniform_rects,
 };
-use ggo_worldlib::sprites::import::DecodedFrame;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::{PAL_SLOTS, slot_rgba};
 use ggo_worldlib::sprites::tileset_meta::{
@@ -131,11 +129,9 @@ actions!(
     ]
 );
 
-
 /// The panel's key-dispatch context (`.key_context`), which the
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoImportPanel";
-
 
 /// The assets subdirectory hanging off an emerald project root. Hardcoded
 /// upstream -- it is NOT a configurable `emerald.toml` key. Same constant
@@ -159,7 +155,6 @@ const PREVIEW_HEIGHT: Pixels = px(120.);
 const SWATCH_PX: f32 = 16.0;
 
 pub fn init(cx: &mut App) {
-
     // Right-clicking a `.png` offers "Import as tileset…". Deliberately NOT
     // a `register_path_open_interceptor`: a LEFT click on a `.png` must keep
     // opening upstream's image viewer, which is a perfectly good way to look
@@ -187,7 +182,6 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 }
-
 
 /// Is `path` a source the wizard reads (by extension)?
 fn is_importable_path(path: &Path) -> bool {
@@ -218,8 +212,9 @@ fn intercept_image_drop(
         panel.adopt_root(root, cx);
         panel.open_abs_source(first, cx);
         if ignored > 0 {
-            panel.status =
-                Some(format!("{ignored} more dropped file(s) ignored — one source at a time"));
+            panel.status = Some(format!(
+                "{ignored} more dropped file(s) ignored — one source at a time"
+            ));
         }
     });
     true
@@ -613,7 +608,8 @@ impl OpenImport {
     fn apply_record(&mut self, record: &ImportRecord) {
         self.wizard
             .commit_region(record.crop.map(|(x, y, w, h)| Region { x, y, w, h }));
-        self.wizard.set_reserve_transparent(record.reserve_transparent);
+        self.wizard
+            .set_reserve_transparent(record.reserve_transparent);
         self.as_sprite = record.as_sprite;
         self.frame_cut = (record.frame_w, record.frame_h);
     }
@@ -792,7 +788,8 @@ impl ImportPanel {
             if let Ok(Ok(Some(mut paths))) = paths.await
                 && let Some(abs) = paths.pop()
             {
-                this.update(cx, |this, cx| this.open_abs_source(abs, cx)).ok();
+                this.update(cx, |this, cx| this.open_abs_source(abs, cx))
+                    .ok();
             }
         })
         .detach();
@@ -819,20 +816,19 @@ impl ImportPanel {
             return;
         }
         let assets = project_root.join(ASSETS_DIR);
-        let dest_dir = if project_root.join(ggo_common::EMERALD_MANIFEST).is_file()
-            && assets.is_dir()
-        {
-            // `assets/sprites` is where the sprite pipeline's trios live, so
-            // an imported tileset defaults beside them rather than at the
-            // asset-tree root.
-            if assets.join(SPRITES_DIR).is_dir() {
-                format!("{ASSETS_DIR}/{SPRITES_DIR}")
+        let dest_dir =
+            if project_root.join(ggo_common::EMERALD_MANIFEST).is_file() && assets.is_dir() {
+                // `assets/sprites` is where the sprite pipeline's trios live, so
+                // an imported tileset defaults beside them rather than at the
+                // asset-tree root.
+                if assets.join(SPRITES_DIR).is_dir() {
+                    format!("{ASSETS_DIR}/{SPRITES_DIR}")
+                } else {
+                    ASSETS_DIR.to_string()
+                }
             } else {
-                ASSETS_DIR.to_string()
-            }
-        } else {
-            String::new()
-        };
+                String::new()
+            };
         // The full path is the display name: "hero.png" alone would not say
         // which of five out-of-repo hero.pngs is open.
         let source_rel = abs
@@ -1335,19 +1331,19 @@ impl ImportPanel {
             // `.spr`/`.til`/`.pal` trio in one call; the wizard's tileset
             // preview is not consulted.
             sprite_import(&rgba, src_w, src_h, open.wizard.reserve_transparent, &rects)
-            .map_err(|e| e.to_string())
-            .and_then(|state| {
-                let spr_rel = format!("{dest_stem}.spr");
-                io::save_sprite(
-                    &dest_root,
-                    &spr_rel,
-                    &state,
-                    &til_rel,
-                    &format!("{dest_stem}.pal"),
-                )
-                .map(|saved| (spr_rel, saved.tile_count))
                 .map_err(|e| e.to_string())
-            })
+                .and_then(|state| {
+                    let spr_rel = format!("{dest_stem}.spr");
+                    io::save_sprite(
+                        &dest_root,
+                        &spr_rel,
+                        &state,
+                        &til_rel,
+                        &format!("{dest_stem}.pal"),
+                    )
+                    .map(|saved| (spr_rel, saved.tile_count))
+                    .map_err(|e| e.to_string())
+                })
         } else {
             match open.wizard.preview.as_ref() {
                 Some(preview) => {
@@ -1438,8 +1434,10 @@ impl ImportPanel {
     /// The tileset panel's "Re-import…": load the recorded source for
     /// `til_rel`, then apply the record and target that tileset once the
     /// load lands.
+    /// The caller runs inside a `Workspace` update and has already handed
+    /// the root over ([`Self::adopt_root`]) -- refreshing here would read
+    /// the leased workspace and panic.
     fn reimport_tileset(&mut self, til_rel: &str, cx: &mut Context<Self>) {
-        self.refresh_root(cx);
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
@@ -1545,17 +1543,12 @@ impl ImportPanel {
             .items_center()
             .gap_1()
             .child(Label::new(message).color(Color::Muted))
-            .when(
-                !matches!(self.state, ViewerState::Loading { .. }),
-                |el| {
-                    el.child(
-                        Button::new("ggo-import-pick", "Choose PNG…")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.pick_source(window, cx)
-                            })),
-                    )
-                },
-            )
+            .when(!matches!(self.state, ViewerState::Loading { .. }), |el| {
+                el.child(
+                    Button::new("ggo-import-pick", "Choose PNG…")
+                        .on_click(cx.listener(|this, _, window, cx| this.pick_source(window, cx))),
+                )
+            })
             .children(self.import_summary().map(|summary| {
                 Label::new(summary)
                     .size(LabelSize::XSmall)
@@ -1607,9 +1600,9 @@ impl ImportPanel {
                         IconButton::new("ggo-import-pick-other", IconName::FolderOpen)
                             .icon_size(IconSize::XSmall)
                             .tooltip(Tooltip::text("Choose another PNG…"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.pick_source(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.pick_source(window, cx)),
+                            ),
                     )
                     .child(
                         Button::new("ggo-import-clear-crop", "Clear crop")
@@ -1731,7 +1724,8 @@ impl ImportPanel {
             (Some(image), Some(preview)) => div()
                 .p_1()
                 .child(
-                    img(image.clone()).nearest(true)
+                    img(image.clone())
+                        .nearest(true)
                         .w(px(preview.w as f32))
                         .h(px(preview.h as f32)),
                 )
@@ -1791,7 +1785,11 @@ impl ImportPanel {
                         "{slot}: #{:04X}{}{}",
                         palette[slot],
                         if a == 0 { " (transparent)" } else { "" },
-                        if editable { " — click, then click another to swap" } else { "" }
+                        if editable {
+                            " — click, then click another to swap"
+                        } else {
+                            ""
+                        }
                     )))
                     .when(editable, |el| {
                         el.on_click(cx.listener(move |this, _, _, cx| this.palette_click(slot, cx)))
@@ -2134,9 +2132,9 @@ impl Render for ImportPanel {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Import, window, cx| this.import_impl(window, cx)))
             .on_action(cx.listener(|this, _: &ClearCrop, _window, cx| this.clear_crop(cx)))
-            .on_action(cx.listener(|this, _: &ChooseSource, window, cx| {
-                this.pick_source(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ChooseSource, window, cx| this.pick_source(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.step_zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.step_zoom(-1, cx)))
             .on_action(cx.listener(|this, _: &Reimport, _window, cx| this.reimport_impl(cx)))
@@ -2408,12 +2406,22 @@ mod tests {
         let second = workspace.update_in(cx, |workspace, window, cx| {
             open_import_item(workspace, window, cx, |_, _, _| {})
         });
-        assert_eq!(first.entity_id(), second.entity_id(), "one wizard, re-focused");
+        assert_eq!(
+            first.entity_id(),
+            second.entity_id(),
+            "one wizard, re-focused"
+        );
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(workspace.items_of_type::<ImportItem>(cx).count(), 1);
             let item = workspace.items_of_type::<ImportItem>(cx).next().unwrap();
-            assert_eq!(workspace::item::Item::tab_content_text(item.read(cx), 0, cx).as_ref(), "Import");
-            assert!(!workspace::item::Item::is_dirty(item.read(cx), cx), "never dirty");
+            assert_eq!(
+                workspace::item::Item::tab_content_text(item.read(cx), 0, cx).as_ref(),
+                "Import"
+            );
+            assert!(
+                !workspace::item::Item::is_dirty(item.read(cx), cx),
+                "never dirty"
+            );
         });
     }
 
@@ -3195,7 +3203,11 @@ mod tests {
             panel.zoom_at_cursor(-1, local, cx);
             assert_eq!(ready(panel).zoom, 2);
             assert_eq!(ready(panel).image_coord_at(cursor_window), before);
-            assert_eq!(ready(panel).pan, [7.0, -3.0], "a round trip restores the pan");
+            assert_eq!(
+                ready(panel).pan,
+                [7.0, -3.0],
+                "a round trip restores the pan"
+            );
 
             // At the top of the ladder the zoom clamps AND the pan stays.
             set_camera(panel, geom::MAX_ZOOM, [7.0, -3.0]);
@@ -3688,7 +3700,10 @@ mod tests {
         assert!(claimed);
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert!(matches!(panel.state, ViewerState::Ready(_)), "the first drop opened");
+            assert!(
+                matches!(panel.state, ViewerState::Ready(_)),
+                "the first drop opened"
+            );
             assert!(panel.status.as_deref().unwrap_or("").contains("1 more"));
         });
 
@@ -3723,7 +3738,12 @@ mod tests {
         panel.update_in(cx, |panel, window, cx| {
             window.focus(&panel.focus_handle, cx);
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.wizard.commit_region(Some(Region { x: 0, y: 0, w: 2, h: 2 }));
+                open.wizard.commit_region(Some(Region {
+                    x: 0,
+                    y: 0,
+                    w: 2,
+                    h: 2,
+                }));
                 open.zoom = 3;
             }
         });
@@ -3745,7 +3765,12 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.wizard.commit_region(Some(Region { x: 0, y: 0, w: 16, h: 16 }));
+                open.wizard.commit_region(Some(Region {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 16,
+                }));
                 open.wizard.set_reserve_transparent(true);
                 open.frame_cut = (Some(8), None);
             }
@@ -3769,7 +3794,15 @@ mod tests {
             assert_eq!(ready(panel).wizard.region, None, "a plain open has no crop");
             panel.reimport_impl(cx);
             let open = ready(panel);
-            assert_eq!(open.wizard.region, Some(Region { x: 0, y: 0, w: 16, h: 16 }));
+            assert_eq!(
+                open.wizard.region,
+                Some(Region {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 16
+                })
+            );
             assert!(open.wizard.reserve_transparent);
             assert_eq!(open.frame_cut, (Some(8), None));
         });
@@ -3777,7 +3810,12 @@ mod tests {
         // The tileset panel's route: load by `.til`, land with the record
         // applied and the destination pointed back at it.
         let other = new_panel(cx, dir.path());
-        other.update(cx, |panel, cx| panel.reimport_tileset("assets/art/hero.til", cx));
+        other.update(cx, |panel, cx| {
+            // The workspace action hands the root over (`adopt_root`); a
+            // direct call resolves it the panel's own way.
+            panel.refresh_root(cx);
+            panel.reimport_tileset("assets/art/hero.til", cx);
+        });
         cx.executor().run_until_parked();
         other.read_with(cx, |panel, _| {
             let open = ready(panel);
@@ -3818,7 +3856,11 @@ mod tests {
             assert_eq!(imported.asset_rel, "art/walk.spr");
         });
         let opened = io::open_sprite(&assets, "art/walk.spr").expect("spr round-trips");
-        assert_eq!(opened.state.frames.len(), 3, "one sprite frame per source frame");
+        assert_eq!(
+            opened.state.frames.len(),
+            3,
+            "one sprite frame per source frame"
+        );
         assert_eq!((opened.state.w_tiles, opened.state.h_tiles), (2, 1));
     }
 
@@ -3833,7 +3875,10 @@ mod tests {
             panel.commit(cx).expect("baseline commit");
         });
         let baseline = read_pal();
-        assert_ne!(baseline[1], baseline[2], "the fixture quantizes to two colours");
+        assert_ne!(
+            baseline[1], baseline[2],
+            "the fixture quantizes to two colours"
+        );
 
         panel.update(cx, |panel, cx| {
             panel.palette_click(1, cx);
@@ -3849,13 +3894,21 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.palette_click(2, cx);
             panel.palette_move(-1, cx);
-            assert_eq!(ready(panel).swatch_pick, Some(1), "the pick follows the move");
+            assert_eq!(
+                ready(panel).swatch_pick,
+                Some(1),
+                "the pick follows the move"
+            );
             panel.palette_reset(cx);
             assert_eq!(ready(panel).swatch_pick, None);
             panel.commit(cx).expect("commit after reset");
             panel.set_as_sprite(true, cx);
             panel.palette_click(3, cx);
-            assert_eq!(ready(panel).swatch_pick, None, "sprite mode ignores palette clicks");
+            assert_eq!(
+                ready(panel).swatch_pick,
+                None,
+                "sprite mode ignores palette clicks"
+            );
         });
         assert_eq!(read_pal(), baseline, "reset re-quantized");
     }
@@ -3866,15 +3919,25 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.wizard.commit_region(Some(Region { x: 0, y: 0, w: 8, h: 8 }));
+                open.wizard.commit_region(Some(Region {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 8,
+                }));
             }
             panel.commit(cx).expect("commit");
         });
         std::fs::remove_file(dir.path().join("assets/art/hero.png")).unwrap();
-        panel.update(cx, |panel, cx| panel.reimport_tileset("assets/art/hero.til", cx));
+        panel.update(cx, |panel, cx| {
+            panel.reimport_tileset("assets/art/hero.til", cx)
+        });
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert!(matches!(panel.state, ViewerState::Error(_)), "the source is gone");
+            assert!(
+                matches!(panel.state, ViewerState::Error(_)),
+                "the source is gone"
+            );
             assert!(panel.pending_record.is_none(), "not left for the next load");
         });
         panel.update(cx, |panel, cx| panel.load_source("art/outside.png", cx));
@@ -3907,7 +3970,9 @@ mod tests {
         cx.run_until_parked();
         // The fields are created on the first render; make them and focus the stem editor.
         panel.update_in(cx, |panel, window, cx| panel.ensure_fields(window, cx));
-        let stem = panel.read_with(cx, |panel, _| ready(panel).fields.as_ref().unwrap().stem.clone());
+        let stem = panel.read_with(cx, |panel, _| {
+            ready(panel).fields.as_ref().unwrap().stem.clone()
+        });
         stem.update_in(cx, |editor, window, cx| {
             window.focus(&editor.focus_handle(cx), cx);
             editor.set_text("t", window, cx);
@@ -3916,7 +3981,77 @@ mod tests {
         let zoom_before = panel.read_with(cx, |panel, _| ready(panel).zoom);
         cx.simulate_keystrokes("-");
         cx.run_until_parked();
-        assert_eq!(stem.read_with(cx, |editor, cx| editor.text(cx)), "t-", "typed, not zoomed");
-        assert_eq!(panel.read_with(cx, |panel, _| ready(panel).zoom), zoom_before);
+        assert_eq!(
+            stem.read_with(cx, |editor, cx| editor.text(cx)),
+            "t-",
+            "typed, not zoomed"
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, _| ready(panel).zoom),
+            zoom_before
+        );
+    }
+
+    /// The tileset panel's "Re-import…" arrives as a workspace action, so
+    /// the handler runs with the `Workspace` LEASED: anything it calls
+    /// that reads the workspace back panics. Driven here through the real
+    /// action, on a panel with no `root_override`, which is what makes
+    /// that reachable.
+    #[gpui::test]
+    async fn test_the_reimport_action_opens_the_tab_without_reading_the_leased_workspace(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = routed_workspace(cx, dir.path()).await;
+        // Commit an import so `assets/art/hero.til` carries a record.
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.commit(cx).expect("commit succeeds");
+        });
+
+        // A FRESH tab's panel has no root override, so `refresh_root`
+        // would read the leased workspace.
+        workspace.update_in(cx, |workspace, window, cx| {
+            for item in workspace
+                .items_of_type::<ImportItem>(cx)
+                .collect::<Vec<_>>()
+            {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.remove_item(item.entity_id(), false, true, window, cx);
+                });
+            }
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(ggo_common::ReimportTileset {
+                    til_rel: "assets/art/hero.til".to_string(),
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let item = workspace
+                .items_of_type::<ImportItem>(cx)
+                .next()
+                .expect("the action opened the import tab");
+            let panel = item.read(cx).panel().read(cx);
+            assert!(
+                panel.project_root.is_some(),
+                "the handler handed the root over"
+            );
+            assert!(
+                matches!(
+                    panel.state,
+                    ViewerState::Ready(_) | ViewerState::Loading { .. }
+                ),
+                "the recorded source is loading"
+            );
+        });
     }
 }

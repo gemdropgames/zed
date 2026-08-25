@@ -25,7 +25,6 @@ ggo_common.workspace = true # GGO -- shared `default_db_path` + the child-proces
 ggo_world_panel.workspace = true # GGO -- S4's "Emulate this world" saves that panel's doc and reuses its world-path rule
 gpui.workspace = true
 image.workspace = true
-keymap_editor.workspace = true
 log.workspace = true # GGO -- R6: the cpal stream-error callback runs on a realtime audio thread, so it reports rather than panics
 project.workspace = true
 serde_json.workspace = true

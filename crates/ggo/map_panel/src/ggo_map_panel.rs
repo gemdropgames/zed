@@ -47,10 +47,10 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity,
-    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent,
-    Styled, Task, WeakEntity, Window, actions, bounds, div, fill, outline, point, px, size,
+    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, FocusHandle, Focusable, Hsla,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, RenderImage, ScrollWheelEvent, Styled, Task, WeakEntity, Window, actions, bounds, div,
+    fill, outline, point, px, size,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -88,11 +88,9 @@ actions!(
     ]
 );
 
-
 /// The panel's key-dispatch context (`.key_context`), which the
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoMapPanel";
-
 
 /// The tileset strip's height. Two rows of 16px tiles at
 /// [`geom::STRIP_ZOOM`] plus room to scroll a taller sheet.
@@ -112,7 +110,6 @@ const ASSETS_DIR: &str = "assets";
 const EMPTY_MESSAGE: &str = "Open a .map file from the project panel";
 
 pub fn init(cx: &mut App) {
-
     // Explorer-driven routing: clicking a `.map` in the project panel loads
     // it HERE instead of opening a (binary, unreadable) editor tab. This is
     // the panel's only way in -- there is no in-panel file picker.
@@ -175,7 +172,6 @@ fn create_blank_map(project_root: &Path, source_rel: &str) -> Option<()> {
     }
     Some(())
 }
-
 
 /// Does `path` name a map? The one rule, shared by the open interceptor and
 /// (indirectly) by everything else that asks.
@@ -808,6 +804,9 @@ impl MapPanel {
         }));
     }
 
+    /// Only the tests reach this now: the "New Map…" commit writes the
+    /// file and opens its tab directly (`open_map_item`).
+    #[cfg(test)]
     /// Create a blank `.map` in the worktree-relative directory `dir_rel`
     /// and open it -- the body of the project panel's "New Map…" entry.
     ///
@@ -1030,7 +1029,11 @@ impl MapPanel {
     /// Drives both the close guard and (indirectly) the title's dirty dot.
     /// The dirty guard a tab close (or a map switch) runs: prompt, save
     /// on request, and answer whether to proceed.
-    pub(crate) fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+    pub(crate) fn prepare_to_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
         ggo_common::prepare_to_close_dirty(self.dirty_map_name(), window, cx, Self::save_for_close)
     }
 
@@ -1094,7 +1097,10 @@ impl MapPanel {
         til_rel: &str,
     ) -> (
         Result<loader::Tileset, String>,
-        (ggo_worldlib::sprites::tileset_meta::TilesetMeta, Option<String>),
+        (
+            ggo_worldlib::sprites::tileset_meta::TilesetMeta,
+            Option<String>,
+        ),
     ) {
         let (meta, meta_rel) = match project_root {
             Some(project_root) => (
@@ -1109,7 +1115,10 @@ impl MapPanel {
 
     fn adopt_tileset_meta(
         open: &mut OpenMap,
-        (meta, meta_rel): (ggo_worldlib::sprites::tileset_meta::TilesetMeta, Option<String>),
+        (meta, meta_rel): (
+            ggo_worldlib::sprites::tileset_meta::TilesetMeta,
+            Option<String>,
+        ),
     ) {
         open.terrains = meta.terrains;
         open.til_meta_rel = meta_rel;
@@ -1285,7 +1294,9 @@ impl MapPanel {
     }
 
     fn paste_impl(&mut self, cx: &mut Context<Self>) {
-        let Some(stamp) = self.clipboard.clone() else { return };
+        let Some(stamp) = self.clipboard.clone() else {
+            return;
+        };
         let Some(open) = self.ready_map() else { return };
         if open.tileset.is_none() {
             return;
@@ -1353,7 +1364,10 @@ impl MapPanel {
         if let ViewerState::Ready(open) = &mut self.state
             && open.tileset.is_some()
         {
-            open.terrains.push(Terrain { name, tiles: vec![] });
+            open.terrains.push(Terrain {
+                name,
+                tiles: vec![],
+            });
             open.terrain = Some(open.terrains.len() - 1);
         }
         self.save_terrains(cx);
@@ -1428,7 +1442,9 @@ impl MapPanel {
 
     /// The terrain editor, shown while the Terrain tool is active.
     fn render_terrains(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let open = self.ready_map().filter(|open| open.tool == MapTool::Terrain)?;
+        let open = self
+            .ready_map()
+            .filter(|open| open.tool == MapTool::Terrain)?;
         let selected = open.terrain.and_then(|i| open.terrains.get(i));
         let anchor = Self::anchor_tile(open);
         let mask = open.mask_draft;
@@ -1443,9 +1459,17 @@ impl MapPanel {
         });
         // Rows of the 3x3 neighbour pad; the centre is the anchor tile.
         let pad = [
-            [Some(terrain::NORTH_WEST), Some(terrain::NORTH), Some(terrain::NORTH_EAST)],
+            [
+                Some(terrain::NORTH_WEST),
+                Some(terrain::NORTH),
+                Some(terrain::NORTH_EAST),
+            ],
             [Some(terrain::WEST), None, Some(terrain::EAST)],
-            [Some(terrain::SOUTH_WEST), Some(terrain::SOUTH), Some(terrain::SOUTH_EAST)],
+            [
+                Some(terrain::SOUTH_WEST),
+                Some(terrain::SOUTH),
+                Some(terrain::SOUTH_EAST),
+            ],
         ];
         Some(
             v_flex()
@@ -1482,9 +1506,9 @@ impl MapPanel {
                         .children(open.terrains.iter().enumerate().map(|(i, t)| {
                             Button::new(("ggo-map-terrain", i), t.name.clone())
                                 .toggle_state(open.terrain == Some(i))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_terrain(i, cx)
-                                }))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.select_terrain(i, cx)),
+                                )
                         })),
                 )
                 .child(
@@ -1552,9 +1576,11 @@ impl MapPanel {
                                             IconName::Close,
                                         )
                                         .icon_size(IconSize::XSmall)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.unassign_tile(tile, cx)
-                                        })),
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.unassign_tile(tile, cx)
+                                            }),
+                                        ),
                                     )
                             }),
                         )),
@@ -1785,7 +1811,8 @@ impl MapPanel {
                     move |value, _window, cx| {
                         let span = (geom::PAL_SUB_MAX - geom::PAL_SUB_MIN) as f32;
                         let pal_sub = geom::PAL_SUB_MIN + (value * span).round() as u16;
-                        weak.update(cx, |this, cx| this.set_pal_sub(pal_sub, cx)).ok();
+                        weak.update(cx, |this, cx| this.set_pal_sub(pal_sub, cx))
+                            .ok();
                     }
                 }),
             )
@@ -1942,7 +1969,10 @@ impl MapPanel {
                 }
                 // A flood fill is a click, not a drag: refilling per move
                 // would stack one undo entry per region crossed.
-                if this.ready_map().is_some_and(|open| open.tool == MapTool::Fill) {
+                if this
+                    .ready_map()
+                    .is_some_and(|open| open.tool == MapTool::Fill)
+                {
                     return;
                 }
                 let Some(cell) = cell else { return };
@@ -2235,8 +2265,11 @@ impl MapPanel {
                     .on_click(cx.listener(|this, _, window, cx| this.resize_impl(window, cx))),
             )
             .children(open.save_error.as_ref().map(|e| {
-                ggo_common::CopyableText::new("ggo-map-save-error-copy", format!("save failed: {e}"))
-                    .size(LabelSize::Small)
+                ggo_common::CopyableText::new(
+                    "ggo-map-save-error-copy",
+                    format!("save failed: {e}"),
+                )
+                .size(LabelSize::Small)
             }))
             .children(open.tileset_error.as_ref().map(|e| {
                 ggo_common::CopyableText::new("ggo-map-tileset-error-copy", e.clone())
@@ -2429,7 +2462,15 @@ fn paint_strip(scene: &StripScene, canvas: Bounds<Pixels>, window: &mut Window) 
     window.with_content_mask(Some(ContentMask { bounds: canvas }), |window| {
         window.paint_quad(fill(canvas, scene.background));
         if let Some(image) = &scene.image {
-            let _ = window.paint_image(canvas, canvas, Corners::default(), image.clone(), 0, false, true);
+            let _ = window.paint_image(
+                canvas,
+                canvas,
+                Corners::default(),
+                image.clone(),
+                0,
+                false,
+                true,
+            );
         }
         let (c0, r0, c1, r1) = scene.sel;
         let r = cell_rect(canvas, [0.0, 0.0], geom::STRIP_ZOOM, c0, r0, c1, r1);
@@ -2462,12 +2503,14 @@ impl Render for MapPanel {
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
             .on_action(cx.listener(|this, _: &Copy, _window, cx| this.copy_impl(cx)))
             .on_action(cx.listener(|this, _: &Paste, _window, cx| this.paste_impl(cx)))
-            .on_action(cx.listener(|this, _: &DeleteSelection, _window, cx| {
-                this.delete_selection_impl(cx)
-            }))
-            .on_action(cx.listener(|this, _: &ClearSelection, _window, cx| {
-                this.clear_selection_impl(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &DeleteSelection, _window, cx| {
+                    this.delete_selection_impl(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ClearSelection, _window, cx| this.clear_selection_impl(cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &ApplyResize, window, cx| this.resize_impl(window, cx)),
             )
@@ -2665,11 +2708,20 @@ mod tests {
     /// clicked dir joined in.
     #[test]
     fn map_rel_applies_the_stem_rules() {
-        assert_eq!(map_rel("assets/maps", "level"), Ok("assets/maps/level.map".to_string()));
-        assert_eq!(map_rel("assets/maps", "level.map"), Ok("assets/maps/level.map".to_string()));
+        assert_eq!(
+            map_rel("assets/maps", "level"),
+            Ok("assets/maps/level.map".to_string())
+        );
+        assert_eq!(
+            map_rel("assets/maps", "level.map"),
+            Ok("assets/maps/level.map".to_string())
+        );
         assert_eq!(map_rel("", "level"), Ok("level.map".to_string()));
         for bad in &["", "  ", "a/b", "a\\b", ".", "..", ".map"] {
-            assert!(map_rel("assets/maps", bad).is_err(), "{bad:?} must be refused");
+            assert!(
+                map_rel("assets/maps", bad).is_err(),
+                "{bad:?} must be refused"
+            );
         }
     }
 
@@ -2695,7 +2747,6 @@ mod tests {
         init(cx);
         ggo_common::bind_default_keymap(cx);
     }
-
 
     // --------------------------------------------------------------- load
 
@@ -3474,11 +3525,18 @@ mod tests {
             pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
         });
         cx.run_until_parked();
-        assert!(cx.has_pending_prompt(), "a dirty map tab prompts before closing");
+        assert!(
+            cx.has_pending_prompt(),
+            "a dirty map tab prompts before closing"
+        );
         cx.simulate_prompt_answer("Cancel");
         close.await.unwrap();
         workspace.read_with(cx, |workspace, cx| {
-            assert_eq!(workspace.items_of_type::<MapEditorItem>(cx).count(), 1, "still open");
+            assert_eq!(
+                workspace.items_of_type::<MapEditorItem>(cx).count(),
+                1,
+                "still open"
+            );
         });
         panel.read_with(cx, |panel, _| assert!(panel.dirty(), "and still dirty"));
     }
@@ -3872,7 +3930,10 @@ mod tests {
         });
         cx.run_until_parked();
 
-        assert!(assets.join("maps/arena.map").is_file(), "the file must exist");
+        assert!(
+            assets.join("maps/arena.map").is_file(),
+            "the file must exist"
+        );
         // The new map opens in its OWN tab, not the fixture's.
         let panel = workspace.read_with(cx, |workspace, cx| {
             workspace
@@ -4057,7 +4118,10 @@ mod tests {
             panel.strip_primary_down(point(px(1.), px(1.)), cx);
             panel.strip_drag_move(&move_event(65., 1., None), cx);
             let open = ready(panel);
-            assert!(!open.pal_dragging, "a move without the button ends the drag");
+            assert!(
+                !open.pal_dragging,
+                "a move without the button ends the drag"
+            );
             assert_eq!(open.pal_far, (0, 0), "without extending the selection");
         });
     }
@@ -4096,7 +4160,10 @@ mod tests {
             );
             {
                 let open = ready(panel);
-                assert!(open.pan_drag.is_none(), "release elsewhere cancels the drag");
+                assert!(
+                    open.pan_drag.is_none(),
+                    "release elsewhere cancels the drag"
+                );
                 assert_eq!(open.pan, [25.0, 20.0], "without moving the pan again");
             }
 
@@ -4111,9 +4178,7 @@ mod tests {
     /// keeps the map pixel under the cursor fixed ([`geom::zoom_at`]), and
     /// the ladder ends are no-ops for both zoom and pan.
     #[gpui::test]
-    async fn test_zoom_at_cursor_steps_the_ladder_and_no_ops_at_the_ends(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_zoom_at_cursor_steps_the_ladder_and_no_ops_at_the_ends(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
@@ -4127,7 +4192,12 @@ mod tests {
                 assert_eq!(open.zoom, geom::DEFAULT_ZOOM + 1);
                 assert_eq!(
                     open.pan,
-                    geom::zoom_at([8.0, 4.0], geom::DEFAULT_ZOOM, [40.0, 20.0], geom::DEFAULT_ZOOM + 1),
+                    geom::zoom_at(
+                        [8.0, 4.0],
+                        geom::DEFAULT_ZOOM,
+                        [40.0, 20.0],
+                        geom::DEFAULT_ZOOM + 1
+                    ),
                     "the pan is the cursor-anchored adjustment"
                 );
             }
@@ -4330,13 +4400,21 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.bind_tileset("tiles/wide.til".to_string(), cx);
             let open = ready(panel);
-            assert_eq!(open.tileset.as_ref().unwrap().cols, 3, "cols come from the sidecar");
+            assert_eq!(
+                open.tileset.as_ref().unwrap().cols,
+                3,
+                "cols come from the sidecar"
+            );
             assert_eq!(open.terrains[0].name, "grass");
             assert_eq!(open.til_meta_rel.as_deref(), Some("assets/tiles/wide.til"));
             // Undoing the bind returns to world.til, which has no sidecar.
             panel.undo_impl(cx);
             let open = ready(panel);
-            assert_eq!(open.tileset.as_ref().unwrap().cols, FIXTURE_TILES, "back to the default layout");
+            assert_eq!(
+                open.tileset.as_ref().unwrap().cols,
+                FIXTURE_TILES,
+                "back to the default layout"
+            );
             assert!(open.terrains.is_empty());
         });
     }
@@ -4376,9 +4454,17 @@ mod tests {
             panel.paint_at((1, 0), cx);
             panel.end_paint(cx);
             panel.undo_impl(cx);
-            assert_eq!(cells(panel), blank_cells(), "one undo reverts the whole drag");
+            assert_eq!(
+                cells(panel),
+                blank_cells(),
+                "one undo reverts the whole drag"
+            );
             panel.undo_impl(cx);
-            assert_eq!(cells(panel), blank_cells(), "a second undo has nothing to revert");
+            assert_eq!(
+                cells(panel),
+                blank_cells(),
+                "a second undo has nothing to revert"
+            );
         });
     }
 
@@ -4394,7 +4480,11 @@ mod tests {
             panel.paint_at((2, 2), cx);
             panel.paint_at((1, 1), cx);
             panel.end_paint(cx);
-            assert_eq!(ready(panel).selection, Some((1, 1, 2, 2)), "normalized on release");
+            assert_eq!(
+                ready(panel).selection,
+                Some((1, 1, 2, 2)),
+                "normalized on release"
+            );
 
             panel.copy_impl(cx);
             let stamp = panel.clipboard.as_ref().unwrap();
@@ -4409,7 +4499,11 @@ mod tests {
             let cells_now = cells(panel);
             assert_eq!(cells_now[at(2, 0)], tile0);
             assert_eq!(cells_now[at(3, 1)], CELL_BLANK);
-            assert_eq!(ready(panel).selection, Some((2, 0, 3, 1)), "selection follows the paste");
+            assert_eq!(
+                ready(panel).selection,
+                Some((2, 0, 3, 1)),
+                "selection follows the paste"
+            );
 
             panel.delete_selection_impl(cx);
             assert_eq!(cells(panel)[at(2, 0)], CELL_BLANK);
