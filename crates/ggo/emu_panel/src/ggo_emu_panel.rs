@@ -486,20 +486,32 @@ pub struct EmuPanel {
     watch_window: Option<AnyWindowHandle>,
     _watch_subscription: Option<Subscription>,
     _watch_debounce: Option<Task<()>>,
+    /// An `emd pack-ggo` is in flight: a second one would race it on the
+    /// same output file, so saves meanwhile queue one rebuild instead.
+    building: bool,
+    /// The in-flight build was the user's own "Emulate this world" (whose
+    /// save produces events); changes seen during it are not queued.
+    build_is_explicit: bool,
+    pending_rebuild: bool,
+    /// The next `emulate_world` is a watch restart: keep the pad, skip the
+    /// report hop, count it.
+    watch_restart_pending: bool,
 }
 
 /// How long after the last change the re-pack waits, so a save that
 /// writes several files (a `.til`/`.pal` pair, a sprite trio) packs once.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Does a changed worktree-relative path warrant a re-pack? The pack's
-/// own output and the editor sidecars never do (the former would loop).
+/// Does a changed worktree-relative path warrant a re-pack? Build output
+/// (any `target/` -- the pack writes under the emerald project's, which
+/// need not be the worktree root) and editor sidecars never do: the
+/// former would loop.
 fn watch_triggers(rel: &str, change: &project::PathChange) -> bool {
-    if matches!(change, project::PathChange::Removed | project::PathChange::Loaded) {
+    if matches!(change, project::PathChange::Loaded) {
         return false;
     }
-    let rel = rel.trim_start_matches('/');
-    !(rel.starts_with(menu::PACK_OUT_DIR) || rel.starts_with(".ggo-ide"))
+    !rel.split('/')
+        .any(|component| component == "target" || component == ".ggo-ide")
 }
 
 impl EmuPanel {
@@ -572,10 +584,22 @@ impl EmuPanel {
             watch_window: None,
             _watch_subscription: None,
             _watch_debounce: None,
+            building: false,
+            build_is_explicit: false,
+            pending_rebuild: false,
+            watch_restart_pending: false,
         }
     }
 
     // --------------------------------------------------------------- watch
+
+    /// A plain cart replaced the world: nothing left to re-pack.
+    fn forget_watched_world(&mut self) {
+        self.watch = false;
+        self.watched_world = None;
+        self._watch_debounce = None;
+        self.pending_rebuild = false;
+    }
 
     /// Turn watch mode on/off. On requires a world to have been emulated
     /// (a bare cart has nothing to re-pack).
@@ -585,6 +609,9 @@ impl EmuPanel {
         }
         self.watch = on;
         self.watch_window = on.then(|| window.window_handle());
+        self.watch_rebuilds = 0;
+        self.pending_rebuild = false;
+        self.watch_restart_pending = false;
         if !on {
             self._watch_debounce = None;
         }
@@ -627,9 +654,18 @@ impl EmuPanel {
         let relevant = changes
             .iter()
             .any(|(path, _, change)| watch_triggers(path.as_unix_str(), change));
-        if relevant {
-            self.schedule_watch_rebuild(cx);
+        if !relevant {
+            return;
         }
+        if self.building {
+            // Queue behind the running pack -- unless that pack is the
+            // user's own Emulate, whose save is what we are seeing.
+            if !self.build_is_explicit {
+                self.pending_rebuild = true;
+            }
+            return;
+        }
+        self.schedule_watch_rebuild(cx);
     }
 
     /// (Re)start the debounce; the rebuild runs when it lapses.
@@ -637,18 +673,38 @@ impl EmuPanel {
         let (Some(world), Some(window)) = (self.watched_world.clone(), self.watch_window) else {
             return;
         };
+        let workspace = self.workspace.clone();
         self._watch_debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(WATCH_DEBOUNCE).await;
             window
                 .update(cx, |_, window, cx| {
-                    this.update(cx, |this, cx| {
-                        if !this.watch {
-                            return;
-                        }
-                        this.watch_rebuilds += 1;
-                        this.emulate_world(&world, window, cx);
-                    })
-                    .ok();
+                    let go = this
+                        .update(cx, |this, _| {
+                            if !this.watch {
+                                return false;
+                            }
+                            if this.building {
+                                this.pending_rebuild = true;
+                                return false;
+                            }
+                            // A restart is not a finished run: no report
+                            // hop (it would steal focus and drop the pad).
+                            this.charts_for_run = None;
+                            this.watch_restart_pending = true;
+                            this.watch_rebuilds += 1;
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !go {
+                        return;
+                    }
+                    // Through the registered emulator, so a dirty world
+                    // panel is saved first -- what an explicit Emulate does.
+                    if let Some(workspace) = workspace.as_ref().and_then(|w| w.upgrade()) {
+                        workspace.update(cx, |workspace, cx| {
+                            ggo_common::emulate_world(workspace, &world, window, cx);
+                        });
+                    }
                 })
                 .ok();
         }));
@@ -707,6 +763,7 @@ impl EmuPanel {
         // Switching carts: end the current run the normal way, so its perf
         // data still lands in the database.
         self.stop(window, cx);
+        self.forget_watched_world();
         self.selected = Some(rel.to_string());
         // The previous cart's counters would otherwise sit under the newly
         // selected one's name.
@@ -837,7 +894,9 @@ impl EmuPanel {
         // row, which is also why bumping `run_generation` here would be
         // the wrong fix (it would discard a legitimate ingest).
         let owns_status = self.build_generation;
-        self.input.clear();
+        if !self.watch_restart_pending {
+            self.input.clear();
+        }
         self.ingest_status = IngestStatus::Uploading;
         cx.notify();
 
@@ -961,7 +1020,16 @@ impl EmuPanel {
     /// the world -- is deferred onto the spawned task, exactly as
     /// [`Self::open_rel_path`] defers it for the interceptor.
     pub fn emulate_world(&mut self, world_rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let restart = self.watch_restart_pending;
+        // `stop` reads the flag (a restart keeps the pad); clear it after.
         self.stop(window, cx);
+        self.watch_restart_pending = false;
+        if !restart {
+            self.watch_rebuilds = 0;
+            self._watch_debounce = None;
+        }
+        self.building = true;
+        self.build_is_explicit = !restart;
         self.watched_world = Some(world_rel.to_string());
         self.build_generation += 1;
         let generation = self.build_generation;
@@ -979,6 +1047,7 @@ impl EmuPanel {
                 .ok()
                 .flatten();
             let Some((request, runner, cart)) = prepared else {
+                this.update(cx, |this, cx| this.build_done(generation, cx)).ok();
                 return;
             };
             let capture = cx.background_spawn(async move { runner(request) }).await;
@@ -986,6 +1055,7 @@ impl EmuPanel {
                 if this.build_generation != generation {
                     return;
                 }
+                this.build_done(generation, cx);
                 if !capture.ok {
                     this.report_failure(
                         format!("build failed: {}", menu::failure_reason(&capture)),
@@ -1008,6 +1078,18 @@ impl EmuPanel {
     /// on the status row why there isn't one. Runs on the UI thread, where
     /// a problem can still be shown, and hands the background task
     /// everything it needs by value.
+    /// The build for `generation` ended (either way): release the
+    /// in-flight flag and run any rebuild that queued behind it.
+    fn build_done(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.build_generation != generation {
+            return;
+        }
+        self.building = false;
+        if std::mem::take(&mut self.pending_rebuild) && self.watch {
+            self.schedule_watch_rebuild(cx);
+        }
+    }
+
     fn prepare_world_build(
         &mut self,
         world_rel: &str,
@@ -1063,6 +1145,7 @@ impl EmuPanel {
         // that run must not be the one that gets the hop.
         self.stop(window, cx);
         if self.selected.as_deref() != Some(rel) {
+            self.forget_watched_world();
             self.selected = Some(rel.to_string());
             self.frame = 0;
             self.stats = RunStats::default();
@@ -5288,8 +5371,11 @@ mod tests {
         assert!(watch_triggers("assets/tiles/a.til", &PathChange::Updated));
         assert!(watch_triggers("assets/worlds/main.toml", &PathChange::AddedOrUpdated));
         assert!(!watch_triggers("target/ggo-emulate/worlds-main.ggo", &PathChange::Added));
+        assert!(!watch_triggers("game/target/ggo-emulate/x.ggo", &PathChange::Added), "nested project");
+        assert!(!watch_triggers("target", &PathChange::Added), "the output dir itself");
         assert!(!watch_triggers(".ggo-ide/assets/tiles/a.til.editor.json", &PathChange::Updated));
-        assert!(!watch_triggers("assets/tiles/a.til", &PathChange::Removed));
+        assert!(watch_triggers("assets/tiles/a.til", &PathChange::Removed), "a deleted asset re-packs");
+        assert!(!watch_triggers("assets/tiles/a.til", &PathChange::Loaded), "the initial scan");
     }
 
     #[gpui::test]
@@ -5346,11 +5432,31 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(calls.lock().unwrap().len(), after_save, "no rebuild for the output");
 
+        // The debounce restarts on every change: two saves 200 ms apart
+        // rebuild once, after the second.
+        fake_fs.insert_file("/proj/assets/tiles/c.til", b"til".to_vec()).await;
+        cx.run_until_parked();
+        cx.executor().advance_clock(WATCH_DEBOUNCE * 2 / 3);
+        cx.run_until_parked();
+        fake_fs.insert_file("/proj/assets/tiles/d.til", b"til".to_vec()).await;
+        cx.run_until_parked();
+        cx.executor().advance_clock(WATCH_DEBOUNCE * 2 / 3);
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), after_save, "the second save re-armed the debounce");
+        cx.executor().advance_clock(WATCH_DEBOUNCE);
+        cx.run_until_parked();
+        let after_pair = calls.lock().unwrap().len();
+        assert_eq!(after_pair, after_save + 1, "one rebuild for the pair");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.watch_restart_pending, "the restart flag is consumed");
+            assert!(!panel.building);
+        });
+
         panel.update_in(cx, |panel, window, cx| panel.set_watch(false, window, cx));
         fake_fs.insert_file("/proj/assets/tiles/b.til", b"til".to_vec()).await;
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), after_save, "off means off");
+        assert_eq!(calls.lock().unwrap().len(), after_pair, "off means off");
     }
 }
