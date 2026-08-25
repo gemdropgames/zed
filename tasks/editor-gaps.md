@@ -113,20 +113,20 @@ Refs: Godot import dock, GB Studio assets folder.
 - [x] Palette surgery in the import preview: swap, move, sort, reset (tileset mode) (2026-08-25)
 - [x] Keybindings for the import wizard (2026-08-25)
 
-## 7. Pixel tools — `small each`
+## 7. Pixel tools — `done 2026-08-25`
 
 Tileset editor tools are Pencil / Eraser / Picker / Select
 (`tileset_panel/src/ggo_tileset_panel.rs:196`). Palette is 16 swatches +
 per-channel steppers (`palette_widget.rs`).
 Refs: Pixelorama, LibreSprite.
 
-- [ ] Bucket fill
-- [ ] Line, rect, ellipse tools
-- [ ] Brush size
-- [ ] Move / transform selection (the marquee exists; it can only copy/paste)
-- [ ] Mirror / symmetry painting
-- [ ] Delete row / column (only `InsertRow` / `InsertColumn` exist — `:706`, `:722`)
-- [ ] Magnified single-tile canvas (zoom currently magnifies the whole sheet)
+- [x] Bucket fill (floods the composed sheet across tiles) (2026-08-25)
+- [x] Line, rect, ellipse tools (shift = filled) (2026-08-25)
+- [x] Brush size 1–4 px (2026-08-25)
+- [x] Move (drag inside the marquee) + flip H/V (2026-08-25)
+- [x] Mirror painting, per-tile axes (2026-08-25)
+- [x] Delete row / column edge bars (`TilesetOp::DeleteRow/DeleteColumn`) (2026-08-25)
+- [x] Magnified single-tile canvas as a focus mode on the sheet (2026-08-25)
 - [ ] Palette: hex entry, ramps, sort, swap (model on the sprite panel's `PaletteRemap`)
 - [ ] Sprite preview: checker / black / white background picker + LCD scanline filter (`MIGRATION.md:128`)
 - [ ] Fix atlas leak in the sprite panel (`MIGRATION.md:571`)
