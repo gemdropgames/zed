@@ -103,8 +103,12 @@ use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, is_importable_source, join_dest_path,
     slice_to_tiles, source_rel_if_in_project, sprite_import, uniform_rects,
 };
+use ggo_worldlib::sprites::import::DecodedFrame;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::{PAL_SLOTS, slot_rgba};
+use ggo_worldlib::sprites::tileset_meta::{
+    ImportRecord, load_tileset_meta, save_tileset_meta, source_mtime,
+};
 
 actions!(
     ggo_import,
@@ -121,6 +125,8 @@ actions!(
         ZoomIn,
         /// Zooms the source canvas out.
         ZoomOut,
+        /// Replays the destination tileset's recorded import settings.
+        Reimport,
     ]
 );
 
@@ -189,6 +195,16 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ImportPanel>(window, cx);
         });
+        workspace.register_action(
+            |workspace, action: &ggo_common::ReimportTileset, window, cx| {
+                let Some(panel) = workspace.panel::<ImportPanel>(cx) else {
+                    return;
+                };
+                let til_rel = action.til_rel.clone();
+                panel.update(cx, |panel, cx| panel.reimport_tileset(&til_rel, cx));
+                workspace.focus_panel::<ImportPanel>(window, cx);
+            },
+        );
     })
     .detach();
 }
@@ -208,6 +224,8 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("=", ZoomIn, Some(KEY_CONTEXT)),
         KeyBinding::new("+", ZoomIn, Some(KEY_CONTEXT)),
         KeyBinding::new("-", ZoomOut, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-r", Reimport, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-r", Reimport, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -249,12 +267,14 @@ fn intercept_image_drop(
     true
 }
 
-/// Does `path` name a PNG? One rule, so the menu predicate and the tests
-/// agree.
+/// Does `path` name an importable source (PNG or Aseprite)? One rule, so
+/// the menu predicate and the tests agree.
 fn is_png_path(path: &ProjectPath) -> bool {
-    path.path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case(PNG_EXT))
+    path.path.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case(PNG_EXT)
+            || ext.eq_ignore_ascii_case("ase")
+            || ext.eq_ignore_ascii_case("aseprite")
+    })
 }
 
 /// `workspace::ContextMenuContributor` for a `.png` FILE: "Import as
@@ -398,6 +418,10 @@ fn parent_dir(rel: &str) -> String {
 
 /// A frame-size field's value: blank (or unparseable, or zero) means
 /// "default", i.e. the crop's own extent on that axis.
+fn dim_text(dim: Option<usize>) -> String {
+    dim.map(|d| d.to_string()).unwrap_or_default()
+}
+
 fn parse_frame_dim(text: &str) -> Option<usize> {
     text.trim().parse::<usize>().ok().filter(|&v| v > 0)
 }
@@ -535,6 +559,9 @@ struct OpenImport {
     pan_drag: Option<PanDrag>,
     /// True between the canvas's primary-down and its matching up.
     cropping: bool,
+    /// Every decoded frame; more than one only for an Aseprite source, in
+    /// which case a sprite import takes them as its frames.
+    frames: Vec<DecodedFrame>,
     /// "Import as sprite": also write a `.spr` whose frames are cut on the
     /// [`frame_rects`] grid. Off = plain tileset import.
     as_sprite: bool,
@@ -575,11 +602,41 @@ impl OpenImport {
             pan: [0.0, 0.0],
             pan_drag: None,
             cropping: false,
+            frames: loaded.frames,
             as_sprite: false,
             frame_cut: (None, None),
             canvas_bounds: Rc::new(RefCell::new(None)),
             fields: None,
         }
+    }
+
+    /// What this import would record: the source (project-relative when
+    /// inside the worktree), its mtime, and the wizard's settings.
+    fn import_record(&self, project_root: &Path) -> ImportRecord {
+        let source = self
+            .source_abs
+            .strip_prefix(project_root)
+            .map(|p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
+            .unwrap_or_else(|_| self.source_abs.to_string_lossy().to_string());
+        ImportRecord {
+            source,
+            mtime: source_mtime(&self.source_abs).unwrap_or(0),
+            crop: self.wizard.region.map(|r| (r.x, r.y, r.w, r.h)),
+            reserve_transparent: self.wizard.reserve_transparent,
+            as_sprite: self.as_sprite,
+            frame_w: self.frame_cut.0,
+            frame_h: self.frame_cut.1,
+        }
+    }
+
+    /// Restore a record's crop and settings (the fields are rebuilt from
+    /// `frame_cut` on the next render).
+    fn apply_record(&mut self, record: &ImportRecord) {
+        self.wizard
+            .commit_region(record.crop.map(|(x, y, w, h)| Region { x, y, w, h }));
+        self.wizard.set_reserve_transparent(record.reserve_transparent);
+        self.as_sprite = record.as_sprite;
+        self.frame_cut = (record.frame_w, record.frame_h);
     }
 
     /// Canvas-local coordinates for a window-space `position`, or `None`
@@ -652,6 +709,9 @@ pub struct ImportPanel {
     project_root: Option<PathBuf>,
     state: ViewerState,
     load_generation: u64,
+    /// A record to apply (plus the destination stem) once the re-import
+    /// load lands.
+    pending_record: Option<(ImportRecord, String)>,
     _load_task: Option<Task<()>>,
     /// A failure or a note worth showing (a refused commit, a delete that
     /// didn't land). Successes live in [`Self::last_import`] instead, so the
@@ -674,6 +734,7 @@ impl ImportPanel {
             project_root: None,
             state: ViewerState::Empty,
             load_generation: 0,
+            pending_record: None,
             _load_task: None,
             status: None,
             last_import: None,
@@ -832,6 +893,10 @@ impl ImportPanel {
                         // Default the destination to wherever the source
                         // already lives, ASSET-ROOT-relative.
                         open.wizard.set_dest_dir(dest_dir);
+                        if let Some((record, stem)) = this.pending_record.take() {
+                            open.apply_record(&record);
+                            open.wizard.set_dest_stem(stem);
+                        }
                         Self::rebuild_preview(&mut open);
                         ViewerState::Ready(Box::new(open))
                     }
@@ -1032,8 +1097,8 @@ impl ImportPanel {
         let fields = Fields {
             dir: Self::new_field(&dir, window, cx),
             stem: Self::new_field(&stem, window, cx),
-            frame_w: Self::new_field("", window, cx),
-            frame_h: Self::new_field("", window, cx),
+            frame_w: Self::new_field(&dim_text(open.frame_cut.0), window, cx),
+            frame_h: Self::new_field(&dim_text(open.frame_cut.1), window, cx),
         };
         if let ViewerState::Ready(open) = &mut self.state {
             open.fields = Some(fields);
@@ -1179,7 +1244,27 @@ impl ImportPanel {
         let (dest_root, dest_stem) = open.dest();
         let til_rel = format!("{dest_stem}.til");
         let written = if open.as_sprite {
-            let rects = frame_rects(open.crop(), open.frame_cut);
+            // An Aseprite source's frames ARE the sprite's frames: the crop
+            // is applied to each, laid side by side in one strip so the
+            // single-call `sprite_import` path below stays as it was.
+            let (rgba, src_w, src_h, rects) = if open.frames.len() > 1 {
+                let (strip, w, h) = loader::frame_strip(&open.frames);
+                let crop = open.crop();
+                let rects = (0..open.frames.len())
+                    .map(|i| Region {
+                        x: crop.x + i * open.wizard.src_w,
+                        ..crop
+                    })
+                    .collect();
+                (strip, w, h, rects)
+            } else {
+                (
+                    open.wizard.rgba.clone(),
+                    open.wizard.src_w,
+                    open.wizard.src_h,
+                    frame_rects(open.crop(), open.frame_cut),
+                )
+            };
             if rects.is_empty() {
                 self.status =
                     Some("Nothing to import: the frame size exceeds the crop".to_string());
@@ -1190,13 +1275,7 @@ impl ImportPanel {
             // `sprite_import` rule, ported from ggo-ide) and writes the
             // `.spr`/`.til`/`.pal` trio in one call; the wizard's tileset
             // preview is not consulted.
-            sprite_import(
-                &open.wizard.rgba,
-                open.wizard.src_w,
-                open.wizard.src_h,
-                open.wizard.reserve_transparent,
-                &rects,
-            )
+            sprite_import(&rgba, src_w, src_h, open.wizard.reserve_transparent, &rects)
             .map_err(|e| e.to_string())
             .and_then(|state| {
                 let spr_rel = format!("{dest_stem}.spr");
@@ -1247,16 +1326,85 @@ impl ImportPanel {
         let worktree_rel = project_root
             .as_deref()
             .and_then(|project_root| worktree_rel_for(project_root, &dest_root, &asset_rel));
+        // Remember where this came from, so a changed source can be
+        // re-imported with the same crop and settings.
+        let record_error = project_root.as_deref().and_then(|project_root| {
+            let til_worktree_rel = worktree_rel_for(project_root, &dest_root, &til_rel)?;
+            let record = open.import_record(project_root);
+            let mut meta = load_tileset_meta(project_root, &til_worktree_rel);
+            meta.import = Some(record);
+            save_tileset_meta(project_root, &til_worktree_rel, &meta).err()
+        });
         let imported = Imported {
             asset_rel,
             worktree_rel,
             tile_count,
             sprite: open.as_sprite,
         };
-        self.status = None;
+        self.status =
+            record_error.map(|e| format!("Imported, but the import record was not saved: {e}"));
         self.last_import = Some(imported.clone());
         cx.notify();
         Some((imported, source))
+    }
+
+    // ---------------------------------------------------------- re-import
+
+    /// The import record the destination tileset carries, if any.
+    fn dest_record(&self) -> Option<ImportRecord> {
+        let project_root = self.project_root.as_deref()?;
+        let open = self.ready()?;
+        let (dest_root, dest_stem) = open.dest();
+        let til_rel = worktree_rel_for(project_root, &dest_root, &format!("{dest_stem}.til"))?;
+        load_tileset_meta(project_root, &til_rel).import
+    }
+
+    /// `Reimport`: replay the destination's recorded crop and settings on
+    /// the open source. Enter then imports.
+    fn reimport_impl(&mut self, cx: &mut Context<Self>) {
+        let Some(record) = self.dest_record() else {
+            self.status = Some("No import record for this destination".to_string());
+            cx.notify();
+            return;
+        };
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.apply_record(&record);
+            Self::rebuild_preview(open);
+            // Rebuilt on the next render, seeded from the restored cut.
+            open.fields = None;
+        }
+        cx.notify();
+    }
+
+    /// The tileset panel's "Re-import…": load the recorded source for
+    /// `til_rel`, then apply the record and target that tileset once the
+    /// load lands.
+    fn reimport_tileset(&mut self, til_rel: &str, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        let Some(project_root) = self.project_root.clone() else {
+            return;
+        };
+        let Some(record) = load_tileset_meta(&project_root, til_rel).import else {
+            self.status = Some(format!("{til_rel} has no import record"));
+            cx.notify();
+            return;
+        };
+        let (root, under) = split_png_path(&project_root, til_rel);
+        let dest_dir = parent_dir(&under);
+        let stem = under
+            .rsplit('/')
+            .next()
+            .unwrap_or(&under)
+            .trim_end_matches(".til")
+            .to_string();
+        let source_abs = record.source_path(&project_root);
+        let source_rel = source_abs
+            .strip_prefix(&project_root)
+            .unwrap_or(&source_abs)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        self.pending_record = Some((record, stem));
+        self.start_load(source_rel, source_abs, root, dest_dir, cx);
     }
 
     /// Offer to delete the source PNG now that its tiles live in a `.til`.
@@ -1601,6 +1749,7 @@ impl ImportPanel {
         let reserve = open.wizard.reserve_transparent;
         let as_sprite = open.as_sprite;
         let frame_count = frame_rects(crop, open.frame_cut).len();
+        let source_frames = open.frames.len();
         let weak = cx.weak_entity();
         let weak_sprite = weak.clone();
 
@@ -1641,7 +1790,14 @@ impl ImportPanel {
                             }),
                     ),
             )
-            .when(as_sprite, |el| {
+            .when(as_sprite && source_frames > 1, |el| {
+                el.child(
+                    Label::new(format!("{source_frames} frames from the source"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+            .when(as_sprite && source_frames <= 1, |el| {
                 el.child(
                     h_flex()
                         .gap_1()
@@ -1876,6 +2032,7 @@ impl Render for ImportPanel {
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.step_zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.step_zoom(-1, cx)))
+            .on_action(cx.listener(|this, _: &Reimport, _window, cx| this.reimport_impl(cx)))
             .bg(cx.theme().colors().panel_background)
             .child(div().flex_1().min_h_0().child(body))
     }
@@ -3552,5 +3709,90 @@ mod tests {
             assert_eq!(open.wizard.region, None, "escape cleared the crop");
             assert_eq!(open.zoom, 2, "minus zoomed out");
         });
+    }
+
+    // ------------------------------------ record, re-import, aseprite (task 6)
+
+    #[gpui::test]
+    async fn test_a_commit_records_the_import_and_reimport_replays_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.wizard.commit_region(Some(Region { x: 0, y: 0, w: 16, h: 16 }));
+                open.wizard.set_reserve_transparent(true);
+                open.frame_cut = (Some(8), None);
+            }
+            panel.commit(cx).expect("commit succeeds");
+        });
+        let record = load_tileset_meta(dir.path(), "assets/art/hero.til")
+            .import
+            .expect("the commit wrote an import record");
+        assert_eq!(record.source, "assets/art/hero.png", "project-relative");
+        assert_eq!(record.crop, Some((0, 0, 16, 16)));
+        assert!(record.reserve_transparent);
+        assert_eq!(record.frame_w, Some(8));
+        assert_ne!(record.mtime, 0);
+
+        // A fresh wizard on the same destination replays the record.
+        panel.update(cx, |panel, cx| {
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert_eq!(ready(panel).wizard.region, None, "a plain open has no crop");
+            panel.reimport_impl(cx);
+            let open = ready(panel);
+            assert_eq!(open.wizard.region, Some(Region { x: 0, y: 0, w: 16, h: 16 }));
+            assert!(open.wizard.reserve_transparent);
+            assert_eq!(open.frame_cut, (Some(8), None));
+        });
+
+        // The tileset panel's route: load by `.til`, land with the record
+        // applied and the destination pointed back at it.
+        let other = new_panel(cx, dir.path());
+        other.update(cx, |panel, cx| panel.reimport_tileset("assets/art/hero.til", cx));
+        cx.executor().run_until_parked();
+        other.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.wizard.region.map(|r| r.w), Some(16));
+            assert_eq!(open.wizard.dest_rel_stem(), "art/hero");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_an_aseprite_source_imports_its_frames_as_the_sprite_frames(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path());
+        let assets = dir.path().join(ASSETS_DIR);
+        let a = two_tone_rgba(SRC_W, SRC_H);
+        let mut b = a.clone();
+        b.rotate_left(4);
+        std::fs::write(
+            assets.join("art/walk.ase"),
+            ggo_worldlib::sprites::aseprite::encode_rgba_frames(
+                &[&a, &b, &a],
+                SRC_W as u16,
+                SRC_H as u16,
+            ),
+        )
+        .unwrap();
+        let panel = new_panel(cx, dir.path());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("assets/art/walk.ase", cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert_eq!(ready(panel).frames.len(), 3);
+            panel.set_as_sprite(true, cx);
+            let (imported, _) = panel.commit(cx).expect("commit succeeds");
+            assert_eq!(imported.asset_rel, "art/walk.spr");
+        });
+        let opened = io::open_sprite(&assets, "art/walk.spr").expect("spr round-trips");
+        assert_eq!(opened.state.frames.len(), 3, "one sprite frame per source frame");
+        assert_eq!((opened.state.w_tiles, opened.state.h_tiles), (2, 1));
     }
 }

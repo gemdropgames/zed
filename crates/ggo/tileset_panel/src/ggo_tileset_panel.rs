@@ -29,7 +29,7 @@ mod palette_widget;
 mod tileset_item;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -45,6 +45,7 @@ use workspace::Workspace;
 use ggo_worldlib::sprites::io::save_tileset;
 use ggo_worldlib::sprites::palette565::PAL_SLOTS;
 use ggo_worldlib::sprites::tileset_doc::{TILE_PX, TilesetDocStore};
+use ggo_worldlib::sprites::tileset_meta::load_tileset_meta;
 
 use loader::LoadedTileset;
 pub use palette_widget::SmallPaletteEditor;
@@ -202,8 +203,34 @@ enum Tool {
 
 /// The open tileset: worldlib's doc store plus the view state that must
 /// survive a re-click on the already-open file.
+/// The import-record banner: the recorded source changed since the
+/// import (or is gone).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImportAlert {
+    source: String,
+    missing: bool,
+}
+
+/// Compare the `.til`'s recorded source against disk (checked on open,
+/// never watched).
+fn import_alert_for(root: &Path, rel: &str) -> Option<ImportAlert> {
+    let record = load_tileset_meta(root, rel).import?;
+    match record.source_changed(root) {
+        Some(true) => Some(ImportAlert {
+            source: record.source,
+            missing: false,
+        }),
+        None => Some(ImportAlert {
+            source: record.source,
+            missing: true,
+        }),
+        Some(false) => None,
+    }
+}
+
 struct OpenTileset {
     rel_path: String,
+    import_alert: Option<ImportAlert>,
     pal_path: String,
     missing_pal: bool,
     cols: usize,
@@ -242,6 +269,7 @@ impl OpenTileset {
     fn new(rel_path: String, loaded: LoadedTileset) -> Self {
         Self {
             rel_path,
+            import_alert: None,
             pal_path: loaded.pal_path,
             missing_pal: loaded.missing_pal,
             cols: loaded.cols,
@@ -377,6 +405,7 @@ impl TilesetPanel {
 
         let load = {
             let rel = rel.clone();
+            let root = root.clone();
             cx.background_spawn(async move { loader::load_tileset(&root, &rel) })
         };
         self._load_task = Some(cx.spawn(async move |this, cx| {
@@ -386,7 +415,11 @@ impl TilesetPanel {
                     return;
                 }
                 this.state = match result {
-                    Ok(loaded) => ViewerState::Ready(Box::new(OpenTileset::new(rel, loaded))),
+                    Ok(loaded) => {
+                        let mut open = OpenTileset::new(rel.clone(), loaded);
+                        open.import_alert = import_alert_for(&root, &rel);
+                        ViewerState::Ready(Box::new(open))
+                    }
                     Err(e) => ViewerState::Error(e),
                 };
                 cx.notify();
@@ -1237,10 +1270,58 @@ impl TilesetPanel {
             .into_any_element()
     }
 
+    /// "Source changed — Re-import…": hands the `.til` to the import panel
+    /// through `ggo_common::ReimportTileset` (no crate cycle).
+    fn render_import_alert(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let alert = open.import_alert.clone()?;
+        let til_rel = open.rel_path.clone();
+        let text = if alert.missing {
+            format!("Import source {} is missing", alert.source)
+        } else {
+            format!("Import source {} changed", alert.source)
+        };
+        Some(
+            h_flex()
+                .gap_1()
+                .px_1()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .child(Label::new(text).size(LabelSize::XSmall).color(Color::Warning))
+                .when(!alert.missing, |el| {
+                    el.child(Button::new("ggo-tileset-reimport", "Re-import…").on_click(
+                        move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(ggo_common::ReimportTileset {
+                                    til_rel: til_rel.clone(),
+                                }),
+                                cx,
+                            );
+                        },
+                    ))
+                })
+                .child(
+                    Button::new("ggo-tileset-reimport-dismiss", "Dismiss").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            if let ViewerState::Ready(open) = &mut this.state {
+                                open.import_alert = None;
+                                cx.notify();
+                            }
+                        },
+                    )),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_ready(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         v_flex()
             .size_full()
             .child(self.render_toolbar(cx))
+            .children(self.render_import_alert(cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -2265,5 +2346,47 @@ mod tests {
         assert_eq!(r.indices[0], 0);
         assert_eq!(r.indices[TILE_PIXELS], 1);
         assert!(!r.missing_pal);
+    }
+
+    // ------------------------------------------------ import alert (task 6)
+
+    #[gpui::test]
+    async fn test_a_changed_or_missing_import_source_raises_the_alert(cx: &mut TestAppContext) {
+        use ggo_worldlib::sprites::tileset_meta::{
+            ImportRecord, TilesetMeta, save_tileset_meta, source_mtime,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("art/hero.png");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"png").unwrap();
+        let record = |mtime: u64| TilesetMeta {
+            import: Some(ImportRecord {
+                source: "art/hero.png".into(),
+                mtime,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let current = source_mtime(&source).unwrap();
+
+        save_tileset_meta(dir.path(), "tiles/world.til", &record(current)).unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.read_with(cx, |panel, _| assert_eq!(ready(panel).import_alert, None));
+
+        save_tileset_meta(dir.path(), "tiles/world.til", &record(current - 5)).unwrap();
+        panel.update(cx, |panel, cx| panel.load_rel_path("tiles/world.til", cx));
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let alert = ready(panel).import_alert.clone().expect("stale mtime alerts");
+            assert!(!alert.missing);
+            assert_eq!(alert.source, "art/hero.png");
+        });
+
+        std::fs::remove_file(&source).unwrap();
+        panel.update(cx, |panel, cx| panel.load_rel_path("tiles/world.til", cx));
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(ready(panel).import_alert.as_ref().is_some_and(|a| a.missing));
+        });
     }
 }

@@ -16,7 +16,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ggo_common::to_render_image;
-use ggo_worldlib::sprites::import::{DecodedPng, Preview, decode_png, preview_rgba};
+use ggo_worldlib::sprites::import::{
+    DecodedFrame, DecodedPng, Preview, decode_source, preview_rgba,
+};
 use gpui::RenderImage;
 
 /// A decoded source PNG plus its gpui image, assembled entirely off the UI
@@ -27,6 +29,9 @@ pub struct LoadedPng {
     /// crop gesture changes the OUTLINE, never the pixels underneath, so
     /// there is no invalidation point at all.
     pub image: Arc<RenderImage>,
+    /// Every frame (one for a PNG); a multi-frame source becomes a
+    /// sprite's frames.
+    pub frames: Vec<DecodedFrame>,
 }
 
 /// Read and decode the PNG at absolute path `abs`.
@@ -38,10 +43,35 @@ pub struct LoadedPng {
 /// through) -- see the panel's `split_png_path`.
 pub fn load_png(abs: &Path) -> Result<LoadedPng, String> {
     let bytes = std::fs::read(abs).map_err(|e| format!("reading {}: {e}", abs.display()))?;
-    let decoded = decode_png(&bytes).map_err(|e| e.to_string())?;
+    let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let frames = decode_source(name, &bytes).map_err(|e| e.to_string())?;
+    let first = frames.first().ok_or_else(|| "the file has no frames".to_string())?;
+    let decoded: DecodedPng = first.clone().into();
     let image = to_render_image(&decoded.rgba, decoded.w as u32, decoded.h as u32)
-        .ok_or_else(|| "the PNG has no pixels".to_string())?;
-    Ok(LoadedPng { decoded, image })
+        .ok_or_else(|| "the image has no pixels".to_string())?;
+    Ok(LoadedPng {
+        decoded,
+        image,
+        frames,
+    })
+}
+
+/// Lay `frames` side by side into one RGBA strip (`w * n` wide), so the
+/// sprite cut can stay one `sprite_import` call.
+pub fn frame_strip(frames: &[DecodedFrame]) -> (Vec<u8>, usize, usize) {
+    let Some(first) = frames.first() else {
+        return (Vec::new(), 0, 0);
+    };
+    let (w, h, n) = (first.w, first.h, frames.len());
+    let mut strip = vec![0u8; w * n * h * 4];
+    for (index, frame) in frames.iter().enumerate() {
+        for y in 0..h.min(frame.h) {
+            let src = &frame.rgba[y * frame.w * 4..][..w.min(frame.w) * 4];
+            let at = (y * w * n + index * w) * 4;
+            strip[at..at + src.len()].copy_from_slice(src);
+        }
+    }
+    (strip, w * n, h)
 }
 
 /// Composite a quantized [`Preview`] into a gpui image -- what the commit
@@ -106,6 +136,25 @@ mod tests {
         let bytes = loaded.image.as_bytes(0).unwrap();
         assert_eq!(bytes.len(), 4 * 2 * 4);
         assert_eq!(&bytes[..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn load_png_reads_every_aseprite_frame_and_strips_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anim.ase");
+        let a = two_tone_rgba(2, 1);
+        let b: Vec<u8> = a.chunks(4).rev().flatten().copied().collect();
+        std::fs::write(
+            &path,
+            ggo_worldlib::sprites::aseprite::encode_rgba_frames(&[&a, &b], 2, 1),
+        )
+        .unwrap();
+        let loaded = load_png(&path).unwrap();
+        assert_eq!(loaded.frames.len(), 2);
+        assert_eq!(loaded.decoded.rgba, a, "frame 0 is the wizard's image");
+        let (strip, w, h) = frame_strip(&loaded.frames);
+        assert_eq!((w, h), (4, 1));
+        assert_eq!(strip, [a, b].concat());
     }
 
     #[test]

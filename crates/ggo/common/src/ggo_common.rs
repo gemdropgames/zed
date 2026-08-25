@@ -24,8 +24,21 @@ use std::sync::Arc;
 use smol::process::Command;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, PromptLevel, RenderImage, Task, WeakEntity, Window,
+    Action, App, AppContext as _, Context, Entity, PromptLevel, RenderImage, Task, WeakEntity,
+    Window,
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// Replay a tileset's recorded import from its (changed) source. Lives
+/// here rather than in the import panel so the tileset panel -- which the
+/// import panel depends on -- can dispatch it without a crate cycle.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = ggo_common)]
+pub struct ReimportTileset {
+    /// The `.til`'s worktree-relative path (the import record's sidecar key).
+    pub til_rel: String,
+}
 use image::Frame;
 use project::ProjectPath;
 use workspace::Workspace;

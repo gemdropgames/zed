@@ -7528,10 +7528,12 @@ name = "ggo-worldlib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "ggo-asset-formats",
  "ggo-db",
  "ggo-emu-core",
  "image",
+ "serde",
  "serde_json",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
@@ -7586,6 +7588,8 @@ dependencies = [
  "image",
  "path",
  "project",
+ "schemars 1.0.4",
+ "serde",
  "smol",
  "tempfile",
  "ui",
