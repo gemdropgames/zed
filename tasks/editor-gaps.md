@@ -131,13 +131,13 @@ Refs: Pixelorama, LibreSprite.
 - [ ] Sprite preview: checker / black / white background picker + LCD scanline filter (`MIGRATION.md:128`)
 - [ ] Fix atlas leak in the sprite panel (`MIGRATION.md:571`)
 
-## 8. Hot iteration — `small → large`
+## 8. Hot iteration — `done 2026-08-25` (core hot-swap deferred)
 
 Every change is save → `emd pack-ggo --world <stem>` → Run.
 Refs: Defold, Godot.
 
-- [ ] Watch mode: on save of any asset under the open world, re-pack and restart the cart in the emu tab (one keystroke loop) — `small`
-- [ ] Keep the emulator's input/pad + window position across the restart
+- [x] Watch mode: any change under the project re-packs and restarts the emulated world in the emu tab (Watch toggle, 300 ms debounce) (2026-08-25)
+- [x] Pane state kept across the restart: held pad re-published, mute/debug/console untouched, paused runs resume (2026-08-25)
 - [ ] True asset hot-swap: core accepts a new asset section mid-run — `large`, needs `ggo-emu-core` support
 
 ## 9. Deploy to hardware — `medium`
