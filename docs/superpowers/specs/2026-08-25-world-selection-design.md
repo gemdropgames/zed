@@ -32,7 +32,11 @@ panel's atlas leak.
    last element = primary (what the inspector edits). Click replaces,
    shift-click toggles, empty-space left-drag rubber-bands (bbox
    intersection; shift adds), `ctrl-a` selects all, `escape` clears.
-   Structural ops (remove, undo/redo) clear the set, as today.
+   Remove clears the set; undo/redo PRUNE it -- entries whose index no
+   longer exists are dropped, surviving indices keep pointing at whatever
+   now sits there (the rule a single selection always had). Clearing on
+   every undo would deselect after undoing a plain move, which reads as
+   the editor losing the user's place.
 2. **Two new worldlib ops** (`../ggo/tools/ggo-worldlib/src/world_doc.rs`):
    - `WorldOp::MoveMany { moves: Vec<(Selection, [f64; 2])>, gesture:
      Option<String> }` — inverse holds the previous positions; coalesces on
@@ -68,9 +72,11 @@ panel's atlas leak.
 7. **Redo re-resolve**: after `store.redo()`, any instance with neither
    `resolved` nor `error` is resolved (`loader::resolve_instance`),
    `set_instances_resolved(.., false)`, asset loads filled, images rebuilt.
-8. **Atlas retirement**: every image-map rebuild computes the keys the
-   new map no longer holds and queues their images; the canvas render
-   drops the queue two-stage (what was queued before the previous
+8. **Atlas retirement**: a rebuild reuses the previous cache's
+   `RenderImage` for every key still loaded (so unchanged images keep
+   their atlas identity and are not re-uploaded) and queues the images
+   of keys the new map no longer holds; the canvas item's and the dock's
+   renders drop the queue two-stage (what was queued before the previous
    render), and `on_release` drops everything.
 
 ## Keys (`GgoWorldPanel`)
