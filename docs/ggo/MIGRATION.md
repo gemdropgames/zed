@@ -262,6 +262,10 @@ but `emerald.toml` itself is still read as text.
 | Emulator Pause / Resume + Step (`ctrl-alt-p`, `ctrl-alt-.`) | `drive::Session::{pause, resume, step}` (2026-08-25) | The drive loop parks after publishing a frame, feeds silence so the device stays live, and keeps the parked time out of the cart's clock. Step while running is a pause, never a skipped frame. ggo-ide had neither. |
 | Emulator debug column (`ctrl-alt-d`): tile sheet, per-layer tilemap with the scroll window outlined, OAM composite + list, palette grid, hover readouts | `ggo_emu_panel::debug` over `ggo_emu_core::ppu::PpuSnapshot` (2026-08-25) | The drive thread refills a snapshot slot every vsync; viewers decode off-thread, throttled to 10 Hz while running and immediately on pause/step, images retired through the pane's atlas discipline. Replaces the wasm data panel ggo-ide dropped. |
 | Pane runs persist saves | `drive.rs` via `ggo_emu_core::savefile` (moved from the `ggo-emu` binary, 2026-08-25) | Same rule as the standalone: `<card dir>/savs/<NAME>.sav`, flushed on a dirty frame at most once a second and at run end. |
+| World editor selection set: shift-click, rubber-band, `ctrl-a` / `escape`, group drag and nudge as ONE undo entry (`WorldOp::MoveMany`) | `ggo_world_panel` + `ggo-worldlib::world_doc` (2026-08-25) | ggo-ide was single-select with no marquee. The inspector edits the primary (last-selected) item; every selected item gets its own outline. |
+| World editor copy / paste / duplicate (`ctrl-c` / `ctrl-v` / `ctrl-d`) as world-file TOML on the OS clipboard | `ggo_world_panel` + `world_file::{fragment_to_toml, parse_fragment}` (2026-08-25) | Paste is one `WorldOp::Batch`; it lands at the cursor when it is over the canvas (snapped with Snap on), else one tile right/down. Pasted instances go through the cycle guard and are resolved so they render. |
+| Entity / instance list in the world dock | `ggo_world_panel::render_entity_list` (2026-08-25) | Rows `#i <component>[ · stem]` and `⧉ <world>`; click / shift-click select like the canvas. Closes the "hard-to-click entity has no list fallback" gap in §4. |
+| Instance removal asks first | `ggo_world_panel::delete_selected_impl` (2026-08-25) | A set holding instances confirms (`ggo_common::confirm_destructive`); entities alone delete without a prompt (one undo away). Multi-delete is one `WorldOp::Batch`. |
 | Audio tab: waveform, play/stop/loop, **Source \| Baked** A/B (the blob through a standalone `ggo_emu_core::apu::Apu` into the emu pane's cpal ring), rate picker, **Import → `assets/<stem>.adp`** | `ggo_audio_panel` + `../ggo/tools/ggo-audio` (2026-08-24) | ggo-ide could only import (with a rate knob) and play the source through `<audio controls>`. The rate knob is editor-side by design: emerald packs a pre-baked `.adp` verbatim and knows nothing of the editor. No synthesis, sequencer, or PSG/ADSR/pan authoring — emerald's runtime never programs those. |
 | World toolbar `audio N / 384 KiB` readout | `ggo_world_panel::audio_budget` (2026-08-24) | Every `Music`/`Sfx` stem the world (and its resolved instances) names, sized off-thread; red when over the APU sample region, since the runtime silently skips an upload past it. Cache clears on panel refresh, so a re-imported file re-sizes when the panel is next shown. |
 | `.wav` / `.ogg` / `.adp` explorer routing | `ggo_audio_panel::intercept_audio_open` | Same interceptor pattern as `.spr` / `.til` / `.cart` / `.map` / worlds. |
@@ -557,10 +561,9 @@ guards and follow-ups that someone has to pick up:
 - **PaletteSet slot guard** and **last-frame `FrameDelete` guard** — the next
   worldlib doc-op hardening PR (follow-on to ggo #73). Panels re-check both
   before applying, so this is defence in depth, not a live crash.
-- **Redo of an add leaves the instance subtree unresolved** — `AddInstance`
-  resolves the subtree at add time (fork `ade65c4d`), but a redo of that op
-  replays the doc op without the resolve, so the instance renders as a
-  placeholder until the world is reopened.
+- **~~Redo of an add leaves the instance subtree unresolved.~~ Resolved
+  2026-08-25.** `redo_impl` re-resolves every instance that comes back with
+  neither `resolved` nor `error` and refreshes the image cache.
 - **`ggo-db` index PR**: `frame(run_id)` and `profile(run_id)` have no index;
   the charts panel's per-run sample query full-scans. Not felt at current run
   counts.
@@ -572,10 +575,13 @@ guards and follow-ups that someone has to pick up:
 
 - **Atlas retention in the two document panels.** Only `ggo_emu_panel`
   implements the `Window::drop_image` release contract (double-buffered retire,
-  full release on stop, `on_release` at teardown). `ggo_world_panel` rebuilds
-  its whole image cache on add-instance and on every world switch, and
+  full release on stop, `on_release` at teardown). ~~`ggo_world_panel` rebuilds
+  its whole image cache on add-instance and on every world switch~~ (resolved
+  2026-08-25: every rebuild queues the images the new cache no longer holds,
+  a world switch queues the whole cache, the canvas item's render drops them
+  two-stage and `on_release` sweeps the rest), and
   `ggo_sprite_panel` rebuilds every frame + pool-tile `RenderImage` after
-  *every* op/undo/redo/save — neither ever calls `drop_image`, so both leak
+  *every* op/undo/redo/save and never calls `drop_image`, so it still leaks
   atlas tiles at edit frequency. Bounded by session length, not by a loop, so it
   was not an F2/F3 blocker; it is still a real leak.
 - **~~Linear-upscale blur in the emu pane.~~ Resolved.** The pane paints

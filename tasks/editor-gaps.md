@@ -66,21 +66,21 @@ Refs: GB Studio 4.3 debugger, Mesen/bgb-style VRAM viewers.
 - [x] Runs over `MAX_FRAMES` ingest their first 100k frames with a note (2026-08-25)
 - [x] Pane runs flush saves like the standalone (`savefile` moved into the core, 2026-08-25)
 
-## 4. World editor interaction floor — `medium`
+## 4. World editor interaction floor — `done 2026-08-25`
 
 Selection is `Option<Selection>` (`world_panel/src/ggo_world_panel.rs:614`).
 No rubber-band, shift-click, group move, copy/paste, duplicate, entity list
 (`MIGRATION.md:150`), or delete confirm (`MIGRATION.md:153`).
 Refs: LDtk, Godot 2D editor.
 
-- [ ] Selection set instead of `Option`; shift-click add/remove
-- [ ] Rubber-band select on empty-space drag (currently deselect)
-- [ ] Group move as one gesture / one undo entry (extend the existing gesture-id coalescing)
-- [ ] Copy / paste / duplicate entities and instances (`ctrl-c` / `ctrl-v` / `ctrl-d`)
-- [ ] Delete confirm for instance removal (reuse `ggo_common::confirm_destructive`)
-- [ ] Entity / instance list in the dock (dock already owns the document); click-to-select, keyboard nav
-- [ ] Fix redo-of-add leaving the instance subtree unresolved (`MIGRATION.md:557`)
-- [ ] Fix atlas leak: call `drop_image` on cache rebuild, per the emu panel's pattern (`MIGRATION.md:567`)
+- [x] Selection set instead of `Option`; shift-click add/remove (2026-08-25)
+- [x] Rubber-band select on empty-space drag (2026-08-25)
+- [x] Group move as one gesture / one undo entry (`WorldOp::MoveMany`, 2026-08-25)
+- [x] Copy / paste / duplicate as world-file TOML on the clipboard (2026-08-25)
+- [x] Delete confirm for instance removal (2026-08-25)
+- [x] Entity / instance list in the dock; click / shift-click select (keyboard nav not done) (2026-08-25)
+- [x] Fix redo-of-add leaving the instance subtree unresolved (2026-08-25)
+- [x] Fix the world panel's atlas leak (two-stage retirement + on_release) (2026-08-25)
 
 ## 5. Map editor — `medium`
 
