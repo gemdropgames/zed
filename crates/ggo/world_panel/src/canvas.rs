@@ -143,13 +143,28 @@ pub fn image_key(img: &RgbaImage) -> usize {
 /// One `RenderImage` per `Loadable::Ready` entry across the given load
 /// maps, keyed by [`image_key`].
 pub fn build_image_cache(loads: &[&AssetLoads]) -> HashMap<usize, Arc<RenderImage>> {
+    build_image_cache_reusing(loads, &HashMap::new())
+}
+
+/// [`build_image_cache`] that keeps `previous`'s `RenderImage` for every
+/// key still present, so a rebuild neither re-uploads unchanged images
+/// nor mints a new atlas identity for them -- which is what lets the
+/// panel retire images by key.
+pub fn build_image_cache_reusing(
+    loads: &[&AssetLoads],
+    previous: &HashMap<usize, Arc<RenderImage>>,
+) -> HashMap<usize, Arc<RenderImage>> {
     let mut cache = HashMap::new();
     for map in loads {
         for load in map.values() {
-            if let Loadable::Ready(img) = load
-                && let Some(render_image) = to_render_image(&img.rgba, img.w, img.h)
-            {
-                cache.insert(image_key(img), render_image);
+            let Loadable::Ready(img) = load else {
+                continue;
+            };
+            let key = image_key(img);
+            if let Some(existing) = previous.get(&key) {
+                cache.insert(key, existing.clone());
+            } else if let Some(render_image) = to_render_image(&img.rgba, img.w, img.h) {
+                cache.insert(key, render_image);
             }
         }
     }

@@ -658,9 +658,9 @@ struct OpenWorld {
     /// Why the popout Emulate could not launch (failed build or spawn),
     /// shown on the toolbar next to `save_error`.
     popout_error: Option<String>,
-    /// What a paste could not do (bad clipboard text, a refused instance),
-    /// shown on the toolbar; cleared by the next successful paste.
-    paste_error: Option<String>,
+    /// What a copy or paste could not do (bad clipboard text, a refused
+    /// instance), shown on the toolbar; cleared by the next successful paste.
+    clipboard_error: Option<String>,
     /// Region bytes per audio stem, filled off-thread -- see
     /// [`audio_budget`]. Cleared by [`WorldPanel::refresh_worlds`].
     audio_sizes: audio_budget::AudioSizes,
@@ -745,7 +745,7 @@ impl OpenWorld {
             inspector: Vec::new(),
             save_error: None,
             popout_error: None,
-            paste_error: None,
+            clipboard_error: None,
             audio_sizes: HashMap::new(),
             audio_size_generation: 0,
             _audio_size_task: None,
@@ -778,7 +778,8 @@ fn retired_by_rebuild(
 }
 
 /// The list column's rows: every entity (`#i <first non-Transform
-/// component>[ · stem]`) then every instance (`⧉ <stem>`).
+/// component>[ · stem]` -- any component's `stem`, so Tilemap and Sfx
+/// rows read as usefully as sprites) then every instance (`⧉ <stem>`).
 fn entity_list_rows(state: &ggo_worldlib::world_doc::WorldState) -> Vec<(Selection, String)> {
     let mut rows = Vec::with_capacity(state.entities.len() + state.instances.len());
     for (i, entity) in state.entities.iter().enumerate() {
@@ -845,6 +846,15 @@ fn move_ops(
             .collect(),
         gesture,
     }
+}
+
+/// How many selected instances actually exist (a stale index after an
+/// undo/redo restructure is not something to prompt about).
+fn removable_instances(selected: &[Selection], state: &ggo_worldlib::world_doc::WorldState) -> usize {
+    selected
+        .iter()
+        .filter(|s| matches!(s, Selection::Instance(i) if *i < state.instances.len()))
+        .count()
 }
 
 /// One batch removing every selected item that still exists, entities
@@ -945,6 +955,17 @@ impl OpenWorld {
         } else {
             self.selected.push(target);
         }
+    }
+
+    /// Drop selection entries that no longer index anything -- after an
+    /// undo/redo restructure. Surviving indices keep pointing at whatever
+    /// now sits there, which is the same rule a single selection had.
+    fn prune_selection(&mut self) {
+        let state = self.store.state();
+        self.selected.retain(|target| match *target {
+            Selection::Entity(i) => i < state.entities.len(),
+            Selection::Instance(i) => i < state.instances.len(),
+        });
     }
 
     /// The current position of every selected item that still exists.
@@ -1414,11 +1435,7 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let instances = open
-            .selected
-            .iter()
-            .filter(|s| matches!(s, Selection::Instance(_)))
-            .count();
+        let instances = removable_instances(&open.selected, &open.store.state());
         if instances == 0 {
             self.delete_selected_now(cx);
             return;
@@ -1755,6 +1772,7 @@ impl WorldPanel {
         if let ViewerState::Ready(open) = &mut self.state
             && open.store.undo()
         {
+            open.prune_selection();
             cx.notify();
         }
     }
@@ -1767,6 +1785,7 @@ impl WorldPanel {
         if !open.store.redo() {
             return;
         }
+        open.prune_selection();
         // A redone add-instance comes back from the undo stack as it was
         // snapshotted -- unresolved -- so it would render as a placeholder
         // until reload. Resolve whatever has neither a subtree nor an
@@ -1953,8 +1972,11 @@ impl WorldPanel {
         let primary_start = open
             .primary()
             .and_then(|p| starts.iter().find(|(t, _)| *t == p).map(|(_, pos)| *pos));
-        open.edit_drag = match (hit, primary_start) {
-            (Some(_), Some(start_pos)) if !starts.is_empty() => {
+        // Only a click that leaves its target selected drags: a shift-click
+        // that just REMOVED a member must not move the survivors.
+        let clicked_is_selected = hit.is_some_and(|target| open.selected.contains(&target));
+        open.edit_drag = match (clicked_is_selected, primary_start) {
+            (true, Some(start_pos)) if !starts.is_empty() => {
                 open.gesture_counter += 1;
                 Some(EditDrag {
                     gesture_id: format!("drag-{}", open.gesture_counter),
@@ -2458,7 +2480,7 @@ impl WorldPanel {
         match fragment_to_toml(&entities, &instances) {
             Ok(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             Err(e) => {
-                open.paste_error = Some(format!("copy failed: {e}"));
+                open.clipboard_error = Some(format!("copy failed: {e}"));
                 cx.notify();
             }
         }
@@ -2472,7 +2494,7 @@ impl WorldPanel {
             Ok(fragment) => fragment,
             Err(e) => {
                 if let ViewerState::Ready(open) = &mut self.state {
-                    open.paste_error = Some(format!("clipboard is not world TOML: {e}"));
+                    open.clipboard_error = Some(format!("clipboard is not world TOML: {e}"));
                     cx.notify();
                 }
                 return;
@@ -2564,7 +2586,7 @@ impl WorldPanel {
                 gesture: None,
             });
         }
-        open.paste_error = (!refused.is_empty()).then(|| {
+        open.clipboard_error = (!refused.is_empty()).then(|| {
             format!(
                 "skipped instance{} that would cycle: {}",
                 if refused.len() == 1 { "" } else { "s" },
@@ -2608,11 +2630,13 @@ impl WorldPanel {
     /// Rebuild the image cache from the current loads and queue every
     /// image the new cache no longer holds for atlas release.
     fn replace_images(open: &mut OpenWorld, retired: &mut Vec<Arc<RenderImage>>) {
-        let images = Arc::new(canvas::build_image_cache(&[
-            &open.sprite_loads,
-            &open.map_loads,
-            &open.meta_sprite_loads,
-        ]));
+        // Reusing the previous cache's images is what makes retiring by
+        // key correct: a key still present keeps its RenderImage (and its
+        // atlas identity); only a key that vanished is released.
+        let images = Arc::new(canvas::build_image_cache_reusing(
+            &[&open.sprite_loads, &open.map_loads, &open.meta_sprite_loads],
+            &open.images,
+        ));
         retired.extend(retired_by_rebuild(&open.images, &images));
         open.images = images;
     }
@@ -3256,7 +3280,7 @@ impl WorldPanel {
                 )
                 .size(LabelSize::Small)
             }))
-            .children(open.paste_error.as_ref().map(|e| {
+            .children(open.clipboard_error.as_ref().map(|e| {
                 ggo_common::CopyableText::new("ggo-world-paste-error-copy", e.clone())
                     .size(LabelSize::Small)
             }))
@@ -3473,9 +3497,15 @@ impl WorldPanel {
                     }
                 }),
             )
-            .on_hover(cx.listener(|this, hovered: &bool, _window, _cx| {
-                if !hovered && let ViewerState::Ready(open) = &this.state {
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !hovered && let ViewerState::Ready(open) = &mut this.state {
                     open.view.borrow_mut().hover = None;
+                    // A band released outside the canvas gets no mouse-up
+                    // here; settle it as "nothing more" rather than leave
+                    // it drawing.
+                    if open.marquee.take().is_some() {
+                        cx.notify();
+                    }
                 }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
@@ -3949,6 +3979,9 @@ impl Render for WorldPanel {
         self.ensure_inspector(window, cx);
         self.refresh_stem_completion(window, cx);
         self.schedule_audio_sizes(cx);
+        // The canvas item drains this too; with no canvas tab open the dock
+        // is the only render, so drain here as well.
+        self.retire_images(window);
         let body = match &self.state {
             ViewerState::Empty => self.render_message(EMPTY_MESSAGE.to_string(), cx),
             ViewerState::Loading { stem } => self.render_message(format!("Loading {stem}…"), cx),
@@ -8255,7 +8288,7 @@ mod tests {
                 vec![Selection::Entity(before), Selection::Entity(before + 1)],
                 "the pasted set is the selection"
             );
-            assert!(open_of(panel).paste_error.is_none());
+            assert!(open_of(panel).clipboard_error.is_none());
             panel.undo_impl(cx);
             assert_eq!(open_of(panel).store.state().entities.len(), before, "one undo");
         });
@@ -8330,16 +8363,16 @@ mod tests {
             assert_eq!(pasted.pos, [3.0 + 16.0, 4.0 + 16.0]);
             assert!(pasted.resolved.is_some(), "resolved so it renders");
             assert!(
-                open.paste_error.as_deref().unwrap_or("").contains("worlds/test"),
+                open.clipboard_error.as_deref().unwrap_or("").contains("worlds/test"),
                 "{:?}",
-                open.paste_error
+                open.clipboard_error
             );
             assert_eq!(open.selected, vec![Selection::Instance(before)]);
         });
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("not = [toml".into())));
         panel.update(cx, |panel, cx| {
             panel.paste_impl(cx);
-            assert!(open_of(panel).paste_error.as_deref().unwrap().contains("not world TOML"));
+            assert!(open_of(panel).clipboard_error.as_deref().unwrap().contains("not world TOML"));
         });
     }
 
@@ -8365,6 +8398,87 @@ mod tests {
         assert_eq!(rows[1], (Selection::Entity(1), "#1 Entity".to_string()));
         assert_eq!(rows[2].0, Selection::Instance(0));
         assert!(rows[2].1.starts_with("⧉ "));
+    }
+
+    /// A rebuild keeps the RenderImage (and atlas identity) of every key
+    /// still loaded and retires only a key that vanished -- the property
+    /// that makes retiring by key release the right tiles.
+    #[gpui::test]
+    async fn test_replace_images_reuses_kept_images_and_retires_dropped_keys(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let rgba = |n: u8| ggo_worldlib::render::RgbaImage {
+            rgba: Arc::from(vec![n; 4]),
+            w: 1,
+            h: 1,
+        };
+        panel.update(cx, |panel, _| {
+            let mut retired = Vec::new();
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.sprite_loads.insert("a".into(), ggo_worldlib::render::Loadable::Ready(rgba(1)));
+            open.sprite_loads.insert("b".into(), ggo_worldlib::render::Loadable::Ready(rgba(2)));
+            WorldPanel::replace_images(open, &mut retired);
+            assert_eq!(open.images.len(), 2);
+            assert!(retired.is_empty(), "a first build retires nothing");
+            let ids: HashMap<usize, _> = open.images.iter().map(|(k, v)| (*k, v.id)).collect();
+
+            // Rebuild with the same loads: same RenderImages, nothing retired.
+            WorldPanel::replace_images(open, &mut retired);
+            assert!(retired.is_empty(), "unchanged keys keep their images");
+            for (key, image) in open.images.iter() {
+                assert_eq!(ids[key], image.id, "the image for {key} was reused, not re-minted");
+            }
+
+            // Drop one load: exactly its image is retired.
+            let removed_key = match open.sprite_loads.get("a") {
+                Some(ggo_worldlib::render::Loadable::Ready(img)) => canvas::image_key(img),
+                _ => panic!("load a is ready"),
+            };
+            open.sprite_loads.remove("a");
+            WorldPanel::replace_images(open, &mut retired);
+            assert_eq!(retired.len(), 1);
+            assert_eq!(retired[0].id, ids[&removed_key]);
+            assert_eq!(open.images.len(), 1);
+        });
+    }
+
+    /// A shift-click that removes a member must not arm a drag of the
+    /// survivors; a stale instance index never prompts a delete.
+    #[gpui::test]
+    async fn test_shift_remove_does_not_drag_and_stale_instances_do_not_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_down_with([50., 12.], true, cx);
+            assert!(open_of(panel).edit_drag.is_some());
+            panel.canvas_primary_down_with([50., 12.], true, cx);
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(0)]);
+            assert!(open_of(panel).edit_drag.is_none(), "removing a member arms no drag");
+            let state = open_of(panel).store.state();
+            assert_eq!(removable_instances(&[Selection::Instance(99)], &state), 0);
+            assert_eq!(removable_instances(&[Selection::Instance(0), Selection::Entity(0)], &state), 1);
+        });
+    }
+
+    /// Undo/redo prune selection entries that no longer index anything.
+    #[gpui::test]
+    async fn test_undo_prunes_a_selection_that_outlived_its_entity(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.add_entity_impl(cx);
+            let added = open_of(panel).store.state().entities.len() - 1;
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(added)]);
+            panel.undo_impl(cx);
+            assert!(open_of(panel).selected.is_empty(), "the undone entity is no longer selectable");
+        });
     }
 
     #[gpui::test]
