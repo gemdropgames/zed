@@ -4055,6 +4055,19 @@ impl Pane {
             return;
         }
 
+        // GGO: fork-local panels may claim the drop (image sources go to
+        // the import wizard instead of the image viewer).
+        let dropped = paths.paths().to_vec();
+        if self
+            .workspace
+            .update(cx, |workspace, cx| {
+                workspace.intercept_external_drop(&dropped, window, cx)
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+
         let mut to_pane = cx.entity();
         let mut split_direction = self.drag_split_direction;
         let paths = paths.paths().to_vec();

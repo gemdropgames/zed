@@ -87,7 +87,8 @@ use std::sync::Arc;
 use editor::Editor;
 use gpui::{
     Action, App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    FocusHandle, Focusable, Hsla, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent,
     MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent,
     Styled, Task, WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb,
     rgba, size,
@@ -99,8 +100,8 @@ use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::sprites::import::{
-    Mode, Region, WizardState, existing_collisions, join_dest_path, slice_to_tiles,
-    source_rel_if_in_project, sprite_import, uniform_rects,
+    Mode, Region, WizardState, existing_collisions, is_importable_source, join_dest_path,
+    slice_to_tiles, source_rel_if_in_project, sprite_import, uniform_rects,
 };
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::{PAL_SLOTS, slot_rgba};
@@ -111,7 +112,15 @@ actions!(
         /// Toggles focus on the GGO import panel.
         ToggleFocus,
         /// Writes the pending import to its `.til`/`.pal`.
-        Import
+        Import,
+        /// Clears the crop rectangle.
+        ClearCrop,
+        /// Opens the file picker for a source image.
+        ChooseSource,
+        /// Zooms the source canvas in.
+        ZoomIn,
+        /// Zooms the source canvas out.
+        ZoomOut,
     ]
 );
 
@@ -166,6 +175,7 @@ pub fn init(cx: &mut App) {
     // at one. Importing is an explicit, destination-writing action, so it
     // gets an explicit menu entry.
     workspace::register_context_menu_contributor(cx, contribute_import_menu);
+    workspace::register_external_drop_interceptor(cx, intercept_image_drop);
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -183,15 +193,60 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// No panel-specific keybinds: the two destination fields are read straight
-/// off their editors on every render (`sync_dest_fields`), so there is
-/// nothing for Enter to "apply", and Import is button-only (it writes files;
-/// a stray keystroke should not). Kept as its own fn -- rather than inlined
-/// into `init` -- so it matches the other GGO panels' shape exactly: `init`
-/// calls it once at startup AND the `KeymapEventChannel` observer calls it
-/// again on every reload.
+/// The wizard's keys, scoped to [`KEY_CONTEXT`]. `init` calls this once at
+/// startup AND the `KeymapEventChannel` observer calls it again on every
+/// reload. Enter imports: it only fires with the panel focused and a
+/// committable wizard, so a stray keystroke elsewhere writes nothing.
 fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([]);
+    cx.bind_keys([
+        KeyBinding::new("enter", Import, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", ClearCrop, Some(KEY_CONTEXT)),
+        KeyBinding::new("delete", ClearCrop, Some(KEY_CONTEXT)),
+        KeyBinding::new("backspace", ClearCrop, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-o", ChooseSource, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-o", ChooseSource, Some(KEY_CONTEXT)),
+        KeyBinding::new("=", ZoomIn, Some(KEY_CONTEXT)),
+        KeyBinding::new("+", ZoomIn, Some(KEY_CONTEXT)),
+        KeyBinding::new("-", ZoomOut, Some(KEY_CONTEXT)),
+    ]);
+}
+
+/// Is `path` a source the wizard reads (by extension)?
+fn is_importable_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_importable_source)
+}
+
+/// `workspace::ExternalDropInterceptor`: a drop made only of image sources
+/// opens the first in the wizard. Anything else (a `.rs`, a mixed drop)
+/// is left to upstream, which opens the files as tabs.
+fn intercept_image_drop(
+    workspace: &mut Workspace,
+    paths: &[PathBuf],
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let Some(first) = paths.first() else {
+        return false;
+    };
+    if !paths.iter().all(|path| is_importable_path(path)) {
+        return false;
+    }
+    let Some(panel) = workspace.panel::<ImportPanel>(cx) else {
+        return false;
+    };
+    let ignored = paths.len() - 1;
+    panel.update(cx, |panel, cx| {
+        // The drop can land before the panel was ever activated.
+        panel.refresh_root(cx);
+        panel.open_abs_source(first.clone(), cx);
+        if ignored > 0 {
+            panel.status = Some(format!("{ignored} more dropped file(s) ignored — one source at a time"));
+        }
+    });
+    workspace.focus_panel::<ImportPanel>(window, cx);
+    true
 }
 
 /// Does `path` name a PNG? One rule, so the menu predicate and the tests
@@ -1815,6 +1870,12 @@ impl Render for ImportPanel {
             .size_full()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Import, window, cx| this.import_impl(window, cx)))
+            .on_action(cx.listener(|this, _: &ClearCrop, _window, cx| this.clear_crop(cx)))
+            .on_action(cx.listener(|this, _: &ChooseSource, window, cx| {
+                this.pick_source(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.step_zoom(1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.step_zoom(-1, cx)))
             .bg(cx.theme().colors().panel_background)
             .child(div().flex_1().min_h_0().child(body))
     }
@@ -3422,5 +3483,74 @@ mod tests {
              the asset rel -- the asset rel `art/hero.til` names no file in \
              the worktree"
         );
+    }
+
+    // ------------------------------------------------- drop + keys (task 6)
+
+    #[test]
+    fn importable_paths_are_png_and_aseprite() {
+        assert!(is_importable_path(Path::new("/a/b.PNG")));
+        assert!(is_importable_path(Path::new("c.aseprite")));
+        assert!(!is_importable_path(Path::new("c.png.txt")));
+        assert!(!is_importable_path(Path::new("/dir")));
+    }
+
+    #[gpui::test]
+    async fn test_an_image_drop_is_claimed_and_opens_the_wizard(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _, cx) = routed_workspace(cx, dir.path()).await;
+        let png = dir.path().join("art/outside.png");
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_external_drop(&[png.clone(), png.clone()], window, cx)
+        });
+        assert!(claimed);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(panel.state, ViewerState::Ready(_)), "the first drop opened");
+            assert!(panel.status.as_deref().unwrap_or("").contains("1 more"));
+        });
+
+        let text = dir.path().join("assets/notes.txt");
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_external_drop(&[png, text], window, cx)
+        });
+        assert!(!claimed, "a mixed drop is upstream's");
+    }
+
+    #[gpui::test]
+    async fn test_escape_clears_the_crop_and_minus_zooms_out(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        write_project(dir.path());
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ImportPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        cx.update(|window, _| window.activate_window());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.wizard.commit_region(Some(Region { x: 0, y: 0, w: 2, h: 2 }));
+                open.zoom = 3;
+            }
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("-");
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.wizard.region, None, "escape cleared the crop");
+            assert_eq!(open.zoom, 2, "minus zoomed out");
+        });
     }
 }

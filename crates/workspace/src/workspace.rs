@@ -1011,6 +1011,47 @@ impl Workspace {
 // GGO: end of the fork-local open-interceptor block opened above. Everything
 // between the two markers is ours; nothing outside them was touched.
 
+// GGO: fork-local interceptors for files dropped from the OS onto a pane. A
+// registered fn is offered the dropped paths and returns `true` when it took
+// them (the import panel claims image sources); `false` falls through to
+// upstream's open-paths behaviour. Same shape as the path-open interceptors.
+pub type ExternalDropInterceptor =
+    fn(&mut Workspace, &[PathBuf], &mut Window, &mut Context<Workspace>) -> bool;
+
+#[derive(Default)]
+struct ExternalDropInterceptors(Vec<ExternalDropInterceptor>);
+
+impl Global for ExternalDropInterceptors {}
+
+/// Registers an [`ExternalDropInterceptor`] for the app. GGO.
+pub fn register_external_drop_interceptor(cx: &mut App, interceptor: ExternalDropInterceptor) {
+    cx.default_global::<ExternalDropInterceptors>()
+        .0
+        .push(interceptor);
+}
+
+impl Workspace {
+    /// Offers the dropped `paths` to every registered
+    /// [`ExternalDropInterceptor`], returning `true` as soon as one claims
+    /// them. `false` (always, with an empty registry) means "open them the
+    /// normal way". GGO.
+    pub fn intercept_external_drop(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let interceptors = match cx.try_global::<ExternalDropInterceptors>() {
+            Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+            _ => return false,
+        };
+        interceptors
+            .iter()
+            .any(|intercept| intercept(self, paths, window, cx))
+    }
+}
+// GGO: end of the external-drop interceptor block.
+
 // GGO: fork-local project-panel context-menu contributors. A registered fn is
 // offered the right-clicked path and returns the entries it wants appended to
 // the menu -- "Delete World" on a world `.toml`, "Import as tileset…" on a
