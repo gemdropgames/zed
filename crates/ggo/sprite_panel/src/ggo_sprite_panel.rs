@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable,
-    IntoElement, KeyBinding, KeyContext, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    IntoElement, KeyContext, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Render, RenderImage, Styled, Subscription, Task, WeakEntity, Window, actions, div, img, px,
 };
 use project::ProjectPath;
@@ -130,15 +130,6 @@ const CLIPS_WIDTH: Pixels = px(148.);
 const TICK: Duration = Duration::from_millis(16);
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as `ggo_world_panel::init`: `zed::reload_keymaps` clears
-    // and rebuilds ALL key bindings on every keymap/settings change
-    // (including once at startup), and keymap assets are upstream files
-    // this fork doesn't edit. Re-running `bind_panel_keys` on
-    // `KeymapEventChannel` keeps the panel's bindings alive across
-    // reloads.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
 
     // Explorer-driven routing: clicking a `.spr` in the project panel loads
     // it HERE instead of opening a (binary, unreadable) editor tab. This is
@@ -866,43 +857,6 @@ fn rename_seed(source_rel: &str) -> String {
         .to_string()
 }
 
-fn bind_panel_keys(cx: &mut App) {
-    // All scoped to the panel's key context. Space additionally requires
-    // `not_editing` (the panel's dispatch context stamps `editing` while
-    // any clip/duration field editor is focused, project_panel's
-    // `not_editing` pattern) -- otherwise a panel-depth space binding
-    // would win over a focused editor's plain-character input, since no
-    // deeper binding shadows it. Ctrl-z/ctrl-s DON'T need the guard: the
-    // default keymap binds them at the deeper `Editor` context, which
-    // takes precedence while a field editor is focused. Enter is bound at
-    // `KEY_CONTEXT > Editor` (single-line editors leave Enter unbound --
-    // `editor::Newline` is `mode == full` only), committing the focused
-    // field. `ToggleFocus` stays unbound, dispatched via
-    // `Panel::toggle_action` / the command palette.
-    cx.bind_keys([
-        KeyBinding::new(
-            "space",
-            PlayPause,
-            Some(&format!("{KEY_CONTEXT} && not_editing")),
-        ),
-        KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
-        KeyBinding::new(
-            "enter",
-            CommitField,
-            Some(&format!("{KEY_CONTEXT} > Editor")),
-        ),
-        // Escape drops the active tile selection (the click-doesn't-
-        // mutate affordance). No `not_editing` guard needed: while a
-        // field editor is focused, the default keymap's deeper
-        // `Editor`-context escape binding wins.
-        KeyBinding::new("escape", DeselectTile, Some(KEY_CONTEXT)),
-    ]);
-}
 
 // ------------------------------------------------------------- view state
 
@@ -3239,15 +3193,27 @@ impl SpritePanel {
                 |this, d, cx| this.update_onion(|s| s.step_fwd(d), cx),
                 cx,
             ))
-            .child(Self::stepper(
-                "ggo-sprite-onion-opacity",
-                format!("{}%", (o.opacity * 100.0).round() as i32),
-                o.can_step_opacity(-1),
-                o.can_step_opacity(1),
-                "Ghost opacity",
-                |this, d, cx| this.update_onion(|s| s.step_opacity(d), cx),
-                cx,
-            ))
+            .child({
+                let weak = cx.weak_entity();
+                h_flex()
+                    .gap_0p5()
+                    .items_center()
+                    .child(
+                        Label::new(format!("{}%", (o.opacity * 100.0).round() as i32))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        ui::Slider::new("ggo-sprite-onion-opacity", o.opacity)
+                            .width(px(72.))
+                            .on_change(move |value, _window, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.update_onion(|s| s.set_opacity(value), cx)
+                                })
+                                .ok();
+                            }),
+                    )
+            })
             .into_any_element()
     }
 
@@ -4408,6 +4374,7 @@ mod tests {
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
+        ggo_common::bind_default_keymap(cx);
     }
 
     /// Author a real 2-frame sprite trio (`.spr`/`.til`/`.pal`) via
@@ -4471,6 +4438,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         write_sprite_fixture(root);
         let root = root.to_path_buf();
@@ -4780,6 +4748,7 @@ mod tests {
             AppState::test(cx);
             if run_init {
                 init(cx);
+                ggo_common::bind_default_keymap(cx);
             }
         });
 
@@ -5905,6 +5874,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let dir = tempfile::tempdir().unwrap();
         write_sprite_fixture(dir.path());
@@ -6050,6 +6020,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let dir = tempfile::tempdir().unwrap();
         write_sprite_fixture(dir.path());
@@ -7215,6 +7186,7 @@ mod tests {
             AppState::test(cx);
             project_panel::init(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(

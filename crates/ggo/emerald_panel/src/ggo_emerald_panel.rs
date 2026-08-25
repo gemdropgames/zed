@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use editor::Editor;
 use gpui::{
     Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, KeyBinding, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window,
+    IntoElement, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window,
     actions, div, px,
 };
 
@@ -132,14 +132,6 @@ const CADENCES: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
 const EMPTY_MESSAGE: &str = "Right-click the project root or manifests/ → New Component…, or an assets directory → New World…";
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as every other GGO panel's `init`: `zed::reload_keymaps`
-    // clears and rebuilds ALL key bindings on every keymap/settings change
-    // (including once at startup), and keymap assets are upstream files
-    // this fork doesn't edit. Re-running `bind_panel_keys` on
-    // `KeymapEventChannel` keeps the panel's bindings alive across reloads.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
 
     // Right-clicking a directory offers the generate entries that belong
     // to it. Deliberately NOT a `register_path_open_interceptor`: this
@@ -308,20 +300,6 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
     ))
 }
 
-/// Enter submits the open form.
-///
-/// Scoped `KEY_CONTEXT > Editor` for the same reason `ggo_world_panel`
-/// scopes its own commit binding there: single-line editors don't bind
-/// Enter themselves (the default keymap's `enter -> editor::Newline` is
-/// `mode == full` only), so this fires while a form field is focused,
-/// which is the only time the form can be submitted from the keyboard.
-fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "enter",
-        Submit,
-        Some(&format!("{KEY_CONTEXT} > Editor")),
-    )]);
-}
 
 // -------------------------------------------------------- the context menu
 

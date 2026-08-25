@@ -91,7 +91,7 @@ use std::sync::Arc;
 use editor::Editor;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity,
-    FocusHandle, Focusable, Hsla, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent,
     MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent,
     Styled, Task, WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb,
@@ -135,7 +135,6 @@ actions!(
 /// The panel's key-dispatch context (`.key_context`), which the
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoImportPanel";
-const KEY_CONTEXT_NO_EDITOR: &str = "GgoImportPanel && !Editor";
 
 
 /// The assets subdirectory hanging off an emerald project root. Hardcoded
@@ -160,14 +159,6 @@ const PREVIEW_HEIGHT: Pixels = px(120.);
 const SWATCH_PX: f32 = 16.0;
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as every other GGO panel's `init`: `zed::reload_keymaps`
-    // clears and rebuilds ALL key bindings on every keymap/settings change
-    // (including once at startup), and keymap assets are upstream files this
-    // fork doesn't edit. Re-running `bind_panel_keys` on `KeymapEventChannel`
-    // keeps the panel's bindings alive across reloads.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
 
     // Right-clicking a `.png` offers "Import as tileset…". Deliberately NOT
     // a `register_path_open_interceptor`: a LEFT click on a `.png` must keep
@@ -197,26 +188,6 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// The wizard's keys, scoped to [`KEY_CONTEXT`]. `init` calls this once at
-/// startup AND the `KeymapEventChannel` observer calls it again on every
-/// reload. Enter imports: it only fires with the panel focused and a
-/// committable wizard, so a stray keystroke elsewhere writes nothing.
-fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("enter", Import, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", ClearCrop, Some(KEY_CONTEXT)),
-        KeyBinding::new("delete", ClearCrop, Some(KEY_CONTEXT)),
-        KeyBinding::new("backspace", ClearCrop, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-o", ChooseSource, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-o", ChooseSource, Some(KEY_CONTEXT)),
-        // Not while a destination field has focus: `-`/`=` are typed there.
-        KeyBinding::new("=", ZoomIn, Some(KEY_CONTEXT_NO_EDITOR)),
-        KeyBinding::new("+", ZoomIn, Some(KEY_CONTEXT_NO_EDITOR)),
-        KeyBinding::new("-", ZoomOut, Some(KEY_CONTEXT_NO_EDITOR)),
-        KeyBinding::new("ctrl-r", Reimport, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-r", Reimport, Some(KEY_CONTEXT)),
-    ]);
-}
 
 /// Is `path` a source the wizard reads (by extension)?
 fn is_importable_path(path: &Path) -> bool {
@@ -1142,6 +1113,17 @@ impl ImportPanel {
         }
     }
 
+    /// Set the zoom outright (the slider), clamped.
+    fn set_zoom(&mut self, zoom: usize, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            let next = zoom.clamp(geom::MIN_ZOOM, geom::MAX_ZOOM);
+            if next != open.zoom {
+                open.zoom = next;
+                cx.notify();
+            }
+        }
+    }
+
     /// Wheel zoom anchored on the cursor ([`geom::zoom_at`]).
     fn zoom_at_cursor(&mut self, delta: isize, cursor: [f32; 2], cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
@@ -1634,20 +1616,22 @@ impl ImportPanel {
                             .disabled(open.wizard.region.is_none())
                             .on_click(cx.listener(|this, _, _, cx| this.clear_crop(cx))),
                     )
-                    .child(
-                        IconButton::new("ggo-import-zoom-out", IconName::Dash)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Zoom out"))
-                            .disabled(open.zoom <= geom::MIN_ZOOM)
-                            .on_click(cx.listener(|this, _, _, cx| this.step_zoom(-1, cx))),
-                    )
                     .child(Label::new(format!("{}x", open.zoom)).size(LabelSize::XSmall))
                     .child(
-                        IconButton::new("ggo-import-zoom-in", IconName::Plus)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Zoom in"))
-                            .disabled(open.zoom >= geom::MAX_ZOOM)
-                            .on_click(cx.listener(|this, _, _, cx| this.step_zoom(1, cx))),
+                        ui::Slider::new(
+                            "ggo-import-zoom",
+                            (open.zoom - geom::MIN_ZOOM) as f32
+                                / (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32,
+                        )
+                        .width(px(72.))
+                        .on_change({
+                            let weak = cx.weak_entity();
+                            move |value, _window, cx| {
+                                let span = (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32;
+                                let zoom = geom::MIN_ZOOM + (value * span).round() as usize;
+                                weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
+                            }
+                        }),
                     ),
             )
             .into_any_element()
@@ -2398,6 +2382,7 @@ mod tests {
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
+        ggo_common::bind_default_keymap(cx);
     }
 
     /// Proves the panel is registered on a real workspace, and that
@@ -2410,6 +2395,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -3452,6 +3438,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let dir = tempfile::tempdir().unwrap();
         write_project(dir.path());
@@ -3526,6 +3513,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
             // The handoff target. Registering it here is also what proves
             // the two panels can coexist in one workspace.
             ggo_tileset_panel::init(cx);
@@ -3717,6 +3705,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         write_project(dir.path());
         let root = dir.path().to_path_buf();
@@ -3901,6 +3890,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         write_project(dir.path());
         let root = dir.path().to_path_buf();

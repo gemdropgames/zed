@@ -93,7 +93,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseMoveEvent,
+    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseMoveEvent,
     Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription, Task,
     WeakEntity, Window, actions, div, point, px, size,
 };
@@ -154,14 +154,6 @@ const DEBUG_COLUMN_PX: f32 = 360.0;
 const DEBUG_SWATCH_PX: f32 = 12.0;
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as the other GGO panels' `init`: `zed::reload_keymaps`
-    // clears and rebuilds ALL key bindings on every keymap/settings
-    // change (including once at startup), and keymap assets are upstream
-    // files this fork doesn't edit. Re-running `bind_panel_keys` on
-    // `KeymapEventChannel` is what keeps Run/Stop alive across reloads.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
 
     // Explorer-driven routing: clicking a `.cart` in the project panel
     // selects it HERE instead of opening a (binary, unreadable) editor tab.
@@ -269,30 +261,6 @@ fn intercept_cart_open(
     })
 }
 
-/// Transport bindings only. The 18 pad keys are deliberately NOT
-/// `KeyBinding`s: an action fires on press and has no release event, and
-/// the pad mask is level-triggered (the cart asks "is A held right now"),
-/// so they go through `on_key_down`/`on_key_up`/`on_modifiers_changed`
-/// listeners on the focus-tracked root instead -- see [`EmuPanel::render`]
-/// and [`input`].
-///
-/// `ctrl-alt-` rather than anything shorter, for two reasons. Every bare
-/// letter is a pad key while the pane is focused, and a binding would
-/// swallow the keystroke before the pad listener saw it; and shift is
-/// SELECT, so any shift chord would latch a button as a side effect of
-/// running the cart. `ToggleFocus` stays unbound, dispatched via
-/// `Panel::toggle_action` / the command palette, exactly as the other
-/// three GGO panels leave it.
-fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-alt-r", Run, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-alt-s", Stop, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-alt-m", ToggleMute, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-alt-p", TogglePause, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-alt-.", StepFrame, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-alt-d", ToggleDebug, Some(KEY_CONTEXT)),
-    ]);
-}
 
 // ------------------------------------------------------------- view state
 
@@ -2447,6 +2415,7 @@ mod tests {
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
+        ggo_common::bind_default_keymap(cx);
     }
 
     /// Get (creating on first call) THE center-pane emulator item's
@@ -2477,6 +2446,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
 
         let fs = FakeFs::new(cx.executor());
@@ -3207,6 +3177,7 @@ mod tests {
             AppState::test(cx);
             if run_init {
                 init(cx);
+                ggo_common::bind_default_keymap(cx);
             }
         });
 
@@ -4035,6 +4006,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
             ggo_world_panel::init(cx);
             ggo_charts_panel::init(cx);
         });
@@ -4832,6 +4804,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
         cx.update(|window, _| window.activate_window());
@@ -4886,6 +4859,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
         cx.update(|window, _| window.activate_window());
@@ -4945,6 +4919,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
         cx.update(|window, _| window.activate_window());
@@ -5021,6 +4996,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
         cx.update(|window, _| window.activate_window());
@@ -5128,6 +5104,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
         cx.update(|window, _| window.activate_window());

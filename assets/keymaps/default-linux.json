@@ -1615,4 +1615,139 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  // GGO: the fork's panels (bound here, not in code, so the keymap editor sees them)
+  {
+    "context": "GgoMapPanel",
+    "bindings": {
+      "ctrl-z": "ggo_map::Undo",
+      "ctrl-shift-z": "ggo_map::Redo",
+      "ctrl-s": "ggo_map::Save",
+      "ctrl-c": "ggo_map::Copy",
+      "ctrl-v": "ggo_map::Paste",
+      "delete": "ggo_map::DeleteSelection",
+      "backspace": "ggo_map::DeleteSelection",
+      "escape": "ggo_map::ClearSelection",
+    },
+  },
+  {
+    "context": "GgoMapPanel > Editor",
+    "bindings": {
+      "enter": "ggo_map::ApplyResize",
+    },
+  },
+  {
+    "context": "GgoTilesetPanel",
+    "bindings": {
+      "left": "ggo_tileset::ScrollLeft",
+      "right": "ggo_tileset::ScrollRight",
+      "up": "ggo_tileset::ScrollUp",
+      "down": "ggo_tileset::ScrollDown",
+      "[": "ggo_tileset::BrushSmaller",
+      "]": "ggo_tileset::BrushLarger",
+      "shift-h": "ggo_tileset::FlipHorizontal",
+      "shift-v": "ggo_tileset::FlipVertical",
+      "escape": "ggo_tileset::Cancel",
+      "f": "ggo_tileset::FocusTile",
+      "ctrl-z": "ggo_tileset::Undo",
+      "ctrl-shift-z": "ggo_tileset::Redo",
+      "ctrl-s": "ggo_tileset::Save",
+      "ctrl-c": "ggo_tileset::CopySelection",
+      "ctrl-v": "ggo_tileset::PasteSelection",
+    },
+  },
+  {
+    "context": "GgoImportPanel",
+    "bindings": {
+      "enter": "ggo_import::Import",
+      "escape": "ggo_import::ClearCrop",
+      "delete": "ggo_import::ClearCrop",
+      "backspace": "ggo_import::ClearCrop",
+      "ctrl-o": "ggo_import::ChooseSource",
+      "ctrl-r": "ggo_import::Reimport",
+    },
+  },
+  {
+    "context": "GgoImportPanel && !Editor",
+    "bindings": {
+      "=": "ggo_import::ZoomIn",
+      "+": "ggo_import::ZoomIn",
+      "-": "ggo_import::ZoomOut",
+    },
+  },
+  {
+    "context": "GgoSpritePanel",
+    "bindings": {
+      "escape": "ggo_sprite::DeselectTile",
+      "ctrl-z": "ggo_sprite::Undo",
+      "ctrl-shift-z": "ggo_sprite::Redo",
+      "ctrl-s": "ggo_sprite::Save",
+    },
+  },
+  {
+    "context": "GgoSpritePanel && not_editing",
+    "bindings": {
+      "space": "ggo_sprite::PlayPause",
+    },
+  },
+  {
+    "context": "GgoSpritePanel > Editor",
+    "bindings": {
+      "enter": "ggo_sprite::CommitField",
+    },
+  },
+  {
+    "context": "GgoWorldPanel",
+    "bindings": {
+      "delete": "ggo_world::DeleteSelected",
+      "backspace": "ggo_world::DeleteSelected",
+      "escape": "ggo_world::ClearSelection",
+      "left": "ggo_world::NudgeLeft",
+      "right": "ggo_world::NudgeRight",
+      "up": "ggo_world::NudgeUp",
+      "down": "ggo_world::NudgeDown",
+      "shift-left": "ggo_world::NudgeLeftTile",
+      "shift-right": "ggo_world::NudgeRightTile",
+      "shift-up": "ggo_world::NudgeUpTile",
+      "shift-down": "ggo_world::NudgeDownTile",
+      "ctrl-z": "ggo_world::Undo",
+      "ctrl-shift-z": "ggo_world::Redo",
+      "ctrl-s": "ggo_world::Save",
+      "ctrl-a": "ggo_world::SelectAll",
+      "ctrl-c": "ggo_world::Copy",
+      "ctrl-v": "ggo_world::Paste",
+      "ctrl-d": "ggo_world::Duplicate",
+    },
+  },
+  {
+    "context": "GgoWorldPanel > Editor",
+    "bindings": {
+      "enter": "ggo_world::CommitField",
+      "tab": "ggo_world::FocusNextField",
+      "shift-tab": "ggo_world::FocusPrevField",
+    },
+  },
+  {
+    "context": "GgoEmuPanel",
+    "bindings": {
+      "ctrl-alt-r": "ggo_emu::Run",
+      "ctrl-alt-s": "ggo_emu::Stop",
+      "ctrl-alt-m": "ggo_emu::ToggleMute",
+      "ctrl-alt-p": "ggo_emu::TogglePause",
+      "ctrl-alt-.": "ggo_emu::StepFrame",
+      "ctrl-alt-d": "ggo_emu::ToggleDebug",
+    },
+  },
+  {
+    "context": "GgoAudioPanel",
+    "bindings": {
+      "space": "ggo_audio::PlayStop",
+      "l": "ggo_audio::ToggleLoop",
+    },
+  },
+  {
+    "context": "GgoEmeraldPanel > Editor",
+    "bindings": {
+      "enter": "ggo_emerald::Submit",
+    },
+  },
 ]

@@ -224,20 +224,9 @@ const NO_RERUN_PATH: &str = "no cart path recorded for this run, so it cannot be
 /// registry is empty when `ggo_emu_panel::init` never ran.
 const NO_CART_RUNNER: &str = "no emulator pane is available to run this cart";
 
-pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as `ggo_world_panel::init`/`ggo_sprite_panel::init`:
-    // `zed::reload_keymaps` clears and rebuilds ALL key bindings on every
-    // keymap/settings change (including once at startup), and keymap
-    // assets are upstream files this fork doesn't edit. Re-running
-    // `bind_panel_keys` on `KeymapEventChannel` keeps the panel's
-    // bindings alive across reloads -- required scaffolding for any
-    // panel with keybinds even before it has any (C2 will add chart
-    // interaction keys here).
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
-
-}
+/// Nothing to register: the reports tab opens from the emulator and
+/// the keybindings live in the keymap assets.
+pub fn init(_cx: &mut App) {}
 
 /// Open (or focus) THE center-pane reports tab and run `f` against its
 /// panel -- the reports view is a singleton item, so the emulator's
@@ -275,15 +264,6 @@ pub fn open_charts_item(
     true
 }
 
-/// No panel-specific keybinds exist yet: run selection is a click and
-/// the chart readout follows the pointer, so nothing in this panel is
-/// reachable only by key. Kept as its own fn (rather than inlined into `init`)
-/// so it matches `ggo_world_panel`/`ggo_sprite_panel`'s shape
-/// exactly: `init` calls it once at startup AND the `KeymapEventChannel`
-/// observer calls it again on every reload.
-fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([]);
-}
 
 // ------------------------------------------------------------- view state
 

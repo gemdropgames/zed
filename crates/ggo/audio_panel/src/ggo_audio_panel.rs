@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use editor::Editor;
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render, Styled,
+    App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
     Task, WeakEntity, Window, actions, div, point, px, size,
 };
 use project::ProjectPath;
@@ -66,21 +66,9 @@ const WAVEFORM_HEIGHT_PX: f32 = 160.0;
 const PLAYHEAD_TICK: Duration = Duration::from_millis(33);
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as every other GGO panel: `zed::reload_keymaps` clears and
-    // rebuilds ALL bindings on every keymap/settings change, so re-bind on
-    // `KeymapEventChannel`.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
     workspace::register_path_open_interceptor(cx, intercept_audio_open);
 }
 
-fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("space", PlayStop, Some(KEY_CONTEXT)),
-        KeyBinding::new("l", ToggleLoop, Some(KEY_CONTEXT)),
-    ]);
-}
 
 /// Whether `path` is a file this tab opens (extension only, case-insensitive).
 pub fn claims(path: &Path) -> bool {

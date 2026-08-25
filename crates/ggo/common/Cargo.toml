@@ -12,6 +12,8 @@ workspace = true
 path = "src/ggo_common.rs"
 
 [dependencies]
+log.workspace = true
+settings.workspace = true # GGO -- `bind_default_keymap` for panel tests
 gpui.workspace = true
 schemars.workspace = true # GGO -- the `ReimportTileset` Action derive
 serde.workspace = true

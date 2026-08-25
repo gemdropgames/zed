@@ -7586,10 +7586,12 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "image",
+ "log",
  "path",
  "project",
  "schemars 1.0.4",
  "serde",
+ "settings",
  "smol",
  "tempfile",
  "ui",

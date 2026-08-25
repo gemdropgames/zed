@@ -48,7 +48,7 @@ use std::sync::Arc;
 use editor::Editor;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity,
-    FocusHandle, Focusable, Hsla, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent,
     Styled, Task, WeakEntity, Window, actions, bounds, div, fill, outline, point, px, size,
 };
@@ -112,14 +112,6 @@ const ASSETS_DIR: &str = "assets";
 const EMPTY_MESSAGE: &str = "Open a .map file from the project panel";
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as every other GGO panel's `init`: `zed::reload_keymaps`
-    // clears and rebuilds ALL key bindings on every keymap/settings change
-    // (including once at startup), and keymap assets are upstream files
-    // this fork doesn't edit. Re-running `bind_panel_keys` on
-    // `KeymapEventChannel` keeps the panel's bindings alive across reloads.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
 
     // Explorer-driven routing: clicking a `.map` in the project panel loads
     // it HERE instead of opening a (binary, unreadable) editor tab. This is
@@ -184,31 +176,6 @@ fn create_blank_map(project_root: &Path, source_rel: &str) -> Option<()> {
     Some(())
 }
 
-fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-c", Copy, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-c", Copy, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-v", Paste, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-v", Paste, Some(KEY_CONTEXT)),
-        KeyBinding::new("delete", DeleteSelection, Some(KEY_CONTEXT)),
-        KeyBinding::new("backspace", DeleteSelection, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", ClearSelection, Some(KEY_CONTEXT)),
-        // Single-line editors don't bind Enter themselves (the default
-        // keymap's `enter -> editor::Newline` is `mode == full` only), so
-        // this fires while a resize field is focused.
-        KeyBinding::new(
-            "enter",
-            ApplyResize,
-            Some(&format!("{KEY_CONTEXT} > Editor")),
-        ),
-    ]);
-}
 
 /// Does `path` name a map? The one rule, shared by the open interceptor and
 /// (indirectly) by everything else that asks.
@@ -1805,18 +1772,22 @@ impl MapPanel {
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
-            .child(
-                IconButton::new("ggo-map-pal-down", IconName::Dash)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(pal_sub == geom::PAL_SUB_MIN)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_pal_sub(-1, cx))),
-            )
             .child(Label::new(pal_sub.to_string()).size(LabelSize::XSmall))
             .child(
-                IconButton::new("ggo-map-pal-up", IconName::Plus)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(pal_sub >= geom::PAL_SUB_MAX)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_pal_sub(1, cx))),
+                ui::Slider::new(
+                    "ggo-map-pal-sub",
+                    (pal_sub - geom::PAL_SUB_MIN) as f32
+                        / (geom::PAL_SUB_MAX - geom::PAL_SUB_MIN) as f32,
+                )
+                .width(px(64.))
+                .on_change({
+                    let weak = cx.weak_entity();
+                    move |value, _window, cx| {
+                        let span = (geom::PAL_SUB_MAX - geom::PAL_SUB_MIN) as f32;
+                        let pal_sub = geom::PAL_SUB_MIN + (value * span).round() as u16;
+                        weak.update(cx, |this, cx| this.set_pal_sub(pal_sub, cx)).ok();
+                    }
+                }),
             )
             .child(
                 Checkbox::new("ggo-map-grid", ToggleState::from(grid))
@@ -1832,18 +1803,21 @@ impl MapPanel {
                         .ok();
                     }),
             )
-            .child(
-                IconButton::new("ggo-map-zoom-out", IconName::Dash)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(zoom <= geom::MIN_ZOOM)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_zoom(-1, cx))),
-            )
             .child(Label::new(format!("{zoom}x")).size(LabelSize::XSmall))
             .child(
-                IconButton::new("ggo-map-zoom-in", IconName::Plus)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(zoom >= geom::MAX_ZOOM)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_zoom(1, cx))),
+                ui::Slider::new(
+                    "ggo-map-zoom",
+                    (zoom - geom::MIN_ZOOM) as f32 / (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32,
+                )
+                .width(px(64.))
+                .on_change({
+                    let weak = cx.weak_entity();
+                    move |value, _window, cx| {
+                        let span = (geom::MAX_ZOOM - geom::MIN_ZOOM) as f32;
+                        let zoom = geom::MIN_ZOOM + (value * span).round() as usize;
+                        weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
+                    }
+                }),
             )
             .into_any_element()
     }
@@ -1861,6 +1835,7 @@ impl MapPanel {
         }
     }
 
+    #[cfg(test)]
     fn step_zoom(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state {
             let next = geom::zoom_by(open.zoom, delta);
@@ -1871,9 +1846,20 @@ impl MapPanel {
         }
     }
 
-    fn step_pal_sub(&mut self, delta: i32, cx: &mut Context<Self>) {
+    /// Set the zoom outright (the slider), clamped to the ladder.
+    fn set_zoom(&mut self, zoom: usize, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state {
-            let next = geom::pal_sub_by(open.pal_sub, delta);
+            let next = zoom.clamp(geom::MIN_ZOOM, geom::MAX_ZOOM);
+            if next != open.zoom {
+                open.zoom = next;
+                cx.notify();
+            }
+        }
+    }
+
+    fn set_pal_sub(&mut self, pal_sub: u16, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            let next = pal_sub.clamp(geom::PAL_SUB_MIN, geom::PAL_SUB_MAX);
             if next != open.pal_sub {
                 open.pal_sub = next;
                 cx.notify();
@@ -2707,6 +2693,7 @@ mod tests {
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
+        ggo_common::bind_default_keymap(cx);
     }
 
 
@@ -3721,6 +3708,7 @@ mod tests {
             AppState::test(cx);
             project_panel::init(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -4202,6 +4190,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         write_project(root);
         let root = root.to_path_buf();

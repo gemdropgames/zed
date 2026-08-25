@@ -91,6 +91,18 @@ pub fn thumbnail_rgba(rgba: &[u8], w: usize, h: usize, size: usize) -> Vec<u8> {
     out
 }
 
+/// Bind the default Linux keymap asset -- what the app does at startup and
+/// what a panel test needs before it can simulate keystrokes, now that the
+/// GGO bindings live in `assets/keymaps/` rather than in each panel's
+/// `init`. Bindings whose actions are not linked into the test binary are
+/// skipped (`load_asset_allow_partial_failure`).
+pub fn bind_default_keymap(cx: &mut App) {
+    match settings::KeymapFile::load_asset_allow_partial_failure("keymaps/default-linux.json", cx) {
+        Ok(bindings) => cx.bind_keys(bindings),
+        Err(e) => log::error!("GGO: default keymap failed to load: {e}"),
+    }
+}
+
 // --------------------------------------------------------- shared db path
 
 /// Database filename under `~/.ggo/`, matching `ggo-ide`'s

@@ -123,6 +123,7 @@ pub fn zoom_at(pan: [f32; 2], zoom: usize, cursor: [f32; 2], new_zoom: usize) ->
     ]
 }
 
+    #[cfg(test)]
 /// Step the brush's palSub by `delta`, clamped to the 4-bit field.
 pub fn pal_sub_by(pal_sub: u16, delta: i32) -> u16 {
     (pal_sub as i32 + delta).clamp(PAL_SUB_MIN as i32, PAL_SUB_MAX as i32) as u16

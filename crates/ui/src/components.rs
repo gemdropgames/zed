@@ -33,6 +33,7 @@ mod project_empty_state;
 mod redistributable_columns;
 mod right_click_menu;
 mod scrollbar;
+mod slider; // GGO
 mod stack;
 mod sticky_items;
 mod tab;
@@ -76,6 +77,7 @@ pub use project_empty_state::*;
 pub use redistributable_columns::*;
 pub use right_click_menu::*;
 pub use scrollbar::*;
+pub use slider::*; // GGO
 pub use stack::*;
 pub use sticky_items::*;
 pub use tab::*;

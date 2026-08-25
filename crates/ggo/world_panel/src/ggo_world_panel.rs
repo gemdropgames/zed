@@ -39,7 +39,7 @@ use editor::{Editor, EditorEvent};
 use gpui::{
     ClipboardItem,
     Action, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task,
     WeakEntity, Window, actions, div, px,
 };
@@ -134,15 +134,6 @@ const LIST_WIDTH: Pixels = px(140.);
 const PASTE_OFFSET_PX: f64 = 16.0;
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // `zed::reload_keymaps` CLEARS all key bindings and rebuilds them from
-    // keymap files on every keymap/settings change (including once at
-    // startup) -- and this fork's rule is that keymap assets are upstream
-    // files we don't edit. `KeymapEventChannel` is triggered at the end of
-    // every such reload, so re-adding our panel-scoped bindings there
-    // keeps them alive without touching any upstream keymap.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
 
     // Explorer-driven routing: clicking a `**/worlds/**/*.toml` in the project
     // panel loads it HERE instead of opening a TOML editor tab. This is the
@@ -489,62 +480,6 @@ fn delete_world_handler(
     })
 }
 
-fn bind_panel_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
-        // Panel-focused only: an inspector field editor's own (deeper)
-        // Editor-context bindings win while typing.
-        KeyBinding::new("delete", DeleteSelected, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-a", SelectAll, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-a", SelectAll, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", ClearSelection, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-c", Copy, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-c", Copy, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-v", Paste, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-v", Paste, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-d", Duplicate, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-d", Duplicate, Some(KEY_CONTEXT)),
-        KeyBinding::new("backspace", DeleteSelected, Some(KEY_CONTEXT)),
-        // Arrow-key nudge, same panel-focused-only rule: the arrows keep
-        // moving the cursor while an inspector field editor has focus,
-        // because `Editor` is the deeper context.
-        KeyBinding::new("left", NudgeLeft, Some(KEY_CONTEXT)),
-        KeyBinding::new("right", NudgeRight, Some(KEY_CONTEXT)),
-        KeyBinding::new("up", NudgeUp, Some(KEY_CONTEXT)),
-        KeyBinding::new("down", NudgeDown, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-left", NudgeLeftTile, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-right", NudgeRightTile, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-up", NudgeUpTile, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-down", NudgeDownTile, Some(KEY_CONTEXT)),
-        // Single-line editors don't bind Enter themselves (the default
-        // keymap's `enter -> editor::Newline` is `mode == full` only), so
-        // this fires while an inspector field editor is focused.
-        KeyBinding::new(
-            "enter",
-            CommitField,
-            Some(&format!("{KEY_CONTEXT} > Editor")),
-        ),
-        // These outrank the default keymap's `Editor`-context
-        // `tab -> editor::Tab`: same dispatch depth (both match at the
-        // editor node), and later-added bindings win -- `init` re-adds
-        // these after every keymap reload.
-        KeyBinding::new(
-            "tab",
-            FocusNextField,
-            Some(&format!("{KEY_CONTEXT} > Editor")),
-        ),
-        KeyBinding::new(
-            "shift-tab",
-            FocusPrevField,
-            Some(&format!("{KEY_CONTEXT} > Editor")),
-        ),
-    ]);
-}
 
 // ------------------------------------------------------------- view state
 
@@ -1759,6 +1694,7 @@ impl WorldPanel {
         cx.notify();
     }
 
+    #[cfg(test)]
     fn step_zoom(&mut self, dir: i32, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
@@ -3325,59 +3261,23 @@ impl WorldPanel {
                             .ok();
                     }),
             )
-            .child(
-                IconButton::new("ggo-world-zoom-minus", IconName::Dash)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(ui::Tooltip::text("Zoom out"))
-                    .disabled(zoom <= canvas::ZOOM_MIN)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_zoom(-1, cx))),
-            )
-            .child(
-                // The zoom bar: one segment per ladder level, filled up to
-                // the current zoom. Click or drag across segments to set the
-                // level directly -- per-segment mouse handlers, so no
-                // track-bounds math and drag needs no capture (the segment
-                // under the cursor hears the move).
-                h_flex()
-                    .gap_0p5()
-                    .children(
-                        canvas::ZOOM_LEVELS
-                            .iter()
-                            .enumerate()
-                            .map(|(index, &level)| {
-                                let filled = level <= zoom + 1e-9;
-                                div()
-                                    .id(("ggo-world-zoom-bar", index))
-                                    .w(px(6.0))
-                                    .h(px(10.0))
-                                    .rounded_xs()
-                                    .bg(if filled {
-                                        cx.theme().colors().text_accent
-                                    } else {
-                                        cx.theme().colors().element_background
-                                    })
-                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| this.set_zoom(level, cx)),
-                                    )
-                                    .on_mouse_move(cx.listener(
-                                        move |this, event: &MouseMoveEvent, _, cx| {
-                                            if event.pressed_button == Some(MouseButton::Left) {
-                                                this.set_zoom(level, cx);
-                                            }
-                                        },
-                                    ))
-                            }),
-                    ),
-            )
-            .child(
-                IconButton::new("ggo-world-zoom-plus", IconName::Plus)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(ui::Tooltip::text("Zoom in"))
-                    .disabled(zoom >= canvas::ZOOM_MAX)
-                    .on_click(cx.listener(|this, _, _, cx| this.step_zoom(1, cx))),
-            )
+            .child({
+                // The slider walks the zoom ladder: one notch per level.
+                let levels = canvas::ZOOM_LEVELS;
+                let last = levels.len().saturating_sub(1).max(1);
+                let index = levels
+                    .iter()
+                    .position(|&level| (level - zoom).abs() < 1e-9)
+                    .unwrap_or_else(|| levels.iter().filter(|&&level| level < zoom).count());
+                let weak = cx.weak_entity();
+                ui::Slider::new("ggo-world-zoom", index as f32 / last as f32)
+                    .width(px(72.))
+                    .on_change(move |value, _window, cx| {
+                        let index = (value * last as f32).round() as usize;
+                        let level = levels[index.min(levels.len() - 1)];
+                        weak.update(cx, |this, cx| this.set_zoom(level, cx)).ok();
+                    })
+            })
             .child(
                 Label::new(format!("{:.0}%", zoom * 100.0))
                     .size(LabelSize::XSmall)
@@ -4142,6 +4042,7 @@ mod tests {
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
+        ggo_common::bind_default_keymap(cx);
     }
 
     /// Proves the panel is registered on a real workspace, and that
@@ -4157,6 +4058,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
 
         let fs = FakeFs::new(cx.executor());
@@ -5063,6 +4965,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
         write_fixture(root);
         let root = root.to_path_buf();
@@ -6522,6 +6425,7 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
+            ggo_common::bind_default_keymap(cx);
         });
 
         let fs = FakeFs::new(cx.executor());
@@ -6684,6 +6588,7 @@ mod tests {
             editor::init(cx);
             if run_init {
                 init(cx);
+                ggo_common::bind_default_keymap(cx);
             }
         });
 

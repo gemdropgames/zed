@@ -34,7 +34,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding,
+    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage,
     ScrollHandle, Styled, Task, WeakEntity, Window, actions, div, img, point, px,
 };
@@ -123,45 +123,11 @@ const EDGE_BAR_PX: f32 = 18.0;
 const TILESET_EXT: &str = "til";
 
 pub fn init(cx: &mut App) {
-    bind_panel_keys(cx);
-    // Same rule as every other GGO panel's `init`: `zed::reload_keymaps`
-    // clears and rebuilds ALL key bindings on every keymap/settings change
-    // (including once at startup), so re-running `bind_panel_keys` on
-    // `KeymapEventChannel` keeps the editor's bindings alive across
-    // reloads.
-    cx.observe_global::<keymap_editor::KeymapEventChannel>(bind_panel_keys)
-        .detach();
-
     // Explorer-driven routing: clicking a `.til` in the project panel opens
     // the tileset editor tab instead of a (binary, unreadable) text buffer.
     workspace::register_path_open_interceptor(cx, intercept_tileset_open);
 }
 
-fn bind_panel_keys(cx: &mut App) {
-    // Ctrl-z/ctrl-s need no `not_editing` guard: the editor hosts no
-    // field editors, so nothing deeper ever shadows these.
-    cx.bind_keys([
-        KeyBinding::new("ctrl-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-s", Save, Some(KEY_CONTEXT)),
-        KeyBinding::new("left", ScrollLeft, Some(KEY_CONTEXT)),
-        KeyBinding::new("right", ScrollRight, Some(KEY_CONTEXT)),
-        KeyBinding::new("up", ScrollUp, Some(KEY_CONTEXT)),
-        KeyBinding::new("down", ScrollDown, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-c", CopySelection, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-c", CopySelection, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-v", PasteSelection, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-v", PasteSelection, Some(KEY_CONTEXT)),
-        KeyBinding::new("[", BrushSmaller, Some(KEY_CONTEXT)),
-        KeyBinding::new("]", BrushLarger, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-h", FlipHorizontal, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-v", FlipVertical, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", Cancel, Some(KEY_CONTEXT)),
-        KeyBinding::new("f", FocusTile, Some(KEY_CONTEXT)),
-    ]);
-}
 
 /// `workspace::PathOpenInterceptor` for `*.til`: claim the path and open
 /// (or focus) its center-pane editor tab. Declines (so the normal open
@@ -529,11 +495,25 @@ impl TilesetPanel {
 
     /// Step the zoom by `delta` steps, clamped to [`MIN_ZOOM`]..=[`MAX_ZOOM`].
     fn zoom_by(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(zoom) = self.ready_zoom() else {
+            return;
+        };
+        self.set_zoom((zoom as isize + delta).max(MIN_ZOOM as isize) as usize, cx);
+    }
+
+    fn ready_zoom(&self) -> Option<usize> {
+        match &self.state {
+            ViewerState::Ready(open) => Some(open.zoom),
+            _ => None,
+        }
+    }
+
+    /// Set the zoom outright (the slider), clamped; persists like a step.
+    fn set_zoom(&mut self, zoom: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let next =
-            (open.zoom as isize + delta).clamp(MIN_ZOOM as isize, MAX_ZOOM as isize) as usize;
+        let next = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         if next != open.zoom {
             open.zoom = next;
             cx.notify();
@@ -1690,20 +1670,17 @@ impl TilesetPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.focus_tile_impl(cx))),
             })
             .child(div().w_2())
-            .child(
-                IconButton::new("ggo-tileset-zoom-out", IconName::Dash)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(open.zoom <= MIN_ZOOM)
-                    .tooltip(ui::Tooltip::text("Zoom out"))
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(-1, cx))),
-            )
             .child(Label::new(zoom_label).size(LabelSize::XSmall))
             .child(
-                IconButton::new("ggo-tileset-zoom-in", IconName::Plus)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(open.zoom >= MAX_ZOOM)
-                    .tooltip(ui::Tooltip::text("Zoom in"))
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1, cx))),
+                ui::Slider::new("ggo-tileset-zoom", zoom_fraction(open.zoom, MIN_ZOOM, MAX_ZOOM))
+                    .width(px(72.))
+                    .on_change({
+                        let weak = cx.weak_entity();
+                        move |value, _window, cx| {
+                            let zoom = zoom_from_fraction(value, MIN_ZOOM, MAX_ZOOM);
+                            weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
+                        }
+                    }),
             )
             .child(
                 IconButton::new("ggo-tileset-lines", IconName::Hash)
@@ -2012,6 +1989,18 @@ fn sheet_to_doc(
             (tile < tile_count).then_some((tile, sx % TILE_PX, sy % TILE_PX))
         }
     }
+}
+
+/// Integer range <-> slider fraction, shared by every zoom / palSub slider.
+fn zoom_fraction(value: usize, min: usize, max: usize) -> f32 {
+    if max <= min {
+        return 0.0;
+    }
+    (value.clamp(min, max) - min) as f32 / (max - min) as f32
+}
+
+fn zoom_from_fraction(fraction: f32, min: usize, max: usize) -> usize {
+    min + (fraction.clamp(0.0, 1.0) * (max - min) as f32).round() as usize
 }
 
 #[cfg(test)]

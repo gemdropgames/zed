@@ -141,6 +141,15 @@ impl OnionState {
 
     /// Step opacity by `steps` x [`OPACITY_STEP`], clamped to the range --
     /// the stepper standing in for ggo-ide's slider (module doc).
+    /// Set the opacity outright (a slider), quantised to [`OPACITY_STEP`]
+    /// so the readout and the stepper agree.
+    pub fn set_opacity(&mut self, opacity: f32) {
+        let quantized = (opacity / OPACITY_STEP).round() * OPACITY_STEP;
+        self.opacity = quantized.clamp(OPACITY_MIN, OPACITY_MAX);
+    }
+
+    /// Kept for the tests that pin the step quantisation; the panel uses `set_opacity`.
+    #[cfg(test)]
     pub fn step_opacity(&mut self, steps: i32) {
         let next = self.opacity + steps as f32 * OPACITY_STEP;
         // Re-quantize onto the step ladder so repeated float adds can't
@@ -159,6 +168,8 @@ impl OnionState {
         clamp_count(i64::from(self.fwd) + i64::from(delta)) != self.fwd
     }
 
+    /// Kept for the tests that pin the step quantisation; the panel uses `set_opacity`.
+    #[cfg(test)]
     pub fn can_step_opacity(&self, steps: i32) -> bool {
         let mut probe = *self;
         probe.step_opacity(steps);
