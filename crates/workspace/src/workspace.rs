@@ -26,6 +26,7 @@ mod theme_preview;
 mod toast_layer;
 mod toolbar;
 pub mod welcome;
+pub mod ggo_thumbnails; // GGO
 pub mod workspace_error;
 mod workspace_settings;
 

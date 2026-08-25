@@ -65,6 +65,31 @@ pub fn to_render_image(rgba: &[u8], w: u32, h: u32) -> Option<Arc<RenderImage>> 
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
 }
 
+/// Nearest-neighbour fit of an RGBA image into a `size x size` square,
+/// letterboxed with transparent pixels -- the project panel's thumbnail.
+pub fn thumbnail_rgba(rgba: &[u8], w: usize, h: usize, size: usize) -> Vec<u8> {
+    let mut out = vec![0u8; size * size * 4];
+    if w == 0 || h == 0 || size == 0 || rgba.len() < w * h * 4 {
+        return out;
+    }
+    let scale = (w.max(h) as f32 / size as f32).max(1.0 / size as f32);
+    let (fit_w, fit_h) = (
+        ((w as f32 / scale).round() as usize).clamp(1, size),
+        ((h as f32 / scale).round() as usize).clamp(1, size),
+    );
+    let (ox, oy) = ((size - fit_w) / 2, (size - fit_h) / 2);
+    for y in 0..fit_h {
+        let sy = (y * h / fit_h).min(h - 1);
+        for x in 0..fit_w {
+            let sx = (x * w / fit_w).min(w - 1);
+            let src = (sy * w + sx) * 4;
+            let dst = ((oy + y) * size + ox + x) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
+}
+
 // --------------------------------------------------------- shared db path
 
 /// Database filename under `~/.ggo/`, matching `ggo-ide`'s
@@ -850,6 +875,24 @@ pub fn pack_out_name(world_stem: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn thumbnail_rgba_fits_and_letterboxes() {
+        // 4x2 image: left half red, right half blue.
+        let mut src = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                src.extend_from_slice(if x < 2 { &[255, 0, 0, 255] } else { &[0, 0, 255, 255] });
+            }
+        }
+        let thumb = thumbnail_rgba(&src, 4, 2, 4);
+        let px = |x: usize, y: usize| &thumb[(y * 4 + x) * 4..][..4];
+        assert_eq!(px(0, 0), [0, 0, 0, 0], "letterbox row is transparent");
+        assert_eq!(px(0, 1), [255, 0, 0, 255]);
+        assert_eq!(px(3, 2), [0, 0, 255, 255]);
+        assert_eq!(px(0, 3), [0, 0, 0, 0]);
+        assert_eq!(thumbnail_rgba(&[], 0, 0, 2).len(), 16, "degenerate input is a blank square");
+    }
+
     /// The classic red/blue swap bug: RGBA in, BGRA out, alpha untouched.
     #[test]
     fn rgba_to_bgra_swaps_red_and_blue_only() {
@@ -1321,4 +1364,5 @@ impl ui::prelude::RenderOnce for CopyableText {
                     }),
             )
     }
+
 }

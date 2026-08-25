@@ -77,6 +77,7 @@
 //!   derives. The spec calls this out as an honest, permanent loss.
 
 mod geom;
+mod thumbnails;
 mod loader;
 
 use std::cell::RefCell;
@@ -182,6 +183,11 @@ pub fn init(cx: &mut App) {
     // gets an explicit menu entry.
     workspace::register_context_menu_contributor(cx, contribute_import_menu);
     workspace::register_external_drop_interceptor(cx, intercept_image_drop);
+    workspace::ggo_thumbnails::register_thumbnail_decoder(
+        cx,
+        thumbnails::EXTENSIONS,
+        thumbnails::decode_thumbnail,
+    );
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {

@@ -17,6 +17,7 @@ use fs::TrashId;
 use git;
 use git::status::GitSummary;
 use git_ui_core::file_diff_view::FileDiffView;
+use gpui::img as ggo_img; // GGO: thumbnail rows
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Bounds, ClipboardEntry as GpuiClipboardEntry,
     ClipboardItem, Context, CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter,
@@ -299,6 +300,8 @@ struct EntryDetails {
     is_private: bool,
     worktree_id: WorktreeId,
     canonical_path: Option<Arc<Path>>,
+    // GGO: a registered decoder's thumbnail for this file, replacing its icon.
+    ggo_thumbnail: Option<Arc<gpui::RenderImage>>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -819,6 +822,11 @@ impl ProjectPanel {
                 cx.notify();
             })
             .detach();
+
+            // GGO: re-render when a thumbnail decode lands.
+            if let Some(cache) = workspace::ggo_thumbnails::thumbnail_cache(cx) {
+                cx.observe(&cache, |_, _, cx| cx.notify()).detach();
+            }
 
             let mut project_panel_settings = *ProjectPanelSettings::get_global(cx);
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
@@ -5890,6 +5898,7 @@ impl ProjectPanel {
         let item_colors = get_item_color(is_sticky, cx);
 
         let canonical_path = details.canonical_path.clone();
+        let ggo_thumbnail = details.ggo_thumbnail.clone(); // GGO
         let path_style = self.project.read(cx).path_style(cx);
         let path = details.path.clone();
 
@@ -6405,7 +6414,10 @@ impl ProjectPanel {
                             )
                         },
                     )
-                    .child(if let Some(icon) = &icon {
+                    .child(if let Some(image) = &ggo_thumbnail {
+                        // GGO
+                        h_flex().child(ggo_img(image.clone()).size(IconSize::default().rems()))
+                    } else if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
                         {
@@ -6779,6 +6791,21 @@ impl ProjectPanel {
             }
         };
 
+        // GGO: fork-local decoders draw a thumbnail in place of the file icon.
+        let ggo_thumbnail = if entry.kind.is_file() {
+            workspace::ggo_thumbnails::thumbnail_cache(cx).and_then(|cache| {
+                let abs_path = self
+                    .project
+                    .read(cx)
+                    .worktree_for_id(worktree_id, cx)?
+                    .read(cx)
+                    .absolutize(&entry.path);
+                cache.update(cx, |cache, cx| cache.get(&abs_path, cx))
+            })
+        } else {
+            None
+        };
+
         let path_style = self.project.read(cx).path_style(cx);
         let (depth, difference) =
             ProjectPanel::calculate_depth_and_difference(entry, entries_paths);
@@ -6844,6 +6871,7 @@ impl ProjectPanel {
             is_private: entry.is_private,
             worktree_id,
             canonical_path: entry.canonical_path.clone(),
+            ggo_thumbnail, // GGO
         }
     }
 
