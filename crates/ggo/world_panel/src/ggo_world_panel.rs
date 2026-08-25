@@ -52,7 +52,8 @@ use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::merge_candidates::merge_candidates;
 use ggo_worldlib::render::{
-    AssetLoads, DrawItem, Selection, active_camera_origin, build_draw_list, hit_test, world_label,
+    AssetLoads, DrawItem, Selection, active_camera_origin, build_draw_list_multi, hit_test,
+    items_in_rect, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
 use ggo_worldlib::sprites::palette565;
@@ -83,6 +84,10 @@ actions!(
         FocusPrevField,
         /// Deletes the selected entity or instance from the open world.
         DeleteSelected,
+        /// Selects every entity and instance in the world.
+        SelectAll,
+        /// Clears the selection.
+        ClearSelection,
         /// Resets the canvas camera to the default framing.
         ResetView,
         /// Nudges the selection one pixel left.
@@ -483,6 +488,9 @@ fn bind_panel_keys(cx: &mut App) {
         // Panel-focused only: an inspector field editor's own (deeper)
         // Editor-context bindings win while typing.
         KeyBinding::new("delete", DeleteSelected, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-a", SelectAll, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-a", SelectAll, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", ClearSelection, Some(KEY_CONTEXT)),
         KeyBinding::new("backspace", DeleteSelected, Some(KEY_CONTEXT)),
         // Arrow-key nudge, same panel-focused-only rule: the arrows keep
         // moving the cursor while an inspector field editor has focus,
@@ -547,8 +555,21 @@ struct Drag {
 #[derive(Clone)]
 struct EditDrag {
     gesture_id: String,
+    /// The primary (last-selected) item's start position: the one the
+    /// snap applies to; the rest of the set follows by the same delta.
     start_pos: [f64; 2],
     start_world: [f64; 2],
+    /// Every selected item's start position, in selection order.
+    starts: Vec<(Selection, [f64; 2])>,
+}
+
+/// An in-flight rubber-band selection on empty canvas, in world coords.
+#[derive(Clone)]
+struct Marquee {
+    start: [f64; 2],
+    current: [f64; 2],
+    /// Shift held at mouse-down: the band ADDS to the selection.
+    additive: bool,
 }
 
 /// One inspector text input: which field it edits and the single-line
@@ -597,7 +618,10 @@ struct OpenWorld {
     /// once at load time -- see `canvas::build_image_cache`.
     images: Arc<HashMap<usize, Arc<RenderImage>>>,
     view: Rc<RefCell<ViewShared>>,
-    selected: Option<Selection>,
+    /// The selection SET, in selection order; the last entry is the
+    /// primary -- what the inspector edits and what a drag snaps.
+    selected: Vec<Selection>,
+    marquee: Option<Marquee>,
     snap: bool,
     /// Tile-grid overlay under the draw list -- ggo-ide `open.grid`, which
     /// also defaults ON.
@@ -686,7 +710,8 @@ impl OpenWorld {
                 last_bounds: None,
                 drag: None,
             })),
-            selected: None,
+            selected: Vec::new(),
+            marquee: None,
             snap: false,
             grid: true,
             edit_drag: None,
@@ -715,13 +740,86 @@ fn color565_rgba(c: u16) -> gpui::Rgba {
     }
 }
 
+/// The op that moves `primary` to `primary_pos` and every other item in
+/// `starts` by the same delta: the single-item ops when the set is one
+/// (unchanged undo behaviour), `MoveMany` otherwise. `starts` holds each
+/// item's position at the start of the gesture, so a coalesced drag
+/// stays anchored to where it began.
+fn move_ops(
+    starts: &[(Selection, [f64; 2])],
+    primary: Selection,
+    primary_pos: [f64; 2],
+    gesture: Option<String>,
+) -> WorldOp {
+    let primary_start = starts
+        .iter()
+        .find(|(t, _)| *t == primary)
+        .map(|(_, p)| *p)
+        .unwrap_or(primary_pos);
+    let delta = [primary_pos[0] - primary_start[0], primary_pos[1] - primary_start[1]];
+    if starts.len() <= 1 {
+        return match primary {
+            Selection::Entity(entity) => WorldOp::MoveEntity {
+                entity,
+                pos: primary_pos,
+                gesture,
+            },
+            Selection::Instance(index) => WorldOp::MoveInstance {
+                index,
+                pos: primary_pos,
+                gesture,
+            },
+        };
+    }
+    WorldOp::MoveMany {
+        moves: starts
+            .iter()
+            .map(|(target, start)| (*target, [start[0] + delta[0], start[1] + delta[1]]))
+            .collect(),
+        gesture,
+    }
+}
+
+/// One batch removing every selected item that still exists, entities
+/// and instances each in descending index order so earlier removals
+/// never shift a later index. `None` when nothing removable is selected.
+fn remove_selection_ops(
+    selected: &[Selection],
+    state: &ggo_worldlib::world_doc::WorldState,
+) -> Option<WorldOp> {
+    let mut entities: Vec<usize> = selected
+        .iter()
+        .filter_map(|s| match s {
+            Selection::Entity(i) if *i < state.entities.len() => Some(*i),
+            _ => None,
+        })
+        .collect();
+    let mut instances: Vec<usize> = selected
+        .iter()
+        .filter_map(|s| match s {
+            Selection::Instance(i) if *i < state.instances.len() => Some(*i),
+            _ => None,
+        })
+        .collect();
+    entities.sort_unstable_by(|a, b| b.cmp(a));
+    entities.dedup();
+    instances.sort_unstable_by(|a, b| b.cmp(a));
+    instances.dedup();
+    let ops: Vec<WorldOp> = entities
+        .into_iter()
+        .map(|index| WorldOp::RemoveEntity { index })
+        .chain(instances.into_iter().map(|index| WorldOp::RemoveInstance { index }))
+        .collect();
+    (!ops.is_empty()).then_some(WorldOp::Batch(ops))
+}
+
 /// The current paint-ordered draw list -- built fresh per use (render,
 /// hit test, tests), same per-frame-of-change cadence as ggo-ide.
 fn draw_items(open: &OpenWorld) -> Vec<DrawItem> {
-    build_draw_list(
+    build_draw_list_multi(
         &open.store.state(),
         &open.merged,
-        open.selected,
+        &open.selected,
         &open.sprite_loads,
         &open.map_loads,
         &open.meta_sprite_loads,
@@ -759,6 +857,43 @@ enum ViewerState {
     },
     Ready(Box<OpenWorld>),
     Error(String),
+}
+
+impl OpenWorld {
+    /// The last-selected item, if any.
+    fn primary(&self) -> Option<Selection> {
+        self.selected.last().copied()
+    }
+
+    /// Make `target` the primary: appended if new, moved to the end if
+    /// already selected.
+    fn select_primary(&mut self, target: Selection) {
+        self.selected.retain(|s| *s != target);
+        self.selected.push(target);
+    }
+
+    fn toggle_selected(&mut self, target: Selection) {
+        if self.selected.contains(&target) {
+            self.selected.retain(|s| *s != target);
+        } else {
+            self.selected.push(target);
+        }
+    }
+
+    /// The current position of every selected item that still exists.
+    fn selected_positions(&self) -> Vec<(Selection, [f64; 2])> {
+        let state = self.store.state();
+        self.selected
+            .iter()
+            .filter_map(|target| {
+                let pos = match *target {
+                    Selection::Entity(i) => inspector::entity_pos(&state, i),
+                    Selection::Instance(i) => state.instances.get(i).map(|inst| inst.pos),
+                }?;
+                Some((*target, pos))
+            })
+            .collect()
+    }
 }
 
 pub struct WorldPanel {
@@ -1107,7 +1242,7 @@ impl WorldPanel {
         let mut components = serde_json::Map::new();
         components.insert("Transform".to_string(), Value::Object(transform));
         open.store.apply(WorldOp::AddEntity { components });
-        open.selected = Some(Selection::Entity(open.store.state().entities.len() - 1));
+        open.selected = vec![Selection::Entity(open.store.state().entities.len() - 1)];
         open.edit_drag = None;
         open.nudge_gesture = None;
         cx.notify();
@@ -1149,7 +1284,7 @@ impl WorldPanel {
             pos: center,
             gesture: None,
         });
-        open.selected = Some(Selection::Instance(index));
+        open.selected = vec![Selection::Instance(index)];
         open.edit_drag = None;
         open.nudge_gesture = None;
 
@@ -1188,16 +1323,36 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        match open.selected {
-            Some(Selection::Entity(index)) if index < open.store.state().entities.len() => {
-                open.store.apply(WorldOp::RemoveEntity { index });
-            }
-            Some(Selection::Instance(index)) if index < open.store.state().instances.len() => {
-                open.store.apply(WorldOp::RemoveInstance { index });
-            }
-            _ => return,
-        }
-        open.selected = None;
+        let Some(batch) = remove_selection_ops(&open.selected, &open.store.state()) else {
+            return;
+        };
+        open.store.apply(batch);
+        open.selected.clear();
+        open.edit_drag = None;
+        open.nudge_gesture = None;
+        cx.notify();
+    }
+
+    fn select_all_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let state = open.store.state();
+        open.selected = (0..state.entities.len())
+            .map(Selection::Entity)
+            .chain((0..state.instances.len()).map(Selection::Instance))
+            .collect();
+        open.edit_drag = None;
+        open.nudge_gesture = None;
+        cx.notify();
+    }
+
+    fn clear_selection_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.selected.clear();
+        open.marquee = None;
         open.edit_drag = None;
         open.nudge_gesture = None;
         cx.notify();
@@ -1232,7 +1387,7 @@ impl WorldPanel {
         // `delta`'s sign is the world direction of the keypress, so the pan
         // step reuses it; the magnitude is the camera's own (screen px, not
         // the nudge's world px). No pan before first layout: nothing to do.
-        let Some(selection) = open.selected else {
+        let Some(selection) = open.primary() else {
             let step = if tile {
                 CAMERA_PAN_STEP_PX * 4.0
             } else {
@@ -1261,14 +1416,10 @@ impl WorldPanel {
             cx.notify();
             return;
         };
-        let state = open.store.state();
-        let pos = match selection {
-            Selection::Entity(index) => inspector::entity_pos(&state, index),
-            Selection::Instance(index) => state.instances.get(index).map(|inst| inst.pos),
-        };
+        let positions = open.selected_positions();
         // A selection gone stale against an undo/redo restructure, or an
         // entity with no Transform, has nothing to move.
-        let Some(pos) = pos else {
+        let Some((_, pos)) = positions.iter().find(|(target, _)| *target == selection) else {
             return;
         };
         let mut next = [pos[0] + delta[0], pos[1] + delta[1]];
@@ -1284,18 +1435,8 @@ impl WorldPanel {
                 id
             }
         };
-        match selection {
-            Selection::Entity(entity) => open.store.apply(WorldOp::MoveEntity {
-                entity,
-                pos: next,
-                gesture: Some(gesture),
-            }),
-            Selection::Instance(index) => open.store.apply(WorldOp::MoveInstance {
-                index,
-                pos: next,
-                gesture: Some(gesture),
-            }),
-        }
+        open.store
+            .apply(move_ops(&positions, selection, next, Some(gesture)));
         cx.notify();
     }
 
@@ -1625,7 +1766,15 @@ impl WorldPanel {
     /// coords, update the selection, and arm a placement drag on a hit --
     /// ggo-ide's `PrimaryDown` arm (minus its empty-space pan; panning is
     /// middle-drag here).
+    #[cfg(test)]
     fn canvas_primary_down(&mut self, local: [f64; 2], cx: &mut Context<Self>) {
+        self.canvas_primary_down_with(local, false, cx);
+    }
+
+    /// The real handler: `shift` toggles membership instead of replacing
+    /// the selection, and empty space starts a rubber-band (additive with
+    /// shift) instead of just deselecting.
+    fn canvas_primary_down_with(&mut self, local: [f64; 2], shift: bool, cx: &mut Context<Self>) {
         let Some(view) = self.canvas_view() else {
             return;
         };
@@ -1635,28 +1784,43 @@ impl WorldPanel {
         let world = drag_ops::screen_to_world(local[0], local[1], &view);
         let items = draw_items(open);
         let hit = hit_test(&items, world[0], world[1]);
-        open.selected = hit;
         // A click ends whatever nudge run was in flight, whether or not it
         // lands on the same item: the next arrow key starts a fresh undo
         // entry, not an amendment of one from before the click.
         open.nudge_gesture = None;
-        let start_pos = match hit {
-            Some(Selection::Entity(i)) => inspector::entity_pos(&open.store.state(), i),
-            Some(Selection::Instance(i)) => {
-                open.store.state().instances.get(i).map(|inst| inst.pos)
+        open.marquee = None;
+        match hit {
+            Some(target) if shift => open.toggle_selected(target),
+            // Clicking a member of the current set keeps the set (so the
+            // whole group drags); anything else replaces it.
+            Some(target) if open.selected.contains(&target) => open.select_primary(target),
+            Some(target) => open.selected = vec![target],
+            None => {
+                if !shift {
+                    open.selected.clear();
+                }
+                open.marquee = Some(Marquee {
+                    start: world,
+                    current: world,
+                    additive: shift,
+                });
             }
-            None => None,
-        };
-        open.edit_drag = match start_pos {
-            Some(start_pos) => {
+        }
+        let starts = open.selected_positions();
+        let primary_start = open
+            .primary()
+            .and_then(|p| starts.iter().find(|(t, _)| *t == p).map(|(_, pos)| *pos));
+        open.edit_drag = match (hit, primary_start) {
+            (Some(_), Some(start_pos)) if !starts.is_empty() => {
                 open.gesture_counter += 1;
                 Some(EditDrag {
                     gesture_id: format!("drag-{}", open.gesture_counter),
                     start_pos,
                     start_world: world,
+                    starts,
                 })
             }
-            None => None,
+            _ => None,
         };
         cx.notify();
     }
@@ -1672,23 +1836,50 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        let world = drag_ops::screen_to_world(local[0], local[1], &view);
+        if let Some(marquee) = &mut open.marquee {
+            marquee.current = world;
+            cx.notify();
+            return;
+        }
         let Some(drag) = open.edit_drag.clone() else {
             return;
         };
-        let world = drag_ops::screen_to_world(local[0], local[1], &view);
+        let Some(primary) = open.primary() else {
+            return;
+        };
         let pos = canvas::dragged_pos(drag.start_pos, drag.start_world, world, open.snap);
-        match open.selected {
-            Some(Selection::Entity(entity)) => open.store.apply(WorldOp::MoveEntity {
-                entity,
-                pos,
-                gesture: Some(drag.gesture_id),
-            }),
-            Some(Selection::Instance(index)) => open.store.apply(WorldOp::MoveInstance {
-                index,
-                pos,
-                gesture: Some(drag.gesture_id),
-            }),
-            None => {}
+        open.store
+            .apply(move_ops(&drag.starts, primary, pos, Some(drag.gesture_id)));
+        cx.notify();
+    }
+
+    /// Left button released over the canvas: a rubber-band settles into
+    /// the selection (bbox overlap; additive keeps what was there), a
+    /// placement drag simply ends.
+    fn canvas_primary_up(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.edit_drag = None;
+        let Some(marquee) = open.marquee.take() else {
+            return;
+        };
+        let items = draw_items(open);
+        let hits = items_in_rect(
+            &items,
+            marquee.start[0],
+            marquee.start[1],
+            marquee.current[0],
+            marquee.current[1],
+        );
+        if !marquee.additive {
+            open.selected.clear();
+        }
+        for hit in hits {
+            if !open.selected.contains(&hit) {
+                open.selected.push(hit);
+            }
         }
         cx.notify();
     }
@@ -1752,9 +1943,12 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return None;
         };
-        open.edit_drag.as_ref()?;
+        if open.edit_drag.is_none() && open.marquee.is_none() {
+            return None;
+        }
         if event.pressed_button != Some(MouseButton::Left) {
             open.edit_drag = None;
+            open.marquee = None;
             return None;
         }
         let v = open.view.borrow();
@@ -1777,7 +1971,7 @@ impl WorldPanel {
             return;
         };
         let state = open.store.state();
-        let specs = inspector::selection_field_specs(open.selected, &state, &open.schemas);
+        let specs = inspector::selection_field_specs(open.primary(), &state, &open.schemas);
         let same_targets = open.inspector.len() == specs.len()
             && open
                 .inspector
@@ -2539,7 +2733,7 @@ impl WorldPanel {
             unreachable!("render_toolbar is only called in the Ready state");
         };
         let dirty = open.store.state().dirty;
-        let has_selection = open.selected.is_some();
+        let has_selection = !open.selected.is_empty();
         let candidates = self.instance_candidates();
         let weak = cx.weak_entity();
 
@@ -2770,6 +2964,11 @@ impl WorldPanel {
         // per-frame-of-change rebuild; images inside are `Arc` clones.
         // Selection is threaded through so `build_draw_list` emits the
         // `SelectionOutline` overlay.
+        let marquee = open.marquee.as_ref().map(|m| {
+            let x0 = m.start[0].min(m.current[0]);
+            let y0 = m.start[1].min(m.current[1]);
+            [x0, y0, (m.start[0] - m.current[0]).abs(), (m.start[1] - m.current[1]).abs()]
+        });
         let items = draw_items(open);
         let screen_origin = active_camera_origin(&open.store.state());
         let world_center = canvas::camera_center(screen_origin);
@@ -2798,6 +2997,7 @@ impl WorldPanel {
                     zoom: v.zoom,
                     pan: v.pan.expect("initialized above"),
                     screen_origin,
+                    marquee,
                     grid,
                     background,
                     text_color,
@@ -2833,15 +3033,13 @@ impl WorldPanel {
                             f64::from(event.position.y - bounds.origin.y),
                         ]
                     };
-                    this.canvas_primary_down(local, cx);
+                    this.canvas_primary_down_with(local, event.modifiers.shift, cx);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                    if let ViewerState::Ready(open) = &mut this.state {
-                        open.edit_drag = None;
-                    }
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    this.canvas_primary_up(cx);
                 }),
             )
             .on_mouse_down(
@@ -3263,7 +3461,7 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        let selection = open.selected?;
+        let selection = open.primary()?;
         let editors: HashMap<inspector::FieldTarget, Entity<Editor>> = open
             .inspector
             .iter()
@@ -3334,6 +3532,10 @@ impl Render for WorldPanel {
             .size_full()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
+            .on_action(cx.listener(|this, _: &SelectAll, _window, cx| this.select_all_impl(cx)))
+            .on_action(cx.listener(|this, _: &ClearSelection, _window, cx| {
+                this.clear_selection_impl(cx)
+            }))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
             .on_action(
@@ -3737,7 +3939,7 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
-            assert_eq!(open.selected, Some(Selection::Entity(0)));
+            assert_eq!(open.selected, vec![Selection::Entity(0)]);
             assert!(
                 open.edit_drag.is_some(),
                 "a hit should also arm a placement drag"
@@ -3754,7 +3956,7 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
-            assert_eq!(open.selected, None, "empty-space click deselects");
+            assert!(open.selected.is_empty(), "empty-space click deselects");
             assert!(open.edit_drag.is_none());
             let items = draw_items(open);
             assert!(
@@ -3932,7 +4134,7 @@ mod tests {
                 let center = view_center_world(open);
                 let state = open.store.state();
                 assert_eq!(state.entities.len(), 4);
-                assert_eq!(open.selected, Some(Selection::Entity(3)));
+                assert_eq!(open.selected, vec![Selection::Entity(3)]);
                 assert!(state.dirty, "add dirties the doc");
                 let t = state.entities[3].components["Transform"]
                     .as_object()
@@ -3957,7 +4159,7 @@ mod tests {
                     panic!("expected Ready");
                 };
                 assert_eq!(open.store.state().entities.len(), 3);
-                assert_eq!(open.selected, None, "delete clears the selection");
+                assert!(open.selected.is_empty(), "delete clears the selection");
             }
 
             // Stale-selection guard: nothing selected => no-op.
@@ -4061,7 +4263,7 @@ mod tests {
                 assert_eq!(state.instances.len(), 2);
                 assert_eq!(state.instances[1].world, "worlds/sub");
                 assert_eq!(state.instances[1].pos, center);
-                assert_eq!(open.selected, Some(Selection::Instance(1)));
+                assert_eq!(open.selected, vec![Selection::Instance(1)]);
                 assert!(state.dirty);
             }
         });
@@ -4222,7 +4424,7 @@ mod tests {
             let ViewerState::Ready(open) = &mut panel.state else {
                 panic!("expected Ready");
             };
-            open.selected = Some(Selection::Entity(0));
+            open.selected = vec![Selection::Entity(0)];
             let state = open.store.state();
             let target = inspector::FieldTarget::EntityField {
                 entity: 0,
@@ -4262,7 +4464,7 @@ mod tests {
             let ViewerState::Ready(open) = &mut panel.state else {
                 panic!("expected Ready");
             };
-            open.selected = Some(Selection::Entity(2));
+            open.selected = vec![Selection::Entity(2)];
             assert_eq!(
                 inspector::field_kind(&open.schemas, "Camera", "is_active"),
                 Some(&FieldKind::Bool),
@@ -4316,7 +4518,7 @@ mod tests {
             let ViewerState::Ready(open) = &mut panel.state else {
                 panic!("expected Ready");
             };
-            open.selected = Some(Selection::Entity(0));
+            open.selected = vec![Selection::Entity(0)];
             assert!(
                 !open.store.state().entities[0]
                     .components
@@ -4419,7 +4621,7 @@ mod tests {
                 panic!("expected Ready state after load");
             };
             open.view.borrow_mut().pan = Some([0.0, 0.0]);
-            open.selected = Some(Selection::Entity(0));
+            open.selected = vec![Selection::Entity(0)];
             cx.notify();
         });
         cx.run_until_parked();
@@ -5272,7 +5474,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = None,
+                ViewerState::Ready(open) => open.selected.clear(),
                 _ => panic!("expected Ready"),
             }
             open_of(panel).view.borrow_mut().pan = Some([0.0, 0.0]);
@@ -5292,7 +5494,7 @@ mod tests {
 
             // Selected: the nudge path runs instead, camera stays put.
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                ViewerState::Ready(open) => open.selected = vec![Selection::Entity(0)],
                 _ => panic!("expected Ready"),
             }
             open_of(panel).view.borrow_mut().pan = Some([5.0, 6.0]);
@@ -5324,7 +5526,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let start = entity_pos_of(panel, 0);
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                ViewerState::Ready(open) => open.selected = vec![Selection::Entity(0)],
                 _ => panic!("expected Ready"),
             }
 
@@ -5375,7 +5577,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let start = entity_pos_of(panel, 0);
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                ViewerState::Ready(open) => open.selected = vec![Selection::Entity(0)],
                 _ => panic!("expected Ready"),
             }
             panel.nudge_impl("ArrowRight", false, cx);
@@ -5386,7 +5588,7 @@ mod tests {
             panel.canvas_primary_down([-9999.0, -9999.0], cx);
             assert!(open_of(panel).nudge_gesture.is_none());
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                ViewerState::Ready(open) => open.selected = vec![Selection::Entity(0)],
                 _ => panic!("expected Ready"),
             }
 
@@ -5413,14 +5615,14 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            assert!(open_of(panel).selected.is_none());
+            assert!(open_of(panel).selected.is_empty());
             panel.nudge_impl("ArrowRight", false, cx);
             assert!(!open_of(panel).store.state().dirty, "no selection, no op");
 
             // A stale selection index (undo/redo restructure) is guarded the
             // same way `delete_selected_impl` guards its own.
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(999)),
+                ViewerState::Ready(open) => open.selected = vec![Selection::Entity(999)],
                 _ => panic!("expected Ready"),
             }
             panel.nudge_impl("ArrowRight", false, cx);
@@ -5428,7 +5630,7 @@ mod tests {
 
             // A key that isn't an arrow resolves to no delta.
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = Some(Selection::Entity(0)),
+                ViewerState::Ready(open) => open.selected = vec![Selection::Entity(0)],
                 _ => panic!("expected Ready"),
             }
             panel.nudge_impl("Home", false, cx);
@@ -5446,7 +5648,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let start = open_of(panel).store.state().instances[0].pos;
             match &mut panel.state {
-                ViewerState::Ready(open) => open.selected = Some(Selection::Instance(0)),
+                ViewerState::Ready(open) => open.selected = vec![Selection::Instance(0)],
                 _ => panic!("expected Ready"),
             }
             panel.nudge_impl("ArrowLeft", false, cx);
@@ -5470,7 +5672,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             match &mut panel.state {
                 ViewerState::Ready(open) => {
-                    open.selected = Some(Selection::Entity(0));
+                    open.selected = vec![Selection::Entity(0)];
                     open.snap = true;
                 }
                 _ => panic!("expected Ready"),
@@ -6974,7 +7176,7 @@ mod tests {
                 2,
                 "delete must remove the selected entity"
             );
-            assert_eq!(open.selected, None, "nothing is left selected");
+            assert!(open.selected.is_empty(), "nothing is left selected");
         });
     }
 
@@ -7012,7 +7214,7 @@ mod tests {
             let ViewerState::Ready(open) = &mut panel.state else {
                 panic!("expected Ready");
             };
-            open.selected = None;
+            open.selected.clear();
             cx.notify();
         });
         cx.run_until_parked();
@@ -7149,6 +7351,7 @@ mod tests {
                 gesture_id: "g1".to_string(),
                 start_pos: [0.0, 0.0],
                 start_world: [0.0, 0.0],
+                starts: Vec::new(),
             });
 
             let held = move_event(52.0, 30.0, Some(MouseButton::Left));
@@ -7446,5 +7649,147 @@ mod tests {
         }
         assert_eq!(list_asset_stems(dir.path(), "spr"), vec!["sprites/hero".to_string()]);
         assert_eq!(list_asset_stems(dir.path(), "map"), vec!["sprites/map".to_string()]);
+    }
+
+    /// Shift-click toggles membership; a plain click on a member keeps the
+    /// set (and makes it primary); a plain click elsewhere replaces it.
+    #[gpui::test]
+    async fn test_shift_click_toggles_and_plain_click_replaces(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(0)]);
+            panel.canvas_primary_down_with([50., 12.], true, cx);
+            assert_eq!(
+                open_of(panel).selected,
+                vec![Selection::Entity(0), Selection::Entity(1)],
+                "shift adds"
+            );
+            assert_eq!(open_of(panel).primary(), Some(Selection::Entity(1)));
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            assert_eq!(
+                open_of(panel).selected,
+                vec![Selection::Entity(1), Selection::Entity(0)],
+                "a plain click on a member keeps the set and makes it primary"
+            );
+            panel.canvas_primary_down_with([50., 12.], true, cx);
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(0)], "shift removes");
+            panel.canvas_primary_down_with([50., 12.], false, cx);
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(1)], "plain replaces");
+        });
+    }
+
+    /// Empty-space drag rubber-bands: everything whose bbox the band
+    /// overlaps is selected; with shift the band adds to the set.
+    #[gpui::test]
+    async fn test_rubber_band_selects_by_overlap(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([150., 150.], false, cx);
+            assert!(open_of(panel).marquee.is_some(), "empty space arms a band");
+            assert!(open_of(panel).selected.is_empty());
+            panel.canvas_drag_to([0., 0.], cx);
+            panel.canvas_primary_up(cx);
+            let open = open_of(panel);
+            assert!(open.marquee.is_none());
+            assert!(open.selected.contains(&Selection::Entity(0)), "{:?}", open.selected);
+            assert!(open.selected.contains(&Selection::Entity(1)), "{:?}", open.selected);
+            assert!(open.selected.contains(&Selection::Entity(2)), "{:?}", open.selected);
+
+            // A tiny band on empty space clears (not additive).
+            panel.canvas_primary_down_with([150., 150.], false, cx);
+            panel.canvas_drag_to([151., 151.], cx);
+            panel.canvas_primary_up(cx);
+            assert!(open_of(panel).selected.is_empty());
+
+            // Additive band keeps a prior member.
+            panel.canvas_primary_down_with([50., 12.], false, cx);
+            panel.canvas_primary_down_with([150., 150.], true, cx);
+            panel.canvas_drag_to([0., 0.], cx);
+            panel.canvas_primary_up(cx);
+            let selected = &open_of(panel).selected;
+            assert_eq!(selected[0], Selection::Entity(1), "the prior member stays first");
+            assert!(selected.len() >= 3);
+        });
+    }
+
+    /// Dragging one member of a set moves the whole set by the same delta
+    /// and lands in ONE undo entry.
+    #[gpui::test]
+    async fn test_group_drag_moves_the_set_as_one_undo_entry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.select_all_impl(cx);
+            let before = open_of(panel).selected_positions();
+            assert!(before.len() >= 3);
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            assert_eq!(open_of(panel).selected.len(), before.len(), "clicking a member keeps the set");
+            panel.canvas_drag_to([26., 42.], cx);
+            panel.canvas_drag_to([42., 74.], cx);
+            let after = open_of(panel).selected_positions();
+            for (target, pos) in &before {
+                let moved = after.iter().find(|(t, _)| t == target).map(|(_, p)| *p).unwrap();
+                assert_eq!(moved, [pos[0] + 32.0, pos[1] + 64.0], "{target:?} moved by the delta");
+            }
+            panel.undo_impl(cx);
+            let restored = open_of(panel).selected_positions();
+            for (target, pos) in &before {
+                let now = restored.iter().find(|(t, _)| t == target).map(|(_, p)| *p).unwrap();
+                assert_eq!(now, *pos, "one undo restores {target:?}");
+            }
+            assert!(!open_of(panel).store.state().dirty, "one undo -> back at the save point");
+        });
+    }
+
+    /// Delete removes the whole set in one undo entry.
+    #[gpui::test]
+    async fn test_delete_removes_the_set_in_one_undo_entry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let entities = open_of(panel).store.state().entities.len();
+            let instances = open_of(panel).store.state().instances.len();
+            panel.select_all_impl(cx);
+            panel.delete_selected_impl(cx);
+            let state = open_of(panel).store.state();
+            assert!(state.entities.is_empty() && state.instances.is_empty());
+            assert!(open_of(panel).selected.is_empty());
+            panel.undo_impl(cx);
+            let state = open_of(panel).store.state();
+            assert_eq!((state.entities.len(), state.instances.len()), (entities, instances));
+            assert!(!state.dirty);
+        });
+    }
+
+    /// `ctrl-a` selects everything, `escape` clears, and the arrow keys
+    /// nudge the whole set.
+    #[gpui::test]
+    async fn test_select_all_escape_and_group_nudge_keys(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        focus_the_panel(&panel, cx);
+        cx.simulate_keystrokes("ctrl-a");
+        let (count, before) = panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            (open.selected.len(), open.selected_positions())
+        });
+        assert!(
+            count >= 3,
+            "ctrl-a selects everything, got {:?}",
+            panel.read_with(cx, |panel, _| open_of(panel).selected.clone())
+        );
+        cx.simulate_keystrokes("right right");
+        panel.read_with(cx, |panel, _| {
+            let after = open_of(panel).selected_positions();
+            for (target, pos) in &before {
+                let now = after.iter().find(|(t, _)| t == target).map(|(_, p)| *p).unwrap();
+                assert_eq!(now, [pos[0] + 2.0, pos[1]], "{target:?} nudged twice");
+            }
+        });
+        cx.simulate_keystrokes("escape");
+        panel.read_with(cx, |panel, _| assert!(open_of(panel).selected.is_empty()));
     }
 }

@@ -180,6 +180,8 @@ pub struct Scene {
     pub grid: bool,
     pub background: Hsla,
     pub text_color: Hsla,
+    /// An in-flight rubber-band, `[x, y, w, h]` in world px.
+    pub marquee: Option<[f64; 4]>,
 }
 
 pub fn paint_scene(
@@ -207,6 +209,10 @@ pub fn paint_scene(
                 paint_item(scene, item, &view, canvas_bounds, window, cx);
             }
             paint_device_screen(scene, &view, canvas_bounds, window, cx);
+            if let Some([x, y, w, h]) = scene.marquee {
+                let b = item_bounds(&view, canvas_bounds.origin, x, y, w, h);
+                window.paint_quad(outline(b, color(MARQUEE_COLOR), BorderStyle::default()));
+            }
         },
     );
 }
@@ -320,6 +326,8 @@ fn paint_item(
 const GRID_MAX_LINES: usize = 4096;
 
 const GRID_LINE_COLOR: u32 = 0x80808040;
+/// The rubber-band outline.
+const MARQUEE_COLOR: u32 = 0x88c0d0;
 
 /// World-space coordinates of the grid lines a `w` x `h` px canvas shows
 /// at `view`, as `(xs, ys)` -- ggo-ide's `draw_grid` walk, split out from
