@@ -54,6 +54,7 @@ use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState, Tooltip};
 
 use ggo_worldlib::sprites::terrain::{self, Terrain};
+use ggo_worldlib::sprites::tileset_meta::{load_tileset_meta, save_tileset_meta};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -578,6 +579,10 @@ struct OpenMap {
     /// The sidecar key for saving terrains; `None` outside the worktree.
     til_meta_rel: Option<String>,
     terrain_error: Option<String>,
+    /// The 8-neighbour mask the terrain editor assigns next.
+    mask_draft: u8,
+    /// The terrain editor's name input, created on the first Ready render.
+    terrain_name: Option<Entity<Editor>>,
     /// True between the canvas's own primary-down and its matching up, for
     /// EVERY tool -- ggo-ide's single `painting` flag, ported as one flag
     /// for the same reason: it gates brush/eraser continuing to apply,
@@ -622,6 +627,8 @@ impl OpenMap {
             terrain: None,
             til_meta_rel: loaded.til_meta_rel,
             terrain_error: None,
+            mask_draft: 0,
+            terrain_name: None,
             painting: false,
             resize: None,
             save_error: None,
@@ -1337,6 +1344,239 @@ impl MapPanel {
         }
     }
 
+    // ------------------------------------------------------------ terrains
+
+    /// The tile the terrain editor assigns: the stamp's first cell.
+    fn anchor_tile(open: &OpenMap) -> Option<u16> {
+        let cell = open.fill_cell();
+        (open.tileset.is_some() && cell != CELL_BLANK).then(|| unpack_cell(cell).tile)
+    }
+
+    fn terrain_name_text(&self, cx: &App) -> String {
+        self.ready_map()
+            .and_then(|open| open.terrain_name.as_ref())
+            .map(|editor| editor.read(cx).text(cx).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn add_terrain(&mut self, name: String, cx: &mut Context<Self>) {
+        if name.is_empty() {
+            return;
+        }
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.terrains.push(Terrain { name, tiles: vec![] });
+            open.terrain = Some(open.terrains.len() - 1);
+        }
+        self.save_terrains(cx);
+    }
+
+    fn rename_terrain(&mut self, name: String, cx: &mut Context<Self>) {
+        if name.is_empty() {
+            return;
+        }
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(terrain) = open.terrain.and_then(|i| open.terrains.get_mut(i))
+        {
+            terrain.name = name;
+            self.save_terrains(cx);
+        }
+    }
+
+    fn remove_terrain(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(index) = open.terrain.take()
+            && index < open.terrains.len()
+        {
+            open.terrains.remove(index);
+            self.save_terrains(cx);
+        }
+    }
+
+    fn select_terrain(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.terrain = (index < open.terrains.len()).then_some(index);
+            cx.notify();
+        }
+    }
+
+    /// Give the anchor tile the drafted mask in the selected terrain.
+    fn assign_anchor_tile(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(tile) = Self::anchor_tile(open)
+            && let Some(terrain) = open.terrain.and_then(|i| open.terrains.get_mut(i))
+        {
+            terrain.assign(tile, terrain::canonical(open.mask_draft));
+            self.save_terrains(cx);
+        }
+    }
+
+    fn unassign_tile(&mut self, tile: u16, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(terrain) = open.terrain.and_then(|i| open.terrains.get_mut(i))
+        {
+            terrain.remove_tile(tile);
+            self.save_terrains(cx);
+        }
+    }
+
+    /// Write the terrains into the bound tileset's editor sidecar,
+    /// keeping whatever else (zoom, cols) the tileset panel stored there.
+    fn save_terrains(&mut self, cx: &mut Context<Self>) {
+        let project_root = self.project_root.clone();
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.terrain_error = match (&project_root, &open.til_meta_rel) {
+            (Some(root), Some(rel)) => {
+                let mut meta = load_tileset_meta(root, rel);
+                meta.terrains = open.terrains.clone();
+                save_tileset_meta(root, rel, &meta).err()
+            }
+            _ => Some("tileset is outside the worktree; terrains not saved".to_string()),
+        };
+        cx.notify();
+    }
+
+    /// The terrain editor, shown while the Terrain tool is active.
+    fn render_terrains(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let open = self.ready_map().filter(|open| open.tool == MapTool::Terrain)?;
+        let selected = open.terrain.and_then(|i| open.terrains.get(i));
+        let anchor = Self::anchor_tile(open);
+        let mask = open.mask_draft;
+        let name_field = open.terrain_name.as_ref().map(|editor| {
+            div()
+                .w(px(120.))
+                .px_1()
+                .border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .rounded_sm()
+                .child(editor.clone())
+        });
+        // Rows of the 3x3 neighbour pad; the centre is the anchor tile.
+        let pad = [
+            [Some(terrain::NORTH_WEST), Some(terrain::NORTH), Some(terrain::NORTH_EAST)],
+            [Some(terrain::WEST), None, Some(terrain::EAST)],
+            [Some(terrain::SOUTH_WEST), Some(terrain::SOUTH), Some(terrain::SOUTH_EAST)],
+        ];
+        Some(
+            v_flex()
+                .gap_1()
+                .p_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(name_field)
+                        .child(Button::new("ggo-map-terrain-add", "Add").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                let name = this.terrain_name_text(cx);
+                                this.add_terrain(name, cx);
+                            },
+                        )))
+                        .child(
+                            Button::new("ggo-map-terrain-rename", "Rename")
+                                .disabled(selected.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let name = this.terrain_name_text(cx);
+                                    this.rename_terrain(name, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ggo-map-terrain-remove", "Remove")
+                                .disabled(selected.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| this.remove_terrain(cx))),
+                        )
+                        .children(open.terrains.iter().enumerate().map(|(i, t)| {
+                            Button::new(("ggo-map-terrain", i), t.name.clone())
+                                .toggle_state(open.terrain == Some(i))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_terrain(i, cx)
+                                }))
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(v_flex().children(pad.iter().enumerate().map(|(row, bits)| {
+                            h_flex().children(bits.iter().enumerate().map(|(col, bit)| {
+                                let id = ("ggo-map-mask", row * 3 + col);
+                                match bit {
+                                    Some(bit) => {
+                                        let bit = *bit;
+                                        Button::new(id, if mask & bit != 0 { "■" } else { "·" })
+                                            .toggle_state(mask & bit != 0)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let ViewerState::Ready(open) = &mut this.state {
+                                                    open.mask_draft ^= bit;
+                                                    cx.notify();
+                                                }
+                                            }))
+                                    }
+                                    None => Button::new(
+                                        id,
+                                        anchor.map_or("—".to_string(), |t| format!("T{t}")),
+                                    )
+                                    .disabled(true),
+                                }
+                            }))
+                        })))
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("ggo-map-terrain-assign", "Assign")
+                                        .disabled(selected.is_none() || anchor.is_none())
+                                        .tooltip(Tooltip::text(
+                                            "Give the stamp's first tile this neighbour mask",
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.assign_anchor_tile(cx)
+                                        })),
+                                )
+                                .child(
+                                    Label::new(terrain::mask_glyphs(terrain::canonical(mask)))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .child(h_flex().gap_1().flex_wrap().children(
+                            selected.into_iter().flat_map(|t| t.tiles.iter()).map(|tt| {
+                                let tile = tt.tile;
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new(format!(
+                                            "T{} {}",
+                                            tile,
+                                            terrain::mask_glyphs(tt.mask)
+                                        ))
+                                        .size(LabelSize::XSmall),
+                                    )
+                                    .child(
+                                        IconButton::new(
+                                            ("ggo-map-terrain-tile", tile as usize),
+                                            IconName::Close,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.unassign_tile(tile, cx)
+                                        })),
+                                    )
+                            }),
+                        )),
+                )
+                .children(open.terrain_error.as_ref().map(|e| {
+                    Label::new(e.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning)
+                }))
+                .into_any_element(),
+        )
+    }
+
     // -------------------------------------------------------- resize field
 
     /// Keep the two resize inputs in sync with the document: create them on
@@ -2023,6 +2263,7 @@ impl MapPanel {
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let header = self.render_header(cx);
         let tools = self.render_tools(cx);
+        let terrains = self.render_terrains(cx);
         let canvas = self.render_canvas(cx);
         let strip = self.render_strip(cx);
         let footer = self.render_footer(window, cx);
@@ -2030,6 +2271,7 @@ impl MapPanel {
             .size_full()
             .child(header)
             .child(tools)
+            .children(terrains)
             .child(div().flex_1().min_h_0().child(canvas))
             .child(strip)
             .child(footer)
@@ -2180,6 +2422,11 @@ fn paint_strip(scene: &StripScene, canvas: Bounds<Pixels>, window: &mut Window) 
 impl Render for MapPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_resize_fields(window, cx);
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.terrain_name.is_none()
+        {
+            open.terrain_name = Some(cx.new(|cx| Editor::single_line(window, cx)));
+        }
         let body = match &self.state {
             ViewerState::Empty => self.render_message(EMPTY_MESSAGE.to_string(), cx),
             ViewerState::Loading { rel_path } => {
@@ -4244,6 +4491,62 @@ mod tests {
 
             panel.clear_selection_impl(cx);
             assert_eq!(ready(panel).selection, None);
+        });
+    }
+
+    // --------------------------------------------------------- terrains
+
+    #[gpui::test]
+    async fn test_terrains_persist_to_the_sidecar_and_paint_by_neighbour_mask(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let tile = |c: u16| unpack_cell(c).tile;
+        let at = |x: i32, y: i32| y as usize * FIXTURE_W as usize + x as usize;
+        let sidecar = |root: &Path| {
+            ggo_worldlib::sprites::tileset_meta::load_tileset_meta(root, "assets/tiles/world.til")
+                .terrains
+        };
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(MapTool::Terrain, cx);
+            panel.add_terrain("ground".to_string(), cx);
+            assert_eq!(ready(panel).terrain, Some(0), "a new terrain is selected");
+            assert_eq!(sidecar(dir.path())[0].name, "ground");
+
+            // Tile 0 (the default stamp) is the isolated tile; 1 and 2
+            // are the east- and west-neighbour tiles.
+            panel.assign_anchor_tile(cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.terrains[0].assign(1, terrain::EAST);
+                open.terrains[0].assign(2, terrain::WEST);
+            }
+            panel.save_terrains(cx);
+            assert_eq!(sidecar(dir.path())[0].tiles.len(), 3);
+
+            panel.paint_at((0, 0), cx);
+            assert_eq!(tile(cells(panel)[at(0, 0)]), 0, "alone: the isolated tile");
+            panel.paint_at((1, 0), cx);
+            let now = cells(panel);
+            assert_eq!(tile(now[at(0, 0)]), 1, "gained an east neighbour");
+            assert_eq!(tile(now[at(1, 0)]), 2, "west neighbour");
+
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.paint_erase = true;
+            }
+            panel.paint_at((1, 0), cx);
+            let now = cells(panel);
+            assert_eq!(now[at(1, 0)], CELL_BLANK, "shift-paint erases");
+            assert_eq!(tile(now[at(0, 0)]), 0, "and re-resolves the neighbour");
+
+            panel.unassign_tile(2, cx);
+            panel.rename_terrain("dirt".to_string(), cx);
+            let saved = sidecar(dir.path());
+            assert_eq!(saved[0].name, "dirt");
+            assert_eq!(saved[0].tiles.len(), 2);
+            panel.remove_terrain(cx);
+            assert!(sidecar(dir.path()).is_empty());
+            assert_eq!(ready(panel).terrain, None);
         });
     }
 }
