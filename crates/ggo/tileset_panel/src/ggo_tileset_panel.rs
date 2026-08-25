@@ -83,6 +83,10 @@ actions!(
         BrushSmaller,
         /// Grows the brush by one pixel.
         BrushLarger,
+        /// Flips the selected region horizontally.
+        FlipHorizontal,
+        /// Flips the selected region vertically.
+        FlipVertical,
     ]
 );
 
@@ -145,6 +149,8 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("cmd-v", PasteSelection, Some(KEY_CONTEXT)),
         KeyBinding::new("[", BrushSmaller, Some(KEY_CONTEXT)),
         KeyBinding::new("]", BrushLarger, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-h", FlipHorizontal, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-v", FlipVertical, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -293,6 +299,9 @@ struct OpenTileset {
     mirror_v: bool,
     /// An in-progress Line/Rect/Ellipse drag, sheet-space (anchor, head).
     shape_drag: Option<((usize, usize), (usize, usize))>,
+    /// A Select-tool drag that started INSIDE the marquee: (start, head)
+    /// in sheet pixels; release moves the marquee's pixels by the offset.
+    move_drag: Option<((usize, usize), (usize, usize))>,
 }
 
 impl OpenTileset {
@@ -323,6 +332,15 @@ impl OpenTileset {
             mirror_h: false,
             mirror_v: false,
             shape_drag: None,
+            move_drag: None,
+        }
+    }
+
+    /// The move drag's offset so far.
+    fn move_offset(&self) -> (i32, i32) {
+        match self.move_drag {
+            Some(((sx, sy), (hx, hy))) => (hx as i32 - sx as i32, hy as i32 - sy as i32),
+            None => (0, 0),
         }
     }
 
@@ -732,8 +750,18 @@ impl TilesetPanel {
             }
             Tool::Select => {
                 let anchor = self.sheet_px_at(pos);
+                let inside = match (anchor, self.selection_rect()) {
+                    (Some((x, y)), Some((x0, y0, x1, y1))) => {
+                        (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
+                    }
+                    _ => false,
+                };
                 if let ViewerState::Ready(open) = &mut self.state {
-                    open.selection = anchor.map(|p| (p, p));
+                    if inside {
+                        open.move_drag = anchor.map(|p| (p, p));
+                    } else {
+                        open.selection = anchor.map(|p| (p, p));
+                    }
                     cx.notify();
                 }
             }
@@ -764,10 +792,12 @@ impl TilesetPanel {
             }
             Tool::Select => {
                 let head = self.sheet_px_at(pos);
-                if let (ViewerState::Ready(open), Some(head)) = (&mut self.state, head)
-                    && let Some((anchor, _)) = open.selection
-                {
-                    open.selection = Some((anchor, head));
+                if let (ViewerState::Ready(open), Some(head)) = (&mut self.state, head) {
+                    if let Some((start, _)) = open.move_drag {
+                        open.move_drag = Some((start, head));
+                    } else if let Some((anchor, _)) = open.selection {
+                        open.selection = Some((anchor, head));
+                    }
                     cx.notify();
                 }
             }
@@ -802,18 +832,14 @@ impl TilesetPanel {
         Some((ax.min(hx), ay.min(hy), ax.max(hx), ay.max(hy)))
     }
 
-    /// Copy the selected region into the internal clipboard, sampling the
-    /// doc through sheet coordinates (pad cells copy as 0).
-    fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        let Some((x0, y0, x1, y1)) = self.selection_rect() else {
-            return;
-        };
-        let state = match &self.state {
-            ViewerState::Ready(open) => open.store.state(),
-            _ => return,
-        };
+    /// The pixels of a sheet-space rect, row-major (pad cells read as 0).
+    fn region_pixels(&self, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> (usize, usize, Vec<u8>) {
         let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
         let mut data = vec![0u8; w * h];
+        let ViewerState::Ready(open) = &self.state else {
+            return (w, h, data);
+        };
+        let state = open.store.state();
         for dy in 0..h {
             for dx in 0..w {
                 if let Some((tile, px_x, px_y)) = self.doc_pixel(x0 + dx, y0 + dy) {
@@ -825,10 +851,123 @@ impl TilesetPanel {
                 }
             }
         }
+        (w, h, data)
+    }
+
+    /// Copy the selected region into the internal clipboard, sampling the
+    /// doc through sheet coordinates (pad cells copy as 0).
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(rect) = self.selection_rect() else {
+            return;
+        };
+        let region = self.region_pixels(rect);
         if let ViewerState::Ready(open) = &mut self.state {
-            open.clipboard = Some((w, h, data));
+            open.clipboard = Some(region);
             cx.notify();
         }
+    }
+
+    /// Write per-point colours as ONE undo step; later cells win.
+    fn write_cells(&mut self, cells: &[(i32, i32, u8)], cx: &mut Context<Self>) {
+        let writes: Vec<(usize, usize, usize, u8)> = cells
+            .iter()
+            .filter(|(x, y, _)| *x >= 0 && *y >= 0)
+            .filter_map(|&(x, y, c)| {
+                self.doc_pixel(x as usize, y as usize)
+                    .map(|(tile, px_x, px_y)| (tile, px_x, px_y, c))
+            })
+            .collect();
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if writes.is_empty() {
+            return;
+        }
+        open.store.begin_stroke();
+        for (tile, x, y, color) in writes {
+            open.store.apply_stroke_paint(tile, x, y, color);
+        }
+        open.store.end_stroke();
+        self.recompose_grid(cx);
+    }
+
+    /// Move the marquee's pixels by `(dx, dy)`: the source is cleared to
+    /// slot 0, the destination written over it, one undo step; the
+    /// marquee follows.
+    fn move_selection(&mut self, (dx, dy): (i32, i32), cx: &mut Context<Self>) {
+        let Some((x0, y0, x1, y1)) = self.selection_rect() else {
+            return;
+        };
+        if (dx, dy) == (0, 0) {
+            return;
+        }
+        let (w, h, data) = self.region_pixels((x0, y0, x1, y1));
+        let mut cells = Vec::with_capacity(w * h * 2);
+        for row in 0..h {
+            for col in 0..w {
+                cells.push(((x0 + col) as i32, (y0 + row) as i32, 0));
+            }
+        }
+        for row in 0..h {
+            for col in 0..w {
+                cells.push((
+                    (x0 + col) as i32 + dx,
+                    (y0 + row) as i32 + dy,
+                    data[row * w + col],
+                ));
+            }
+        }
+        self.write_cells(&cells, cx);
+        if let ViewerState::Ready(open) = &mut self.state {
+            let shift = |v: usize, d: i32| (v as i32 + d).max(0) as usize;
+            open.selection = Some(((shift(x0, dx), shift(y0, dy)), (shift(x1, dx), shift(y1, dy))));
+        }
+    }
+
+    /// Flip the marquee's pixels in place, one undo step.
+    fn flip_selection(&mut self, horizontal: bool, cx: &mut Context<Self>) {
+        let Some((x0, y0, x1, y1)) = self.selection_rect() else {
+            return;
+        };
+        let (w, h, data) = self.region_pixels((x0, y0, x1, y1));
+        let mut cells = Vec::with_capacity(w * h);
+        for row in 0..h {
+            for col in 0..w {
+                let (sc, sr) = if horizontal { (w - 1 - col, row) } else { (col, h - 1 - row) };
+                cells.push(((x0 + col) as i32, (y0 + row) as i32, data[sr * w + sc]));
+            }
+        }
+        self.write_cells(&cells, cx);
+    }
+
+    /// Remove the top or bottom row (the edge "−" bars) -- one undo step.
+    fn delete_row(&mut self, at_top: bool, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let cols = open.cols;
+        open.store
+            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::DeleteRow { cols, at_top });
+        open.selection = None;
+        self.recompose_grid(cx);
+    }
+
+    /// Remove the left or right column; the view narrows with it (the
+    /// same doc/view split as `insert_column`).
+    fn delete_column(&mut self, at_left: bool, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let cols = open.cols;
+        if cols <= 1 {
+            return;
+        }
+        open.store
+            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::DeleteColumn { cols, at_left });
+        open.cols = cols - 1;
+        open.selection = None;
+        self.recompose_grid(cx);
+        self.write_view_meta();
     }
 
     /// Paste the clipboard at the selection's top-left as ONE stroke (one
@@ -926,22 +1065,27 @@ impl TilesetPanel {
     /// Release: a shape drag commits (shift = filled); any other gesture
     /// closes its stroke.
     fn on_sheet_mouse_up(&mut self, shift: bool, cx: &mut Context<Self>) {
-        let shape = match &mut self.state {
+        let (shape, moved) = match &mut self.state {
             ViewerState::Ready(open) if open.painting => {
                 open.painting = false;
                 let points = open.shape_points(shift);
                 open.shape_drag = None;
+                let moved = open.move_drag.is_some().then(|| open.move_offset());
+                open.move_drag = None;
                 if open.tool.is_shape() {
-                    Some((points, open.paint_color()))
+                    (Some((points, open.paint_color())), moved)
                 } else {
                     open.store.end_stroke();
-                    None
+                    (None, moved)
                 }
             }
             _ => return,
         };
         if let Some((points, color)) = shape {
             self.write_points(&points, color, cx);
+        }
+        if let Some(offset) = moved {
+            self.move_selection(offset, cx);
         }
         cx.notify();
     }
@@ -1098,7 +1242,11 @@ impl TilesetPanel {
         let show_lines = open.show_lines;
         let accent = cx.theme().colors().border_focused;
         let zoom = open.zoom as f32;
-        let selection = self.selection_rect();
+        let (move_dx, move_dy) = open.move_offset();
+        let selection = self.selection_rect().map(|(x0, y0, x1, y1)| {
+            let shift = |v: usize, d: i32| (v as i32 + d).max(0) as usize;
+            (shift(x0, move_dx), shift(y0, move_dy), shift(x1, move_dx), shift(y1, move_dy))
+        });
         // The shape preview: what a release without shift would paint.
         let preview = open.shape_points(false);
         let preview_color = cx.theme().colors().text_accent;
@@ -1219,33 +1367,46 @@ impl TilesetPanel {
         at_start: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let tooltip = match (horizontal, at_start) {
-            (true, true) => "Add row above",
-            (true, false) => "Add row below",
-            (false, true) => "Add column left",
-            (false, false) => "Add column right",
+        let (add_tip, remove_tip) = match (horizontal, at_start) {
+            (true, true) => ("Add row above", "Delete top row"),
+            (true, false) => ("Add row below", "Delete bottom row"),
+            (false, true) => ("Add column left", "Delete left column"),
+            (false, false) => ("Add column right", "Delete right column"),
+        };
+        let half = |glyph: &'static str, tip: &'static str, index: usize| {
+            div()
+                .id((id, index))
+                .flex_1()
+                .flex()
+                .justify_center()
+                .items_center()
+                .cursor_pointer()
+                .tooltip(ui::Tooltip::text(tip))
+                .child(Label::new(glyph).size(LabelSize::Small).color(Color::Muted))
         };
         div()
             .id(id)
             .flex()
-            .justify_center()
-            .items_center()
+            .when(horizontal, |el| el.flex_row().w(length).h(px(EDGE_BAR_PX)))
+            .when(!horizontal, |el| el.flex_col().w(px(EDGE_BAR_PX)).h(length))
             .border_1()
             .border_dashed()
             .rounded_sm()
             .border_color(cx.theme().colors().border_variant)
-            .cursor_pointer()
-            .when(horizontal, |el| el.w(length).h(px(EDGE_BAR_PX)))
-            .when(!horizontal, |el| el.w(px(EDGE_BAR_PX)).h(length))
-            .tooltip(ui::Tooltip::text(tooltip))
-            .child(Label::new("+").size(LabelSize::Small).color(Color::Muted))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .child(half("+", add_tip, 0).on_click(cx.listener(move |this, _, _, cx| {
                 if horizontal {
                     this.insert_row(at_start, cx);
                 } else {
                     this.insert_column(at_start, cx);
                 }
-            }))
+            })))
+            .child(half("−", remove_tip, 1).on_click(cx.listener(move |this, _, _, cx| {
+                if horizontal {
+                    this.delete_row(at_start, cx);
+                } else {
+                    this.delete_column(at_start, cx);
+                }
+            })))
             .into_any_element()
     }
 
@@ -1371,6 +1532,19 @@ impl TilesetPanel {
                             cx.notify();
                         }
                     })),
+            )
+            .child(div().w_2())
+            .child(
+                Button::new("ggo-tileset-flip-h", "Flip H")
+                    .disabled(open.selection.is_none())
+                    .tooltip(ui::Tooltip::text("Flip the selection horizontally (shift-h)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.flip_selection(true, cx))),
+            )
+            .child(
+                Button::new("ggo-tileset-flip-v", "Flip V")
+                    .disabled(open.selection.is_none())
+                    .tooltip(ui::Tooltip::text("Flip the selection vertically (shift-v)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.flip_selection(false, cx))),
             )
             .child(div().w_2())
             .child(
@@ -1601,6 +1775,12 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.zoom_by(-1, cx)))
             .on_action(cx.listener(|this, _: &BrushSmaller, _window, cx| this.step_brush(-1, cx)))
             .on_action(cx.listener(|this, _: &BrushLarger, _window, cx| this.step_brush(1, cx)))
+            .on_action(cx.listener(|this, _: &FlipHorizontal, _window, cx| {
+                this.flip_selection(true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FlipVertical, _window, cx| {
+                this.flip_selection(false, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &SelectWholeSheet, _window, cx| this.select_whole_sheet(cx)),
             )
@@ -2720,6 +2900,73 @@ mod tests {
             assert_eq!(state.indices[idx(0, 3, 2)], 0, "the middle is untouched");
             panel.step_brush(-5, cx);
             assert_eq!(ready(panel).brush, MIN_BRUSH, "clamped");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_dragging_inside_the_marquee_moves_its_pixels(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            let dot = pixel_pos(ready(panel), 0, 1, 1);
+            panel.on_sheet_mouse_down(dot, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            panel.set_tool(Tool::Select, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), cx);
+            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 2, 2), cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(ready(panel).selection, Some(((0, 0), (2, 2))));
+
+            // Drag from inside the marquee by (+3, 0).
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), cx);
+            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 4, 1), cx);
+            assert_eq!(ready(panel).move_offset(), (3, 0));
+            panel.on_sheet_mouse_up(false, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 1, 1)], 0, "source cleared");
+            assert_eq!(state.indices[idx(0, 4, 1)], 1, "moved");
+            assert_eq!(ready(panel).selection, Some(((3, 0), (5, 2))), "marquee followed");
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 1, 1)], 1, "one undo restores the move");
+            assert_eq!(state.indices[idx(0, 4, 1)], 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_flip_reverses_the_selection_and_delete_row_shrinks(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), cx);
+            panel.on_sheet_mouse_up(false, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (3, 0)));
+            }
+            panel.flip_selection(true, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 0, 0)], 0);
+            assert_eq!(state.indices[idx(0, 3, 0)], 1, "the dot moved to the far end");
+            panel.flip_selection(false, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(0, 3, 0)], 1, "1-row flip V is identity");
+
+            let count = ready(panel).store.state().tile_count;
+            let cols = ready(panel).cols;
+            panel.insert_row(false, cx);
+            assert_eq!(ready(panel).store.state().tile_count, count + cols);
+            panel.delete_row(false, cx);
+            assert_eq!(ready(panel).store.state().tile_count, count);
+            panel.delete_row(false, cx);
+            assert_eq!(ready(panel).store.state().tile_count, count, "the only row stays");
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().tile_count, count + cols, "undo re-grows");
+
+            panel.insert_column(false, cx);
+            assert_eq!(ready(panel).cols, cols + 1);
+            panel.delete_column(false, cx);
+            assert_eq!(ready(panel).cols, cols, "the view narrows with the column");
         });
     }
 }
