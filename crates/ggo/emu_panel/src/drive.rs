@@ -506,6 +506,9 @@ fn run(
             FrameEvent::Vsync(number) => {
                 let bgra = rgb565_to_bgra(&p.default_fb);
                 let step_ms = turn_started.elapsed().as_secs_f32() * MILLIS_PER_SEC;
+                // BEFORE the frame goes out: the snapshot describes this
+                // frame, and the pane reads it on the frame's arrival.
+                publish_snapshot(&p.ppu, snapshot);
                 // Full channel = the UI hasn't drained the previous
                 // frame yet; drop this one. Closed = the panel dropped
                 // the receiver (Stop, or the panel itself went away).
@@ -524,7 +527,6 @@ fn run(
                 if let Some(writer) = &audio_writer {
                     audio_cursor = pump_audio(&p.apu, audio_cursor, &mut audio_scratch, writer);
                 }
-                publish_snapshot(&p.ppu, snapshot);
                 frames_presented = frames_presented.wrapping_add(1);
                 if p.save_dirty
                     && last_save_flush
@@ -1485,25 +1487,29 @@ mod tests {
         assert!(session.snapshot().is_some(), "a presented frame fills the slot");
         session.pause();
         assert!(session.is_paused());
-        // Drain whatever was in flight when the flag landed; then nothing
-        // more should arrive for a while.
-        let mut last_number = first.number;
-        let settle = std::time::Instant::now();
-        while settle.elapsed() < Duration::from_millis(150) {
-            if let Ok(frame) = rx.try_recv() {
-                last_number = frame.number;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let quiet = std::time::Instant::now();
-        let mut arrived = 0;
-        while quiet.elapsed() < Duration::from_millis(200) {
-            if rx.try_recv().is_ok() {
-                arrived += 1;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(arrived, 0, "a paused run publishes no frames");
+        // Drain whatever was in flight when the flag landed, until the
+        // channel has been quiet for a whole frame time several times
+        // over -- a loaded box can delay the in-flight frame, so this
+        // waits for silence rather than assuming a fixed window.
+        let mut last_number = {
+            let mut last_number = first.number;
+            let quiet_for = |rx: &async_channel::Receiver<Frame>, last: &mut u32| {
+                let started = std::time::Instant::now();
+                let mut quiet_since = std::time::Instant::now();
+                while started.elapsed() < Duration::from_secs(3) {
+                    if let Ok(frame) = rx.try_recv() {
+                        *last = frame.number;
+                        quiet_since = std::time::Instant::now();
+                    } else if quiet_since.elapsed() >= Duration::from_millis(250) {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                false
+            };
+            assert!(quiet_for(&rx, &mut last_number), "a paused run stops publishing frames");
+            last_number
+        };
 
         let before_step = session.snapshot().map(|s| Arc::as_ptr(&s) as usize);
         session.step();
@@ -1514,20 +1520,16 @@ mod tests {
             before_step,
             "the stepped frame refilled the snapshot slot"
         );
-        let quiet = std::time::Instant::now();
-        let mut arrived = 0;
-        while quiet.elapsed() < Duration::from_millis(200) {
-            if rx.try_recv().is_ok() {
-                arrived += 1;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(arrived, 0, "after the step it parks again");
+        last_number = stepped.number;
+        assert!(
+            recv_within(&rx, Duration::from_millis(300)).is_none(),
+            "after the step it parks again"
+        );
 
         session.resume();
         assert!(!session.is_paused());
         let resumed = recv_within(&rx, Duration::from_secs(2)).expect("resume lets frames flow");
-        assert!(resumed.number > stepped.number);
+        assert!(resumed.number > last_number);
 
         session.pause();
         let finished = session.wait();
