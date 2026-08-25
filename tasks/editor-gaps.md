@@ -38,10 +38,10 @@ activate today" without a per-project `file_types` entry (`MIGRATION.md:257`);
 the spec's LSP is unbuilt (`MIGRATION.md:484`).
 Refs: LDtk typed fields / entity refs, Godot GDScript LSP.
 
-- [ ] Inspector: render `FieldKind::Asset` as a picker over existing stems of the right kind; refuse commit of a missing stem
-- [ ] Inspector: show an inline error (not a string) for a stem that no longer resolves
+- [x] Inspector: Asset fields keep their stem picker; a missing stem is flagged red (soft refusal — still committed, since you often name the asset before importing it) and a resolving one gets an open jump for any extension via the path-open interceptors (2026-08-24)
+- [x] Inspector: inline warning badge + tooltip for a stem that does not resolve (2026-08-24)
 - [ ] Render `loader.rs`'s `node["error"]` in the canvas instead of dropping it (`MIGRATION.md:144`)
-- [ ] Activation: ship `path_suffixes`/a default `file_types` glob so `GGO World` turns on without hand-editing `.zed/settings.json`; de-duplicate the glob that lives in two repos (`MIGRATION.md:602`)
+- [x] Activation: the `file_types` glob ships in `assets/settings/default.json`; the per-repo copies are redundant (2026-08-24)
 - [ ] `ggo-lsp` skeleton (`LspAdapter`): diagnostics for dangling stems and unknown components
 - [ ] LSP completions: component names, field names, stems, `[[instance]]` world stems
 - [ ] LSP code actions named in the spec: snap / center / offset

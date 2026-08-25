@@ -216,24 +216,11 @@ const SPRITE_COMPONENT: &str = "Sprite";
 /// How many stem suggestions render under a focused Asset field.
 const STEM_SUGGESTION_CAP: usize = 8;
 
-/// The WORKTREE-relative `.spr` path an asset-root-relative `stem` names,
-/// or `None` when it does not resolve to a file that exists.
-///
-/// Two frames are in play and they are not the same one (the F4 asset-root
-/// split): the stem resolves under `asset_root` (`<worktree>/assets` for an
-/// `assets/worlds/main.toml`), while `SpritePanel::open_rel_path` -- like
-/// every explorer-driven open -- takes a path relative to the WORKTREE.
-/// So this joins in the first frame and re-relativizes into the second.
-///
-/// Declines rather than guessing when: the stem names nothing on disk (a
-/// world may legitimately reference a sprite that has not been authored
-/// yet, and handing the sprite panel a missing path would only park it in
-/// an error state), or the asset root is not inside the worktree at all
-/// (nothing worktree-relative to hand over).
-/// Every asset-root-relative, extensionless `/`-separated stem with
-/// extension `ext` under `root`, sorted -- the completion feed for one
-/// Asset-kind inspector field. Recursive on purpose: a fresh project's
-/// `sprites/gg_icon.spr` (or any nested layout) must surface.
+/// Every `<asset root>`-relative stem with extension `ext`, sorted --
+/// the completion feed for an Asset field. Recursive (a project's
+/// `sprites/ui/icons/` layout must surface), with worldlib's walker
+/// limits: dotdirs, `target`/`node_modules`/`dist` skipped, depth capped
+/// at its `MAX_SCAN_DEPTH`.
 fn list_asset_stems(root: &Path, ext: &str) -> Vec<String> {
     // worldlib's walker, not a private one: it skips dotdirs, `target`,
     // `node_modules` and caps depth, and this runs on the render thread's
@@ -255,6 +242,7 @@ fn list_asset_stems(root: &Path, ext: &str) -> Vec<String> {
 /// The worktree-relative path of the file an Asset field names, or
 /// `None` when the stem is empty, the file is missing, or the asset root
 /// lies outside the worktree (nothing the workspace could open).
+#[cfg(test)]
 fn asset_rel_for_stem(
     project_root: &Path,
     asset_root: &Path,
@@ -264,7 +252,7 @@ fn asset_rel_for_stem(
     if stem.is_empty() {
         return None;
     }
-    let abs = inspector::asset_abs_path(asset_root, stem, ext);
+    let abs = inspector::asset_abs_path(asset_root, stem, ext)?;
     if !abs.is_file() {
         return None;
     }
@@ -638,6 +626,14 @@ struct OpenWorld {
     /// ([`WorldPanel::refresh_stem_completion`]), so the directory walk
     /// runs once per focus, not per frame.
     stem_completion: Option<StemCompletion>,
+}
+
+/// What an Asset field's row shows -- see [`WorldPanel::asset_field_view`].
+pub(crate) struct AssetFieldView {
+    pub(crate) stem: String,
+    pub(crate) status: inspector::AssetStatus,
+    /// Worktree-relative path of the resolving file, for the jump.
+    pub(crate) rel: Option<String>,
 }
 
 /// One Asset-kind field's stem candidates: every `{stem}.{ext}` under the
@@ -1331,38 +1327,54 @@ impl WorldPanel {
             .map(str::to_string)
     }
 
-    /// Whether an Asset field's stem resolves -- what drives the red
-    /// badge and the "open" jump on its row.
+    /// Everything an Asset field's row needs, from ONE stat: the committed
+    /// stem, whether it resolves, and (when it does) the worktree-relative
+    /// path the jump opens.
+    pub(crate) fn asset_field_view(
+        &self,
+        entity_ix: usize,
+        component: &str,
+        field: &str,
+    ) -> Option<AssetFieldView> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let ext = self.asset_field_ext(component, field)?;
+        let stem = self.asset_field_stem(entity_ix, component, field)?;
+        let status = inspector::asset_status(&open.root, &stem, &ext);
+        let abs = inspector::asset_abs_path(&open.root, &stem, &ext);
+        let rel = match (status, abs, self.project_root.as_ref()) {
+            (inspector::AssetStatus::Resolves, Some(abs), Some(project_root)) => abs
+                .strip_prefix(project_root)
+                .ok()
+                .map(|rel| {
+                    rel.to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                }),
+            _ => None,
+        };
+        Some(AssetFieldView { stem, status, rel })
+    }
+
+    #[cfg(test)]
     pub(crate) fn asset_field_status(
         &self,
         entity_ix: usize,
         component: &str,
         field: &str,
     ) -> Option<inspector::AssetStatus> {
-        let ViewerState::Ready(open) = &self.state else {
-            return None;
-        };
-        let ext = self.asset_field_ext(component, field)?;
-        let stem = self.asset_field_stem(entity_ix, component, field)?;
-        Some(inspector::asset_status(&open.root, &stem, &ext))
+        self.asset_field_view(entity_ix, component, field)
+            .map(|view| view.status)
     }
 
-    /// The worktree-relative file an Asset field names, when it resolves
-    /// ([`asset_rel_for_stem`]). Drives BOTH whether the row offers the
-    /// jump and where it goes.
+    #[cfg(test)]
     pub(crate) fn asset_field_rel(
         &self,
         entity_ix: usize,
         component: &str,
         field: &str,
     ) -> Option<String> {
-        let ViewerState::Ready(open) = &self.state else {
-            return None;
-        };
-        let project_root = self.project_root.as_ref()?;
-        let ext = self.asset_field_ext(component, field)?;
-        let stem = self.asset_field_stem(entity_ix, component, field)?;
-        asset_rel_for_stem(project_root, &open.root, &stem, &ext)
+        self.asset_field_view(entity_ix, component, field)?.rel
     }
 
     /// Open worktree-relative `rel` wherever its extension is claimed --
@@ -1370,37 +1382,44 @@ impl WorldPanel {
     /// uses, so a `.spr` lands in the sprite tab, a `.til` in the tileset
     /// editor, a `.map` in the map panel and a `.adp` in the audio tab
     /// with no dependency on any of them. Anything unclaimed opens the
-    /// ordinary way. Returns whether a GGO panel claimed it.
-    pub(crate) fn goto_asset(
-        &mut self,
-        rel: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
-            return false;
+    /// ordinary way.
+    ///
+    /// Deferred, like `emulate_impl`: this runs from a click inside THIS
+    /// panel's update, and an interceptor that reveals a dock panel
+    /// (`.map` -> `open_in_panel::<MapPanel>` -> `Dock::activate_panel`)
+    /// calls `set_active(false)` on the dock's current panel -- usually
+    /// this one -- which would nest an update of an entity already being
+    /// updated and panic.
+    pub(crate) fn goto_asset(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
         };
-        workspace.update(cx, |workspace, cx| {
-            let Some(worktree_id) = workspace
-                .project()
-                .read(cx)
-                .visible_worktrees(cx)
-                .next()
-                .map(|worktree| worktree.read(cx).id())
-            else {
-                return false;
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
             };
-            let Some(path) = ggo_common::inline_project_path(worktree_id, &rel) else {
-                return false;
-            };
-            if workspace.intercept_path_open(&path, window, cx) {
-                return true;
-            }
-            workspace
-                .open_path(path, None, true, window, cx)
-                .detach_and_log_err(cx);
-            false
-        })
+            workspace.update(cx, |workspace, cx| {
+                let Some(worktree_id) = workspace
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).id())
+                else {
+                    return;
+                };
+                let Some(path) = ggo_common::inline_project_path(worktree_id, &rel) else {
+                    log::warn!("asset jump: {rel} is not a worktree-relative path");
+                    return;
+                };
+                if workspace.intercept_path_open(&path, window, cx) {
+                    return;
+                }
+                workspace
+                    .open_path(path, None, true, window, cx)
+                    .detach_and_log_err(cx);
+            });
+        });
     }
 
     /// Seal any in-flight nudge run, so the NEXT nudge starts a fresh undo
@@ -3060,15 +3079,13 @@ impl WorldPanel {
                                     // text: the badge answers "does the world
                                     // as saved resolve", and flickering red on
                                     // every keystroke would say nothing.
-                                    let stem = self
-                                        .asset_field_stem(entity_ix, component, field)
-                                        .unwrap_or_default();
-                                    let status = self
-                                        .asset_field_status(entity_ix, component, field)
+                                    let view = self.asset_field_view(entity_ix, component, field);
+                                    let stem = view.as_ref().map(|v| v.stem.clone()).unwrap_or_default();
+                                    let status = view
+                                        .as_ref()
+                                        .map(|v| v.status)
                                         .unwrap_or(inspector::AssetStatus::Empty);
-                                    let jump = (status == inspector::AssetStatus::Resolves)
-                                        .then(|| self.asset_field_rel(entity_ix, component, field))
-                                        .flatten();
+                                    let jump = view.and_then(|v| v.rel);
                                     let mut row = h_flex()
                                         .gap_1()
                                         .child(Self::field_label(field.as_str()))
@@ -5617,9 +5634,8 @@ mod tests {
         let before = workspace.read_with(cx, |workspace, cx| {
             workspace.active_pane().read(cx).items_len()
         });
-        let claimed = panel.update_in(cx, |panel, window, cx| panel.goto_asset(rel, window, cx));
+        panel.update_in(cx, |panel, window, cx| panel.goto_asset(rel, window, cx));
         cx.run_until_parked();
-        assert!(claimed, "the sprite panel's interceptor claims a .spr");
         let after = workspace.read_with(cx, |workspace, cx| {
             workspace.active_pane().read(cx).items_len()
         });
@@ -7351,8 +7367,10 @@ mod tests {
         });
     }
 
-    /// The jump is generic: whatever interceptor claims the extension
-    /// gets the path, and an unclaimed one falls back to a plain open.
+    /// The jump is generic -- whatever interceptor claims the extension
+    /// gets the path -- and DEFERRED: an interceptor that updates this very
+    /// panel (what revealing a dock panel does through `set_active`) must
+    /// not find it mid-update. The `.map` recorder here does exactly that.
     #[gpui::test]
     async fn test_goto_asset_routes_through_the_path_open_interceptors(cx: &mut TestAppContext) {
         thread_local! {
@@ -7373,22 +7391,47 @@ mod tests {
             CLAIMED.with(|c| c.borrow_mut().push(rel));
             true
         }
+        fn nesting_map(
+            workspace: &mut Workspace,
+            path: &ProjectPath,
+            _window: &mut Window,
+            cx: &mut Context<Workspace>,
+        ) -> bool {
+            if !path.path.extension().is_some_and(|e| e == "map") {
+                return false;
+            }
+            // What `open_in_panel::<MapPanel>` ends up doing to the dock's
+            // current panel: an update of the WorldPanel from inside the
+            // interceptor. Panics unless the jump was deferred.
+            let world_panel = workspace
+                .panel::<WorldPanel>(cx)
+                .expect("the world panel is docked");
+            world_panel.update(cx, |_, _| {});
+            let rel = ggo_common::rel_in_primary_worktree(workspace, path, cx)
+                .unwrap_or_default();
+            CLAIMED.with(|c| c.borrow_mut().push(rel));
+            true
+        }
         let dir = tempfile::tempdir().unwrap();
         let (_workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
         open_in_menu_panel(&panel, cx, "worlds/test.toml");
-        cx.update(|_, cx| workspace::register_path_open_interceptor(cx, recording_til));
-
-        let claimed = panel.update_in(cx, |panel, window, cx| {
-            panel.goto_asset("fonts/mono.til".to_string(), window, cx)
+        cx.update(|_, cx| {
+            workspace::register_path_open_interceptor(cx, recording_til);
+            workspace::register_path_open_interceptor(cx, nesting_map);
         });
-        assert!(claimed, "the .til interceptor claims the jump");
-        CLAIMED.with(|c| assert_eq!(c.borrow().as_slice(), ["fonts/mono.til"]));
 
-        let claimed = panel.update_in(cx, |panel, window, cx| {
-            panel.goto_asset("notes.txt".to_string(), window, cx)
+        panel.update_in(cx, |panel, window, cx| {
+            panel.goto_asset("fonts/mono.til".to_string(), window, cx);
+            panel.goto_asset("levels/arena.map".to_string(), window, cx);
         });
         cx.run_until_parked();
-        assert!(!claimed, "an unclaimed extension falls back to a plain open");
+        CLAIMED.with(|c| {
+            assert_eq!(
+                c.borrow().as_slice(),
+                ["fonts/mono.til", "levels/arena.map"],
+                "each jump reached the interceptor that claims its extension"
+            );
+        });
     }
 
     /// The stem walk uses worldlib's hygiene: dotdirs and build dirs are

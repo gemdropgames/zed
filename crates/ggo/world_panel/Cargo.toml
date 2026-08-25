@@ -34,11 +34,11 @@ ggo-worldlib.workspace = true # GGO
 ggo-asset-formats.workspace = true # GGO
 ggo-audio.workspace = true # GGO -- the audio budget line sizes stems against the 384 KiB sample region
 ggo_common.workspace = true
-# The "open this MetaSprite's sprite" handoff needs the sprite panel's own
-# `open_rel_path`. One-way: the sprite panel does not know about worlds.
-ggo_sprite_panel.workspace = true # GGO
-
 [dev-dependencies]
+# Test-only: the asset jump goes through the path-open interceptor
+# registry, so the sprite panel's `init` is what makes a `.spr` land in a
+# sprite tab in the jump test. The panel itself has no sprite-panel dep.
+ggo_sprite_panel.workspace = true # GGO
 # `project`'s test-support turns on `remote/test-support`, which adds a
 # `RemoteConnectionOptions` variant that `remote_connection`'s lib only
 # matches on under ITS `test-support` -- same dance `ggo_emu_panel`'s

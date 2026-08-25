@@ -85,15 +85,19 @@ pub enum AssetStatus {
     Missing,
 }
 
-/// The file an Asset field names: `<asset_root>/<stem>.<ext>`.
-pub fn asset_abs_path(asset_root: &Path, stem: &str, ext: &str) -> PathBuf {
-    asset_root.join(format!("{stem}.{ext}"))
+/// The file an Asset field names: `<asset_root>/<stem>.<ext>`, or `None`
+/// for a stem that escapes the root (absolute, `..`, drive prefix,
+/// backslashes -- worldlib's `safe_join` rules, the same ones the
+/// runtime's loader lives by). An escaping stem that happens to hit a
+/// real file must not count as resolving.
+pub fn asset_abs_path(asset_root: &Path, stem: &str, ext: &str) -> Option<PathBuf> {
+    ggo_worldlib::fsutil::safe_join(asset_root, &format!("{stem}.{ext}")).ok()
 }
 
 pub fn asset_status(asset_root: &Path, stem: &str, ext: &str) -> AssetStatus {
     if stem.is_empty() {
         AssetStatus::Empty
-    } else if asset_abs_path(asset_root, stem, ext).is_file() {
+    } else if asset_abs_path(asset_root, stem, ext).is_some_and(|path| path.is_file()) {
         AssetStatus::Resolves
     } else {
         AssetStatus::Missing
@@ -683,7 +687,15 @@ mod tests {
         assert_eq!(asset_status(dir.path(), "sprites/ghost", "spr"), AssetStatus::Missing);
         assert_eq!(
             asset_abs_path(dir.path(), "sfx/jump", "adp"),
-            dir.path().join("sfx/jump.adp")
+            Some(dir.path().join("sfx/jump.adp"))
         );
+        // A stem that escapes the asset root never resolves, even when the
+        // file it points at exists.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("leak.spr"), b"x").unwrap();
+        let escaping = format!("../{}/leak", outside.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(asset_status(dir.path(), &escaping, "spr"), AssetStatus::Missing);
+        assert_eq!(asset_status(dir.path(), "/etc/hosts", ""), AssetStatus::Missing);
+        assert_eq!(asset_abs_path(dir.path(), "../x", "spr"), None);
     }
 }
