@@ -36,6 +36,9 @@
 
 mod geom;
 mod loader;
+mod map_item;
+
+pub use map_item::MapEditorItem;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -44,7 +47,7 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    Action, App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, EventEmitter,
+    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity,
     FocusHandle, Focusable, Hsla, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent,
     Styled, Task, WeakEntity, Window, actions, bounds, div, fill, outline, point, px, size,
@@ -56,7 +59,6 @@ use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState, Tooltip};
 use ggo_worldlib::sprites::terrain::{self, Terrain};
 use ggo_worldlib::sprites::tileset_meta::{load_tileset_meta, save_tileset_meta};
 use workspace::Workspace;
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::map_doc::{
@@ -74,8 +76,6 @@ actions!(
         DeleteSelection,
         /// Clears the cell selection.
         ClearSelection,
-        /// Toggles focus on the GGO map panel.
-        ToggleFocus,
         /// Undoes the last edit to the open map.
         Undo,
         /// Redoes the last undone edit to the open map.
@@ -88,16 +88,11 @@ actions!(
     ]
 );
 
-const GGO_MAP_PANEL_KEY: &str = "GGOMapPanel";
 
 /// The panel's key-dispatch context (`.key_context`), which the
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoMapPanel";
 
-/// Fixed default width until the panel grows real settings persistence
-/// (same call every other GGO panel made at this stage). Wider than the
-/// other panels' 360px: this one has a canvas AND a tileset strip.
-const DEFAULT_WIDTH: Pixels = px(460.);
 
 /// The tileset strip's height. Two rows of 16px tiles at
 /// [`geom::STRIP_ZOOM`] plus room to scroll a taller sheet.
@@ -134,21 +129,6 @@ pub fn init(cx: &mut App) {
     // Right-clicking an assets DIRECTORY offers "New Map…" -- maps are
     // authored, never imported, so this is how one comes into existence.
     workspace::register_context_menu_contributor(cx, contribute_map_menu);
-
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(window) = window else {
-            return;
-        };
-
-        let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| MapPanel::new(Some(weak_workspace), cx));
-        workspace.add_panel(panel, window, cx);
-
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<MapPanel>(window, cx);
-        });
-    })
-    .detach();
 }
 
 /// Write a blank, unbound `.map` into the worktree-relative directory
@@ -262,12 +242,28 @@ fn intercept_map_open(
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return false;
     };
-    ggo_common::open_in_panel(
-        workspace,
-        window,
-        cx,
-        move |panel: &mut MapPanel, window, cx| panel.open_rel_path(&rel, window, cx),
-    )
+    open_map_item(workspace, rel, window, cx);
+    true
+}
+
+/// Activate the tab already editing `rel`, or open one in the active
+/// pane (one tab per `.map`, the tileset rule).
+pub fn open_map_item(
+    workspace: &mut Workspace,
+    rel: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace
+        .items_of_type::<MapEditorItem>(cx)
+        .find(|item| item.read(cx).rel() == rel);
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return;
+    }
+    let weak = workspace.weak_handle();
+    let item = cx.new(|cx| MapEditorItem::new(rel, weak, window, cx));
+    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
 }
 
 /// `workspace::ContextMenuContributor` for an assets DIRECTORY: "New
@@ -377,16 +373,27 @@ fn new_map_commit(
     dir_rel: String,
 ) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
     move |typed, window, cx| {
-        (ggo_common::panel_entry_handler(
-            workspace,
-            move |panel: &Entity<MapPanel>, window, cx| {
-                let typed = typed.clone();
-                let dir_rel = dir_rel.clone();
-                panel.update(cx, |panel, cx| {
-                    panel.create_map_inline(&dir_rel, &typed, window, cx)
-                });
-            },
-        ))(window, cx);
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let Some(project_root) = workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            else {
+                return;
+            };
+            let Ok(source_rel) = map_rel(&dir_rel, &typed) else {
+                return;
+            };
+            if create_blank_map(&project_root, &source_rel).is_none() {
+                return;
+            }
+            open_map_item(workspace, source_rel, window, cx);
+        });
     }
 }
 
@@ -722,7 +729,6 @@ enum ViewerState {
 
 pub struct MapPanel {
     focus_handle: FocusHandle,
-    position: DockPosition,
     workspace: Option<WeakEntity<Workspace>>,
     /// Test hook: bypass workspace worktree discovery.
     root_override: Option<PathBuf>,
@@ -738,7 +744,6 @@ impl MapPanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            position: DockPosition::Right,
             workspace,
             root_override: None,
             project_root: None,
@@ -784,12 +789,7 @@ impl MapPanel {
             return;
         }
         let rel = rel.to_string();
-        let proceed = ggo_common::prepare_to_close_dirty(
-            self.dirty_map_name(),
-            window,
-            cx,
-            Self::save_for_close,
-        );
+        let proceed = self.prepare_to_close(window, cx);
         cx.spawn(async move |this, cx| {
             if !proceed.await {
                 return;
@@ -1061,6 +1061,17 @@ impl MapPanel {
 
     /// The open map's display path when it has unsaved edits, else `None`.
     /// Drives both the close guard and (indirectly) the title's dirty dot.
+    /// The dirty guard a tab close (or a map switch) runs: prompt, save
+    /// on request, and answer whether to proceed.
+    pub(crate) fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        ggo_common::prepare_to_close_dirty(self.dirty_map_name(), window, cx, Self::save_for_close)
+    }
+
+    /// Whether the open map has unsaved edits (the tab's dirty dot).
+    pub fn dirty(&self) -> bool {
+        self.dirty_map_name().is_some()
+    }
+
     fn dirty_map_name(&self) -> Option<String> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
@@ -2485,91 +2496,6 @@ impl Focusable for MapPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for MapPanel {}
-
-impl Panel for MapPanel {
-    fn persistent_name() -> &'static str {
-        "GGO Map"
-    }
-
-    fn panel_key() -> &'static str {
-        GGO_MAP_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        // Same call as every other GGO panel: no settings persistence yet,
-        // and Bottom isn't a sensible spot for a canvas + strip stack.
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        DEFAULT_WIDTH
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        // This checkout has no grid/layers glyph (`ls assets/icons` finds
-        // nothing matching grid/layer/table/map/tile), and the three
-        // closest shapes are already dock icons: `Blocks` is
-        // `ggo_tileset_panel`, `Public` is `ggo_world_panel`, `Image` is
-        // `ggo_sprite_panel`. `SquareDot` -- a rounded square with a
-        // dot at its centre -- reads as one cell of a grid, which is what
-        // this panel places, and no panel uses it as a dock icon.
-        Some(IconName::SquareDot)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO Map")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        // Verified free at checkout: built-in panels use 0-7,
-        // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
-        // `ggo_charts_panel` 10, `ggo_emu_panel` 11, `ggo_tileset_panel`
-        // 12 (grep activation_priority across crates/). 13 is left for
-        // F5.1's import panel, which lands in parallel with this task.
-        14
-    }
-
-    /// The open map lives in panel state, not in a workspace `Item`, so
-    /// nothing else in the close flow knows it can be dirty. Prompt with
-    /// the same Save/Don't-Save/Cancel warning a dirty buffer gets; a
-    /// failed write cancels the close rather than dropping the edits.
-    fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
-        ggo_common::prepare_to_close_dirty(self.dirty_map_name(), window, cx, Self::save_for_close)
-    }
-
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if active {
-            // Deferred: `set_active` fires inside the workspace's own update
-            // (dock toggle), and `refresh_root` needs to READ the workspace
-            // to find the project root -- reading it re-entrantly panics
-            // (same as every other GGO panel).
-            let this = cx.weak_entity();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_root(cx)).ok();
-            });
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2600,7 +2526,7 @@ mod tests {
     /// contract). `fixture_writes_assets_root_relative_sidecars` asserts
     /// exactly that, so a regression in the fixture itself can't quietly
     /// make the panel's own tests meaningless.
-    fn write_project(root: &Path) -> PathBuf {
+    pub(crate) fn write_project(root: &Path) -> PathBuf {
         std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "[project]\n").unwrap();
         let assets = root.join(ASSETS_DIR);
         std::fs::create_dir_all(assets.join("tiles")).unwrap();
@@ -2783,35 +2709,6 @@ mod tests {
         init(cx);
     }
 
-    /// Proves the panel is registered on a real workspace, and that
-    /// dispatching `ToggleFocus` opens the right dock. Goes through
-    /// `MultiWorkspace::test_new` rather than a bare `Workspace::test_new`
-    /// because `register_action` handlers are only mounted into the
-    /// dispatch tree once something renders `Workspace::actions` (same
-    /// lesson as the other GGO panels').
-    #[gpui::test]
-    async fn test_toggle_focus_opens_panel(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            AppState::test(cx);
-            init(cx);
-        });
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        workspace.update(cx, |workspace, cx| {
-            assert!(workspace.panel::<MapPanel>(cx).is_some());
-            assert!(!workspace.right_dock().read(cx).is_open());
-        });
-        cx.dispatch_action(ToggleFocus);
-        workspace.update(cx, |workspace, cx| {
-            let panel = workspace.panel::<MapPanel>(cx).expect("still registered");
-            assert_eq!(panel.read(cx).position, DockPosition::Right);
-            assert!(workspace.right_dock().read(cx).is_open());
-        });
-    }
 
     // --------------------------------------------------------------- load
 
@@ -3583,13 +3480,20 @@ mod tests {
         cx.run_until_parked();
         dirty_the_map(&panel, cx);
 
-        let close = workspace.update_in(cx, |workspace, window, cx| {
-            workspace.prepare_to_close(workspace::CloseIntent::CloseWindow, window, cx)
+        // The map is a tab: closing it goes through the pane's own dirty
+        // prompt, driven by the item's `is_dirty`.
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let close = pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
         });
         cx.run_until_parked();
-        assert!(cx.has_pending_prompt());
+        assert!(cx.has_pending_prompt(), "a dirty map tab prompts before closing");
         cx.simulate_prompt_answer("Cancel");
-        assert!(!close.await.unwrap());
+        close.await.unwrap();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<MapEditorItem>(cx).count(), 1, "still open");
+        });
+        panel.read_with(cx, |panel, _| assert!(panel.dirty(), "and still dirty"));
     }
 
     /// The data-loss guard on a DOCUMENT SWITCH: a file-tree click while
@@ -3840,13 +3744,21 @@ mod tests {
                 .read(cx)
                 .id()
         });
-        let panel = workspace.read_with(cx, |workspace, cx| {
+        // The editor is a tab per map now: open the fixture map's tab and
+        // hand its panel back, as the dock panel used to be handed back.
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            open_map_item(workspace, "assets/maps/level.map".to_string(), window, cx);
             workspace
-                .panel::<MapPanel>(cx)
-                .expect("init() adds the panel")
+                .items_of_type::<MapEditorItem>(cx)
+                .next()
+                .expect("open_map_item adds the item")
+                .read(cx)
+                .panel()
+                .clone()
         });
         let root = root.to_path_buf();
         panel.update(cx, |panel, _| panel.root_override = Some(root));
+        cx.run_until_parked();
         // The inline "New Map…" entry seeds the project panel's name
         // editor, so the tests need one docked -- production gets it from
         // `initialize_workspace`.
@@ -3939,7 +3851,7 @@ mod tests {
     #[gpui::test]
     async fn test_new_map_names_inline_then_creates_and_opens(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, panel, worktree_id, cx) = routed_workspace(cx, dir.path()).await;
+        let (workspace, _panel, worktree_id, cx) = routed_workspace(cx, dir.path()).await;
         let assets = dir.path().join(ASSETS_DIR);
 
         let handler = new_map_handler(
@@ -3973,6 +3885,17 @@ mod tests {
         cx.run_until_parked();
 
         assert!(assets.join("maps/arena.map").is_file(), "the file must exist");
+        // The new map opens in its OWN tab, not the fixture's.
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<MapEditorItem>(cx)
+                .find(|item| item.read(cx).rel() == "assets/maps/arena.map")
+                .expect("a tab for the new map")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        cx.run_until_parked();
         panel.update(cx, |panel, _| {
             let open = ready(panel);
             assert_eq!(open.source_rel, "assets/maps/arena.map");

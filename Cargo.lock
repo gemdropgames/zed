@@ -7696,6 +7696,7 @@ dependencies = [
 name = "ggo_map_panel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "editor",
  "ggo-asset-formats",
  "ggo-worldlib",

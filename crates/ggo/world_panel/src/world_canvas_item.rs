@@ -102,6 +102,12 @@ impl Item for WorldCanvasItem {
         }
     }
 
+    /// A single document per tab: this is what makes the pane prompt
+    /// before closing a dirty tab (`Pane::skip_save_on_close`).
+    fn buffer_kind(&self, _cx: &App) -> workspace::item::ItemBufferKind {
+        workspace::item::ItemBufferKind::Singleton
+    }
+
     fn is_dirty(&self, cx: &App) -> bool {
         self.panel
             .upgrade()
