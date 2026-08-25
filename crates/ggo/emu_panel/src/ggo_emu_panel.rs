@@ -75,7 +75,7 @@
 //! covers the two teardown paths (Stop, and panel release) where no
 //! further render will come.
 
-mod audio;
+pub mod audio;
 mod emu_item;
 mod drive;
 mod ingest;

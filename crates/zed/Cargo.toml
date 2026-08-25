@@ -112,6 +112,7 @@ feedback.workspace = true
 file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
+ggo_audio_panel.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO
 ggo_emerald_panel.workspace = true # GGO
 ggo_emu_panel.workspace = true # GGO
