@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use ggo_worldlib::render::Selection;
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind};
 use ggo_worldlib::world_doc::{WorldOp, WorldState};
+use ggo_worldlib::world_file::WorldEntity;
 use serde_json::Value;
 
 /// What one inspector text input edits.
@@ -70,6 +71,20 @@ pub fn asset_field_ext(target: &FieldTarget, schemas: &[ComponentSchema]) -> Opt
     match field_kind(schemas, component, field) {
         Some(FieldKind::Asset(ext)) => Some(ext.clone()),
         _ => None,
+    }
+}
+
+/// An entity's `Transform.pos`, if it has one.
+pub fn transform_pos(entity: &WorldEntity) -> Option<[f64; 2]> {
+    let pos = entity.components.get("Transform")?.get("pos")?.as_array()?;
+    Some([pos.first()?.as_f64()?, pos.get(1)?.as_f64()?])
+}
+
+/// Write `Transform.pos` into a component map (creating the Transform's
+/// `pos` field if the table exists), for a pasted copy's placement.
+pub fn set_transform_pos(components: &mut serde_json::Map<String, Value>, pos: [f64; 2]) {
+    if let Some(Value::Object(transform)) = components.get_mut("Transform") {
+        transform.insert("pos".to_string(), serde_json::json!([pos[0], pos[1]]));
     }
 }
 

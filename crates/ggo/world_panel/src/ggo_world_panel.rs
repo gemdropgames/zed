@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
+    ClipboardItem,
     Action, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task,
@@ -56,6 +57,7 @@ use ggo_worldlib::render::{
     items_in_rect, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
+use ggo_worldlib::world_file::{self, WorldEntity, fragment_to_toml, parse_fragment};
 use ggo_worldlib::sprites::palette565;
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
 use ggo_worldlib::world_file::write_world;
@@ -88,6 +90,12 @@ actions!(
         SelectAll,
         /// Clears the selection.
         ClearSelection,
+        /// Copies the selection to the clipboard as world-file TOML.
+        Copy,
+        /// Pastes entities/instances from the clipboard.
+        Paste,
+        /// Duplicates the selection.
+        Duplicate,
         /// Resets the canvas camera to the default framing.
         ResetView,
         /// Nudges the selection one pixel left.
@@ -120,6 +128,10 @@ const DEFAULT_WIDTH: Pixels = px(360.);
 
 /// Inspector column width inside the panel.
 const INSPECTOR_WIDTH: Pixels = px(220.);
+/// The entity/instance list beside the inspector.
+const LIST_WIDTH: Pixels = px(140.);
+/// Paste/duplicate offset when the cursor is not over the canvas: one tile.
+const PASTE_OFFSET_PX: f64 = 16.0;
 
 pub fn init(cx: &mut App) {
     bind_panel_keys(cx);
@@ -491,6 +503,12 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("ctrl-a", SelectAll, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-a", SelectAll, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", ClearSelection, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-c", Copy, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-c", Copy, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", Paste, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-d", Duplicate, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-d", Duplicate, Some(KEY_CONTEXT)),
         KeyBinding::new("backspace", DeleteSelected, Some(KEY_CONTEXT)),
         // Arrow-key nudge, same panel-focused-only rule: the arrows keep
         // moving the cursor while an inspector field editor has focus,
@@ -541,6 +559,9 @@ struct ViewShared {
     pan: Option<[f64; 2]>,
     last_bounds: Option<Bounds<Pixels>>,
     drag: Option<Drag>,
+    /// Canvas-relative cursor position while the pointer is over the
+    /// canvas -- where a paste lands. `None` once it leaves.
+    hover: Option<[f64; 2]>,
 }
 
 /// An in-flight middle-mouse pan drag.
@@ -637,6 +658,9 @@ struct OpenWorld {
     /// Why the popout Emulate could not launch (failed build or spawn),
     /// shown on the toolbar next to `save_error`.
     popout_error: Option<String>,
+    /// What a paste could not do (bad clipboard text, a refused instance),
+    /// shown on the toolbar; cleared by the next successful paste.
+    paste_error: Option<String>,
     /// Region bytes per audio stem, filled off-thread -- see
     /// [`audio_budget`]. Cleared by [`WorldPanel::refresh_worlds`].
     audio_sizes: audio_budget::AudioSizes,
@@ -709,6 +733,7 @@ impl OpenWorld {
                 pan: None,
                 last_bounds: None,
                 drag: None,
+                hover: None,
             })),
             selected: Vec::new(),
             marquee: None,
@@ -720,6 +745,7 @@ impl OpenWorld {
             inspector: Vec::new(),
             save_error: None,
             popout_error: None,
+            paste_error: None,
             audio_sizes: HashMap::new(),
             audio_size_generation: 0,
             _audio_size_task: None,
@@ -738,6 +764,36 @@ fn color565_rgba(c: u16) -> gpui::Rgba {
         b: f32::from(b) / 255.0,
         a: 1.0,
     }
+}
+
+/// The list column's rows: every entity (`#i <first non-Transform
+/// component>[ · stem]`) then every instance (`⧉ <stem>`).
+fn entity_list_rows(state: &ggo_worldlib::world_doc::WorldState) -> Vec<(Selection, String)> {
+    let mut rows = Vec::with_capacity(state.entities.len() + state.instances.len());
+    for (i, entity) in state.entities.iter().enumerate() {
+        let name = entity
+            .components
+            .keys()
+            .find(|k| k.as_str() != "Transform")
+            .cloned()
+            .unwrap_or_else(|| "Entity".to_string());
+        let stem = entity
+            .components
+            .get(&name)
+            .and_then(|c| c.get("stem"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" · {s}"))
+            .unwrap_or_default();
+        rows.push((Selection::Entity(i), format!("#{i} {name}{stem}")));
+    }
+    for (i, instance) in state.instances.iter().enumerate() {
+        rows.push((
+            Selection::Instance(i),
+            format!("⧉ {}", world_label(&instance.world)),
+        ));
+    }
+    rows
 }
 
 /// The op that moves `primary` to `primary_pos` and every other item in
@@ -1319,7 +1375,41 @@ impl WorldPanel {
     /// Delete the selected entity or instance (toolbar button and the
     /// `DeleteSelected` action). Bounds-guarded: a selection gone stale
     /// against an undo/redo restructure is a no-op, not a panic.
-    fn delete_selected_impl(&mut self, cx: &mut Context<Self>) {
+    /// Delete the selection -- after a confirm when it holds instances
+    /// (ggo-ide confirms instance removal; an entity delete is one undo
+    /// away and gets no prompt).
+    fn delete_selected_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let instances = open
+            .selected
+            .iter()
+            .filter(|s| matches!(s, Selection::Instance(_)))
+            .count();
+        if instances == 0 {
+            self.delete_selected_now(cx);
+            return;
+        }
+        let confirm = ggo_common::confirm_destructive(
+            &format!(
+                "Remove {instances} instance{}?",
+                if instances == 1 { "" } else { "s" }
+            ),
+            "Remove",
+            false,
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if confirm.await {
+                this.update(cx, |this, cx| this.delete_selected_now(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn delete_selected_now(&mut self, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -2279,6 +2369,248 @@ impl WorldPanel {
         }
     }
 
+    // ------------------------------------------------- clipboard
+
+    /// The selection as a world-file fragment (entities first, then
+    /// instances, each in selection order).
+    fn selection_fragment(open: &OpenWorld) -> (Vec<WorldEntity>, Vec<world_file::WorldInstance>) {
+        let state = open.store.state();
+        let mut entities = Vec::new();
+        let mut instances = Vec::new();
+        for target in &open.selected {
+            match *target {
+                Selection::Entity(i) => {
+                    if let Some(entity) = state.entities.get(i) {
+                        entities.push(entity.clone());
+                    }
+                }
+                Selection::Instance(i) => {
+                    if let Some(instance) = state.instances.get(i) {
+                        instances.push(world_file::WorldInstance {
+                            world: instance.world.clone(),
+                            pos: instance.pos,
+                            background_priority: instance.background_priority,
+                        });
+                    }
+                }
+            }
+        }
+        (entities, instances)
+    }
+
+    fn copy_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let (entities, instances) = Self::selection_fragment(open);
+        if entities.is_empty() && instances.is_empty() {
+            return;
+        }
+        match fragment_to_toml(&entities, &instances) {
+            Ok(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            Err(e) => {
+                open.paste_error = Some(format!("copy failed: {e}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn paste_impl(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let fragment = match parse_fragment(&text) {
+            Ok(fragment) => fragment,
+            Err(e) => {
+                if let ViewerState::Ready(open) = &mut self.state {
+                    open.paste_error = Some(format!("clipboard is not world TOML: {e}"));
+                    cx.notify();
+                }
+                return;
+            }
+        };
+        self.paste_fragment(fragment.entities, fragment.instances, cx);
+    }
+
+    /// Copy + paste without touching the clipboard.
+    fn duplicate_impl(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let (entities, instances) = Self::selection_fragment(open);
+        if entities.is_empty() && instances.is_empty() {
+            return;
+        }
+        self.paste_fragment(entities, instances, cx);
+    }
+
+    /// Where a paste lands: the group's top-left position goes to the
+    /// cursor when it is over the canvas (snapped when Snap is on),
+    /// otherwise every item shifts one tile right and down.
+    fn paste_delta(&self, entities: &[WorldEntity], instances: &[world_file::WorldInstance]) -> [f64; 2] {
+        let ViewerState::Ready(open) = &self.state else {
+            return [PASTE_OFFSET_PX, PASTE_OFFSET_PX];
+        };
+        let hover = open.view.borrow().hover;
+        let Some((hover, view)) = hover.zip(self.canvas_view()) else {
+            return [PASTE_OFFSET_PX, PASTE_OFFSET_PX];
+        };
+        let positions: Vec<[f64; 2]> = entities
+            .iter()
+            .filter_map(inspector::transform_pos)
+            .chain(instances.iter().map(|i| i.pos))
+            .collect();
+        let Some(base) = positions.iter().copied().reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])])
+        else {
+            return [PASTE_OFFSET_PX, PASTE_OFFSET_PX];
+        };
+        let mut target = drag_ops::screen_to_world(hover[0], hover[1], &view);
+        if open.snap {
+            target = drag_ops::snap_to_tile(target);
+        }
+        [target[0] - base[0], target[1] - base[1]]
+    }
+
+    /// Add `entities` and `instances` (shifted by [`Self::paste_delta`]) as
+    /// ONE undo entry, resolve the new instances so they render, and make
+    /// the pasted set the selection. An instance the cycle guard refuses
+    /// is skipped and reported.
+    fn paste_fragment(
+        &mut self,
+        entities: Vec<WorldEntity>,
+        instances: Vec<world_file::WorldInstance>,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = self.paste_delta(&entities, &instances);
+        let candidates = self.instance_candidates();
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let state = open.store.state();
+        let first_entity = state.entities.len();
+        let first_instance = state.instances.len();
+        let mut ops = Vec::new();
+        for entity in &entities {
+            let mut components = entity.components.clone();
+            if let Some(pos) = inspector::transform_pos(entity) {
+                inspector::set_transform_pos(&mut components, [pos[0] + delta[0], pos[1] + delta[1]]);
+            }
+            ops.push(WorldOp::AddEntity { components });
+        }
+        let mut refused = Vec::new();
+        let mut accepted_stems = Vec::new();
+        for instance in &instances {
+            if !candidates.contains(&instance.world) {
+                refused.push(instance.world.clone());
+                continue;
+            }
+            let index = first_instance + accepted_stems.len();
+            accepted_stems.push(instance.world.clone());
+            ops.push(WorldOp::AddInstance {
+                world: instance.world.clone(),
+            });
+            ops.push(WorldOp::MoveInstance {
+                index,
+                pos: [instance.pos[0] + delta[0], instance.pos[1] + delta[1]],
+                gesture: None,
+            });
+        }
+        open.paste_error = (!refused.is_empty()).then(|| {
+            format!(
+                "skipped instance{} that would cycle: {}",
+                if refused.len() == 1 { "" } else { "s" },
+                refused.join(", ")
+            )
+        });
+        if ops.is_empty() {
+            cx.notify();
+            return;
+        }
+        open.store.apply(WorldOp::Batch(ops));
+        for stem in &accepted_stems {
+            let result = loader::resolve_instance(&open.root, stem);
+            open.store.set_instances_resolved(stem, &result, false);
+        }
+        Self::refresh_asset_images(open);
+        let state = open.store.state();
+        open.selected = (first_entity..state.entities.len())
+            .map(Selection::Entity)
+            .chain((first_instance..state.instances.len()).map(Selection::Instance))
+            .collect();
+        open.edit_drag = None;
+        open.nudge_gesture = None;
+        cx.notify();
+    }
+
+    /// Compose load targets introduced since the last rebuild and refresh
+    /// the image cache -- the tail every path that adds assets shares.
+    fn refresh_asset_images(open: &mut OpenWorld) {
+        let state = open.store.state();
+        loader::fill_missing_asset_loads(
+            &open.root,
+            &state,
+            &mut open.sprite_loads,
+            &mut open.map_loads,
+            &mut open.meta_sprite_loads,
+        );
+        open.images = Arc::new(canvas::build_image_cache(&[
+            &open.sprite_loads,
+            &open.map_loads,
+            &open.meta_sprite_loads,
+        ]));
+    }
+
+    // ------------------------------------------------- entity list
+
+    /// Select from the list: the same rules as a canvas click.
+    fn select_from_list(&mut self, target: Selection, shift: bool, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if shift {
+            open.toggle_selected(target);
+        } else {
+            open.selected = vec![target];
+        }
+        open.edit_drag = None;
+        open.nudge_gesture = None;
+        cx.notify();
+    }
+
+    fn render_entity_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            return div().into_any_element();
+        };
+        let rows = entity_list_rows(&open.store.state());
+        let selected_bg = cx.theme().colors().element_selected;
+        div()
+            .id("ggo-world-entity-list")
+            .w(LIST_WIDTH)
+            .h_full()
+            .flex_none()
+            .overflow_y_scroll()
+            .child(v_flex().children(rows.into_iter().map(|(target, label)| {
+                let selected = open.selected.contains(&target);
+                div()
+                    .id(SharedString::from(format!("ggo-world-list-{target:?}")))
+                    .px_1()
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(selected_bg))
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .color(if selected { Color::Default } else { Color::Muted }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            this.select_from_list(target, event.modifiers.shift, cx)
+                        }),
+                    )
+            })))
+            .into_any_element()
+    }
+
     // ------------------------------------------------- audio budget
 
     /// Size any audio stem the world names that has no cached size yet --
@@ -2814,7 +3146,7 @@ impl WorldPanel {
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Delete selected"))
                     .disabled(!has_selection)
-                    .on_click(cx.listener(|this, _, _, cx| this.delete_selected_impl(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.delete_selected_impl(window, cx))),
             )
             .child(
                 IconButton::new("ggo-world-undo", IconName::Undo)
@@ -2846,6 +3178,10 @@ impl WorldPanel {
                     format!("popout failed: {e}"),
                 )
                 .size(LabelSize::Small)
+            }))
+            .children(open.paste_error.as_ref().map(|e| {
+                ggo_common::CopyableText::new("ggo-world-paste-error-copy", e.clone())
+                    .size(LabelSize::Small)
             }))
             .into_any_element()
     }
@@ -3060,7 +3396,21 @@ impl WorldPanel {
                     }
                 }),
             )
+            .on_hover(cx.listener(|this, hovered: &bool, _window, _cx| {
+                if !hovered && let ViewerState::Ready(open) = &this.state {
+                    open.view.borrow_mut().hover = None;
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if let ViewerState::Ready(open) = &this.state {
+                    let mut v = open.view.borrow_mut();
+                    if let Some(bounds) = v.last_bounds {
+                        v.hover = Some([
+                            f64::from(event.position.x - bounds.origin.x),
+                            f64::from(event.position.y - bounds.origin.y),
+                        ]);
+                    }
+                }
                 if this.handle_pan_move(event, cx) {
                     return;
                 }
@@ -3510,6 +3860,7 @@ impl WorldPanel {
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
+                    .child(self.render_entity_list(cx))
                     .children(inspector),
             )
             .into_any_element()
@@ -3536,10 +3887,13 @@ impl Render for WorldPanel {
             .on_action(cx.listener(|this, _: &ClearSelection, _window, cx| {
                 this.clear_selection_impl(cx)
             }))
+            .on_action(cx.listener(|this, _: &Copy, _window, cx| this.copy_impl(cx)))
+            .on_action(cx.listener(|this, _: &Paste, _window, cx| this.paste_impl(cx)))
+            .on_action(cx.listener(|this, _: &Duplicate, _window, cx| this.duplicate_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
             .on_action(
-                cx.listener(|this, _: &DeleteSelected, _window, cx| this.delete_selected_impl(cx)),
+                cx.listener(|this, _: &DeleteSelected, window, cx| this.delete_selected_impl(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ResetView, _window, cx| this.reset_view_impl(cx)))
             .on_action(cx.listener(|this, _: &NudgeLeft, _window, cx| {
@@ -4153,7 +4507,7 @@ mod tests {
                 center
             };
 
-            panel.delete_selected_impl(cx);
+            panel.delete_selected_now(cx);
             {
                 let ViewerState::Ready(open) = &panel.state else {
                     panic!("expected Ready");
@@ -4163,7 +4517,7 @@ mod tests {
             }
 
             // Stale-selection guard: nothing selected => no-op.
-            panel.delete_selected_impl(cx);
+            panel.delete_selected_now(cx);
             {
                 let ViewerState::Ready(open) = &panel.state else {
                     panic!("expected Ready");
@@ -7753,7 +8107,7 @@ mod tests {
             let entities = open_of(panel).store.state().entities.len();
             let instances = open_of(panel).store.state().instances.len();
             panel.select_all_impl(cx);
-            panel.delete_selected_impl(cx);
+            panel.delete_selected_now(cx);
             let state = open_of(panel).store.state();
             assert!(state.entities.is_empty() && state.instances.is_empty());
             assert!(open_of(panel).selected.is_empty());
@@ -7791,5 +8145,148 @@ mod tests {
         });
         cx.simulate_keystrokes("escape");
         panel.read_with(cx, |panel, _| assert!(open_of(panel).selected.is_empty()));
+    }
+
+    /// Copy writes the selection as world-file TOML; paste with the cursor
+    /// away from the canvas lands one tile right/down of the originals,
+    /// as one undo entry, and selects the pasted set.
+    #[gpui::test]
+    async fn test_copy_and_paste_round_trip_through_the_clipboard(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_down_with([50., 12.], true, cx);
+            panel.copy_impl(cx);
+        });
+        let text = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text())).unwrap();
+        assert_eq!(text.matches("[[entity]]").count(), 2, "{text}");
+        assert!(parse_fragment(&text).is_ok());
+
+        panel.update(cx, |panel, cx| {
+            let before = open_of(panel).store.state().entities.len();
+            panel.paste_impl(cx);
+            let state = open_of(panel).store.state();
+            assert_eq!(state.entities.len(), before + 2);
+            assert_eq!(
+                inspector::transform_pos(&state.entities[before]),
+                Some([4.0 + 16.0, 4.0 + 16.0]),
+                "one tile right/down of the original"
+            );
+            assert_eq!(
+                open_of(panel).selected,
+                vec![Selection::Entity(before), Selection::Entity(before + 1)],
+                "the pasted set is the selection"
+            );
+            assert!(open_of(panel).paste_error.is_none());
+            panel.undo_impl(cx);
+            assert_eq!(open_of(panel).store.state().entities.len(), before, "one undo");
+        });
+    }
+
+    /// With the cursor over the canvas the pasted group's top-left lands
+    /// at the cursor (snapped when Snap is on); duplicate uses the same
+    /// placement and leaves the clipboard alone.
+    #[gpui::test]
+    async fn test_paste_lands_at_the_cursor_and_duplicate_skips_the_clipboard(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_down_with([50., 12.], true, cx);
+            {
+                let open = open_of(panel);
+                open.view.borrow_mut().hover = Some([100.0, 200.0]);
+                let _ = open;
+            }
+            let before = open_of(panel).store.state().entities.len();
+            panel.duplicate_impl(cx);
+            let state = open_of(panel).store.state();
+            assert_eq!(state.entities.len(), before + 2);
+            // Group base was (4, 4); it now sits at the cursor (100, 200),
+            // the second member keeps its offset (36, 4).
+            assert_eq!(inspector::transform_pos(&state.entities[before]), Some([100.0, 200.0]));
+            assert_eq!(
+                inspector::transform_pos(&state.entities[before + 1]),
+                Some([136.0, 204.0])
+            );
+        });
+        assert!(
+            cx.update(|cx| cx.read_from_clipboard()).is_none(),
+            "duplicate never touched the clipboard"
+        );
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.snap = true;
+                open.view.borrow_mut().hover = Some([101.0, 203.0]);
+            }
+            let before = open_of(panel).store.state().entities.len();
+            panel.duplicate_impl(cx);
+            let state = open_of(panel).store.state();
+            assert_eq!(
+                inspector::transform_pos(&state.entities[before]),
+                Some([96.0, 208.0]),
+                "snapped to the tile grid"
+            );
+        });
+    }
+
+    /// A pasted instance goes through the cycle guard: the world's own
+    /// stem is refused and reported, a legal one is added, moved, and
+    /// resolved so it renders.
+    #[gpui::test]
+    async fn test_paste_refuses_cycling_instances_and_resolves_legal_ones(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let fragment = "[[instance]]\nworld = \"worlds/test\"\npos = [1, 2]\n[[instance]]\nworld = \"worlds/sub\"\npos = [3, 4]\n";
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(fragment.to_string())));
+        panel.update(cx, |panel, cx| {
+            let before = open_of(panel).store.state().instances.len();
+            panel.paste_impl(cx);
+            let open = open_of(panel);
+            let state = open.store.state();
+            assert_eq!(state.instances.len(), before + 1, "the self-instance is refused");
+            let pasted = &state.instances[before];
+            assert_eq!(pasted.world, "worlds/sub");
+            assert_eq!(pasted.pos, [3.0 + 16.0, 4.0 + 16.0]);
+            assert!(pasted.resolved.is_some(), "resolved so it renders");
+            assert!(
+                open.paste_error.as_deref().unwrap_or("").contains("worlds/test"),
+                "{:?}",
+                open.paste_error
+            );
+            assert_eq!(open.selected, vec![Selection::Instance(before)]);
+        });
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("not = [toml".into())));
+        panel.update(cx, |panel, cx| {
+            panel.paste_impl(cx);
+            assert!(open_of(panel).paste_error.as_deref().unwrap().contains("not world TOML"));
+        });
+    }
+
+    #[gpui::test]
+    fn entity_list_rows_name_entities_and_instances(_cx: &mut gpui::App) {
+        let world = WorldFile {
+            entities: vec![
+                entity(json!({ "Transform": { "pos": [0, 0] }, "Sprite": { "stem": "hero" } })),
+                entity(json!({ "Transform": { "pos": [0, 0] } })),
+            ],
+            instances: vec![ggo_worldlib::world_file::WorldInstance {
+                world: "worlds/arena".into(),
+                pos: [0.0, 0.0],
+                background_priority: false,
+            }],
+            backgrounds: vec![],
+        };
+        let store = ggo_worldlib::world_doc::WorldDocStore::new(
+            ggo_worldlib::world_doc::WorldDocWire::from(world),
+        );
+        let rows = entity_list_rows(&store.state());
+        assert_eq!(rows[0], (Selection::Entity(0), "#0 Sprite · hero".to_string()));
+        assert_eq!(rows[1], (Selection::Entity(1), "#1 Entity".to_string()));
+        assert_eq!(rows[2].0, Selection::Instance(0));
+        assert!(rows[2].1.starts_with("⧉ "));
     }
 }
