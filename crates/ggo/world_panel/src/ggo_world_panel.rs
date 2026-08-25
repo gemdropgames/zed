@@ -766,6 +766,17 @@ fn color565_rgba(c: u16) -> gpui::Rgba {
     }
 }
 
+/// The images `old` held that `new` does not -- what a rebuild retires.
+fn retired_by_rebuild(
+    old: &HashMap<usize, Arc<RenderImage>>,
+    new: &HashMap<usize, Arc<RenderImage>>,
+) -> Vec<Arc<RenderImage>> {
+    old.iter()
+        .filter(|(key, _)| !new.contains_key(*key))
+        .map(|(_, image)| image.clone())
+        .collect()
+}
+
 /// The list column's rows: every entity (`#i <first non-Transform
 /// component>[ · stem]`) then every instance (`⧉ <stem>`).
 fn entity_list_rows(state: &ggo_worldlib::world_doc::WorldState) -> Vec<(Selection, String)> {
@@ -969,10 +980,30 @@ pub struct WorldPanel {
     /// Launches the standalone `ggo-emu` on the built cartridge.
     emu_launcher: ggo_common::DetachedLauncher,
     _popout_task: Option<Task<()>>,
+    /// Images the image cache no longer holds, waiting to be handed back
+    /// to the window atlas -- two-stage like the emu pane's frame buffer
+    /// (see that crate's module doc: gpui never frees atlas tiles on its
+    /// own). `retired_images` is this render's batch; a render moves it
+    /// to `retired_previous` and drops what was there.
+    retired_images: Vec<Arc<RenderImage>>,
+    retired_previous: Vec<Arc<RenderImage>>,
 }
 
 impl WorldPanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
+        // The last chance to hand the image cache's atlas tiles back: no
+        // render follows a release. Same hook the emu pane uses.
+        cx.on_release(|this, cx| {
+            this.retire_open_images();
+            for image in this
+                .retired_previous
+                .drain(..)
+                .chain(this.retired_images.drain(..))
+            {
+                cx.drop_image(image, None);
+            }
+        })
+        .detach();
         Self {
             focus_handle: cx.focus_handle(),
             position: DockPosition::Right,
@@ -986,6 +1017,8 @@ impl WorldPanel {
             proc_runner: ggo_common::system_proc_runner(),
             emu_launcher: ggo_common::system_detached_launcher(),
             _popout_task: None,
+            retired_images: Vec::new(),
+            retired_previous: Vec::new(),
         }
     }
 
@@ -1191,6 +1224,7 @@ impl WorldPanel {
                 // The open document's file is gone: showing it would offer
                 // edits, undo and a save that all target nothing.
                 if matches!(&this.state, ViewerState::Ready(open) if open.source_rel == rel) {
+                    this.retire_open_images();
                     this.state = ViewerState::Empty;
                 }
                 // Re-enumerate so `+ Instance` stops offering the world
@@ -1224,6 +1258,7 @@ impl WorldPanel {
         self.worlds = loader::list_worlds(&root);
         self.load_generation += 1;
         let generation = self.load_generation;
+        self.retire_open_images();
         self.state = ViewerState::Loading {
             stem: listing.stem.clone(),
         };
@@ -1249,6 +1284,7 @@ impl WorldPanel {
                 if this.load_generation != generation {
                     return;
                 }
+                this.retire_open_images();
                 this.state = match result {
                     Ok((loaded, images)) => ViewerState::Ready(Box::new(OpenWorld::new(
                         listing,
@@ -1364,11 +1400,7 @@ impl WorldPanel {
             &mut open.map_loads,
             &mut open.meta_sprite_loads,
         );
-        open.images = Arc::new(canvas::build_image_cache(&[
-            &open.sprite_loads,
-            &open.map_loads,
-            &open.meta_sprite_loads,
-        ]));
+        Self::replace_images(open, &mut self.retired_images);
         cx.notify();
     }
 
@@ -1729,11 +1761,32 @@ impl WorldPanel {
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
         self.end_nudge_run();
-        if let ViewerState::Ready(open) = &mut self.state
-            && open.store.redo()
-        {
-            cx.notify();
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if !open.store.redo() {
+            return;
         }
+        // A redone add-instance comes back from the undo stack as it was
+        // snapshotted -- unresolved -- so it would render as a placeholder
+        // until reload. Resolve whatever has neither a subtree nor an
+        // error, and refresh the loads/images for it.
+        let unresolved: Vec<String> = open
+            .store
+            .state()
+            .instances
+            .iter()
+            .filter(|instance| instance.resolved.is_none() && instance.error.is_none())
+            .map(|instance| instance.world.clone())
+            .collect();
+        if !unresolved.is_empty() {
+            for stem in unresolved {
+                let result = loader::resolve_instance(&open.root, &stem);
+                open.store.set_instances_resolved(&stem, &result, false);
+            }
+            Self::refresh_asset_images(open, &mut self.retired_images);
+        }
+        cx.notify();
     }
 
     /// `to_doc()` -> `write_world` -> `mark_saved`. Synchronous by choice:
@@ -2224,11 +2277,7 @@ impl WorldPanel {
                 &mut open.map_loads,
                 &mut open.meta_sprite_loads,
             );
-            open.images = Arc::new(canvas::build_image_cache(&[
-                &open.sprite_loads,
-                &open.map_loads,
-                &open.meta_sprite_loads,
-            ]));
+            Self::replace_images(open, &mut self.retired_images);
             cx.notify();
         }
     }
@@ -2531,7 +2580,7 @@ impl WorldPanel {
             let result = loader::resolve_instance(&open.root, stem);
             open.store.set_instances_resolved(stem, &result, false);
         }
-        Self::refresh_asset_images(open);
+        Self::refresh_asset_images(open, &mut self.retired_images);
         let state = open.store.state();
         open.selected = (first_entity..state.entities.len())
             .map(Selection::Entity)
@@ -2544,7 +2593,7 @@ impl WorldPanel {
 
     /// Compose load targets introduced since the last rebuild and refresh
     /// the image cache -- the tail every path that adds assets shares.
-    fn refresh_asset_images(open: &mut OpenWorld) {
+    fn refresh_asset_images(open: &mut OpenWorld, retired: &mut Vec<Arc<RenderImage>>) {
         let state = open.store.state();
         loader::fill_missing_asset_loads(
             &open.root,
@@ -2553,11 +2602,39 @@ impl WorldPanel {
             &mut open.map_loads,
             &mut open.meta_sprite_loads,
         );
-        open.images = Arc::new(canvas::build_image_cache(&[
+        Self::replace_images(open, retired);
+    }
+
+    /// Rebuild the image cache from the current loads and queue every
+    /// image the new cache no longer holds for atlas release.
+    fn replace_images(open: &mut OpenWorld, retired: &mut Vec<Arc<RenderImage>>) {
+        let images = Arc::new(canvas::build_image_cache(&[
             &open.sprite_loads,
             &open.map_loads,
             &open.meta_sprite_loads,
         ]));
+        retired.extend(retired_by_rebuild(&open.images, &images));
+        open.images = images;
+    }
+
+    /// Queue the whole image cache of the open world (it is about to be
+    /// replaced or dropped).
+    fn retire_open_images(&mut self) {
+        if let ViewerState::Ready(open) = &self.state {
+            self.retired_images.extend(open.images.values().cloned());
+        }
+    }
+
+    /// The per-render half of the release contract, called by the canvas
+    /// item: drop what was retired before the previous render, hold this
+    /// render's batch one more frame.
+    pub(crate) fn retire_images(&mut self, window: &mut Window) {
+        for image in std::mem::take(&mut self.retired_previous) {
+            if let Err(error) = window.drop_image(image) {
+                log::warn!("releasing a retired world image: {error}");
+            }
+        }
+        self.retired_previous = std::mem::take(&mut self.retired_images);
     }
 
     // ------------------------------------------------- entity list
@@ -8288,5 +8365,42 @@ mod tests {
         assert_eq!(rows[1], (Selection::Entity(1), "#1 Entity".to_string()));
         assert_eq!(rows[2].0, Selection::Instance(0));
         assert!(rows[2].1.starts_with("⧉ "));
+    }
+
+    #[gpui::test]
+    fn a_rebuild_retires_exactly_the_images_the_new_cache_dropped(_cx: &mut gpui::App) {
+        let image = |n: u8| ggo_common::to_render_image(&[n; 4], 1, 1).unwrap();
+        let (a, b, c) = (image(1), image(2), image(3));
+        let old: HashMap<usize, Arc<RenderImage>> =
+            [(1, a.clone()), (2, b.clone())].into_iter().collect();
+        let new: HashMap<usize, Arc<RenderImage>> =
+            [(2, b), (3, c)].into_iter().collect();
+        let retired = retired_by_rebuild(&old, &new);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].id, a.id, "only the key the new cache lost");
+    }
+
+    /// Undo then redo of an add-instance used to bring the instance back
+    /// unresolved (a placeholder until reload); redo now re-resolves it.
+    #[gpui::test]
+    async fn test_redo_of_an_add_instance_re_resolves_its_subtree(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.add_instance_impl("worlds/sub".to_string(), cx);
+            let state = open_of(panel).store.state();
+            let added = state.instances.len() - 1;
+            assert!(state.instances[added].resolved.is_some(), "resolved on add");
+            panel.undo_impl(cx); // the move
+            panel.undo_impl(cx); // the add
+            assert_eq!(open_of(panel).store.state().instances.len(), added);
+            panel.redo_impl(cx); // the add
+            let state = open_of(panel).store.state();
+            assert_eq!(state.instances.len(), added + 1);
+            assert!(
+                state.instances[added].resolved.is_some(),
+                "redo re-resolves the subtree instead of leaving a placeholder"
+            );
+        });
     }
 }

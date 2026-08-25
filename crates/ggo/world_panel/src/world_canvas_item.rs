@@ -53,11 +53,16 @@ impl Focusable for WorldCanvasItem {
 }
 
 impl Render for WorldCanvasItem {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let canvas: Option<AnyElement> = self.panel.upgrade().and_then(|panel| {
-            panel.update(cx, |panel, cx| match &panel.state {
-                ViewerState::Ready(_) => Some(panel.render_canvas(cx)),
-                _ => None,
+            panel.update(cx, |panel, cx| {
+                // The image cache's atlas release runs here, on the one
+                // render path that paints those images.
+                panel.retire_images(window);
+                match &panel.state {
+                    ViewerState::Ready(_) => Some(panel.render_canvas(cx)),
+                    _ => None,
+                }
             })
         });
         match canvas {
