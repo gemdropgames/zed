@@ -568,6 +568,8 @@ struct OpenImport {
     /// Every decoded frame; more than one only for an Aseprite source, in
     /// which case a sprite import takes them as its frames.
     frames: Vec<DecodedFrame>,
+    /// The palette slot picked for a swap / move (tileset mode).
+    swatch_pick: Option<usize>,
     /// "Import as sprite": also write a `.spr` whose frames are cut on the
     /// [`frame_rects`] grid. Off = plain tileset import.
     as_sprite: bool,
@@ -609,6 +611,7 @@ impl OpenImport {
             pan_drag: None,
             cropping: false,
             frames: loaded.frames,
+            swatch_pick: None,
             as_sprite: false,
             frame_cut: (None, None),
             canvas_bounds: Rc::new(RefCell::new(None)),
@@ -919,6 +922,64 @@ impl ImportPanel {
     /// toggle), never per render.
     fn rebuild_preview(open: &mut OpenImport) {
         open.preview_image = open.wizard.preview.as_ref().and_then(loader::preview_image);
+    }
+
+    // ---------------------------------------------------- palette surgery
+
+    /// Click a swatch: the first click picks, the second swaps with the
+    /// pick (clicking the pick again clears it). Tileset mode only -- the
+    /// sprite path quantizes on its own and ignores the preview.
+    fn palette_click(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && !open.as_sprite
+        {
+            match open.swatch_pick.take() {
+                Some(pick) if pick != slot => {
+                    if let Some(preview) = open.wizard.preview.as_mut() {
+                        preview.swap(pick, slot);
+                    }
+                    Self::rebuild_preview(open);
+                }
+                Some(_) => {}
+                None => open.swatch_pick = Some(slot),
+            }
+            cx.notify();
+        }
+    }
+
+    /// Move the picked slot by `delta`, keeping it picked.
+    fn palette_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(pick) = open.swatch_pick
+            && let Some(preview) = open.wizard.preview.as_mut()
+        {
+            preview.move_slot(pick, delta);
+            open.swatch_pick =
+                Some((pick as isize + delta).clamp(0, PAL_SLOTS as isize - 1) as usize);
+            Self::rebuild_preview(open);
+            cx.notify();
+        }
+    }
+
+    fn palette_sort(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(preview) = open.wizard.preview.as_mut()
+        {
+            preview.sort_by_luma(open.wizard.reserve_transparent);
+            open.swatch_pick = None;
+            Self::rebuild_preview(open);
+            cx.notify();
+        }
+    }
+
+    /// Re-quantize: drops every palette edit.
+    fn palette_reset(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.wizard.commit_region(open.wizard.region);
+            open.swatch_pick = None;
+            Self::rebuild_preview(open);
+            cx.notify();
+        }
     }
 
     fn ready(&self) -> Option<&OpenImport> {
@@ -1707,10 +1768,13 @@ impl ImportPanel {
             return div().into_any_element();
         };
         let palette = preview.palette;
+        let editable = !open.as_sprite;
+        let pick = open.swatch_pick.filter(|_| editable);
         h_flex()
             .flex_wrap()
             .gap_0p5()
             .p_1()
+            .items_center()
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .children((0..PAL_SLOTS).map(|slot| {
@@ -1721,16 +1785,59 @@ impl ImportPanel {
                     .w(px(SWATCH_PX))
                     .h(px(SWATCH_PX))
                     .border_1()
-                    .border_color(cx.theme().colors().border)
+                    .border_color(if pick == Some(slot) {
+                        cx.theme().colors().border_focused
+                    } else {
+                        cx.theme().colors().border
+                    })
                     .rounded_sm()
                     .when(a != 0, |el| el.bg(rgb(color)))
                     .when(a == 0, |el| el.bg(rgba(0x00000000)))
                     .tooltip(ui::Tooltip::text(format!(
-                        "{slot}: #{:04X}{}",
+                        "{slot}: #{:04X}{}{}",
                         palette[slot],
-                        if a == 0 { " (transparent)" } else { "" }
+                        if a == 0 { " (transparent)" } else { "" },
+                        if editable { " — click, then click another to swap" } else { "" }
                     )))
+                    .when(editable, |el| {
+                        el.on_click(cx.listener(move |this, _, _, cx| this.palette_click(slot, cx)))
+                    })
             }))
+            .when(editable, |el| {
+                el.child(
+                    IconButton::new("ggo-import-pal-left", IconName::ChevronLeft)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(pick.is_none())
+                        .tooltip(Tooltip::text("Move the picked slot left"))
+                        .on_click(cx.listener(|this, _, _, cx| this.palette_move(-1, cx))),
+                )
+                .child(
+                    IconButton::new("ggo-import-pal-right", IconName::ChevronRight)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(pick.is_none())
+                        .tooltip(Tooltip::text("Move the picked slot right"))
+                        .on_click(cx.listener(|this, _, _, cx| this.palette_move(1, cx))),
+                )
+                .child(
+                    Button::new("ggo-import-pal-sort", "Sort")
+                        .tooltip(Tooltip::text(
+                            "Order slots by brightness (slot 0 stays when transparent)",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.palette_sort(cx))),
+                )
+                .child(
+                    Button::new("ggo-import-pal-reset", "Reset")
+                        .tooltip(Tooltip::text("Re-quantize; a crop change also resets"))
+                        .on_click(cx.listener(|this, _, _, cx| this.palette_reset(cx))),
+                )
+            })
+            .when(!editable, |el| {
+                el.child(
+                    Label::new("palette editing: tileset mode")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
             .into_any_element()
     }
 
@@ -3800,5 +3907,43 @@ mod tests {
         let opened = io::open_sprite(&assets, "art/walk.spr").expect("spr round-trips");
         assert_eq!(opened.state.frames.len(), 3, "one sprite frame per source frame");
         assert_eq!((opened.state.w_tiles, opened.state.h_tiles), (2, 1));
+    }
+
+    #[gpui::test]
+    async fn test_palette_swaps_reach_the_written_pal(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+        let read_pal = || io::open_tileset(&assets, "art/hero.til").unwrap().palette;
+
+        panel.update(cx, |panel, cx| {
+            panel.commit(cx).expect("baseline commit");
+        });
+        let baseline = read_pal();
+        assert_ne!(baseline[1], baseline[2], "the fixture quantizes to two colours");
+
+        panel.update(cx, |panel, cx| {
+            panel.palette_click(1, cx);
+            assert_eq!(ready(panel).swatch_pick, Some(1));
+            panel.palette_click(2, cx);
+            assert_eq!(ready(panel).swatch_pick, None, "the second click swaps");
+            panel.commit(cx).expect("commit after swap");
+        });
+        let swapped = read_pal();
+        assert_eq!(swapped[1], baseline[2]);
+        assert_eq!(swapped[2], baseline[1]);
+
+        panel.update(cx, |panel, cx| {
+            panel.palette_click(2, cx);
+            panel.palette_move(-1, cx);
+            assert_eq!(ready(panel).swatch_pick, Some(1), "the pick follows the move");
+            panel.palette_reset(cx);
+            assert_eq!(ready(panel).swatch_pick, None);
+            panel.commit(cx).expect("commit after reset");
+            panel.set_as_sprite(true, cx);
+            panel.palette_click(3, cx);
+            assert_eq!(ready(panel).swatch_pick, None, "sprite mode ignores palette clicks");
+        });
+        assert_eq!(read_pal(), baseline, "reset re-quantized");
     }
 }
