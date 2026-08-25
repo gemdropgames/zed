@@ -208,9 +208,10 @@ fn split_world_path(rel: &str) -> Option<(String, WorldListing)> {
 /// for, and the extension that stem resolves with. A `MetaSprite`'s stem is
 /// ASSET-ROOT-relative and extensionless (`sprites/hero`), the same frame
 /// `loader::compose_meta_sprite_rgba` opens it in (`{stem}.spr`).
+#[cfg(test)]
 const META_SPRITE: &str = "MetaSprite";
+#[cfg(test)]
 const SPRITE_COMPONENT: &str = "Sprite";
-const SPRITE_EXT: &str = "spr";
 
 /// How many stem suggestions render under a focused Asset field.
 const STEM_SUGGESTION_CAP: usize = 8;
@@ -234,40 +235,36 @@ const STEM_SUGGESTION_CAP: usize = 8;
 /// Asset-kind inspector field. Recursive on purpose: a fresh project's
 /// `sprites/gg_icon.spr` (or any nested layout) must surface.
 fn list_asset_stems(root: &Path, ext: &str) -> Vec<String> {
-    let mut stems = Vec::new();
-    walk_asset_stems(root, root, ext, &mut stems);
+    // worldlib's walker, not a private one: it skips dotdirs, `target`,
+    // `node_modules` and caps depth, and this runs on the render thread's
+    // focus-change path against a whole asset root.
+    let mut stems: Vec<String> = ggo_worldlib::sprites::io::list_all_files(root)
+        .into_iter()
+        .filter_map(|rel| {
+            let path = Path::new(&rel);
+            path.extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| e.eq_ignore_ascii_case(ext))?;
+            Some(path.with_extension("").to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
     stems.sort();
     stems
 }
 
-fn walk_asset_stems(root: &Path, dir: &Path, ext: &str, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_asset_stems(root, &path, ext, out);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
-            && let Ok(rel) = path.strip_prefix(root)
-        {
-            out.push(
-                rel.with_extension("")
-                    .to_string_lossy()
-                    .replace(std::path::MAIN_SEPARATOR, "/"),
-            );
-        }
-    }
-}
-
-fn sprite_rel_for_stem(project_root: &Path, asset_root: &Path, stem: &str) -> Option<String> {
+/// The worktree-relative path of the file an Asset field names, or
+/// `None` when the stem is empty, the file is missing, or the asset root
+/// lies outside the worktree (nothing the workspace could open).
+fn asset_rel_for_stem(
+    project_root: &Path,
+    asset_root: &Path,
+    stem: &str,
+    ext: &str,
+) -> Option<String> {
     if stem.is_empty() {
         return None;
     }
-    let abs = asset_root.join(format!("{stem}.{SPRITE_EXT}"));
+    let abs = inspector::asset_abs_path(asset_root, stem, ext);
     if !abs.is_file() {
         return None;
     }
@@ -827,6 +824,9 @@ impl WorldPanel {
         // since the panel was last shown gets its new size.
         if let ViewerState::Ready(open) = &mut self.state {
             open.audio_sizes.clear();
+            // Same reason: the stem feed is otherwise only rebuilt when
+            // the focused field changes.
+            open.stem_completion = None;
         }
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
@@ -1303,42 +1303,103 @@ impl WorldPanel {
         cx.notify();
     }
 
-    /// The worktree-relative `.spr` path entity `entity_ix`'s `MetaSprite`
-    /// component points at, or `None` when the entity has no `MetaSprite`,
-    /// its `stem` is missing/blank, or the stem doesn't resolve to a file
-    /// ([`sprite_rel_for_stem`]). Drives BOTH whether the inspector offers
-    /// the jump and where it goes, so the button can't exist without a
-    /// destination.
-    fn goto_sprite_target(&self, entity_ix: usize, component: &str) -> Option<String> {
+    /// The schema extension of `component.field`, when it is an Asset
+    /// field.
+    fn asset_field_ext(&self, component: &str, field: &str) -> Option<String> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        let project_root = self.project_root.as_ref()?;
-        let stem = open
-            .store
+        match inspector::field_kind(&open.schemas, component, field) {
+            Some(FieldKind::Asset(ext)) => Some(ext.clone()),
+            _ => None,
+        }
+    }
+
+    /// The committed stem of `component.field` on entity `entity_ix`.
+    fn asset_field_stem(&self, entity_ix: usize, component: &str, field: &str) -> Option<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        open.store
             .state()
             .entities
             .get(entity_ix)?
             .components
             .get(component)?
-            .get("stem")?
-            .as_str()?
-            .to_string();
-        sprite_rel_for_stem(project_root, &open.root, &stem)
+            .get(field)?
+            .as_str()
+            .map(str::to_string)
     }
 
-    /// Open `rel` in the sprite panel -- the `MetaSprite` inspector's
-    /// "go to sprite" jump. A workspace with no sprite panel docked is a
-    /// no-op, the same graceful degradation every other GGO panel handoff
-    /// makes; the `bool` (did a panel claim it?) is `open_in_panel`'s own
-    /// return, surfaced so a test can tell the two apart.
-    fn goto_sprite(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Whether an Asset field's stem resolves -- what drives the red
+    /// badge and the "open" jump on its row.
+    pub(crate) fn asset_field_status(
+        &self,
+        entity_ix: usize,
+        component: &str,
+        field: &str,
+    ) -> Option<inspector::AssetStatus> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let ext = self.asset_field_ext(component, field)?;
+        let stem = self.asset_field_stem(entity_ix, component, field)?;
+        Some(inspector::asset_status(&open.root, &stem, &ext))
+    }
+
+    /// The worktree-relative file an Asset field names, when it resolves
+    /// ([`asset_rel_for_stem`]). Drives BOTH whether the row offers the
+    /// jump and where it goes.
+    pub(crate) fn asset_field_rel(
+        &self,
+        entity_ix: usize,
+        component: &str,
+        field: &str,
+    ) -> Option<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let project_root = self.project_root.as_ref()?;
+        let ext = self.asset_field_ext(component, field)?;
+        let stem = self.asset_field_stem(entity_ix, component, field)?;
+        asset_rel_for_stem(project_root, &open.root, &stem, &ext)
+    }
+
+    /// Open worktree-relative `rel` wherever its extension is claimed --
+    /// through the same path-open interceptor registry the project panel
+    /// uses, so a `.spr` lands in the sprite tab, a `.til` in the tileset
+    /// editor, a `.map` in the map panel and a `.adp` in the audio tab
+    /// with no dependency on any of them. Anything unclaimed opens the
+    /// ordinary way. Returns whether a GGO panel claimed it.
+    pub(crate) fn goto_asset(
+        &mut self,
+        rel: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
             return false;
         };
         workspace.update(cx, |workspace, cx| {
-            ggo_sprite_panel::open_sprite_item(workspace, rel, window, cx);
-            true
+            let Some(worktree_id) = workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).id())
+            else {
+                return false;
+            };
+            let Some(path) = ggo_common::inline_project_path(worktree_id, &rel) else {
+                return false;
+            };
+            if workspace.intercept_path_open(&path, window, cx) {
+                return true;
+            }
+            workspace
+                .open_path(path, None, true, window, cx)
+                .detach_and_log_err(cx);
+            false
         })
     }
 
@@ -2850,12 +2911,6 @@ impl WorldPanel {
 
         for (component, value) in &entity.components {
             let name = component.clone();
-            // "Go to sprite" for a Sprite or MetaSprite whose stem resolves
-            // to a real `.spr` -- absent (not disabled) otherwise, since an
-            // unresolved stem has nowhere to go.
-            let goto = matches!(component.as_str(), META_SPRITE | SPRITE_COMPONENT)
-                .then(|| self.goto_sprite_target(entity_ix, component))
-                .flatten();
             let mut panel = v_flex().gap_1().child(
                 h_flex()
                     .justify_between()
@@ -2863,14 +2918,6 @@ impl WorldPanel {
                     .child(
                         h_flex()
                             .gap_1()
-                            .children(goto.map(|rel| {
-                                IconButton::new("ggo-goto-sprite", IconName::ArrowUpRight)
-                                    .icon_size(IconSize::XSmall)
-                                    .tooltip(ui::Tooltip::text(format!("Open {rel}")))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        let _ = this.goto_sprite(rel.clone(), window, cx);
-                                    }))
-                            }))
                             .child(
                                 IconButton::new(
                                     SharedString::from(format!("ggo-remove-{component}")),
@@ -3002,19 +3049,63 @@ impl WorldPanel {
                                     }
                                 }
                             }
-                            Some(FieldKind::Asset(_)) => {
+                            Some(FieldKind::Asset(ext)) => {
                                 let target = inspector::FieldTarget::EntityField {
                                     entity: entity_ix,
                                     component: component.clone(),
                                     field: field.clone(),
                                 };
                                 if let Some(editor) = editors.get(&target) {
-                                    panel = panel.child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(Self::field_label(field.as_str()))
-                                            .child(Self::editor_input(editor, cx)),
-                                    );
+                                    // The COMMITTED stem, not the editor's live
+                                    // text: the badge answers "does the world
+                                    // as saved resolve", and flickering red on
+                                    // every keystroke would say nothing.
+                                    let stem = self
+                                        .asset_field_stem(entity_ix, component, field)
+                                        .unwrap_or_default();
+                                    let status = self
+                                        .asset_field_status(entity_ix, component, field)
+                                        .unwrap_or(inspector::AssetStatus::Empty);
+                                    let jump = (status == inspector::AssetStatus::Resolves)
+                                        .then(|| self.asset_field_rel(entity_ix, component, field))
+                                        .flatten();
+                                    let mut row = h_flex()
+                                        .gap_1()
+                                        .child(Self::field_label(field.as_str()))
+                                        .child(Self::editor_input(editor, cx));
+                                    if status == inspector::AssetStatus::Missing {
+                                        row = row.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "ggo-asset-missing-{component}-{field}"
+                                                )))
+                                                .tooltip(ui::Tooltip::text(format!(
+                                                    "no {stem}.{ext} under {}",
+                                                    open.root.display()
+                                                )))
+                                                .child(
+                                                    Icon::new(IconName::Warning)
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Error),
+                                                ),
+                                        );
+                                    }
+                                    if let Some(rel) = jump {
+                                        row = row.child(
+                                            IconButton::new(
+                                                SharedString::from(format!(
+                                                    "ggo-goto-asset-{component}-{field}"
+                                                )),
+                                                IconName::ArrowUpRight,
+                                            )
+                                            .icon_size(IconSize::XSmall)
+                                            .tooltip(ui::Tooltip::text(format!("Open {rel}")))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.goto_asset(rel.clone(), window, cx);
+                                            })),
+                                        );
+                                    }
+                                    panel = panel.child(row);
                                     if let Some(suggestions) =
                                         self.render_stem_suggestions(&target, editor, cx)
                                     {
@@ -5380,7 +5471,7 @@ mod tests {
     /// ASSET-ROOT-relative stem into the WORKTREE-relative path the sprite
     /// panel opens, and declines when the stem names no file.
     #[gpui::test]
-    async fn test_goto_sprite_target_resolves_the_stem_and_declines_when_missing(
+    async fn test_asset_field_rel_resolves_the_stem_and_declines_when_missing(
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
@@ -5388,7 +5479,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             // No MetaSprite on the fixture's entity 0 yet.
-            assert_eq!(panel.goto_sprite_target(0, META_SPRITE), None);
+            assert_eq!(panel.asset_field_rel(0, META_SPRITE, "stem"), None);
 
             let mut defaults = serde_json::Map::new();
             defaults.insert("stem".to_string(), json!("sprites/hero"));
@@ -5403,7 +5494,7 @@ mod tests {
             // The stem is there, but nothing is on disk: decline rather
             // than park the sprite panel in an error state.
             assert_eq!(
-                panel.goto_sprite_target(0, META_SPRITE),
+                panel.asset_field_rel(0, META_SPRITE, "stem"),
                 None,
                 "an unauthored sprite offers no jump"
             );
@@ -5414,7 +5505,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             assert_eq!(
-                panel.goto_sprite_target(0, META_SPRITE),
+                panel.asset_field_rel(0, META_SPRITE, "stem"),
                 Some("sprites/hero.spr".to_string()),
                 "worktree-relative, with the .spr extension the stem omits"
             );
@@ -5432,7 +5523,7 @@ mod tests {
                 cx,
             );
             assert_eq!(
-                panel.goto_sprite_target(0, SPRITE_COMPONENT),
+                panel.asset_field_rel(0, SPRITE_COMPONENT, "stem"),
                 Some("sprites/hero.spr".to_string()),
                 "a static Sprite gets the jump too"
             );
@@ -5447,7 +5538,7 @@ mod tests {
                 },
                 cx,
             );
-            assert_eq!(panel.goto_sprite_target(0, META_SPRITE), None);
+            assert_eq!(panel.asset_field_rel(0, META_SPRITE, "stem"), None);
             panel.apply_op(
                 WorldOp::SetField {
                     entity: 0,
@@ -5457,16 +5548,16 @@ mod tests {
                 },
                 cx,
             );
-            assert_eq!(panel.goto_sprite_target(0, META_SPRITE), None);
+            assert_eq!(panel.asset_field_rel(0, META_SPRITE, "stem"), None);
         });
     }
 
-    /// `sprite_rel_for_stem` is the asset-root/worktree bridge; the panel
+    /// `asset_rel_for_stem` is the asset-root/worktree bridge; the panel
     /// test above exercises it through a worktree-rooted world, this pins
     /// the ASSET-ROOTED layout (`<worktree>/assets/...`) the F4 split
     /// introduced, where the two frames genuinely differ.
     #[gpui::test]
-    fn test_sprite_rel_for_stem_bridges_the_asset_root_and_the_worktree(_cx: &mut gpui::App) {
+    fn test_asset_rel_for_stem_bridges_the_asset_root_and_the_worktree(_cx: &mut gpui::App) {
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path();
         let assets = worktree.join("assets");
@@ -5474,21 +5565,21 @@ mod tests {
         std::fs::write(assets.join("sprites/hero.spr"), b"x").unwrap();
 
         assert_eq!(
-            sprite_rel_for_stem(worktree, &assets, "sprites/hero"),
+            asset_rel_for_stem(worktree, &assets, "sprites/hero", "spr"),
             Some("assets/sprites/hero.spr".to_string()),
             "the stem resolves under the ASSET root but is handed over worktree-relative"
         );
         assert_eq!(
-            sprite_rel_for_stem(worktree, &assets, "sprites/ghost"),
+            asset_rel_for_stem(worktree, &assets, "sprites/ghost", "spr"),
             None
         );
-        assert_eq!(sprite_rel_for_stem(worktree, &assets, ""), None);
+        assert_eq!(asset_rel_for_stem(worktree, &assets, "", "spr"), None);
         // An asset root outside the worktree has nothing to relativize.
         let elsewhere = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(elsewhere.path().join("sprites")).unwrap();
         std::fs::write(elsewhere.path().join("sprites/hero.spr"), b"x").unwrap();
         assert_eq!(
-            sprite_rel_for_stem(worktree, elsewhere.path(), "sprites/hero"),
+            asset_rel_for_stem(worktree, elsewhere.path(), "sprites/hero", "spr"),
             None
         );
     }
@@ -5515,17 +5606,20 @@ mod tests {
                 },
                 cx,
             );
-            panel.goto_sprite_target(0, META_SPRITE).expect("the stem resolves")
+            panel.asset_field_rel(0, META_SPRITE, "stem").expect("the stem resolves")
         });
         assert_eq!(rel, "sprites/hero.spr");
 
-        // Dock era over: the jump opens a center-pane sprite tab.
+        // The jump routes through the path-open interceptor registry, so
+        // the sprite panel's `init` is what makes a `.spr` land in a
+        // center-pane sprite tab.
+        cx.update(|_, cx| ggo_sprite_panel::init(cx));
         let before = workspace.read_with(cx, |workspace, cx| {
             workspace.active_pane().read(cx).items_len()
         });
-        let claimed = panel.update_in(cx, |panel, window, cx| panel.goto_sprite(rel, window, cx));
+        let claimed = panel.update_in(cx, |panel, window, cx| panel.goto_asset(rel, window, cx));
         cx.run_until_parked();
-        assert!(claimed, "the jump is always claimed now");
+        assert!(claimed, "the sprite panel's interceptor claims a .spr");
         let after = workspace.read_with(cx, |workspace, cx| {
             workspace.active_pane().read(cx).items_len()
         });
@@ -7203,5 +7297,111 @@ mod tests {
             assert!(!budget.over());
             assert_eq!(budget.label(), "audio 9 / 384 KiB · 1 missing");
         });
+    }
+
+    /// An Asset field's status follows the file on disk: a dangling stem
+    /// is flagged (but stays committed), and resolves -- with a jump --
+    /// once the file exists. Schema-driven, so `Sfx.stem` (`.adp`) works
+    /// exactly like `MetaSprite.stem` (`.spr`).
+    #[gpui::test]
+    async fn test_asset_field_status_flags_dangling_stems_until_the_file_exists(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let mut defaults = serde_json::Map::new();
+            defaults.insert("stem".to_string(), json!("sfx/jump"));
+            panel.apply_op(
+                WorldOp::AddComponent {
+                    entity: 0,
+                    name: "Sfx".to_string(),
+                    defaults,
+                },
+                cx,
+            );
+            assert_eq!(
+                panel.asset_field_status(0, "Sfx", "stem"),
+                Some(inspector::AssetStatus::Missing)
+            );
+            assert_eq!(panel.asset_field_rel(0, "Sfx", "stem"), None);
+            assert_eq!(
+                panel.asset_field_stem(0, "Sfx", "stem").as_deref(),
+                Some("sfx/jump"),
+                "a dangling stem is still committed"
+            );
+            assert_eq!(
+                panel.asset_field_status(0, "Sfx", "looping"),
+                None,
+                "only Asset fields have a status"
+            );
+        });
+
+        std::fs::create_dir_all(dir.path().join("sfx")).unwrap();
+        std::fs::write(dir.path().join("sfx/jump.adp"), b"x").unwrap();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.asset_field_status(0, "Sfx", "stem"),
+                Some(inspector::AssetStatus::Resolves)
+            );
+            assert_eq!(
+                panel.asset_field_rel(0, "Sfx", "stem").as_deref(),
+                Some("sfx/jump.adp")
+            );
+        });
+    }
+
+    /// The jump is generic: whatever interceptor claims the extension
+    /// gets the path, and an unclaimed one falls back to a plain open.
+    #[gpui::test]
+    async fn test_goto_asset_routes_through_the_path_open_interceptors(cx: &mut TestAppContext) {
+        thread_local! {
+            static CLAIMED: std::cell::RefCell<Vec<String>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn recording_til(
+            workspace: &mut Workspace,
+            path: &ProjectPath,
+            _window: &mut Window,
+            cx: &mut Context<Workspace>,
+        ) -> bool {
+            if !path.path.extension().is_some_and(|e| e == "til") {
+                return false;
+            }
+            let rel = ggo_common::rel_in_primary_worktree(workspace, path, cx)
+                .unwrap_or_default();
+            CLAIMED.with(|c| c.borrow_mut().push(rel));
+            true
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        cx.update(|_, cx| workspace::register_path_open_interceptor(cx, recording_til));
+
+        let claimed = panel.update_in(cx, |panel, window, cx| {
+            panel.goto_asset("fonts/mono.til".to_string(), window, cx)
+        });
+        assert!(claimed, "the .til interceptor claims the jump");
+        CLAIMED.with(|c| assert_eq!(c.borrow().as_slice(), ["fonts/mono.til"]));
+
+        let claimed = panel.update_in(cx, |panel, window, cx| {
+            panel.goto_asset("notes.txt".to_string(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!claimed, "an unclaimed extension falls back to a plain open");
+    }
+
+    /// The stem walk uses worldlib's hygiene: dotdirs and build dirs are
+    /// skipped, so a `.git` full of stale sprites never pollutes the feed.
+    #[gpui::test]
+    fn test_list_asset_stems_skips_dot_and_build_dirs(_cx: &mut gpui::App) {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in ["sprites/hero.spr", ".git/junk.spr", "target/old.spr", "sprites/map.map"] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        assert_eq!(list_asset_stems(dir.path(), "spr"), vec!["sprites/hero".to_string()]);
+        assert_eq!(list_asset_stems(dir.path(), "map"), vec!["sprites/map".to_string()]);
     }
 }

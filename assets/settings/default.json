@@ -2144,6 +2144,7 @@
     ],
     "Markdown": [".rules", ".cursorrules", ".windsurfrules", ".clinerules"],
     "Shell Script": [".env.*"],
+    "GGO World": ["**/worlds/**/*.toml"], // GGO
   },
   // Settings for which version of Node.js and NPM to use when installing
   // language servers and Copilot.

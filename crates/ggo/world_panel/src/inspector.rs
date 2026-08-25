@@ -9,6 +9,7 @@
 //! Enter/blur (matching ggo-ide's Enter-or-cross-field-commit rule; an
 //! unparsable buffer is dropped, not committed).
 
+use std::path::{Path, PathBuf};
 use ggo_worldlib::render::Selection;
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind};
 use ggo_worldlib::world_doc::{WorldOp, WorldState};
@@ -69,6 +70,33 @@ pub fn asset_field_ext(target: &FieldTarget, schemas: &[ComponentSchema]) -> Opt
     match field_kind(schemas, component, field) {
         Some(FieldKind::Asset(ext)) => Some(ext.clone()),
         _ => None,
+    }
+}
+
+/// Whether an Asset field's stem names a file under the asset root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetStatus {
+    /// Nothing typed yet -- not an error, the field is simply unset.
+    Empty,
+    Resolves,
+    /// A stem with no `<stem>.<ext>` behind it. Still committed (you
+    /// often name the asset before importing it), but flagged: the
+    /// runtime would load nothing and say nothing.
+    Missing,
+}
+
+/// The file an Asset field names: `<asset_root>/<stem>.<ext>`.
+pub fn asset_abs_path(asset_root: &Path, stem: &str, ext: &str) -> PathBuf {
+    asset_root.join(format!("{stem}.{ext}"))
+}
+
+pub fn asset_status(asset_root: &Path, stem: &str, ext: &str) -> AssetStatus {
+    if stem.is_empty() {
+        AssetStatus::Empty
+    } else if asset_abs_path(asset_root, stem, ext).is_file() {
+        AssetStatus::Resolves
+    } else {
+        AssetStatus::Missing
     }
 }
 
@@ -642,5 +670,20 @@ mod tests {
             "empty input offers everything"
         );
         assert!(rank_stem_matches("zzz", &candidates).is_empty());
+    }
+
+    #[test]
+    fn asset_status_distinguishes_empty_missing_and_resolving_stems() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
+        std::fs::write(dir.path().join("sprites/hero.spr"), b"x").unwrap();
+        assert_eq!(asset_status(dir.path(), "", "spr"), AssetStatus::Empty);
+        assert_eq!(asset_status(dir.path(), "sprites/hero", "spr"), AssetStatus::Resolves);
+        assert_eq!(asset_status(dir.path(), "sprites/hero", "til"), AssetStatus::Missing);
+        assert_eq!(asset_status(dir.path(), "sprites/ghost", "spr"), AssetStatus::Missing);
+        assert_eq!(
+            asset_abs_path(dir.path(), "sfx/jump", "adp"),
+            dir.path().join("sfx/jump.adp")
+        );
     }
 }

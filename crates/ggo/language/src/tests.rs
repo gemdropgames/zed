@@ -388,37 +388,53 @@ fn a_worlds_toml_matches_through_the_projects_file_types(cx: &mut App) {
     }
 }
 
+/// With the glob shipped in the fork's default settings, a world file
+/// activates the language in ANY project -- no per-repo
+/// `.zed/settings.json` -- while ordinary TOML stays TOML.
 #[gpui::test]
-fn without_the_leading_globstar_the_worktree_root_defeats_the_glob(cx: &mut App) {
-    // Pins the reason `.zed/settings.json` must say `**/worlds/**/*.toml` and
-    // not `worlds/**/*.toml`: the candidate `find_for_file` tests is
-    // `File::full_path`, which is prefixed with the worktree's root name
-    // ("ggo/worlds/arena.toml"), so an unanchored glob never matches.
-    init_settings(cx, |settings| {
-        settings
-            .file_types
-            .get_or_insert_default()
-            .0
-            .insert(LANGUAGE_NAME.into(), vec!["worlds/**/*.toml".into()].into());
-    });
-    let languages = registry(cx);
-
-    assert_eq!(
-        languages.language_for_file(&test_file("worlds/arena.toml"), None, cx),
-        None,
-    );
-}
-
-#[gpui::test]
-fn the_language_does_not_claim_toml_files_without_the_setting(cx: &mut App) {
+fn the_default_settings_activate_the_language_without_a_project_setting(cx: &mut App) {
     init_settings(cx, |_| {});
     let languages = registry(cx);
+    let name = |file| {
+        languages
+            .language_for_file(&file, None, cx)
+            .and_then(|id| languages.language_name_for_id(id))
+    };
 
-    for path in ["worlds/arena.toml", "Cargo.toml"] {
+    for path in ["worlds/arena.toml", "assets/worlds/nested/boss.toml"] {
         assert_eq!(
-            languages.language_for_file(&test_file(path), None, cx),
-            None,
-            "{path} matched with no `file_types` configured",
+            name(test_file(path)).map(|n| n.to_string()),
+            Some(LANGUAGE_NAME.to_string()),
+            "{path} should be a GGO World"
         );
     }
+    for path in ["Cargo.toml", "assets/sprites/hero.toml", "worlds/README.md"] {
+        assert_eq!(name(test_file(path)), None, "{path} should not match");
+    }
+}
+
+/// The shipped glob must start with `**/`: `find_for_file` matches
+/// against `File::full_path`, which is prefixed with the worktree's root
+/// name ("ggo/worlds/arena.toml"), so an unanchored `worlds/**/*.toml`
+/// never matches. Pinned on the constant since the default settings now
+/// carry it everywhere.
+#[test]
+fn the_project_glob_is_anchored_with_a_leading_globstar() {
+    assert!(PROJECT_FILE_TYPE_GLOB.starts_with("**/"), "{PROJECT_FILE_TYPE_GLOB}");
+}
+
+/// The fork ships the project glob in its DEFAULT settings, so the
+/// language activates in every project without a per-repo
+/// `.zed/settings.json` (the config-placement gap MIGRATION.md §11 named).
+/// An upstream merge that drops the `// GGO` line in
+/// `assets/settings/default.json` fails here.
+#[test]
+fn the_default_settings_ship_the_project_glob() {
+    let defaults = settings::default_settings();
+    let value: serde_json::Value =
+        settings_json::parse_json_with_comments(&defaults).expect("default.json parses");
+    let globs = value["file_types"][LANGUAGE_NAME]
+        .as_array()
+        .expect("GGO World has a default file_types entry");
+    assert_eq!(globs, &vec![serde_json::json!(PROJECT_FILE_TYPE_GLOB)]);
 }
