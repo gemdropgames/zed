@@ -87,8 +87,15 @@ actions!(
         FlipHorizontal,
         /// Flips the selected region vertically.
         FlipVertical,
+        /// Leaves tile focus, or clears the selection.
+        Cancel,
+        /// Focuses the tile under the selection (or tile 0) for magnified editing.
+        FocusTile,
     ]
 );
+
+/// The zoom focus mode uses when the sheet's own zoom is smaller.
+const FOCUS_MIN_ZOOM: usize = 8;
 
 /// Brush size bounds (px, square).
 const MIN_BRUSH: usize = 1;
@@ -151,6 +158,8 @@ fn bind_panel_keys(cx: &mut App) {
         KeyBinding::new("]", BrushLarger, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-h", FlipHorizontal, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-v", FlipVertical, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", Cancel, Some(KEY_CONTEXT)),
+        KeyBinding::new("f", FocusTile, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -302,6 +311,10 @@ struct OpenTileset {
     /// A Select-tool drag that started INSIDE the marquee: (start, head)
     /// in sheet pixels; release moves the marquee's pixels by the offset.
     move_drag: Option<((usize, usize), (usize, usize))>,
+    /// Focus mode: the sheet shows only this tile, magnified.
+    focus: Option<usize>,
+    /// The sheet zoom to restore when focus ends.
+    zoom_before_focus: Option<usize>,
 }
 
 impl OpenTileset {
@@ -333,6 +346,8 @@ impl OpenTileset {
             mirror_v: false,
             shape_drag: None,
             move_drag: None,
+            focus: None,
+            zoom_before_focus: None,
         }
     }
 
@@ -547,7 +562,75 @@ impl TilesetPanel {
     /// arrow-key camera. Offsets grow NEGATIVE as the view scrolls
     /// right/down (gpui's convention); the paint pass clamps to the
     /// content, so only the zero edge needs guarding here.
+    /// Enter focus on `tile`: the sheet becomes that one tile, magnified.
+    fn enter_focus(&mut self, tile: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if tile >= open.store.state().tile_count {
+            return;
+        }
+        if open.focus.is_none() {
+            open.zoom_before_focus = Some(open.zoom);
+            open.zoom = open.zoom.clamp(FOCUS_MIN_ZOOM, MAX_ZOOM);
+        }
+        open.focus = Some(tile);
+        open.selection = None;
+        open.shape_drag = None;
+        open.move_drag = None;
+        self.recompose_grid(cx);
+    }
+
+    fn leave_focus(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if open.focus.take().is_none() {
+            return;
+        }
+        if let Some(zoom) = open.zoom_before_focus.take() {
+            open.zoom = zoom;
+        }
+        open.selection = None;
+        self.recompose_grid(cx);
+    }
+
+    /// Focus the tile under the marquee (its anchor), else tile 0.
+    fn focus_tile_impl(&mut self, cx: &mut Context<Self>) {
+        let tile = self
+            .selection_rect()
+            .and_then(|(x0, y0, ..)| self.doc_pixel(x0, y0))
+            .map_or(0, |(tile, ..)| tile);
+        self.enter_focus(tile, cx);
+    }
+
+    /// Escape: leave focus if in it, else drop the selection.
+    fn cancel_impl(&mut self, cx: &mut Context<Self>) {
+        let focused = matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some());
+        if focused {
+            self.leave_focus(cx);
+        } else if let ViewerState::Ready(open) = &mut self.state {
+            open.selection = None;
+            cx.notify();
+        }
+    }
+
+    fn step_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let (Some(focus), count) = (open.focus, open.store.state().tile_count) else {
+            return;
+        };
+        let next = (focus as isize + delta).clamp(0, count.max(1) as isize - 1) as usize;
+        self.enter_focus(next, cx);
+    }
+
     fn scroll_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        if matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some()) && dx != 0.0 {
+            self.step_focus(if dx > 0.0 { 1 } else { -1 }, cx);
+            return;
+        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -612,11 +695,7 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        let tile = (sy / TILE_PX) * open.cols + sx / TILE_PX;
-        if tile >= open.store.state().tile_count {
-            return None;
-        }
-        Some((tile, sx % TILE_PX, sy % TILE_PX))
+        sheet_to_doc(open.focus, open.cols, open.store.state().tile_count, sx, sy)
     }
 
     /// [`Self::sheet_px_at`] + [`Self::doc_pixel`]: the doc pixel under a
@@ -680,25 +759,20 @@ impl TilesetPanel {
         let Some((sx, sy)) = self.sheet_px_at(pos) else {
             return;
         };
-        let (state, cols, color) = match &self.state {
-            ViewerState::Ready(open) => (open.store.state(), open.cols, open.paint_color()),
+        let (state, cols, focus, color) = match &self.state {
+            ViewerState::Ready(open) => {
+                (open.store.state(), open.cols, open.focus, open.paint_color())
+            }
             _ => return,
         };
         let sample = |x: i32, y: i32| {
             if x < 0 || y < 0 {
                 return None;
             }
-            let (x, y) = (x as usize, y as usize);
-            if x >= cols * TILE_PX {
-                return None;
-            }
-            let tile = (y / TILE_PX) * cols + x / TILE_PX;
-            if tile >= state.tile_count {
-                return None;
-            }
-            let index = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS
-                + (y % TILE_PX) * TILE_PX
-                + x % TILE_PX;
+            let (tile, px_x, px_y) =
+                sheet_to_doc(focus, cols, state.tile_count, x as usize, y as usize)?;
+            let index =
+                tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + px_y * TILE_PX + px_x;
             state.indices.get(index).copied()
         };
         let region = pixel_tools::flood(sample, (sx as i32, sy as i32));
@@ -712,12 +786,34 @@ impl TilesetPanel {
             return;
         };
         let state = open.store.state();
-        if let Some(grid) =
-            loader::compose_grid(&state.indices, state.tile_count, open.cols, &state.palette)
-        {
+        let composed = match open.focus {
+            Some(tile) => {
+                let pixels = state
+                    .indices
+                    .get(tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS..)
+                    .and_then(|rest| rest.get(..ggo_worldlib::sprites::tileset_doc::TILE_PIXELS));
+                match pixels {
+                    Some(pixels) => (loader::compose_grid(pixels, 1, 1, &state.palette), (TILE_PX as u32, TILE_PX as u32)),
+                    // The focused tile is gone (deleted, undone): fall back
+                    // to the sheet.
+                    None => {
+                        open.focus = None;
+                        (
+                            loader::compose_grid(&state.indices, state.tile_count, open.cols, &state.palette),
+                            loader::grid_pixel_size(state.tile_count, open.cols),
+                        )
+                    }
+                }
+            }
+            None => (
+                loader::compose_grid(&state.indices, state.tile_count, open.cols, &state.palette),
+                loader::grid_pixel_size(state.tile_count, open.cols),
+            ),
+        };
+        if let Some(grid) = composed.0 {
             open.grid = grid;
         }
-        open.grid_size = loader::grid_pixel_size(state.tile_count, open.cols);
+        open.grid_size = composed.1;
         cx.notify();
     }
 
@@ -1326,6 +1422,12 @@ impl TilesetPanel {
                                                 |this, event: &MouseDownEvent, window, cx| {
                                                     // Take focus so undo/save bindings apply.
                                                     window.focus(&this.focus_handle, cx);
+                                                    if event.click_count >= 2 {
+                                                        if let Some((tile, ..)) = this.pixel_at(event.position) {
+                                                            this.enter_focus(tile, cx);
+                                                        }
+                                                        return;
+                                                    }
                                                     this.on_sheet_mouse_down(event.position, cx);
                                                 },
                                             ),
@@ -1367,6 +1469,9 @@ impl TilesetPanel {
         at_start: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        if matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some()) {
+            return div().into_any_element();
+        }
         let (add_tip, remove_tip) = match (horizontal, at_start) {
             (true, true) => ("Add row above", "Delete top row"),
             (true, false) => ("Add row below", "Delete bottom row"),
@@ -1546,6 +1651,15 @@ impl TilesetPanel {
                     .tooltip(ui::Tooltip::text("Flip the selection vertically (shift-v)"))
                     .on_click(cx.listener(|this, _, _, cx| this.flip_selection(false, cx))),
             )
+            .child(div().w_2())
+            .child(match open.focus {
+                Some(tile) => Button::new("ggo-tileset-focus", format!("Tile {tile} — Back"))
+                    .tooltip(ui::Tooltip::text("Leave focus (escape); ←/→ step tiles"))
+                    .on_click(cx.listener(|this, _, _, cx| this.leave_focus(cx))),
+                None => Button::new("ggo-tileset-focus", "Focus")
+                    .tooltip(ui::Tooltip::text("Magnify one tile (f, or double-click a tile)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.focus_tile_impl(cx))),
+            })
             .child(div().w_2())
             .child(
                 IconButton::new("ggo-tileset-zoom-out", IconName::Dash)
@@ -1781,6 +1895,8 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &FlipVertical, _window, cx| {
                 this.flip_selection(false, cx)
             }))
+            .on_action(cx.listener(|this, _: &Cancel, _window, cx| this.cancel_impl(cx)))
+            .on_action(cx.listener(|this, _: &FocusTile, _window, cx| this.focus_tile_impl(cx)))
             .on_action(
                 cx.listener(|this, _: &SelectWholeSheet, _window, cx| this.select_whole_sheet(cx)),
             )
@@ -1844,6 +1960,28 @@ fn paint_tile_borders(bounds: Bounds<Pixels>, cols: usize, rows: usize, window: 
             ),
             gpui::white(),
         ));
+    }
+}
+
+/// The doc pixel `(tile, x, y)` for sheet pixel `(sx, sy)`: in focus mode
+/// the sheet IS one tile; otherwise it is the `cols`-wide grid, and pad
+/// cells past `tile_count` are `None`.
+fn sheet_to_doc(
+    focus: Option<usize>,
+    cols: usize,
+    tile_count: usize,
+    sx: usize,
+    sy: usize,
+) -> Option<(usize, usize, usize)> {
+    match focus {
+        Some(tile) => (sx < TILE_PX && sy < TILE_PX && tile < tile_count).then_some((tile, sx, sy)),
+        None => {
+            if cols == 0 || sx >= cols * TILE_PX {
+                return None;
+            }
+            let tile = (sy / TILE_PX) * cols + sx / TILE_PX;
+            (tile < tile_count).then_some((tile, sx % TILE_PX, sy % TILE_PX))
+        }
     }
 }
 
@@ -2967,6 +3105,39 @@ mod tests {
             assert_eq!(ready(panel).cols, cols + 1);
             panel.delete_column(false, cx);
             assert_eq!(ready(panel).cols, cols, "the view narrows with the column");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_focus_mode_edits_one_tile_and_steps_with_arrows(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_focus(1, cx);
+            let open = ready(panel);
+            assert_eq!(open.focus, Some(1));
+            assert_eq!(open.grid_size, (TILE_PX as u32, TILE_PX as u32));
+            assert!(open.zoom >= FOCUS_MIN_ZOOM);
+        });
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            // Sheet pixel (2, 3) is tile 1's own (2, 3) in focus.
+            let z = ready(panel).zoom as f32;
+            panel.select_slot(2, cx);
+            panel.on_sheet_mouse_down(point(px(2.5 * z), px(3.5 * z)), cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(1, 2, 3)], 2);
+            assert_eq!(ready(panel).store.state().indices[idx(0, 2, 3)], 0, "tile 0 untouched");
+
+            panel.scroll_by(1.0, 0.0, cx);
+            assert_eq!(ready(panel).focus, Some(2), "right steps to the next tile");
+            panel.scroll_by(1.0, 0.0, cx);
+            assert_eq!(ready(panel).focus, Some(2), "clamped at the last tile");
+            panel.cancel_impl(cx);
+            let open = ready(panel);
+            assert_eq!(open.focus, None);
+            assert_eq!(open.zoom, DEFAULT_ZOOM, "zoom restored");
+            assert_eq!(open.grid_size.0, (FIXTURE_TILES * TILE_PX) as u32, "whole sheet again");
         });
     }
 }
