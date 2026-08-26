@@ -79,6 +79,7 @@ pub mod audio;
 mod debug;
 mod emu_item;
 mod drive;
+mod hardware;
 mod ingest;
 mod input;
 mod menu;
@@ -464,6 +465,25 @@ pub struct EmuPanel {
     /// The next `emulate_world` is a watch restart: keep the pad, skip the
     /// report hop, count it.
     watch_restart_pending: bool,
+
+    /// How this panel streams a flash / setup run. Injectable for the
+    /// same reason `proc_runner` is: a test scripts the transcript.
+    proc_streamer: ggo_common::ProcStreamer,
+    /// The flash (or setup) run in flight. Dropping it kills the child --
+    /// that is the cancel button.
+    flash: Option<FlashRun>,
+}
+
+/// A board run in progress: what stage it reached, and the task whose
+/// drop cancels it.
+struct FlashRun {
+    /// What the status row shows, parsed from `ggo-diag`'s output.
+    stage: Option<hardware::Stage>,
+    /// `Some` once a `RESULT:` line landed.
+    verdict: Option<bool>,
+    /// What is being run, for the status row while no stage has landed.
+    what: String,
+    _task: Task<()>,
 }
 
 /// How long after the last change the re-pack waits, so a save that
@@ -556,7 +576,180 @@ impl EmuPanel {
             build_is_explicit: false,
             pending_rebuild: false,
             watch_restart_pending: false,
+            proc_streamer: ggo_common::system_proc_streamer(),
+            flash: None,
         }
+    }
+
+    // ------------------------------------------------------------- flash
+
+    /// This machine's hardware readiness, probed fresh (a setup run, or
+    /// plugging the board in, changes the answer).
+    fn hardware_env(&self) -> hardware::HardwareEnv {
+        hardware::probe(
+            self.project_root.as_deref(),
+            std::env::var("PATH").ok().as_deref(),
+            &std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+        )
+    }
+
+    fn is_flashing(&self) -> bool {
+        self.flash.is_some()
+    }
+
+    /// The flash-and-run button: flash the open project to the board and
+    /// boot it, or -- while one is in flight -- cancel.
+    pub fn flash_to_board(&mut self, cx: &mut Context<Self>) {
+        if self.flash.take().is_some() {
+            self.status = Some("flash cancelled".to_string());
+            self.status_is_error = false;
+            cx.notify();
+            return;
+        }
+        self.refresh_root(cx);
+        let env = self.hardware_env();
+        match hardware::flash_request(&env) {
+            Ok(request) => self.start_board_run(vec![request], "flashing".to_string(), cx),
+            Err(message) => self.report_failure(message, cx),
+        }
+    }
+
+    /// "Set up hardware tooling": run every install step in order,
+    /// stopping at the first failure.
+    pub fn setup_hardware(&mut self, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        let env = self.hardware_env();
+        let steps = hardware::setup_steps(&env);
+        if steps.is_empty() {
+            let blocked: Vec<String> = env
+                .missing()
+                .into_iter()
+                .filter(|m| !m.installable())
+                .map(|m| m.label())
+                .collect();
+            self.report_failure(
+                if blocked.is_empty() {
+                    "nothing to install".to_string()
+                } else {
+                    format!("nothing ZedGG can install: {}", blocked.join("; "))
+                },
+                cx,
+            );
+            return;
+        }
+        let what = steps
+            .iter()
+            .map(|step| step.label.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.start_board_run(steps.into_iter().map(|step| step.request).collect(), what, cx);
+    }
+
+    /// Run `requests` in order through the streaming runner, feeding every
+    /// line to the console and every recognised line to the status row.
+    /// Stops at the first failure.
+    fn start_board_run(
+        &mut self,
+        requests: Vec<ggo_common::ProcRequest>,
+        what: String,
+        cx: &mut Context<Self>,
+    ) {
+        let console = self.console.get_or_insert_with(uart::UartLog::new).clone();
+        let streamer = self.proc_streamer.clone();
+        self.status = None;
+        self.status_is_error = false;
+        let task = cx.spawn({
+            let what = what.clone();
+            async move |this, cx| {
+            for request in requests {
+                let (line_tx, line_rx) = async_channel::unbounded::<String>();
+                let run = {
+                    let streamer = streamer.clone();
+                    let console = console.clone();
+                    cx.background_spawn(async move {
+                        streamer(
+                            request,
+                            Box::new(move |line: &str| {
+                                console.push_line(line);
+                                line_tx.try_send(line.to_string()).ok();
+                            }),
+                        )
+                    })
+                };
+                // Lines arrive while the child runs; each recognised one
+                // moves the status row.
+                let pump = {
+                    let this = this.clone();
+                    cx.spawn(async move |cx| {
+                    while let Ok(line) = line_rx.recv().await {
+                        let Some(stage) = hardware::parse_stage(&line) else {
+                            continue;
+                        };
+                        if this
+                            .update(cx, |this, cx| {
+                                if let Some(flash) = &mut this.flash {
+                                    flash.verdict = stage.verdict().or(flash.verdict);
+                                    flash.stage = Some(stage);
+                                    cx.notify();
+                                }
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    })
+                };
+                let capture = run.await;
+                drop(pump);
+                let failed = !capture.ok
+                    || this
+                        .read_with(cx, |this, _| {
+                            this.flash.as_ref().and_then(|f| f.verdict) == Some(false)
+                        })
+                        .unwrap_or(false);
+                if failed {
+                    let reason = ggo_common::failure_reason(&capture);
+                    this.update(cx, |this, cx| {
+                        this.flash = None;
+                        this.report_failure(format!("{what} failed: {reason}"), cx);
+                    })
+                    .ok();
+                    return;
+                }
+            }
+            this.update(cx, |this, cx| {
+                let passed = this.flash.as_ref().and_then(|f| f.verdict);
+                this.flash = None;
+                this.status = Some(match passed {
+                    Some(true) => format!("{what}: PASS"),
+                    _ => format!("{what}: done"),
+                });
+                this.status_is_error = false;
+                cx.notify();
+            })
+            .ok();
+            }
+        });
+        self.flash = Some(FlashRun {
+            stage: None,
+            verdict: None,
+            what,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    /// The status row's flash text: the current stage, else what is running.
+    fn flash_status(&self) -> Option<String> {
+        let flash = self.flash.as_ref()?;
+        Some(match &flash.stage {
+            Some(stage) => format!("{}: {}", flash.what, stage.label()),
+            None => format!("{}…", flash.what),
+        })
     }
 
     // --------------------------------------------------------------- watch
@@ -1983,6 +2176,34 @@ impl EmuPanel {
                     .disabled(!running)
                     .tooltip(Tooltip::text("Run one frame (ctrl-alt-.)"))
                     .on_click(cx.listener(|this, _event, _window, cx| this.step_frame(cx))),
+            )
+            .child({
+                let flashing = self.is_flashing();
+                IconButton::new("ggo-emu-flash", IconName::GgoFlashRun)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(flashing)
+                    .tooltip(Tooltip::text(if flashing {
+                        "Cancel the flash"
+                    } else {
+                        "Flash this project to the board and run it"
+                    }))
+                    .on_click(cx.listener(|this, _event, _window, cx| this.flash_to_board(cx)))
+            })
+            .children(self.flash_status().map(|text| {
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+            }))
+            .children(
+                // Offered whenever this machine cannot flash yet -- not
+                // only after a failed press.
+                (!self.is_flashing() && !self.hardware_env().ready()).then(|| {
+                    Button::new("ggo-emu-hardware-setup", "Set up hardware tooling")
+                        .tooltip(Tooltip::text(
+                            "Clone the GGO repo and install the tools flashing needs",
+                        ))
+                        .on_click(cx.listener(|this, _event, _window, cx| this.setup_hardware(cx)))
+                }),
             )
             .child(self.render_mute_button(cx))
             .child(
@@ -5435,5 +5656,247 @@ mod tests {
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
         assert_eq!(calls.lock().unwrap().len(), after_pair, "off means off");
+    }
+
+    // ---------------------------------------------- flash to hardware
+
+    /// A streamer that replays `lines` and then reports `ok`, recording
+    /// every request it was handed.
+    fn fake_streamer(
+        lines: Vec<&'static str>,
+        ok: bool,
+    ) -> (
+        ggo_common::ProcStreamer,
+        Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>>,
+    ) {
+        let calls: Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let streamer: ggo_common::ProcStreamer = Arc::new(move |request, mut on_line| {
+            recorded.lock().unwrap().push(request);
+            for line in &lines {
+                on_line(line);
+            }
+            ggo_common::ProcCapture {
+                ok,
+                lines: lines.iter().map(|l| l.to_string()).collect(),
+            }
+        });
+        (streamer, calls)
+    }
+
+    /// A panel whose machine looks ready to flash, with a scripted
+    /// streamer standing in for `ggo-diag`.
+    fn flashable_panel(
+        cx: &mut TestAppContext,
+        root: &std::path::Path,
+        streamer: ggo_common::ProcStreamer,
+    ) -> Entity<EmuPanel> {
+        let root = root.to_path_buf();
+        cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = EmuPanel::new(None, None, cx);
+                panel.root_override = Some(root);
+                panel.proc_streamer = streamer;
+                panel
+            })
+        })
+    }
+
+    /// A ready env pointing at real fixture dirs, so `flash_request`
+    /// builds a command without needing a board attached.
+    fn ready_hardware(root: &std::path::Path) -> hardware::HardwareEnv {
+        hardware::HardwareEnv {
+            diag_bin: Some("ggo-diag".into()),
+            emd_bin: Some("emd".into()),
+            repo: Some(root.join("repo")),
+            emerald: None,
+            ports: vec!["/dev/ttyUSB0".into()],
+            project: Some(root.join("game")),
+            cargo: true,
+            git: true,
+            clone_dest: root.join(".ggo/ggo"),
+        }
+    }
+
+    /// The happy path: every recognised line moves the status row, and a
+    /// `RESULT: PASS` lands as a passing verdict.
+    #[gpui::test]
+    async fn test_a_flash_run_streams_stages_and_reports_pass(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(
+            vec![
+                "==> Provision SD card",
+                "  [boot] banner — GemOS",
+                "diag step 1: PASS",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(vec![request], "flashing".to_string(), cx);
+            assert!(panel.is_flashing(), "the run is in flight");
+        });
+        cx.executor().run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().len(), 1, "one ggo-diag invocation");
+        let args = &calls.lock().unwrap()[0].args;
+        assert!(args.contains(&"--project".to_string()) && args.contains(&"--skip-pnr".to_string()));
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_flashing(), "the run finished");
+            assert_eq!(panel.status.as_deref(), Some("flashing: PASS"));
+            assert!(!panel.status_is_error);
+            let console = panel.console.as_ref().expect("the console took the lines");
+            assert!(
+                console.lines().iter().any(|l| l.contains("[boot] banner")),
+                "raw lines reach the console: {:?}",
+                console.lines()
+            );
+        });
+    }
+
+    /// A `RESULT: FAIL` is a failed run even when the process exits 0 --
+    /// the verdict is the CLI's, not the shell's.
+    #[gpui::test]
+    async fn test_a_fail_verdict_is_an_error_even_on_a_zero_exit(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: FAIL"], true);
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(vec![request], "flashing".to_string(), cx)
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.status_is_error, "a FAIL verdict is an error");
+            assert!(
+                panel.status.as_deref().unwrap_or("").contains("flashing failed"),
+                "{:?}",
+                panel.status
+            );
+            assert!(!panel.is_flashing());
+        });
+    }
+
+    /// A non-zero exit with no verdict line still fails, and the reason
+    /// is the last thing the child said.
+    #[gpui::test]
+    async fn test_a_nonzero_exit_without_a_verdict_still_fails(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(vec![request], "flashing".to_string(), cx)
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.status_is_error);
+            assert!(
+                panel.status.as_deref().unwrap_or("").contains("fujprog: no board"),
+                "the child's own words: {:?}",
+                panel.status
+            );
+        });
+    }
+
+    /// Pressing the button during a run cancels it: the task is dropped
+    /// (which kills the child) and nothing is left in flight.
+    #[gpui::test]
+    async fn test_pressing_flash_again_cancels_the_run(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(vec![request], "flashing".to_string(), cx);
+            assert!(panel.is_flashing());
+            panel.flash_to_board(cx);
+            assert!(!panel.is_flashing(), "the second press cancelled");
+            assert_eq!(panel.status.as_deref(), Some("flash cancelled"));
+        });
+    }
+
+    /// A machine with nothing set up spawns NOTHING and names every gap.
+    #[gpui::test]
+    async fn test_flashing_without_the_prerequisites_spawns_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec![], true);
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        panel.update(cx, |panel, cx| {
+            // No project, no repo, no board.
+            panel.root_override = None;
+            panel.flash_to_board(cx);
+            assert!(panel.status_is_error);
+            let status = panel.status.clone().unwrap_or_default();
+            assert!(status.contains("flashing needs a board"), "{status}");
+            assert!(!panel.is_flashing());
+        });
+        cx.executor().run_until_parked();
+        assert!(calls.lock().unwrap().is_empty(), "nothing was spawned");
+    }
+
+    /// The setup flow runs its steps in order and stops at the first
+    /// failure.
+    #[gpui::test]
+    async fn test_setup_runs_its_steps_in_order(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec!["installing"], true);
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        let env = hardware::HardwareEnv {
+            cargo: true,
+            git: true,
+            clone_dest: dir.path().join(".ggo/ggo"),
+            ..Default::default()
+        };
+        let steps = hardware::setup_steps(&env);
+        assert_eq!(steps.len(), 3, "clone + two installs");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(
+                steps.into_iter().map(|s| s.request).collect(),
+                "setting up".to_string(),
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "every step ran");
+        assert_eq!(calls[0].bin, "git");
+        assert_eq!(calls[1].bin, "cargo");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.status.as_deref(), Some("setting up: done"));
+        });
+    }
+
+    /// A failing step stops the ones after it.
+    #[gpui::test]
+    async fn test_a_failed_setup_step_stops_the_rest(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec!["error: no network"], false);
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        let env = hardware::HardwareEnv {
+            cargo: true,
+            git: true,
+            clone_dest: dir.path().join(".ggo/ggo"),
+            ..Default::default()
+        };
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(
+                hardware::setup_steps(&env)
+                    .into_iter()
+                    .map(|s| s.request)
+                    .collect(),
+                "setting up".to_string(),
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1, "stopped at the first failure");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.status_is_error);
+            assert!(panel.status.as_deref().unwrap_or("").contains("no network"));
+        });
     }
 }

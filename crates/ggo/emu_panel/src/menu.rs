@@ -74,7 +74,7 @@ pub const DIAG_TTY_ENV: &str = "GGO_DIAG_TTY";
 /// The file whose presence marks a GGO repo checkout: `firmware/system` is
 /// the OS crate every diagnostic build needs. `looks_like_repo_root` in
 /// ggo-ide's `backend/emubuild` uses exactly this fingerprint.
-const REPO_FINGERPRINT: &str = "firmware/system/Cargo.toml";
+pub(crate) const REPO_FINGERPRINT: &str = "firmware/system/Cargo.toml";
 
 // ------------------------------------------------------------- predicates
 

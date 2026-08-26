@@ -160,6 +160,7 @@ pub enum IconName {
     GenericMinimize,
     GenericRestore,
     Gerrit,
+    GgoFlashRun, // GGO: flash the open game to a board and run it
     GitBranch,
     GitBranchPlus,
     GitCommit,
