@@ -144,6 +144,121 @@ impl HardwareEnv {
     }
 }
 
+/// What the setup page can do about one requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remedy {
+    /// Already satisfied; the row shows where it was found.
+    Satisfied,
+    /// ZedGG can fix this: the page's Install button covers it.
+    Install(String),
+    /// Only the user can fix this -- the exact thing to do.
+    Manual(String),
+}
+
+/// One row of the setup page. A view model, so the page renders and the
+/// tests assert against the same values rather than parsed sentences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    /// Short name, e.g. `ggo-diag`.
+    pub name: &'static str,
+    /// Why the flash needs it.
+    pub why: &'static str,
+    /// Where it was found, when it was.
+    pub found: Option<String>,
+    pub remedy: Remedy,
+}
+
+impl Requirement {
+    pub fn satisfied(&self) -> bool {
+        self.found.is_some()
+    }
+}
+
+impl HardwareEnv {
+    /// Every prerequisite, satisfied or not, in the order the page lists
+    /// them. Unsatisfied rows carry either the install ZedGG would run or
+    /// the exact manual step -- a board and a serial permission cannot be
+    /// installed, and saying nothing about them would leave the page a
+    /// dead end.
+    pub fn requirements(&self) -> Vec<Requirement> {
+        vec![
+            Requirement {
+                name: "Game project",
+                why: "the game that gets packed onto the card image",
+                found: self
+                    .project
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                remedy: match &self.project {
+                    Some(_) => Remedy::Satisfied,
+                    None => Remedy::Manual(format!(
+                        "open a folder containing {}",
+                        ggo_common::EMERALD_MANIFEST
+                    )),
+                },
+            },
+            Requirement {
+                name: "GGO repo",
+                why: "the pipeline builds GemOS and the gateware out of it",
+                found: self.repo.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                remedy: match (&self.repo, self.git) {
+                    (Some(_), _) => Remedy::Satisfied,
+                    (None, true) => Remedy::Install(format!(
+                        "git clone into {}",
+                        self.clone_dest.display()
+                    )),
+                    (None, false) => Remedy::Manual(format!(
+                        "install git, or set {DIAG_REPO_ENV} to an existing checkout"
+                    )),
+                },
+            },
+            Requirement {
+                name: DEFAULT_DIAG_BIN,
+                why: "runs the flash pipeline",
+                found: self.diag_bin.clone(),
+                remedy: match (&self.diag_bin, self.cargo) {
+                    (Some(_), _) => Remedy::Satisfied,
+                    (None, true) => Remedy::Install("cargo install ggo-diag".to_string()),
+                    (None, false) => Remedy::Manual(format!(
+                        "install Rust (cargo), or set {DIAG_BIN_ENV} to a built binary"
+                    )),
+                },
+            },
+            Requirement {
+                name: ggo_common::DEFAULT_EMD_BIN,
+                why: "packs the project into a .ggo",
+                found: self.emd_bin.clone(),
+                remedy: match (&self.emd_bin, self.cargo) {
+                    (Some(_), _) => Remedy::Satisfied,
+                    (None, true) => Remedy::Install("cargo install emd".to_string()),
+                    (None, false) => Remedy::Manual(format!(
+                        "install Rust (cargo), or set {} to a built binary",
+                        ggo_common::EMD_BIN_ENV
+                    )),
+                },
+            },
+            Requirement {
+                name: "Board",
+                why: "the ULX3S to flash and boot-verify over UART",
+                found: self.ports.first().cloned(),
+                remedy: match self.ports.first() {
+                    Some(_) => Remedy::Satisfied,
+                    // Not installable, so the row has to carry the whole
+                    // remedy: the two things that actually cause an empty
+                    // scan are an unplugged board and a user who is not in
+                    // the `dialout` group.
+                    None => Remedy::Manual(format!(
+                        "connect the board over USB; if it is connected, add \
+                         yourself to the serial group (`sudo usermod -aG dialout \
+                         $USER`, then log out and back in) or set {DIAG_TTY_ENV}"
+                    )),
+                },
+            },
+        ]
+    }
+
+}
+
 /// `ggo-diag`'s argv for flashing `project` and booting it on `tty`.
 ///
 /// `--skip-pnr` is not the CLI's default but IS the right default for a

@@ -80,6 +80,7 @@ mod debug;
 mod emu_item;
 mod drive;
 mod hardware;
+mod hardware_item;
 mod ingest;
 mod input;
 mod menu;
@@ -186,15 +187,12 @@ pub fn init(cx: &mut App) {
     // that handler saves the world panel's doc and takes the workspace
     // itself -- neither may nest inside the caller's updates.
     ggo_common::register_board_flasher(cx, |workspace, window, cx| {
-        open_emu_item(workspace, window, cx, |_emu, _window, cx| {
+        open_emu_item(workspace, window, cx, |_emu, window, cx| {
             // DEFERRED, like the world emulator below: this handler runs
             // inside `workspace.update`, and `flash_to_board` ->
             // `refresh_root` reads that same leased entity. Doing it here
             // is the double-lease panic, not a style preference.
-            let emu = cx.weak_entity();
-            cx.defer(move |cx| {
-                emu.update(cx, |emu, cx| emu.flash_to_board(cx)).ok();
-            });
+            cx.defer_in(window, |emu, window, cx| emu.flash_to_board(window, cx));
         })
     });
 
@@ -636,7 +634,7 @@ impl EmuPanel {
 
     /// The flash-and-run button: flash the open project to the board and
     /// boot it, or -- while one is in flight -- cancel.
-    pub fn flash_to_board(&mut self, cx: &mut Context<Self>) {
+    pub fn flash_to_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.flash.take().is_some() {
             self.status = Some("flash cancelled".to_string());
             self.status_is_error = false;
@@ -648,8 +646,30 @@ impl EmuPanel {
         let env = self.hardware_env_cached();
         match hardware::flash_request(&env) {
             Ok(request) => self.start_board_run(vec![request], "flashing".to_string(), cx),
-            Err(message) => self.report_failure(message, cx),
+            // A missing prerequisite is not a one-line error, it is a
+            // page: what is needed, what is here, and a button for the
+            // rest. The status row cannot carry that.
+            Err(_) => self.open_hardware_page(window, cx),
         }
+    }
+
+    /// Show the hardware setup page.
+    pub(crate) fn open_hardware_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        // `window.defer`, NOT `cx.defer_in`: the latter runs its closure
+        // inside an `EmuPanel` update, and opening the page reaches back
+        // into this very panel (`open_emu_item`) -- which is a double
+        // lease on it. Deferring at the App level leaves both free.
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                hardware_item::open_hardware_item(workspace, window, cx);
+            });
+        });
     }
 
     /// "Set up hardware tooling": run every install step in order,
@@ -790,6 +810,14 @@ impl EmuPanel {
             _task: task,
         });
         cx.notify();
+    }
+
+    /// The console's lines, for the setup page's output pane.
+    pub(crate) fn console_lines(&self) -> Vec<String> {
+        self.console
+            .as_ref()
+            .map(|console| console.lines())
+            .unwrap_or_default()
     }
 
     /// The status row's flash text: the current stage, else what is running.
@@ -2236,7 +2264,9 @@ impl EmuPanel {
                     } else {
                         "Flash this project to the board and run it"
                     }))
-                    .on_click(cx.listener(|this, _event, _window, cx| this.flash_to_board(cx)))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.flash_to_board(window, cx)
+                    }))
             })
             .children(self.flash_status().map(|text| {
                 Label::new(text)
@@ -2249,9 +2279,11 @@ impl EmuPanel {
                 (!self.is_flashing() && !self.hardware_env_cached().ready()).then(|| {
                     Button::new("ggo-emu-hardware-setup", "Set up hardware tooling")
                         .tooltip(Tooltip::text(
-                            "Clone the GGO repo and install the tools flashing needs",
+                            "What flashing needs, and install the missing parts",
                         ))
-                        .on_click(cx.listener(|this, _event, _window, cx| this.setup_hardware(cx)))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.open_hardware_page(window, cx)
+                        }))
                 }),
             )
             .child(self.render_mute_button(cx))
@@ -4264,7 +4296,7 @@ mod tests {
     /// other GGO menu test makes: the fake tree exists so a `ProjectPath`
     /// resolves, `root_override` is what the panel actually reads and
     /// writes through.
-    async fn run_menu_workspace<'a>(
+    pub(crate) async fn run_menu_workspace<'a>(
         cx: &'a mut TestAppContext,
         root: &std::path::Path,
     ) -> (
@@ -5739,19 +5771,21 @@ mod tests {
 
     /// A panel whose machine looks ready to flash, with a scripted
     /// streamer standing in for `ggo-diag`.
-    fn flashable_panel(
-        cx: &mut TestAppContext,
+    fn flashable_panel<'a>(
+        cx: &'a mut TestAppContext,
         root: &std::path::Path,
         streamer: ggo_common::ProcStreamer,
-    ) -> Entity<EmuPanel> {
+    ) -> (Entity<EmuPanel>, &'a mut gpui::VisualTestContext) {
         let root = root.to_path_buf();
+        // A windowed view renders, and rendering needs the theme.
         cx.update(|cx| {
-            cx.new(|cx| {
-                let mut panel = EmuPanel::new(None, None, cx);
-                panel.root_override = Some(root);
-                panel.proc_streamer = streamer;
-                panel
-            })
+            AppState::test(cx);
+        });
+        cx.add_window_view(|window, cx| {
+            let mut panel = EmuPanel::new(None, Some(window), cx);
+            panel.root_override = Some(root);
+            panel.proc_streamer = streamer;
+            panel
         })
     }
 
@@ -5786,7 +5820,7 @@ mod tests {
             ],
             true,
         );
-        let panel = flashable_panel(cx, dir.path(), streamer);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(vec![request], "flashing".to_string(), cx);
@@ -5816,7 +5850,7 @@ mod tests {
     async fn test_a_fail_verdict_is_an_error_even_on_a_zero_exit(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: FAIL"], true);
-        let panel = flashable_panel(cx, dir.path(), streamer);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(vec![request], "flashing".to_string(), cx)
@@ -5839,7 +5873,7 @@ mod tests {
     async fn test_a_nonzero_exit_without_a_verdict_still_fails(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
-        let panel = flashable_panel(cx, dir.path(), streamer);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(vec![request], "flashing".to_string(), cx)
@@ -5861,12 +5895,12 @@ mod tests {
     async fn test_pressing_flash_again_cancels_the_run(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
-        let panel = flashable_panel(cx, dir.path(), streamer);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
-        panel.update(cx, |panel, cx| {
+        panel.update_in(cx, |panel, window, cx| {
             panel.start_board_run(vec![request], "flashing".to_string(), cx);
             assert!(panel.is_flashing());
-            panel.flash_to_board(cx);
+            panel.flash_to_board(window, cx);
             assert!(!panel.is_flashing(), "the second press cancelled");
             assert_eq!(panel.status.as_deref(), Some("flash cancelled"));
         });
@@ -5877,17 +5911,16 @@ mod tests {
     async fn test_flashing_without_the_prerequisites_spawns_nothing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, calls) = fake_streamer(vec![], true);
-        let panel = flashable_panel(cx, dir.path(), streamer);
-        panel.update(cx, |panel, cx| {
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        panel.update_in(cx, |panel, window, cx| {
             // No project, no repo, no board.
             panel.root_override = None;
-            panel.flash_to_board(cx);
-            assert!(panel.status_is_error);
-            let status = panel.status.clone().unwrap_or_default();
-            assert!(status.contains("flashing needs a board"), "{status}");
-            assert!(!panel.is_flashing());
+            panel.flash_to_board(window, cx);
+            assert!(!panel.is_flashing(), "nothing to flash yet");
         });
-        cx.executor().run_until_parked();
+        // The page needs a workspace to open into; this panel has none,
+        // so the only thing being asserted here is that nothing ran.
+        cx.run_until_parked();
         assert!(calls.lock().unwrap().is_empty(), "nothing was spawned");
     }
 
@@ -5897,7 +5930,7 @@ mod tests {
     async fn test_setup_runs_its_steps_in_order(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, calls) = fake_streamer(vec!["installing"], true);
-        let panel = flashable_panel(cx, dir.path(), streamer);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let env = hardware::HardwareEnv {
             cargo: true,
             git: true,
@@ -5929,7 +5962,7 @@ mod tests {
     async fn test_a_failed_setup_step_stops_the_rest(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, calls) = fake_streamer(vec!["error: no network"], false);
-        let panel = flashable_panel(cx, dir.path(), streamer);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let env = hardware::HardwareEnv {
             cargo: true,
             git: true,
@@ -5988,13 +6021,17 @@ mod tests {
                 .clone()
         });
         panel.read_with(cx, |panel, _| {
-            // No board on a CI machine, so it reports rather than runs --
-            // the point is that it got far enough to report at all.
+            // No board on a CI machine, so nothing runs -- the point is
+            // that it got far enough to say so.
             assert!(!panel.is_flashing());
-            assert!(
-                panel.status.as_deref().unwrap_or("").contains("needs a board"),
-                "{:?}",
-                panel.status
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<hardware_item::HardwareSetupItem>(cx)
+                    .count(),
+                1,
+                "a missing prerequisite opens the setup page, not a status line"
             );
         });
     }
@@ -6028,20 +6065,20 @@ mod tests {
             })
         };
         let dir = tempfile::tempdir().unwrap();
-        let panel = flashable_panel(cx, dir.path(), streamer);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(vec![request], "flashing".to_string(), cx)
         });
-        cx.executor().run_until_parked();
+        cx.run_until_parked();
         assert_eq!(
             dropped.load(Ordering::SeqCst),
             0,
             "the run is still in flight"
         );
 
-        panel.update(cx, |panel, cx| panel.flash_to_board(cx));
-        cx.executor().run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.flash_to_board(window, cx));
+        cx.run_until_parked();
         assert_eq!(
             dropped.load(Ordering::SeqCst),
             1,
