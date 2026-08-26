@@ -787,6 +787,118 @@ pub fn run_capture(request: &ProcRequest) -> ProcCapture {
 /// spawned is a non-ok capture naming the command" rule -- is
 /// [`run_capture`]'s contract, unchanged; this is where both are actually
 /// implemented.
+/// A sink for a child's output lines, called as they arrive.
+pub type LineSink = Box<dyn FnMut(&str) + Send>;
+
+/// [`ProcRunner`]'s streaming twin: the same `ProcCapture` at the end,
+/// plus every line handed over as it lands. Injectable for the same
+/// reason the capture runner is -- a test scripts the transcript instead
+/// of spawning a board-flashing pipeline.
+pub type ProcStreamer = Arc<dyn Fn(ProcRequest, LineSink) -> ProcCapture + Send + Sync>;
+
+/// The real streamer: [`run_streaming`] on this machine.
+pub fn system_proc_streamer() -> ProcStreamer {
+    Arc::new(|request, on_line| run_streaming(&request, on_line))
+}
+
+pub fn run_streaming(request: &ProcRequest, on_line: LineSink) -> ProcCapture {
+    smol::block_on(run_streaming_async(request, on_line))
+}
+
+/// Run `request`, calling `on_line` for each stdout/stderr line as it
+/// arrives, and return the same capture [`run_capture_async`] would.
+///
+/// A flash pipeline is minutes of work; captured-only output means a UI
+/// that looks hung until it finishes. Both streams are read concurrently
+/// (a child that fills one pipe while nobody drains the other deadlocks)
+/// and interleaved into one transcript in arrival order -- unlike
+/// [`run_capture_async`], whose stdout-then-stderr order is load-bearing
+/// for `emd`'s error reporting but useless for live progress.
+///
+/// **Dropping this future kills the child**, exactly as
+/// [`run_capture_async`] does and for the same reason: that is what makes
+/// a cancel button possible.
+pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> ProcCapture {
+    use smol::io::{AsyncBufReadExt, BufReader};
+    use smol::stream::StreamExt;
+    use std::cell::RefCell;
+
+    let child = Command::new(&request.bin)
+        .args(&request.args)
+        .current_dir(&request.cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            let line = format!("running `{}`: {e}", request.command_line());
+            let mut on_line = on_line;
+            on_line(&line);
+            return ProcCapture {
+                ok: false,
+                lines: vec![line],
+            };
+        }
+    };
+
+    // `on_line` and the transcript are shared by the two drain futures
+    // below. They run interleaved on ONE thread (this future), and no
+    // borrow is held across an await, so a `RefCell` is the whole of the
+    // synchronisation needed.
+    let shared = RefCell::new((on_line, Vec::<String>::new()));
+    let take = |line: Result<String, std::io::Error>| {
+        // A child's output is not guaranteed UTF-8 and a read can fail
+        // mid-stream; a lossy transcript beats none (`capture_lines`
+        // makes the same call).
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => format!("reading output: {e}"),
+        };
+        let mut shared = shared.borrow_mut();
+        (shared.0)(&line);
+        shared.1.push(line);
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // BOTH pipes must be drained concurrently -- a child that fills one
+    // while nobody reads the other blocks forever -- and the merge has to
+    // END when both do. `StreamExt::race` does NOT: with both streams at
+    // EOF neither of its arms matches and it falls through to
+    // `Poll::Pending` for good. `zip` of two self-terminating drains is
+    // the combinator that actually finishes.
+    let drain_out = async {
+        if let Some(stdout) = stdout {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next().await {
+                take(line);
+            }
+        }
+    };
+    let drain_err = async {
+        if let Some(stderr) = stderr {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Some(line) = lines.next().await {
+                take(line);
+            }
+        }
+    };
+    smol::future::zip(drain_out, drain_err).await;
+
+    let (mut on_line, mut lines) = shared.into_inner();
+    let ok = match child.status().await {
+        Ok(status) => status.success(),
+        Err(e) => {
+            let line = format!("waiting on `{}`: {e}", request.command_line());
+            on_line(&line);
+            lines.push(line);
+            false
+        }
+    };
+    ProcCapture { ok, lines }
+}
+
 pub async fn run_capture_async(request: &ProcRequest) -> ProcCapture {
     let output = Command::new(&request.bin)
         .args(&request.args)
@@ -907,6 +1019,62 @@ pub fn pack_out_name(world_stem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The streaming runner hands every line over as it arrives AND
+    /// returns the same capture the blocking one would.
+    #[test]
+    fn run_streaming_reports_lines_then_the_capture() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let seen = seen.clone();
+            Box::new(move |line: &str| seen.lock().unwrap().push(line.to_string())) as LineSink
+        };
+        let request = ProcRequest::new(
+            "sh",
+            std::env::temp_dir(),
+            vec![
+                "-c".to_string(),
+                "echo one; echo two >&2; echo three".to_string(),
+            ],
+        );
+        let capture = run_streaming(&request, sink);
+        assert!(capture.ok, "the script exits 0");
+        let streamed = seen.lock().unwrap().clone();
+        assert_eq!(streamed.len(), 3, "every line was streamed: {streamed:?}");
+        assert!(streamed.contains(&"one".to_string()));
+        assert!(streamed.contains(&"two".to_string()), "stderr streams too");
+        let mut sorted = capture.lines;
+        sorted.sort();
+        assert_eq!(sorted, vec!["one", "three", "two"], "and lands in the capture");
+    }
+
+    /// A non-zero exit is a failed capture, and a binary that cannot be
+    /// spawned reports rather than panicking.
+    #[test]
+    fn run_streaming_surfaces_failures() {
+        let request = ProcRequest::new(
+            "sh",
+            std::env::temp_dir(),
+            vec!["-c".to_string(), "echo nope >&2; exit 3".to_string()],
+        );
+        let capture = run_streaming(&request, Box::new(|_| {}));
+        assert!(!capture.ok, "exit 3 is a failure");
+        assert_eq!(failure_reason(&capture), "nope");
+
+        let missing = ProcRequest::new(
+            "ggo-not-a-real-binary",
+            std::env::temp_dir(),
+            Vec::new(),
+        );
+        let capture = run_streaming(&missing, Box::new(|_| {}));
+        assert!(!capture.ok);
+        assert!(
+            capture.lines[0].contains("ggo-not-a-real-binary"),
+            "the failure names the binary: {:?}",
+            capture.lines
+        );
+    }
 
     /// The keymap tripwire: every GGO context block must exist in each
     /// platform asset (and the `> Editor` ones in `vim.json` too, or vim's
