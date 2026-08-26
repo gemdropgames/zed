@@ -186,8 +186,15 @@ pub fn init(cx: &mut App) {
     // that handler saves the world panel's doc and takes the workspace
     // itself -- neither may nest inside the caller's updates.
     ggo_common::register_board_flasher(cx, |workspace, window, cx| {
-        open_emu_item(workspace, window, cx, |emu, _window, cx| {
-            emu.flash_to_board(cx);
+        open_emu_item(workspace, window, cx, |_emu, _window, cx| {
+            // DEFERRED, like the world emulator below: this handler runs
+            // inside `workspace.update`, and `flash_to_board` ->
+            // `refresh_root` reads that same leased entity. Doing it here
+            // is the double-lease panic, not a style preference.
+            let emu = cx.weak_entity();
+            cx.defer(move |cx| {
+                emu.update(cx, |emu, cx| emu.flash_to_board(cx)).ok();
+            });
         })
     });
 
@@ -478,6 +485,8 @@ pub struct EmuPanel {
     /// The flash (or setup) run in flight. Dropping it kills the child --
     /// that is the cancel button.
     flash: Option<FlashRun>,
+    /// The last hardware probe. `None` re-probes on the next ask.
+    hardware: Option<hardware::HardwareEnv>,
 }
 
 /// A board run in progress: what stage it reached, and the task whose
@@ -584,10 +593,29 @@ impl EmuPanel {
             watch_restart_pending: false,
             proc_streamer: ggo_common::system_proc_streamer(),
             flash: None,
+            hardware: None,
         }
     }
 
     // ------------------------------------------------------------- flash
+
+    /// The cached readiness, refreshing it if this is the first ask.
+    ///
+    /// `probe` walks `/dev`, scans `PATH` four times and walks the
+    /// ancestors for a repo -- fine once, ruinous from `render_transport`,
+    /// which runs on every frame of a running cart.
+    fn hardware_env_cached(&mut self) -> hardware::HardwareEnv {
+        if self.hardware.is_none() {
+            self.hardware = Some(self.hardware_env());
+        }
+        self.hardware.clone().unwrap_or_default()
+    }
+
+    /// Drop the cached probe: a setup run just changed the answer, and so
+    /// does plugging the board in (which is why activation re-probes).
+    fn invalidate_hardware(&mut self) {
+        self.hardware = None;
+    }
 
     /// This machine's hardware readiness, probed fresh (a setup run, or
     /// plugging the board in, changes the answer).
@@ -616,7 +644,8 @@ impl EmuPanel {
             return;
         }
         self.refresh_root(cx);
-        let env = self.hardware_env();
+        self.invalidate_hardware();
+        let env = self.hardware_env_cached();
         match hardware::flash_request(&env) {
             Ok(request) => self.start_board_run(vec![request], "flashing".to_string(), cx),
             Err(message) => self.report_failure(message, cx),
@@ -627,7 +656,8 @@ impl EmuPanel {
     /// stopping at the first failure.
     pub fn setup_hardware(&mut self, cx: &mut Context<Self>) {
         self.refresh_root(cx);
-        let env = self.hardware_env();
+        self.invalidate_hardware();
+        let env = self.hardware_env_cached();
         let steps = hardware::setup_steps(&env);
         if steps.is_empty() {
             let blocked: Vec<String> = env
@@ -667,23 +697,24 @@ impl EmuPanel {
         let streamer = self.proc_streamer.clone();
         self.status = None;
         self.status_is_error = false;
+        self.console_expanded = true;
         let task = cx.spawn({
             let what = what.clone();
             async move |this, cx| {
             for request in requests {
                 let (line_tx, line_rx) = async_channel::unbounded::<String>();
+                // The command itself, so the console says which argv (and
+                // which of several `/dev/ttyUSB*`) this run used.
+                console.push_line(format!("$ {}", request.command_line()));
                 let run = {
-                    let streamer = streamer.clone();
                     let console = console.clone();
-                    cx.background_spawn(async move {
-                        streamer(
-                            request,
-                            Box::new(move |line: &str| {
-                                console.push_line(line);
-                                line_tx.try_send(line.to_string()).ok();
-                            }),
-                        )
-                    })
+                    streamer(
+                        request,
+                        Box::new(move |line: &str| {
+                            console.push_line(line);
+                            line_tx.try_send(line.to_string()).ok();
+                        }),
+                    )
                 };
                 // Lines arrive while the child runs; each recognised one
                 // moves the status row.
@@ -691,16 +722,21 @@ impl EmuPanel {
                     let this = this.clone();
                     cx.spawn(async move |cx| {
                     while let Ok(line) = line_rx.recv().await {
-                        let Some(stage) = hardware::parse_stage(&line) else {
-                            continue;
-                        };
+                        let stage = hardware::parse_stage(&line);
+                        // Notify for EVERY line, not only recognised
+                        // ones: `cargo install` matches none of the
+                        // grammar, and an unrepainted console during a
+                        // five-minute install is the opposite of the
+                        // streaming this exists to provide.
                         if this
                             .update(cx, |this, cx| {
                                 if let Some(flash) = &mut this.flash {
-                                    flash.verdict = stage.verdict().or(flash.verdict);
-                                    flash.stage = Some(stage);
-                                    cx.notify();
+                                    if let Some(stage) = stage {
+                                        flash.verdict = stage.verdict().or(flash.verdict);
+                                        flash.stage = Some(stage);
+                                    }
                                 }
+                                cx.notify();
                             })
                             .is_err()
                         {
@@ -710,15 +746,20 @@ impl EmuPanel {
                     })
                 };
                 let capture = run.await;
-                drop(pump);
-                let failed = !capture.ok
-                    || this
-                        .read_with(cx, |this, _| {
-                            this.flash.as_ref().and_then(|f| f.verdict) == Some(false)
-                        })
-                        .unwrap_or(false);
-                if failed {
-                    let reason = ggo_common::failure_reason(&capture);
+                // AWAITED, not dropped: the sink drops with the run
+                // future, which closes the channel and ends the pump. A
+                // drop here could lose the last line -- and the last line
+                // is the verdict.
+                pump.await;
+                let Ok(verdict) = this.read_with(cx, |this, _| {
+                    this.flash.as_ref().and_then(|f| f.verdict)
+                }) else {
+                    // The panel is gone; a released tab must not keep
+                    // installing things.
+                    return;
+                };
+                if !capture.ok || verdict == Some(false) {
+                    let reason = hardware::failure_reason(&capture);
                     this.update(cx, |this, cx| {
                         this.flash = None;
                         this.report_failure(format!("{what} failed: {reason}"), cx);
@@ -730,6 +771,8 @@ impl EmuPanel {
             this.update(cx, |this, cx| {
                 let passed = this.flash.as_ref().and_then(|f| f.verdict);
                 this.flash = None;
+                // Installing something changes what this machine can do.
+                this.invalidate_hardware();
                 this.status = Some(match passed {
                     Some(true) => format!("{what}: PASS"),
                     _ => format!("{what}: done"),
@@ -2203,7 +2246,7 @@ impl EmuPanel {
             .children(
                 // Offered whenever this machine cannot flash yet -- not
                 // only after a failed press.
-                (!self.is_flashing() && !self.hardware_env().ready()).then(|| {
+                (!self.is_flashing() && !self.hardware_env_cached().ready()).then(|| {
                     Button::new("ggo-emu-hardware-setup", "Set up hardware tooling")
                         .tooltip(Tooltip::text(
                             "Clone the GGO repo and install the tools flashing needs",
@@ -5680,13 +5723,16 @@ mod tests {
         let recorded = calls.clone();
         let streamer: ggo_common::ProcStreamer = Arc::new(move |request, mut on_line| {
             recorded.lock().unwrap().push(request);
-            for line in &lines {
-                on_line(line);
-            }
-            ggo_common::ProcCapture {
-                ok,
-                lines: lines.iter().map(|l| l.to_string()).collect(),
-            }
+            let lines = lines.clone();
+            Box::pin(async move {
+                for line in &lines {
+                    on_line(line);
+                }
+                ggo_common::ProcCapture {
+                    ok,
+                    lines: lines.iter().map(|l| l.to_string()).collect(),
+                }
+            })
         });
         (streamer, calls)
     }
@@ -5722,6 +5768,7 @@ mod tests {
             cargo: true,
             git: true,
             clone_dest: root.join(".ggo/ggo"),
+            home: root.to_path_buf(),
         }
     }
 
@@ -5855,6 +5902,7 @@ mod tests {
             cargo: true,
             git: true,
             clone_dest: dir.path().join(".ggo/ggo"),
+            home: dir.path().to_path_buf(),
             ..Default::default()
         };
         let steps = hardware::setup_steps(&env);
@@ -5886,6 +5934,7 @@ mod tests {
             cargo: true,
             git: true,
             clone_dest: dir.path().join(".ggo/ggo"),
+            home: dir.path().to_path_buf(),
             ..Default::default()
         };
         panel.update(cx, |panel, cx| {
@@ -5904,5 +5953,99 @@ mod tests {
             assert!(panel.status_is_error);
             assert!(panel.status.as_deref().unwrap_or("").contains("no network"));
         });
+    }
+
+    /// The REGISTERED flasher -- the path the world panel's button takes.
+    ///
+    /// It runs inside `workspace.update`, and `flash_to_board` ->
+    /// `refresh_root` reads that same entity, so anything but a deferred
+    /// call is `cannot read Workspace while it is already being updated`.
+    /// The routing test in `ggo_world_panel` installs a FAKE flasher and
+    /// therefore never touches this; only driving the real registration
+    /// does.
+    #[gpui::test]
+    async fn test_the_registered_flasher_does_not_double_lease_the_workspace(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::flash_to_board(workspace, window, cx)
+        });
+        assert!(claimed, "init registers a board flasher");
+        // The deferred `flash_to_board` runs here; before the fix this
+        // panicked instead.
+        cx.run_until_parked();
+
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<EmulatorItem>(cx)
+                .next()
+                .expect("the flasher opened the emulator tab")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        panel.read_with(cx, |panel, _| {
+            // No board on a CI machine, so it reports rather than runs --
+            // the point is that it got far enough to report at all.
+            assert!(!panel.is_flashing());
+            assert!(
+                panel.status.as_deref().unwrap_or("").contains("needs a board"),
+                "{:?}",
+                panel.status
+            );
+        });
+    }
+
+    /// Cancelling drops the run future, which is what `kill_on_drop`
+    /// hangs off: a streamer whose future is merely *abandoned* would
+    /// leave `ggo-diag` holding the board's serial port.
+    #[gpui::test]
+    async fn test_cancelling_drops_the_run_future(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropGuard(Arc<AtomicUsize>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let streamer: ggo_common::ProcStreamer = {
+            let dropped = dropped.clone();
+            Arc::new(move |_request, _on_line| {
+                let guard = DropGuard(dropped.clone());
+                Box::pin(async move {
+                    // A real flash runs for minutes; this one never
+                    // finishes, so the only way out is cancellation.
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                })
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let panel = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(vec![request], "flashing".to_string(), cx)
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "the run is still in flight"
+        );
+
+        panel.update(cx, |panel, cx| panel.flash_to_board(cx));
+        cx.executor().run_until_parked();
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "cancelling dropped the run future -- that is what kills the child"
+        );
     }
 }

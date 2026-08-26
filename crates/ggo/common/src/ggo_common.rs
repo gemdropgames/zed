@@ -826,13 +826,24 @@ pub type LineSink = Box<dyn FnMut(&str) + Send>;
 /// plus every line handed over as it lands. Injectable for the same
 /// reason the capture runner is -- a test scripts the transcript instead
 /// of spawning a board-flashing pipeline.
-pub type ProcStreamer = Arc<dyn Fn(ProcRequest, LineSink) -> ProcCapture + Send + Sync>;
+/// It returns a FUTURE, not a `ProcCapture`, and that is the whole
+/// point: a blocking signature has to be driven on some pool thread as
+/// one uninterruptible poll, so dropping the caller's task cannot reach
+/// the child. Awaiting the future means dropping the task drops the
+/// future, which runs `kill_on_drop` -- the cancel button.
+pub type ProcStreamer =
+    Arc<dyn Fn(ProcRequest, LineSink) -> smol::future::Boxed<ProcCapture> + Send + Sync>;
 
-/// The real streamer: [`run_streaming`] on this machine.
+/// The real streamer: [`run_streaming_async`] on this machine.
 pub fn system_proc_streamer() -> ProcStreamer {
-    Arc::new(|request, on_line| run_streaming(&request, on_line))
+    Arc::new(|request, on_line| {
+        Box::pin(async move { run_streaming_async(&request, on_line).await })
+    })
 }
 
+/// [`run_streaming_async`] on the current thread. Tests and other
+/// synchronous callers only -- a UI must await the async form, or a
+/// cancel cannot reach the child.
 pub fn run_streaming(request: &ProcRequest, on_line: LineSink) -> ProcCapture {
     smol::block_on(run_streaming_async(request, on_line))
 }
@@ -853,7 +864,7 @@ pub fn run_streaming(request: &ProcRequest, on_line: LineSink) -> ProcCapture {
 pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> ProcCapture {
     use smol::io::{AsyncBufReadExt, BufReader};
     use smol::stream::StreamExt;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     let child = Command::new(&request.bin)
         .args(&request.args)
@@ -876,10 +887,11 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
     };
 
     // `on_line` and the transcript are shared by the two drain futures
-    // below. They run interleaved on ONE thread (this future), and no
-    // borrow is held across an await, so a `RefCell` is the whole of the
-    // synchronisation needed.
-    let shared = RefCell::new((on_line, Vec::<String>::new()));
+    // below. They interleave within this one future and no lock is held
+    // across an await, so this is never contended -- it is a `Mutex`
+    // rather than a `RefCell` only so the whole future stays `Send`,
+    // which is what lets a caller await it wherever it likes.
+    let shared = Mutex::new((on_line, Vec::<String>::new()));
     let take = |line: Result<String, std::io::Error>| {
         // A child's output is not guaranteed UTF-8 and a read can fail
         // mid-stream; a lossy transcript beats none (`capture_lines`
@@ -888,7 +900,12 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
             Ok(line) => line,
             Err(e) => format!("reading output: {e}"),
         };
-        let mut shared = shared.borrow_mut();
+        let mut shared = match shared.lock() {
+            Ok(shared) => shared,
+            // A panicking sink poisons the lock; the transcript is best
+            // effort, so drop the line rather than propagate a panic.
+            Err(_) => return,
+        };
         (shared.0)(&line);
         shared.1.push(line);
     };
@@ -918,7 +935,10 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
     };
     smol::future::zip(drain_out, drain_err).await;
 
-    let (mut on_line, mut lines) = shared.into_inner();
+    let (mut on_line, mut lines) = match shared.into_inner() {
+        Ok(shared) => shared,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let ok = match child.status().await {
         Ok(status) => status.success(),
         Err(e) => {
@@ -962,6 +982,23 @@ fn capture_lines(bytes: &[u8]) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+/// The last line of a failed capture that `skip` does not recognise as
+/// progress.
+///
+/// [`failure_reason`] takes the last non-blank line, which is right for
+/// `run_capture` (stderr is appended AFTER stdout, so the error is last)
+/// but wrong for a streamed run: the transcript is in arrival order and
+/// a CLI's last word is usually its verdict banner, not what went wrong.
+pub fn failure_line(capture: &ProcCapture, skip: impl Fn(&str) -> bool) -> String {
+    capture
+        .lines
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty() && !skip(line))
+        .cloned()
+        .unwrap_or_else(|| failure_reason(capture))
 }
 
 /// The last non-blank line of a failed capture -- with `--json` implying

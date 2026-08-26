@@ -26,8 +26,17 @@ use crate::menu::{
 /// same `~/.ggo` the databases already live in.
 pub const DEFAULT_CLONE_PARENT: &str = ".ggo";
 
-pub const GGO_REPO_URL: &str = "git@github.com:gemdropgames/ggo.git";
-pub const EMERALD_REPO_URL: &str = "git@github.com:gemdropgames/emerald.git";
+/// `ssh://` form, NOT the scp-style `git@host:path`: `git clone` accepts
+/// both, `cargo install --git` accepts only this one ("relative URL
+/// without a base"), and one constant serving both callers has to be the
+/// stricter spelling.
+pub const GGO_REPO_URL: &str = "ssh://git@github.com/gemdropgames/ggo.git";
+pub const EMERALD_REPO_URL: &str = "ssh://git@github.com/gemdropgames/emerald.git";
+
+/// The binaries each repo installs -- `--git <url>` with no package spec
+/// installs every binary in the workspace (or refuses as ambiguous).
+pub const GGO_DIAG_CRATE: &str = "ggo-diag";
+pub const EMD_CRATE: &str = "emerald-cli";
 
 /// One unmet precondition for flashing. A value, not a sentence, so the
 /// status line and [`setup_steps`] read from the same source.
@@ -95,6 +104,9 @@ pub struct HardwareEnv {
     pub git: bool,
     /// Where a clone would go.
     pub clone_dest: PathBuf,
+    /// This user's home directory -- the one place a setup step can be
+    /// spawned into without creating it first.
+    pub home: PathBuf,
 }
 
 impl HardwareEnv {
@@ -121,6 +133,14 @@ impl HardwareEnv {
 
     pub fn ready(&self) -> bool {
         self.missing().is_empty()
+    }
+
+    /// Where a setup step runs. The home directory exists by
+    /// construction; `~/.ggo` and the clone destination do not, and a
+    /// child spawned into a missing directory dies before it can report
+    /// anything useful.
+    pub fn cwd_for_setup(&self) -> PathBuf {
+        self.home.clone()
     }
 }
 
@@ -208,6 +228,16 @@ impl Stage {
     }
 }
 
+/// Why a run failed, in the child's own words: the last line that is
+/// not one of `ggo-diag`'s own progress banners.
+///
+/// `ggo_common::failure_reason` takes the last non-blank line, which for
+/// a streamed transcript is almost always `RESULT: FAIL` -- the verdict,
+/// not the cause. The cause is a few lines above it.
+pub fn failure_reason(capture: &ggo_common::ProcCapture) -> String {
+    ggo_common::failure_line(capture, |line| parse_stage(line).is_some())
+}
+
 /// One output line as a stage, or `None` for lines that carry no
 /// progress. An unknown line is not an error: it still reaches the
 /// console, it just does not move the status row.
@@ -259,16 +289,19 @@ pub struct SetupStep {
 pub fn setup_steps(env: &HardwareEnv) -> Vec<SetupStep> {
     let mut steps = Vec::new();
     let repo = env.repo.clone().unwrap_or_else(|| env.clone_dest.clone());
-    if env.repo.is_none() && env.git {
-        let parent = repo
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+    // Every step runs somewhere that is guaranteed to exist: a child
+    // spawned with a `current_dir` that is not there fails as "No such
+    // file or directory" before it can say anything useful, and on the
+    // fresh machine this feature is FOR, neither `~/.ggo` nor the clone
+    // destination exists yet.
+    let cwd = env.cwd_for_setup();
+    let cloning = env.repo.is_none() && env.git;
+    if cloning {
         steps.push(SetupStep {
             label: format!("clone the GGO repo into {}", repo.display()),
             request: ProcRequest::new(
                 "git",
-                parent,
+                cwd.clone(),
                 vec![
                     "clone".to_string(),
                     GGO_REPO_URL.to_string(),
@@ -280,10 +313,20 @@ pub fn setup_steps(env: &HardwareEnv) -> Vec<SetupStep> {
     if !env.cargo {
         return steps;
     }
+    // The clone above lands before these run, so it counts as a local
+    // checkout -- installing from git would re-fetch what we just cloned.
+    let have_repo = env.repo.is_some() || cloning;
     if env.diag_bin.is_none() {
         steps.push(SetupStep {
             label: "install ggo-diag".to_string(),
-            request: cargo_install(&repo, "tools/ggo-diag", GGO_REPO_URL, env.repo.is_some()),
+            request: cargo_install(
+                &repo,
+                "tools/ggo-diag",
+                GGO_REPO_URL,
+                GGO_DIAG_CRATE,
+                have_repo,
+                &cwd,
+            ),
         });
     }
     if env.emd_bin.is_none() {
@@ -293,15 +336,30 @@ pub fn setup_steps(env: &HardwareEnv) -> Vec<SetupStep> {
         };
         steps.push(SetupStep {
             label: "install emd".to_string(),
-            request: cargo_install(&root, "crates/cli", EMERALD_REPO_URL, has_local),
+            request: cargo_install(
+                &root,
+                "crates/cli",
+                EMERALD_REPO_URL,
+                EMD_CRATE,
+                has_local,
+                &cwd,
+            ),
         });
     }
     steps
 }
 
 /// `cargo install` from a local checkout when there is one, else from
-/// git. `--path` is relative to `root`; the fallback fetches `url`.
-fn cargo_install(root: &Path, sub: &str, url: &str, local: bool) -> ProcRequest {
+/// git. `--path` is `root/sub`; the fallback fetches `crate_name` out of
+/// `url`. Runs in `cwd`, which the caller guarantees exists.
+fn cargo_install(
+    root: &Path,
+    sub: &str,
+    url: &str,
+    crate_name: &str,
+    local: bool,
+    cwd: &Path,
+) -> ProcRequest {
     let args = if local {
         vec![
             "install".to_string(),
@@ -315,11 +373,10 @@ fn cargo_install(root: &Path, sub: &str, url: &str, local: bool) -> ProcRequest 
             "--locked".to_string(),
             "--git".to_string(),
             url.to_string(),
+            crate_name.to_string(),
         ]
     };
-    // A local install runs in the checkout; a git install has no
-    // meaningful cwd, so it runs where the clone would land.
-    ProcRequest::new("cargo", root.to_path_buf(), args)
+    ProcRequest::new("cargo", cwd.to_path_buf(), args)
 }
 
 /// Resolve `bin` the way a spawn would: a path with a separator must
@@ -331,8 +388,15 @@ pub fn resolve_on_path(bin: &str, path_env: Option<&str>) -> Option<String> {
     if bin.contains(std::path::MAIN_SEPARATOR) {
         return Path::new(bin).is_file().then(|| bin.to_string());
     }
+    // `cargo` is `cargo.exe` on Windows; without the suffix every probe
+    // there reports a missing toolchain that is in fact installed.
+    let candidates: Vec<String> = if cfg!(windows) {
+        vec![bin.to_string(), format!("{bin}.exe")]
+    } else {
+        vec![bin.to_string()]
+    };
     std::env::split_paths(path_env?)
-        .map(|dir| dir.join(bin))
+        .flat_map(|dir| candidates.iter().map(move |name| dir.join(name)))
         .any(|candidate| candidate.is_file())
         .then(|| bin.to_string())
 }
@@ -376,10 +440,14 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         repo,
         emerald,
         ports,
-        project: project.map(Path::to_path_buf),
+        // The subject is an EMERALD project, not merely an open folder:
+        // `ggo-diag --project` hands it to `emd pack-ggo`, which fails
+        // deep inside itself on a folder that is not one.
+        project: project.and_then(ggo_common::emerald_project_root),
         cargo: resolve_on_path("cargo", path_env).is_some(),
         git: resolve_on_path("git", path_env).is_some(),
         clone_dest: home.join(DEFAULT_CLONE_PARENT).join("ggo"),
+        home: home.to_path_buf(),
     }
 }
 
@@ -398,6 +466,7 @@ mod tests {
             cargo: true,
             git: true,
             clone_dest: PathBuf::from("/home/u/.ggo/ggo"),
+            home: PathBuf::from("/home/u"),
         }
     }
 
@@ -519,13 +588,27 @@ mod tests {
         assert_eq!(steps.len(), 3, "clone, ggo-diag, emd");
         assert_eq!(steps[0].request.bin, "git");
         assert_eq!(steps[0].request.args[0], "clone");
+        assert!(
+            steps[0].request.args.contains(&GGO_REPO_URL.to_string())
+                && GGO_REPO_URL.starts_with("ssh://"),
+            "cargo cannot parse scp-style URLs, so one spelling serves both"
+        );
         assert!(steps[1].label.contains("ggo-diag"));
         assert!(
-            steps[1].request.args.contains(&"--git".to_string()),
-            "no checkout to build from: {:?}",
+            steps[1]
+                .request
+                .args
+                .contains(&"/home/u/.ggo/ggo/tools/ggo-diag".to_string()),
+            "the clone above IS the checkout to build from: {:?}",
             steps[1].request.args
         );
         assert!(steps[2].label.contains("emd"));
+        for step in &steps {
+            assert_eq!(
+                step.request.cwd, bare.home,
+                "every step runs in a directory that exists"
+            );
+        }
 
         // With a checkout, ggo-diag builds from it and no clone runs.
         let mut local = bare.clone();
@@ -566,6 +649,12 @@ mod tests {
         let steps = setup_steps(&no_git);
         assert_eq!(steps.len(), 2);
         assert!(steps.iter().all(|s| s.request.bin == "cargo"));
+        // Nothing to clone with and no checkout: fetch, and name the
+        // crate -- a bare `--git <url>` installs every binary in the
+        // workspace, or refuses as ambiguous.
+        assert!(steps[0].request.args.contains(&"--git".to_string()));
+        assert!(steps[0].request.args.contains(&GGO_DIAG_CRATE.to_string()));
+        assert!(steps[1].request.args.contains(&EMD_CRATE.to_string()));
     }
 
     #[test]
@@ -594,5 +683,29 @@ mod tests {
             None,
             "an explicit path that is not there does not resolve"
         );
+    }
+
+    #[test]
+    fn the_failure_reason_is_the_cause_not_the_verdict_banner() {
+        let capture = ggo_common::ProcCapture {
+            ok: false,
+            lines: vec![
+                "==> Flash board".to_string(),
+                "fujprog: cannot open /dev/ttyUSB0".to_string(),
+                "diag step 2: FAIL".to_string(),
+                "RESULT: FAIL".to_string(),
+            ],
+        };
+        assert_eq!(
+            failure_reason(&capture),
+            "fujprog: cannot open /dev/ttyUSB0",
+            "the last NON-progress line is what went wrong"
+        );
+        // Nothing but banners: fall back rather than invent silence.
+        let all_banners = ggo_common::ProcCapture {
+            ok: false,
+            lines: vec!["==> Flash board".to_string(), "RESULT: FAIL".to_string()],
+        };
+        assert_eq!(failure_reason(&all_banners), "RESULT: FAIL");
     }
 }
