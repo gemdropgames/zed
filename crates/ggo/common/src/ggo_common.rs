@@ -449,6 +449,38 @@ pub fn run_cart(
     runners.iter().any(|run| run(workspace, rel, window, cx))
 }
 
+/// A handler that can flash the open project to an attached board and
+/// boot it. Same registry pattern -- and the same reason -- as
+/// [`WorldEmulator`]: the flashing lives in `ggo_emu_panel`, which
+/// already depends on `ggo_world_panel`, so the world panel's flash
+/// button cannot call it directly.
+pub type BoardFlasher = fn(&mut Workspace, &mut Window, &mut Context<Workspace>) -> bool;
+
+#[derive(Default)]
+struct BoardFlashers(Vec<BoardFlasher>);
+
+impl gpui::Global for BoardFlashers {}
+
+/// Register a [`BoardFlasher`]. Called once by `ggo_emu_panel::init`.
+pub fn register_board_flasher(cx: &mut App, flasher: BoardFlasher) {
+    cx.default_global::<BoardFlashers>().0.push(flasher);
+}
+
+/// Ask the registered flasher to put the open project on the board.
+/// `false` means no emulator pane exists in this build -- reported, not
+/// swallowed, exactly as [`run_cart`] explains.
+pub fn flash_to_board(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let flashers = match cx.try_global::<BoardFlashers>() {
+        Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+        _ => return false,
+    };
+    flashers.iter().any(|flash| flash(workspace, window, cx))
+}
+
 /// A handler that can build and boot a world into an emulator pane. Same
 /// registry pattern as [`CartRunner`], for the same reason: `ggo_emu_panel`
 /// already depends on `ggo_world_panel`, so the world panel's Emulate

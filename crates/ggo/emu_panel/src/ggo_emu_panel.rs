@@ -185,6 +185,12 @@ pub fn init(cx: &mut App) {
     // explorer's "Emulate this world (cart)" entry uses, deferred because
     // that handler saves the world panel's doc and takes the workspace
     // itself -- neither may nest inside the caller's updates.
+    ggo_common::register_board_flasher(cx, |workspace, window, cx| {
+        open_emu_item(workspace, window, cx, |emu, _window, cx| {
+            emu.flash_to_board(cx);
+        })
+    });
+
     ggo_common::register_world_emulator(cx, |workspace, rel, window, cx| {
         let handler = menu::emulate_world_handler(workspace.weak_handle(), rel.to_string());
         window.defer(cx, move |window, cx| handler(window, cx));

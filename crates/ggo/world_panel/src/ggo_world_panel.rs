@@ -2312,6 +2312,26 @@ impl WorldPanel {
     /// booting the in-IDE pane. No registry hop, because no emulator pane
     /// is involved -- the whole flow is this panel's own, and its failures
     /// land on this toolbar ([`OpenWorld::popout_error`]).
+    /// The toolbar's flash button: hand the open project to the emulator
+    /// pane's board flasher. Deferred out of this click for the same
+    /// reason [`Self::emulate_impl`] defers -- the handler updates the
+    /// workspace, which is leased while a panel listener runs.
+    fn flash_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                if !ggo_common::flash_to_board(workspace, window, cx) {
+                    log::warn!("no emulator pane is available to flash this project");
+                }
+            });
+        });
+    }
+
     fn emulate_popout_impl(&mut self, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
@@ -3167,6 +3187,12 @@ impl WorldPanel {
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Emulate this world (cart)"))
                     .on_click(cx.listener(|this, _, window, cx| this.emulate_impl(window, cx))),
+            )
+            .child(
+                IconButton::new("ggo-world-flash", IconName::GgoFlashRun)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Flash this project to the board and run it"))
+                    .on_click(cx.listener(|this, _, window, cx| this.flash_impl(window, cx))),
             )
             .child(
                 IconButton::new("ggo-world-emulate-popout", IconName::ArrowUpRight)
@@ -8428,5 +8454,45 @@ mod tests {
                 "redo re-resolves the subtree instead of leaving a placeholder"
             );
         });
+    }
+
+    thread_local! {
+        static FLASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn recording_flasher(
+        _workspace: &mut Workspace,
+        _window: &mut Window,
+        _cx: &mut Context<Workspace>,
+    ) -> bool {
+        FLASHED.with(|f| f.set(f.get() + 1));
+        true
+    }
+
+    /// The toolbar's flash button reaches the emulator pane through the
+    /// registry, never by naming it: `ggo_emu_panel` depends on this
+    /// crate, so the edge only goes one way.
+    #[gpui::test]
+    async fn test_the_flash_button_routes_through_the_board_flasher(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        FLASHED.with(|f| f.set(0));
+        cx.update(|cx| ggo_common::register_board_flasher(cx, recording_flasher));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+
+        panel.update_in(cx, |panel, window, cx| panel.flash_impl(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            FLASHED.with(|f| f.get()),
+            1,
+            "the button reached the registered flasher"
+        );
     }
 }
