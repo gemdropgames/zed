@@ -140,15 +140,15 @@ Refs: Defold, Godot.
 - [x] Pane state kept across the restart: held pad re-published, mute/debug/console untouched, paused runs resume (2026-08-25)
 - [ ] True asset hot-swap: core accepts a new asset section mid-run — `large`, needs `ggo-emu-core` support
 
-## 9. Deploy to hardware — `deferred indefinitely` (2026-08-25, user's call)
+## 9. Deploy to hardware — `partial 2026-08-25` (flash+run shipped; export/verdict rail open)
 
 Only "Run hardware diagnostics" (`ggo-diag --launch`). Flashing lives in the
 ggo repo's `.zed/tasks.json` with raw stdout and no verdict parsing
 (`MIGRATION.md:223`, `:225`).
 Refs: GB Studio ROM export, TIC-80 cart export.
 
-- [ ] "Flash to board" context-menu entry on a `.cart`/`.ggo` → `ggo-diag` provision + launch flow
-- [ ] State machine over `ggo-diag` stdout with parsed verdicts on the emu status row
+- [x] Flash-and-run button (emulator transport + world panel toolbar) → `ggo-diag --project --skip-pnr`, plus tooling setup (clone repo, install ggo-diag/emd; OSS CAD Suite via ggo-diag) (2026-08-25)
+- [x] Stages parsed from `ggo-diag`'s event grammar onto the emu status row, raw lines to the console, cancellable (2026-08-25)
 - [ ] Export cart to a chosen path (the pack already exists; expose it without running)
 
 ## 10. Editor chrome consistency — `partial 2026-08-25` (emerald + charts items open)
