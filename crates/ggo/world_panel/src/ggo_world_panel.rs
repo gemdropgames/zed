@@ -1195,6 +1195,13 @@ impl WorldPanel {
     /// against the asset root DERIVED from it ([`split_world_path`]). A
     /// stale result (superseded by a later open) is dropped by generation
     /// check.
+    /// Re-read `rel` from disk, DISCARDING any unsaved edits -- the
+    /// "Don't Save" answer to the tab's close prompt. Unlike
+    /// `open_rel_path` this asks nothing: the user already answered.
+    pub(crate) fn reload_from_disk(&mut self, rel: &str, cx: &mut Context<Self>) {
+        self.load_rel_path(rel, cx);
+    }
+
     fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
         let Some((asset_root_rel, listing)) = split_world_path(rel) else {
             return;

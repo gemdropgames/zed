@@ -445,6 +445,14 @@ impl TilesetPanel {
 
     /// Kick off the off-thread load of `rel`. A stale result (superseded by
     /// a later open) is dropped by generation check.
+    /// Re-read `rel` from disk, DISCARDING any unsaved edits -- the
+    /// "Don't Save" answer to the tab's close prompt. Unlike
+    /// `open_rel_path` this asks nothing: the user already answered.
+    pub(crate) fn reload_from_disk(&mut self, rel: &str, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        self.load_rel_path(rel, cx);
+    }
+
     fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
         let rel = rel.to_string();
         let Some(root) = self.project_root.clone() else {

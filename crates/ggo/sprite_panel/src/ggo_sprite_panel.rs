@@ -1682,6 +1682,14 @@ impl SpritePanel {
 
     /// Kick off the off-thread load of `rel`. A stale result (superseded by
     /// a later open) is dropped by generation check.
+    /// Re-read `rel` from disk, DISCARDING any unsaved edits -- the
+    /// "Don't Save" answer to the tab's close prompt. Unlike
+    /// `open_rel_path` this asks nothing: the user already answered.
+    pub(crate) fn reload_from_disk(&mut self, rel: &str, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        self.load_rel_path(rel, cx);
+    }
+
     fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
         let source_rel = rel.to_string();
         let Some(project_root) = self.project_root.clone() else {
@@ -7839,5 +7847,138 @@ mod tests {
                 Some("assets/sprites/other.spr already exists")
             );
         });
+    }
+
+    // ------------------------------------ closing a dirty tab (regression)
+
+    /// Open `sprites/hero.spr` as a tab and hand back the pane plus the
+    /// item's panel.
+    async fn dirty_sprite_tab<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<workspace::Pane>,
+        Entity<SpritePanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let project = routed_project(cx, root, true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            open_sprite_item(workspace, "sprites/hero.spr".to_string(), window, cx);
+            workspace
+                .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                .next()
+                .expect("the tab opened")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        cx.run_until_parked();
+        // An unsaved edit, the way the user had one.
+        panel.update(cx, |panel, cx| panel.step_size(1, 0, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let item = workspace
+                .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                .next()
+                .expect("still open");
+            assert!(
+                workspace::item::Item::is_dirty(item.read(cx), cx),
+                "the tab must be dirty before the close"
+            );
+        });
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        (workspace, pane, panel, cx)
+    }
+
+    fn open_sprite_tabs(workspace: &Entity<Workspace>, cx: &mut gpui::VisualTestContext) -> usize {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                .count()
+        })
+    }
+
+    /// Closing a tab with unsaved sprite edits must prompt and then honour
+    /// the answer -- the real flow the user hit: edit the icon sprite,
+    /// close the tab. Every GGO editor item reports
+    /// `ItemBufferKind::Singleton`, which is what makes `Pane` prompt at
+    /// all (`Pane::skip_save_on_close`); before that a dirty tab closed
+    /// silently and dropped the edits.
+    #[gpui::test]
+    async fn test_closing_a_dirty_sprite_tab_prompts_and_saves(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, pane, panel, cx) = dirty_sprite_tab(cx, dir.path()).await;
+
+        let close = pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "a dirty sprite tab must prompt");
+        cx.simulate_prompt_answer("Save");
+        close.await.expect("the close task must not fail");
+        cx.run_until_parked();
+
+        assert_eq!(open_sprite_tabs(&workspace, cx), 0, "the tab closed");
+        let saved = open_sprite(dir.path(), "sprites/hero.spr").expect("the trio round-trips");
+        assert_eq!(saved.state.w_tiles, 2, "the edit reached disk");
+        drop(panel);
+    }
+
+    /// Cancel keeps the tab open AND still dirty -- nothing written.
+    #[gpui::test]
+    async fn test_cancelling_the_close_keeps_the_dirty_sprite_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, pane, panel, cx) = dirty_sprite_tab(cx, dir.path()).await;
+        let before = open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles;
+
+        let close = pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        close.await.expect("a cancelled close is not an error");
+        cx.run_until_parked();
+
+        assert_eq!(open_sprite_tabs(&workspace, cx), 1, "the tab stayed open");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(&panel.state, ViewerState::Ready(open) if open.store.dirty()),
+                "and kept its unsaved edits"
+            );
+        });
+        assert_eq!(
+            open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles,
+            before,
+            "nothing was written"
+        );
+    }
+
+    /// "Don't Save" closes the tab and deliberately drops the edits.
+    #[gpui::test]
+    async fn test_discarding_closes_the_sprite_tab_without_writing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, pane, _panel, cx) = dirty_sprite_tab(cx, dir.path()).await;
+        let before = open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles;
+
+        let close = pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Don't Save");
+        close.await.expect("the close task must not fail");
+        cx.run_until_parked();
+
+        assert_eq!(open_sprite_tabs(&workspace, cx), 0, "the tab closed");
+        assert_eq!(
+            open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles,
+            before,
+            "discard writes nothing"
+        );
     }
 }

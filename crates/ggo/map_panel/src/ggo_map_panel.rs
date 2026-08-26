@@ -776,6 +776,14 @@ impl MapPanel {
     /// Kick off the off-thread load of the worktree-relative path `rel`,
     /// against the asset root DERIVED from it ([`split_map_path`]). A stale
     /// result (superseded by a later open) is dropped by generation check.
+    /// Re-read `rel` from disk, DISCARDING any unsaved edits -- the
+    /// "Don't Save" answer to the tab's close prompt. Unlike
+    /// `open_rel_path` this asks nothing: the user already answered.
+    pub(crate) fn reload_from_disk(&mut self, rel: &str, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        self.load_rel_path(rel, cx);
+    }
+
     fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
         let Some(project_root) = self.project_root.clone() else {
             return;
@@ -3551,6 +3559,42 @@ mod tests {
             );
         });
         panel.read_with(cx, |panel, _| assert!(panel.dirty(), "and still dirty"));
+    }
+
+    /// "Don't Save" closes the tab and discards the edits. `Pane` reloads
+    /// a singleton item from disk on that answer, so `Item::reload` MUST
+    /// exist -- the default is `unimplemented!()`, which took the whole
+    /// editor down when a dirty tab was closed that way.
+    #[gpui::test]
+    async fn test_discarding_closes_the_dirty_map_tab_without_writing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _, cx) = routed_workspace(cx, dir.path()).await;
+        dirty_the_map(&panel, cx);
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let close = pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "a dirty map tab must prompt");
+        cx.simulate_prompt_answer("Don't Save");
+        close.await.unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<MapEditorItem>(cx).count(),
+                0,
+                "the tab closed"
+            );
+        });
+        assert_eq!(
+            io::open_map(&dir.path().join(ASSETS_DIR), "maps/level.map")
+                .unwrap()
+                .cells,
+            blank_cells(),
+            "discard writes nothing"
+        );
     }
 
     /// The data-loss guard on a DOCUMENT SWITCH: a file-tree click while

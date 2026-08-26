@@ -116,6 +116,23 @@ impl Item for MapEditorItem {
         self.is_dirty(cx)
     }
 
+    /// "Don't Save" on the close prompt lands here (`Pane::save_item`,
+    /// the `Ok(1)` arm): a singleton item that `can_save` MUST implement
+    /// this, or the default `unimplemented!()` takes the process down.
+    /// Discarding is a re-read from disk through the panel's own load
+    /// path, which is generation-guarded and drops the dirty document.
+    fn reload(
+        &mut self,
+        _project: Entity<Project>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let rel = self.rel.clone();
+        self.panel
+            .update(cx, |panel, cx| panel.reload_from_disk(&rel, cx));
+        Task::ready(Ok(()))
+    }
+
     fn save(
         &mut self,
         _options: SaveOptions,

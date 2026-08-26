@@ -122,6 +122,23 @@ impl Item for TilesetEditorItem {
         self.is_dirty(cx)
     }
 
+    /// "Don't Save" on the close prompt lands here (`Pane::save_item`,
+    /// the `Ok(1)` arm): a singleton item that `can_save` MUST implement
+    /// this, or the default `unimplemented!()` takes the process down.
+    /// Discarding is a re-read from disk through the panel's own load
+    /// path, which is generation-guarded and drops the dirty document.
+    fn reload(
+        &mut self,
+        _project: Entity<Project>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let rel = self.rel.clone();
+        self.panel
+            .update(cx, |panel, cx| panel.reload_from_disk(&rel, cx));
+        Task::ready(Ok(()))
+    }
+
     fn save(
         &mut self,
         _options: SaveOptions,
@@ -227,5 +244,48 @@ mod tests {
                 "a failed save must keep the document dirty"
             );
         });
+    }
+
+    /// "Don't Save" on the tab's close prompt reaches `Item::reload`
+    /// (`Pane::save_item`'s `Ok(1)` arm, for a singleton that `can_save`).
+    /// The trait default is `unimplemented!()`, so a missing impl here is
+    /// a crash on a routine close, not a soft failure.
+    #[gpui::test]
+    async fn test_reload_discards_the_unsaved_tileset(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            crate::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        let before = std::fs::read(dir.path().join("tiles/world.til")).expect("fixture");
+        let root = dir.path().to_path_buf();
+        let (item, cx) = cx.add_window_view(|window, cx| {
+            TilesetEditorItem::new_for_test("tiles/world.til".into(), root, window, cx)
+        });
+        cx.run_until_parked();
+
+        item.update(cx, |item, cx| {
+            item.panel()
+                .clone()
+                .update(cx, |panel, cx| panel.apply_paint_for_test(0, 0, 0, 1, cx));
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, cx| assert!(item.is_dirty(cx), "edited"));
+
+        let reload = item.update_in(cx, |item, window, cx| item.reload(project, window, cx));
+        reload.await.expect("reload must not fail");
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, cx| {
+            assert!(!item.is_dirty(cx), "the discarded document is clean again");
+        });
+        assert_eq!(
+            std::fs::read(dir.path().join("tiles/world.til")).expect("fixture"),
+            before,
+            "discarding writes nothing"
+        );
     }
 }

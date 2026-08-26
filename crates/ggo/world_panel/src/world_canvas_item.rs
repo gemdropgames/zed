@@ -118,6 +118,27 @@ impl Item for WorldCanvasItem {
         self.is_dirty(cx)
     }
 
+    /// "Don't Save" on the close prompt lands here (`Pane::save_item`,
+    /// the `Ok(1)` arm): a singleton item that `can_save` MUST implement
+    /// this, or the default `unimplemented!()` takes the process down.
+    /// Discarding is a re-read from disk through the panel's own load
+    /// path, which is generation-guarded and drops the dirty document.
+    fn reload(
+        &mut self,
+        _project: Entity<Project>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        if let Some(panel) = self.panel.upgrade() {
+            panel.update(cx, |panel, cx| {
+                if let Some(rel) = panel.open_rel_path_now().map(str::to_string) {
+                    panel.reload_from_disk(&rel, cx);
+                }
+            });
+        }
+        Task::ready(Ok(()))
+    }
+
     fn save(
         &mut self,
         _options: SaveOptions,
@@ -283,6 +304,28 @@ mod tests {
         item.read_with(cx, |item, cx| {
             assert_eq!(item.tab_content_text(0, cx).as_ref(), "World");
             assert!(!item.is_dirty(cx), "an empty panel has nothing to save");
+        });
+    }
+
+    /// The same close-prompt path as the other GGO editors: "Don't Save"
+    /// calls `Item::reload`, whose trait default is `unimplemented!()`.
+    #[gpui::test]
+    async fn test_reload_discards_the_unsaved_world(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = crate::tests::ready_panel_in_window(cx, dir.path()).await;
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.downgrade(), cx)));
+
+        crate::tests::dirty_the_world(&panel, cx);
+        item.read_with(cx, |item, cx| assert!(item.is_dirty(cx), "edited"));
+
+        let reload = item.update_in(cx, |item, window, cx| item.reload(project, window, cx));
+        reload.await.expect("reload must not fail");
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, cx| {
+            assert!(!item.is_dirty(cx), "the discarded world is clean again");
         });
     }
 }
