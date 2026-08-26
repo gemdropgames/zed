@@ -201,13 +201,21 @@ impl HardwareEnv {
                 name: "GGO repo",
                 why: "the pipeline builds GemOS and the gateware out of it",
                 found: self.repo.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                remedy: match (&self.repo, self.git) {
-                    (Some(_), _) => Remedy::Satisfied,
-                    (None, true) => Remedy::Install(format!(
+                remedy: match (&self.repo, self.git, self.clone_dest.exists()) {
+                    (Some(_), _, _) => Remedy::Satisfied,
+                    // Something is already at the clone destination and it
+                    // is not a checkout (`probe` would have adopted it):
+                    // say so, because cloning over it just fails.
+                    (None, _, true) => Remedy::Manual(format!(
+                        "{} already exists but is not a GGO checkout -- remove it, \
+                         or set {DIAG_REPO_ENV} to a real one",
+                        self.clone_dest.display()
+                    )),
+                    (None, true, false) => Remedy::Install(format!(
                         "git clone into {}",
                         self.clone_dest.display()
                     )),
-                    (None, false) => Remedy::Manual(format!(
+                    (None, false, false) => Remedy::Manual(format!(
                         "install git, or set {DIAG_REPO_ENV} to an existing checkout"
                     )),
                 },
@@ -410,7 +418,12 @@ pub fn setup_steps(env: &HardwareEnv) -> Vec<SetupStep> {
     // fresh machine this feature is FOR, neither `~/.ggo` nor the clone
     // destination exists yet.
     let cwd = env.cwd_for_setup();
-    let cloning = env.repo.is_none() && env.git;
+    // `git clone` refuses a destination that already exists, and by this
+    // point `probe` has already adopted it if it were a real checkout --
+    // so an existing path here is something else, and overwriting it is
+    // not ours to do.
+    let dest_taken = env.clone_dest.exists();
+    let cloning = env.repo.is_none() && env.git && !dest_taken;
     if cloning {
         steps.push(SetupStep {
             label: format!("clone the GGO repo into {}", repo.display()),
@@ -494,6 +507,25 @@ fn cargo_install(
     ProcRequest::new("cargo", cwd.to_path_buf(), args)
 }
 
+/// Does `dir` hold a GGO checkout?
+pub fn is_repo(dir: &Path) -> bool {
+    dir.join(crate::menu::REPO_FINGERPRINT).is_file()
+}
+
+/// Expand a leading `~` against `home`. Env vars are not shell words, so
+/// nothing else does this and a `~` reaches the filesystem literally.
+pub fn expand_home(value: &str, home: &Path) -> PathBuf {
+    if value == "~" {
+        return home.to_path_buf();
+    }
+    // Only a bare `~/`: `~someone/x` names ANOTHER user's home, which is
+    // not this one and not ours to guess.
+    match value.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(value),
+    }
+}
+
 /// Resolve `bin` the way a spawn would: a path with a separator must
 /// exist as given, a bare name is looked up in `path_env`. Parametrized
 /// over PATH (rather than reading the process env) so it is testable
@@ -526,12 +558,19 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         .unwrap_or_else(|| DEFAULT_DIAG_BIN.to_string());
     let diag_bin = resolve_on_path(&diag, path_env);
     let emd_bin = resolve_on_path(&ggo_common::emd_bin(), path_env);
+    let clone_dest = home.join(DEFAULT_CLONE_PARENT).join("ggo");
     let repo = std::env::var(DIAG_REPO_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .filter(|repo| repo.join(crate::menu::REPO_FINGERPRINT).is_file())
-        .or_else(|| project.and_then(crate::menu::find_repo_root));
+        // A `~` typed into an env var is not expanded by anything: the
+        // shell only does it for un-quoted words it parses itself.
+        .map(|v| expand_home(&v, home))
+        .filter(|repo| is_repo(repo))
+        .or_else(|| project.and_then(crate::menu::find_repo_root))
+        // A clone this feature made earlier is a checkout like any other;
+        // without this the repo row stays missing and Install tries to
+        // clone on top of it ("destination path already exists").
+        .or_else(|| is_repo(&clone_dest).then(|| clone_dest.clone()));
     // An `emerald` checkout beside the GGO repo is the natural `emd`
     // source; ggo-diag's own repo layout puts them as siblings.
     let emerald = repo
@@ -561,7 +600,7 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         project: project.and_then(ggo_common::emerald_project_root),
         cargo: resolve_on_path("cargo", path_env).is_some(),
         git: resolve_on_path("git", path_env).is_some(),
-        clone_dest: home.join(DEFAULT_CLONE_PARENT).join("ggo"),
+        clone_dest,
         home: home.to_path_buf(),
     }
 }
@@ -822,5 +861,69 @@ mod tests {
             lines: vec!["==> Flash board".to_string(), "RESULT: FAIL".to_string()],
         };
         assert_eq!(failure_reason(&all_banners), "RESULT: FAIL");
+    }
+
+    #[test]
+    fn a_previous_clone_is_adopted_and_never_cloned_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(".ggo/ggo");
+
+        // Nothing there yet: clone.
+        let mut env = HardwareEnv {
+            cargo: true,
+            git: true,
+            clone_dest: dest.clone(),
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            env.requirements()[1].remedy,
+            Remedy::Install(_)
+        ));
+        assert_eq!(setup_steps(&env)[0].request.args[0], "clone");
+
+        // The destination exists but is not a checkout: cloning into it
+        // would just fail, so say what to do instead.
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("stray.txt"), b"x").unwrap();
+        match &env.requirements()[1].remedy {
+            Remedy::Manual(what) => assert!(
+                what.contains("already exists"),
+                "the row explains the collision: {what}"
+            ),
+            other => panic!("expected a manual remedy, got {other:?}"),
+        }
+        assert!(
+            setup_steps(&env).iter().all(|s| s.request.bin != "git"),
+            "never clone onto an existing path"
+        );
+
+        // A real checkout there IS the repo -- what `probe` adopts.
+        std::fs::create_dir_all(dest.join("firmware/system")).unwrap();
+        std::fs::write(dest.join(crate::menu::REPO_FINGERPRINT), b"[package]").unwrap();
+        assert!(is_repo(&dest));
+        env.repo = Some(dest);
+        assert_eq!(env.requirements()[1].remedy, Remedy::Satisfied);
+        assert!(
+            setup_steps(&env).iter().all(|s| s.request.bin != "git"),
+            "an adopted checkout needs no clone"
+        );
+    }
+
+    #[test]
+    fn a_tilde_in_the_env_var_is_expanded() {
+        let home = Path::new("/home/u");
+        assert_eq!(expand_home("~/.ggo/ggo", home), PathBuf::from("/home/u/.ggo/ggo"));
+        assert_eq!(expand_home("~", home), PathBuf::from("/home/u"));
+        assert_eq!(
+            expand_home("/abs/path", home),
+            PathBuf::from("/abs/path"),
+            "an absolute path is left alone"
+        );
+        assert_eq!(
+            expand_home("~user/x", home),
+            PathBuf::from("~user/x"),
+            "another user's home is not ours to guess"
+        );
     }
 }

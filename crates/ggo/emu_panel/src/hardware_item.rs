@@ -225,9 +225,30 @@ impl Render for HardwareSetupItem {
                         .rounded_sm()
                         .bg(colors.element_background)
                         .child(
-                            Label::new("Output")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Label::new("Output")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(div().flex_1())
+                                .child({
+                                    // The whole transcript in one click:
+                                    // an install failure is something you
+                                    // paste somewhere, and a rendered
+                                    // `Label` cannot be selected.
+                                    let all = log.join("\n");
+                                    IconButton::new("ggo-hardware-copy-log", IconName::Copy)
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(Tooltip::text("Copy all output"))
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(
+                                                gpui::ClipboardItem::new_string(all.clone()),
+                                            );
+                                        })
+                                }),
                         )
                         // Newest last, the way a terminal reads; the tail
                         // is what a running install is doing right now.
