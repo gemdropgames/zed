@@ -13,11 +13,13 @@ use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window,
 };
 use ui::prelude::*;
-use ui::Tooltip;
+use ui::{CommonAnimationExt, Disclosure, Tooltip};
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};
 
-use crate::hardware::{Remedy, Requirement};
+use std::time::Duration;
+
+use crate::hardware::{FlashProgress, PhaseRow, PhaseState, Remedy, Requirement};
 use crate::{EmuPanel, open_emu_item};
 
 pub enum HardwareItemEvent {
@@ -27,6 +29,44 @@ pub enum HardwareItemEvent {
 pub struct HardwareSetupItem {
     panel: WeakEntity<EmuPanel>,
     focus_handle: FocusHandle,
+    /// The reader's own choice about the transcript, which beats the
+    /// auto-open on failure in both directions.
+    log_expanded: Option<bool>,
+    /// The reader re-opened the checklist a ready machine collapses.
+    requirements_expanded: bool,
+}
+
+/// Which parts of the page are showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PageLayout {
+    pub requirements_open: bool,
+    pub timeline: bool,
+    pub log_open: bool,
+}
+
+/// The page's one layout rule, kept out of `render` so it can be
+/// asserted without a window: a machine that cannot flash gets the
+/// checklist, a run gets the timeline, and a failure puts the child's
+/// own words on screen without a click.
+pub(crate) fn page_layout(
+    ready: bool,
+    progress: Option<&FlashProgress>,
+    log_toggled: Option<bool>,
+) -> PageLayout {
+    PageLayout {
+        requirements_open: !ready,
+        // A setup run announces no phases, so its progress has no rows
+        // and the page stays on its console.
+        timeline: progress.is_some_and(|progress| !progress.rows().is_empty()),
+        log_open: log_toggled
+            .unwrap_or_else(|| progress.is_some_and(|progress| progress.verdict() == Some(false))),
+    }
+}
+
+/// `m:ss`, the only duration this page shows.
+fn elapsed_text(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 impl HardwareSetupItem {
@@ -40,7 +80,136 @@ impl HardwareSetupItem {
         Self {
             panel,
             focus_handle: cx.focus_handle(),
+            log_expanded: None,
+            requirements_expanded: false,
         }
+    }
+
+    /// One phase of the pipeline: where it got to, for how long, and --
+    /// while it is the running one -- what it is doing right now.
+    fn render_phase(&self, row: &PhaseRow, now: Duration) -> AnyElement {
+        let (name, color) = match row.state {
+            PhaseState::Pending => (IconName::Circle, Color::Muted),
+            PhaseState::Running => (IconName::ArrowCircle, Color::Accent),
+            PhaseState::Done => (IconName::Check, Color::Success),
+            PhaseState::Failed => (IconName::XCircle, Color::Error),
+        };
+        let icon = Icon::new(name).size(IconSize::Small).color(color);
+        // The spin is not decoration: it is the only thing repainting
+        // this page during a phase that says nothing for minutes, which
+        // is also what keeps the elapsed time moving.
+        let icon = if row.state == PhaseState::Running {
+            icon.with_rotate_animation(2).into_any_element()
+        } else {
+            icon.into_any_element()
+        };
+        v_flex()
+            .gap_0p5()
+            .py_0p5()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(icon)
+                    .child(Label::new(row.title.clone()).color(match row.state {
+                        PhaseState::Pending => Color::Muted,
+                        _ => Color::Default,
+                    }))
+                    .child(div().flex_1())
+                    .when(row.state != PhaseState::Pending, |el| {
+                        el.child(
+                            Label::new(elapsed_text(row.elapsed(now)))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .when_some(
+                row.detail
+                    .clone()
+                    .filter(|_| row.state == PhaseState::Running),
+                |el, detail| {
+                    el.child(
+                        div().pl_6().child(
+                            Label::new(detail)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    /// The run: what it is going onto, how far it got, and how it ended.
+    fn render_timeline(
+        &self,
+        progress: &FlashProgress,
+        now: Duration,
+        target: &(Option<String>, Option<String>),
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let (project, port) = target;
+        let verdict = progress.verdict().map(|pass| {
+            Label::new(if pass { "PASS" } else { "FAIL" })
+                .size(LabelSize::Small)
+                .color(if pass { Color::Success } else { Color::Error })
+        });
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_sm()
+            .bg(colors.element_background)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new(match (project, port) {
+                            (Some(project), Some(port)) => format!("{project} → {port}"),
+                            (Some(project), None) => project.clone(),
+                            _ => "this project".to_string(),
+                        })
+                        .size(LabelSize::Small),
+                    )
+                    .child(div().flex_1())
+                    .children(verdict)
+                    .child(
+                        Label::new(elapsed_text(now))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .children(
+                progress
+                    .rows()
+                    .iter()
+                    .map(|row| self.render_phase(row, now)),
+            )
+            .when(!progress.diag_steps().is_empty(), |el| {
+                el.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Label::new("Diagnostics")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .children(progress.diag_steps().iter().map(|step| {
+                            Label::new(format!("{} {}", step.index, step.status))
+                                .size(LabelSize::XSmall)
+                                .color(match step.status.as_str() {
+                                    "PASS" => Color::Success,
+                                    "FAIL" => Color::Error,
+                                    _ => Color::Muted,
+                                })
+                        })),
+                )
+            })
+            .into_any_element()
     }
 
     /// One requirement's row: state, where it was found or why not, and
@@ -114,16 +283,35 @@ impl Render for HardwareSetupItem {
                 .p_4()
                 .child(Label::new("The emulator pane is gone.").color(Color::Muted));
         };
-        let (requirements, ready, busy, status, log) = panel.update(cx, |panel, _cx| {
-            let env = panel.hardware_env_cached();
-            (
-                env.requirements(),
-                env.ready(),
-                panel.is_flashing(),
-                panel.flash_status(),
-                panel.console_lines(),
-            )
-        });
+        let (requirements, ready, busy, status, log, progress, target) =
+            panel.update(cx, |panel, _cx| {
+                let env = panel.hardware_env_cached();
+                let target = (
+                    env.project
+                        .as_ref()
+                        .and_then(|project| project.file_name())
+                        .map(|name| name.to_string_lossy().into_owned()),
+                    env.ports.first().cloned(),
+                );
+                (
+                    env.requirements(),
+                    env.ready(),
+                    panel.is_flashing(),
+                    panel.flash_status(),
+                    panel.console_lines(),
+                    panel
+                        .flash_progress()
+                        .map(|(progress, elapsed)| (progress.clone(), elapsed)),
+                    target,
+                )
+            });
+        let layout = page_layout(
+            ready,
+            progress.as_ref().map(|(progress, _)| progress),
+            self.log_expanded,
+        );
+        let requirements_open = layout.requirements_open || self.requirements_expanded;
+        let unmet = requirements.iter().filter(|r| !r.satisfied()).count();
         let installable = requirements
             .iter()
             .filter(|r| matches!(r.remedy, Remedy::Install(_)))
@@ -142,60 +330,112 @@ impl Render for HardwareSetupItem {
                 v_flex()
                     .gap_1()
                     .child(Headline::new("Flash to hardware").size(HeadlineSize::Small))
-                    .child(
-                        Label::new(
-                            "Flashing packs this project, writes the card image, programs the \
-                             board and boots it. Here is what that needs.",
+                    // Once the machine can flash, the explanation has
+                    // done its job and the run is what matters.
+                    .when(!ready, |el| {
+                        el.child(
+                            Label::new(
+                                "Flashing packs this project, writes the card image, programs \
+                                 the board and boots it. Here is what that needs.",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                         )
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    ),
+                    }),
             )
             .child(
                 v_flex()
-                    .children(
-                        requirements
-                            .iter()
-                            .map(|requirement| self.render_requirement(requirement, cx)),
-                    ),
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Disclosure::new("ggo-hardware-requirements", requirements_open)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.requirements_expanded = !this.requirements_expanded;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Icon::new(if ready {
+                                    IconName::Check
+                                } else {
+                                    IconName::Warning
+                                })
+                                .size(IconSize::Small)
+                                .color(if ready { Color::Success } else { Color::Warning }),
+                            )
+                            .child(
+                                Label::new(if ready {
+                                    "Ready to flash".to_string()
+                                } else {
+                                    format!("{unmet} of {} things missing", requirements.len())
+                                })
+                                .size(LabelSize::Small),
+                            ),
+                    )
+                    .when(requirements_open, |el| {
+                        el.children(
+                            requirements
+                                .iter()
+                                .map(|requirement| self.render_requirement(requirement, cx)),
+                        )
+                    }),
+            )
+            .when_some(
+                progress.as_ref().filter(|_| layout.timeline),
+                |el, (progress, elapsed)| {
+                    el.child(self.render_timeline(progress, *elapsed, &target, cx))
+                },
             )
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
+                    .when(!ready, |el| {
+                        el.child(
+                            Button::new("ggo-hardware-install", "Install tools")
+                                .disabled(busy || installable == 0)
+                                .tooltip(Tooltip::text(if installable == 0 {
+                                    "Nothing left for ZedGG to install"
+                                } else {
+                                    "Clone the GGO repo and install the missing binaries"
+                                }))
+                                .on_click({
+                                    let panel = self.panel.clone();
+                                    move |_, _window, cx| {
+                                        panel.update(cx, |panel, cx| panel.setup_hardware(cx)).ok();
+                                    }
+                                }),
+                        )
+                    })
                     .child(
-                        Button::new("ggo-hardware-install", "Install tools")
-                            .disabled(busy || installable == 0)
-                            .tooltip(Tooltip::text(if installable == 0 {
-                                "Nothing left for ZedGG to install"
+                        Button::new(
+                            "ggo-hardware-flash",
+                            if busy {
+                                "Cancel"
+                            } else if progress.is_some() {
+                                "Flash again"
                             } else {
-                                "Clone the GGO repo and install the missing binaries"
-                            }))
-                            .on_click({
-                                let panel = self.panel.clone();
-                                move |_, _window, cx| {
-                                    panel
-                                        .update(cx, |panel, cx| panel.setup_hardware(cx))
-                                        .ok();
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("ggo-hardware-flash", "Flash now")
-                            .disabled(busy || !ready)
-                            .tooltip(Tooltip::text(if ready {
-                                "Flash this project to the board and run it"
-                            } else {
-                                "Still missing something above"
-                            }))
-                            .on_click({
-                                let panel = self.panel.clone();
-                                move |_, window, cx| {
-                                    panel
-                                        .update(cx, |panel, cx| panel.flash_to_board(window, cx))
-                                        .ok();
-                                }
-                            }),
+                                "Flash now"
+                            },
+                        )
+                        .disabled(!busy && !ready)
+                        .tooltip(Tooltip::text(if busy {
+                            "Stop the run and kill the child process"
+                        } else if ready {
+                            "Flash this project to the board and run it"
+                        } else {
+                            "Still missing something above"
+                        }))
+                        .on_click({
+                            let panel = self.panel.clone();
+                            move |_, window, cx| {
+                                panel
+                                    .update(cx, |panel, cx| panel.flash_to_board(window, cx))
+                                    .ok();
+                            }
+                        }),
                     )
                     .child(
                         Button::new("ggo-hardware-recheck", "Re-check")
@@ -213,9 +453,13 @@ impl Render for HardwareSetupItem {
                                 }
                             }),
                     )
-                    .children(status.map(|status| {
-                        Label::new(status).size(LabelSize::Small).color(Color::Muted)
-                    })),
+                    // The timeline already names the running phase; the
+                    // status row is what a run without one has.
+                    .when(!layout.timeline, |el| {
+                        el.children(status.map(|status| {
+                            Label::new(status).size(LabelSize::Small).color(Color::Muted)
+                        }))
+                    }),
             )
             .when(!log.is_empty(), |el| {
                 el.child(
@@ -229,16 +473,25 @@ impl Render for HardwareSetupItem {
                                 .gap_2()
                                 .items_center()
                                 .child(
-                                    Label::new("Output")
+                                    Disclosure::new("ggo-hardware-log", layout.log_open).on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            let open = this.log_expanded.unwrap_or(false);
+                                            this.log_expanded = Some(!open);
+                                            cx.notify();
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    Label::new(format!("Output ({} lines)", log.len()))
                                         .size(LabelSize::XSmall)
                                         .color(Color::Muted),
                                 )
                                 .child(div().flex_1())
                                 .child({
                                     // The whole transcript in one click:
-                                    // an install failure is something you
-                                    // paste somewhere, and a rendered
-                                    // `Label` cannot be selected.
+                                    // a failure is something you paste
+                                    // somewhere, and a rendered `Label`
+                                    // cannot be selected.
                                     let all = log.join("\n");
                                     IconButton::new("ggo-hardware-copy-log", IconName::Copy)
                                         .icon_size(IconSize::XSmall)
@@ -250,14 +503,16 @@ impl Render for HardwareSetupItem {
                                         })
                                 }),
                         )
-                        // Newest last, the way a terminal reads; the tail
-                        // is what a running install is doing right now.
-                        .children(log.iter().rev().take(200).rev().map(|line| {
-                            Label::new(line.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line()
-                        })),
+                        // Newest last, the way a terminal reads; the
+                        // tail is what a running install is doing now.
+                        .when(layout.log_open, |el| {
+                            el.children(log.iter().rev().take(200).rev().map(|line| {
+                                Label::new(line.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line()
+                            }))
+                        }),
                 )
             })
     }
@@ -305,8 +560,74 @@ pub fn open_hardware_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::HardwareEnv;
+    use crate::hardware::{FlashProgress, HardwareEnv};
+    use std::time::Duration;
     use gpui::TestAppContext;
+
+    #[test]
+    fn elapsed_is_minutes_and_padded_seconds() {
+        assert_eq!(elapsed_text(Duration::from_secs(9)), "0:09");
+        assert_eq!(elapsed_text(Duration::from_secs(65)), "1:05");
+        assert_eq!(elapsed_text(Duration::from_secs(600)), "10:00");
+    }
+
+    /// A machine that cannot flash yet gets the checklist, not a
+    /// timeline of a run that never happened.
+    #[test]
+    fn a_bare_machine_shows_the_requirements() {
+        let layout = page_layout(false, None, None);
+        assert_eq!(
+            layout,
+            PageLayout {
+                requirements_open: true,
+                timeline: false,
+                log_open: false,
+            }
+        );
+    }
+
+    /// Once everything is satisfied the checklist has nothing left to
+    /// say, so it collapses out of the way of the button.
+    #[test]
+    fn a_ready_machine_collapses_the_requirements() {
+        let layout = page_layout(true, None, None);
+        assert!(!layout.requirements_open, "five green rows are noise");
+        assert!(!layout.timeline, "nothing has run yet");
+    }
+
+    /// A run in flight is the whole page.
+    #[test]
+    fn a_run_in_flight_shows_the_timeline() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Flash board", Duration::from_secs(0));
+        let layout = page_layout(true, Some(&progress), None);
+        assert!(layout.timeline);
+        assert!(!layout.requirements_open);
+        assert!(!layout.log_open, "a healthy run does not need the transcript");
+    }
+
+    /// A failure puts the cause on screen without a click: the log is
+    /// where the child's own words are.
+    #[test]
+    fn a_failed_run_opens_the_log_itself() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Flash board", Duration::from_secs(0));
+        progress.apply("RESULT: FAIL", Duration::from_secs(1));
+        assert!(page_layout(true, Some(&progress), None).log_open);
+    }
+
+    /// ...but the reader closing it wins. Auto-open is a default, not a
+    /// decision the page keeps making.
+    #[test]
+    fn closing_the_log_beats_the_auto_open() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("RESULT: FAIL", Duration::from_secs(0));
+        assert!(!page_layout(true, Some(&progress), Some(false)).log_open);
+        assert!(
+            page_layout(true, None, Some(true)).log_open,
+            "and opening it on a quiet page works too",
+        );
+    }
 
     /// The rows a bare machine shows: what is needed, what ZedGG can
     /// install, and what only the user can do.

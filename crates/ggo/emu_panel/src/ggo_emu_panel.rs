@@ -483,6 +483,9 @@ pub struct EmuPanel {
     /// The flash (or setup) run in flight. Dropping it kills the child --
     /// that is the cancel button.
     flash: Option<FlashRun>,
+    /// The last run's timeline and total, kept after the run ends so the
+    /// page can still show what happened.
+    last_flash: Option<(hardware::FlashProgress, Duration)>,
     /// The last hardware probe. `None` re-probes on the next ask.
     hardware: Option<hardware::HardwareEnv>,
 }
@@ -490,11 +493,12 @@ pub struct EmuPanel {
 /// A board run in progress: what stage it reached, and the task whose
 /// drop cancels it.
 struct FlashRun {
-    /// What the status row shows, parsed from `ggo-diag`'s output.
-    stage: Option<hardware::Stage>,
-    /// `Some` once a `RESULT:` line landed.
-    verdict: Option<bool>,
-    /// What is being run, for the status row while no stage has landed.
+    /// The run's timeline, folded from `ggo-diag`'s own output.
+    progress: hardware::FlashProgress,
+    /// When the run began. Every phase time is relative to this, which
+    /// is why [`hardware::FlashProgress`] needs no clock of its own.
+    started: Instant,
+    /// What is being run, for the status row before any phase lands.
     what: String,
     _task: Task<()>,
 }
@@ -591,6 +595,7 @@ impl EmuPanel {
             watch_restart_pending: false,
             proc_streamer: ggo_common::system_proc_streamer(),
             flash: None,
+            last_flash: None,
             hardware: None,
         }
     }
@@ -635,7 +640,11 @@ impl EmuPanel {
     /// The flash-and-run button: flash the open project to the board and
     /// boot it, or -- while one is in flight -- cancel.
     pub fn flash_to_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.flash.take().is_some() {
+        if let Some(flash) = self.flash.take() {
+            // Cancelling is not failing: the timeline stays as it was,
+            // with the phase it got to still marked running.
+            let elapsed = flash.started.elapsed();
+            self.last_flash = Some((flash.progress, elapsed));
             self.status = Some("flash cancelled".to_string());
             self.status_is_error = false;
             cx.notify();
@@ -644,12 +653,19 @@ impl EmuPanel {
         self.refresh_root(cx);
         self.invalidate_hardware();
         let env = self.hardware_env_cached();
-        match hardware::flash_request(&env) {
-            Ok(request) => self.start_board_run(vec![request], "flashing".to_string(), cx),
-            // A missing prerequisite is not a one-line error, it is a
-            // page: what is needed, what is here, and a button for the
-            // rest. The status row cannot carry that.
-            Err(_) => self.open_hardware_page(window, cx),
+        // Unconditional, because both outcomes are the same page: a
+        // missing prerequisite is not a one-line error but a checklist
+        // with buttons, and a started run is a timeline of phases. The
+        // status row can carry neither, and "where did my flash go"
+        // should have one answer.
+        self.open_hardware_page(window, cx);
+        if let Ok(request) = hardware::flash_request(&env) {
+            self.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
         }
     }
 
@@ -701,7 +717,15 @@ impl EmuPanel {
             .map(|step| step.label.clone())
             .collect::<Vec<_>>()
             .join(", ");
-        self.start_board_run(steps.into_iter().map(|step| step.request).collect(), what, cx);
+        // An install run announces none of `ggo-diag`'s phases (cargo
+        // and git have their own output), so it gets no timeline -- the
+        // page falls back to its console for these.
+        self.start_board_run(
+            steps.into_iter().map(|step| step.request).collect(),
+            what,
+            hardware::FlashProgress::steps(Vec::new()),
+            cx,
+        );
     }
 
     /// Run `requests` in order through the streaming runner, feeding every
@@ -711,6 +735,7 @@ impl EmuPanel {
         &mut self,
         requests: Vec<ggo_common::ProcRequest>,
         what: String,
+        progress: hardware::FlashProgress,
         cx: &mut Context<Self>,
     ) {
         let console = self.console.get_or_insert_with(uart::UartLog::new).clone();
@@ -742,7 +767,6 @@ impl EmuPanel {
                     let this = this.clone();
                     cx.spawn(async move |cx| {
                     while let Ok(line) = line_rx.recv().await {
-                        let stage = hardware::parse_stage(&line);
                         // Notify for EVERY line, not only recognised
                         // ones: `cargo install` matches none of the
                         // grammar, and an unrepainted console during a
@@ -751,10 +775,8 @@ impl EmuPanel {
                         if this
                             .update(cx, |this, cx| {
                                 if let Some(flash) = &mut this.flash {
-                                    if let Some(stage) = stage {
-                                        flash.verdict = stage.verdict().or(flash.verdict);
-                                        flash.stage = Some(stage);
-                                    }
+                                    let at = flash.started.elapsed();
+                                    flash.progress.apply(&line, at);
                                 }
                                 cx.notify();
                             })
@@ -772,7 +794,7 @@ impl EmuPanel {
                 // is the verdict.
                 pump.await;
                 let Ok(verdict) = this.read_with(cx, |this, _| {
-                    this.flash.as_ref().and_then(|f| f.verdict)
+                    this.flash.as_ref().and_then(|f| f.progress.verdict())
                 }) else {
                     // The panel is gone; a released tab must not keep
                     // installing things.
@@ -781,7 +803,7 @@ impl EmuPanel {
                 if !capture.ok || verdict == Some(false) {
                     let reason = hardware::failure_reason(&capture);
                     this.update(cx, |this, cx| {
-                        this.flash = None;
+                        this.retire_flash(false);
                         this.report_failure(format!("{what} failed: {reason}"), cx);
                     })
                     .ok();
@@ -789,8 +811,8 @@ impl EmuPanel {
                 }
             }
             this.update(cx, |this, cx| {
-                let passed = this.flash.as_ref().and_then(|f| f.verdict);
-                this.flash = None;
+                let passed = this.flash.as_ref().and_then(|f| f.progress.verdict());
+                this.retire_flash(true);
                 // Installing something changes what this machine can do.
                 this.invalidate_hardware();
                 this.status = Some(match passed {
@@ -804,12 +826,39 @@ impl EmuPanel {
             }
         });
         self.flash = Some(FlashRun {
-            stage: None,
-            verdict: None,
+            progress,
+            started: Instant::now(),
             what,
             _task: task,
         });
         cx.notify();
+    }
+
+    /// Move a finished run's timeline off the live slot and onto the
+    /// page: which phase a run died in is exactly what someone looks at
+    /// after it ends, and dropping it with the task loses that.
+    fn retire_flash(&mut self, passed: bool) {
+        let Some(mut flash) = self.flash.take() else {
+            return;
+        };
+        let elapsed = flash.started.elapsed();
+        if !passed {
+            flash.progress.fail(elapsed);
+        }
+        self.last_flash = Some((flash.progress, elapsed));
+    }
+
+    /// The run to draw: the one in flight, else the last one to end.
+    /// The `Duration` is the run's total elapsed time, which is what
+    /// turns each row's start into a live timer.
+    pub(crate) fn flash_progress(&self) -> Option<(&hardware::FlashProgress, Duration)> {
+        match &self.flash {
+            Some(flash) => Some((&flash.progress, flash.started.elapsed())),
+            None => self
+                .last_flash
+                .as_ref()
+                .map(|(progress, elapsed)| (progress, *elapsed)),
+        }
     }
 
     /// The console's lines, for the setup page's output pane.
@@ -823,8 +872,12 @@ impl EmuPanel {
     /// The status row's flash text: the current stage, else what is running.
     fn flash_status(&self) -> Option<String> {
         let flash = self.flash.as_ref()?;
-        Some(match &flash.stage {
-            Some(stage) => format!("{}: {}", flash.what, stage.label()),
+        Some(match flash.progress.running() {
+            Some(row) => format!(
+                "{}: {}",
+                flash.what,
+                row.detail.clone().unwrap_or_else(|| row.title.clone())
+            ),
             None => format!("{}…", flash.what),
         })
     }
@@ -5823,7 +5876,12 @@ mod tests {
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
-            panel.start_board_run(vec![request], "flashing".to_string(), cx);
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
             assert!(panel.is_flashing(), "the run is in flight");
         });
         cx.executor().run_until_parked();
@@ -5844,6 +5902,128 @@ mod tests {
         });
     }
 
+    /// The run's shape, not just its last line: every announced phase
+    /// lands on the timeline, and the finished run stays on the page
+    /// instead of vanishing with the task.
+    #[gpui::test]
+    async fn test_a_flash_run_builds_a_phase_timeline(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(
+            vec![
+                "==> Compile firmware",
+                "--> component cpu",
+                "==> Flash board",
+                "diag step 1: PASS",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let (progress, _elapsed) = panel
+                .flash_progress()
+                .expect("the finished run stays on the page");
+            assert_eq!(progress.verdict(), Some(true));
+            let rows: Vec<(&str, hardware::PhaseState)> = progress
+                .rows()
+                .iter()
+                .map(|row| (row.title.as_str(), row.state))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("Compile firmware", hardware::PhaseState::Done),
+                    ("Flash board", hardware::PhaseState::Done),
+                ],
+                "the announced phases, in order, all closed",
+            );
+            assert_eq!(
+                progress.diag_steps().len(),
+                1,
+                "the diagnostic step is on the page too",
+            );
+        });
+    }
+
+    /// A failed run keeps the timeline: which phase died is the whole
+    /// point of looking at the page afterwards.
+    #[gpui::test]
+    async fn test_a_failed_flash_leaves_the_dead_phase_on_the_page(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) =
+            fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.is_flashing());
+            let (progress, _elapsed) = panel.flash_progress().expect("the dead run stays");
+            assert_eq!(progress.verdict(), Some(false));
+            let dead = progress
+                .rows()
+                .iter()
+                .find(|row| row.state == hardware::PhaseState::Failed)
+                .expect("the phase that died");
+            assert_eq!(dead.title, "Flash board");
+        });
+    }
+
+    /// Starting a second run clears the last one's timeline, so a stale
+    /// PASS can never sit above a running flash.
+    #[gpui::test]
+    async fn test_a_new_run_replaces_the_previous_timeline(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(
+                vec![request.clone()],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+            let (progress, _) = panel.flash_progress().expect("the run in flight");
+            assert_eq!(progress.verdict(), None, "the old verdict is gone");
+            assert!(
+                progress
+                    .rows()
+                    .iter()
+                    .all(|row| row.state == hardware::PhaseState::Pending),
+                "a fresh pipeline",
+            );
+        });
+    }
+
     /// A `RESULT: FAIL` is a failed run even when the process exits 0 --
     /// the verdict is the CLI's, not the shell's.
     #[gpui::test]
@@ -5853,7 +6033,12 @@ mod tests {
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
-            panel.start_board_run(vec![request], "flashing".to_string(), cx)
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            )
         });
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {
@@ -5876,7 +6061,12 @@ mod tests {
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
-            panel.start_board_run(vec![request], "flashing".to_string(), cx)
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            )
         });
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {
@@ -5898,7 +6088,12 @@ mod tests {
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
-            panel.start_board_run(vec![request], "flashing".to_string(), cx);
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
             assert!(panel.is_flashing());
             panel.flash_to_board(window, cx);
             assert!(!panel.is_flashing(), "the second press cancelled");
@@ -5944,6 +6139,7 @@ mod tests {
             panel.start_board_run(
                 steps.into_iter().map(|s| s.request).collect(),
                 "setting up".to_string(),
+                hardware::FlashProgress::steps(Vec::new()),
                 cx,
             )
         });
@@ -5977,6 +6173,7 @@ mod tests {
                     .map(|s| s.request)
                     .collect(),
                 "setting up".to_string(),
+                hardware::FlashProgress::steps(Vec::new()),
                 cx,
             )
         });
@@ -6068,7 +6265,12 @@ mod tests {
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
-            panel.start_board_run(vec![request], "flashing".to_string(), cx)
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            )
         });
         cx.run_until_parked();
         assert_eq!(

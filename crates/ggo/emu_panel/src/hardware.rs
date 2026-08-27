@@ -15,6 +15,7 @@
 //! image. When that binary lands, it belongs here beside `flash_args`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ggo_common::ProcRequest;
 
@@ -342,13 +343,6 @@ impl Stage {
             Stage::Result { pass: false } => "FAIL".to_string(),
         }
     }
-
-    pub fn verdict(&self) -> Option<bool> {
-        match self {
-            Stage::Result { pass } => Some(*pass),
-            _ => None,
-        }
-    }
 }
 
 /// Why a run failed, in the child's own words: the last line that is
@@ -392,6 +386,208 @@ pub fn parse_stage(line: &str) -> Option<Stage> {
         });
     }
     None
+}
+
+/// The phases a flash announces, in order. Pre-seeding them is what
+/// lets the page answer "how much is left" before the run gets there;
+/// the list is a hint, not a contract -- an unannounced phase is
+/// inserted where it ran and a skipped one drops out.
+pub const FLASH_PHASES: [&str; 5] = [
+    "Compile firmware",
+    "Provision SD card",
+    "Flash board",
+    "Boot verify (UART)",
+    "Report",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseState {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+/// One line of the flash timeline.
+#[derive(Debug, Clone)]
+pub struct PhaseRow {
+    pub title: String,
+    pub state: PhaseState,
+    /// The newest sub-line: which component is placing, which boot stage
+    /// is up. Replaced, not accumulated -- the transcript is the log's
+    /// job, this is the "right now".
+    pub detail: Option<String>,
+    started: Duration,
+    finished: Option<Duration>,
+}
+
+impl PhaseRow {
+    /// How long this phase has taken, `now` being the run's elapsed
+    /// time. A finished phase stops counting; a running one does not, so
+    /// the caller's clock -- not this model -- is what ticks.
+    pub fn elapsed(&self, now: Duration) -> Duration {
+        match self.state {
+            PhaseState::Pending => Duration::ZERO,
+            _ => self.finished.unwrap_or(now).saturating_sub(self.started),
+        }
+    }
+}
+
+/// One diagnostic-cart step, latest status only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagStep {
+    pub index: String,
+    pub status: String,
+}
+
+/// A run's shape as it happens: which phase, for how long, what it is
+/// doing, and how it ended.
+///
+/// Pure and clock-free -- every mutator takes the run's elapsed time
+/// from its caller, which is what makes the whole thing unit-testable
+/// without spawning or sleeping.
+#[derive(Debug, Clone, Default)]
+pub struct FlashProgress {
+    rows: Vec<PhaseRow>,
+    diag_steps: Vec<DiagStep>,
+    verdict: Option<bool>,
+}
+
+impl FlashProgress {
+    /// A flash run: the expected pipeline, all pending.
+    pub fn flash() -> Self {
+        Self::steps(FLASH_PHASES.iter().map(|title| title.to_string()).collect())
+    }
+
+    /// A run whose phases the caller names -- a setup run emits none of
+    /// `ggo-diag`'s banners, so its steps come through [`Self::advance_to`].
+    pub fn steps(titles: Vec<String>) -> Self {
+        Self {
+            rows: titles
+                .into_iter()
+                .map(|title| PhaseRow {
+                    title,
+                    state: PhaseState::Pending,
+                    detail: None,
+                    started: Duration::ZERO,
+                    finished: None,
+                })
+                .collect(),
+            diag_steps: Vec::new(),
+            verdict: None,
+        }
+    }
+
+    pub fn rows(&self) -> &[PhaseRow] {
+        &self.rows
+    }
+
+    pub fn diag_steps(&self) -> &[DiagStep] {
+        &self.diag_steps
+    }
+
+    pub fn verdict(&self) -> Option<bool> {
+        self.verdict
+    }
+
+    pub fn running(&self) -> Option<&PhaseRow> {
+        self.rows.iter().find(|row| row.state == PhaseState::Running)
+    }
+
+    fn running_mut(&mut self) -> Option<&mut PhaseRow> {
+        self.rows
+            .iter_mut()
+            .find(|row| row.state == PhaseState::Running)
+    }
+
+    /// Start `title`, closing whatever was running.
+    ///
+    /// A pending row with this title is claimed where it sits, and the
+    /// pending rows jumped over are dropped: `--skip-pnr` skips phases,
+    /// and a skipped one left above the running phase reads as still to
+    /// come. A title nobody expected is inserted at that same place.
+    pub fn advance_to(&mut self, title: &str, at: Duration) {
+        if let Some(running) = self.running_mut() {
+            running.state = PhaseState::Done;
+            running.finished = Some(at);
+        }
+        let cursor = self
+            .rows
+            .iter()
+            .position(|row| row.state == PhaseState::Pending)
+            .unwrap_or(self.rows.len());
+        let claimed = self.rows[cursor..]
+            .iter()
+            .position(|row| row.title == title)
+            .map(|offset| cursor + offset);
+        match claimed {
+            Some(index) => {
+                self.rows.drain(cursor..index);
+            }
+            None => self.rows.insert(
+                cursor,
+                PhaseRow {
+                    title: title.to_string(),
+                    state: PhaseState::Pending,
+                    detail: None,
+                    started: Duration::ZERO,
+                    finished: None,
+                },
+            ),
+        }
+        if let Some(row) = self.rows.get_mut(cursor) {
+            row.state = PhaseState::Running;
+            row.started = at;
+            row.finished = None;
+        }
+    }
+
+    /// Fold one output line in. Unrecognised lines move nothing -- they
+    /// are the log's business.
+    pub fn apply(&mut self, line: &str, at: Duration) {
+        let Some(stage) = parse_stage(line) else {
+            return;
+        };
+        match stage {
+            Stage::Phase(title) => self.advance_to(&title, at),
+            Stage::Component(_) | Stage::Boot(_) => {
+                let detail = stage.label();
+                if let Some(row) = self.running_mut() {
+                    row.detail = Some(detail);
+                }
+            }
+            Stage::DiagStep { index, status } => {
+                match self.diag_steps.iter_mut().find(|step| step.index == index) {
+                    Some(step) => step.status = status,
+                    None => self.diag_steps.push(DiagStep { index, status }),
+                }
+            }
+            Stage::Result { pass } => {
+                self.verdict = Some(pass);
+                if pass {
+                    if let Some(row) = self.running_mut() {
+                        row.state = PhaseState::Done;
+                        row.finished = Some(at);
+                    }
+                    // Nothing else is coming: what is still pending was
+                    // skipped, not queued.
+                    self.rows.retain(|row| row.state != PhaseState::Pending);
+                } else {
+                    self.fail(at);
+                }
+            }
+        }
+    }
+
+    /// The run died without saying so itself: a non-zero exit, or a
+    /// `RESULT: FAIL`. The phase it was in is where it died.
+    pub fn fail(&mut self, at: Duration) {
+        self.verdict = Some(false);
+        if let Some(row) = self.running_mut() {
+            row.state = PhaseState::Failed;
+            row.finished = Some(at);
+        }
+    }
 }
 
 /// One install step: a label for the console and the command to run.
@@ -608,6 +804,7 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn ready_env() -> HardwareEnv {
         HardwareEnv {
@@ -714,15 +911,14 @@ mod tests {
     }
 
     #[test]
-    fn stage_labels_and_verdicts() {
+    fn stage_labels_read_as_status_text() {
         assert_eq!(Stage::Phase("Flash board".into()).label(), "Flash board");
         assert_eq!(
             Stage::Component("ppu".into()).label(),
             "place & route: ppu"
         );
         assert_eq!(Stage::Boot("banner".into()).label(), "boot: banner");
-        assert_eq!(Stage::Result { pass: true }.verdict(), Some(true));
-        assert_eq!(Stage::Phase("x".into()).verdict(), None);
+        assert_eq!(Stage::Result { pass: true }.label(), "PASS");
     }
 
     #[test]
@@ -926,4 +1122,193 @@ mod tests {
             "another user's home is not ours to guess"
         );
     }
+
+    // ------------------------------------------------- flash progress
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// A run starts with the whole pipeline visible and nothing done:
+    /// the point of the page is answering "how much is left".
+    #[test]
+    fn a_flash_starts_with_every_phase_pending() {
+        let progress = FlashProgress::flash();
+        assert_eq!(
+            progress
+                .rows()
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            FLASH_PHASES.to_vec(),
+        );
+        assert!(progress.rows().iter().all(|row| row.state == PhaseState::Pending));
+        assert_eq!(progress.verdict(), None);
+    }
+
+    /// An announced phase becomes the running one and closes the phase
+    /// before it, which keeps its own elapsed time.
+    #[test]
+    fn an_announced_phase_closes_the_one_before_it() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Compile firmware", secs(0));
+        progress.apply("==> Provision SD card", secs(12));
+
+        let rows = progress.rows();
+        assert_eq!(rows[0].state, PhaseState::Done);
+        assert_eq!(rows[0].elapsed(secs(30)), secs(12), "a done phase stops counting");
+        assert_eq!(rows[1].state, PhaseState::Running);
+        assert_eq!(rows[1].elapsed(secs(30)), secs(18), "the running one keeps counting");
+        assert_eq!(rows[2].state, PhaseState::Pending);
+    }
+
+    /// Component and boot lines say what the running phase is doing;
+    /// they are not phases themselves.
+    #[test]
+    fn detail_lines_annotate_the_running_phase_without_adding_rows() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Flash board", secs(0));
+        let before = progress.rows().len();
+        progress.apply("--> component cpu", secs(1));
+        assert_eq!(progress.rows().len(), before, "no row was added");
+        assert_eq!(
+            progress.running().and_then(|row| row.detail.clone()),
+            Some("place & route: cpu".to_string()),
+        );
+        progress.apply("  [boot] banner — GemOS", secs(2));
+        assert_eq!(
+            progress.running().and_then(|row| row.detail.clone()),
+            Some("boot: banner".to_string()),
+            "the newest detail replaces the last",
+        );
+    }
+
+    /// A diagnostic step is one chip that changes status, not a new one
+    /// per line.
+    #[test]
+    fn diag_steps_are_upserted_by_index() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("diag step 1: running", secs(0));
+        progress.apply("diag step 1: PASS", secs(1));
+        progress.apply("diag step 2: running", secs(2));
+        assert_eq!(
+            progress
+                .diag_steps()
+                .iter()
+                .map(|step| (step.index.as_str(), step.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("1", "PASS"), ("2", "running")],
+        );
+    }
+
+    /// A FAIL verdict marks the phase it happened in, so the page points
+    /// at where the run died rather than only saying that it did.
+    #[test]
+    fn a_fail_verdict_marks_the_running_phase() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Flash board", secs(0));
+        progress.apply("RESULT: FAIL", secs(5));
+        assert_eq!(progress.verdict(), Some(false));
+        let failed = progress
+            .rows()
+            .iter()
+            .find(|row| row.state == PhaseState::Failed)
+            .expect("the phase that died");
+        assert_eq!(failed.title, "Flash board");
+        assert!(
+            progress
+                .rows()
+                .iter()
+                .any(|row| row.state == PhaseState::Pending),
+            "the phases after it never ran",
+        );
+    }
+
+    /// A PASS verdict leaves nothing running.
+    #[test]
+    fn a_pass_verdict_closes_the_last_phase() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Report", secs(0));
+        progress.apply("RESULT: PASS", secs(3));
+        assert_eq!(progress.verdict(), Some(true));
+        assert!(progress.running().is_none());
+        assert!(
+            progress
+                .rows()
+                .iter()
+                .any(|row| row.title == "Report" && row.state == PhaseState::Done),
+        );
+    }
+
+    /// A finished run has no "still to come": whatever never ran was
+    /// skipped, and a pending row under a PASS reads as unfinished work.
+    #[test]
+    fn a_pass_drops_the_phases_that_never_ran() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Flash board", secs(0));
+        progress.apply("RESULT: PASS", secs(2));
+        assert!(
+            progress.rows().iter().all(|row| row.state == PhaseState::Done),
+            "{:?}",
+            progress.rows(),
+        );
+    }
+
+    /// A non-zero exit with no verdict line still ends the run, in the
+    /// phase it was in.
+    #[test]
+    fn a_dead_child_fails_the_running_phase() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Compile firmware", secs(0));
+        progress.fail(secs(4));
+        assert_eq!(progress.verdict(), Some(false));
+        assert_eq!(progress.rows()[0].state, PhaseState::Failed);
+        assert_eq!(progress.rows()[0].elapsed(secs(9)), secs(4));
+    }
+
+    /// `--skip-pnr` skips phases. A skipped one does not sit above the
+    /// running phase pretending it is still coming.
+    #[test]
+    fn a_skipped_phase_drops_out_of_the_list() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Compile firmware", secs(0));
+        progress.apply("==> Flash board", secs(9));
+        let titles: Vec<&str> = progress.rows().iter().map(|r| r.title.as_str()).collect();
+        assert!(
+            !titles.contains(&"Provision SD card"),
+            "the skipped phase is gone: {titles:?}",
+        );
+        assert_eq!(titles[0], "Compile firmware");
+        assert_eq!(titles[1], "Flash board");
+        assert!(titles.contains(&"Report"), "what is still to come stays");
+    }
+
+    /// A phase this fork has never heard of is still shown, where it
+    /// happened -- the CLI's phase list is not ours to freeze.
+    #[test]
+    fn an_unknown_phase_is_inserted_where_it_ran() {
+        let mut progress = FlashProgress::flash();
+        progress.apply("==> Compile firmware", secs(0));
+        progress.apply("==> Sacrifice a goat", secs(2));
+        let titles: Vec<&str> = progress.rows().iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles[1], "Sacrifice a goat");
+        assert_eq!(titles[2], "Provision SD card", "the known ones still follow");
+        assert_eq!(progress.rows()[1].state, PhaseState::Running);
+    }
+
+    /// A setup run has no `==>` output at all, so the panel names each
+    /// step through the same door the parser uses.
+    #[test]
+    fn a_named_step_advances_the_list_without_any_output() {
+        let mut progress = FlashProgress::steps(vec![
+            "clone the GGO repo".to_string(),
+            "install ggo-diag".to_string(),
+        ]);
+        progress.advance_to("clone the GGO repo", secs(0));
+        progress.advance_to("install ggo-diag", secs(6));
+        assert_eq!(progress.rows()[0].state, PhaseState::Done);
+        assert_eq!(progress.rows()[0].elapsed(secs(6)), secs(6));
+        assert_eq!(progress.rows()[1].state, PhaseState::Running);
+    }
+
 }
