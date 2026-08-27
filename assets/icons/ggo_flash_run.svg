@@ -1,8 +1,7 @@
 <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-<!-- GGO: flash-and-run. A bolt over a play triangle, drawn rather than
-     composed from the two stock icons: scaled down to a third of the box
-     each, their strokes merge into a smudge by 14px. The 2-unit gap is
-     what keeps the two shapes readable as two at toolbar size. -->
-<path d="M9.8 0.8L4.6 5.2H7.2L6.2 8.2L11.4 3.8H8.8L9.8 0.8Z" fill="black"/>
-<path d="M6 10.2L11.2 12.8L6 15.4V10.2Z" fill="black"/>
+<!-- GGO: flash-to-board. A bolt striking a board bar. The bolt gets ~11 of
+     the 16 units so it still reads at IconSize::Small (12px); the earlier
+     bolt-over-play-triangle gave each shape half the box and smudged. -->
+<path d="M9.6 1L4.2 7.4H7.3L6.4 11.6L11.8 5.2H8.7L9.6 1Z" fill="black"/>
+<rect x="2.6" y="13" width="10.8" height="1.6" rx="0.8" fill="black"/>
 </svg>
