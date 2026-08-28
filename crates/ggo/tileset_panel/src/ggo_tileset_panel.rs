@@ -774,6 +774,8 @@ impl TilesetPanel {
     /// TILE_PIXELS]` unchecked and would panic on an out-of-range tile, and
     /// worldlib is a separate repository.
     fn duplicate_tile(&mut self, cx: &mut Context<Self>) {
+        // Any other document op puts a float down first.
+        self.commit_float(cx);
         let Some(tile) = self.target_tile() else {
             return;
         };
@@ -796,6 +798,8 @@ impl TilesetPanel {
 
     /// Append one blank tile to the end of the sheet.
     fn append_tile(&mut self, cx: &mut Context<Self>) {
+        // Any other document op puts a float down first.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1471,6 +1475,15 @@ impl TilesetPanel {
     /// Copy the selected region into the internal clipboard, sampling the
     /// doc through sheet coordinates (pad cells copy as 0).
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        // A float IS the selection's pixels; reading the sheet under it
+        // would copy whatever it is hovering over instead.
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(float) = &open.float
+        {
+            open.clipboard = Some((float.w, float.h, float.pixels.clone()));
+            cx.notify();
+            return;
+        }
         let Some(rect) = self.selection_rect() else {
             return;
         };
@@ -1487,6 +1500,25 @@ impl TilesetPanel {
     /// the only way to clear a region was to switch to the eraser and scrub
     /// it with a brush capped at 4px.
     fn erase_selection(&mut self, cx: &mut Context<Self>) {
+        // Deleting a float throws away the carried pixels AND blanks where
+        // they came from, in one step.
+        if let Some(float) = match &self.state {
+            ViewerState::Ready(open) => open.float.clone(),
+            _ => None,
+        } {
+            let cells: Vec<(i32, i32, u8)> = (0..float.h)
+                .flat_map(|row| {
+                    (0..float.w)
+                        .map(move |col| (float.from.0 + col as i32, float.from.1 + row as i32, 0u8))
+                })
+                .collect();
+            if let ViewerState::Ready(open) = &mut self.state {
+                open.float = None;
+                open.selection = None;
+            }
+            self.write_cells(&cells, cx);
+            return;
+        }
         let Some((x0, y0, x1, y1)) = self.selection_rect() else {
             return;
         };
@@ -1701,6 +1733,26 @@ impl TilesetPanel {
 
     /// Flip the marquee's pixels in place, one undo step.
     fn flip_selection(&mut self, horizontal: bool, cx: &mut Context<Self>) {
+        // Flipping a float rearranges the carried buffer, not the document:
+        // it stays one pending change until commit.
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(float) = &mut open.float
+        {
+            let (w, h) = (float.w, float.h);
+            let source = float.pixels.clone();
+            for row in 0..h {
+                for col in 0..w {
+                    let (sc, sr) = if horizontal {
+                        (w - 1 - col, row)
+                    } else {
+                        (col, h - 1 - row)
+                    };
+                    float.pixels[row * w + col] = source[sr * w + sc];
+                }
+            }
+            self.recompose_grid(cx);
+            return;
+        }
         let Some((x0, y0, x1, y1)) = self.selection_rect() else {
             return;
         };
@@ -1721,6 +1773,8 @@ impl TilesetPanel {
 
     /// Remove the top or bottom row (the edge "−" bars) -- one undo step.
     fn delete_row(&mut self, at_top: bool, cx: &mut Context<Self>) {
+        // Any other document op puts a float down first.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1735,6 +1789,8 @@ impl TilesetPanel {
     /// same doc/view split as `insert_column`: undo restores the strip but
     /// the view keeps the narrower cols, so tiles rewrap).
     fn delete_column(&mut self, at_left: bool, cx: &mut Context<Self>) {
+        // Any other document op puts a float down first.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1777,6 +1833,8 @@ impl TilesetPanel {
     }
 
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        // Any other document op puts a float down first.
+        self.commit_float(cx);
         let Some((x0, y0)) = self.paste_origin() else {
             return;
         };
@@ -1824,6 +1882,8 @@ impl TilesetPanel {
     /// Insert a blank row at the sheet's top or bottom (the edge "+"
     /// bars) -- one undo step; the store pads a partial last row first.
     fn insert_row(&mut self, at_top: bool, cx: &mut Context<Self>) {
+        // Any other document op puts a float down first.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1840,6 +1900,8 @@ impl TilesetPanel {
     /// column's tiles rewrap -- doc state and view settings are separate
     /// by design.
     fn insert_column(&mut self, at_left: bool, cx: &mut Context<Self>) {
+        // Any other document op puts a float down first.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -6008,6 +6070,93 @@ mod tests {
             let doc = &ready(panel).store.state().indices;
             assert_eq!(doc[idx(1, 0, 0)], 1, "document still has the source");
             assert!(!ready(panel).store.state().dirty, "and is not dirty");
+        });
+    }
+
+    /// Copy, flip and delete act on the FLOAT when one exists. Reading the
+    /// sheet under it would take whatever it is hovering over.
+    #[gpui::test]
+    async fn test_copy_and_flip_act_on_the_float_not_the_sheet(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            // A 2x1 whose left pixel is slot 1 and right pixel transparent.
+            panel.select_slot(1, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX - 1, 0), (TILE_PX, 0)));
+            }
+            // Move it clear of tile 1's solid art, onto transparent tile 0.
+            panel.move_selection((-8, 0), cx);
+            let carried = ready(panel).float.clone().expect("floating");
+            assert_eq!(carried.pixels, vec![0, 1], "lifted from the tile boundary");
+
+            panel.copy_selection(cx);
+            assert_eq!(
+                ready(panel).clipboard,
+                Some((2, 1, vec![0, 1])),
+                "copied the float, not the sheet under it"
+            );
+
+            panel.flip_selection(true, cx);
+            assert_eq!(
+                ready(panel).float.as_ref().unwrap().pixels,
+                vec![1, 0],
+                "the flip rearranged the carried buffer"
+            );
+            assert!(
+                !ready(panel).store.state().dirty,
+                "and wrote nothing to the document"
+            );
+        });
+    }
+
+    /// Deleting a float throws the carried pixels away and blanks where
+    /// they came from, in one step.
+    #[gpui::test]
+    async fn test_deleting_a_float_blanks_its_origin(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            panel.move_selection((6, 0), cx);
+            panel.erase_selection(cx);
+
+            assert!(ready(panel).float.is_none(), "the float is gone");
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 0, 0)], 0, "origin blanked");
+            assert_eq!(
+                state.indices[idx(1, 6, 0)],
+                1,
+                "and nothing was stamped at the destination"
+            );
+        });
+    }
+
+    /// A structural op puts the float down first, so it cannot be stranded
+    /// against a sheet whose shape just changed underneath it.
+    #[gpui::test]
+    async fn test_a_structural_op_commits_the_float_first(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            panel.move_selection((4, 0), cx);
+            assert!(ready(panel).float.is_some());
+
+            panel.append_tile(cx);
+            assert!(ready(panel).float.is_none(), "committed by the append");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 4, 0)],
+                1,
+                "the move landed before the sheet grew"
+            );
         });
     }
 
