@@ -716,7 +716,7 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let tile_count = open.store.state().tile_count;
+        let tile_count = open.store.tile_count();
         let next = cols.clamp(1, tile_count.max(1));
         if next == open.cols {
             return;
@@ -736,7 +736,7 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        if tile >= open.store.state().tile_count {
+        if tile >= open.store.tile_count() {
             return;
         }
         if open.focus.is_none() {
@@ -806,7 +806,7 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        if tile >= open.store.state().tile_count {
+        if tile >= open.store.tile_count() {
             return;
         }
         open.store
@@ -815,7 +815,7 @@ impl TilesetPanel {
         // on a magnified view of the tile you just left would look like the
         // duplicate silently failed.
         if open.focus.is_some() {
-            open.focus = Some(open.store.state().tile_count - 1);
+            open.focus = Some(open.store.tile_count() - 1);
         }
         self.recompose_grid(cx);
     }
@@ -852,7 +852,7 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let (Some(focus), count) = (open.focus, open.store.state().tile_count) else {
+        let (Some(focus), count) = (open.focus, open.store.tile_count()) else {
             return;
         };
         let next = (focus as isize + delta).clamp(0, count.max(1) as isize - 1) as usize;
@@ -1187,9 +1187,10 @@ impl TilesetPanel {
             return;
         };
         let bound_rect = self.selection_rect();
-        let (state, cols, focus, color) = match &self.state {
+        let (indices, tile_count, cols, focus, color) = match &self.state {
             ViewerState::Ready(open) => (
-                open.store.state(),
+                open.store.indices(),
+                open.store.tile_count(),
                 open.cols,
                 open.focus,
                 open.paint_color(),
@@ -1197,7 +1198,7 @@ impl TilesetPanel {
             _ => return,
         };
         // A pad cell backs no tile, so there is nothing to flood.
-        let Some((clicked_tile, ..)) = sheet_to_doc(focus, cols, state.tile_count, sx, sy) else {
+        let Some((clicked_tile, ..)) = sheet_to_doc(focus, cols, tile_count, sx, sy) else {
             return;
         };
         if bound_rect.is_some_and(|(x0, y0, x1, y1)| sx < x0 || sx > x1 || sy < y0 || sy > y1) {
@@ -1213,13 +1214,13 @@ impl TilesetPanel {
             {
                 return None;
             }
-            let (tile, px_x, px_y) = sheet_to_doc(focus, cols, state.tile_count, x, y)?;
+            let (tile, px_x, px_y) = sheet_to_doc(focus, cols, tile_count, x, y)?;
             if !whole_sheet && tile != clicked_tile {
                 return None;
             }
             let index =
                 tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + px_y * TILE_PX + px_x;
-            state.indices.get(index).copied()
+            indices.get(index).copied()
         };
         let region = pixel_tools::flood(sample, (sx as i32, sy as i32));
         self.write_points(&region, color, cx);
@@ -1237,10 +1238,12 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let state = open.store.state();
         // Borrow the float's view when there is one, else the document's own
-        // pixels. Everything else -- palette, tile count -- is the same.
-        let indices: &[u8] = floated.as_deref().unwrap_or(&state.indices);
+        // pixels. The palette is copied out (it is 32 bytes) so the store
+        // borrow does not have to live across the focus-arm's mutations.
+        let tile_count = open.store.tile_count();
+        let palette = *open.store.palette();
+        let indices: &[u8] = floated.as_deref().unwrap_or_else(|| open.store.indices());
         let composed = match open.focus {
             Some(tile) => {
                 let pixels = indices
@@ -1248,7 +1251,7 @@ impl TilesetPanel {
                     .and_then(|rest| rest.get(..ggo_worldlib::sprites::tileset_doc::TILE_PIXELS));
                 match pixels {
                     Some(pixels) => (
-                        loader::compose_grid(pixels, 1, 1, &state.palette),
+                        loader::compose_grid(pixels, 1, 1, &palette),
                         (TILE_PX as u32, TILE_PX as u32),
                     ),
                     // The focused tile is gone (deleted, undone): fall back
@@ -1259,20 +1262,15 @@ impl TilesetPanel {
                             open.zoom = zoom;
                         }
                         (
-                            loader::compose_grid(
-                                indices,
-                                state.tile_count,
-                                open.cols,
-                                &state.palette,
-                            ),
-                            loader::grid_pixel_size(state.tile_count, open.cols),
+                            loader::compose_grid(indices, tile_count, open.cols, &palette),
+                            loader::grid_pixel_size(tile_count, open.cols),
                         )
                     }
                 }
             }
             None => (
-                loader::compose_grid(indices, state.tile_count, open.cols, &state.palette),
-                loader::grid_pixel_size(state.tile_count, open.cols),
+                loader::compose_grid(indices, tile_count, open.cols, &palette),
+                loader::grid_pixel_size(tile_count, open.cols),
             ),
         };
         if let Some(grid) = composed.0 {
@@ -1399,9 +1397,8 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let state = open.store.state();
         let idx = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + y * TILE_PX + x;
-        if let Some(&slot) = state.indices.get(idx) {
+        if let Some(slot) = open.store.indices().get(idx).copied() {
             open.slot = slot as usize;
             if keep_tool {
                 cx.notify();
@@ -1499,14 +1496,14 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &self.state else {
             return (w, h, data);
         };
-        let state = open.store.state();
+        let indices = open.store.indices();
         for dy in 0..h {
             for dx in 0..w {
                 if let Some((tile, px_x, px_y)) = self.doc_pixel(x0 + dx, y0 + dy) {
                     let idx = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS
                         + px_y * TILE_PX
                         + px_x;
-                    if let Some(&v) = state.indices.get(idx) {
+                    if let Some(&v) = indices.get(idx) {
                         data[dy * w + dx] = v;
                     }
                 }
@@ -1542,7 +1539,7 @@ impl TilesetPanel {
                     float.w,
                     float.h,
                     float.pixels.clone(),
-                    open.store.state().palette,
+                    *open.store.palette(),
                 )),
                 None => None,
             },
@@ -1558,7 +1555,7 @@ impl TilesetPanel {
                 let ViewerState::Ready(open) = &self.state else {
                     return;
                 };
-                (w, h, pixels, open.store.state().palette)
+                (w, h, pixels, *open.store.palette())
             }
         };
         Self::set_clip(w, h, pixels, palette, cx);
@@ -1748,8 +1745,8 @@ impl TilesetPanel {
             return None;
         };
         let float = open.float.as_ref()?;
-        let state = open.store.state();
-        let mut indices = state.indices;
+        // The one deliberate copy: this fn RETURNS an owned view.
+        let mut indices = open.store.indices().to_vec();
         let mut put = |x: i32, y: i32, value: u8| {
             if x < 0 || y < 0 {
                 return;
@@ -1921,7 +1918,7 @@ impl TilesetPanel {
         // numbers are different colours, so say so rather than silently
         // recolouring what was pasted.
         if let ViewerState::Ready(open) = &mut self.state {
-            open.clipboard_note = (open.store.state().palette != clip.palette)
+            open.clipboard_note = (*open.store.palette() != clip.palette)
                 .then_some("pasted from a tileset with a different palette");
         }
         let mut writes = Vec::new();
@@ -2118,7 +2115,7 @@ impl TilesetPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        if slot == 0 || slot >= PAL_SLOTS || open.store.state().palette[slot] == rgb565 {
+        if slot == 0 || slot >= PAL_SLOTS || open.store.palette()[slot] == rgb565 {
             return;
         }
         open.store.apply_palette_coalesced(slot, rgb565);
@@ -2199,13 +2196,12 @@ impl TilesetPanel {
         let Some(root) = self.project_root.clone() else {
             return;
         };
-        let state = open.store.state();
         match save_tileset(
             &root,
             &open.rel_path,
-            &state.indices,
-            state.tile_count,
-            &state.palette,
+            open.store.indices(),
+            open.store.tile_count(),
+            open.store.palette(),
         ) {
             Ok(()) => {
                 open.store.mark_saved();
@@ -2586,10 +2582,12 @@ impl TilesetPanel {
             unreachable!("render_info is only called in the Ready state");
         };
         let (w, h) = open.grid_size;
-        let state = open.store.state();
         let mut summary = format!(
             "{} tiles · {}x{} px · {} cols",
-            state.tile_count, w, h, open.cols
+            open.store.tile_count(),
+            w,
+            h,
+            open.cols
         );
         if let Some(hover) = self.hover_status() {
             summary.push_str(" · ");
