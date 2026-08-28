@@ -213,10 +213,6 @@ fn intercept_image_drop(
     // from inside `pane.update(..)`, and `open_import_item` reads every pane
     // to find an existing wizard tab, then activates it. Doing that here
     // double-lease-panics on the leased pane.
-    // Claimed now, opened later: `Pane::handle_external_paths_drop` calls us
-    // from inside `pane.update(..)`, and `open_import_item` reads every pane
-    // to find an existing wizard tab, then activates it. Doing that here
-    // double-lease-panics on the leased pane.
     cx.defer_in(window, move |workspace, window, cx| {
         open_import_item(workspace, window, cx, move |panel, _window, cx| {
             panel.adopt_root(root, cx);

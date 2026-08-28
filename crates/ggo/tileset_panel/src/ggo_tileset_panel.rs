@@ -141,8 +141,8 @@ actions!(
 /// The zoom focus mode uses when the sheet's own zoom is smaller.
 const FOCUS_MIN_ZOOM: usize = 8;
 
-/// Upper bound on transparency-checker quads per frame.
-const CHECKER_MAX_CELLS: f32 = 8192.0;
+/// The transparency checkerboard's square size, in screen px.
+const CHECKER_PX: f32 = 8.0;
 
 /// Brush size bounds (px, square).
 const MIN_BRUSH: usize = 1;
@@ -1808,6 +1808,53 @@ impl TilesetPanel {
         under
     }
 
+    /// Every cell putting `float` down would write, source first, later
+    /// cells winning: the mode's source-rect writes (a Move blanks it, a
+    /// Swap sends the pixels under the destination home, a Copy leaves it
+    /// alone), then the stamp at the destination. ONE producer, consumed by
+    /// both [`Self::commit_float`] (through `write_cells`) and
+    /// [`Self::float_composed_indices`] (through its `put`), so the
+    /// preview cannot drift from what a commit writes.
+    fn float_cells(&self, float: &Float, skip_transparent: bool) -> Vec<(i32, i32, u8)> {
+        let mut cells = Vec::with_capacity(float.w * float.h * 2);
+        match float.mode {
+            FloatMode::Move if float.at != float.from => {
+                for row in 0..float.h {
+                    for col in 0..float.w {
+                        cells.push((float.from.0 + col as i32, float.from.1 + row as i32, 0u8));
+                    }
+                }
+            }
+            FloatMode::Swap => {
+                // Read before any write: both consumers apply the cells to
+                // an untouched document.
+                let under = self.pixels_under_float(float);
+                for row in 0..float.h {
+                    for col in 0..float.w {
+                        cells.push((
+                            float.from.0 + col as i32,
+                            float.from.1 + row as i32,
+                            under[row * float.w + col],
+                        ));
+                    }
+                }
+            }
+            FloatMode::Move | FloatMode::Copy => {}
+        }
+        for row in 0..float.h {
+            for col in 0..float.w {
+                let value = float.pixels[row * float.w + col];
+                // A swap is an exact exchange, so its transparent pixels
+                // write through regardless of the paste_opaque toggle.
+                if value == 0 && skip_transparent && float.mode != FloatMode::Swap {
+                    continue;
+                }
+                cells.push((float.at.0 + col as i32, float.at.1 + row as i32, value));
+            }
+        }
+        cells
+    }
+
     /// Stamp the float back into the sheet and drop it. One undo step.
     ///
     /// Composites like [`Self::paste_clipboard`] and honours the same
@@ -1832,44 +1879,7 @@ impl TilesetPanel {
             },
             _ => return,
         };
-        let mut cells = Vec::with_capacity(float.w * float.h * 2);
-        match float.mode {
-            // Blank the source first; a later cell for the same pixel wins,
-            // so an overlapping move still stamps correctly.
-            FloatMode::Move if float.at != float.from => {
-                for row in 0..float.h {
-                    for col in 0..float.w {
-                        cells.push((float.from.0 + col as i32, float.from.1 + row as i32, 0u8));
-                    }
-                }
-            }
-            // A swap sends whatever sat under the destination back to the
-            // source. Read before any write below.
-            FloatMode::Swap => {
-                let under = self.pixels_under_float(&float);
-                for row in 0..float.h {
-                    for col in 0..float.w {
-                        cells.push((
-                            float.from.0 + col as i32,
-                            float.from.1 + row as i32,
-                            under[row * float.w + col],
-                        ));
-                    }
-                }
-            }
-            FloatMode::Move | FloatMode::Copy => {}
-        }
-        for row in 0..float.h {
-            for col in 0..float.w {
-                let value = float.pixels[row * float.w + col];
-                // A swap is an exact exchange, so its transparent pixels
-                // write through regardless of the paste_opaque toggle.
-                if value == 0 && skip_transparent && float.mode != FloatMode::Swap {
-                    continue;
-                }
-                cells.push((float.at.0 + col as i32, float.at.1 + row as i32, value));
-            }
-        }
+        let cells = self.float_cells(&float, skip_transparent);
         self.write_cells(&cells, cx);
         if let ViewerState::Ready(open) = &mut self.state {
             open.float = None;
@@ -1899,13 +1909,14 @@ impl TilesetPanel {
             return None;
         };
         let float = open.float.as_ref()?;
-        // What a swap will send home, read BEFORE any of the writes below.
-        let under = (float.mode == FloatMode::Swap).then(|| self.pixels_under_float(float));
-        // The one deliberate copy: this fn RETURNS an owned view.
+        // The same cells a commit would write, applied to an owned copy of
+        // the document instead of through write_cells -- one producer, so
+        // the preview cannot drift from the commit.
+        let cells = self.float_cells(float, !open.paste_opaque);
         let mut indices = open.store.indices().to_vec();
-        let mut put = |x: i32, y: i32, value: u8| {
+        for (x, y, value) in cells {
             if x < 0 || y < 0 {
-                return;
+                continue;
             }
             if let Some((tile, px_x, px_y)) = self.doc_pixel(x as usize, y as usize) {
                 let at =
@@ -1913,39 +1924,6 @@ impl TilesetPanel {
                 if let Some(slot) = indices.get_mut(at) {
                     *slot = value;
                 }
-            }
-        };
-        // Mirror commit_float mode for mode: the preview must be what a
-        // commit would produce, or the view lies.
-        match (float.mode, &under) {
-            (FloatMode::Move, _) if float.at != float.from => {
-                for row in 0..float.h {
-                    for col in 0..float.w {
-                        put(float.from.0 + col as i32, float.from.1 + row as i32, 0);
-                    }
-                }
-            }
-            (FloatMode::Swap, Some(under)) => {
-                for row in 0..float.h {
-                    for col in 0..float.w {
-                        put(
-                            float.from.0 + col as i32,
-                            float.from.1 + row as i32,
-                            under[row * float.w + col],
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-        let skip_transparent = !open.paste_opaque;
-        for row in 0..float.h {
-            for col in 0..float.w {
-                let value = float.pixels[row * float.w + col];
-                if value == 0 && skip_transparent && float.mode != FloatMode::Swap {
-                    continue;
-                }
-                put(float.at.0 + col as i32, float.at.1 + row as i32, value);
             }
         }
         Some(indices)
@@ -1982,12 +1960,12 @@ impl TilesetPanel {
             let source = float.pixels.clone();
             for row in 0..h {
                 for col in 0..w {
-                    let (sc, sr) = if horizontal {
+                    let (source_col, source_row) = if horizontal {
                         (w - 1 - col, row)
                     } else {
                         (col, h - 1 - row)
                     };
-                    float.pixels[row * w + col] = source[sr * w + sc];
+                    float.pixels[row * w + col] = source[source_row * w + source_col];
                 }
             }
             self.recompose_grid(cx);
@@ -2000,12 +1978,16 @@ impl TilesetPanel {
         let mut cells = Vec::with_capacity(w * h);
         for row in 0..h {
             for col in 0..w {
-                let (sc, sr) = if horizontal {
+                let (source_col, source_row) = if horizontal {
                     (w - 1 - col, row)
                 } else {
                     (col, h - 1 - row)
                 };
-                cells.push(((x0 + col) as i32, (y0 + row) as i32, data[sr * w + sc]));
+                cells.push((
+                    (x0 + col) as i32,
+                    (y0 + row) as i32,
+                    data[source_row * w + source_col],
+                ));
             }
         }
         self.write_cells(&cells, cx);
@@ -2603,16 +2585,25 @@ impl TilesetPanel {
                                         .w(px(w))
                                         .h(px(h))
                                         .child(
-                                            gpui::canvas(
-                                                |_, _, _| (),
-                                                |bounds, (), window, _cx| {
-                                                    paint_checkerboard(bounds, window);
-                                                },
-                                            )
-                                            .absolute()
-                                            .top_0()
-                                            .left_0()
-                                            .size_full(),
+                                            // The transparency backdrop:
+                                            // slot 0 composes to alpha 0,
+                                            // and on a dark theme a hole is
+                                            // otherwise indistinguishable
+                                            // from near-black paint. One
+                                            // shader-backed quad; the old
+                                            // CPU loop needed a quad per
+                                            // cell and a budget to stop a
+                                            // big sheet costing thousands.
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .size_full()
+                                                .bg(gpui::rgb(0x4a4a4a))
+                                                .child(div().size_full().bg(gpui::checkerboard(
+                                                    gpui::rgb(0x6b6b6b),
+                                                    CHECKER_PX,
+                                                ))),
                                         )
                                         .child(
                                             img(open.grid.clone()).nearest(true).w(px(w)).h(px(h)),
@@ -3431,12 +3422,6 @@ fn grid_regions(tile_count: usize, cols: usize) -> Vec<(usize, usize, usize)> {
     regions
 }
 
-/// The checkerboard cell size in SCREEN px for a sheet drawn `w` x `h`.
-///
-/// 8px reads as a backdrop rather than as art, but a big sheet at a high
-/// zoom would need tens of thousands of quads at that size, so the cell
-/// doubles until the count is under [`CHECKER_MAX_CELLS`]. Bounded work per
-/// frame, and a coarser check on a huge sheet is not worth a stutter.
 /// Pull `head` onto the nearest constrained position from `anchor`: a
 /// square for Rect and Ellipse, one of eight directions for Line.
 ///
@@ -3463,53 +3448,6 @@ fn constrain_head(anchor: (i32, i32), head: (i32, i32), tool: Tool) -> (i32, i32
             }
         }
         _ => head,
-    }
-}
-
-fn checker_cell_px(w: f32, h: f32) -> f32 {
-    let mut cell = 8.0_f32;
-    while cell < 4096.0 && (w / cell).ceil() * (h / cell).ceil() > CHECKER_MAX_CELLS {
-        cell *= 2.0;
-    }
-    cell
-}
-
-/// Paint the transparency checkerboard across `bounds`.
-///
-/// Nothing rendered transparency AS transparency: slot 0 composes to alpha
-/// 0, so on a dark theme it was indistinguishable from a near-black palette
-/// entry and you could not tell a hole from a colour.
-fn paint_checkerboard(bounds: Bounds<Pixels>, window: &mut Window) {
-    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-    if w <= 0.0 || h <= 0.0 {
-        return;
-    }
-    let cell = checker_cell_px(w, h);
-    let light = gpui::rgb(0x6b6b6b);
-    let dark = gpui::rgb(0x4a4a4a);
-    let mut row = 0usize;
-    let mut y = 0.0_f32;
-    while y < h {
-        let mut col = 0usize;
-        let mut x = 0.0_f32;
-        while x < w {
-            let color = if (row + col).is_multiple_of(2) {
-                light
-            } else {
-                dark
-            };
-            window.paint_quad(gpui::fill(
-                Bounds::new(
-                    gpui::point(bounds.origin.x + px(x), bounds.origin.y + px(y)),
-                    gpui::size(px(cell.min(w - x)), px(cell.min(h - y))),
-                ),
-                color,
-            ));
-            x += cell;
-            col += 1;
-        }
-        y += cell;
-        row += 1;
     }
 }
 
@@ -5987,22 +5925,6 @@ mod tests {
             panel.on_sheet_mouse_move(pos, gpui::Modifiers::default(), cx);
             assert_eq!(panel.hover_status().as_deref(), Some("pad cell"));
         });
-    }
-
-    /// The checker cell grows so a huge sheet cannot cost tens of thousands
-    /// of quads a frame.
-    #[test]
-    fn checker_cell_stays_within_its_quad_budget() {
-        assert_eq!(checker_cell_px(192.0, 64.0), 8.0, "a small sheet gets 8px");
-        for (w, h) in [(192.0, 64.0), (4096.0, 4096.0), (16384.0, 16384.0)] {
-            let cell = checker_cell_px(w, h);
-            let cells = (w / cell).ceil() * (h / cell).ceil();
-            assert!(
-                cells <= CHECKER_MAX_CELLS,
-                "{w}x{h} needs {cells} cells at {cell}px"
-            );
-            assert!(cell >= 8.0, "never finer than 8px");
-        }
     }
 
     /// Ctrl constrains, NOT shift: shift already means "filled" on these
