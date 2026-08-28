@@ -340,6 +340,10 @@ struct OpenTileset {
     /// Whether shift was held during the in-flight shape drag, so the
     /// preview draws what a release would actually paint.
     shape_filled: bool,
+    /// The in-flight stroke is a right-drag, which paints the transparent
+    /// slot. Aseprite's secondary colour; in a 16-slot indexed palette
+    /// where slot 0 IS transparency, erase is what a secondary is for.
+    secondary_paint: bool,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -386,6 +390,7 @@ impl OpenTileset {
             show_lines: loaded.lines.unwrap_or(true),
             snap_tiles: false,
             shape_filled: false,
+            secondary_paint: false,
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -449,6 +454,9 @@ impl OpenTileset {
     /// The color the current tool paints with. Only meaningful for the
     /// painting tools -- Picker/Select never reach `paint_at`.
     fn paint_color(&self) -> u8 {
+        if self.secondary_paint {
+            return 0;
+        }
         match self.tool {
             Tool::Eraser => 0,
             _ => self.slot as u8,
@@ -772,10 +780,20 @@ impl TilesetPanel {
         &mut self,
         position: Point<Pixels>,
         _click_count: usize,
-        shift: bool,
+        modifiers: gpui::Modifiers,
+        secondary: bool,
         cx: &mut Context<Self>,
     ) {
-        self.on_sheet_mouse_down(position, shift, cx);
+        // Alt samples the colour under the cursor whatever tool is active,
+        // and leaves that tool alone.
+        if modifiers.alt {
+            self.pick_at(position, true, cx);
+            return;
+        }
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.secondary_paint = secondary;
+        }
+        self.on_sheet_mouse_down(position, modifiers.shift, cx);
     }
 
     /// An arrow-key step: shift the marquee if there is one, else step
@@ -1072,7 +1090,7 @@ impl TilesetPanel {
                 self.paint_at(pos, cx);
             }
             Tool::Picker => {
-                self.pick_at(pos, cx);
+                self.pick_at(pos, false, cx);
                 return; // a pick is instantaneous, no drag state
             }
             Tool::Fill => {
@@ -1148,7 +1166,7 @@ impl TilesetPanel {
 
     /// The Picker tool: sample the palette slot under the click, make it
     /// the pencil color, and switch back to the pencil.
-    fn pick_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    fn pick_at(&mut self, pos: Point<Pixels>, keep_tool: bool, cx: &mut Context<Self>) {
         let Some((tile, x, y)) = self.pixel_at(pos) else {
             return;
         };
@@ -1159,6 +1177,13 @@ impl TilesetPanel {
         let idx = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + y * TILE_PX + x;
         if let Some(&slot) = state.indices.get(idx) {
             open.slot = slot as usize;
+            if keep_tool {
+                cx.notify();
+                return;
+            }
+            // Picking with the Picker TOOL is an intent to draw with the
+            // colour, so it hands you the pencil. Alt-picking mid-stroke is
+            // not -- it samples and gives you your tool straight back.
             open.tool = Tool::Pencil;
             cx.notify();
         }
@@ -1527,6 +1552,11 @@ impl TilesetPanel {
         if let Some(offset) = moved {
             self.move_selection(offset, cx);
         }
+        // Cleared only now: a shape tool reads paint_color at commit time,
+        // above, so clearing any earlier would paint the primary slot.
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.secondary_paint = false;
+        }
         cx.notify();
     }
 
@@ -1555,7 +1585,7 @@ impl TilesetPanel {
             return;
         };
         let next = (open.slot as isize + delta).rem_euclid(PAL_SLOTS as isize) as usize;
-        self.select_slot(next, cx);
+        self.set_slot(next, true, cx);
     }
 
     /// Back to the zoom a freshly opened tileset uses.
@@ -1564,13 +1594,22 @@ impl TilesetPanel {
     }
 
     fn select_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
+        self.set_slot(slot, false, cx);
+    }
+
+    /// `keep_tool` leaves the active tool alone. CLICKING a swatch is an
+    /// intent to draw with it, so it hands you the pencil; CYCLING the
+    /// palette from the keyboard is not -- being yanked out of the Rect
+    /// tool because you stepped a colour is just a lost tool.
+    fn set_slot(&mut self, slot: usize, keep_tool: bool, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
         if slot < PAL_SLOTS && open.slot != slot {
             open.slot = slot;
-            // Picking a color is an intent to draw with it.
-            open.tool = Tool::Pencil;
+            if !keep_tool {
+                open.tool = Tool::Pencil;
+            }
             cx.notify();
         }
     }
@@ -1796,7 +1835,8 @@ impl TilesetPanel {
                                                     this.on_sheet_click(
                                                         event.position,
                                                         event.click_count,
-                                                        event.modifiers.shift,
+                                                        event.modifiers,
+                                                        false,
                                                         cx,
                                                     );
                                                 },
@@ -1811,6 +1851,27 @@ impl TilesetPanel {
                                                 );
                                             },
                                         ))
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(
+                                                |this, event: &MouseDownEvent, window, cx| {
+                                                    window.focus(&this.focus_handle, cx);
+                                                    this.on_sheet_click(
+                                                        event.position,
+                                                        event.click_count,
+                                                        event.modifiers,
+                                                        true,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Right,
+                                            cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                                                this.on_sheet_mouse_up(event.modifiers.shift, cx);
+                                            }),
+                                        )
                                         .on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(|this, event: &MouseUpEvent, _, cx| {
@@ -3918,7 +3979,13 @@ mod tests {
         place_sheet_at_origin(&panel, cx);
         panel.update(cx, |panel, cx| {
             panel.select_slot(1, cx);
-            panel.on_sheet_click(pixel_pos(ready(panel), 0, 2, 3), 2, false, cx);
+            panel.on_sheet_click(
+                pixel_pos(ready(panel), 0, 2, 3),
+                2,
+                gpui::Modifiers::default(),
+                false,
+                cx,
+            );
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).focus, None, "no hard focus on a double click");
             assert_eq!(
@@ -4687,6 +4754,12 @@ mod tests {
             assert_eq!(ready(panel).slot, 0, "and forwards off the end");
             panel.step_slot(3, cx);
             assert_eq!(ready(panel).slot, 3);
+
+            // Cycling colours must not steal the active tool.
+            panel.set_tool(Tool::Rect, cx);
+            panel.step_slot(1, cx);
+            assert_eq!(ready(panel).slot, 4);
+            assert_eq!(ready(panel).tool, Tool::Rect, "still the Rect tool");
         });
     }
 
@@ -4717,6 +4790,92 @@ mod tests {
             assert_eq!(ready(panel).focus, Some(0), "and up comes back");
             panel.scroll_by(0.0, -1.0, cx);
             assert_eq!(ready(panel).focus, Some(0), "clamped at the first tile");
+        });
+    }
+
+    /// Right-drag paints the secondary colour. In a 16-slot indexed palette
+    /// where slot 0 IS transparency, that means erase -- the most-used
+    /// Aseprite gesture after left-drag, and the sheet registered Left
+    /// handlers only.
+    #[gpui::test]
+    async fn test_right_drag_erases_and_restores_the_primary_slot(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            // Tile 1 is solid slot 1.
+            panel.on_sheet_click(
+                pixel_pos(ready(panel), 1, 3, 3),
+                1,
+                gpui::Modifiers::default(),
+                true,
+                cx,
+            );
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 3, 3)],
+                0,
+                "right-drag erased rather than painting slot 2"
+            );
+            assert!(
+                !ready(panel).secondary_paint,
+                "the flag is cleared on release"
+            );
+
+            // A left press afterwards paints the primary slot again.
+            panel.on_sheet_click(
+                pixel_pos(ready(panel), 1, 5, 5),
+                1,
+                gpui::Modifiers::default(),
+                false,
+                cx,
+            );
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(1, 5, 5)], 2);
+        });
+    }
+
+    /// Alt samples the colour under the cursor with any tool active and
+    /// hands that tool straight back. Picking with the Picker TOOL still
+    /// switches to Pencil, which the beginner persona relies on.
+    #[gpui::test]
+    async fn test_alt_click_samples_without_stealing_the_tool(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(3, cx);
+            panel.set_tool(Tool::Rect, cx);
+            let alt = gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+            panel.on_sheet_click(pixel_pos(ready(panel), 1, 3, 3), 1, alt, false, cx);
+            let open = ready(panel);
+            assert_eq!(open.slot, 1, "sampled tile 1's colour");
+            assert_eq!(open.tool, Tool::Rect, "and kept the Rect tool");
+            assert!(!open.store.state().dirty, "sampling paints nothing");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_the_picker_tool_still_hands_you_the_pencil(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Picker, cx);
+            panel.on_sheet_click(
+                pixel_pos(ready(panel), 1, 3, 3),
+                1,
+                gpui::Modifiers::default(),
+                false,
+                cx,
+            );
+            let open = ready(panel);
+            assert_eq!(open.slot, 1);
+            assert_eq!(open.tool, Tool::Pencil, "unchanged behaviour");
         });
     }
 
