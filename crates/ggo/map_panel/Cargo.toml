@@ -8,6 +8,14 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
+[features]
+# Cross-crate test hooks: `ggo_smoke`'s map journeys drive the panel
+# through the tab the open interceptor creates, and every field they read
+# (the store's cells, the canvas bounds, the cell selection) is
+# crate-private -- the same reason `ggo_world_panel`/`ggo_sprite_panel`
+# carry this feature. Read-only hooks only.
+test-support = []
+
 [lib]
 path = "src/ggo_map_panel.rs"
 

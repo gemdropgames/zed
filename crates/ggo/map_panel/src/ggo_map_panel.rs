@@ -2331,6 +2331,83 @@ impl MapPanel {
             .into_any_element()
     }
 
+    // ------------------------------------------------------ test hooks
+
+    /// A loaded map is on screen. `test-support` only, for `ggo_smoke`'s
+    /// map journeys -- read-only, like every hook below it.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_ready(&self) -> bool {
+        matches!(self.state, ViewerState::Ready(_))
+    }
+
+    /// The open map has unsaved edits. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_dirty(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.store.dirty())
+    }
+
+    /// The map canvas's on-screen bounds, recorded at the last prepaint --
+    /// `None` before the first Ready paint. Cell `(x, y)`'s centre is
+    /// `origin + ((x + 0.5) * TILE_PX * zoom, (y + 0.5) * TILE_PX * zoom)`
+    /// while the pan is at the origin. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_canvas_bounds(&self) -> Option<Bounds<Pixels>> {
+        match &self.state {
+            ViewerState::Ready(open) => *open.canvas_bounds.borrow(),
+            _ => None,
+        }
+    }
+
+    /// The canvas's integer zoom, i.e. how many screen px one map pixel
+    /// occupies ([`geom::DEFAULT_ZOOM`] until the user zooms).
+    /// `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_zoom(&self) -> usize {
+        match &self.state {
+            ViewerState::Ready(open) => open.zoom,
+            _ => geom::DEFAULT_ZOOM,
+        }
+    }
+
+    /// The PACKED cell at `(x, y)` -- `map_doc::pack_cell`'s `u16`, so a
+    /// painted cell reads back as `pack_cell(tile, pal_sub, hflip, vflip)`
+    /// and an unpainted one as the blank sentinel
+    /// [`ggo_worldlib::sprites::map_doc::CELL_BLANK`] (`0x03FF`, which is
+    /// also the tile-index mask -- blank is NOT zero). `None` outside the
+    /// map or before it loads. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_cell(&self, x: usize, y: usize) -> Option<u16> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let state = open.store.state();
+        (x < state.w as usize && y < state.h as usize)
+            .then(|| state.cells.get(y * state.w as usize + x).copied())
+            .flatten()
+    }
+
+    /// The asset-root-relative `.til` the open map is bound to (`""` when
+    /// it is unbound). `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_til_path(&self) -> Option<String> {
+        match &self.state {
+            ViewerState::Ready(open) => Some(open.store.state().til_path),
+            _ => None,
+        }
+    }
+
+    /// The settled cell selection as normalized inclusive corners
+    /// `(x0, y0, x1, y1)`, or `None` when nothing is selected (which is
+    /// what `escape` leaves behind, and what makes `delete` a no-op).
+    /// `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_selection(&self) -> Option<(i32, i32, i32, i32)> {
+        match &self.state {
+            ViewerState::Ready(open) => open.selection,
+            _ => None,
+        }
+    }
+
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let header = self.render_header(cx);
         let tools = self.render_tools(cx);

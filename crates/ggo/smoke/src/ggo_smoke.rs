@@ -1542,4 +1542,317 @@ mod tests {
             );
         });
     }
+
+    // -------------------------------------------------- map edit journeys
+
+    /// The fixture map's side, in cells.
+    const MAP_DIM: u16 = 8;
+
+    /// The packed cell a canvas click paints with NOTHING selected in the
+    /// tileset strip. The strip's anchor/far both start at `(0, 0)`, so
+    /// `palette_sel_rect` + `build_stamp` give a 1x1 stamp of tile 0 with
+    /// palSub 0 and no flips -- `pack_cell(0, 0, false, false)`, i.e. `0`.
+    /// Blank is `CELL_BLANK` (`0x03FF`), so a painted cell and an unpainted
+    /// one are never confusable.
+    fn map_painted_cell() -> u16 {
+        ggo_worldlib::sprites::map_doc::pack_cell(0, 0, false, false)
+    }
+
+    /// A blank cell: worldlib's own sentinel, NOT zero.
+    fn map_blank_cell() -> u16 {
+        ggo_worldlib::sprites::map_doc::CELL_BLANK
+    }
+
+    /// An 8x8 all-blank map at `assets/maps/edit.map`, born BOUND to a
+    /// two-tile tileset at `assets/art/mapfx.til` (tile 0 transparent,
+    /// tile 1 solid slot 1 -- the same hand-built sheet the float journeys
+    /// use).
+    ///
+    /// Bound at write time on purpose: binding is a picker flow of its
+    /// own, and what these journeys are about is the EDIT session that
+    /// follows one. The `til_path` inside the map is asset-root-relative
+    /// (`art/mapfx.til`, no `assets/` segment), because `split_map_path`
+    /// opens a map under `assets/` against `<project>/assets` -- the F4
+    /// `ggo-sprfix` contract the panel's own fixture asserts too.
+    fn write_map_fixture(root: &Path) {
+        let tile_pixels = ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+        let mut indices = vec![0u8; 2 * tile_pixels];
+        for value in &mut indices[tile_pixels..] {
+            *value = 1;
+        }
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800;
+        ggo_worldlib::sprites::io::save_tileset(
+            root,
+            "assets/art/mapfx.til",
+            &indices,
+            2,
+            &palette,
+        )
+        .expect("worldlib writes the fixture tileset");
+
+        std::fs::create_dir_all(root.join("assets/maps")).unwrap();
+        ggo_worldlib::sprites::io::save_map(
+            root,
+            "assets/maps/edit.map",
+            &ggo_worldlib::sprites::map_doc::MapState {
+                w: MAP_DIM,
+                h: MAP_DIM,
+                cells: vec![map_blank_cell(); MAP_DIM as usize * MAP_DIM as usize],
+                til_path: "art/mapfx.til".to_string(),
+                pal_path: "art/mapfx.pal".to_string(),
+                dirty: false,
+            },
+        )
+        .expect("worldlib writes the fixture map");
+    }
+
+    /// Write the fixture and open it the way a user does: the project
+    /// panel's click funnel offers `assets/maps/edit.map` to the fork's
+    /// interceptors, the map interceptor claims it and adds a FOCUSED tab
+    /// whose focus handle is the panel's own -- which is what puts the
+    /// `GgoMapPanel` keymap context under the keystrokes below.
+    async fn open_fixture_map(
+        workspace: &Entity<Workspace>,
+        root: &Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<ggo_map_panel::MapPanel> {
+        write_map_fixture(root);
+        assert!(
+            offer_open(workspace, cx, "assets/maps/edit.map"),
+            "the map interceptor claimed the fixture"
+        );
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_map_panel::MapEditorItem>(cx)
+                .next()
+                .expect("the interceptor opened the map tab")
+                .read(cx)
+                .test_panel()
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_ready(), "the map loaded");
+            assert_eq!(
+                panel.test_til_path().as_deref(),
+                Some("art/mapfx.til"),
+                "the map opened already bound to the fixture tileset"
+            );
+            assert!(!panel.test_is_dirty(), "a freshly loaded map is clean");
+            for y in 0..MAP_DIM as usize {
+                for x in 0..MAP_DIM as usize {
+                    assert_eq!(
+                        panel.test_cell(x, y),
+                        Some(map_blank_cell()),
+                        "cell ({x}, {y}) starts blank"
+                    );
+                }
+            }
+        });
+        panel
+    }
+
+    /// Screen point at the centre of map cell `(x, y)`. The canvas draws
+    /// its grid from the canvas element's own origin at an INTEGER zoom
+    /// with the pan at rest, so one cell is `TILE_PX * zoom` px square.
+    fn map_cell_center(
+        panel: &Entity<ggo_map_panel::MapPanel>,
+        cx: &mut gpui::VisualTestContext,
+        x: i32,
+        y: i32,
+    ) -> gpui::Point<gpui::Pixels> {
+        panel.read_with(cx, |panel, _| {
+            let bounds = panel.test_canvas_bounds().expect("the canvas painted");
+            let step = (ggo_worldlib::sprites::tileset_doc::TILE_PX * panel.test_zoom()) as f32;
+            gpui::point(
+                bounds.origin.x + gpui::px((x as f32 + 0.5) * step),
+                bounds.origin.y + gpui::px((y as f32 + 0.5) * step),
+            )
+        })
+    }
+
+    /// Click the centre of map cell `(x, y)`.
+    fn click_map_cell(
+        panel: &Entity<ggo_map_panel::MapPanel>,
+        cx: &mut gpui::VisualTestContext,
+        x: i32,
+        y: i32,
+    ) {
+        let at = map_cell_center(panel, cx, x, y);
+        click(cx, at);
+    }
+
+    /// Switch to the Select tool the way a user does -- a click on its
+    /// toolbar button. The map tools are toolbar-only (ggo-ide has no
+    /// letter hotkeys for them either), and an `IconButton`'s debug
+    /// selector is its ICON name, which `MapTool::Select`
+    /// (`IconName::Maximize`) shares with the pane's own zoom button. The
+    /// guard below pins the hit to the panel's tool rail -- above the
+    /// canvas and hard against its left edge -- so a wrong-button click
+    /// fails here instead of silently doing something else.
+    fn pick_select_tool(panel: &Entity<ggo_map_panel::MapPanel>, cx: &mut gpui::VisualTestContext) {
+        let canvas = panel.read_with(cx, |panel, _| {
+            panel.test_canvas_bounds().expect("the canvas painted")
+        });
+        let button = cx
+            .debug_bounds("ICON-Maximize")
+            .expect("the Select tool button painted");
+        assert!(
+            button.origin.y < canvas.origin.y && button.origin.x < canvas.origin.x + gpui::px(200.),
+            "the resolved button is the panel's Select tool, not the pane's zoom button"
+        );
+        click(cx, button.center());
+        cx.run_until_parked();
+    }
+
+    /// The map editing spine through the REAL keymap: click a cell to
+    /// stamp the default brush into it, walk that edit back and forth with
+    /// undo/redo, ctrl-s, and reread the `.map` through worldlib.
+    ///
+    /// The stamp is the interesting part of the fixture: nothing is
+    /// selected in the tileset strip, and the panel still paints -- the
+    /// strip's anchor starts at tile 0, so "no selection" is a 1x1 stamp
+    /// of tile 0 rather than a dead brush.
+    #[gpui::test]
+    async fn smoke_map_paint_undo_and_save_round_trip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        let panel = open_fixture_map(&workspace, dir.path(), cx).await;
+
+        click_map_cell(&panel, cx, 1, 1);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_cell(1, 1),
+                Some(map_painted_cell()),
+                "the click stamped the default brush -- tile 0, palSub 0, no flips"
+            );
+            assert_eq!(
+                panel.test_cell(0, 0),
+                Some(map_blank_cell()),
+                "and touched no other cell"
+            );
+            assert!(panel.test_is_dirty(), "the document went dirty");
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_cell(1, 1),
+                Some(map_blank_cell()),
+                "one undo took the whole click-gesture back"
+            );
+        });
+        cx.simulate_keystrokes("ctrl-shift-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_cell(1, 1),
+                Some(map_painted_cell()),
+                "and redo replays it"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_dirty(), "ctrl-s cleared the dirty flag");
+        });
+
+        let on_disk = ggo_worldlib::sprites::io::open_map(dir.path(), "assets/maps/edit.map")
+            .expect("worldlib reopens what ctrl-s wrote");
+        assert_eq!((on_disk.w, on_disk.h), (MAP_DIM, MAP_DIM), "same size");
+        assert_eq!(
+            on_disk.til_path, "art/mapfx.til",
+            "the save kept the asset-root-relative binding"
+        );
+        let cell_index = |x: usize, y: usize| y * MAP_DIM as usize + x;
+        assert_eq!(
+            on_disk.cells[cell_index(1, 1)],
+            map_painted_cell(),
+            "the file holds the cell the panel shows"
+        );
+        assert_eq!(
+            on_disk.cells[0],
+            map_blank_cell(),
+            "and left every other cell blank"
+        );
+    }
+
+    /// The selection branches of the same panel, which only a whole
+    /// journey tells apart from a dead binding: a Select-tool drag really
+    /// settles a cell selection, escape really drops it (so the delete
+    /// that follows is the documented no-op -- `delete_selection_impl`
+    /// returns early with no selection -- and blanks nothing), and a
+    /// re-selected delete blanks exactly the selected cells with one undo
+    /// putting them back.
+    #[gpui::test]
+    async fn smoke_map_select_delete_and_escape_branches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        let panel = open_fixture_map(&workspace, dir.path(), cx).await;
+
+        click_map_cell(&panel, cx, 1, 1);
+        click_map_cell(&panel, cx, 2, 1);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_cell(1, 1), Some(map_painted_cell()));
+            assert_eq!(panel.test_cell(2, 1), Some(map_painted_cell()));
+        });
+
+        pick_select_tool(&panel, cx);
+        let select_both = |cx: &mut gpui::VisualTestContext| {
+            let from = map_cell_center(&panel, cx, 1, 1);
+            let to = map_cell_center(&panel, cx, 2, 1);
+            cx.simulate_mouse_down(from, gpui::MouseButton::Left, Default::default());
+            cx.simulate_mouse_move(to, gpui::MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default());
+            cx.run_until_parked();
+        };
+        select_both(cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_selection(),
+                Some((1, 1, 2, 1)),
+                "the drag settled a two-cell selection"
+            );
+        });
+
+        cx.simulate_keystrokes("escape");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_selection(), None, "escape cleared it");
+        });
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_cell(1, 1),
+                Some(map_painted_cell()),
+                "delete with nothing selected is a no-op"
+            );
+            assert_eq!(panel.test_cell(2, 1), Some(map_painted_cell()));
+        });
+
+        select_both(cx);
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_cell(1, 1),
+                Some(map_blank_cell()),
+                "delete blanked the selected cells"
+            );
+            assert_eq!(panel.test_cell(2, 1), Some(map_blank_cell()));
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_cell(1, 1),
+                Some(map_painted_cell()),
+                "one undo restored both cells -- the delete is ONE rect fill"
+            );
+            assert_eq!(panel.test_cell(2, 1), Some(map_painted_cell()));
+        });
+    }
 }
