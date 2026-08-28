@@ -565,6 +565,50 @@ pub struct TilesetPanel {
 }
 
 impl TilesetPanel {
+    /// Smoke-test hooks, so `ggo_smoke`'s journeys can aim real mouse
+    /// events and assert real pixels without the panel's internals leaking
+    /// into the app.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_ready(&self) -> bool {
+        matches!(self.state, ViewerState::Ready(_))
+    }
+
+    /// The sheet's on-screen bounds, recorded at the last prepaint.
+    #[cfg(feature = "test-support")]
+    pub fn test_sheet_bounds(&self) -> Option<gpui::Bounds<Pixels>> {
+        match &self.state {
+            ViewerState::Ready(open) => *open.sheet_bounds.borrow(),
+            _ => None,
+        }
+    }
+
+    /// The current zoom, for mapping sheet pixels to screen points.
+    #[cfg(feature = "test-support")]
+    pub fn test_zoom(&self) -> usize {
+        match &self.state {
+            ViewerState::Ready(open) => open.zoom,
+            _ => 0,
+        }
+    }
+
+    /// The palette index at `(x, y)` of `tile`, straight from the store.
+    #[cfg(feature = "test-support")]
+    pub fn test_pixel(&self, tile: usize, x: usize, y: usize) -> Option<u8> {
+        match &self.state {
+            ViewerState::Ready(open) => open
+                .store
+                .indices()
+                .get(tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + y * TILE_PX + x)
+                .copied(),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_is_dirty(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.store.dirty())
+    }
+
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),

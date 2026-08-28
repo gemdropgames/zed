@@ -7711,6 +7711,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_smoke"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "ggo-worldlib",
+ "ggo_common",
+ "ggo_import_panel",
+ "ggo_sprite_panel",
+ "ggo_tileset_panel",
+ "gpui",
+ "image",
+ "path",
+ "project",
+ "remote_connection",
+ "serde_json",
+ "tempfile",
+ "workspace",
+]
+
+[[package]]
 name = "ggo_sprite_panel"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,33 @@
+[package]
+name = "ggo_smoke"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ggo_smoke.rs"
+
+[dependencies]
+
+[dev-dependencies]
+editor.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+ggo_common.workspace = true
+ggo_import_panel = { workspace = true, features = ["test-support"] }
+ggo_sprite_panel.workspace = true
+ggo_tileset_panel = { workspace = true, features = ["test-support"] }
+ggo-worldlib.workspace = true # GGO
+image.workspace = true
+path = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+# `project`'s test-support turns on `remote/test-support`; `remote_connection`
+# only matches the added variant under ITS test-support -- the same dance the
+# other ggo panels' dev-deps document.
+remote_connection = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

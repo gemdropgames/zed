@@ -70,6 +70,12 @@ impl TilesetEditorItem {
         &self.rel
     }
 
+    /// Smoke-test hook: `ggo_smoke` reaches the panel through the tab.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_panel(&self) -> Entity<TilesetPanel> {
+        self.panel.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn panel(&self) -> &Entity<TilesetPanel> {
         &self.panel

@@ -778,6 +778,34 @@ impl ImportPanel {
     /// panel that has never been activated. Safe here: the caller is a
     /// context-menu entry handler, which runs outside both the project
     /// panel's lease and any `Workspace` update.
+    /// Smoke-test hooks: the wizard driven the way `ggo_smoke`'s journeys
+    /// need, without exposing the panel's internals to the app.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_ready(&self) -> bool {
+        matches!(self.state, ViewerState::Ready(_))
+    }
+
+    /// Whether the "Import as sprite" toggle is on, and the commit itself.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_as_sprite(&mut self, as_sprite: bool) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.as_sprite = as_sprite;
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_set_frame_tiles(&mut self, cut: (Option<usize>, Option<usize>)) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.frame_tiles = cut;
+        }
+    }
+
+    /// Commit the wizard; the asset-root-relative rel of what it wrote.
+    #[cfg(feature = "test-support")]
+    pub fn test_commit(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        self.commit(cx).map(|(imported, _)| imported.asset_rel)
+    }
+
     pub fn open_source(&mut self, rel: &str, _window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_root(cx);
         self.load_source(rel, cx);
