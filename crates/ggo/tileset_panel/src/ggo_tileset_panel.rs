@@ -302,6 +302,18 @@ impl gpui::Global for SharedClipboard {}
 /// was ten mutations, anything pushed past the sheet edge was filtered out
 /// by `doc_pixel` and gone for good, and each step composited over whatever
 /// art it landed on. Lifting once and moving a buffer fixes all three.
+/// What putting a float down does to its source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FloatMode {
+    /// Blank the source, stamp the destination -- an ordinary move.
+    #[default]
+    Move,
+    /// Leave the source alone: alt-drag, Aseprite's copy-drag.
+    Copy,
+    /// Exchange the two regions exactly, transparency included: shift-drag.
+    Swap,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Float {
     w: usize,
@@ -312,6 +324,7 @@ struct Float {
     at: (i32, i32),
     /// Where it was lifted from, so a cancel can put it back.
     from: (i32, i32),
+    mode: FloatMode,
 }
 
 /// The open tileset: worldlib's doc store plus the view state that must
@@ -414,6 +427,9 @@ struct OpenTileset {
     cols_history: std::collections::HashMap<usize, (usize, usize)>,
     /// The lifted region, if the marquee has been moved.
     float: Option<Float>,
+    /// The mode the NEXT lift will use, decided by the modifiers on the
+    /// press that started the drag; consumed by `lift_selection`.
+    pending_float_mode: FloatMode,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -467,6 +483,7 @@ impl OpenTileset {
             pan_drag: None,
             cols_history: std::collections::HashMap::new(),
             float: None,
+            pending_float_mode: FloatMode::Move,
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -874,11 +891,31 @@ impl TilesetPanel {
         secondary: bool,
         cx: &mut Context<Self>,
     ) {
-        // Alt samples the colour under the cursor whatever tool is active,
-        // and leaves that tool alone.
-        if modifiers.alt {
+        // A press INSIDE a Select marquee is a drag of that marquee, and
+        // the modifiers pick what the drag does: alt copies, shift swaps.
+        // The explicit marquee outranks alt's sampling meaning, which alt
+        // keeps everywhere else.
+        let inside_marquee = matches!(&self.state, ViewerState::Ready(open) if open.tool == Tool::Select)
+            && match (self.sheet_px_at(position), self.selection_rect()) {
+                (Some((x, y)), Some((x0, y0, x1, y1))) => {
+                    (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
+                }
+                _ => false,
+            };
+        if modifiers.alt && !inside_marquee {
             self.pick_at(position, true, cx);
             return;
+        }
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.pending_float_mode = if !inside_marquee {
+                FloatMode::Move
+            } else if modifiers.alt {
+                FloatMode::Copy
+            } else if modifiers.shift {
+                FloatMode::Swap
+            } else {
+                FloatMode::Move
+            };
         }
         if matches!(&self.state, ViewerState::Ready(open) if open.space_held) {
             self.begin_pan(position, cx);
@@ -1429,9 +1466,11 @@ impl TilesetPanel {
     /// so the state has to be said out loud.
     fn float_status(&self) -> Option<&'static str> {
         match &self.state {
-            ViewerState::Ready(open) if open.float.is_some() => {
-                Some("floating — escape cancels, click away to place")
-            }
+            ViewerState::Ready(open) => match open.float.as_ref().map(|f| f.mode)? {
+                FloatMode::Move => Some("floating — escape cancels, click away to place"),
+                FloatMode::Copy => Some("floating a COPY — escape cancels, click away to place"),
+                FloatMode::Swap => Some("floating a SWAP — escape cancels, click away to swap"),
+            },
             _ => None,
         }
     }
@@ -1568,8 +1607,17 @@ impl TilesetPanel {
     /// the only way to clear a region was to switch to the eraser and scrub
     /// it with a brush capped at 4px.
     fn erase_selection(&mut self, cx: &mut Context<Self>) {
-        // Deleting a float throws away the carried pixels AND blanks where
-        // they came from, in one step.
+        // Deleting a MOVE float throws away the carried pixels AND blanks
+        // where they came from, in one step. A copy or swap float never
+        // owed the document anything, so deleting it is just a cancel.
+        if matches!(&self.state, ViewerState::Ready(open) if open
+            .float
+            .as_ref()
+            .is_some_and(|f| f.mode != FloatMode::Move))
+        {
+            self.cancel_float(cx);
+            return;
+        }
         if let Some(float) = match &self.state {
             ViewerState::Ready(open) => open.float.clone(),
             _ => None,
@@ -1670,16 +1718,46 @@ impl TilesetPanel {
         let (w, h, pixels) = self.region_pixels((x0, y0, x1, y1));
         if let ViewerState::Ready(open) = &mut self.state {
             let at = (x0 as i32, y0 as i32);
+            let mode = std::mem::take(&mut open.pending_float_mode);
             open.float = Some(Float {
                 w,
                 h,
                 pixels,
                 at,
                 from: at,
+                mode,
             });
         }
         self.recompose_grid(cx);
         true
+    }
+
+    /// The document's pixels under the float's DESTINATION rect,
+    /// row-major; cells off the sheet or on padding read as 0. What a swap
+    /// sends back to the source.
+    fn pixels_under_float(&self, float: &Float) -> Vec<u8> {
+        let mut under = vec![0u8; float.w * float.h];
+        let ViewerState::Ready(open) = &self.state else {
+            return under;
+        };
+        let indices = open.store.indices();
+        for row in 0..float.h {
+            for col in 0..float.w {
+                let (x, y) = (float.at.0 + col as i32, float.at.1 + row as i32);
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                if let Some((tile, px_x, px_y)) = self.doc_pixel(x as usize, y as usize) {
+                    let at = tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS
+                        + px_y * TILE_PX
+                        + px_x;
+                    if let Some(&v) = indices.get(at) {
+                        under[row * float.w + col] = v;
+                    }
+                }
+            }
+        }
+        under
     }
 
     /// Stamp the float back into the sheet and drop it. One undo step.
@@ -1698,19 +1776,38 @@ impl TilesetPanel {
             _ => return,
         };
         let mut cells = Vec::with_capacity(float.w * float.h * 2);
-        if float.at != float.from {
+        match float.mode {
             // Blank the source first; a later cell for the same pixel wins,
             // so an overlapping move still stamps correctly.
-            for row in 0..float.h {
-                for col in 0..float.w {
-                    cells.push((float.from.0 + col as i32, float.from.1 + row as i32, 0u8));
+            FloatMode::Move if float.at != float.from => {
+                for row in 0..float.h {
+                    for col in 0..float.w {
+                        cells.push((float.from.0 + col as i32, float.from.1 + row as i32, 0u8));
+                    }
                 }
             }
+            // A swap sends whatever sat under the destination back to the
+            // source. Read before any write below.
+            FloatMode::Swap => {
+                let under = self.pixels_under_float(&float);
+                for row in 0..float.h {
+                    for col in 0..float.w {
+                        cells.push((
+                            float.from.0 + col as i32,
+                            float.from.1 + row as i32,
+                            under[row * float.w + col],
+                        ));
+                    }
+                }
+            }
+            FloatMode::Move | FloatMode::Copy => {}
         }
         for row in 0..float.h {
             for col in 0..float.w {
                 let value = float.pixels[row * float.w + col];
-                if value == 0 && skip_transparent {
+                // A swap is an exact exchange, so its transparent pixels
+                // write through regardless of the paste_opaque toggle.
+                if value == 0 && skip_transparent && float.mode != FloatMode::Swap {
                     continue;
                 }
                 cells.push((float.at.0 + col as i32, float.at.1 + row as i32, value));
@@ -1745,6 +1842,8 @@ impl TilesetPanel {
             return None;
         };
         let float = open.float.as_ref()?;
+        // What a swap will send home, read BEFORE any of the writes below.
+        let under = (float.mode == FloatMode::Swap).then(|| self.pixels_under_float(float));
         // The one deliberate copy: this fn RETURNS an owned view.
         let mut indices = open.store.indices().to_vec();
         let mut put = |x: i32, y: i32, value: u8| {
@@ -1759,18 +1858,34 @@ impl TilesetPanel {
                 }
             }
         };
-        if float.at != float.from {
-            for row in 0..float.h {
-                for col in 0..float.w {
-                    put(float.from.0 + col as i32, float.from.1 + row as i32, 0);
+        // Mirror commit_float mode for mode: the preview must be what a
+        // commit would produce, or the view lies.
+        match (float.mode, &under) {
+            (FloatMode::Move, _) if float.at != float.from => {
+                for row in 0..float.h {
+                    for col in 0..float.w {
+                        put(float.from.0 + col as i32, float.from.1 + row as i32, 0);
+                    }
                 }
             }
+            (FloatMode::Swap, Some(under)) => {
+                for row in 0..float.h {
+                    for col in 0..float.w {
+                        put(
+                            float.from.0 + col as i32,
+                            float.from.1 + row as i32,
+                            under[row * float.w + col],
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
         let skip_transparent = !open.paste_opaque;
         for row in 0..float.h {
             for col in 0..float.w {
                 let value = float.pixels[row * float.w + col];
-                if value == 0 && skip_transparent {
+                if value == 0 && skip_transparent && float.mode != FloatMode::Swap {
                     continue;
                 }
                 put(float.at.0 + col as i32, float.at.1 + row as i32, value);
@@ -6400,6 +6515,177 @@ mod tests {
                     .clipboard_note
                     .is_some_and(|note| note.contains("different palette")),
                 "the mismatch is surfaced"
+            );
+        });
+    }
+
+    /// Alt-dragging inside the marquee floats a COPY: the source survives
+    /// the commit. Alt outside a marquee keeps its sampling meaning.
+    #[gpui::test]
+    async fn test_alt_drag_inside_the_marquee_copies_instead_of_moving(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                // Tile 1's top-left 2x2, solid slot 1.
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 1)));
+            }
+            let alt = gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+            // Alt-press INSIDE the marquee starts a copy-drag, not a sample.
+            panel.on_sheet_click(pixel_pos(ready(panel), 1, 0, 0), 1, alt, false, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 4, 0),
+                gpui::Modifiers::default(),
+                cx,
+            );
+            panel.on_sheet_mouse_up(false, cx);
+            assert!(ready(panel).float.is_some(), "the drag lifted a float");
+
+            panel.commit_float(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(
+                state.indices[idx(1, 0, 0)],
+                1,
+                "the SOURCE survived the commit"
+            );
+            assert_eq!(
+                state.indices[idx(0, 4, 0)],
+                1,
+                "and the copy landed where it was dropped"
+            );
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 4, 0)],
+                0,
+                "one undo removes the copy"
+            );
+        });
+    }
+
+    /// Shift-dragging inside the marquee SWAPS the two regions on commit:
+    /// an exact exchange, transparent pixels included.
+    #[gpui::test]
+    async fn test_shift_drag_inside_the_marquee_swaps_the_regions(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            // Give tile 0 distinguishable content: one slot-2 pixel on
+            // otherwise-transparent ground.
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Pencil, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                // Tile 1's top-left 2x2, solid slot 1.
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 1)));
+            }
+            let shift = gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            };
+            panel.on_sheet_click(pixel_pos(ready(panel), 1, 0, 0), 1, shift, false, cx);
+            // Drag exactly one tile left, onto tile 0's marked corner.
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 0, 0),
+                gpui::Modifiers::default(),
+                cx,
+            );
+            panel.on_sheet_mouse_up(false, cx);
+            panel.commit_float(cx);
+
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 0, 0)], 1, "tile 1's art arrived");
+            assert_eq!(
+                state.indices[idx(1, 0, 0)],
+                2,
+                "and tile 0's marked pixel went BACK to tile 1"
+            );
+            assert_eq!(
+                state.indices[idx(1, 1, 1)],
+                0,
+                "the exchange is exact: transparent came back too"
+            );
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 0, 0)], 1, "one undo undoes the swap");
+            assert_eq!(state.indices[idx(0, 0, 0)], 2);
+        });
+    }
+
+    /// The precedence rule: alt only starts a copy-drag INSIDE a Select
+    /// marquee. Anywhere else it still samples without stealing the tool.
+    #[gpui::test]
+    async fn test_alt_outside_the_marquee_still_samples(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (1, 1)));
+            }
+            let alt = gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+            // Tile 1 is outside the marquee and solid slot 1.
+            panel.on_sheet_click(pixel_pos(ready(panel), 1, 3, 3), 1, alt, false, cx);
+            let open = ready(panel);
+            assert_eq!(open.slot, 1, "sampled");
+            assert_eq!(open.tool, Tool::Select, "tool kept");
+            assert!(open.float.is_none(), "and nothing lifted");
+        });
+    }
+
+    /// The composed view previews each mode exactly as commit will write
+    /// it, and deleting a copy float is a cancel, not a source-blank.
+    #[gpui::test]
+    async fn test_the_view_previews_copy_and_swap_and_delete_cancels_a_copy(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 1)));
+            }
+            let alt = gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+            panel.on_sheet_click(pixel_pos(ready(panel), 1, 0, 0), 1, alt, false, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 4, 0),
+                gpui::Modifiers::default(),
+                cx,
+            );
+            panel.on_sheet_mouse_up(false, cx);
+
+            let view = panel.float_composed_indices().expect("floating");
+            assert_eq!(view[idx(1, 0, 0)], 1, "the view keeps the copy's source");
+            assert_eq!(view[idx(0, 4, 0)], 1, "and shows the copy");
+            assert!(
+                panel
+                    .float_status()
+                    .is_some_and(|status| status.contains("COPY")),
+                "the status line names the mode"
+            );
+
+            panel.erase_selection(cx);
+            assert!(ready(panel).float.is_none());
+            assert!(
+                !ready(panel).store.state().dirty,
+                "deleting a copy float owes the document nothing"
             );
         });
     }
