@@ -357,6 +357,10 @@ struct OpenTileset {
     /// The sheet pixel under the cursor, for the status readout. `None`
     /// once the pointer leaves the sheet.
     hover: Option<(usize, usize)>,
+    /// Space is held: the sheet pans instead of painting.
+    space_held: bool,
+    /// An in-flight space-pan: (cursor at press, scroll offset at press).
+    pan_drag: Option<(Point<Pixels>, Point<Pixels>)>,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -406,6 +410,8 @@ impl OpenTileset {
             shape_constrained: false,
             secondary_paint: false,
             hover: None,
+            space_held: false,
+            pan_drag: None,
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -810,6 +816,10 @@ impl TilesetPanel {
             self.pick_at(position, true, cx);
             return;
         }
+        if matches!(&self.state, ViewerState::Ready(open) if open.space_held) {
+            self.begin_pan(position, cx);
+            return;
+        }
         if let ViewerState::Ready(open) = &mut self.state {
             open.secondary_paint = secondary;
         }
@@ -840,12 +850,100 @@ impl TilesetPanel {
         cx.notify();
     }
 
+    /// Zoom one step, keeping the sheet pixel `(sx, sy)` under the cursor.
+    ///
+    /// The sheet is drawn at `image * zoom` inside a scroll container, so a
+    /// pixel `s` sits at `origin + offset + s*zoom`. Holding it still across
+    /// a zoom change is exactly `offset' = offset + s*(zoom - zoom')`.
+    /// Without this the view lurches toward the origin on every step and you
+    /// lose whatever you were working on.
+    fn zoom_at_sheet_px(&mut self, delta: isize, (sx, sy): (usize, usize), cx: &mut Context<Self>) {
+        let Some(before) = self.ready_zoom() else {
+            return;
+        };
+        self.zoom_by(delta, cx);
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let after = open.zoom;
+        if after == before {
+            return;
+        }
+        let shift = before as f32 - after as f32;
+        let offset = open.scroll.offset();
+        // Offsets are negative-or-zero: 0 is the top/left of the sheet.
+        open.scroll.set_offset(point(
+            (offset.x + px(sx as f32 * shift)).min(px(0.)),
+            (offset.y + px(sy as f32 * shift)).min(px(0.)),
+        ));
+        cx.notify();
+    }
+
+    /// Begin a space-pan from `pos`, remembering where the sheet started.
+    fn begin_pan(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.pan_drag = Some((pos, open.scroll.offset()));
+            cx.notify();
+        }
+    }
+
+    /// Continue a space-pan: the sheet follows the cursor one-to-one.
+    fn pan_to(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some((start, base)) = open.pan_drag else {
+            return;
+        };
+        open.scroll.set_offset(point(
+            (base.x + (pos.x - start.x)).min(px(0.)),
+            (base.y + (pos.y - start.y)).min(px(0.)),
+        ));
+        cx.notify();
+    }
+
+    fn end_pan(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.pan_drag.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Space down/up. Releasing space also ends any pan in flight, so a
+    /// release off the sheet cannot strand the drag.
+    fn set_space_held(&mut self, held: bool, cx: &mut Context<Self>) {
+        let changed = match &mut self.state {
+            ViewerState::Ready(open) if open.space_held != held => {
+                open.space_held = held;
+                true
+            }
+            _ => false,
+        };
+        if !held {
+            self.end_pan(cx);
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// Ctrl-wheel zooms; a plain wheel is left to the scroll container.
-    fn on_sheet_scroll(&mut self, dy: f32, zoom_modifier: bool, cx: &mut Context<Self>) -> bool {
+    fn on_sheet_scroll(
+        &mut self,
+        dy: f32,
+        zoom_modifier: bool,
+        at: Option<(usize, usize)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !zoom_modifier || dy == 0.0 {
             return false;
         }
-        self.zoom_by(if dy > 0.0 { 1 } else { -1 }, cx);
+        let delta = if dy > 0.0 { 1 } else { -1 };
+        match at {
+            Some(sheet_px) => self.zoom_at_sheet_px(delta, sheet_px, cx),
+            None => self.zoom_by(delta, cx),
+        }
         true
     }
 
@@ -1162,6 +1260,10 @@ impl TilesetPanel {
         modifiers: gpui::Modifiers,
         cx: &mut Context<Self>,
     ) {
+        if matches!(&self.state, ViewerState::Ready(open) if open.pan_drag.is_some()) {
+            self.pan_to(pos, cx);
+            return;
+        }
         let hover = self.sheet_px_at(pos);
         if let ViewerState::Ready(open) = &mut self.state {
             open.shape_filled = modifiers.shift;
@@ -1595,6 +1697,10 @@ impl TilesetPanel {
     /// Release: a shape drag commits (shift = filled); any other gesture
     /// closes its stroke.
     fn on_sheet_mouse_up(&mut self, shift: bool, cx: &mut Context<Self>) {
+        if matches!(&self.state, ViewerState::Ready(open) if open.pan_drag.is_some()) {
+            self.end_pan(cx);
+            return;
+        }
         let (shape, moved) = match &mut self.state {
             ViewerState::Ready(open) if open.painting => {
                 open.painting = false;
@@ -1924,9 +2030,11 @@ impl TilesetPanel {
                                             |this, event: &ScrollWheelEvent, _, cx| {
                                                 let dy =
                                                     f32::from(event.delta.pixel_delta(px(20.)).y);
+                                                let at = this.sheet_px_at(event.position);
                                                 if this.on_sheet_scroll(
                                                     dy,
                                                     event.modifiers.control,
+                                                    at,
                                                     cx,
                                                 ) {
                                                     cx.stop_propagation();
@@ -2568,11 +2676,21 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &UseLine, _, cx| this.set_tool(Tool::Line, cx)))
             .on_action(cx.listener(|this, _: &UseRect, _, cx| this.set_tool(Tool::Rect, cx)))
             .on_action(cx.listener(|this, _: &UseEllipse, _, cx| this.set_tool(Tool::Ellipse, cx)))
-            .on_mouse_down_out(
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.clear_selection_on_click_out(cx)
-                }),
-            )
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.clear_selection_on_click_out(cx);
+                // A press elsewhere means we will never see the space-up.
+                this.set_space_held(false, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "space" {
+                    this.set_space_held(true, cx);
+                }
+            }))
+            .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _, cx| {
+                if event.keystroke.key == "space" {
+                    this.set_space_held(false, cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &SelectWholeSheet, _window, cx| this.select_whole_sheet(cx)),
             )
@@ -5226,20 +5344,131 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let before = ready(panel).zoom;
             assert!(
-                !panel.on_sheet_scroll(20.0, false, cx),
+                !panel.on_sheet_scroll(20.0, false, None, cx),
                 "plain wheel declines"
             );
             assert_eq!(ready(panel).zoom, before, "so the container can scroll");
 
-            assert!(panel.on_sheet_scroll(20.0, true, cx));
+            assert!(panel.on_sheet_scroll(20.0, true, None, cx));
             assert_eq!(ready(panel).zoom, before + 1);
-            assert!(panel.on_sheet_scroll(-20.0, true, cx));
+            assert!(panel.on_sheet_scroll(-20.0, true, None, cx));
             assert_eq!(ready(panel).zoom, before);
 
             assert!(
-                !panel.on_sheet_scroll(0.0, true, cx),
+                !panel.on_sheet_scroll(0.0, true, None, cx),
                 "a zero delta is not a zoom"
             );
+        });
+    }
+
+    /// Zooming kept the scroll offset, so the view lurched toward the
+    /// origin on every step and took whatever you were working on with it.
+    #[gpui::test]
+    async fn test_zoom_keeps_the_sheet_pixel_under_the_cursor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            let before = ready(panel).zoom;
+            // Screen position of sheet pixel (20, 6) before the zoom.
+            let anchored = |panel: &TilesetPanel| {
+                let open = ready(panel);
+                let o = open.scroll.offset();
+                (
+                    f32::from(o.x) + 20.0 * open.zoom as f32,
+                    f32::from(o.y) + 6.0 * open.zoom as f32,
+                )
+            };
+            let at = anchored(panel);
+
+            panel.zoom_at_sheet_px(1, (20, 6), cx);
+            assert_eq!(ready(panel).zoom, before + 1, "it did zoom");
+            let after = anchored(panel);
+            assert!(
+                (after.0 - at.0).abs() < 0.01 && (after.1 - at.1).abs() < 0.01,
+                "the pixel stayed put: {at:?} -> {after:?}"
+            );
+        });
+    }
+
+    /// Offsets are negative-or-zero, so anchoring must never scroll the
+    /// sheet away from its own origin.
+    #[gpui::test]
+    async fn test_zoom_anchoring_never_pushes_past_the_origin(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.zoom_at_sheet_px(-1, (40, 12), cx);
+            let o = ready(panel).scroll.offset();
+            assert!(f32::from(o.x) <= 0.0 && f32::from(o.y) <= 0.0, "{o:?}");
+        });
+    }
+
+    /// Space turns a press into a pan instead of a paint, and the sheet
+    /// follows the cursor one-to-one.
+    #[gpui::test]
+    async fn test_space_drag_pans_instead_of_painting(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            panel.set_space_held(true, cx);
+
+            let start = pixel_pos(ready(panel), 1, 3, 3);
+            panel.on_sheet_click(start, 1, gpui::Modifiers::default(), false, cx);
+            assert!(ready(panel).pan_drag.is_some(), "a pan began");
+            assert!(!ready(panel).store.state().dirty, "and it painted nothing");
+
+            // Drag left/up: the offset follows by the same delta, clamped.
+            panel.on_sheet_mouse_move(
+                point(start.x - px(30.), start.y - px(10.)),
+                gpui::Modifiers::default(),
+                cx,
+            );
+            let o = ready(panel).scroll.offset();
+            assert_eq!(f32::from(o.x), -30.0);
+            assert_eq!(f32::from(o.y), -10.0);
+
+            panel.on_sheet_mouse_up(false, cx);
+            assert!(ready(panel).pan_drag.is_none(), "release ends the pan");
+        });
+    }
+
+    /// Releasing space anywhere ends a pan, so a release off the sheet
+    /// cannot strand the drag and swallow the next press.
+    #[gpui::test]
+    async fn test_releasing_space_ends_a_pan_in_flight(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_space_held(true, cx);
+            panel.on_sheet_click(
+                pixel_pos(ready(panel), 0, 1, 1),
+                1,
+                gpui::Modifiers::default(),
+                false,
+                cx,
+            );
+            assert!(ready(panel).pan_drag.is_some());
+
+            panel.set_space_held(false, cx);
+            assert!(ready(panel).pan_drag.is_none(), "the pan is gone");
+            assert!(!ready(panel).space_held);
+
+            // And a normal press paints again.
+            panel.select_slot(2, cx);
+            panel.on_sheet_click(
+                pixel_pos(ready(panel), 0, 1, 1),
+                1,
+                gpui::Modifiers::default(),
+                false,
+                cx,
+            );
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(0, 1, 1)], 2);
         });
     }
 
