@@ -605,6 +605,19 @@ impl TilesetPanel {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn test_is_floating(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.float.is_some())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_tile_count(&self) -> usize {
+        match &self.state {
+            ViewerState::Ready(open) => open.store.tile_count(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn test_is_dirty(&self) -> bool {
         matches!(&self.state, ViewerState::Ready(open) if open.store.dirty())
     }

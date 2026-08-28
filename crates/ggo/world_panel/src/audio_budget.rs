@@ -40,12 +40,17 @@ pub fn audio_stems(state: &WorldState, schemas: &[ComponentSchema]) -> Vec<Strin
     let audio_fields: Vec<(&str, &str)> = schemas
         .iter()
         .flat_map(|schema| {
-            schema.fields.iter().filter_map(move |field| match &field.kind {
-                FieldKind::Asset(ext) if AUDIO_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) => {
-                    Some((schema.name.as_str(), field.name.as_str()))
-                }
-                _ => None,
-            })
+            schema
+                .fields
+                .iter()
+                .filter_map(move |field| match &field.kind {
+                    FieldKind::Asset(ext)
+                        if AUDIO_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) =>
+                    {
+                        Some((schema.name.as_str(), field.name.as_str()))
+                    }
+                    _ => None,
+                })
         })
         .collect();
     let mut stems = std::collections::BTreeSet::new();
@@ -253,7 +258,10 @@ mod tests {
         };
         let blob = ggo_audio::bake(&decoded, 16_000);
         ggo_audio::write_adp(dir.path(), "sfx/jump.adp", &blob).unwrap();
-        assert_eq!(size_stem(dir.path(), "sfx/jump"), Some((16_000 / 120 + 1) * 64));
+        assert_eq!(
+            size_stem(dir.path(), "sfx/jump"),
+            Some((16_000 / 120 + 1) * 64)
+        );
 
         // A raw wav at 32 kHz bakes at the 16 kHz SFX rate: 8000 samples.
         let mut wav = Vec::new();
@@ -273,7 +281,10 @@ mod tests {
         wav.extend_from_slice(&data);
         std::fs::create_dir_all(dir.path().join("sfx")).unwrap();
         std::fs::write(dir.path().join("sfx/step.wav"), wav).unwrap();
-        assert_eq!(size_stem(dir.path(), "sfx/step"), Some((8_000 / 120 + 1) * 64));
+        assert_eq!(
+            size_stem(dir.path(), "sfx/step"),
+            Some((8_000 / 120 + 1) * 64)
+        );
 
         assert_eq!(size_stem(dir.path(), "sfx/nope"), None);
     }

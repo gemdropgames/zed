@@ -103,6 +103,10 @@ mod tests {
         let names = vec!["idle".to_string(), String::new()];
         assert_eq!(frame_label(&names, 0), "idle");
         assert_eq!(frame_label(&names, 1), "Frame 2", "empty name falls back");
-        assert_eq!(frame_label(&names, 5), "Frame 6", "past the list falls back");
+        assert_eq!(
+            frame_label(&names, 5),
+            "Frame 6",
+            "past the list falls back"
+        );
     }
 }

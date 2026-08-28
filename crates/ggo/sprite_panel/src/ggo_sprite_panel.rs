@@ -40,6 +40,7 @@ mod editor_meta;
 mod edits;
 mod loader;
 mod sprite_item;
+pub use sprite_item::SpriteEditorItem;
 mod onion;
 mod playback;
 mod tiles;
@@ -53,9 +54,9 @@ use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable,
-    IntoElement, KeyContext, MouseButton, MouseDownEvent, ParentElement, Pixels,
-    Render, RenderImage, Styled, Subscription, Task, WeakEntity, Window, actions, div, img, px,
+    App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement, KeyContext,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Render, RenderImage, Styled, Subscription,
+    Task, WeakEntity, Window, actions, div, img, px,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -90,7 +91,6 @@ actions!(
     ]
 );
 
-
 /// The panel's key-dispatch context identifier. [`dispatch_context`]
 /// additionally stamps `editing`/`not_editing` (project_panel's pattern)
 /// so plain-key bindings (space) can be scoped away from focused text
@@ -98,7 +98,6 @@ actions!(
 ///
 /// [`dispatch_context`]: SpritePanel::dispatch_context
 const KEY_CONTEXT: &str = "GgoSpritePanel";
-
 
 /// Frame-strip thumbnail box (px, square -- frames fit inside it via
 /// `playback::fit_size`).
@@ -130,7 +129,6 @@ const CLIPS_WIDTH: Pixels = px(148.);
 const TICK: Duration = Duration::from_millis(16);
 
 pub fn init(cx: &mut App) {
-
     // Explorer-driven routing: clicking a `.spr` in the project panel loads
     // it HERE instead of opening a (binary, unreadable) editor tab. This is
     // the panel's only way in -- there is no in-panel file picker.
@@ -140,7 +138,6 @@ pub fn init(cx: &mut App) {
     // menu can't: Duplicate (which has to rewrite the copy's sidecar rels,
     // not just copy bytes) and Delete.
     workspace::register_context_menu_contributor(cx, contribute_sprite_menu);
-
 }
 
 /// The sprite extension this panel claims from the file explorer.
@@ -454,9 +451,9 @@ fn sprite_item_entry_handler(
                 None => {
                     let weak = workspace.weak_handle();
                     let item = match target_rel.clone() {
-                        Some(rel) => cx.new(|cx| {
-                            sprite_item::SpriteEditorItem::new(rel, weak, window, cx)
-                        }),
+                        Some(rel) => {
+                            cx.new(|cx| sprite_item::SpriteEditorItem::new(rel, weak, window, cx))
+                        }
                         None => cx.new(|cx| sprite_item::SpriteEditorItem::new_empty(weak, cx)),
                     };
                     workspace.add_item_to_active_pane(
@@ -856,7 +853,6 @@ fn rename_seed(source_rel: &str) -> String {
         .unwrap_or(file)
         .to_string()
 }
-
 
 // ------------------------------------------------------------- view state
 
@@ -1907,7 +1903,10 @@ impl SpritePanel {
         if open.active_clip.is_some_and(|c| c >= clip_count) {
             open.active_clip = None;
         }
-        if open.frame_settings.is_some_and(|(clip, _)| clip >= clip_count) {
+        if open
+            .frame_settings
+            .is_some_and(|(clip, _)| clip >= clip_count)
+        {
             // The popup's owning clip vanished under an undo/delete.
             open.frame_settings = None;
         }
@@ -2287,7 +2286,10 @@ impl SpritePanel {
             frame_names: open.frame_names.clone(),
         };
         if let Err(e) = editor_meta::save(&open.root, &open.rel_path, &meta) {
-            log::error!("GGO: failed to write editor sidecar for {}: {e}", open.rel_path);
+            log::error!(
+                "GGO: failed to write editor sidecar for {}: {e}",
+                open.rel_path
+            );
         }
     }
 
@@ -2312,11 +2314,7 @@ impl SpritePanel {
             return; // blank or vanished tile -- not pickable
         };
         let rc = (display_ix % strip.cols, display_ix / strip.cols);
-        open.selection = if open
-            .selection
-            .as_ref()
-            .and_then(tiles::TileBlock::single)
-            == Some(tile)
+        open.selection = if open.selection.as_ref().and_then(tiles::TileBlock::single) == Some(tile)
         {
             None
         } else {
@@ -2337,8 +2335,8 @@ impl SpritePanel {
         let local_x = f32::from(position.x - bounds.origin.x);
         let local_y = f32::from(position.y - bounds.origin.y);
         let col = ((local_x / PICKER_CELL_PX).floor().max(0.) as usize).min(strip.cols - 1);
-        let row = ((local_y / PICKER_CELL_PX).floor().max(0.) as usize)
-            .min(strip.rows.saturating_sub(1));
+        let row =
+            ((local_y / PICKER_CELL_PX).floor().max(0.) as usize).min(strip.rows.saturating_sub(1));
         Some((col, row))
     }
 
@@ -2772,16 +2770,18 @@ impl SpritePanel {
                 // transform; unparsable input is dropped and the editor
                 // re-syncs from the doc (the duration editor's revert).
                 let merged = match target {
-                    EditTarget::Rot => edits::parse_angle_deg(&text).map(|angle256| {
-                        FrameTransform {
+                    EditTarget::Rot => {
+                        edits::parse_angle_deg(&text).map(|angle256| FrameTransform {
                             angle256,
                             ..current
-                        }
-                    }),
-                    EditTarget::ScaleX => edits::parse_fixed88(&text)
-                        .map(|sx| FrameTransform { sx, ..current }),
-                    EditTarget::ScaleY => edits::parse_fixed88(&text)
-                        .map(|sy| FrameTransform { sy, ..current }),
+                        })
+                    }
+                    EditTarget::ScaleX => {
+                        edits::parse_fixed88(&text).map(|sx| FrameTransform { sx, ..current })
+                    }
+                    EditTarget::ScaleY => {
+                        edits::parse_fixed88(&text).map(|sy| FrameTransform { sy, ..current })
+                    }
                     EditTarget::ShearX => edits::parse_fixed88(&text)
                         .map(|shear_x| FrameTransform { shear_x, ..current }),
                     _ => edits::parse_fixed88(&text)
@@ -3298,7 +3298,8 @@ impl SpritePanel {
                 .filter_map(|ghost| {
                     let image = open.ghost_image(ghost.dist, ghost.idx)?;
                     Some(
-                        img(image).nearest(true)
+                        img(image)
+                            .nearest(true)
                             .absolute()
                             .w(px(fit_w))
                             .h(px(fit_h))
@@ -3353,9 +3354,7 @@ impl SpritePanel {
             .pool_strip
             .as_ref()
             .map_or(loader::PICKER_COLS, |strip| strip.cols);
-        let width = px(
-            (PICKER_CELL_PX * sheet_cols as f32 + 12.).max(f32::from(PICKER_WIDTH)),
-        );
+        let width = px((PICKER_CELL_PX * sheet_cols as f32 + 12.).max(f32::from(PICKER_WIDTH)));
         let picker_cols = open.picker_cols;
         let mut column = v_flex()
             .flex_none()
@@ -3803,7 +3802,11 @@ impl SpritePanel {
                     .p_0p5()
                     .border_1()
                     .rounded_sm()
-                    .border_color(if open.selected_frame == ix { accent } else { border })
+                    .border_color(if open.selected_frame == ix {
+                        accent
+                    } else {
+                        border
+                    })
                     .debug_selector(|| format!("ggo-sprite-seq-{clip_ix}-{seq_pos}"))
                     .child(
                         div()
@@ -3830,9 +3833,11 @@ impl SpritePanel {
                                 )
                                 .icon_size(IconSize::XSmall)
                                 .tooltip(ui::Tooltip::text("Duplicate frame"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.duplicate_frame_in_clip(clip_ix, seq_pos, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.duplicate_frame_in_clip(clip_ix, seq_pos, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 IconButton::new(
@@ -3841,9 +3846,11 @@ impl SpritePanel {
                                 )
                                 .icon_size(IconSize::XSmall)
                                 .tooltip(ui::Tooltip::text("Delete frame"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_frame_in_clip(clip_ix, seq_pos, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.delete_frame_in_clip(clip_ix, seq_pos, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 IconButton::new(
@@ -3852,14 +3859,16 @@ impl SpritePanel {
                                 )
                                 .icon_size(IconSize::XSmall)
                                 .tooltip(ui::Tooltip::text("Frame settings"))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_frame_settings(
-                                        clip_ix,
-                                        ix,
-                                        window.mouse_position(),
-                                        cx,
-                                    );
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.open_frame_settings(
+                                            clip_ix,
+                                            ix,
+                                            window.mouse_position(),
+                                            cx,
+                                        );
+                                    },
+                                )),
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.select_frame(ix, cx)))
@@ -3915,7 +3924,11 @@ impl SpritePanel {
             .px_1()
             .pt_1()
             .items_center()
-            .child(Label::new("Frames").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new("Frames")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
             .child(
                 IconButton::new("ggo-sprite-frame-add", IconName::Plus)
                     .icon_size(IconSize::Small)
@@ -3941,67 +3954,65 @@ impl SpritePanel {
             .min_h_0()
             .p_1()
             .overflow_y_scroll()
-            .child(
-                v_flex()
-                    .gap_1()
-                    .children(edits::library_indices(&state.frames).into_iter().map(|ix| {
-                        let thumb = open.frames.get(ix).map(|image| {
-                            let (w, h) = image_px_size(image);
-                            let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
-                            img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
-                        });
-                        let label = editor_meta::frame_label(names, ix);
-                        v_flex()
-                            .id(("ggo-sprite-frame", ix))
-                            // Test-only bounds hook (a no-op in release
-                            // builds): the drag-reorder test aims real
-                            // mouse events at the cells.
-                            .debug_selector(|| format!("ggo-sprite-frame-{ix}"))
-                            .items_center()
-                            .gap_0p5()
-                            .p_0p5()
-                            .border_1()
-                            .rounded_sm()
-                            .border_color(if ix == selected { accent } else { border })
-                            .child(
-                                div()
-                                    .w(px(THUMB_PX))
-                                    .h(px(THUMB_PX))
-                                    .flex()
-                                    .justify_center()
-                                    .items_center()
-                                    .children(thumb),
-                            )
-                            .child(
-                                Label::new(label.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(if names.get(ix).is_some_and(|n| !n.is_empty()) {
-                                        Color::Default
-                                    } else {
-                                        Color::Muted
-                                    }),
-                            )
-                            // Single click selects; double click names.
-                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+            .child(v_flex().gap_1().children(
+                edits::library_indices(&state.frames).into_iter().map(|ix| {
+                    let thumb = open.frames.get(ix).map(|image| {
+                        let (w, h) = image_px_size(image);
+                        let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
+                        img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
+                    });
+                    let label = editor_meta::frame_label(names, ix);
+                    v_flex()
+                        .id(("ggo-sprite-frame", ix))
+                        // Test-only bounds hook (a no-op in release
+                        // builds): the drag-reorder test aims real
+                        // mouse events at the cells.
+                        .debug_selector(|| format!("ggo-sprite-frame-{ix}"))
+                        .items_center()
+                        .gap_0p5()
+                        .p_0p5()
+                        .border_1()
+                        .rounded_sm()
+                        .border_color(if ix == selected { accent } else { border })
+                        .child(
+                            div()
+                                .w(px(THUMB_PX))
+                                .h(px(THUMB_PX))
+                                .flex()
+                                .justify_center()
+                                .items_center()
+                                .children(thumb),
+                        )
+                        .child(Label::new(label.clone()).size(LabelSize::XSmall).color(
+                            if names.get(ix).is_some_and(|n| !n.is_empty()) {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            },
+                        ))
+                        // Single click selects; double click names.
+                        .on_click(
+                            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                 if event.click_count() > 1 {
                                     this.begin_name_frame(ix, window, cx);
                                 } else {
                                     this.select_frame(ix, cx);
                                 }
-                            }))
-                            .on_drag(
-                                DraggedFrame {
-                                    ix,
-                                    label: label.into(),
-                                },
-                                |frame, _, _, cx| cx.new(|_| frame.clone()),
-                            )
-                            .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
-                            .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
-                                this.move_frame_to(dragged.ix, ix, cx);
-                            }))
-                    })),
-            );
+                            }),
+                        )
+                        .on_drag(
+                            DraggedFrame {
+                                ix,
+                                label: label.into(),
+                            },
+                            |frame, _, _, cx| cx.new(|_| frame.clone()),
+                        )
+                        .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
+                        .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
+                            this.move_frame_to(dragged.ix, ix, cx);
+                        }))
+                }),
+            ));
         v_flex()
             .flex_none()
             .w(CLIPS_WIDTH)
@@ -4035,7 +4046,9 @@ impl SpritePanel {
                 .items_center()
                 .child(
                     div().w(px(28.)).child(
-                        Label::new(label).size(LabelSize::XSmall).color(Color::Muted),
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     ),
                 )
                 .child(
@@ -4056,10 +4069,7 @@ impl SpritePanel {
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().elevated_surface_background)
             .shadow_md()
-            .child(
-                Label::new(format!("Frame {}", open.selected_frame + 1))
-                    .size(LabelSize::XSmall),
-            )
+            .child(Label::new(format!("Frame {}", open.selected_frame + 1)).size(LabelSize::XSmall))
             .child(labelled("ms", 56., EditTarget::Duration))
             .child(labelled("rot", 48., EditTarget::Rot))
             .child(labelled("sx", 56., EditTarget::ScaleX))
@@ -4228,7 +4238,6 @@ impl Focusable for SpritePanel {
     }
 }
 
-
 /// The `.spr`/`.til`/`.pal` fixture trio the crate's tests (and
 /// `sprite_item`'s) write to a real-fs temp project: a 1x1-tile,
 /// 2-frame, 2-tile sprite with one clip.
@@ -4301,11 +4310,22 @@ pub(crate) mod test_fixtures {
             h_tiles: 1,
             pool_shared: false,
         };
-        save_sprite(root, "sprites/multi.spr", &state, "sprites/multi.til", "sprites/multi.pal")
-            .unwrap();
+        save_sprite(
+            root,
+            "sprites/multi.spr",
+            &state,
+            "sprites/multi.til",
+            "sprites/multi.pal",
+        )
+        .unwrap();
     }
 
-    pub(crate) fn save_fixture(root: &std::path::Path, spr_rel: &str, til_rel: &str, pal_rel: &str) {
+    pub(crate) fn save_fixture(
+        root: &std::path::Path,
+        spr_rel: &str,
+        til_rel: &str,
+        pal_rel: &str,
+    ) {
         let mut pool = vec![0u8; 2 * TILE_BYTES];
         for b in &mut pool[TILE_BYTES..] {
             *b = 0x11; // both nibbles = palette index 1
@@ -4345,7 +4365,9 @@ pub(crate) mod test_fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::test_fixtures::{save_fixture, write_sprite_fixture, write_sprite_fixture_at, write_sprite_fixture_named};
+    use super::test_fixtures::{
+        save_fixture, write_sprite_fixture, write_sprite_fixture_at, write_sprite_fixture_named,
+    };
     use super::*;
     use ggo_worldlib::sprites::cow::ClipEdit;
     use ggo_worldlib::sprites::hw::{TILE_BYTES, TILE_PX};
@@ -4659,7 +4681,10 @@ mod tests {
     /// The single selected tile, in the shape the pre-marquee tests
     /// asserted -- `None` when nothing (or a bigger block) is selected.
     fn selected_single(panel: &SpritePanel) -> Option<u16> {
-        ready(panel).selection.as_ref().and_then(tiles::TileBlock::single)
+        ready(panel)
+            .selection
+            .as_ref()
+            .and_then(tiles::TileBlock::single)
     }
 
     fn ready(panel: &SpritePanel) -> &OpenSprite {
@@ -4847,7 +4872,10 @@ mod tests {
                 cx,
             )
         });
-        assert!(claimed, "a .spr must be claimed, suppressing the raw editor");
+        assert!(
+            claimed,
+            "a .spr must be claimed, suppressing the raw editor"
+        );
         cx.run_until_parked();
         assert_eq!(open_rels(&workspace, cx), vec!["sprites/hero.spr"]);
 
@@ -5466,7 +5494,10 @@ mod tests {
             panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
             panel.on_picker_up(gpui::point(px(2.), px(2.)), cx);
             assert_eq!(
-                ready(panel).selection.as_ref().and_then(tiles::TileBlock::single),
+                ready(panel)
+                    .selection
+                    .as_ref()
+                    .and_then(tiles::TileBlock::single),
                 Some(1),
                 "plain click selects the single POOL tile under the cell"
             );
@@ -5515,8 +5546,6 @@ mod tests {
             assert_eq!(ready(panel).store.state().frames.len(), 3);
         });
     }
-
-
 
     /// The per-frame duplicate/delete buttons on the clip sequence:
     /// duplicate inserts a copy right after its frame (extending the
@@ -5618,7 +5647,6 @@ mod tests {
         });
     }
 
-
     /// Sequence thumbnails render the frame's TRANSFORM, not the legacy
     /// composite: a rotated frame's thumb image is the doubled canvas
     /// (cached per frame until the next doc mutation), identity frames
@@ -5636,7 +5664,11 @@ mod tests {
             let transformed = open.frame_image(1).expect("composes");
             let (w, h) = image_px_size(&transformed);
             let (lw, lh) = image_px_size(&legacy);
-            assert_eq!((w, h), (lw * 2, lh * 2), "rotated thumb is the doubled canvas");
+            assert_eq!(
+                (w, h),
+                (lw * 2, lh * 2),
+                "rotated thumb is the doubled canvas"
+            );
             let again = open.frame_image(1).expect("composes");
             assert!(Arc::ptr_eq(&transformed, &again), "cached per frame");
             let identity = open.frame_image(0).expect("identity frame");
@@ -6102,9 +6134,7 @@ mod tests {
     /// panel-depth binding from matching, so playback must NOT start and
     /// the editor must receive the space as plain text.
     #[gpui::test]
-    async fn test_space_keystroke_toggles_playback_only_when_not_editing(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_space_keystroke_toggles_playback_only_when_not_editing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
 
@@ -6249,9 +6279,7 @@ mod tests {
     /// `start_offset_ms` into frame 1's window (100..300ms) and lets the
     /// REAL tick path do the recompute.
     #[gpui::test]
-    async fn test_toggle_play_runs_the_transport_and_advances_on_ticks(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_toggle_play_runs_the_transport_and_advances_on_ticks(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
@@ -6286,7 +6314,11 @@ mod tests {
             let open = ready(panel);
             assert!(open.playing.is_none(), "toggle_play again stops it");
             assert!(open._tick_task.is_none(), "the tick loop is dropped");
-            assert_eq!(open.shown_frame(), 0, "the preview falls back to the selection");
+            assert_eq!(
+                open.shown_frame(),
+                0,
+                "the preview falls back to the selection"
+            );
         });
     }
 
@@ -6322,7 +6354,11 @@ mod tests {
             .expect("clip 0's sequence is painted with no activation step");
 
         cx.simulate_mouse_move(library0.center(), None, gpui::Modifiers::default());
-        cx.simulate_mouse_down(library0.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_down(
+            library0.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
         cx.simulate_mouse_move(seq0.center(), MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_move(seq0.center(), MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_up(seq0.center(), MouseButton::Left, gpui::Modifiers::default());
@@ -6370,13 +6406,29 @@ mod tests {
             .expect("frame 1's strip cell is painted");
 
         cx.simulate_mouse_move(cell0.center(), None, gpui::Modifiers::default());
-        cx.simulate_mouse_down(cell0.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_down(
+            cell0.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
         // The first held move (past the 2px threshold) starts the drag
         // and refreshes; the second hovers frame 1's freshly painted
         // hitbox so the release lands on its drop listener.
-        cx.simulate_mouse_move(cell1.center(), MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_move(cell1.center(), MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_up(cell1.center(), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            cell1.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            cell1.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            cell1.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
 
         panel.read_with(cx, |panel, _| {
             let open = ready(panel);
@@ -7933,7 +7985,10 @@ mod tests {
     async fn test_cancelling_the_close_keeps_the_dirty_sprite_tab(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, pane, panel, cx) = dirty_sprite_tab(cx, dir.path()).await;
-        let before = open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles;
+        let before = open_sprite(dir.path(), "sprites/hero.spr")
+            .expect("trio")
+            .state
+            .w_tiles;
 
         let close = pane.update_in(cx, |pane, window, cx| {
             pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
@@ -7952,7 +8007,10 @@ mod tests {
             );
         });
         assert_eq!(
-            open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles,
+            open_sprite(dir.path(), "sprites/hero.spr")
+                .expect("trio")
+                .state
+                .w_tiles,
             before,
             "nothing was written"
         );
@@ -7963,7 +8021,10 @@ mod tests {
     async fn test_discarding_closes_the_sprite_tab_without_writing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, pane, _panel, cx) = dirty_sprite_tab(cx, dir.path()).await;
-        let before = open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles;
+        let before = open_sprite(dir.path(), "sprites/hero.spr")
+            .expect("trio")
+            .state
+            .w_tiles;
 
         let close = pane.update_in(cx, |pane, window, cx| {
             pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
@@ -7976,7 +8037,10 @@ mod tests {
 
         assert_eq!(open_sprite_tabs(&workspace, cx), 0, "the tab closed");
         assert_eq!(
-            open_sprite(dir.path(), "sprites/hero.spr").expect("trio").state.w_tiles,
+            open_sprite(dir.path(), "sprites/hero.spr")
+                .expect("trio")
+                .state
+                .w_tiles,
             before,
             "discard writes nothing"
         );

@@ -59,7 +59,6 @@ pub fn fit_size(w: u32, h: u32, max_px: f32) -> (f32, f32) {
     (w as f32 * scale, h as f32 * scale)
 }
 
-
 /// The on-screen size for the big preview's image: the FRAME's
 /// dimensions pick the fit scale (into `box_px`), and the image -- which
 /// may be the transform composer's doubled canvas -- displays at that
@@ -195,11 +194,17 @@ mod tests {
     #[test]
     fn preview_display_size_keeps_the_texel_scale_constant() {
         // Identity: image == frame -> the plain fit.
-        assert_eq!(preview_display_size(16, 16, 16, 16, 240.0), fit_size(16, 16, 240.0));
+        assert_eq!(
+            preview_display_size(16, 16, 16, 16, 240.0),
+            fit_size(16, 16, 240.0)
+        );
         // A doubled (transformed) canvas shows at exactly TWICE the
         // identity fit -- same pixels-per-texel, bigger canvas -- rather
         // than being squeezed into the same box at half scale.
         let (fw, fh) = fit_size(16, 16, 240.0);
-        assert_eq!(preview_display_size(32, 32, 16, 16, 240.0), (fw * 2.0, fh * 2.0));
+        assert_eq!(
+            preview_display_size(32, 32, 16, 16, 240.0),
+            (fw * 2.0, fh * 2.0)
+        );
     }
 }

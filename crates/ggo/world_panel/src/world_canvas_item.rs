@@ -38,7 +38,6 @@ impl WorldCanvasItem {
             focus_handle: cx.focus_handle(),
         }
     }
-
 }
 
 impl EventEmitter<WorldCanvasEvent> for WorldCanvasItem {}
@@ -228,8 +227,7 @@ mod tests {
             })
         });
         save.await.expect("a healthy save must succeed");
-        let on_disk =
-            ggo_worldlib::world_file::read_world(dir.path(), "worlds/test.toml").unwrap();
+        let on_disk = ggo_worldlib::world_file::read_world(dir.path(), "worlds/test.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             serde_json::json!([50, 60]),
@@ -253,7 +251,10 @@ mod tests {
                 },
                 cx,
             );
-            assert!(panel.dirty_world_name().is_some(), "op should dirty the doc");
+            assert!(
+                panel.dirty_world_name().is_some(),
+                "op should dirty the doc"
+            );
         });
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"not a directory").unwrap();

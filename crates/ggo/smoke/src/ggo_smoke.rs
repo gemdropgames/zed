@@ -263,6 +263,501 @@ mod tests {
         assert_eq!(opened.state.frames.len(), 1, "one 16x16 frame at 1 tile");
     }
 
+    /// A hand-built two-tile tileset -- tile 0 transparent, tile 1 solid
+    /// slot 1 -- written through worldlib and opened through the fork's
+    /// path-open interceptor, exactly as a click in the project panel
+    /// would. Decoupled from the import quantizer so the float journeys
+    /// assert against known pixels.
+    async fn open_fixture_tileset(
+        workspace: &Entity<Workspace>,
+        root: &Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<ggo_tileset_panel::TilesetPanel> {
+        let tile_pixels = ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+        let mut indices = vec![0u8; 2 * tile_pixels];
+        for value in &mut indices[tile_pixels..] {
+            *value = 1;
+        }
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800;
+        palette[2] = 0x07E0;
+        ggo_worldlib::sprites::io::save_tileset(root, "assets/art/fx.til", &indices, 2, &palette)
+            .unwrap();
+
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project::ProjectPath {
+                    worktree_id,
+                    path: path::rel_path::rel_path("assets/art/fx.til").into_arc(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(claimed, "the tileset interceptor claimed the fixture");
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_tileset_panel::TilesetEditorItem>(cx)
+                .next()
+                .expect("tileset tab")
+                .read(cx)
+                .test_panel()
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert!(panel.test_is_ready()));
+        panel
+    }
+
+    /// Screen point of tile 1's pixel `(x, y)` on the fixture sheet.
+    fn tile1_at(
+        panel: &Entity<ggo_tileset_panel::TilesetPanel>,
+        cx: &mut gpui::VisualTestContext,
+        x: f32,
+        y: f32,
+    ) -> gpui::Point<gpui::Pixels> {
+        panel.read_with(cx, |panel, _| {
+            let bounds = panel.test_sheet_bounds().expect("sheet painted");
+            let zoom = panel.test_zoom() as f32;
+            gpui::point(
+                bounds.origin.x + gpui::px((16.0 + x + 0.5) * zoom),
+                bounds.origin.y + gpui::px((y + 0.5) * zoom),
+            )
+        })
+    }
+
+    /// Drag a 2x2 marquee over tile 1's top-left with the Select tool,
+    /// through the real keymap (`m`) and real mouse events.
+    fn marquee_tile1(
+        panel: &Entity<ggo_tileset_panel::TilesetPanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        cx.simulate_keystrokes("m");
+        let from = tile1_at(panel, cx, 0.0, 0.0);
+        let to = tile1_at(panel, cx, 1.0, 1.0);
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default());
+    }
+
+    /// Float lifecycle, cancel branch: arrow keys lift the marquee into a
+    /// float, escape drops it, and the document was never touched.
+    #[gpui::test]
+    async fn smoke_float_escape_cancels_without_touching_the_document(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        marquee_tile1(&panel, cx);
+        cx.simulate_keystrokes("right right right");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_floating(), "the nudges lifted a float");
+            assert!(!panel.test_is_dirty(), "without touching the document");
+        });
+
+        cx.simulate_keystrokes("escape");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "escape dropped it");
+            assert!(!panel.test_is_dirty());
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(1), "art untouched");
+        });
+    }
+
+    /// Commit branch: nudge, click away to place, and the whole move is
+    /// ONE undo step through ctrl-z.
+    #[gpui::test]
+    async fn smoke_float_commit_by_click_away_is_one_undo_step(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        marquee_tile1(&panel, cx);
+        cx.simulate_keystrokes("right right right right");
+        let away = tile1_at(&panel, cx, 12.0, 12.0);
+        cx.simulate_mouse_down(away, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(away, gpui::MouseButton::Left, Default::default());
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "the click placed it");
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(0), "source vacated");
+            assert_eq!(panel.test_pixel(1, 4, 0), Some(1), "landed 4 right");
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(1), "ONE undo restored");
+            assert!(!panel.test_is_dirty());
+        });
+    }
+
+    /// Copy branch: alt-drag inside the marquee, place -- the source
+    /// survives, and one undo removes only the copy.
+    #[gpui::test]
+    async fn smoke_float_alt_drag_copies(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        marquee_tile1(&panel, cx);
+        let alt = gpui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        // Drag INTO tile 0's transparent ground, where a landed copy is
+        // distinguishable -- tile 1's own interior is already solid 1.
+        let zoom = panel.read_with(cx, |panel, _| panel.test_zoom()) as f32;
+        let from = tile1_at(&panel, cx, 0.0, 0.0);
+        let to = gpui::point(from.x - gpui::px(8.0 * zoom), from.y);
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, alt);
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default());
+
+        let away = tile1_at(&panel, cx, 12.0, 12.0);
+        cx.simulate_mouse_down(away, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(away, gpui::MouseButton::Left, Default::default());
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(1), "source survived");
+            assert_eq!(panel.test_pixel(0, 8, 0), Some(1), "copy landed in tile 0");
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(0, 8, 0), Some(0), "undo took the copy");
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(1), "and left the source");
+        });
+    }
+
+    /// Swap branch: paint a marker in tile 0, shift-drag tile 1's corner
+    /// onto it, place -- an exact exchange, one undo restores both sides.
+    #[gpui::test]
+    async fn smoke_float_shift_drag_swaps(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        // A slot-2 marker at tile 0 (0,0): `.` steps 1 -> 2 on the keymap.
+        cx.simulate_keystrokes("b .");
+        let marker = {
+            let base = tile1_at(&panel, cx, 0.0, 0.0);
+            gpui::point(
+                base.x - gpui::px(16.0 * panel.read_with(cx, |p, _| p.test_zoom()) as f32),
+                base.y,
+            )
+        };
+        cx.simulate_mouse_down(marker, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(marker, gpui::MouseButton::Left, Default::default());
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(0, 0, 0), Some(2), "marker painted");
+        });
+
+        marquee_tile1(&panel, cx);
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let from = tile1_at(&panel, cx, 0.0, 0.0);
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, shift);
+        cx.simulate_mouse_move(marker, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(marker, gpui::MouseButton::Left, Default::default());
+        let away = tile1_at(&panel, cx, 12.0, 12.0);
+        cx.simulate_mouse_down(away, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(away, gpui::MouseButton::Left, Default::default());
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(0, 0, 0), Some(1), "tile 1's art arrived");
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(2), "the marker went back");
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_pixel(0, 0, 0),
+                Some(2),
+                "one undo undid the swap"
+            );
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(1));
+        });
+    }
+
+    /// Undo-while-floating branch (the review's finding, by keystrokes):
+    /// ctrl-z with a float pending cancels the float and rewinds nothing.
+    #[gpui::test]
+    async fn smoke_float_undo_cancels_the_pending_float(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        // A real prior op that a mis-routed undo would visibly rewind.
+        cx.simulate_keystrokes("b .");
+        let dot = tile1_at(&panel, cx, 14.0, 14.0);
+        cx.simulate_mouse_down(dot, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(dot, gpui::MouseButton::Left, Default::default());
+
+        marquee_tile1(&panel, cx);
+        cx.simulate_keystrokes("right");
+        panel.read_with(cx, |panel, _| assert!(panel.test_is_floating()));
+
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "undo consumed the float");
+            assert_eq!(
+                panel.test_pixel(1, 14, 14),
+                Some(2),
+                "and rewound NOTHING underneath it"
+            );
+        });
+    }
+
+    /// Delete branch: delete with a lifted float blanks its origin in one
+    /// step; duplicate appends a copy of the marquee'd tile.
+    #[gpui::test]
+    async fn smoke_float_delete_blanks_and_duplicate_appends(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        marquee_tile1(&panel, cx);
+        cx.simulate_keystrokes("right delete");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating());
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(0), "origin blanked");
+        });
+        cx.simulate_keystrokes("ctrl-z");
+
+        marquee_tile1(&panel, cx);
+        cx.simulate_keystrokes("ctrl-d");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_tile_count(), 3, "duplicate appended a tile");
+            assert_eq!(panel.test_pixel(2, 0, 0), Some(1), "with tile 1's art");
+        });
+    }
+
+    /// One `ProjectPath` in the primary worktree.
+    fn project_path(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        rel: &str,
+    ) -> project::ProjectPath {
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        project::ProjectPath {
+            worktree_id,
+            path: path::rel_path::rel_path(rel).into_arc(),
+        }
+    }
+
+    /// Offer `rel` to the fork's path-open interceptors, the project
+    /// panel's exact funnel call.
+    fn offer_open(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        rel: &str,
+    ) -> bool {
+        let path = project_path(workspace, cx, rel);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(&path, window, cx)
+        })
+    }
+
+    /// Boot with EVERY panel registered, for the routing journeys.
+    async fn boot_all<'a>(
+        cx: &'a mut TestAppContext,
+        root: &Path,
+    ) -> (Entity<Workspace>, &'a mut gpui::VisualTestContext) {
+        write_project(root);
+        cx.update(|cx| {
+            AppState::test(cx);
+            editor::init(cx);
+            ggo_import_panel::init(cx);
+            ggo_tileset_panel::init(cx);
+            ggo_sprite_panel::init(cx);
+            ggo_map_panel::init(cx);
+            ggo_world_panel::init(cx);
+            ggo_audio_panel::init(cx);
+            ggo_emu_panel::init(cx);
+            ggo_common::bind_default_keymap(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            root,
+            serde_json::json!({
+                "emerald.toml": "",
+                "assets": { "art": { "hero.png": "" }, "notes.txt": "notes\n" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        (workspace, cx)
+    }
+
+    /// The routing spine, every registered claimer at once: each asset
+    /// kind lands in ITS panel's tab, and a plain text file is claimed by
+    /// none of them -- the fall-through that keeps normal editing working
+    /// with the whole fork loaded.
+    #[gpui::test]
+    async fn smoke_every_asset_kind_routes_to_its_panel_and_text_falls_through(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        let root = dir.path();
+
+        // Fixtures for every claimer, written through worldlib where a
+        // real decoder sits behind the tab.
+        let tile_pixels = ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+        ggo_worldlib::sprites::io::save_tileset(
+            root,
+            "assets/art/fx.til",
+            &vec![1u8; tile_pixels],
+            1,
+            &[0u16; 16],
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("assets/maps")).unwrap();
+        ggo_worldlib::sprites::io::save_new_map(root, "assets/maps/lvl.map", 8, 8).unwrap();
+        std::fs::create_dir_all(root.join("assets/audio")).unwrap();
+        std::fs::write(root.join("assets/audio/hit.wav"), b"RIFF").unwrap();
+        std::fs::create_dir_all(root.join("worlds")).unwrap();
+        std::fs::write(root.join("worlds/overworld.toml"), "").unwrap();
+        std::fs::write(root.join("game.cart"), b"").unwrap();
+
+        assert!(offer_open(&workspace, cx, "assets/art/fx.til"), "tileset");
+        assert!(offer_open(&workspace, cx, "assets/maps/lvl.map"), "map");
+        assert!(offer_open(&workspace, cx, "assets/audio/hit.wav"), "audio");
+        assert!(offer_open(&workspace, cx, "worlds/overworld.toml"), "world");
+        assert!(offer_open(&workspace, cx, "game.cart"), "cart");
+        assert!(
+            !offer_open(&workspace, cx, "assets/notes.txt"),
+            "text falls through to the plain editor with the whole fork loaded"
+        );
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_tileset_panel::TilesetEditorItem>(cx)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_map_panel::MapEditorItem>(cx)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_audio_panel::AudioItem>(cx)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_world_panel::WorldCanvasItem>(cx)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_emu_panel::EmulatorItem>(cx)
+                    .count(),
+                1
+            );
+        });
+    }
+
+    /// The sprite pipeline closes its loop: the trio the import wizard
+    /// wrote opens in the sprite panel when its `.spr` is clicked.
+    #[gpui::test]
+    async fn smoke_imported_sprite_opens_in_the_sprite_panel(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+
+        let png = dir.path().join("assets/art/hero.png");
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_external_paths_drop(&gpui::ExternalPaths(vec![png].into()), window, cx)
+        });
+        cx.run_until_parked();
+        let wizard = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_import_panel::ImportItem>(cx)
+                .next()
+                .expect("wizard")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        cx.run_until_parked();
+        let asset_rel = wizard.update(cx, |wizard, cx| {
+            wizard.test_set_as_sprite(true);
+            wizard.test_set_frame_tiles((Some(1), None));
+            wizard.test_commit(cx).expect("commit succeeds")
+        });
+        cx.run_until_parked();
+
+        assert!(
+            offer_open(&workspace, cx, &format!("assets/{asset_rel}")),
+            "the sprite interceptor claims the written .spr"
+        );
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx)
+                    .count(),
+                1,
+                "and the sprite tab exists"
+            );
+        });
+    }
+
+    /// New Map, the authoring path: the blank map worldlib writes opens in
+    /// the map panel, and worldlib reopens what was created.
+    #[gpui::test]
+    async fn smoke_new_map_opens_and_round_trips(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        std::fs::create_dir_all(dir.path().join("assets/maps")).unwrap();
+        ggo_worldlib::sprites::io::save_new_map(dir.path(), "assets/maps/lvl.map", 8, 8).unwrap();
+
+        assert!(offer_open(&workspace, cx, "assets/maps/lvl.map"));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_map_panel::MapEditorItem>(cx)
+                    .count(),
+                1,
+                "the map tab exists"
+            );
+        });
+
+        let reopened = ggo_worldlib::sprites::io::open_map(dir.path(), "assets/maps/lvl.map")
+            .expect("worldlib reopens the new map");
+        assert_eq!((reopened.w, reopened.h), (8, 8));
+    }
+
     /// The journey that crashed the editor this morning: a `.png` dropped
     /// on a pane whose active item is an EDITOR. The drop reaches the
     /// fork's interceptor through `Pane::handle_external_paths_drop` with

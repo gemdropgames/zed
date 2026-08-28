@@ -199,7 +199,12 @@ mod tests {
     fn library_indices_keep_the_first_of_each_unique_map() {
         // Range clips duplicate frames physically; the LIBRARY shows one
         // entry per unique tile map, first occurrence wins.
-        let frames = vec![frame(vec![0]), frame(vec![1]), frame(vec![0]), frame(vec![1])];
+        let frames = vec![
+            frame(vec![0]),
+            frame(vec![1]),
+            frame(vec![0]),
+            frame(vec![1]),
+        ];
         assert_eq!(super::library_indices(&frames), vec![0, 1]);
     }
 

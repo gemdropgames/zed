@@ -28,6 +28,7 @@ mod canvas;
 mod inspector;
 mod loader;
 mod world_canvas_item;
+pub use world_canvas_item::WorldCanvasItem;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -37,17 +38,16 @@ use std::sync::Arc;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    ClipboardItem,
-    Action, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Action, App, Bounds, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task,
     WeakEntity, Window, actions, div, px,
 };
 use serde_json::Value;
 use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, Divider, DropdownMenu, ToggleState};
-use workspace::{SplitDirection, Workspace};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
+use workspace::{SplitDirection, Workspace};
 
 use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
@@ -57,10 +57,10 @@ use ggo_worldlib::render::{
     items_in_rect, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
-use ggo_worldlib::world_file::{self, WorldEntity, fragment_to_toml, parse_fragment};
 use ggo_worldlib::sprites::palette565;
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
 use ggo_worldlib::world_file::write_world;
+use ggo_worldlib::world_file::{self, WorldEntity, fragment_to_toml, parse_fragment};
 use ggo_worldlib::world_files::{self, WorldListing};
 use project::ProjectPath;
 
@@ -134,7 +134,6 @@ const LIST_WIDTH: Pixels = px(140.);
 const PASTE_OFFSET_PX: f64 = 16.0;
 
 pub fn init(cx: &mut App) {
-
     // Explorer-driven routing: clicking a `**/worlds/**/*.toml` in the project
     // panel loads it HERE instead of opening a TOML editor tab. This is the
     // panel's only way in -- there is no in-panel world picker.
@@ -480,7 +479,6 @@ fn delete_world_handler(
     })
 }
 
-
 // ------------------------------------------------------------- view state
 
 /// Pan/zoom + gesture state shared (via `Rc<RefCell>`) between the panel's
@@ -759,7 +757,10 @@ fn move_ops(
         .find(|(t, _)| *t == primary)
         .map(|(_, p)| *p)
         .unwrap_or(primary_pos);
-    let delta = [primary_pos[0] - primary_start[0], primary_pos[1] - primary_start[1]];
+    let delta = [
+        primary_pos[0] - primary_start[0],
+        primary_pos[1] - primary_start[1],
+    ];
     if starts.len() <= 1 {
         return match primary {
             Selection::Entity(entity) => WorldOp::MoveEntity {
@@ -785,7 +786,10 @@ fn move_ops(
 
 /// How many selected instances actually exist (a stale index after an
 /// undo/redo restructure is not something to prompt about).
-fn removable_instances(selected: &[Selection], state: &ggo_worldlib::world_doc::WorldState) -> usize {
+fn removable_instances(
+    selected: &[Selection],
+    state: &ggo_worldlib::world_doc::WorldState,
+) -> usize {
     selected
         .iter()
         .filter(|s| matches!(s, Selection::Instance(i) if *i < state.instances.len()))
@@ -820,7 +824,11 @@ fn remove_selection_ops(
     let ops: Vec<WorldOp> = entities
         .into_iter()
         .map(|index| WorldOp::RemoveEntity { index })
-        .chain(instances.into_iter().map(|index| WorldOp::RemoveInstance { index }))
+        .chain(
+            instances
+                .into_iter()
+                .map(|index| WorldOp::RemoveInstance { index }),
+        )
         .collect();
     (!ops.is_empty()).then_some(WorldOp::Batch(ops))
 }
@@ -1394,7 +1402,8 @@ impl WorldPanel {
         );
         cx.spawn_in(window, async move |this, cx| {
             if confirm.await {
-                this.update(cx, |this, cx| this.delete_selected_now(cx)).ok();
+                this.update(cx, |this, cx| this.delete_selected_now(cx))
+                    .ok();
             }
         })
         .detach();
@@ -1566,13 +1575,12 @@ impl WorldPanel {
         let status = inspector::asset_status(&open.root, &stem, &ext);
         let abs = inspector::asset_abs_path(&open.root, &stem, &ext);
         let rel = match (status, abs, self.project_root.as_ref()) {
-            (inspector::AssetStatus::Resolves, Some(abs), Some(project_root)) => abs
-                .strip_prefix(project_root)
-                .ok()
-                .map(|rel| {
+            (inspector::AssetStatus::Resolves, Some(abs), Some(project_root)) => {
+                abs.strip_prefix(project_root).ok().map(|rel| {
                     rel.to_string_lossy()
                         .replace(std::path::MAIN_SEPARATOR, "/")
-                }),
+                })
+            }
             _ => None,
         };
         Some(AssetFieldView { stem, status, rel })
@@ -2481,7 +2489,11 @@ impl WorldPanel {
     /// Where a paste lands: the group's top-left position goes to the
     /// cursor when it is over the canvas (snapped when Snap is on),
     /// otherwise every item shifts one tile right and down.
-    fn paste_delta(&self, entities: &[WorldEntity], instances: &[world_file::WorldInstance]) -> [f64; 2] {
+    fn paste_delta(
+        &self,
+        entities: &[WorldEntity],
+        instances: &[world_file::WorldInstance],
+    ) -> [f64; 2] {
         let ViewerState::Ready(open) = &self.state else {
             return [PASTE_OFFSET_PX, PASTE_OFFSET_PX];
         };
@@ -2494,7 +2506,10 @@ impl WorldPanel {
             .filter_map(inspector::transform_pos)
             .chain(instances.iter().map(|i| i.pos))
             .collect();
-        let Some(base) = positions.iter().copied().reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])])
+        let Some(base) = positions
+            .iter()
+            .copied()
+            .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])])
         else {
             return [PASTE_OFFSET_PX, PASTE_OFFSET_PX];
         };
@@ -2527,7 +2542,10 @@ impl WorldPanel {
         for entity in &entities {
             let mut components = entity.components.clone();
             if let Some(pos) = inspector::transform_pos(entity) {
-                inspector::set_transform_pos(&mut components, [pos[0] + delta[0], pos[1] + delta[1]]);
+                inspector::set_transform_pos(
+                    &mut components,
+                    [pos[0] + delta[0], pos[1] + delta[1]],
+                );
             }
             ops.push(WorldOp::AddEntity { components });
         }
@@ -2660,11 +2678,11 @@ impl WorldPanel {
                     .px_1()
                     .cursor_pointer()
                     .when(selected, |this| this.bg(selected_bg))
-                    .child(
-                        Label::new(label)
-                            .size(LabelSize::Small)
-                            .color(if selected { Color::Default } else { Color::Muted }),
-                    )
+                    .child(Label::new(label).size(LabelSize::Small).color(if selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -3171,15 +3189,13 @@ impl WorldPanel {
                 div()
                     .id("ggo-world-audio-budget")
                     .tooltip(ui::Tooltip::text(tooltip))
-                    .child(
-                        Label::new(budget.label())
-                            .size(LabelSize::Small)
-                            .color(if budget.over() {
-                                Color::Error
-                            } else {
-                                Color::Muted
-                            }),
-                    )
+                    .child(Label::new(budget.label()).size(LabelSize::Small).color(
+                        if budget.over() {
+                            Color::Error
+                        } else {
+                            Color::Muted
+                        },
+                    ))
             }))
             .child(div().flex_1())
             .child(
@@ -3191,13 +3207,17 @@ impl WorldPanel {
             .child(
                 IconButton::new("ggo-world-flash", IconName::GgoFlashRun)
                     .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Flash this project to the board and run it"))
+                    .tooltip(ui::Tooltip::text(
+                        "Flash this project to the board and run it",
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| this.flash_impl(window, cx))),
             )
             .child(
                 IconButton::new("ggo-world-emulate-popout", IconName::ArrowUpRight)
                     .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Emulate this world in the external emulator"))
+                    .tooltip(ui::Tooltip::text(
+                        "Emulate this world in the external emulator",
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.emulate_popout_impl(cx))),
             )
             .child(
@@ -3216,7 +3236,9 @@ impl WorldPanel {
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::text("Delete selected"))
                     .disabled(!has_selection)
-                    .on_click(cx.listener(|this, _, window, cx| this.delete_selected_impl(window, cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.delete_selected_impl(window, cx)),
+                    ),
             )
             .child(
                 IconButton::new("ggo-world-undo", IconName::Undo)
@@ -3337,7 +3359,12 @@ impl WorldPanel {
         let marquee = open.marquee.as_ref().map(|m| {
             let x0 = m.start[0].min(m.current[0]);
             let y0 = m.start[1].min(m.current[1]);
-            [x0, y0, (m.start[0] - m.current[0]).abs(), (m.start[1] - m.current[1]).abs()]
+            [
+                x0,
+                y0,
+                (m.start[0] - m.current[0]).abs(),
+                (m.start[1] - m.current[1]).abs(),
+            ]
         });
         let items = draw_items(open);
         let screen_origin = active_camera_origin(&open.store.state());
@@ -3523,29 +3550,27 @@ impl WorldPanel {
                     .justify_between()
                     .child(Label::new(SharedString::from(component.clone())))
                     .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                IconButton::new(
-                                    SharedString::from(format!("ggo-remove-{component}")),
-                                    IconName::Trash,
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        // Direct undoable removal (ggo-ide's
-                                        // Transform-with-visual confirm modal is
-                                        // not ported; undo covers it).
-                                        this.apply_op(
-                                            WorldOp::RemoveComponent {
-                                                entity: entity_ix,
-                                                name: name.clone(),
-                                            },
-                                            cx,
-                                        );
-                                    },
-                                )),
-                            ),
+                        h_flex().gap_1().child(
+                            IconButton::new(
+                                SharedString::from(format!("ggo-remove-{component}")),
+                                IconName::Trash,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    // Direct undoable removal (ggo-ide's
+                                    // Transform-with-visual confirm modal is
+                                    // not ported; undo covers it).
+                                    this.apply_op(
+                                        WorldOp::RemoveComponent {
+                                            entity: entity_ix,
+                                            name: name.clone(),
+                                        },
+                                        cx,
+                                    );
+                                },
+                            )),
+                        ),
                     ),
             );
 
@@ -3668,7 +3693,8 @@ impl WorldPanel {
                                     // as saved resolve", and flickering red on
                                     // every keystroke would say nothing.
                                     let view = self.asset_field_view(entity_ix, component, field);
-                                    let stem = view.as_ref().map(|v| v.stem.clone()).unwrap_or_default();
+                                    let stem =
+                                        view.as_ref().map(|v| v.stem.clone()).unwrap_or_default();
                                     let status = view
                                         .as_ref()
                                         .map(|v| v.status)
@@ -3705,9 +3731,11 @@ impl WorldPanel {
                                             )
                                             .icon_size(IconSize::XSmall)
                                             .tooltip(ui::Tooltip::text(format!("Open {rel}")))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.goto_asset(rel.clone(), window, cx);
-                                            })),
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.goto_asset(rel.clone(), window, cx);
+                                                }),
+                                            ),
                                         );
                                     }
                                     panel = panel.child(row);
@@ -3834,8 +3862,11 @@ impl WorldPanel {
         if let Some(error) = &instance.error {
             if !error.is_null() {
                 col = col.child(
-                    ggo_common::CopyableText::new("ggo-world-instance-error-copy", error.to_string())
-                        .size(LabelSize::Small),
+                    ggo_common::CopyableText::new(
+                        "ggo-world-instance-error-copy",
+                        error.to_string(),
+                    )
+                    .size(LabelSize::Small),
                 );
             }
         }
@@ -3927,17 +3958,17 @@ impl Render for WorldPanel {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Undo, _window, cx| this.undo_impl(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| this.select_all_impl(cx)))
-            .on_action(cx.listener(|this, _: &ClearSelection, _window, cx| {
-                this.clear_selection_impl(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ClearSelection, _window, cx| this.clear_selection_impl(cx)),
+            )
             .on_action(cx.listener(|this, _: &Copy, _window, cx| this.copy_impl(cx)))
             .on_action(cx.listener(|this, _: &Paste, _window, cx| this.paste_impl(cx)))
             .on_action(cx.listener(|this, _: &Duplicate, _window, cx| this.duplicate_impl(cx)))
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
-            .on_action(
-                cx.listener(|this, _: &DeleteSelected, window, cx| this.delete_selected_impl(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &DeleteSelected, window, cx| {
+                this.delete_selected_impl(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ResetView, _window, cx| this.reset_view_impl(cx)))
             .on_action(cx.listener(|this, _: &NudgeLeft, _window, cx| {
                 this.nudge_impl("ArrowLeft", false, cx)
@@ -6225,7 +6256,9 @@ mod tests {
                 },
                 cx,
             );
-            panel.asset_field_rel(0, META_SPRITE, "stem").expect("the stem resolves")
+            panel
+                .asset_field_rel(0, META_SPRITE, "stem")
+                .expect("the stem resolves")
         });
         assert_eq!(rel, "sprites/hero.spr");
 
@@ -6950,8 +6983,7 @@ mod tests {
             assert_eq!(pane.items_len(), 1, "the canvas tab alone");
             assert!(
                 pane.active_item()
-                    .and_then(|item| item
-                        .downcast::<world_canvas_item::WorldCanvasItem>())
+                    .and_then(|item| item.downcast::<world_canvas_item::WorldCanvasItem>())
                     .is_some(),
                 "the canvas tab ends active"
             );
@@ -7863,7 +7895,11 @@ mod tests {
             {
                 let v = open_of(panel).view.borrow();
                 assert_eq!(v.zoom, canvas::ZOOM_MAX, "the top of the ladder holds");
-                assert_eq!(v.pan, Some([0.0, 0.0]), "a ladder end must not move the pan");
+                assert_eq!(
+                    v.pan,
+                    Some([0.0, 0.0]),
+                    "a ladder end must not move the pan"
+                );
             }
 
             open_of(panel).view.borrow_mut().zoom = canvas::ZOOM_MIN;
@@ -7895,8 +7931,12 @@ mod tests {
             rate_hz: 16_000,
             source_channels: 1,
         };
-        ggo_audio::write_adp(dir.path(), "sfx/jump.adp", &ggo_audio::bake(&decoded, 16_000))
-            .unwrap();
+        ggo_audio::write_adp(
+            dir.path(),
+            "sfx/jump.adp",
+            &ggo_audio::bake(&decoded, 16_000),
+        )
+        .unwrap();
 
         panel.update(cx, |panel, cx| panel.load_rel_path("worlds/audio.toml", cx));
         cx.executor().run_until_parked();
@@ -7991,8 +8031,7 @@ mod tests {
             if !path.path.extension().is_some_and(|e| e == "til") {
                 return false;
             }
-            let rel = ggo_common::rel_in_primary_worktree(workspace, path, cx)
-                .unwrap_or_default();
+            let rel = ggo_common::rel_in_primary_worktree(workspace, path, cx).unwrap_or_default();
             CLAIMED.with(|c| c.borrow_mut().push(rel));
             true
         }
@@ -8012,8 +8051,7 @@ mod tests {
                 .panel::<WorldPanel>(cx)
                 .expect("the world panel is docked");
             world_panel.update(cx, |_, _| {});
-            let rel = ggo_common::rel_in_primary_worktree(workspace, path, cx)
-                .unwrap_or_default();
+            let rel = ggo_common::rel_in_primary_worktree(workspace, path, cx).unwrap_or_default();
             CLAIMED.with(|c| c.borrow_mut().push(rel));
             true
         }
@@ -8044,13 +8082,24 @@ mod tests {
     #[gpui::test]
     fn test_list_asset_stems_skips_dot_and_build_dirs(_cx: &mut gpui::App) {
         let dir = tempfile::tempdir().unwrap();
-        for rel in ["sprites/hero.spr", ".git/junk.spr", "target/old.spr", "sprites/map.map"] {
+        for rel in [
+            "sprites/hero.spr",
+            ".git/junk.spr",
+            "target/old.spr",
+            "sprites/map.map",
+        ] {
             let path = dir.path().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"").unwrap();
         }
-        assert_eq!(list_asset_stems(dir.path(), "spr"), vec!["sprites/hero".to_string()]);
-        assert_eq!(list_asset_stems(dir.path(), "map"), vec!["sprites/map".to_string()]);
+        assert_eq!(
+            list_asset_stems(dir.path(), "spr"),
+            vec!["sprites/hero".to_string()]
+        );
+        assert_eq!(
+            list_asset_stems(dir.path(), "map"),
+            vec!["sprites/map".to_string()]
+        );
     }
 
     /// Shift-click toggles membership; a plain click on a member keeps the
@@ -8076,9 +8125,17 @@ mod tests {
                 "a plain click on a member keeps the set and makes it primary"
             );
             panel.canvas_primary_down_with([50., 12.], true, cx);
-            assert_eq!(open_of(panel).selected, vec![Selection::Entity(0)], "shift removes");
+            assert_eq!(
+                open_of(panel).selected,
+                vec![Selection::Entity(0)],
+                "shift removes"
+            );
             panel.canvas_primary_down_with([50., 12.], false, cx);
-            assert_eq!(open_of(panel).selected, vec![Selection::Entity(1)], "plain replaces");
+            assert_eq!(
+                open_of(panel).selected,
+                vec![Selection::Entity(1)],
+                "plain replaces"
+            );
         });
     }
 
@@ -8096,9 +8153,21 @@ mod tests {
             panel.canvas_primary_up(cx);
             let open = open_of(panel);
             assert!(open.marquee.is_none());
-            assert!(open.selected.contains(&Selection::Entity(0)), "{:?}", open.selected);
-            assert!(open.selected.contains(&Selection::Entity(1)), "{:?}", open.selected);
-            assert!(open.selected.contains(&Selection::Entity(2)), "{:?}", open.selected);
+            assert!(
+                open.selected.contains(&Selection::Entity(0)),
+                "{:?}",
+                open.selected
+            );
+            assert!(
+                open.selected.contains(&Selection::Entity(1)),
+                "{:?}",
+                open.selected
+            );
+            assert!(
+                open.selected.contains(&Selection::Entity(2)),
+                "{:?}",
+                open.selected
+            );
 
             // A tiny band on empty space clears (not additive).
             panel.canvas_primary_down_with([150., 150.], false, cx);
@@ -8112,7 +8181,11 @@ mod tests {
             panel.canvas_drag_to([0., 0.], cx);
             panel.canvas_primary_up(cx);
             let selected = &open_of(panel).selected;
-            assert_eq!(selected[0], Selection::Entity(1), "the prior member stays first");
+            assert_eq!(
+                selected[0],
+                Selection::Entity(1),
+                "the prior member stays first"
+            );
             assert!(selected.len() >= 3);
         });
     }
@@ -8128,21 +8201,40 @@ mod tests {
             let before = open_of(panel).selected_positions();
             assert!(before.len() >= 3);
             panel.canvas_primary_down_with([10., 10.], false, cx);
-            assert_eq!(open_of(panel).selected.len(), before.len(), "clicking a member keeps the set");
+            assert_eq!(
+                open_of(panel).selected.len(),
+                before.len(),
+                "clicking a member keeps the set"
+            );
             panel.canvas_drag_to([26., 42.], cx);
             panel.canvas_drag_to([42., 74.], cx);
             let after = open_of(panel).selected_positions();
             for (target, pos) in &before {
-                let moved = after.iter().find(|(t, _)| t == target).map(|(_, p)| *p).unwrap();
-                assert_eq!(moved, [pos[0] + 32.0, pos[1] + 64.0], "{target:?} moved by the delta");
+                let moved = after
+                    .iter()
+                    .find(|(t, _)| t == target)
+                    .map(|(_, p)| *p)
+                    .unwrap();
+                assert_eq!(
+                    moved,
+                    [pos[0] + 32.0, pos[1] + 64.0],
+                    "{target:?} moved by the delta"
+                );
             }
             panel.undo_impl(cx);
             let restored = open_of(panel).selected_positions();
             for (target, pos) in &before {
-                let now = restored.iter().find(|(t, _)| t == target).map(|(_, p)| *p).unwrap();
+                let now = restored
+                    .iter()
+                    .find(|(t, _)| t == target)
+                    .map(|(_, p)| *p)
+                    .unwrap();
                 assert_eq!(now, *pos, "one undo restores {target:?}");
             }
-            assert!(!open_of(panel).store.state().dirty, "one undo -> back at the save point");
+            assert!(
+                !open_of(panel).store.state().dirty,
+                "one undo -> back at the save point"
+            );
         });
     }
 
@@ -8161,7 +8253,10 @@ mod tests {
             assert!(open_of(panel).selected.is_empty());
             panel.undo_impl(cx);
             let state = open_of(panel).store.state();
-            assert_eq!((state.entities.len(), state.instances.len()), (entities, instances));
+            assert_eq!(
+                (state.entities.len(), state.instances.len()),
+                (entities, instances)
+            );
             assert!(!state.dirty);
         });
     }
@@ -8187,7 +8282,11 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             let after = open_of(panel).selected_positions();
             for (target, pos) in &before {
-                let now = after.iter().find(|(t, _)| t == target).map(|(_, p)| *p).unwrap();
+                let now = after
+                    .iter()
+                    .find(|(t, _)| t == target)
+                    .map(|(_, p)| *p)
+                    .unwrap();
                 assert_eq!(now, [pos[0] + 2.0, pos[1]], "{target:?} nudged twice");
             }
         });
@@ -8207,7 +8306,9 @@ mod tests {
             panel.canvas_primary_down_with([50., 12.], true, cx);
             panel.copy_impl(cx);
         });
-        let text = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text())).unwrap();
+        let text = cx
+            .update(|cx| cx.read_from_clipboard().and_then(|i| i.text()))
+            .unwrap();
         assert_eq!(text.matches("[[entity]]").count(), 2, "{text}");
         assert!(parse_fragment(&text).is_ok());
 
@@ -8228,7 +8329,11 @@ mod tests {
             );
             assert!(open_of(panel).clipboard_error.is_none());
             panel.undo_impl(cx);
-            assert_eq!(open_of(panel).store.state().entities.len(), before, "one undo");
+            assert_eq!(
+                open_of(panel).store.state().entities.len(),
+                before,
+                "one undo"
+            );
         });
     }
 
@@ -8255,7 +8360,10 @@ mod tests {
             assert_eq!(state.entities.len(), before + 2);
             // Group base was (4, 4); it now sits at the cursor (100, 200),
             // the second member keeps its offset (36, 4).
-            assert_eq!(inspector::transform_pos(&state.entities[before]), Some([100.0, 200.0]));
+            assert_eq!(
+                inspector::transform_pos(&state.entities[before]),
+                Some([100.0, 200.0])
+            );
             assert_eq!(
                 inspector::transform_pos(&state.entities[before + 1]),
                 Some([136.0, 204.0])
@@ -8295,13 +8403,20 @@ mod tests {
             panel.paste_impl(cx);
             let open = open_of(panel);
             let state = open.store.state();
-            assert_eq!(state.instances.len(), before + 1, "the self-instance is refused");
+            assert_eq!(
+                state.instances.len(),
+                before + 1,
+                "the self-instance is refused"
+            );
             let pasted = &state.instances[before];
             assert_eq!(pasted.world, "worlds/sub");
             assert_eq!(pasted.pos, [3.0 + 16.0, 4.0 + 16.0]);
             assert!(pasted.resolved.is_some(), "resolved so it renders");
             assert!(
-                open.clipboard_error.as_deref().unwrap_or("").contains("worlds/test"),
+                open.clipboard_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("worlds/test"),
                 "{:?}",
                 open.clipboard_error
             );
@@ -8310,7 +8425,13 @@ mod tests {
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("not = [toml".into())));
         panel.update(cx, |panel, cx| {
             panel.paste_impl(cx);
-            assert!(open_of(panel).clipboard_error.as_deref().unwrap().contains("not world TOML"));
+            assert!(
+                open_of(panel)
+                    .clipboard_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("not world TOML")
+            );
         });
     }
 
@@ -8332,7 +8453,10 @@ mod tests {
             ggo_worldlib::world_doc::WorldDocWire::from(world),
         );
         let rows = entity_list_rows(&store.state());
-        assert_eq!(rows[0], (Selection::Entity(0), "#0 Sprite · hero".to_string()));
+        assert_eq!(
+            rows[0],
+            (Selection::Entity(0), "#0 Sprite · hero".to_string())
+        );
         assert_eq!(rows[1], (Selection::Entity(1), "#1 Entity".to_string()));
         assert_eq!(rows[2].0, Selection::Instance(0));
         assert!(rows[2].1.starts_with("⧉ "));
@@ -8357,8 +8481,10 @@ mod tests {
             let ViewerState::Ready(open) = &mut panel.state else {
                 panic!("expected Ready");
             };
-            open.sprite_loads.insert("a".into(), ggo_worldlib::render::Loadable::Ready(rgba(1)));
-            open.sprite_loads.insert("b".into(), ggo_worldlib::render::Loadable::Ready(rgba(2)));
+            open.sprite_loads
+                .insert("a".into(), ggo_worldlib::render::Loadable::Ready(rgba(1)));
+            open.sprite_loads
+                .insert("b".into(), ggo_worldlib::render::Loadable::Ready(rgba(2)));
             WorldPanel::replace_images(open, &mut retired);
             assert_eq!(open.images.len(), 2);
             assert!(retired.is_empty(), "a first build retires nothing");
@@ -8368,7 +8494,10 @@ mod tests {
             WorldPanel::replace_images(open, &mut retired);
             assert!(retired.is_empty(), "unchanged keys keep their images");
             for (key, image) in open.images.iter() {
-                assert_eq!(ids[key], image.id, "the image for {key} was reused, not re-minted");
+                assert_eq!(
+                    ids[key], image.id,
+                    "the image for {key} was reused, not re-minted"
+                );
             }
 
             // Drop one load: exactly its image is retired.
@@ -8398,10 +8527,16 @@ mod tests {
             assert!(open_of(panel).edit_drag.is_some());
             panel.canvas_primary_down_with([50., 12.], true, cx);
             assert_eq!(open_of(panel).selected, vec![Selection::Entity(0)]);
-            assert!(open_of(panel).edit_drag.is_none(), "removing a member arms no drag");
+            assert!(
+                open_of(panel).edit_drag.is_none(),
+                "removing a member arms no drag"
+            );
             let state = open_of(panel).store.state();
             assert_eq!(removable_instances(&[Selection::Instance(99)], &state), 0);
-            assert_eq!(removable_instances(&[Selection::Instance(0), Selection::Entity(0)], &state), 1);
+            assert_eq!(
+                removable_instances(&[Selection::Instance(0), Selection::Entity(0)], &state),
+                1
+            );
         });
     }
 
@@ -8415,7 +8550,10 @@ mod tests {
             let added = open_of(panel).store.state().entities.len() - 1;
             assert_eq!(open_of(panel).selected, vec![Selection::Entity(added)]);
             panel.undo_impl(cx);
-            assert!(open_of(panel).selected.is_empty(), "the undone entity is no longer selectable");
+            assert!(
+                open_of(panel).selected.is_empty(),
+                "the undone entity is no longer selectable"
+            );
         });
     }
 
@@ -8425,8 +8563,7 @@ mod tests {
         let (a, b, c) = (image(1), image(2), image(3));
         let old: HashMap<usize, Arc<RenderImage>> =
             [(1, a.clone()), (2, b.clone())].into_iter().collect();
-        let new: HashMap<usize, Arc<RenderImage>> =
-            [(2, b), (3, c)].into_iter().collect();
+        let new: HashMap<usize, Arc<RenderImage>> = [(2, b), (3, c)].into_iter().collect();
         let retired = retired_by_rebuild(&old, &new);
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].id, a.id, "only the key the new cache lost");

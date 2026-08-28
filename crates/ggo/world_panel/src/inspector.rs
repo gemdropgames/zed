@@ -9,12 +9,12 @@
 //! Enter/blur (matching ggo-ide's Enter-or-cross-field-commit rule; an
 //! unparsable buffer is dropped, not committed).
 
-use std::path::{Path, PathBuf};
 use ggo_worldlib::render::Selection;
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind};
 use ggo_worldlib::world_doc::{WorldOp, WorldState};
 use ggo_worldlib::world_file::WorldEntity;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// What one inspector text input edits.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -697,9 +697,18 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
         std::fs::write(dir.path().join("sprites/hero.spr"), b"x").unwrap();
         assert_eq!(asset_status(dir.path(), "", "spr"), AssetStatus::Empty);
-        assert_eq!(asset_status(dir.path(), "sprites/hero", "spr"), AssetStatus::Resolves);
-        assert_eq!(asset_status(dir.path(), "sprites/hero", "til"), AssetStatus::Missing);
-        assert_eq!(asset_status(dir.path(), "sprites/ghost", "spr"), AssetStatus::Missing);
+        assert_eq!(
+            asset_status(dir.path(), "sprites/hero", "spr"),
+            AssetStatus::Resolves
+        );
+        assert_eq!(
+            asset_status(dir.path(), "sprites/hero", "til"),
+            AssetStatus::Missing
+        );
+        assert_eq!(
+            asset_status(dir.path(), "sprites/ghost", "spr"),
+            AssetStatus::Missing
+        );
         assert_eq!(
             asset_abs_path(dir.path(), "sfx/jump", "adp"),
             Some(dir.path().join("sfx/jump.adp"))
@@ -708,9 +717,18 @@ mod tests {
         // file it points at exists.
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("leak.spr"), b"x").unwrap();
-        let escaping = format!("../{}/leak", outside.path().file_name().unwrap().to_string_lossy());
-        assert_eq!(asset_status(dir.path(), &escaping, "spr"), AssetStatus::Missing);
-        assert_eq!(asset_status(dir.path(), "/etc/hosts", ""), AssetStatus::Missing);
+        let escaping = format!(
+            "../{}/leak",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            asset_status(dir.path(), &escaping, "spr"),
+            AssetStatus::Missing
+        );
+        assert_eq!(
+            asset_status(dir.path(), "/etc/hosts", ""),
+            AssetStatus::Missing
+        );
         assert_eq!(asset_abs_path(dir.path(), "../x", "spr"), None);
     }
 }

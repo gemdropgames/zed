@@ -126,7 +126,9 @@ pub fn compose_pool_strip(state: &SpriteState, cols: usize) -> Option<PoolStrip>
     let tiles: Vec<u16> = (0..state.tile_count)
         .filter(|&t| {
             let off = t * hw::TILE_BYTES;
-            !state.pool[off..off + hw::TILE_BYTES].iter().all(|&b| b == 0)
+            !state.pool[off..off + hw::TILE_BYTES]
+                .iter()
+                .all(|&b| b == 0)
         })
         .map(|t| t as u16)
         .collect();
