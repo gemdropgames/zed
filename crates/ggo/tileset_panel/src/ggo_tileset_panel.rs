@@ -810,6 +810,10 @@ impl TilesetPanel {
         }
         open.store
             .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::DuplicateTile { tile });
+        self.prune_stale_cols_pins();
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
         // In focus mode the sheet IS one tile, so follow the copy -- landing
         // on a magnified view of the tile you just left would look like the
         // duplicate silently failed.
@@ -828,6 +832,7 @@ impl TilesetPanel {
         };
         open.store
             .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::AppendTile);
+        self.prune_stale_cols_pins();
         self.recompose_grid(cx);
     }
 
@@ -1224,6 +1229,7 @@ impl TilesetPanel {
         if let ViewerState::Ready(open) = &mut self.state {
             open.store.end_stroke();
         }
+        self.prune_stale_cols_pins();
     }
 
     /// The Fill tool: flood the composed sheet from the clicked pixel.
@@ -1688,6 +1694,7 @@ impl TilesetPanel {
             open.store.apply_stroke_paint(tile, x, y, color);
         }
         open.store.end_stroke();
+        self.prune_stale_cols_pins();
         self.recompose_grid(cx);
     }
 
@@ -1991,6 +1998,10 @@ impl TilesetPanel {
         let cols = open.cols;
         open.store
             .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::DeleteRow { cols, at_top });
+        self.prune_stale_cols_pins();
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
         open.selection = None;
         self.recompose_grid(cx);
     }
@@ -2089,7 +2100,10 @@ impl TilesetPanel {
             open.store.apply_stroke_paint(tile, px_x, px_y, color);
         }
         open.store.end_stroke();
-        open.selection = Some(((x0, y0), (x0 + w - 1, y0 + h - 1)));
+        self.prune_stale_cols_pins();
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.selection = Some(((x0, y0), (x0 + w - 1, y0 + h - 1)));
+        }
         self.recompose_grid(cx);
     }
 
@@ -2104,6 +2118,7 @@ impl TilesetPanel {
         let cols = open.cols;
         open.store
             .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::InsertRow { cols, at_top });
+        self.prune_stale_cols_pins();
         self.recompose_grid(cx);
     }
 
@@ -2163,6 +2178,7 @@ impl TilesetPanel {
             self.end_pan(cx);
             return;
         }
+        let mut stroke_closed = false;
         let (shape, moved) = match &mut self.state {
             ViewerState::Ready(open) if open.painting => {
                 open.painting = false;
@@ -2174,6 +2190,7 @@ impl TilesetPanel {
                     (Some((points, open.paint_color())), moved)
                 } else {
                     open.store.end_stroke();
+                    stroke_closed = true;
                     (None, moved)
                 }
             }
@@ -2181,6 +2198,9 @@ impl TilesetPanel {
         };
         if let Some((points, color)) = shape {
             self.write_points(&points, color, cx);
+        }
+        if stroke_closed {
+            self.prune_stale_cols_pins();
         }
         if let Some(offset) = moved {
             self.move_selection(offset, cx);
@@ -2272,6 +2292,18 @@ impl TilesetPanel {
         self.recompose_grid(cx);
     }
 
+    /// Kill column pins at or above the current undo depth. Called after
+    /// every NON-column op lands: a new op reuses the depth an undone
+    /// column op once held, and a pin left there would fire when the new
+    /// op is redone, resurrecting a width that belongs to nothing.
+    fn prune_stale_cols_pins(&mut self) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let depth = open.store.undo_depth();
+        open.cols_history.retain(|&d, _| d < depth);
+    }
+
     /// Record that the op that just landed took `cols` from `before` to
     /// `after`, so undo and redo can put the view back.
     fn record_cols_change(&mut self, before: usize, after: usize) {
@@ -2303,11 +2335,15 @@ impl TilesetPanel {
                 return;
             }
             match open.cols_history.get(&depth) {
-                Some(&(before, _)) => {
+                // Only when the pin's endpoint matches the width being
+                // left: worldlib's UNDO_CAP trims the stack's base and
+                // shifts every depth by one, so a drifted pin must miss
+                // rather than fire against an unrelated op.
+                Some(&(before, after)) if after == open.cols => {
                     open.cols = before;
                     true
                 }
-                None => false,
+                _ => false,
             }
         };
         self.recompose_grid(cx);
@@ -2329,11 +2365,11 @@ impl TilesetPanel {
             }
             let depth = open.store.undo_depth();
             match open.cols_history.get(&depth) {
-                Some(&(_, after)) => {
+                Some(&(before, after)) if before == open.cols => {
                     open.cols = after;
                     true
                 }
-                None => false,
+                _ => false,
             }
         };
         self.recompose_grid(cx);
@@ -2387,6 +2423,7 @@ impl TilesetPanel {
         if let ViewerState::Ready(open) = &mut self.state {
             open.store
                 .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::Paint { tile, x, y, color });
+            self.prune_stale_cols_pins();
             self.recompose_grid(cx);
         }
     }
@@ -6970,6 +7007,43 @@ mod tests {
                 ready(panel).float.as_ref().map(|f| f.mode),
                 Some(FloatMode::Move),
                 "the stale Swap intent did not leak into the nudge"
+            );
+        });
+    }
+
+    /// A pin recorded at undo depth d must die when a DIFFERENT op later
+    /// reuses that depth: insert a column, undo it, paint (the paint now
+    /// owns depth d), undo the paint, redo the paint. The redo must not
+    /// find the column pin and resurrect the old width.
+    #[gpui::test]
+    async fn test_a_repainted_undo_depth_does_not_resurrect_a_column_pin(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(3, cx);
+            panel.insert_column(false, cx);
+            assert_eq!(ready(panel).cols, 4);
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).cols, 3);
+
+            // The paint takes over the column op's undo depth.
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Pencil, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+
+            panel.undo_impl(cx);
+            panel.redo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 1, 1)],
+                2,
+                "the redo redid the PAINT"
+            );
+            assert_eq!(
+                ready(panel).cols,
+                3,
+                "and did not resurrect the dead column pin"
             );
         });
     }
