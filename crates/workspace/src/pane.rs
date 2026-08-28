@@ -4043,7 +4043,10 @@ impl Pane {
             .log_err();
     }
 
-    fn handle_external_paths_drop(
+    // GGO: `pub` so a fork test can drive a real OS drop instead of
+    // hand-rolling the conditions. This is the only caller-visible change --
+    // the body below is upstream's plus the interceptor hook.
+    pub fn handle_external_paths_drop(
         &mut self,
         paths: &ExternalPaths,
         window: &mut Window,

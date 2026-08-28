@@ -20,13 +20,13 @@ pub mod security_modal;
 pub mod shared_screen;
 pub use shared_screen::SharedScreen;
 pub mod focus_follows_mouse;
+pub mod ggo_thumbnails; // GGO
 mod status_bar;
 pub mod tasks;
 mod theme_preview;
 mod toast_layer;
 mod toolbar;
 pub mod welcome;
-pub mod ggo_thumbnails; // GGO
 pub mod workspace_error;
 mod workspace_settings;
 
@@ -1016,6 +1016,16 @@ impl Workspace {
 // registered fn is offered the dropped paths and returns `true` when it took
 // them (the import panel claims image sources); `false` falls through to
 // upstream's open-paths behaviour. Same shape as the path-open interceptors.
+//
+// DECIDE HERE, ACT LATER. `Pane::handle_external_paths_drop` calls this from
+// inside `pane.update(..)`, so the dropped-on pane is leased for the whole
+// call. An interceptor that opens a tab -- `add_item_to_active_pane`,
+// `activate_item`, even `items_of_type`, which reads every pane -- panics
+// with "cannot read workspace::pane::Pane while it is already being updated"
+// and takes the window down with it. The `bool` has to be returned
+// synchronously (the pane needs it to know whether to fall through), so only
+// path inspection belongs in the body; push the tab work into
+// `cx.defer_in(window, ..)`.
 pub type ExternalDropInterceptor =
     fn(&mut Workspace, &[PathBuf], &mut Window, &mut Context<Workspace>) -> bool;
 

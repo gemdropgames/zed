@@ -208,14 +208,24 @@ fn intercept_image_drop(
     let ignored = paths.len() - 1;
     let root = worktree_root(workspace, cx);
     let first = first.clone();
-    open_import_item(workspace, window, cx, move |panel, _window, cx| {
-        panel.adopt_root(root, cx);
-        panel.open_abs_source(first, cx);
-        if ignored > 0 {
-            panel.status = Some(format!(
-                "{ignored} more dropped file(s) ignored — one source at a time"
-            ));
-        }
+    // Claimed now, opened later: `Pane::handle_external_paths_drop` calls us
+    // from inside `pane.update(..)`, and `open_import_item` reads every pane
+    // to find an existing wizard tab, then activates it. Doing that here
+    // double-lease-panics on the leased pane.
+    // Claimed now, opened later: `Pane::handle_external_paths_drop` calls us
+    // from inside `pane.update(..)`, and `open_import_item` reads every pane
+    // to find an existing wizard tab, then activates it. Doing that here
+    // double-lease-panics on the leased pane.
+    cx.defer_in(window, move |workspace, window, cx| {
+        open_import_item(workspace, window, cx, move |panel, _window, cx| {
+            panel.adopt_root(root, cx);
+            panel.open_abs_source(first, cx);
+            if ignored > 0 {
+                panel.status = Some(format!(
+                    "{ignored} more dropped file(s) ignored — one source at a time"
+                ));
+            }
+        });
     });
     true
 }
@@ -3710,6 +3720,61 @@ mod tests {
             workspace.intercept_external_drop(&[png, text], window, cx)
         });
         assert!(!claimed, "a mixed drop is upstream's");
+    }
+
+    /// Dropping a `.png` onto a pane showing an editor, through the real
+    /// entry point rather than a hand-rolled approximation of it.
+    ///
+    /// `Pane::handle_external_paths_drop` runs under `pane.update(..)`, so
+    /// the dropped-on pane is leased for the whole call, and `Editor` does
+    /// not override `Item::handle_drop`, so the drop reaches the fork's
+    /// interceptor with that lease still held. Opening the wizard from there
+    /// synchronously double-lease-panics -- `open_import_item` reads every
+    /// pane looking for an existing wizard tab -- with "cannot read
+    /// workspace::pane::Pane while it is already being updated", which takes
+    /// the window down. The other drop tests call `intercept_external_drop`
+    /// from a plain workspace update, where no pane is leased, so they could
+    /// never see it.
+    #[gpui::test]
+    async fn test_dropping_a_png_on_an_editor_opens_the_wizard(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, worktree_id, cx) = routed_workspace(cx, dir.path()).await;
+        // `Editor` is only openable as a project item once it registers.
+        cx.update(|_, cx| editor::init(cx));
+
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    project_path(worktree_id, "assets/notes.txt"),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("the text file opens");
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                pane.active_item().map(|item| item.item_id()),
+                Some(editor.item_id()),
+                "the editor is what the drop lands on"
+            );
+        });
+
+        let png = dir.path().join("art/outside.png");
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_external_paths_drop(&gpui::ExternalPaths(vec![png].into()), window, cx)
+        });
+
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(panel.state, ViewerState::Ready(_)),
+                "the wizard opened the dropped source"
+            );
+        });
     }
 
     #[gpui::test]
