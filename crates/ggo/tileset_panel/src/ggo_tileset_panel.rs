@@ -559,6 +559,9 @@ pub struct TilesetPanel {
     pub(crate) state: ViewerState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
+    /// The pending debounced sidecar write; replaced on every schedule, so
+    /// only the trailing edge of a burst actually touches the disk.
+    view_meta_write: Option<Task<()>>,
 }
 
 impl TilesetPanel {
@@ -571,6 +574,7 @@ impl TilesetPanel {
             state: ViewerState::Empty,
             load_generation: 0,
             _load_task: None,
+            view_meta_write: None,
         }
     }
 
@@ -701,8 +705,27 @@ impl TilesetPanel {
         if next != open.zoom {
             open.zoom = next;
             cx.notify();
-            self.write_view_meta();
+            // Debounced: ctrl-wheel and key-repeat ctrl-= land here many
+            // times a second, and write_view_meta is a synchronous
+            // read-parse-serialize-write of the sidecar on the UI thread.
+            // Only the burst's trailing edge writes.
+            self.schedule_view_meta_write(cx);
         }
+    }
+
+    /// Write the view sidecar 300ms after the LAST call, coalescing a
+    /// gesture's worth of changes into one disk touch.
+    fn schedule_view_meta_write(&mut self, cx: &mut Context<Self>) {
+        self.view_meta_write = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            this.update(cx, |this, _| {
+                this.view_meta_write = None;
+                this.write_view_meta();
+            })
+            .ok();
+        }));
     }
 
     /// Set the grid's column count, clamped to `1..=tile_count` --
@@ -4090,6 +4113,11 @@ mod tests {
             panel.set_cols(2, cx);
             panel.zoom_by(3, cx);
         });
+        // Zoom writes are debounced; let the trailing edge land before
+        // editing the sidecar underneath it.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.executor().run_until_parked();
         // The map panel keeps its terrains in the same sidecar; a later
         // view write must not wipe them.
         let mut meta = loader::load_view_meta(dir.path(), "tiles/world.til");
@@ -4099,9 +4127,13 @@ mod tests {
         }];
         loader::save_view_meta(dir.path(), "tiles/world.til", &meta).unwrap();
         panel.update(cx, |panel, cx| panel.zoom_by(-1, cx));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.executor().run_until_parked();
         assert_eq!(
             loader::load_view_meta(dir.path(), "tiles/world.til").terrains[0].name,
-            "grass"
+            "grass",
+            "the debounced write load-modify-saves, so it must not wipe them"
         );
 
         // A fresh panel on the same rel restores the stored view settings.
@@ -7046,6 +7078,34 @@ mod tests {
                 "and did not resurrect the dead column pin"
             );
         });
+    }
+
+    /// Zoom changes write the sidecar 300ms after the LAST change, not on
+    /// every wheel tick: write_view_meta is synchronous disk I/O on the UI
+    /// thread and ctrl-wheel fires many times a second.
+    #[gpui::test]
+    async fn test_zoom_writes_the_sidecar_once_after_the_burst(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            for zoom in 5..=9 {
+                panel.set_zoom(zoom, cx);
+            }
+        });
+        assert_ne!(
+            load_tileset_meta(dir.path(), "tiles/world.til").zoom,
+            Some(9),
+            "mid-burst, the disk has not been touched"
+        );
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.executor().run_until_parked();
+        assert_eq!(
+            load_tileset_meta(dir.path(), "tiles/world.til").zoom,
+            Some(9),
+            "the trailing edge wrote the final zoom"
+        );
     }
 
     #[gpui::test]
