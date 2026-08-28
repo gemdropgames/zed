@@ -1366,7 +1366,7 @@ impl TilesetPanel {
         };
         let (w, h) = open.zoomed_size();
         let bounds_cell = open.sheet_bounds.clone();
-        let (cols, rows) = (open.cols, open.grid_size.1 as usize / TILE_PX);
+        let (cols, tile_count) = (open.cols, open.store.state().tile_count);
         let show_lines = open.show_lines;
         let accent = cx.theme().colors().border_focused;
         let zoom = open.zoom as f32;
@@ -1393,7 +1393,7 @@ impl TilesetPanel {
             },
             move |bounds, (), window, _cx| {
                 if show_lines {
-                    paint_tile_borders(bounds, cols, rows, window);
+                    paint_tile_borders(bounds, tile_count, cols, window);
                 }
                 if let Some((x0, y0, x1, y1)) = selection {
                     let rect = Bounds::new(
@@ -2006,7 +2006,59 @@ impl EventEmitter<TilesetPanelEvent> for TilesetPanel {}
 /// Paint tile-boundary lines over the zoomed sheet: a 1px white line
 /// centered in a 3px black one, so the boundary reads against any tile
 /// art (`ggo_sprite_panel::paint_tile_grid`'s idiom, thickened).
-fn paint_tile_borders(bounds: Bounds<Pixels>, cols: usize, rows: usize, window: &mut Window) {
+/// The blocks of the sheet grid that back a REAL tile, as
+/// `(row_start, rows, cols)` in tile units: the full rows, then the
+/// partial last row on its own.
+///
+/// `compose_tile_grid` pads the sheet image up to a whole last row, so the
+/// drawn rectangle is always `cols x div_ceil(tile_count, cols)`. Stroking
+/// that whole rectangle draws a tile box over cells no tile backs -- 18
+/// tiles at 7 cols shows 21. The pad pixels themselves are index 0, which
+/// `slot_rgba` maps to alpha 0, so the borders are the entire illusion.
+fn grid_regions(tile_count: usize, cols: usize) -> Vec<(usize, usize, usize)> {
+    if tile_count == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let full_rows = tile_count / cols;
+    let remainder = tile_count % cols;
+    let mut regions = Vec::new();
+    if full_rows > 0 {
+        regions.push((0, full_rows, cols));
+    }
+    if remainder > 0 {
+        regions.push((full_rows, 1, remainder));
+    }
+    regions
+}
+
+fn paint_tile_borders(bounds: Bounds<Pixels>, tile_count: usize, cols: usize, window: &mut Window) {
+    // `bounds` covers the PADDED sheet, so a cell is sized against the
+    // padded row count; only the blocks that back a tile are stroked.
+    let total_rows = if cols == 0 {
+        0
+    } else {
+        tile_count.div_ceil(cols)
+    };
+    if total_rows == 0 {
+        return;
+    }
+    let cell_w = bounds.size.width / cols as f32;
+    let cell_h = bounds.size.height / total_rows as f32;
+    for (row_start, rows, region_cols) in grid_regions(tile_count, cols) {
+        paint_grid(
+            Bounds::new(
+                gpui::point(bounds.origin.x, bounds.origin.y + cell_h * row_start as f32),
+                gpui::size(cell_w * region_cols as f32, cell_h * rows as f32),
+            ),
+            region_cols,
+            rows,
+            window,
+        );
+    }
+}
+
+/// Stroke a complete `cols x rows` lattice over `bounds`.
+fn paint_grid(bounds: Bounds<Pixels>, cols: usize, rows: usize, window: &mut Window) {
     if cols == 0 || rows == 0 {
         return;
     }
@@ -2074,6 +2126,40 @@ fn sheet_to_doc(
 
 #[cfg(test)]
 mod tests {
+    use super::grid_regions;
+
+    /// Only cells that back a real tile get a border. The reported case is
+    /// 18 tiles at 7 cols: the sheet image is padded to 3 full rows (21
+    /// cells), so stroking the whole rectangle drew 3 tiles that do not
+    /// exist.
+    #[test]
+    fn grid_regions_cover_exactly_the_real_tiles() {
+        assert_eq!(grid_regions(18, 7), vec![(0, 2, 7), (2, 1, 4)]);
+        assert_eq!(
+            grid_regions(21, 7),
+            vec![(0, 3, 7)],
+            "an exact fit is one block, no partial row"
+        );
+        assert_eq!(grid_regions(0, 7), Vec::new());
+        assert_eq!(
+            grid_regions(5, 7),
+            vec![(0, 1, 5)],
+            "a sheet shorter than one row is just the partial row"
+        );
+
+        // The property that was violated: the blocks account for every
+        // tile and never more.
+        for tile_count in 0..40usize {
+            for cols in 1..12usize {
+                let cells: usize = grid_regions(tile_count, cols)
+                    .into_iter()
+                    .map(|(_, rows, c)| rows * c)
+                    .sum();
+                assert_eq!(cells, tile_count, "{tile_count} tiles at {cols} cols");
+            }
+        }
+    }
+
     use super::*;
     use ggo_worldlib::sprites::io::{open_tileset, save_tileset};
     use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
