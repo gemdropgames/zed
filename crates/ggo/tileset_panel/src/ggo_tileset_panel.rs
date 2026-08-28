@@ -43,7 +43,7 @@ use ui::prelude::*;
 use workspace::Workspace;
 
 use ggo_worldlib::sprites::io::save_tileset;
-use ggo_worldlib::sprites::palette565::PAL_SLOTS;
+use ggo_worldlib::sprites::palette565::{PAL_SLOTS, Pal};
 use ggo_worldlib::sprites::pixel_tools;
 use ggo_worldlib::sprites::tileset_doc::{TILE_PX, TilesetDocStore};
 use ggo_worldlib::sprites::tileset_meta::load_tileset_meta;
@@ -273,6 +273,28 @@ impl Tool {
     }
 }
 
+/// A copied region, shared by every open tileset.
+///
+/// The buffer used to live on `OpenTileset`, and `tileset_item` builds a
+/// fresh panel entity per tab, so copying in one tileset and pasting into
+/// another silently did nothing at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TilesetClip {
+    w: usize,
+    h: usize,
+    pixels: Vec<u8>,
+    /// The palette these indices were written against. Pixels are palette
+    /// INDICES, so pasting them under a different palette reads the same
+    /// numbers as different colours -- worth saying rather than silently
+    /// recolouring someone's art.
+    palette: Pal,
+}
+
+#[derive(Default)]
+struct SharedClipboard(Option<TilesetClip>);
+
+impl gpui::Global for SharedClipboard {}
+
 /// A region lifted out of the sheet and floating above it.
 ///
 /// Moving a marquee used to rewrite the document on every step: blank the
@@ -351,7 +373,9 @@ struct OpenTileset {
     /// anchor).
     selection: Option<((usize, usize), (usize, usize))>,
     /// The copy buffer: `(w, h, indices)` row-major, sheet-space.
-    clipboard: Option<(usize, usize, Vec<u8>)>,
+    /// Set when the last paste came from a tileset with a different
+    /// palette, so the status line can say the colours will not match.
+    clipboard_note: Option<&'static str>,
     /// Whether the tile-boundary lines draw over the sheet.
     show_lines: bool,
     /// Expand the marquee to whole tiles. Off by default: this is a pixel
@@ -432,7 +456,7 @@ impl OpenTileset {
             painting: false,
             scroll: ScrollHandle::new(),
             selection: None,
-            clipboard: None,
+            clipboard_note: None,
             show_lines: loaded.lines.unwrap_or(true),
             snap_tiles: false,
             shape_filled: false,
@@ -1491,26 +1515,54 @@ impl TilesetPanel {
         (w, h, data)
     }
 
+    /// The shared clip, if anything has been copied in any tileset.
+    fn clip(cx: &App) -> Option<TilesetClip> {
+        cx.try_global::<SharedClipboard>().and_then(|c| c.0.clone())
+    }
+
+    /// Put `pixels` on the shared clipboard, tagged with the palette they
+    /// were indexed against.
+    fn set_clip(w: usize, h: usize, pixels: Vec<u8>, palette: Pal, cx: &mut App) {
+        cx.set_global(SharedClipboard(Some(TilesetClip {
+            w,
+            h,
+            pixels,
+            palette,
+        })));
+    }
+
     /// Copy the selected region into the internal clipboard, sampling the
     /// doc through sheet coordinates (pad cells copy as 0).
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
         // A float IS the selection's pixels; reading the sheet under it
         // would copy whatever it is hovering over instead.
-        if let ViewerState::Ready(open) = &mut self.state
-            && let Some(float) = &open.float
-        {
-            open.clipboard = Some((float.w, float.h, float.pixels.clone()));
-            cx.notify();
-            return;
-        }
-        let Some(rect) = self.selection_rect() else {
-            return;
+        let copied = match &self.state {
+            ViewerState::Ready(open) => match &open.float {
+                Some(float) => Some((
+                    float.w,
+                    float.h,
+                    float.pixels.clone(),
+                    open.store.state().palette,
+                )),
+                None => None,
+            },
+            _ => return,
         };
-        let region = self.region_pixels(rect);
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.clipboard = Some(region);
-            cx.notify();
-        }
+        let (w, h, pixels, palette) = match copied {
+            Some(copied) => copied,
+            None => {
+                let Some(rect) = self.selection_rect() else {
+                    return;
+                };
+                let (w, h, pixels) = self.region_pixels(rect);
+                let ViewerState::Ready(open) = &self.state else {
+                    return;
+                };
+                (w, h, pixels, open.store.state().palette)
+            }
+        };
+        Self::set_clip(w, h, pixels, palette, cx);
+        cx.notify();
     }
 
     /// Blank the selected region to slot 0 as one undo step.
@@ -1857,17 +1909,21 @@ impl TilesetPanel {
         let Some((x0, y0)) = self.paste_origin() else {
             return;
         };
-        let clipboard = match &self.state {
-            ViewerState::Ready(open) => open.clipboard.clone(),
-            _ => return,
-        };
-        let Some((w, h, data)) = clipboard else {
+        let Some(clip) = Self::clip(cx) else {
             return;
         };
+        let (w, h, data) = (clip.w, clip.h, clip.pixels);
         let skip_transparent = match &self.state {
             ViewerState::Ready(open) => !open.paste_opaque,
             _ => return,
         };
+        // Pixels are palette INDICES. Under a different palette the same
+        // numbers are different colours, so say so rather than silently
+        // recolouring what was pasted.
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.clipboard_note = (open.store.state().palette != clip.palette)
+                .then_some("pasted from a tileset with a different palette");
+        }
         let mut writes = Vec::new();
         for dy in 0..h {
             for dx in 0..w {
@@ -2540,6 +2596,10 @@ impl TilesetPanel {
             summary.push_str(&hover);
         }
         if let Some(note) = self.float_status() {
+            summary.push_str(" · ");
+            summary.push_str(note);
+        }
+        if let Some(note) = open.clipboard_note {
             summary.push_str(" · ");
             summary.push_str(note);
         }
@@ -3895,9 +3955,10 @@ mod tests {
             );
 
             panel.copy_selection(cx);
+            let clip = TilesetPanel::clip(cx).expect("copy filled the clipboard");
             assert_eq!(
-                ready(panel).clipboard,
-                Some((2, 2, vec![1, 1, 1, 1])),
+                (clip.w, clip.h, clip.pixels),
+                (2, 2, vec![1, 1, 1, 1]),
                 "copy sampled the region"
             );
 
@@ -3936,9 +3997,9 @@ mod tests {
 
             // No marquee is NOT a no-op any more -- the paste lands at the
             // top-left visible tile instead of being silently dropped.
+            TilesetPanel::set_clip(1, 1, vec![5], [0u16; PAL_SLOTS], cx);
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.selection = None;
-                open.clipboard = Some((1, 1, vec![5]));
             }
             panel.paste_clipboard(cx);
             assert_eq!(
@@ -4852,10 +4913,10 @@ mod tests {
                 open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
             }
             panel.cut_selection(cx);
+            let clip = TilesetPanel::clip(cx).expect("cut filled the clipboard");
+            assert_eq!((clip.w, clip.h), (TILE_PX, TILE_PX));
+            assert!(clip.pixels.iter().all(|&v| v == 1), "the copy took the art");
             let open = ready(panel);
-            let (w, h, data) = open.clipboard.clone().expect("cut filled the clipboard");
-            assert_eq!((w, h), (TILE_PX, TILE_PX));
-            assert!(data.iter().all(|&v| v == 1), "the copy took the art");
             assert_eq!(
                 open.store.state().indices[idx(1, 7, 7)],
                 0,
@@ -5138,8 +5199,8 @@ mod tests {
             for x in 0..TILE_PX {
                 data[x] = 1; // row 0 only
             }
+            TilesetPanel::set_clip(TILE_PX, TILE_PX, data, [0u16; PAL_SLOTS], cx);
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.clipboard = Some((TILE_PX, TILE_PX, data));
                 // Destination: tile 1, solid slot 1 in the fixture.
                 open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
             }
@@ -5160,8 +5221,8 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             let data = vec![0u8; TILE_PX * TILE_PX];
+            TilesetPanel::set_clip(TILE_PX, TILE_PX, data, [0u16; PAL_SLOTS], cx);
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.clipboard = Some((TILE_PX, TILE_PX, data));
                 open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
                 open.paste_opaque = true;
             }
@@ -5179,8 +5240,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
+            TilesetPanel::set_clip(
+                TILE_PX,
+                TILE_PX,
+                vec![2u8; TILE_PX * TILE_PX],
+                [0u16; PAL_SLOTS],
+                cx,
+            );
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.clipboard = Some((TILE_PX, TILE_PX, vec![2u8; TILE_PX * TILE_PX]));
                 open.selection = None;
             }
             panel.paste_clipboard(cx);
@@ -5202,8 +5269,14 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             panel.enter_focus(2, cx);
+            TilesetPanel::set_clip(
+                TILE_PX,
+                TILE_PX,
+                vec![2u8; TILE_PX * TILE_PX],
+                [0u16; PAL_SLOTS],
+                cx,
+            );
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.clipboard = Some((TILE_PX, TILE_PX, vec![2u8; TILE_PX * TILE_PX]));
                 open.selection = None;
             }
             panel.paste_clipboard(cx);
@@ -5230,8 +5303,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
+            TilesetPanel::set_clip(
+                TILE_PX,
+                TILE_PX,
+                vec![0u8; TILE_PX * TILE_PX],
+                [0u16; PAL_SLOTS],
+                cx,
+            );
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.clipboard = Some((TILE_PX, TILE_PX, vec![0u8; TILE_PX * TILE_PX]));
                 open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
             }
             panel.paste_clipboard(cx);
@@ -5250,8 +5329,14 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             panel.set_cols(2, cx);
+            TilesetPanel::set_clip(
+                TILE_PX,
+                TILE_PX,
+                vec![2u8; TILE_PX * TILE_PX],
+                [0u16; PAL_SLOTS],
+                cx,
+            );
             if let ViewerState::Ready(open) = &mut panel.state {
-                open.clipboard = Some((TILE_PX, TILE_PX, vec![2u8; TILE_PX * TILE_PX]));
                 // The pad cell's origin on the second row.
                 open.selection = Some(((TILE_PX, TILE_PX), (2 * TILE_PX - 1, 2 * TILE_PX - 1)));
             }
@@ -5314,7 +5399,7 @@ mod tests {
             );
             // Must not panic when the region is read back.
             panel.copy_selection(cx);
-            assert!(ready(panel).clipboard.is_some());
+            assert!(TilesetPanel::clip(cx).is_some());
         });
     }
 
@@ -6138,9 +6223,10 @@ mod tests {
             assert_eq!(carried.pixels, vec![0, 1], "lifted from the tile boundary");
 
             panel.copy_selection(cx);
+            let clip = TilesetPanel::clip(cx).expect("copied");
             assert_eq!(
-                ready(panel).clipboard,
-                Some((2, 1, vec![0, 1])),
+                (clip.w, clip.h, clip.pixels),
+                (2, 1, vec![0, 1]),
                 "copied the float, not the sheet under it"
             );
 
@@ -6254,6 +6340,69 @@ mod tests {
 
             panel.commit_float(cx);
             assert_eq!(panel.float_status(), None, "and goes quiet once placed");
+        });
+    }
+
+    /// The clipboard lived on `OpenTileset`, and `tileset_item` builds a
+    /// fresh panel entity per tab, so copying in one tileset and pasting
+    /// into another silently did nothing at all.
+    #[gpui::test]
+    async fn test_the_clipboard_is_shared_between_open_tilesets(cx: &mut TestAppContext) {
+        let source_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let source = ready_panel(cx, source_dir.path()).await;
+        let dest = ready_panel(cx, dest_dir.path()).await;
+
+        source.update(cx, |panel, cx| {
+            // Tile 1's top-left 2x2 is solid slot 1 in the fixture.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 1)));
+            }
+            panel.copy_selection(cx);
+        });
+
+        dest.update(cx, |panel, cx| {
+            // Tile 0 is transparent, so a paste there is unambiguous.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (1, 1)));
+            }
+            panel.paste_clipboard(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 0, 0)],
+                1,
+                "the other tileset's copy landed here"
+            );
+        });
+    }
+
+    /// Pixels are palette INDICES, so the same numbers under a different
+    /// palette are different colours. Say so rather than silently
+    /// recolouring what was pasted.
+    #[gpui::test]
+    async fn test_pasting_across_palettes_says_the_colours_will_differ(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (1, 1)));
+            }
+
+            // Same palette: no note.
+            panel.copy_selection(cx);
+            panel.paste_clipboard(cx);
+            assert_eq!(ready(panel).clipboard_note, None, "palettes match");
+
+            // A clip written against a different palette.
+            let mut other = [0u16; PAL_SLOTS];
+            other[1] = 0x07E0; // green, where the fixture is red
+            TilesetPanel::set_clip(1, 1, vec![1], other, cx);
+            panel.paste_clipboard(cx);
+            assert!(
+                ready(panel)
+                    .clipboard_note
+                    .is_some_and(|note| note.contains("different palette")),
+                "the mismatch is surfaced"
+            );
         });
     }
 
