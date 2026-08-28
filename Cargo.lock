@@ -7718,6 +7718,7 @@ dependencies = [
  "ggo-worldlib",
  "ggo_audio_panel",
  "ggo_common",
+ "ggo_emerald_panel",
  "ggo_emu_panel",
  "ggo_import_panel",
  "ggo_map_panel",

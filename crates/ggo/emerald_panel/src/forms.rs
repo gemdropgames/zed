@@ -571,8 +571,18 @@ mod tests {
     #[test]
     fn world_name_error_rejects_what_emd_would() {
         for bad in &[
-            "", "Arena", "dungeon/Arena", "a b", "a.b", "/arena", "arena/", "a//b", "..",
-            "../a", "a/../b", "a\\b",
+            "",
+            "Arena",
+            "dungeon/Arena",
+            "a b",
+            "a.b",
+            "/arena",
+            "arena/",
+            "a//b",
+            "..",
+            "../a",
+            "a/../b",
+            "a\\b",
         ] {
             assert!(world_name_error(bad).is_some(), "{bad:?} should fail");
         }
@@ -581,10 +591,10 @@ mod tests {
     #[test]
     fn split_world_name_separates_dir_levels_from_the_file() {
         assert_eq!(split_world_name("arena"), (vec![], "arena"));
-        assert_eq!(split_world_name("dungeon/arena"), (vec!["dungeon"], "arena"));
         assert_eq!(
-            split_world_name("a/b/c"),
-            (vec!["a", "b"], "c")
+            split_world_name("dungeon/arena"),
+            (vec!["dungeon"], "arena")
         );
+        assert_eq!(split_world_name("a/b/c"), (vec!["a", "b"], "c"));
     }
 }

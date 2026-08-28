@@ -20,6 +20,7 @@ ggo_common.workspace = true
 ggo_import_panel = { workspace = true, features = ["test-support"] }
 ggo_sprite_panel.workspace = true
 ggo_audio_panel.workspace = true
+ggo_emerald_panel = { workspace = true, features = ["test-support"] }
 ggo_emu_panel.workspace = true
 ggo_map_panel.workspace = true
 ggo_world_panel.workspace = true

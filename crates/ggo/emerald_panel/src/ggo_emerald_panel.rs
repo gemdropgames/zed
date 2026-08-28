@@ -55,8 +55,7 @@ use std::path::{Path, PathBuf};
 use editor::Editor;
 use gpui::{
     Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window,
-    actions, div, px,
+    IntoElement, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window, actions, div, px,
 };
 
 use project::ProjectPath;
@@ -92,6 +91,11 @@ actions!(
         NewProject
     ]
 );
+
+/// Smoke-test surface: the runner seam and its types, so `ggo_smoke` can
+/// drive the real NewProject action with a stubbed `emd`.
+#[cfg(feature = "test-support")]
+pub use runner::EmdRunner as TestEmdRunner;
 
 const GGO_EMERALD_PANEL_KEY: &str = "GGOEmeraldPanel";
 
@@ -132,7 +136,6 @@ const CADENCES: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
 const EMPTY_MESSAGE: &str = "Right-click the project root or manifests/ → New Component…, or an assets directory → New World…";
 
 pub fn init(cx: &mut App) {
-
     // Right-clicking a directory offers the generate entries that belong
     // to it. Deliberately NOT a `register_path_open_interceptor`: this
     // panel claims no file extension -- the artifacts `emd generate`
@@ -187,11 +190,22 @@ fn new_project(
         .unwrap_or_else(system_runner);
     cx.spawn_in(window, async move |workspace, cx| {
         // A dropped or cancelled dialog is a plain "never mind".
-        let Some(dest) = dest.await.ok().flatten().and_then(|paths| paths.into_iter().next())
+        let Some(dest) = dest
+            .await
+            .ok()
+            .flatten()
+            .and_then(|paths| paths.into_iter().next())
         else {
             return anyhow::Ok(());
         };
-        create_project_at(workspace, dest, runner, Box::new(open_project_workspace), cx).await
+        create_project_at(
+            workspace,
+            dest,
+            runner,
+            Box::new(open_project_workspace),
+            cx,
+        )
+        .await
     })
     .detach_and_log_err(cx);
 }
@@ -291,15 +305,10 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
         return None;
     }
     Some((
-        EmdRequest::new(
-            ggo_common::emd_bin(),
-            parent,
-            vec!["new".to_string(), name],
-        ),
+        EmdRequest::new(ggo_common::emd_bin(), parent, vec!["new".to_string(), name]),
         dest.to_path_buf(),
     ))
 }
-
 
 // -------------------------------------------------------- the context menu
 
@@ -491,37 +500,40 @@ fn new_world_inline_handler(
     worktree_id: project::WorktreeId,
     seed: WorldSeed,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace.clone(), move |panel: &Entity<ProjectPanel>, window, cx| {
-        let workspace = workspace.clone();
-        let seed = seed.clone();
-        panel.update(cx, |panel, cx| {
-            let Some(path) = inline_project_path(worktree_id, &seed.seed_rel) else {
-                return;
-            };
-            let seeded = panel.ggo_new_entry_inline(
-                &path,
-                world_validate(&seed),
-                new_world_commit(workspace.clone(), seed.clone()),
-                window,
-                cx,
-            );
-            if !seeded {
-                // `assets/worlds/` may not exist yet -- seed at the
-                // clicked dir instead; `emd` creates the worlds dir on the
-                // first generate and the file appears there.
-                let Some(path) = inline_project_path(worktree_id, &seed.fallback_rel) else {
+    ggo_common::panel_entry_handler(
+        workspace.clone(),
+        move |panel: &Entity<ProjectPanel>, window, cx| {
+            let workspace = workspace.clone();
+            let seed = seed.clone();
+            panel.update(cx, |panel, cx| {
+                let Some(path) = inline_project_path(worktree_id, &seed.seed_rel) else {
                     return;
                 };
-                panel.ggo_new_entry_inline(
+                let seeded = panel.ggo_new_entry_inline(
                     &path,
                     world_validate(&seed),
                     new_world_commit(workspace.clone(), seed.clone()),
                     window,
                     cx,
                 );
-            }
-        });
-    })
+                if !seeded {
+                    // `assets/worlds/` may not exist yet -- seed at the
+                    // clicked dir instead; `emd` creates the worlds dir on the
+                    // first generate and the file appears there.
+                    let Some(path) = inline_project_path(worktree_id, &seed.fallback_rel) else {
+                        return;
+                    };
+                    panel.ggo_new_entry_inline(
+                        &path,
+                        world_validate(&seed),
+                        new_world_commit(workspace.clone(), seed.clone()),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        },
+    )
 }
 
 /// The inline world-name gate: `emd`'s per-segment snake_case rule
@@ -595,24 +607,27 @@ fn new_tileset_inline_handler(
     dir_abs: PathBuf,
     under: String,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace.clone(), move |panel: &Entity<ProjectPanel>, window, cx| {
-        let workspace = workspace.clone();
-        let dir_rel = dir_rel.clone();
-        let dir_abs = dir_abs.clone();
-        let under = under.clone();
-        panel.update(cx, |panel, cx| {
-            let Some(path) = inline_project_path(worktree_id, &dir_rel) else {
-                return;
-            };
-            panel.ggo_new_entry_inline(
-                &path,
-                tileset_validate(dir_abs, under),
-                new_tileset_commit(workspace, dir_rel.clone()),
-                window,
-                cx,
-            );
-        });
-    })
+    ggo_common::panel_entry_handler(
+        workspace.clone(),
+        move |panel: &Entity<ProjectPanel>, window, cx| {
+            let workspace = workspace.clone();
+            let dir_rel = dir_rel.clone();
+            let dir_abs = dir_abs.clone();
+            let under = under.clone();
+            panel.update(cx, |panel, cx| {
+                let Some(path) = inline_project_path(worktree_id, &dir_rel) else {
+                    return;
+                };
+                panel.ggo_new_entry_inline(
+                    &path,
+                    tileset_validate(dir_abs, under),
+                    new_tileset_commit(workspace, dir_rel.clone()),
+                    window,
+                    cx,
+                );
+            });
+        },
+    )
 }
 
 /// The inline tileset gate: [`tileset::tileset_rel`]'s own stem rules,
@@ -834,6 +849,13 @@ pub struct EmeraldPanel {
 }
 
 impl EmeraldPanel {
+    /// Smoke-test hook: swap the `emd` seam for a stub, the same
+    /// injection the crate's own tests use.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_runner(&mut self, runner: EmdRunner) {
+        self.runner = runner;
+    }
+
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
@@ -2049,12 +2071,14 @@ impl EmeraldPanel {
                     ),
                 );
             }
-            col = col.child(
-                div().debug_selector(|| "ggo-emerald-field-add".into()).child(
-                    Button::new("ggo-emerald-field-add", "+ Field")
-                        .on_click(cx.listener(|this, _, window, cx| this.add_field(window, cx))),
-                ),
-            );
+            col =
+                col.child(
+                    div()
+                        .debug_selector(|| "ggo-emerald-field-add".into())
+                        .child(Button::new("ggo-emerald-field-add", "+ Field").on_click(
+                            cx.listener(|this, _, window, cx| this.add_field(window, cx)),
+                        )),
+                );
         }
         if let Some(error) = error
             && !draft.pristine()
@@ -2743,7 +2767,11 @@ mod tests {
 
         assert_eq!(new_project_request(Path::new("/")), None);
         assert_eq!(new_project_request(Path::new("")), None);
-        assert_eq!(new_project_request(Path::new("my-game")), None, "relative destination with no parent dir");
+        assert_eq!(
+            new_project_request(Path::new("my-game")),
+            None,
+            "relative destination with no parent dir"
+        );
     }
 
     use ggo_worldlib::emerald::{
@@ -4406,12 +4434,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
         let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let seed = world_seed(
-            &dir.path().join("assets"),
-            dir.path(),
-            "assets",
-        )
-        .expect("an emerald project has a world seed");
+        let seed = world_seed(&dir.path().join("assets"), dir.path(), "assets")
+            .expect("an emerald project has a world seed");
         let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
@@ -4469,10 +4493,7 @@ mod tests {
             vec!["generate", "world", "arena", "--json"]
         );
         assert_eq!(recorded[0].cwd, dir.path());
-        assert_eq!(
-            run_state_message(&panel, cx),
-            "done Created world arena"
-        );
+        assert_eq!(run_state_message(&panel, cx), "done Created world arena");
         let world_panel = workspace.read_with(cx, |workspace, cx| {
             workspace.panel::<WorldPanel>(cx).expect("docked")
         });
@@ -4524,7 +4545,14 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].args,
-            vec!["generate", "world", "arena", "--dir", "dungeon/floors", "--json"],
+            vec![
+                "generate",
+                "world",
+                "arena",
+                "--dir",
+                "dungeon/floors",
+                "--json"
+            ],
             "clicked base and typed levels compose into --dir"
         );
     }
@@ -5362,11 +5390,21 @@ mod tests {
         let (runner, calls) = fake_runner(|_| ok_outcome("/home/me/games/my-game"));
         let (open_project, opened) = recording_open_project();
 
-        create_project(&workspace, "/home/me/games/my-game", runner, open_project, cx).await;
+        create_project(
+            &workspace,
+            "/home/me/games/my-game",
+            runner,
+            open_project,
+            cx,
+        )
+        .await;
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "exactly one emd spawn");
-        assert_eq!(calls[0].args, vec!["new".to_string(), "my-game".to_string()]);
+        assert_eq!(
+            calls[0].args,
+            vec!["new".to_string(), "my-game".to_string()]
+        );
         assert_eq!(calls[0].cwd, PathBuf::from("/home/me/games"));
         drop(calls);
 
@@ -5392,7 +5430,14 @@ mod tests {
         let (runner, calls) = fake_runner(|_| err_outcome("destination already exists"));
         let (open_project, opened) = recording_open_project();
 
-        create_project(&workspace, "/home/me/games/my-game", runner, open_project, cx).await;
+        create_project(
+            &workspace,
+            "/home/me/games/my-game",
+            runner,
+            open_project,
+            cx,
+        )
+        .await;
 
         assert_eq!(calls.lock().unwrap().len(), 1, "the spawn still happened");
         assert!(
@@ -5436,8 +5481,15 @@ mod tests {
         cx.run_until_parked();
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "the dialog's choice reached the panel's runner");
-        assert_eq!(calls[0].args, vec!["new".to_string(), "my-game".to_string()]);
+        assert_eq!(
+            calls.len(),
+            1,
+            "the dialog's choice reached the panel's runner"
+        );
+        assert_eq!(
+            calls[0].args,
+            vec!["new".to_string(), "my-game".to_string()]
+        );
         assert_eq!(calls[0].cwd, PathBuf::from("/home/me/games"));
         drop(calls);
 
@@ -5559,9 +5611,7 @@ mod tests {
     /// takes no fields, so the Component's field rows leave the screen,
     /// and come back (kept, not rebuilt) when the kind switches back.
     #[gpui::test]
-    async fn test_select_kind_switches_the_draft_kind_and_its_field_rows(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_select_kind_switches_the_draft_kind_and_its_field_rows(cx: &mut TestAppContext) {
         let dir = emerald_project();
         let (runner, _calls) = fake_runner(|_| ok_outcome("/x/never"));
         let (panel, cx) = rendered_panel(cx, dir.path(), runner);
@@ -5631,9 +5681,11 @@ mod tests {
             })
         });
         let fields = panel.read_with(cx, |panel, _| match &panel.form {
-            Some(PanelForm::Generate(form)) => {
-                form.fields.iter().map(|row| row.name.clone()).collect::<Vec<_>>()
-            }
+            Some(PanelForm::Generate(form)) => form
+                .fields
+                .iter()
+                .map(|row| row.name.clone())
+                .collect::<Vec<_>>(),
             _ => panic!("expected a generate form"),
         });
         type_into(&fields[0], "hp", cx);
@@ -5654,7 +5706,10 @@ mod tests {
                 "an out-of-range remove is a no-op"
             );
         });
-        assert!(calls.lock().unwrap().is_empty(), "editing rows spawns nothing");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "editing rows spawns nothing"
+        );
     }
 
     /// The form row's rendered trash button: with one field row open, a
@@ -5704,14 +5759,22 @@ mod tests {
         panel.update(cx, |panel, cx| panel.select_item("HeroUnit", cx));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.tab, BrowseTab::Components, "the browser opens on Components");
+            assert_eq!(
+                panel.tab,
+                BrowseTab::Components,
+                "the browser opens on Components"
+            );
             assert_eq!(panel.selected.as_deref(), Some("HeroUnit"));
         });
 
         click(cx, "ggo-emerald-tab-Systems");
 
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.tab, BrowseTab::Systems, "the click must switch the tab");
+            assert_eq!(
+                panel.tab,
+                BrowseTab::Systems,
+                "the click must switch the tab"
+            );
             assert_eq!(
                 panel.selected, None,
                 "a selection never survives a tab change"

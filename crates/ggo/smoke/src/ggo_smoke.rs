@@ -592,6 +592,7 @@ mod tests {
             ggo_world_panel::init(cx);
             ggo_audio_panel::init(cx);
             ggo_emu_panel::init(cx);
+            ggo_emerald_panel::init(cx);
             ggo_common::bind_default_keymap(cx);
         });
         let fs = FakeFs::new(cx.executor());
@@ -756,6 +757,103 @@ mod tests {
         let reopened = ggo_worldlib::sprites::io::open_map(dir.path(), "assets/maps/lvl.map")
             .expect("worldlib reopens the new map");
         assert_eq!((reopened.w, reopened.h), (8, 8));
+    }
+
+    /// Install the emerald dock panel with a stubbed `emd` runner that
+    /// records every request and "scaffolds" by writing the project dir
+    /// itself, then answers as the stub decides.
+    fn install_emerald_stub(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        ok: bool,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>> {
+        use std::sync::{Arc, Mutex};
+        let calls: Arc<Mutex<Vec<ggo_common::ProcRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: ggo_emerald_panel::TestEmdRunner =
+            Arc::new(move |request: ggo_common::ProcRequest| {
+                if ok
+                    && request.args.first().map(String::as_str) == Some("new")
+                    && let Some(name) = request.args.get(1)
+                {
+                    let dest = request.cwd.join(name);
+                    std::fs::create_dir_all(&dest).unwrap();
+                    std::fs::write(dest.join("emerald.toml"), "").unwrap();
+                }
+                recorded.lock().unwrap().push(request);
+                let outcome = ggo_worldlib::emerald::EmdRunOutcome {
+                    ok,
+                    output: if ok {
+                        "created".into()
+                    } else {
+                        "boom: emd said no".into()
+                    },
+                    result: None,
+                };
+                Box::pin(async move { outcome })
+            });
+        // init() already installed the dock panel; swap the seam on the
+        // one the action handler will actually reach for.
+        workspace.update(cx, |workspace, cx| {
+            let panel = workspace
+                .panel::<ggo_emerald_panel::EmeraldPanel>(cx)
+                .expect("init installed the emerald panel");
+            panel.update(cx, |panel, _| panel.test_set_runner(runner));
+        });
+        calls
+    }
+
+    /// NewProject, the real surface end to end: the action fires the
+    /// native new-path dialog (simulated), the handler builds `emd new
+    /// <name>` in the chosen parent, and the stubbed scaffolder's output
+    /// exists on disk afterwards.
+    #[gpui::test]
+    async fn smoke_new_project_scaffolds_through_the_stubbed_runner(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        let calls = install_emerald_stub(&workspace, cx, true);
+
+        let dest = dir.path().join("newgame");
+        let chosen = dest.clone();
+        // The dialog opens when the action runs; the simulation answers
+        // the pending prompt.
+        cx.dispatch_action(ggo_emerald_panel::NewProject);
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one emd invocation");
+        assert_eq!(
+            calls[0].args,
+            vec!["new".to_string(), "newgame".to_string()],
+            "emd new <name>"
+        );
+        assert_eq!(calls[0].cwd, dir.path(), "run in the chosen parent");
+        assert!(
+            dest.join("emerald.toml").is_file(),
+            "the scaffold exists where the dialog pointed"
+        );
+    }
+
+    /// The failure branch: the scaffolder says no, nothing is created,
+    /// and the workspace survives to show the toast.
+    #[gpui::test]
+    async fn smoke_new_project_failure_leaves_nothing_behind(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        let calls = install_emerald_stub(&workspace, cx, false);
+
+        let dest = dir.path().join("doomed");
+        let chosen = dest.clone();
+        // The dialog opens when the action runs; the simulation answers
+        // the pending prompt.
+        cx.dispatch_action(ggo_emerald_panel::NewProject);
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().len(), 1, "emd was asked");
+        assert!(!dest.exists(), "and nothing was left behind");
+        workspace.read_with(cx, |_, _| ());
     }
 
     /// The journey that crashed the editor this morning: a `.png` dropped
