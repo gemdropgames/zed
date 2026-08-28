@@ -91,6 +91,22 @@ actions!(
         Cancel,
         /// Focuses the tile under the selection (or tile 0) for magnified editing.
         FocusTile,
+        /// Selects the Pencil tool.
+        UsePencil,
+        /// Selects the Eraser tool.
+        UseEraser,
+        /// Selects the colour Picker tool.
+        UsePicker,
+        /// Selects the marquee Select tool.
+        UseSelect,
+        /// Selects the Fill tool.
+        UseFill,
+        /// Selects the Line tool.
+        UseLine,
+        /// Selects the Rect tool.
+        UseRect,
+        /// Selects the Ellipse tool.
+        UseEllipse,
     ]
 );
 
@@ -195,6 +211,28 @@ enum Tool {
     Line,
     Rect,
     Ellipse,
+}
+
+/// The single key that selects `tool`, shown in its toolbar tooltip and
+/// bound in the default keymaps. `f` is deliberately absent -- it is
+/// already `FocusTile` -- so Fill takes `g`, the bucket key.
+fn tool_shortcut(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Pencil => "b",
+        Tool::Eraser => "e",
+        Tool::Picker => "i",
+        Tool::Select => "m",
+        Tool::Fill => "g",
+        Tool::Line => "l",
+        Tool::Rect => "r",
+        Tool::Ellipse => "o",
+    }
+}
+
+/// A tool button's tooltip: its description with its key appended, the
+/// same `"... (key)"` shape the brush and flip buttons already use.
+fn tool_tip(description: &str, tool: Tool) -> String {
+    format!("{description} ({})", tool_shortcut(tool))
 }
 
 impl Tool {
@@ -616,7 +654,51 @@ impl TilesetPanel {
         self.enter_focus(next, cx);
     }
 
+    /// A left press on the sheet. `click_count` is deliberately unused: a
+    /// double click is just two clicks.
+    ///
+    /// It used to enter single-tile focus, which fires by accident
+    /// whenever you paint quickly and replaces the whole sheet with one
+    /// magnified tile. Focus is still reachable on purpose -- `f`
+    /// ([`FocusTile`]) or the toolbar button.
+    fn on_sheet_click(
+        &mut self,
+        position: Point<Pixels>,
+        _click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_sheet_mouse_down(position, cx);
+    }
+
+    /// An arrow-key step: shift the marquee if there is one, else step
+    /// tiles in focus mode, else scroll the sheet.
+    ///
+    /// The marquee wins because a visible selection is what the arrows most
+    /// obviously address -- and it is the same move dragging inside the
+    /// marquee performs, so the two gestures agree. Escape drops the
+    /// selection and hands the arrows back to scrolling.
+    /// A press that landed outside the panel entirely drops the marquee.
+    ///
+    /// Scoped to the panel ROOT, not the sheet: the toolbar's Copy, Paste
+    /// and Flip buttons all operate on the selection, so a press inside the
+    /// panel must never clear it.
+    fn clear_selection_on_click_out(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if open.selection.is_none() && open.move_drag.is_none() {
+            return;
+        }
+        open.selection = None;
+        open.move_drag = None;
+        cx.notify();
+    }
+
     fn scroll_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        if self.selection_rect().is_some() {
+            self.move_selection((dx as i32, dy as i32), cx);
+            return;
+        }
         if matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some()) && dx != 0.0 {
             self.step_focus(if dx > 0.0 { 1 } else { -1 }, cx);
             return;
@@ -1465,15 +1547,11 @@ impl TilesetPanel {
                                                 |this, event: &MouseDownEvent, window, cx| {
                                                     // Take focus so undo/save bindings apply.
                                                     window.focus(&this.focus_handle, cx);
-                                                    if event.click_count >= 2 {
-                                                        if let Some((tile, ..)) =
-                                                            this.pixel_at(event.position)
-                                                        {
-                                                            this.enter_focus(tile, cx);
-                                                        }
-                                                        return;
-                                                    }
-                                                    this.on_sheet_mouse_down(event.position, cx);
+                                                    this.on_sheet_click(
+                                                        event.position,
+                                                        event.click_count,
+                                                        cx,
+                                                    );
                                                 },
                                             ),
                                         )
@@ -1617,30 +1695,37 @@ impl TilesetPanel {
                 IconButton::new("ggo-tileset-pencil", IconName::Pencil)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Pencil)
-                    .tooltip(ui::Tooltip::text("Pencil"))
+                    .tooltip(ui::Tooltip::text(tool_tip("Pencil", Tool::Pencil)))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Pencil, cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-eraser", IconName::Eraser)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Eraser)
-                    .tooltip(ui::Tooltip::text("Eraser (paints transparent)"))
+                    .tooltip(ui::Tooltip::text(tool_tip(
+                        "Eraser, paints transparent",
+                        Tool::Eraser,
+                    )))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Eraser, cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-picker", IconName::Crosshair)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Picker)
-                    .tooltip(ui::Tooltip::text("Pick color from the sheet"))
+                    .tooltip(ui::Tooltip::text(tool_tip(
+                        "Pick color from the sheet",
+                        Tool::Picker,
+                    )))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Picker, cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-select", IconName::SquareDot)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Select)
-                    .tooltip(ui::Tooltip::text(
-                        "Select region (ctrl-c copy, ctrl-v paste)",
-                    ))
+                    .tooltip(ui::Tooltip::text(tool_tip(
+                        "Select region; ctrl-c copy, ctrl-v paste, arrows nudge",
+                        Tool::Select,
+                    )))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Select, cx))),
             )
             .children(
@@ -1669,7 +1754,7 @@ impl TilesetPanel {
                     IconButton::new(id, icon)
                         .icon_size(IconSize::Small)
                         .toggle_state(open.tool == tool)
-                        .tooltip(ui::Tooltip::text(tip))
+                        .tooltip(ui::Tooltip::text(tool_tip(tip, tool)))
                         .on_click(cx.listener(move |this, _, _, cx| this.set_tool(tool, cx)))
                 }),
             )
@@ -1984,6 +2069,19 @@ impl Render for TilesetPanel {
             )
             .on_action(cx.listener(|this, _: &Cancel, _window, cx| this.cancel_impl(cx)))
             .on_action(cx.listener(|this, _: &FocusTile, _window, cx| this.focus_tile_impl(cx)))
+            .on_action(cx.listener(|this, _: &UsePencil, _, cx| this.set_tool(Tool::Pencil, cx)))
+            .on_action(cx.listener(|this, _: &UseEraser, _, cx| this.set_tool(Tool::Eraser, cx)))
+            .on_action(cx.listener(|this, _: &UsePicker, _, cx| this.set_tool(Tool::Picker, cx)))
+            .on_action(cx.listener(|this, _: &UseSelect, _, cx| this.set_tool(Tool::Select, cx)))
+            .on_action(cx.listener(|this, _: &UseFill, _, cx| this.set_tool(Tool::Fill, cx)))
+            .on_action(cx.listener(|this, _: &UseLine, _, cx| this.set_tool(Tool::Line, cx)))
+            .on_action(cx.listener(|this, _: &UseRect, _, cx| this.set_tool(Tool::Rect, cx)))
+            .on_action(cx.listener(|this, _: &UseEllipse, _, cx| this.set_tool(Tool::Ellipse, cx)))
+            .on_mouse_down_out(
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.clear_selection_on_click_out(cx)
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &SelectWholeSheet, _window, cx| this.select_whole_sheet(cx)),
             )
@@ -3368,6 +3466,127 @@ mod tests {
                 open.grid_size.0,
                 (FIXTURE_TILES * TILE_PX) as u32,
                 "whole sheet again"
+            );
+        });
+    }
+
+    /// A double click is just two clicks. It used to drop the sheet into
+    /// single-tile focus mode, which fires constantly while painting fast
+    /// and yanks the whole view out from under you. Focus stays reachable
+    /// deliberately, via `f` or the toolbar.
+    #[gpui::test]
+    async fn test_double_clicking_a_tile_paints_instead_of_entering_focus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(1, cx);
+            panel.on_sheet_click(pixel_pos(ready(panel), 0, 2, 3), 2, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(ready(panel).focus, None, "no hard focus on a double click");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 2, 3)],
+                1,
+                "the second click still paints"
+            );
+        });
+    }
+
+    /// With a marquee up, the arrow keys shift the selected pixels instead
+    /// of scrolling -- same operation dragging inside the marquee performs.
+    /// With no selection they still scroll, and focus mode still steps.
+    #[gpui::test]
+    async fn test_arrows_nudge_the_selection_and_scroll_without_one(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                // Tile 1 is solid index 1; select its top-left 2x2.
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 1)));
+            }
+            let before = ready(panel).scroll.offset();
+
+            panel.scroll_by(1.0, 0.0, cx);
+
+            assert_eq!(
+                panel.selection_rect(),
+                Some((TILE_PX + 1, 0, TILE_PX + 2, 1)),
+                "the marquee travelled one pixel right"
+            );
+            assert_eq!(
+                ready(panel).scroll.offset(),
+                before,
+                "and the view did not scroll"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.cancel_impl(cx);
+            assert!(ready(panel).selection.is_none());
+            panel.scroll_by(0.0, 1.0, cx);
+            assert!(
+                ready(panel).scroll.offset().y < px(0.),
+                "with no selection the arrows scroll again"
+            );
+        });
+    }
+
+    /// Every tool has its own key, and none of them collide with a key the
+    /// panel already binds -- `f` is `FocusTile`, which is why Fill is `g`.
+    #[test]
+    fn every_tool_has_a_distinct_shortcut_that_is_not_already_taken() {
+        let tools = [
+            Tool::Pencil,
+            Tool::Eraser,
+            Tool::Picker,
+            Tool::Select,
+            Tool::Fill,
+            Tool::Line,
+            Tool::Rect,
+            Tool::Ellipse,
+        ];
+        let keys: Vec<&str> = tools.into_iter().map(tool_shortcut).collect();
+        for (i, key) in keys.iter().enumerate() {
+            assert!(!key.is_empty(), "{:?} has no shortcut", tools[i]);
+            assert!(
+                !["f", "[", "]", "escape"].contains(key),
+                "{key} is already bound in this panel"
+            );
+        }
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "shortcuts collide: {keys:?}");
+    }
+
+    /// Pressing outside the panel drops the marquee; anything inside it,
+    /// such as reaching for a toolbar button, leaves the selection alone.
+    #[gpui::test]
+    async fn test_pressing_outside_the_panel_clears_the_selection(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (3, 3)));
+                open.move_drag = Some(((1, 1), (2, 2)));
+            }
+
+            // A toolbar press stays inside the panel.
+            panel.set_tool(Tool::Select, cx);
+            assert!(
+                panel.selection_rect().is_some(),
+                "the toolbar must not clear what its buttons act on"
+            );
+
+            panel.clear_selection_on_click_out(cx);
+            assert!(panel.selection_rect().is_none(), "the marquee is gone");
+            assert!(
+                ready(panel).move_drag.is_none(),
+                "and so is any half-finished move"
             );
         });
     }
