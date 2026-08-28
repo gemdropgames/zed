@@ -115,6 +115,26 @@ actions!(
         DuplicateFocusedTile,
         /// Appends one new blank tile to the sheet.
         AppendBlankTile,
+        /// Selects the next palette slot.
+        NextSlot,
+        /// Selects the previous palette slot.
+        PrevSlot,
+        /// Returns the sheet to its default zoom.
+        ResetZoom,
+        /// Steps to the next tile in focus mode.
+        NextTile,
+        /// Steps to the previous tile in focus mode.
+        PrevTile,
+        /// Toggles the tile-boundary lines.
+        ToggleLines,
+        /// Toggles horizontal mirrored painting.
+        ToggleMirrorHorizontal,
+        /// Toggles vertical mirrored painting.
+        ToggleMirrorVertical,
+        /// Toggles snapping the selection to whole tiles.
+        ToggleSnapTiles,
+        /// Toggles whether paste writes transparent pixels.
+        TogglePasteOpaque,
     ]
 );
 
@@ -788,8 +808,21 @@ impl TilesetPanel {
             self.move_selection((dx as i32 * step, dy as i32 * step), cx);
             return;
         }
-        if matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some()) && dx != 0.0 {
-            self.step_focus(if dx > 0.0 { 1 } else { -1 }, cx);
+        // In focus mode the sheet IS one tile, so there is nothing to
+        // scroll: left/right step one tile, up/down step a whole row. Up
+        // and down used to be dead keys there.
+        if let ViewerState::Ready(open) = &self.state
+            && open.focus.is_some()
+        {
+            let cols = open.cols.max(1) as isize;
+            let delta = if dx != 0.0 {
+                if dx > 0.0 { 1 } else { -1 }
+            } else if dy != 0.0 {
+                if dy > 0.0 { cols } else { -cols }
+            } else {
+                return;
+            };
+            self.step_focus(delta, cx);
             return;
         }
         let ViewerState::Ready(open) = &self.state else {
@@ -1512,6 +1545,22 @@ impl TilesetPanel {
             open.tool = tool;
             cx.notify();
         }
+    }
+
+    /// Move the painting slot by `delta`, wrapping the 16-slot palette.
+    /// Slot 0 is included on purpose -- it is the transparent slot, and
+    /// painting with it is how you erase without changing tool.
+    fn step_slot(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let next = (open.slot as isize + delta).rem_euclid(PAL_SLOTS as isize) as usize;
+        self.select_slot(next, cx);
+    }
+
+    /// Back to the zoom a freshly opened tileset uses.
+    fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(DEFAULT_ZOOM, cx);
     }
 
     fn select_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
@@ -2300,6 +2349,36 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &DeleteSelection, _, cx| this.erase_selection(cx)))
             .on_action(cx.listener(|this, _: &DuplicateFocusedTile, _, cx| this.duplicate_tile(cx)))
             .on_action(cx.listener(|this, _: &AppendBlankTile, _, cx| this.append_tile(cx)))
+            .on_action(cx.listener(|this, _: &NextSlot, _, cx| this.step_slot(1, cx)))
+            .on_action(cx.listener(|this, _: &PrevSlot, _, cx| this.step_slot(-1, cx)))
+            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.reset_zoom(cx)))
+            .on_action(cx.listener(|this, _: &NextTile, _, cx| this.step_focus(1, cx)))
+            .on_action(cx.listener(|this, _: &PrevTile, _, cx| this.step_focus(-1, cx)))
+            .on_action(cx.listener(|this, _: &ToggleLines, _, cx| this.toggle_lines(cx)))
+            .on_action(cx.listener(|this, _: &ToggleMirrorHorizontal, _, cx| {
+                if let ViewerState::Ready(open) = &mut this.state {
+                    open.mirror_h = !open.mirror_h;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMirrorVertical, _, cx| {
+                if let ViewerState::Ready(open) = &mut this.state {
+                    open.mirror_v = !open.mirror_v;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSnapTiles, _, cx| {
+                if let ViewerState::Ready(open) = &mut this.state {
+                    open.snap_tiles = !open.snap_tiles;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TogglePasteOpaque, _, cx| {
+                if let ViewerState::Ready(open) = &mut this.state {
+                    open.paste_opaque = !open.paste_opaque;
+                    cx.notify();
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &PasteSelection, _window, cx| this.paste_clipboard(cx)),
             )
@@ -4067,7 +4146,18 @@ mod tests {
     /// ZoomOut and SelectWholeSheet all sat unbound.
     #[test]
     fn every_ggo_tileset_action_is_bound_or_allowlisted() {
-        const UNBOUND_BY_DESIGN: &[&str] = &["AppendBlankTile"];
+        // Reachable from the command palette; deliberately keyless,
+        // because the panel's single-letter budget is spent on the tools.
+        const UNBOUND_BY_DESIGN: &[&str] = &[
+            "AppendBlankTile",
+            "NextTile",
+            "PrevTile",
+            "ToggleLines",
+            "ToggleMirrorHorizontal",
+            "ToggleMirrorVertical",
+            "ToggleSnapTiles",
+            "TogglePasteOpaque",
+        ];
         let actions = [
             "Undo",
             "Redo",
@@ -4082,6 +4172,7 @@ mod tests {
             "DeleteSelection",
             "ZoomIn",
             "ZoomOut",
+            "ResetZoom",
             "SelectWholeSheet",
             "BrushSmaller",
             "BrushLarger",
@@ -4097,6 +4188,17 @@ mod tests {
             "UseLine",
             "UseRect",
             "UseEllipse",
+            "DuplicateFocusedTile",
+            "AppendBlankTile",
+            "NextSlot",
+            "PrevSlot",
+            "NextTile",
+            "PrevTile",
+            "ToggleLines",
+            "ToggleMirrorHorizontal",
+            "ToggleMirrorVertical",
+            "ToggleSnapTiles",
+            "TogglePasteOpaque",
         ];
         for keymap in [
             "/../../../assets/keymaps/default-linux.json",
@@ -4568,6 +4670,53 @@ mod tests {
                 !open.shape_points(open.shape_filled).contains(&(5, 5)),
                 "an outline again"
             );
+        });
+    }
+
+    /// Colour selection was mouse-only: neither select_slot nor
+    /// set_palette_slot had an action behind it.
+    #[gpui::test]
+    async fn test_slot_stepping_wraps_the_palette(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(0, cx);
+            panel.step_slot(-1, cx);
+            assert_eq!(ready(panel).slot, PAL_SLOTS - 1, "wraps backwards off zero");
+            panel.step_slot(1, cx);
+            assert_eq!(ready(panel).slot, 0, "and forwards off the end");
+            panel.step_slot(3, cx);
+            assert_eq!(ready(panel).slot, 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reset_zoom_returns_to_the_default(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.zoom_by(2, cx);
+            assert_ne!(ready(panel).zoom, DEFAULT_ZOOM);
+            panel.reset_zoom(cx);
+            assert_eq!(ready(panel).zoom, DEFAULT_ZOOM);
+        });
+    }
+
+    /// Up and down were dead keys in focus mode: the sheet is one tile, so
+    /// there was nothing to scroll and only left/right stepped.
+    #[gpui::test]
+    async fn test_up_and_down_step_a_row_in_focus_mode(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(2, cx);
+            panel.enter_focus(0, cx);
+            panel.scroll_by(0.0, 1.0, cx);
+            assert_eq!(ready(panel).focus, Some(2), "down steps a whole row of 2");
+            panel.scroll_by(0.0, -1.0, cx);
+            assert_eq!(ready(panel).focus, Some(0), "and up comes back");
+            panel.scroll_by(0.0, -1.0, cx);
+            assert_eq!(ready(panel).focus, Some(0), "clamped at the first tile");
         });
     }
 
