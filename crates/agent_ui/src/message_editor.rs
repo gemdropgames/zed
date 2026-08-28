@@ -36,7 +36,7 @@ use project::{
 };
 use rope::Point;
 use settings::Settings;
-use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
+use std::{cmp::min, fmt::Write, ops::Range, path::PathBuf, rc::Rc, sync::Arc};
 use text::LineEnding;
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, prelude::*};
@@ -378,7 +378,7 @@ async fn resolve_pasted_context_items(
     (items, added_worktrees)
 }
 
-fn insert_project_path_as_context(
+pub(crate) fn insert_project_path_as_context(
     project_path: ProjectPath,
     editor: Entity<Editor>,
     mention_set: Entity<MentionSet>,
@@ -403,6 +403,51 @@ fn insert_project_path_as_context(
     })
     .ok()
     .flatten()
+}
+
+/// Mention `declined` -- files that exist but whose image format the
+/// pipeline cannot carry -- as plain files, so an explicitly chosen or
+/// pasted path always produces something visible. A non-local project is
+/// skipped, matching the drop path: the panels cannot resolve a local path
+/// into a remote worktree.
+pub(crate) async fn insert_declined_images_as_file_mentions(
+    declined: Vec<PathBuf>,
+    editor: Entity<Editor>,
+    mention_set: Entity<MentionSet>,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    if declined.is_empty() {
+        return;
+    }
+    let Ok(Some(project)) = cx.update(|_, cx| {
+        let workspace = workspace.upgrade()?;
+        let project = workspace.read(cx).project().clone();
+        project.read(cx).is_local().then_some(project)
+    }) else {
+        return;
+    };
+    for path in declined {
+        let Ok(resolve_task) = cx.update({
+            let project = project.clone();
+            move |_, cx| Workspace::project_path_for_path(project, &path, false, cx)
+        }) else {
+            continue;
+        };
+        let Some((_worktree, project_path)) = resolve_task.await.log_err() else {
+            continue;
+        };
+        if let Some(task) = insert_project_path_as_context(
+            project_path,
+            editor.clone(),
+            mention_set.clone(),
+            workspace.clone(),
+            true,
+            cx,
+        ) {
+            task.await;
+        }
+    }
 }
 
 async fn insert_resolved_pasted_context_items(
@@ -1639,22 +1684,29 @@ impl MessageEditor {
                 };
 
                 let default_image_name: SharedString = "Image".into();
-                let images = cx
+                let (images, declined) = cx
                     .background_spawn(async move {
-                        paths
-                            .into_iter()
-                            .filter_map(|path| {
-                                crate::mention_set::load_external_image_from_path(
-                                    &path,
-                                    &default_image_name,
-                                )
-                            })
-                            .collect::<Vec<_>>()
+                        crate::mention_set::load_external_images_from_paths(
+                            paths,
+                            &default_image_name,
+                        )
                     })
                     .await;
 
                 crate::mention_set::insert_images_as_context(
                     images,
+                    editor.clone(),
+                    mention_set.clone(),
+                    workspace.clone(),
+                    cx,
+                )
+                .await;
+
+                // The user explicitly chose these files; a format the image
+                // pipeline cannot carry becomes a file mention rather than
+                // silently nothing.
+                insert_declined_images_as_file_mentions(
+                    declined,
                     editor,
                     mention_set,
                     workspace,

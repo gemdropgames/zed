@@ -12,8 +12,8 @@ use editor::{
 };
 use futures::{AsyncReadExt as _, FutureExt as _, future::Shared};
 use gpui::{
-    AppContext, ClipboardEntry, Context, Empty, Entity, EntityId, Image, ImageFormat, Img,
-    SharedString, Task, WeakEntity,
+    AppContext, ClipboardEntry, Context, Empty, Entity, EntityId, Image, ImageFormat, SharedString,
+    Task, WeakEntity,
 };
 use http_client::{AsyncBody, HttpClientWithUrl};
 use itertools::Either;
@@ -853,6 +853,56 @@ mod tests {
         // Non-image extensions and paths with no extension.
         assert!(!is_raster_image_path(Path::new("/tmp/notes.txt")));
         assert!(!is_raster_image_path(Path::new("/tmp/README")));
+
+        // Formats gpui's ImageFormat cannot carry are NOT raster-image
+        // paths for mention purposes: classifying them as images sent them
+        // into a pipeline that could only decline them later, silently.
+        // As file mentions they at least resolve to visible feedback.
+        for extension in ["tga", "qoi", "avif", "dds", "hdr", "exr", "ff", "farbfeld"] {
+            assert!(
+                !is_raster_image_path(&Path::new("/tmp/img").with_extension(extension)),
+                ".{extension} is admitted by Img::extensions but unmappable"
+            );
+        }
+    }
+
+    /// The batch loader partitions rather than swallows: a decodable image
+    /// loads, an unmappable one comes back as a path the caller can route
+    /// to a file mention instead of dropping it on the floor.
+    #[test]
+    fn test_batch_image_load_returns_declined_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let qoi = dir.path().join("dropped.qoi");
+        let mut header = b"qoif".to_vec();
+        header.extend_from_slice(&1u32.to_be_bytes());
+        header.extend_from_slice(&1u32.to_be_bytes());
+        header.extend_from_slice(&[4, 0]);
+        std::fs::write(&qoi, &header).unwrap();
+
+        let png = dir.path().join("real.png");
+        let mut encoded = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut encoded),
+            &[255u8, 0, 0, 255],
+            1,
+            1,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        std::fs::write(&png, &encoded).unwrap();
+
+        let (images, declined) = load_external_images_from_paths(
+            vec![qoi.clone(), png, dir.path().join("missing.png")],
+            &"Image".into(),
+        );
+        assert_eq!(images.len(), 1, "the png loaded");
+        assert_eq!(images[0].1.as_ref(), "real.png");
+        assert_eq!(
+            declined,
+            vec![qoi],
+            "the qoi is handed back; an unreadable path stays dropped"
+        );
     }
 
     /// `is_raster_image_path` gates on `Img::extensions()`, which lists seven
@@ -865,13 +915,9 @@ mod tests {
     /// non-image handling.
     #[test]
     fn test_an_unmappable_image_format_is_declined_not_panicked() {
-        for extension in ["avif", "tga", "dds", "hdr", "exr", "ff", "qoi"] {
-            let path = Path::new("/tmp/dropped").with_extension(extension);
-            assert!(
-                is_raster_image_path(&path),
-                ".{extension} gets past the drop gate, so the mapping must survive it"
-            );
-        }
+        // The gate now refuses the unmappable extensions outright, but the
+        // mapping still has to survive them: content sniffing reaches it
+        // for a mappably-NAMED file whose bytes are another format.
 
         for format in [
             image::ImageFormat::Qoi,
@@ -1049,14 +1095,11 @@ fn image_format_from_external_content(format: image::ImageFormat) -> Option<Imag
         image::ImageFormat::Tiff => Some(ImageFormat::Tiff),
         image::ImageFormat::Ico => Some(ImageFormat::Ico),
         image::ImageFormat::Pnm => Some(ImageFormat::Pnm),
-        // Not an invariant violation: `is_raster_image_path` gates on
-        // `Img::extensions()`, which admits `avif`/`tga`/`dds`/`hdr`/`exr`/
-        // `ff`/`qoi`, and the sniff runs on whatever bytes the file actually
-        // holds -- so decline rather than crash a debug build. Callers vary
-        // in how gracefully they take a `None`: the drop path falls through
-        // to a plain file mention, but the paste path and the image picker
-        // currently swallow the file with no feedback at all, which is why
-        // this is a warn and not a debug trace.
+        // Not an invariant violation: the sniff runs on whatever bytes the
+        // file actually holds, so a mappably-NAMED file in an unmappable
+        // format lands here -- decline rather than crash a debug build.
+        // Every caller now routes a declined path to a file mention, so
+        // the file still produces something visible.
         _ => {
             log::warn!("declining an image in an unsupported format: {format:?}");
             None
@@ -1064,16 +1107,23 @@ fn image_format_from_external_content(format: image::ImageFormat) -> Option<Imag
     }
 }
 
+/// Extensions of the formats [`image_format_from_external_content`] can
+/// actually map into a gpui [`ImageFormat`]. Deliberately NOT
+/// `Img::extensions()`: that list also admits avif/tga/dds/hdr/exr/ff/qoi,
+/// which the mapping declines -- so classifying those as images sent them
+/// into a pipeline that could only drop them later. As file mentions they
+/// resolve to visible feedback instead.
+const MAPPABLE_IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "ico", "pbm", "pam", "ppm", "pgm",
+];
+
 // Case-insensitive so that e.g. `foo.PNG` is recognized the same as `foo.png`.
 // SVG is excluded because it is handled separately.
 fn is_raster_image_path(path: &Path) -> bool {
     let Some(extension) = path.extension().and_then(OsStr::to_str) else {
         return false;
     };
-    if extension.eq_ignore_ascii_case("svg") {
-        return false;
-    }
-    Img::extensions()
+    MAPPABLE_IMAGE_EXTENSIONS
         .iter()
         .any(|known| known.eq_ignore_ascii_case(extension))
 }
@@ -1093,6 +1143,26 @@ pub(crate) fn load_external_image_from_path(
         .unwrap_or_else(|| default_name.clone());
 
     Some((Image::from_bytes(format, content), name))
+}
+
+/// Load every path that decodes into a mappable image; hand back the ones
+/// that exist but decline, so the caller can route them to file mentions
+/// instead of silently dropping an explicitly chosen file. Unreadable
+/// paths stay dropped -- there is nothing to mention.
+pub(crate) fn load_external_images_from_paths(
+    paths: Vec<PathBuf>,
+    default_name: &SharedString,
+) -> (Vec<(Image, SharedString)>, Vec<PathBuf>) {
+    let mut images = Vec::new();
+    let mut declined = Vec::new();
+    for path in paths {
+        match load_external_image_from_path(&path, default_name) {
+            Some(image) => images.push(image),
+            None if path.is_file() => declined.push(path),
+            None => {}
+        }
+    }
+    (images, declined)
 }
 
 pub(crate) fn paste_images_as_context(
@@ -1126,22 +1196,43 @@ pub(crate) fn paste_images_as_context(
             })
             .partition_map::<Vec<_>, Vec<_>, _, _, _>(std::convert::identity);
 
+        let mut declined = Vec::new();
         if !paths.is_empty() {
-            images.extend(
-                cx.background_spawn(async move {
-                    paths
-                        .into_iter()
-                        .flat_map(|paths| paths.paths().to_owned())
-                        .filter_map(|path| load_external_image_from_path(&path, &default_name))
-                        .collect::<Vec<_>>()
+            let (loaded, batch_declined) = cx
+                .background_spawn(async move {
+                    load_external_images_from_paths(
+                        paths
+                            .into_iter()
+                            .flat_map(|paths| paths.paths().to_owned())
+                            .collect(),
+                        &default_name,
+                    )
                 })
-                .await,
-            );
+                .await;
+            images.extend(loaded);
+            declined = batch_declined;
         }
 
         if !images.is_empty() {
-            insert_images_as_context(images, editor, mention_set, workspace, &mut cx).await;
+            insert_images_as_context(
+                images,
+                editor.clone(),
+                mention_set.clone(),
+                workspace.clone(),
+                &mut cx,
+            )
+            .await;
         }
+        // A pasted path whose image format the pipeline cannot carry still
+        // produces a mention -- a file one -- instead of silently nothing.
+        crate::message_editor::insert_declined_images_as_file_mentions(
+            declined,
+            editor,
+            mention_set,
+            workspace,
+            &mut cx,
+        )
+        .await;
     }))
 }
 
