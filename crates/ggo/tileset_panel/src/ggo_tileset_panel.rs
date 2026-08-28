@@ -361,6 +361,14 @@ struct OpenTileset {
     space_held: bool,
     /// An in-flight space-pan: (cursor at press, scroll offset at press).
     pan_drag: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Column-count changes pinned to the document revision that caused
+    /// them: undo depth AFTER the op -> (cols before, cols after).
+    ///
+    /// `cols` is a VIEW property, so the store cannot restore it, but
+    /// InsertColumn/DeleteColumn change it. Without this, undoing a column
+    /// op put the tile strip back and left the sheet wrapped at the wrong
+    /// width, silently rearranging every tile.
+    cols_history: std::collections::HashMap<usize, (usize, usize)>,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -412,6 +420,7 @@ impl OpenTileset {
             hover: None,
             space_held: false,
             pan_drag: None,
+            cols_history: std::collections::HashMap::new(),
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -1565,6 +1574,7 @@ impl TilesetPanel {
             .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::DeleteColumn { cols, at_left });
         open.cols = cols - 1;
         open.selection = None;
+        self.record_cols_change(cols, cols - 1);
         self.recompose_grid(cx);
         self.write_view_meta();
     }
@@ -1667,6 +1677,7 @@ impl TilesetPanel {
         if let ViewerState::Ready(open) = &mut self.state {
             open.cols = cols + 1;
         }
+        self.record_cols_change(cols, cols + 1);
         self.recompose_grid(cx);
         self.write_view_meta();
     }
@@ -1800,21 +1811,64 @@ impl TilesetPanel {
         self.recompose_grid(cx);
     }
 
-    fn undo_impl(&mut self, cx: &mut Context<Self>) {
+    /// Record that the op that just landed took `cols` from `before` to
+    /// `after`, so undo and redo can put the view back.
+    fn record_cols_change(&mut self, before: usize, after: usize) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        if open.store.undo() {
-            self.recompose_grid(cx);
+        let depth = open.store.undo_depth();
+        // A new op clears the redo stack, so anything pinned above this
+        // revision is unreachable and would only mislead a later undo.
+        open.cols_history.retain(|&d, _| d < depth);
+        open.cols_history.insert(depth, (before, after));
+    }
+
+    fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        let restored = {
+            let ViewerState::Ready(open) = &mut self.state else {
+                return;
+            };
+            // The entry is keyed by the depth the op PRODUCED, which is the
+            // depth we are standing on before undoing it.
+            let depth = open.store.undo_depth();
+            if !open.store.undo() {
+                return;
+            }
+            match open.cols_history.get(&depth) {
+                Some(&(before, _)) => {
+                    open.cols = before;
+                    true
+                }
+                None => false,
+            }
+        };
+        self.recompose_grid(cx);
+        if restored {
+            self.write_view_meta();
         }
     }
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
-        let ViewerState::Ready(open) = &mut self.state else {
-            return;
+        let restored = {
+            let ViewerState::Ready(open) = &mut self.state else {
+                return;
+            };
+            if !open.store.redo() {
+                return;
+            }
+            let depth = open.store.undo_depth();
+            match open.cols_history.get(&depth) {
+                Some(&(_, after)) => {
+                    open.cols = after;
+                    true
+                }
+                None => false,
+            }
         };
-        if open.store.redo() {
-            self.recompose_grid(cx);
+        self.recompose_grid(cx);
+        if restored {
+            self.write_view_meta();
         }
     }
 
@@ -2118,12 +2172,27 @@ impl TilesetPanel {
             return div().into_any_element();
         }
         let (add_tip, remove_tip) = match (horizontal, at_start) {
-            (true, true) => ("Add row above", "Delete top row"),
-            (true, false) => ("Add row below", "Delete bottom row"),
-            (false, true) => ("Add column left", "Delete left column"),
-            (false, false) => ("Add column right", "Delete right column"),
+            (true, true) => (
+                "Add row above",
+                "Delete top row — removes its art (ctrl-z undoes)",
+            ),
+            (true, false) => (
+                "Add row below",
+                "Delete bottom row — removes its art (ctrl-z undoes)",
+            ),
+            (false, true) => (
+                "Add column left",
+                "Delete left column — removes its art (ctrl-z undoes)",
+            ),
+            (false, false) => (
+                "Add column right",
+                "Delete right column — removes its art (ctrl-z undoes)",
+            ),
         };
-        let half = |glyph: &'static str, tip: &'static str, index: usize| {
+        // The destructive half is coloured, not just glyph-different: it
+        // sits inside an 18px strip next to the additive one, and a misclick
+        // takes a whole row or column of art with it.
+        let half = |glyph: &'static str, tip: &'static str, index: usize, destructive: bool| {
             div()
                 .id((id, index))
                 .flex_1()
@@ -2132,7 +2201,15 @@ impl TilesetPanel {
                 .items_center()
                 .cursor_pointer()
                 .tooltip(ui::Tooltip::text(tip))
-                .child(Label::new(glyph).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    Label::new(glyph)
+                        .size(LabelSize::Small)
+                        .color(if destructive {
+                            Color::Error
+                        } else {
+                            Color::Muted
+                        }),
+                )
         };
         div()
             .id(id)
@@ -2144,7 +2221,7 @@ impl TilesetPanel {
             .rounded_sm()
             .border_color(cx.theme().colors().border_variant)
             .child(
-                half("+", add_tip, 0).on_click(cx.listener(move |this, _, _, cx| {
+                half("+", add_tip, 0, false).on_click(cx.listener(move |this, _, _, cx| {
                     if horizontal {
                         this.insert_row(at_start, cx);
                     } else {
@@ -2153,7 +2230,7 @@ impl TilesetPanel {
                 })),
             )
             .child(
-                half("−", remove_tip, 1).on_click(cx.listener(move |this, _, _, cx| {
+                half("−", remove_tip, 1, true).on_click(cx.listener(move |this, _, _, cx| {
                     if horizontal {
                         this.delete_row(at_start, cx);
                     } else {
@@ -5469,6 +5546,94 @@ mod tests {
             );
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).store.state().indices[idx(0, 1, 1)], 2);
+        });
+    }
+
+    /// insert_column's own doc comment admitted this: undo restored the
+    /// tile strip but left `cols` widened, so the sheet rewrapped and every
+    /// tile appeared to move. `cols` is a view property the store cannot
+    /// restore, so the panel pins it to the document revision.
+    #[gpui::test]
+    async fn test_undo_of_a_column_op_restores_the_view_width(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(3, cx);
+            let before = ready(panel).grid_size;
+
+            panel.insert_column(false, cx);
+            assert_eq!(ready(panel).cols, 4);
+            assert_ne!(ready(panel).grid_size, before);
+
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).cols, 3, "the view width came back");
+            assert_eq!(ready(panel).grid_size, before, "and so did the layout");
+
+            panel.redo_impl(cx);
+            assert_eq!(ready(panel).cols, 4, "redo re-widens it");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_undo_of_a_column_delete_restores_the_view_width(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(3, cx);
+            panel.delete_column(true, cx);
+            assert_eq!(ready(panel).cols, 2);
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).cols, 3, "a delete undoes its width too");
+        });
+    }
+
+    /// A paint between the column op and the undo must not confuse the
+    /// pinning: only the revision that actually changed `cols` restores it.
+    #[gpui::test]
+    async fn test_an_unrelated_undo_leaves_the_view_width_alone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(3, cx);
+            panel.insert_column(false, cx);
+            assert_eq!(ready(panel).cols, 4);
+
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Pencil, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+
+            // Undo the PAINT: the width must not move.
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).cols, 4, "the paint did not change cols");
+
+            // Undo the column op: now it must.
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).cols, 3);
+        });
+    }
+
+    /// A new op after an undo clears the redo stack, so pins recorded above
+    /// the current revision are unreachable and must not fire later.
+    #[gpui::test]
+    async fn test_a_new_op_after_an_undo_discards_stale_column_pins(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(3, cx);
+            panel.insert_column(false, cx);
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).cols, 3);
+
+            // A different op now occupies that revision.
+            panel.append_tile(cx);
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).cols,
+                3,
+                "undoing the append must not resurrect the old column pin"
+            );
         });
     }
 
