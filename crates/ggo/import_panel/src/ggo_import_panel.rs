@@ -419,8 +419,13 @@ fn parse_frame_dim(text: &str) -> Option<usize> {
 /// applies; a frame bigger than the crop yields no frames, which the commit
 /// refuses loudly rather than importing an empty sprite.
 fn frame_rects(crop: Region, cut: (Option<usize>, Option<usize>)) -> Vec<Region> {
-    let frame_w = cut.0.map_or(crop.w, |tiles| tiles * TILE_PX);
-    let frame_h = cut.1.map_or(crop.h, |tiles| tiles * TILE_PX);
+    // checked_mul: the field accepts any usize, and this runs on every
+    // render. An absurd entry saturates into "wider than any crop", which
+    // yields no frames and the commit's existing loud refusal -- instead of
+    // an overflow panic loop in dev builds.
+    let scale = |tiles: usize| tiles.checked_mul(TILE_PX).unwrap_or(usize::MAX);
+    let frame_w = cut.0.map_or(crop.w, scale);
+    let frame_h = cut.1.map_or(crop.h, scale);
     uniform_rects(crop.w, crop.h, frame_w, frame_h)
         .into_iter()
         .map(|r| Region {
@@ -2607,6 +2612,21 @@ mod tests {
             frame_rects(crop, (Some(4), None)).is_empty(),
             "4 tiles is wider than the crop, so the commit refuses loudly"
         );
+    }
+
+    /// The field parses any usize, and frame_rects runs per render: a
+    /// 19-digit entry must degrade to "no frames" -- the commit's loud
+    /// refusal -- not panic with a multiply overflow every frame.
+    #[test]
+    fn an_absurd_frame_count_yields_no_frames_instead_of_overflowing() {
+        let crop = Region {
+            x: 0,
+            y: 0,
+            w: 32,
+            h: 16,
+        };
+        assert!(frame_rects(crop, (Some(usize::MAX / 4), None)).is_empty());
+        assert!(frame_rects(crop, (None, Some(usize::MAX))).is_empty());
     }
 
     /// A blank field keeps meaning "one frame at the whole crop", even when
