@@ -1,0 +1,21 @@
+# GGO panel crates
+
+* Do not call `TilesetDocStore::state()` to read one field: it clones the
+  whole pixel buffer (~64KB). Use the borrowing accessors -- `indices()`,
+  `palette()`, `tile_count()`, `dirty()` -- and reserve `state()` for
+  callers that genuinely need an owned snapshot (tests, save). Seventeen
+  production call sites had this wrong at once, and an eighteenth slipped
+  past the sweep that fixed them.
+
+* A preview must CONSUME the commit's producer, never mirror it. Two
+  shipped branches lied to the user this way: the shape preview drew
+  `shape_points(false)` while release painted `shape_points(shift)`, and
+  the float preview duplicated `commit_float`'s compositing until both were
+  routed through one `float_cells`. If you are about to write a "keep these
+  in lockstep" comment, extract the shared producer instead.
+
+* Panels expose smoke-test hooks through a `test-support` cargo feature as
+  `test_*` methods -- never by widening `pub(crate)` internals. The
+  established pattern lives in `ggo_tileset_panel`, `ggo_import_panel` and
+  `ggo_emerald_panel`; `ggo_smoke` is the consumer. Whole-journey tests
+  belong in `ggo_smoke`, per-feature regressions in the panel's own crate.

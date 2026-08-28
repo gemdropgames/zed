@@ -186,3 +186,25 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 1. Agent notes a pattern during a session.
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
+
+# GGO fork hooks
+
+The fork's workspace hooks -- `PathOpenInterceptor`, `ExternalDropInterceptor`,
+`ContextMenuContributor` -- run while a `Pane` or `ProjectPanel` entity is
+LEASED (`entity.update` is on the stack). Decide synchronously: return the
+claim `bool` or the menu items from path inspection alone. Push anything that
+reads or updates a pane -- opening tabs, `items_of_type`, `activate_item`,
+`add_item_to_active_pane` -- into `cx.defer_in(window, ..)`. Doing that work
+inline panics with "cannot read workspace::pane::Pane while it is already
+being updated" and takes the window down. Three independent hits validated
+this rule (the drop-to-import crash, the reimport action, select-all's inline
+tool assignment bypassing set_tool's commit).
+
+# Verification gates the commit
+
+Chain verification into the commit on real exit codes:
+`./script/clippy -p <crate> && cargo test -p <crate> --lib && git commit ...`.
+Never run a check whose output is displayed but whose exit status nothing
+consumes -- `echo`-after-clippy patterns shipped lint errors past review
+twice in one session. The failure mode is silent: the transcript LOOKS
+checked.
