@@ -317,6 +317,9 @@ struct OpenTileset {
     /// selection impossible without a modifier. Per-session, like
     /// `paste_opaque`.
     snap_tiles: bool,
+    /// Whether shift was held during the in-flight shape drag, so the
+    /// preview draws what a release would actually paint.
+    shape_filled: bool,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -362,6 +365,7 @@ impl OpenTileset {
             clipboard: None,
             show_lines: loaded.lines.unwrap_or(true),
             snap_tiles: false,
+            shape_filled: false,
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -383,8 +387,20 @@ impl OpenTileset {
 
     /// Brush expansion then per-tile mirroring -- what every paint goes
     /// through before it reaches the document.
+    /// Expand `points` by the brush, then mirror.
+    ///
+    /// worldlib's `brush_expand` grows only down-right from each point, so a
+    /// 4px brush put the cursor on the footprint's top-left CORNER and every
+    /// stroke landed low and right of where it was aimed. Recentre here
+    /// rather than in worldlib: that crate is a separate repository and its
+    /// own tests pin the down-right expansion.
     fn expand_points(&self, points: &[(i32, i32)]) -> Vec<(i32, i32)> {
-        let brushed = pixel_tools::brush_expand(points, self.brush);
+        let offset = (self.brush.max(1) as i32 - 1) / 2;
+        let centred: Vec<(i32, i32)> = points
+            .iter()
+            .map(|&(x, y)| (x - offset, y - offset))
+            .collect();
+        let brushed = pixel_tools::brush_expand(&centred, self.brush);
         pixel_tools::mirror_in_tile(&brushed, TILE_PX, self.mirror_h, self.mirror_v)
     }
 
@@ -1060,7 +1076,10 @@ impl TilesetPanel {
         }
     }
 
-    fn on_sheet_mouse_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    fn on_sheet_mouse_move(&mut self, pos: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.shape_filled = shift;
+        }
         let (tool, painting) = match &self.state {
             ViewerState::Ready(open) => (open.tool, open.painting),
             _ => return,
@@ -1641,7 +1660,7 @@ impl TilesetPanel {
             )
         });
         // The shape preview: what a release without shift would paint.
-        let preview = open.shape_points(false);
+        let preview = open.shape_points(open.shape_filled);
         let preview_color = cx.theme().colors().text_accent;
         // `.top_0().left_0()` matters: an absolute child with auto insets
         // sits at its STATIC position -- after the in-flow img sibling --
@@ -1736,7 +1755,11 @@ impl TilesetPanel {
                                         )
                                         .on_mouse_move(cx.listener(
                                             |this, event: &MouseMoveEvent, _, cx| {
-                                                this.on_sheet_mouse_move(event.position, cx);
+                                                this.on_sheet_mouse_move(
+                                                    event.position,
+                                                    event.modifiers.shift,
+                                                    cx,
+                                                );
                                             },
                                         ))
                                         .on_mouse_up(
@@ -2752,9 +2775,9 @@ mod tests {
             let drag = pixel_pos(ready(panel), 0, 1, 0);
             let after = pixel_pos(ready(panel), 0, 2, 0);
             panel.on_sheet_mouse_down(down, false, cx);
-            panel.on_sheet_mouse_move(drag, cx);
+            panel.on_sheet_mouse_move(drag, false, cx);
             panel.on_sheet_mouse_up(false, cx);
-            panel.on_sheet_mouse_move(after, cx);
+            panel.on_sheet_mouse_move(after, false, cx);
 
             let state = ready(panel).store.state();
             assert_eq!(state.indices[0], 1, "the mouse-down pixel painted");
@@ -3054,7 +3077,7 @@ mod tests {
             let from = pixel_pos(ready(panel), 1, 0, 0);
             let to = pixel_pos(ready(panel), 1, 1, 1);
             panel.on_sheet_mouse_down(from, false, cx);
-            panel.on_sheet_mouse_move(to, cx);
+            panel.on_sheet_mouse_move(to, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(
                 panel.selection_rect(),
@@ -3466,7 +3489,7 @@ mod tests {
             let a = pixel_pos(ready(panel), 0, 0, 0);
             let b = pixel_pos(ready(panel), 0, 5, 3);
             panel.on_sheet_mouse_down(a, false, cx);
-            panel.on_sheet_mouse_move(b, cx);
+            panel.on_sheet_mouse_move(b, false, cx);
             assert_eq!(
                 ready(panel).store.state().indices[idx(0, 0, 0)],
                 0,
@@ -3500,13 +3523,13 @@ mod tests {
             let a = pixel_pos(ready(panel), 0, 1, 1);
             let b = pixel_pos(ready(panel), 0, 4, 4);
             panel.on_sheet_mouse_down(a, false, cx);
-            panel.on_sheet_mouse_move(b, cx);
+            panel.on_sheet_mouse_move(b, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(0, 1, 1)], 1);
             assert_eq!(state.indices[idx(0, 2, 2)], 0, "outline leaves the middle");
             panel.on_sheet_mouse_down(a, false, cx);
-            panel.on_sheet_mouse_move(b, cx);
+            panel.on_sheet_mouse_move(b, false, cx);
             panel.on_sheet_mouse_up(true, cx);
             assert_eq!(
                 ready(panel).store.state().indices[idx(0, 2, 2)],
@@ -3688,13 +3711,13 @@ mod tests {
             panel.on_sheet_mouse_up(false, cx);
             panel.set_tool(Tool::Select, cx);
             panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), false, cx);
-            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 2, 2), cx);
+            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 2, 2), false, cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).selection, Some(((0, 0), (2, 2))));
 
             // Drag from inside the marquee by (+3, 0).
             panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), false, cx);
-            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 4, 1), cx);
+            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 4, 1), false, cx);
             assert_eq!(ready(panel).move_offset(), (3, 0));
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
@@ -4488,6 +4511,62 @@ mod tests {
                 panel.selection_rect(),
                 Some((0, 0, TILE_PX - 1, TILE_PX - 1)),
                 "the focus sheet IS one tile"
+            );
+        });
+    }
+
+    /// worldlib's brush_expand grows down-right from each point, which put
+    /// the cursor on the footprint's top-left CORNER: every wide stroke
+    /// landed low and right of where it was aimed.
+    #[gpui::test]
+    async fn test_a_wide_brush_is_centred_on_the_cursor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.step_brush(2, cx); // 1 -> 3
+            assert_eq!(ready(panel).brush, 3);
+            let points = ready(panel).expand_points(&[(5, 5)]);
+            assert!(points.contains(&(4, 4)), "reaches up-left of the cursor");
+            assert!(points.contains(&(6, 6)), "and down-right");
+            assert!(
+                !points.contains(&(7, 7)),
+                "a 3px brush centred on (5,5) stops at 6"
+            );
+        });
+    }
+
+    /// The preview drew `shape_points(false)` unconditionally, so holding
+    /// shift showed an outline and then painted a filled shape.
+    #[gpui::test]
+    async fn test_the_shape_preview_matches_what_a_release_would_paint(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Rect, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 2, 2), false, cx);
+            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 8, 8), true, cx);
+
+            let open = ready(panel);
+            assert!(open.shape_filled, "the drag recorded the modifier");
+            let previewed = open.shape_points(open.shape_filled);
+            assert_eq!(
+                previewed,
+                open.shape_points(true),
+                "the preview is what a shift release paints"
+            );
+            assert!(
+                previewed.contains(&(5, 5)),
+                "a filled rect covers its interior"
+            );
+
+            // Releasing the modifier mid-drag must flip the preview back.
+            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 8, 8), false, cx);
+            let open = ready(panel);
+            assert!(!open.shape_filled);
+            assert!(
+                !open.shape_points(open.shape_filled).contains(&(5, 5)),
+                "an outline again"
             );
         });
     }
