@@ -665,9 +665,10 @@ impl TilesetPanel {
         &mut self,
         position: Point<Pixels>,
         _click_count: usize,
+        shift: bool,
         cx: &mut Context<Self>,
     ) {
-        self.on_sheet_mouse_down(position, cx);
+        self.on_sheet_mouse_down(position, shift, cx);
     }
 
     /// An arrow-key step: shift the marquee if there is one, else step
@@ -830,10 +831,20 @@ impl TilesetPanel {
     }
 
     /// The Fill tool: flood the composed sheet from the clicked pixel.
-    fn fill_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    /// Flood from `pos`, walled in by the clicked TILE unless `whole_sheet`.
+    ///
+    /// Slot 0 is transparent everywhere, so across a whole sheet every
+    /// unpainted pixel of every tile is one contiguous region -- an
+    /// unbounded bucket repaints the entire tileset on the first click.
+    /// One tile is the tileset analogue of Aseprite's canvas, so that is
+    /// the default; shift restores the sheet-wide reach. A live marquee
+    /// walls the flood in as well, matching what a selection means in
+    /// every other editor.
+    fn fill_at(&mut self, pos: Point<Pixels>, whole_sheet: bool, cx: &mut Context<Self>) {
         let Some((sx, sy)) = self.sheet_px_at(pos) else {
             return;
         };
+        let bound_rect = self.selection_rect();
         let (state, cols, focus, color) = match &self.state {
             ViewerState::Ready(open) => (
                 open.store.state(),
@@ -843,12 +854,27 @@ impl TilesetPanel {
             ),
             _ => return,
         };
+        // A pad cell backs no tile, so there is nothing to flood.
+        let Some((clicked_tile, ..)) = sheet_to_doc(focus, cols, state.tile_count, sx, sy) else {
+            return;
+        };
+        if bound_rect.is_some_and(|(x0, y0, x1, y1)| sx < x0 || sx > x1 || sy < y0 || sy > y1) {
+            return;
+        }
         let sample = |x: i32, y: i32| {
             if x < 0 || y < 0 {
                 return None;
             }
-            let (tile, px_x, px_y) =
-                sheet_to_doc(focus, cols, state.tile_count, x as usize, y as usize)?;
+            let (x, y) = (x as usize, y as usize);
+            if let Some((x0, y0, x1, y1)) = bound_rect
+                && (x < x0 || x > x1 || y < y0 || y > y1)
+            {
+                return None;
+            }
+            let (tile, px_x, px_y) = sheet_to_doc(focus, cols, state.tile_count, x, y)?;
+            if !whole_sheet && tile != clicked_tile {
+                return None;
+            }
             let index =
                 tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + px_y * TILE_PX + px_x;
             state.indices.get(index).copied()
@@ -906,7 +932,7 @@ impl TilesetPanel {
         cx.notify();
     }
 
-    fn on_sheet_mouse_down(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+    fn on_sheet_mouse_down(&mut self, pos: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
         let tool = match &mut self.state {
             ViewerState::Ready(open) => {
                 // A release off the sheet may not have reached us: a new
@@ -929,7 +955,7 @@ impl TilesetPanel {
                 return; // a pick is instantaneous, no drag state
             }
             Tool::Fill => {
-                self.fill_at(pos, cx);
+                self.fill_at(pos, shift, cx);
                 return;
             }
             Tool::Line | Tool::Rect | Tool::Ellipse => {
@@ -1550,6 +1576,7 @@ impl TilesetPanel {
                                                     this.on_sheet_click(
                                                         event.position,
                                                         event.click_count,
+                                                        event.modifiers.shift,
                                                         cx,
                                                     );
                                                 },
@@ -1734,7 +1761,7 @@ impl TilesetPanel {
                         Tool::Fill,
                         "ggo-tileset-fill",
                         IconName::Sparkle,
-                        "Fill (floods across tiles)",
+                        "Fill this tile (shift: whole sheet)",
                     ),
                     (Tool::Line, "ggo-tileset-line", IconName::Dash, "Line"),
                     (
@@ -2492,7 +2519,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             // Paint tile 0's pixel (3, 2) with slot 1 (red).
             let pos = pixel_pos(ready(panel), 0, 3, 2);
-            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_down(pos, false, cx);
             panel.on_sheet_mouse_up(false, cx);
 
             let open = ready(panel);
@@ -2528,7 +2555,7 @@ mod tests {
             let down = pixel_pos(ready(panel), 0, 0, 0);
             let drag = pixel_pos(ready(panel), 0, 1, 0);
             let after = pixel_pos(ready(panel), 0, 2, 0);
-            panel.on_sheet_mouse_down(down, cx);
+            panel.on_sheet_mouse_down(down, false, cx);
             panel.on_sheet_mouse_move(drag, cx);
             panel.on_sheet_mouse_up(false, cx);
             panel.on_sheet_mouse_move(after, cx);
@@ -2546,9 +2573,9 @@ mod tests {
             assert!(!state.dirty);
 
             // Two separate clicks are two steps.
-            panel.on_sheet_mouse_down(down, cx);
+            panel.on_sheet_mouse_down(down, false, cx);
             panel.on_sheet_mouse_up(false, cx);
-            panel.on_sheet_mouse_down(drag, cx);
+            panel.on_sheet_mouse_down(drag, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             panel.undo_impl(cx);
             let state = ready(panel).store.state();
@@ -2570,7 +2597,7 @@ mod tests {
             // Tile 1 is solid index 1 in the fixture; erase one pixel.
             panel.set_tool(Tool::Eraser, cx);
             let pos = pixel_pos(ready(panel), 1, 5, 5);
-            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_down(pos, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert_eq!(
@@ -2605,7 +2632,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             let (w, h) = ready(panel).zoomed_size();
-            panel.on_sheet_mouse_down(point(px(w + 10.), px(h + 10.)), cx);
+            panel.on_sheet_mouse_down(point(px(w + 10.), px(h + 10.)), false, cx);
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert!(!state.dirty, "off-sheet clicks must not paint");
@@ -2675,7 +2702,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             let pos = pixel_pos(ready(panel), 0, 0, 0);
-            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_down(pos, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             panel.save_impl(cx);
             let open = ready(panel);
@@ -2689,7 +2716,7 @@ mod tests {
         // the atomic write's create-parent-dirs step fail deterministically.
         panel.update(cx, |panel, cx| {
             let pos = pixel_pos(ready(panel), 0, 1, 0);
-            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_down(pos, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             panel.project_root = Some(dir.path().join("tiles/world.til"));
             panel.save_impl(cx);
@@ -2809,7 +2836,7 @@ mod tests {
             panel.set_tool(Tool::Picker, cx);
             // Tile 1 is solid index 1 in the fixture.
             let pos = pixel_pos(ready(panel), 1, 4, 4);
-            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_down(pos, false, cx);
             let open = ready(panel);
             assert_eq!(open.slot, 1, "picked the slot under the click");
             assert_eq!(open.tool, Tool::Pencil, "picking returns to the pencil");
@@ -2830,7 +2857,7 @@ mod tests {
             panel.set_tool(Tool::Select, cx);
             let from = pixel_pos(ready(panel), 1, 0, 0);
             let to = pixel_pos(ready(panel), 1, 1, 1);
-            panel.on_sheet_mouse_down(from, cx);
+            panel.on_sheet_mouse_down(from, false, cx);
             panel.on_sheet_mouse_move(to, cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(
@@ -2848,7 +2875,7 @@ mod tests {
 
             // Move the selection onto tile 0 (all transparent) and paste.
             let target_from = pixel_pos(ready(panel), 0, 2, 2);
-            panel.on_sheet_mouse_down(target_from, cx);
+            panel.on_sheet_mouse_down(target_from, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             panel.paste_clipboard(cx);
             {
@@ -3234,7 +3261,7 @@ mod tests {
             panel.set_tool(Tool::Line, cx);
             let a = pixel_pos(ready(panel), 0, 0, 0);
             let b = pixel_pos(ready(panel), 0, 5, 3);
-            panel.on_sheet_mouse_down(a, cx);
+            panel.on_sheet_mouse_down(a, false, cx);
             panel.on_sheet_mouse_move(b, cx);
             assert_eq!(
                 ready(panel).store.state().indices[idx(0, 0, 0)],
@@ -3268,13 +3295,13 @@ mod tests {
             panel.set_tool(Tool::Rect, cx);
             let a = pixel_pos(ready(panel), 0, 1, 1);
             let b = pixel_pos(ready(panel), 0, 4, 4);
-            panel.on_sheet_mouse_down(a, cx);
+            panel.on_sheet_mouse_down(a, false, cx);
             panel.on_sheet_mouse_move(b, cx);
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(0, 1, 1)], 1);
             assert_eq!(state.indices[idx(0, 2, 2)], 0, "outline leaves the middle");
-            panel.on_sheet_mouse_down(a, cx);
+            panel.on_sheet_mouse_down(a, false, cx);
             panel.on_sheet_mouse_move(b, cx);
             panel.on_sheet_mouse_up(true, cx);
             assert_eq!(
@@ -3286,31 +3313,135 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_fill_floods_across_the_tile_border(cx: &mut TestAppContext) {
+    async fn test_fill_stops_at_the_tile_border(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         place_sheet_at_origin(&panel, cx);
         panel.update(cx, |panel, cx| {
-            // Tiles 1 and 2 are solid slot 1 and adjacent on the sheet; tile
-            // 0 is transparent. Filling tile 1 with slot 2 crosses into 2.
+            // Tiles 1 and 2 are solid slot 1 and adjacent on the sheet.
             panel.select_slot(2, cx);
             panel.set_tool(Tool::Fill, cx);
-            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 3, 3), cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 3, 3), false, cx);
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
-            assert_eq!(state.indices[idx(1, 0, 0)], 2);
-            assert_eq!(state.indices[idx(2, 7, 7)], 2, "flooded across the border");
+            assert_eq!(state.indices[idx(1, 0, 0)], 2, "the clicked tile filled");
             assert_eq!(
-                state.indices[idx(0, 0, 0)],
-                0,
-                "tile 0 was a different colour"
+                state.indices[idx(2, 7, 7)],
+                1,
+                "the neighbour is NOT touched"
+            );
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().indices[idx(1, 0, 0)], 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_shift_fill_still_floods_the_whole_sheet(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Fill, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 3, 3), true, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(2, 7, 7)],
+                2,
+                "shift crosses the border"
             );
             panel.undo_impl(cx);
             assert_eq!(
                 ready(panel).store.state().indices[idx(2, 7, 7)],
                 1,
-                "one undo step"
+                "still one undo step"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fill_is_bounded_by_the_marquee(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 7, TILE_PX - 1)));
+            }
+            panel.set_tool(Tool::Fill, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 3, 3), false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 3, 3)], 2, "inside the marquee");
+            assert_eq!(state.indices[idx(1, 15, 3)], 1, "the marquee walls it in");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fill_outside_the_marquee_paints_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 7, TILE_PX - 1)));
+            }
+            panel.set_tool(Tool::Fill, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 3, 3), false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert!(
+                !ready(panel).store.state().dirty,
+                "a click outside the marquee is a no-op"
+            );
+        });
+    }
+
+    /// A press on a pad cell -- `tile_count` not a multiple of `cols` -- has
+    /// no tile to bound the flood to, so it must do nothing at all.
+    #[gpui::test]
+    async fn test_fill_on_a_pad_cell_is_a_no_op(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| panel.set_cols(2, cx));
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Fill, cx);
+            // 3 tiles at 2 cols: the second row's right cell is padding.
+            let pos = {
+                let z = ready(panel).zoom as f32;
+                point(
+                    px((TILE_PX as f32 + 4.0) * z),
+                    px((TILE_PX as f32 + 4.0) * z),
+                )
+            };
+            panel.on_sheet_mouse_down(pos, false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert!(
+                !ready(panel).store.state().dirty,
+                "the pad cell backs no tile"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fill_in_focus_mode_fills_the_focused_tile_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| panel.enter_focus(1, cx));
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Fill, cx);
+            let z = ready(panel).zoom as f32;
+            panel.on_sheet_mouse_down(point(px(3.5 * z), px(3.5 * z)), false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 0, 0)], 2, "the focused tile filled");
+            assert_eq!(state.indices[idx(2, 7, 7)], 1, "tile 2 untouched");
+            assert_eq!(state.indices[idx(0, 0, 0)], 0, "tile 0 untouched");
         });
     }
 
@@ -3326,7 +3457,7 @@ mod tests {
                 open.mirror_h = true;
             }
             let pos = pixel_pos(ready(panel), 0, 1, 2);
-            panel.on_sheet_mouse_down(pos, cx);
+            panel.on_sheet_mouse_down(pos, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             for (x, y) in [(1, 2), (2, 2), (1, 3), (2, 3)] {
@@ -3349,16 +3480,16 @@ mod tests {
         place_sheet_at_origin(&panel, cx);
         panel.update(cx, |panel, cx| {
             let dot = pixel_pos(ready(panel), 0, 1, 1);
-            panel.on_sheet_mouse_down(dot, cx);
+            panel.on_sheet_mouse_down(dot, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             panel.set_tool(Tool::Select, cx);
-            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), false, cx);
             panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 2, 2), cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).selection, Some(((0, 0), (2, 2))));
 
             // Drag from inside the marquee by (+3, 0).
-            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), false, cx);
             panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 4, 1), cx);
             assert_eq!(ready(panel).move_offset(), (3, 0));
             panel.on_sheet_mouse_up(false, cx);
@@ -3383,7 +3514,7 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
         place_sheet_at_origin(&panel, cx);
         panel.update(cx, |panel, cx| {
-            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), false, cx);
             panel.on_sheet_mouse_up(false, cx);
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.selection = Some(((0, 0), (3, 0)));
@@ -3445,7 +3576,7 @@ mod tests {
             // Sheet pixel (2, 3) is tile 1's own (2, 3) in focus.
             let z = ready(panel).zoom as f32;
             panel.select_slot(2, cx);
-            panel.on_sheet_mouse_down(point(px(2.5 * z), px(3.5 * z)), cx);
+            panel.on_sheet_mouse_down(point(px(2.5 * z), px(3.5 * z)), false, cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).store.state().indices[idx(1, 2, 3)], 2);
             assert_eq!(
@@ -3481,7 +3612,7 @@ mod tests {
         place_sheet_at_origin(&panel, cx);
         panel.update(cx, |panel, cx| {
             panel.select_slot(1, cx);
-            panel.on_sheet_click(pixel_pos(ready(panel), 0, 2, 3), 2, cx);
+            panel.on_sheet_click(pixel_pos(ready(panel), 0, 2, 3), 2, false, cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).focus, None, "no hard focus on a double click");
             assert_eq!(
@@ -3604,7 +3735,7 @@ mod tests {
                 open.move_drag = Some(((1, 1), (5, 1)));
                 open.painting = false;
             }
-            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 2, 2), cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 1, 2, 2), false, cx);
             assert!(
                 ready(panel).move_drag.is_none(),
                 "the stale move drag is gone"
