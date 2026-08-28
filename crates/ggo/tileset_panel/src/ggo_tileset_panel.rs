@@ -312,6 +312,10 @@ struct OpenTileset {
     clipboard: Option<(usize, usize, Vec<u8>)>,
     /// Whether the tile-boundary lines draw over the sheet.
     show_lines: bool,
+    /// Paste writes the clipboard's transparent pixels too, punching holes
+    /// in the destination. Off = composite over. Per-session ink mode, so
+    /// unlike `show_lines` it is not persisted.
+    paste_opaque: bool,
     /// Brush size (px, square) for the pencil, eraser and shape tools.
     brush: usize,
     /// Mirror every paint about the painted tile's centre lines.
@@ -352,6 +356,7 @@ impl OpenTileset {
             selection: None,
             clipboard: None,
             show_lines: loaded.lines.unwrap_or(true),
+            paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
             mirror_v: false,
@@ -1290,8 +1295,30 @@ impl TilesetPanel {
     /// Paste the clipboard at the selection's top-left as ONE stroke (one
     /// undo step). Pixels landing on pad cells are skipped; the selection
     /// moves to the pasted rect.
+    /// Where a paste with no marquee lands: the sheet origin in focus mode
+    /// (the sheet IS one tile), else the top-left visible sheet pixel,
+    /// floored to a tile boundary so a paste never lands half a tile off.
+    fn paste_origin(&self) -> Option<(usize, usize)> {
+        if let Some((x0, y0, ..)) = self.selection_rect() {
+            return Some((x0, y0));
+        }
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        if open.focus.is_some() {
+            return Some((0, 0));
+        }
+        let zoom = open.zoom.max(1) as f32;
+        let offset = open.scroll.offset();
+        let floor = |v: f32| ((v.max(0.) as usize) / TILE_PX) * TILE_PX;
+        Some((
+            floor(f32::from(-offset.x) / zoom),
+            floor(f32::from(-offset.y) / zoom),
+        ))
+    }
+
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
-        let Some((x0, y0, ..)) = self.selection_rect() else {
+        let Some((x0, y0)) = self.paste_origin() else {
             return;
         };
         let clipboard = match &self.state {
@@ -1301,11 +1328,22 @@ impl TilesetPanel {
         let Some((w, h, data)) = clipboard else {
             return;
         };
+        let skip_transparent = match &self.state {
+            ViewerState::Ready(open) => !open.paste_opaque,
+            _ => return,
+        };
         let mut writes = Vec::new();
         for dy in 0..h {
             for dx in 0..w {
+                let value = data[dy * w + dx];
+                // Composite: a transparent source pixel leaves the
+                // destination alone, so pasting art copied on transparent
+                // ground does not punch that ground through.
+                if value == 0 && skip_transparent {
+                    continue;
+                }
                 if let Some((tile, px_x, px_y)) = self.doc_pixel(x0 + dx, y0 + dy) {
-                    writes.push((tile, px_x, px_y, data[dy * w + dx]));
+                    writes.push((tile, px_x, px_y, value));
                 }
             }
         }
@@ -1959,6 +1997,20 @@ impl TilesetPanel {
                         weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
                     }
                 }),
+            )
+            .child(
+                IconButton::new("ggo-tileset-paste-opaque", IconName::Copy)
+                    .icon_size(IconSize::XSmall)
+                    .toggle_state(open.paste_opaque)
+                    .tooltip(ui::Tooltip::text(
+                        "Paste writes transparent pixels too (off: composite over)",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let ViewerState::Ready(open) = &mut this.state {
+                            open.paste_opaque = !open.paste_opaque;
+                            cx.notify();
+                        }
+                    })),
             )
             .child(
                 IconButton::new("ggo-tileset-lines", IconName::Hash)
@@ -2998,15 +3050,23 @@ mod tests {
             assert_eq!(state.indices[3 * TILE_PX + 3], 0);
             assert!(!state.dirty);
 
-            // Paste with no clipboard or no selection: no-ops.
+            // Paste again, then undo back to a clean document.
             panel.paste_clipboard(cx);
             panel.undo_impl(cx);
+            assert!(!ready(panel).store.state().dirty);
+
+            // No marquee is NOT a no-op any more -- the paste lands at the
+            // top-left visible tile instead of being silently dropped.
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.selection = None;
                 open.clipboard = Some((1, 1, vec![5]));
             }
             panel.paste_clipboard(cx);
-            assert!(!ready(panel).store.state().dirty);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 0, 0)],
+                5,
+                "it landed at the sheet origin"
+            );
         });
     }
 
@@ -4129,6 +4189,144 @@ mod tests {
                 grid_regions(4, 2),
                 vec![(0, 2, 2)],
                 "the row is full, so no partial block is stroked"
+            );
+        });
+    }
+
+    /// Paste composites: a transparent source pixel leaves the destination
+    /// alone. Copying a tile with art on transparent ground and pasting it
+    /// over another tile used to punch the whole ground through.
+    #[gpui::test]
+    async fn test_paste_skips_transparent_source_pixels(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let mut data = vec![0u8; TILE_PX * TILE_PX];
+            for x in 0..TILE_PX {
+                data[x] = 1; // row 0 only
+            }
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.clipboard = Some((TILE_PX, TILE_PX, data));
+                // Destination: tile 1, solid slot 1 in the fixture.
+                open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
+            }
+            panel.paste_clipboard(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 0, 0)], 1, "row 0 written");
+            assert_eq!(
+                state.indices[idx(1, 0, 5)],
+                1,
+                "row 5 kept its own art, not a hole"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_opaque_paste_writes_the_zeros(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let data = vec![0u8; TILE_PX * TILE_PX];
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.clipboard = Some((TILE_PX, TILE_PX, data));
+                open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
+                open.paste_opaque = true;
+            }
+            panel.paste_clipboard(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 0, 5)],
+                0,
+                "opaque paste punches the hole through"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_paste_without_a_marquee_lands_on_a_tile_boundary(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.clipboard = Some((TILE_PX, TILE_PX, vec![2u8; TILE_PX * TILE_PX]));
+                open.selection = None;
+            }
+            panel.paste_clipboard(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 0, 0)], 2, "landed at the sheet origin");
+            assert_eq!(
+                panel.selection_rect(),
+                Some((0, 0, TILE_PX - 1, TILE_PX - 1)),
+                "and the paste is selected so it can be nudged"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_paste_in_focus_mode_without_a_marquee_lands_at_the_tile_origin(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_focus(2, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.clipboard = Some((TILE_PX, TILE_PX, vec![2u8; TILE_PX * TILE_PX]));
+                open.selection = None;
+            }
+            panel.paste_clipboard(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(2, 0, 0)],
+                2,
+                "the focused tile received it at its origin"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_paste_with_an_empty_clipboard_is_a_no_op(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.paste_clipboard(cx);
+            assert!(!ready(panel).store.state().dirty);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_an_all_transparent_clipboard_paste_pushes_no_undo_entry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.clipboard = Some((TILE_PX, TILE_PX, vec![0u8; TILE_PX * TILE_PX]));
+                open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
+            }
+            panel.paste_clipboard(cx);
+            assert!(
+                !ready(panel).store.state().dirty,
+                "every source pixel was skipped, so nothing was written"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_paste_clipped_by_the_sheet_edge_writes_only_in_sheet_pixels(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(2, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.clipboard = Some((TILE_PX, TILE_PX, vec![2u8; TILE_PX * TILE_PX]));
+                // The pad cell's origin on the second row.
+                open.selection = Some(((TILE_PX, TILE_PX), (2 * TILE_PX - 1, 2 * TILE_PX - 1)));
+            }
+            panel.paste_clipboard(cx);
+            assert_eq!(
+                ready(panel).store.state().tile_count,
+                3,
+                "a paste never grows the sheet"
             );
         });
     }
