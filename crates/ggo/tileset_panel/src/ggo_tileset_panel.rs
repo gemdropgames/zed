@@ -273,6 +273,25 @@ impl Tool {
     }
 }
 
+/// A region lifted out of the sheet and floating above it.
+///
+/// Moving a marquee used to rewrite the document on every step: blank the
+/// source, stamp the destination, one undo entry each. Nudging ten pixels
+/// was ten mutations, anything pushed past the sheet edge was filtered out
+/// by `doc_pixel` and gone for good, and each step composited over whatever
+/// art it landed on. Lifting once and moving a buffer fixes all three.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Float {
+    w: usize,
+    h: usize,
+    pixels: Vec<u8>,
+    /// Top-left in sheet coords. SIGNED: a float may hang off the sheet and
+    /// come back intact, which is the whole point.
+    at: (i32, i32),
+    /// Where it was lifted from, so a cancel can put it back.
+    from: (i32, i32),
+}
+
 /// The open tileset: worldlib's doc store plus the view state that must
 /// survive a re-click on the already-open file.
 /// The import-record banner: the recorded source changed since the
@@ -369,6 +388,8 @@ struct OpenTileset {
     /// op put the tile strip back and left the sheet wrapped at the wrong
     /// width, silently rearranging every tile.
     cols_history: std::collections::HashMap<usize, (usize, usize)>,
+    /// The lifted region, if the marquee has been moved.
+    float: Option<Float>,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -421,6 +442,7 @@ impl OpenTileset {
             space_held: false,
             pan_drag: None,
             cols_history: std::collections::HashMap::new(),
+            float: None,
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -784,6 +806,11 @@ impl TilesetPanel {
 
     /// Escape: leave focus if in it, else drop the selection.
     fn cancel_impl(&mut self, cx: &mut Context<Self>) {
+        // A float outranks the other two meanings: it is the only one
+        // holding unsaved work, and dropping it is free.
+        if self.cancel_float(cx) {
+            return;
+        }
         let focused = matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some());
         if focused {
             self.leave_focus(cx);
@@ -828,6 +855,13 @@ impl TilesetPanel {
         if matches!(&self.state, ViewerState::Ready(open) if open.space_held) {
             self.begin_pan(position, cx);
             return;
+        }
+        // A press outside a float puts it down before anything else acts.
+        if let Some(rect) = self.float_rect()
+            && let Some((sx, sy)) = self.sheet_px_at(position)
+            && (sx < rect.0 || sx > rect.2 || sy < rect.1 || sy > rect.3)
+        {
+            self.commit_float(cx);
         }
         if let ViewerState::Ready(open) = &mut self.state {
             open.secondary_paint = secondary;
@@ -1161,14 +1195,22 @@ impl TilesetPanel {
     /// Rebuild the composed sheet image from the store's current state --
     /// after every op, undo, and redo.
     fn recompose_grid(&mut self, cx: &mut Context<Self>) {
+        // A float is shown by composing it INTO the sheet image rather than
+        // painting it in the overlay: a whole-sheet float would be hundreds
+        // of thousands of quads, and the document must stay untouched until
+        // commit. The copy is proportionate -- composing already allocates a
+        // full RGBA buffer.
+        let floated = self.float_composed_indices();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
         let state = open.store.state();
+        // Borrow the float's view when there is one, else the document's own
+        // pixels. Everything else -- palette, tile count -- is the same.
+        let indices: &[u8] = floated.as_deref().unwrap_or(&state.indices);
         let composed = match open.focus {
             Some(tile) => {
-                let pixels = state
-                    .indices
+                let pixels = indices
                     .get(tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS..)
                     .and_then(|rest| rest.get(..ggo_worldlib::sprites::tileset_doc::TILE_PIXELS));
                 match pixels {
@@ -1185,7 +1227,7 @@ impl TilesetPanel {
                         }
                         (
                             loader::compose_grid(
-                                &state.indices,
+                                indices,
                                 state.tile_count,
                                 open.cols,
                                 &state.palette,
@@ -1196,7 +1238,7 @@ impl TilesetPanel {
                 }
             }
             None => (
-                loader::compose_grid(&state.indices, state.tile_count, open.cols, &state.palette),
+                loader::compose_grid(indices, state.tile_count, open.cols, &state.palette),
                 loader::grid_pixel_size(state.tile_count, open.cols),
             ),
         };
@@ -1487,44 +1529,174 @@ impl TilesetPanel {
     /// Move the marquee's pixels by `(dx, dy)`: the source is cleared to
     /// slot 0, the destination written over it, one undo step; the
     /// marquee follows.
+    /// Move the marquee, lifting it out of the sheet on the first step.
+    ///
+    /// Only the float's origin changes after that, so a ten-pixel nudge is
+    /// one document mutation rather than ten, and pixels carried off the
+    /// sheet edge come back when you move the other way.
     fn move_selection(&mut self, (dx, dy): (i32, i32), cx: &mut Context<Self>) {
-        let Some((x0, y0, x1, y1)) = self.selection_rect() else {
-            return;
-        };
         if (dx, dy) == (0, 0) {
             return;
         }
-        let (w, h, data) = self.region_pixels((x0, y0, x1, y1));
-        let mut cells = Vec::with_capacity(w * h * 2);
-        for row in 0..h {
-            for col in 0..w {
-                cells.push(((x0 + col) as i32, (y0 + row) as i32, 0));
+        if !self.lift_selection(cx) {
+            return;
+        }
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(float) = &mut open.float
+        {
+            float.at = (float.at.0 + dx, float.at.1 + dy);
+        }
+        // Keep the marquee showing where the float actually is.
+        let rect = self.float_rect();
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.selection = rect.map(|(x0, y0, x1, y1)| ((x0, y0), (x1, y1)));
+        }
+        self.recompose_grid(cx);
+    }
+
+    /// Lift the marquee into a float. A no-op if one already exists.
+    ///
+    /// COPIES rather than cuts: the document is not touched until
+    /// [`Self::commit_float`], so the whole move -- blanking the source and
+    /// stamping the destination -- lands as ONE undo step, and a cancel is
+    /// free because there is nothing to roll back.
+    fn lift_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if matches!(&self.state, ViewerState::Ready(open) if open.float.is_some()) {
+            return true;
+        }
+        let Some((x0, y0, x1, y1)) = self.selection_rect() else {
+            return false;
+        };
+        let (w, h, pixels) = self.region_pixels((x0, y0, x1, y1));
+        if let ViewerState::Ready(open) = &mut self.state {
+            let at = (x0 as i32, y0 as i32);
+            open.float = Some(Float {
+                w,
+                h,
+                pixels,
+                at,
+                from: at,
+            });
+        }
+        self.recompose_grid(cx);
+        true
+    }
+
+    /// Stamp the float back into the sheet and drop it. One undo step.
+    ///
+    /// Composites like [`Self::paste_clipboard`] and honours the same
+    /// `paste_opaque` toggle, so moving art over art behaves the way pasting
+    /// it would rather than punching the float's transparent pixels through.
+    /// Cells outside the sheet are dropped HERE and only here -- while
+    /// floating they are still carried.
+    fn commit_float(&mut self, cx: &mut Context<Self>) {
+        let (float, skip_transparent) = match &self.state {
+            ViewerState::Ready(open) => match &open.float {
+                Some(float) => (float.clone(), !open.paste_opaque),
+                None => return,
+            },
+            _ => return,
+        };
+        let mut cells = Vec::with_capacity(float.w * float.h * 2);
+        if float.at != float.from {
+            // Blank the source first; a later cell for the same pixel wins,
+            // so an overlapping move still stamps correctly.
+            for row in 0..float.h {
+                for col in 0..float.w {
+                    cells.push((float.from.0 + col as i32, float.from.1 + row as i32, 0u8));
+                }
             }
         }
-        for row in 0..h {
-            for col in 0..w {
-                cells.push((
-                    (x0 + col) as i32 + dx,
-                    (y0 + row) as i32 + dy,
-                    data[row * w + col],
-                ));
+        for row in 0..float.h {
+            for col in 0..float.w {
+                let value = float.pixels[row * float.w + col];
+                if value == 0 && skip_transparent {
+                    continue;
+                }
+                cells.push((float.at.0 + col as i32, float.at.1 + row as i32, value));
             }
         }
         self.write_cells(&cells, cx);
         if let ViewerState::Ready(open) = &mut self.state {
-            let (sheet_w, sheet_h) = (open.grid_size.0 as i32, open.grid_size.1 as i32);
-            let landed = x1 as i32 + dx >= 0
-                && y1 as i32 + dy >= 0
-                && x0 as i32 + dx < sheet_w
-                && y0 as i32 + dy < sheet_h;
-            let clamp = |v: usize, d: i32, max: i32| (v as i32 + d).clamp(0, max - 1) as usize;
-            open.selection = landed.then(|| {
-                (
-                    (clamp(x0, dx, sheet_w), clamp(y0, dy, sheet_h)),
-                    (clamp(x1, dx, sheet_w), clamp(y1, dy, sheet_h)),
-                )
-            });
+            open.float = None;
+            cx.notify();
         }
+    }
+
+    /// Drop the float. Free: the document was never touched.
+    fn cancel_float(&mut self, cx: &mut Context<Self>) -> bool {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        if open.float.take().is_none() {
+            return false;
+        }
+        self.recompose_grid(cx);
+        true
+    }
+
+    /// The document's pixels with the float applied: source blanked,
+    /// float stamped. `None` when nothing is floating.
+    ///
+    /// This is a VIEW of the document, never written back -- committing is
+    /// what writes, and it goes through `write_cells` for the undo entry.
+    fn float_composed_indices(&self) -> Option<Vec<u8>> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let float = open.float.as_ref()?;
+        let state = open.store.state();
+        let mut indices = state.indices;
+        let mut put = |x: i32, y: i32, value: u8| {
+            if x < 0 || y < 0 {
+                return;
+            }
+            if let Some((tile, px_x, px_y)) = self.doc_pixel(x as usize, y as usize) {
+                let at =
+                    tile * ggo_worldlib::sprites::tileset_doc::TILE_PIXELS + px_y * TILE_PX + px_x;
+                if let Some(slot) = indices.get_mut(at) {
+                    *slot = value;
+                }
+            }
+        };
+        if float.at != float.from {
+            for row in 0..float.h {
+                for col in 0..float.w {
+                    put(float.from.0 + col as i32, float.from.1 + row as i32, 0);
+                }
+            }
+        }
+        let skip_transparent = !open.paste_opaque;
+        for row in 0..float.h {
+            for col in 0..float.w {
+                let value = float.pixels[row * float.w + col];
+                if value == 0 && skip_transparent {
+                    continue;
+                }
+                put(float.at.0 + col as i32, float.at.1 + row as i32, value);
+            }
+        }
+        Some(indices)
+    }
+
+    /// The float's rect in sheet coords, clipped to the sheet.
+    fn float_rect(&self) -> Option<(usize, usize, usize, usize)> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let float = open.float.as_ref()?;
+        let (sheet_w, sheet_h) = (open.grid_size.0 as i32, open.grid_size.1 as i32);
+        let (x0, y0) = float.at;
+        let (x1, y1) = (x0 + float.w as i32 - 1, y0 + float.h as i32 - 1);
+        if x1 < 0 || y1 < 0 || x0 >= sheet_w || y0 >= sheet_h {
+            return None;
+        }
+        Some((
+            x0.max(0) as usize,
+            y0.max(0) as usize,
+            x1.min(sheet_w - 1) as usize,
+            y1.min(sheet_h - 1) as usize,
+        ))
     }
 
     /// Flip the marquee's pixels in place, one undo step.
@@ -1751,6 +1923,11 @@ impl TilesetPanel {
     }
 
     fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        if matches!(&self.state, ViewerState::Ready(open) if open.tool != tool) {
+            // Leaving the Select tool with something floating would strand
+            // it invisibly; put it down first.
+            self.commit_float(cx);
+        }
         if let ViewerState::Ready(open) = &mut self.state
             && open.tool != tool
         {
@@ -1877,6 +2054,8 @@ impl TilesetPanel {
     /// save. A failure keeps the document dirty and surfaces on the panel
     /// (and as the item's save Err).
     pub(crate) fn save_impl(&mut self, cx: &mut Context<Self>) {
+        // The .til must contain what is on screen.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -4250,17 +4429,31 @@ mod tests {
             );
             assert_eq!(ready(panel).move_offset(), (3, 0));
             panel.on_sheet_mouse_up(false, cx);
-            let state = ready(panel).store.state();
-            assert_eq!(state.indices[idx(0, 1, 1)], 0, "source cleared");
-            assert_eq!(state.indices[idx(0, 4, 1)], 1, "moved");
+            // The move is floating: the document is untouched until commit.
+            assert!(ready(panel).float.is_some(), "the drag lifted a float");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(0, 1, 1)],
+                1,
+                "the source is still in the document while floating"
+            );
             assert_eq!(
                 ready(panel).selection,
                 Some(((3, 0), (5, 2))),
                 "marquee followed"
             );
+
+            panel.commit_float(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(0, 1, 1)], 0, "source cleared on commit");
+            assert_eq!(state.indices[idx(0, 4, 1)], 1, "moved");
+
             panel.undo_impl(cx);
             let state = ready(panel).store.state();
-            assert_eq!(state.indices[idx(0, 1, 1)], 1, "one undo restores the move");
+            assert_eq!(
+                state.indices[idx(0, 1, 1)],
+                1,
+                "still ONE undo for the whole move"
+            );
             assert_eq!(state.indices[idx(0, 4, 1)], 0);
         });
     }
@@ -4417,6 +4610,9 @@ mod tests {
         });
 
         panel.update(cx, |panel, cx| {
+            // Escape drops the float first; the marquee needs a second one.
+            panel.cancel_impl(cx);
+            assert!(ready(panel).float.is_none(), "the float is gone");
             panel.cancel_impl(cx);
             assert!(ready(panel).selection.is_none());
             panel.scroll_by(0.0, 1.0, cx);
@@ -5043,6 +5239,9 @@ mod tests {
             }
             assert_eq!(panel.nudge_step(), TILE_PX as i32);
             panel.scroll_by(1.0, 0.0, cx);
+            assert!(ready(panel).float.is_some(), "the nudge lifted a float");
+
+            panel.commit_float(cx);
             assert_eq!(
                 ready(panel).store.state().indices[idx(2, 7, 7)],
                 1,
@@ -5634,6 +5833,181 @@ mod tests {
                 3,
                 "undoing the append must not resurrect the old column pin"
             );
+        });
+    }
+
+    /// Every nudge used to be a full read-blank-write with its own undo
+    /// entry. Ten nudges meant ten mutations and ten undo steps.
+    #[gpui::test]
+    async fn test_many_nudges_are_one_undo_step(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 1)));
+            }
+            for _ in 0..10 {
+                panel.move_selection((1, 0), cx);
+            }
+            assert!(!ready(panel).store.state().dirty, "nothing written yet");
+            panel.commit_float(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 10, 0)],
+                1,
+                "landed ten pixels right"
+            );
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 0, 0)],
+                0,
+                "source blanked once, at commit"
+            );
+
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 0, 0)], 1, "ONE undo for ten nudges");
+            assert_eq!(state.indices[idx(1, 10, 0)], 1, "fixture art is back");
+        });
+    }
+
+    /// Pixels pushed past the sheet edge used to be filtered out by
+    /// doc_pixel and destroyed. A float carries them, so moving back
+    /// recovers them.
+    #[gpui::test]
+    async fn test_pixels_carried_off_the_sheet_come_back(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                // Tile 1's left edge: solid slot 1.
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 3, 0)));
+            }
+            for _ in 0..40 {
+                panel.move_selection((-1, 0), cx);
+            }
+            assert!(
+                panel.float_rect().is_none(),
+                "entirely off the left edge now"
+            );
+            for _ in 0..40 {
+                panel.move_selection((1, 0), cx);
+            }
+            panel.commit_float(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 0, 0)],
+                1,
+                "the round trip lost nothing"
+            );
+        });
+    }
+
+    /// Cancelling is free because the document was never touched.
+    #[gpui::test]
+    async fn test_cancelling_a_float_leaves_the_document_untouched(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 3, 3)));
+            }
+            panel.move_selection((5, 5), cx);
+            assert!(ready(panel).float.is_some());
+
+            assert!(panel.cancel_float(cx));
+            assert!(ready(panel).float.is_none());
+            assert!(
+                !ready(panel).store.state().dirty,
+                "no undo entry to roll back"
+            );
+            assert_eq!(ready(panel).store.state().indices[idx(1, 0, 0)], 1);
+        });
+    }
+
+    /// Leaving the Select tool, saving, or pressing outside the float all
+    /// put it down rather than stranding it invisibly.
+    #[gpui::test]
+    async fn test_changing_tool_commits_a_float(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            panel.move_selection((4, 0), cx);
+            assert!(ready(panel).float.is_some());
+
+            panel.set_tool(Tool::Pencil, cx);
+            assert!(ready(panel).float.is_none(), "the tool change put it down");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 4, 0)],
+                1,
+                "and it landed"
+            );
+        });
+    }
+
+    /// A float over other art must not destroy it until commit, and then
+    /// only where the float is opaque.
+    #[gpui::test]
+    async fn test_a_float_does_not_destroy_art_it_passes_over(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            // Tile 0 is transparent; lift a 2x1 of it and drag it ACROSS
+            // tile 1's solid art and back.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (1, 0)));
+            }
+            for _ in 0..TILE_PX + 4 {
+                panel.move_selection((1, 0), cx);
+            }
+            for _ in 0..TILE_PX + 4 {
+                panel.move_selection((-1, 0), cx);
+            }
+            panel.commit_float(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 4, 0)],
+                1,
+                "tile 1's art survived the pass-over"
+            );
+        });
+    }
+
+    /// The float is shown by composing it into the sheet IMAGE while the
+    /// document stays untouched, so what you see is the moved art and what
+    /// undo sees is still one pending step.
+    #[gpui::test]
+    async fn test_the_composed_view_shows_the_float_but_the_document_does_not(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                // Tile 1's top-left 2x1, solid slot 1.
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            assert!(
+                panel.float_composed_indices().is_none(),
+                "nothing floating yet"
+            );
+
+            panel.move_selection((4, 0), cx);
+            let view = panel
+                .float_composed_indices()
+                .expect("the view reflects the float");
+            assert_eq!(view[idx(1, 0, 0)], 0, "source blanked in the VIEW");
+            assert_eq!(view[idx(1, 4, 0)], 1, "float stamped in the VIEW");
+
+            let doc = &ready(panel).store.state().indices;
+            assert_eq!(doc[idx(1, 0, 0)], 1, "document still has the source");
+            assert!(!ready(panel).store.state().dirty, "and is not dirty");
         });
     }
 
