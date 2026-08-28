@@ -1052,10 +1052,13 @@ fn image_format_from_external_content(format: image::ImageFormat) -> Option<Imag
         // Not an invariant violation: `is_raster_image_path` gates on
         // `Img::extensions()`, which admits `avif`/`tga`/`dds`/`hdr`/`exr`/
         // `ff`/`qoi`, and the sniff runs on whatever bytes the file actually
-        // holds. Every caller treats `None` as "not an image I can attach"
-        // and falls through, so decline rather than crash a debug build.
+        // holds -- so decline rather than crash a debug build. Callers vary
+        // in how gracefully they take a `None`: the drop path falls through
+        // to a plain file mention, but the paste path and the image picker
+        // currently swallow the file with no feedback at all, which is why
+        // this is a warn and not a debug trace.
         _ => {
-            log::debug!("declining a dropped image in an unsupported format: {format:?}");
+            log::warn!("declining an image in an unsupported format: {format:?}");
             None
         }
     }
