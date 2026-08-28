@@ -1019,22 +1019,49 @@ impl TilesetPanel {
         }
     }
 
-    /// Ctrl-wheel zooms; a plain wheel is left to the scroll container.
+    /// The wheel, owned by the panel rather than left to the container's
+    /// native scrolling, so the behaviour is deterministic and testable:
+    /// plain wheel scrolls, shift turns the same wheel sideways (most mice
+    /// have no horizontal wheel), ctrl zooms on the cursor. Returns whether
+    /// the event was consumed; the listener stops propagation exactly then.
     fn on_sheet_scroll(
         &mut self,
+        dx: f32,
         dy: f32,
-        zoom_modifier: bool,
+        modifiers: gpui::Modifiers,
         at: Option<(usize, usize)>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !zoom_modifier || dy == 0.0 {
+        if dx == 0.0 && dy == 0.0 {
             return false;
         }
-        let delta = if dy > 0.0 { 1 } else { -1 };
-        match at {
-            Some(sheet_px) => self.zoom_at_sheet_px(delta, sheet_px, cx),
-            None => self.zoom_by(delta, cx),
+        if modifiers.control {
+            if dy == 0.0 {
+                return false;
+            }
+            let delta = if dy > 0.0 { 1 } else { -1 };
+            match at {
+                Some(sheet_px) => self.zoom_at_sheet_px(delta, sheet_px, cx),
+                None => self.zoom_by(delta, cx),
+            }
+            return true;
         }
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        // Shift routes the vertical delta onto the horizontal axis; a
+        // trackpad's own horizontal delta passes through either way.
+        let (dx, dy) = if modifiers.shift {
+            (dy + dx, 0.0)
+        } else {
+            (dx, dy)
+        };
+        let offset = open.scroll.offset();
+        open.scroll.set_offset(point(
+            (offset.x + px(dx)).min(px(0.)),
+            (offset.y + px(dy)).min(px(0.)),
+        ));
+        cx.notify();
         true
     }
 
@@ -2510,12 +2537,12 @@ impl TilesetPanel {
                                         )
                                         .on_scroll_wheel(cx.listener(
                                             |this, event: &ScrollWheelEvent, _, cx| {
-                                                let dy =
-                                                    f32::from(event.delta.pixel_delta(px(20.)).y);
+                                                let delta = event.delta.pixel_delta(px(20.));
                                                 let at = this.sheet_px_at(event.position);
                                                 if this.on_sheet_scroll(
-                                                    dy,
-                                                    event.modifiers.control,
+                                                    f32::from(delta.x),
+                                                    f32::from(delta.y),
+                                                    event.modifiers,
                                                     at,
                                                     cx,
                                                 ) {
@@ -2537,6 +2564,27 @@ impl TilesetPanel {
                                                 );
                                             },
                                         ))
+                                        .on_mouse_down(
+                                            MouseButton::Middle,
+                                            cx.listener(
+                                                |this, event: &MouseDownEvent, window, cx| {
+                                                    window.focus(&this.focus_handle, cx);
+                                                    this.begin_pan(event.position, cx);
+                                                },
+                                            ),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Middle,
+                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                this.end_pan(cx);
+                                            }),
+                                        )
+                                        .on_mouse_up_out(
+                                            MouseButton::Middle,
+                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                this.end_pan(cx);
+                                            }),
+                                        )
                                         .on_mouse_down(
                                             MouseButton::Right,
                                             cx.listener(
@@ -5915,26 +5963,81 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_ctrl_wheel_zooms_and_a_plain_wheel_does_not(cx: &mut TestAppContext) {
+    async fn test_the_wheel_scrolls_shift_pans_sideways_and_ctrl_zooms(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
-            let before = ready(panel).zoom;
-            assert!(
-                !panel.on_sheet_scroll(20.0, false, None, cx),
-                "plain wheel declines"
-            );
-            assert_eq!(ready(panel).zoom, before, "so the container can scroll");
+            let no_mods = gpui::Modifiers::default();
+            let ctrl = gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            };
+            let shift = gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            };
 
-            assert!(panel.on_sheet_scroll(20.0, true, None, cx));
+            // A plain wheel scrolls the sheet vertically.
+            assert!(panel.on_sheet_scroll(0.0, -30.0, no_mods, None, cx));
+            assert_eq!(f32::from(ready(panel).scroll.offset().y), -30.0);
+            assert_eq!(f32::from(ready(panel).scroll.offset().x), 0.0);
+
+            // Shift turns the same wheel sideways -- most mice have no
+            // horizontal wheel at all.
+            assert!(panel.on_sheet_scroll(0.0, -20.0, shift, None, cx));
+            assert_eq!(f32::from(ready(panel).scroll.offset().x), -20.0);
+            assert_eq!(
+                f32::from(ready(panel).scroll.offset().y),
+                -30.0,
+                "the vertical offset held still"
+            );
+
+            // Scrolling back up clamps at the origin rather than
+            // overshooting past it.
+            assert!(panel.on_sheet_scroll(0.0, 500.0, no_mods, None, cx));
+            assert_eq!(f32::from(ready(panel).scroll.offset().y), 0.0);
+
+            // Ctrl still zooms.
+            let before = ready(panel).zoom;
+            assert!(panel.on_sheet_scroll(0.0, 20.0, ctrl, None, cx));
             assert_eq!(ready(panel).zoom, before + 1);
-            assert!(panel.on_sheet_scroll(-20.0, true, None, cx));
+            assert!(panel.on_sheet_scroll(0.0, -20.0, ctrl, None, cx));
             assert_eq!(ready(panel).zoom, before);
 
             assert!(
-                !panel.on_sheet_scroll(0.0, true, None, cx),
-                "a zero delta is not a zoom"
+                !panel.on_sheet_scroll(0.0, 0.0, ctrl, None, cx),
+                "a zero delta is nothing at all"
             );
+            assert!(!panel.on_sheet_scroll(0.0, 0.0, no_mods, None, cx));
+        });
+    }
+
+    /// A middle-button press pans exactly like space-drag, without needing
+    /// the keyboard: press starts, the sheet follows one-to-one, release
+    /// ends, and nothing is painted along the way.
+    #[gpui::test]
+    async fn test_middle_drag_pans_without_painting(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_slot(2, cx);
+            let start = pixel_pos(ready(panel), 1, 3, 3);
+            panel.begin_pan(start, cx);
+            assert!(ready(panel).pan_drag.is_some());
+
+            panel.on_sheet_mouse_move(
+                point(start.x - px(25.), start.y - px(5.)),
+                gpui::Modifiers::default(),
+                cx,
+            );
+            let offset = ready(panel).scroll.offset();
+            assert_eq!(f32::from(offset.x), -25.0);
+            assert_eq!(f32::from(offset.y), -5.0);
+            assert!(!ready(panel).store.state().dirty, "panned, never painted");
+
+            panel.end_pan(cx);
+            assert!(ready(panel).pan_drag.is_none());
         });
     }
 
