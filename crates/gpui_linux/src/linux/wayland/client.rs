@@ -2536,7 +2536,13 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     const ACTIONS: DndAction = DndAction::Copy;
                     data_offer.set_actions(ACTIONS, ACTIONS);
 
-                    let pipe = Pipe::new().unwrap();
+                    // Out of file descriptors mid-drag is a bad moment to
+                    // take the whole window down: decline the offer and let
+                    // the compositor show the drag as rejected.
+                    let Some(pipe) = Pipe::new().log_err() else {
+                        data_offer.destroy();
+                        return;
+                    };
                     data_offer.receive(FILE_LIST_MIME_TYPE.to_string(), unsafe {
                         BorrowedFd::borrow_raw(pipe.write.as_raw_fd())
                     });
