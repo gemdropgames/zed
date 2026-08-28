@@ -100,6 +100,7 @@ use ui::prelude::*;
 use ui::{Checkbox, ToggleState, Tooltip};
 use workspace::Workspace;
 
+use ggo_asset_formats::TILE_PX;
 use ggo_worldlib::sprites::import::DecodedFrame;
 use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, is_importable_source, join_dest_path,
@@ -403,15 +404,23 @@ fn parse_frame_dim(text: &str) -> Option<usize> {
     text.trim().parse::<usize>().ok().filter(|&v| v > 0)
 }
 
-/// The sprite cut: `crop` tiled row-major into `frame_w x frame_h` frames
-/// (worldlib's own `uniform_rects`, offset to the crop's origin), each axis
-/// defaulting to the crop's extent -- so no input at all is exactly ONE
-/// frame at the crop bounds. Whole frames only, same rule `uniform_rects`
-/// applies; a frame bigger than the crop yields no frames, which the
-/// commit refuses loudly rather than importing an empty sprite.
+/// The sprite cut: `crop` tiled row-major into frames `cut` TILES wide and
+/// tall (worldlib's own `uniform_rects`, offset to the crop's origin).
+///
+/// `cut` counts whole TILES, not pixels: the hardware has no sub-tile frame,
+/// so a pixel-denominated field only invited sizes (`8`, `24`) that cannot
+/// be represented. `uniform_rects` still works in pixels, so each axis is
+/// scaled by [`TILE_PX`] on the way in.
+///
+/// A blank axis still defaults to the crop's own PIXEL extent -- so no input
+/// at all is exactly ONE frame at the crop bounds, whether or not the crop
+/// is a whole number of tiles (an uncropped import is the raw image size,
+/// which no drag has snapped). Whole frames only, same rule `uniform_rects`
+/// applies; a frame bigger than the crop yields no frames, which the commit
+/// refuses loudly rather than importing an empty sprite.
 fn frame_rects(crop: Region, cut: (Option<usize>, Option<usize>)) -> Vec<Region> {
-    let frame_w = cut.0.unwrap_or(crop.w);
-    let frame_h = cut.1.unwrap_or(crop.h);
+    let frame_w = cut.0.map_or(crop.w, |tiles| tiles * TILE_PX);
+    let frame_h = cut.1.map_or(crop.h, |tiles| tiles * TILE_PX);
     uniform_rects(crop.w, crop.h, frame_w, frame_h)
         .into_iter()
         .map(|r| Region {
@@ -490,13 +499,14 @@ struct PanDrag {
 }
 
 /// The form fields: destination directory + stem, and the sprite cut's
-/// frame size (px). The frame fields are blank by default -- blank (or
-/// unparseable) means "one frame at the crop bounds" ([`frame_rects`]).
+/// frame size in whole TILES. The frame fields are blank by default --
+/// blank (or unparseable) means "one frame at the crop bounds"
+/// ([`frame_rects`]).
 struct Fields {
     dir: Entity<Editor>,
     stem: Entity<Editor>,
-    frame_w: Entity<Editor>,
-    frame_h: Entity<Editor>,
+    frame_tiles_w: Entity<Editor>,
+    frame_tiles_h: Entity<Editor>,
 }
 
 /// What a committed import wrote and what to do next with it.
@@ -547,9 +557,9 @@ struct OpenImport {
     /// "Import as sprite": also write a `.spr` whose frames are cut on the
     /// [`frame_rects`] grid. Off = plain tileset import.
     as_sprite: bool,
-    /// The sprite cut parsed off the frame fields every render -- `None`
-    /// per axis means "the crop's own extent".
-    frame_cut: (Option<usize>, Option<usize>),
+    /// The sprite cut parsed off the frame fields every render, in whole
+    /// TILES per axis -- `None` means "the crop's own extent".
+    frame_tiles: (Option<usize>, Option<usize>),
     /// The canvas element's on-screen bounds, recorded at prepaint so the
     /// mouse handlers can map window coords to image pixels
     /// (`ggo_world_panel`'s `last_bounds` idiom).
@@ -588,7 +598,7 @@ impl OpenImport {
             swatch_pick: None,
             source_mtime: 0,
             as_sprite: false,
-            frame_cut: (None, None),
+            frame_tiles: (None, None),
             canvas_bounds: Rc::new(RefCell::new(None)),
             fields: None,
         }
@@ -608,20 +618,20 @@ impl OpenImport {
             crop: self.wizard.region.map(|r| (r.x, r.y, r.w, r.h)),
             reserve_transparent: self.wizard.reserve_transparent,
             as_sprite: self.as_sprite,
-            frame_w: self.frame_cut.0,
-            frame_h: self.frame_cut.1,
+            frame_tiles_w: self.frame_tiles.0,
+            frame_tiles_h: self.frame_tiles.1,
         }
     }
 
     /// Restore a record's crop and settings (the fields are rebuilt from
-    /// `frame_cut` on the next render).
+    /// `frame_tiles` on the next render).
     fn apply_record(&mut self, record: &ImportRecord) {
         self.wizard
             .commit_region(record.crop.map(|(x, y, w, h)| Region { x, y, w, h }));
         self.wizard
             .set_reserve_transparent(record.reserve_transparent);
         self.as_sprite = record.as_sprite;
-        self.frame_cut = (record.frame_w, record.frame_h);
+        self.frame_tiles = (record.frame_tiles_w, record.frame_tiles_h);
     }
 
     /// Canvas-local coordinates for a window-space `position`, or `None`
@@ -1162,8 +1172,8 @@ impl ImportPanel {
         let fields = Fields {
             dir: Self::new_field(&dir, window, cx),
             stem: Self::new_field(&stem, window, cx),
-            frame_w: Self::new_field(&dim_text(open.frame_cut.0), window, cx),
-            frame_h: Self::new_field(&dim_text(open.frame_cut.1), window, cx),
+            frame_tiles_w: Self::new_field(&dim_text(open.frame_tiles.0), window, cx),
+            frame_tiles_h: Self::new_field(&dim_text(open.frame_tiles.1), window, cx),
         };
         if let ViewerState::Ready(open) = &mut self.state {
             open.fields = Some(fields);
@@ -1187,13 +1197,13 @@ impl ImportPanel {
     /// are plain assignments (no requantize, no disk), and this keeps one
     /// source of truth -- the editors -- instead of two that can drift.
     fn sync_dest_fields(&mut self, cx: &mut Context<Self>) {
-        let Some((dir, stem, frame_w, frame_h)) =
+        let Some((dir, stem, frame_tiles_w, frame_tiles_h)) =
             self.ready().and_then(|open| open.fields.as_ref()).map(|f| {
                 (
                     f.dir.clone(),
                     f.stem.clone(),
-                    f.frame_w.clone(),
-                    f.frame_h.clone(),
+                    f.frame_tiles_w.clone(),
+                    f.frame_tiles_h.clone(),
                 )
             })
         else {
@@ -1201,13 +1211,13 @@ impl ImportPanel {
         };
         let (dir, stem) = (dir.read(cx).text(cx), stem.read(cx).text(cx));
         let cut = (
-            parse_frame_dim(&frame_w.read(cx).text(cx)),
-            parse_frame_dim(&frame_h.read(cx).text(cx)),
+            parse_frame_dim(&frame_tiles_w.read(cx).text(cx)),
+            parse_frame_dim(&frame_tiles_h.read(cx).text(cx)),
         );
         if let ViewerState::Ready(open) = &mut self.state {
             open.wizard.set_dest_dir(dir);
             open.wizard.set_dest_stem(stem);
-            open.frame_cut = cut;
+            open.frame_tiles = cut;
         }
     }
 
@@ -1327,7 +1337,7 @@ impl ImportPanel {
                     open.wizard.rgba.clone(),
                     open.wizard.src_w,
                     open.wizard.src_h,
-                    frame_rects(open.crop(), open.frame_cut),
+                    frame_rects(open.crop(), open.frame_tiles),
                 )
             };
             if rects.is_empty() {
@@ -1861,7 +1871,7 @@ impl ImportPanel {
         let can_commit = open.wizard.can_commit();
         let reserve = open.wizard.reserve_transparent;
         let as_sprite = open.as_sprite;
-        let frame_count = frame_rects(crop, open.frame_cut).len();
+        let frame_count = frame_rects(crop, open.frame_tiles).len();
         let source_frames = open.frames.len();
         let weak = cx.weak_entity();
         let weak_sprite = weak.clone();
@@ -1916,13 +1926,13 @@ impl ImportPanel {
                         .gap_1()
                         .flex_wrap()
                         .items_center()
-                        .child(Self::field("Frame W", 48., &fields.frame_w, cx))
-                        .child(Self::field("Frame H", 48., &fields.frame_h, cx))
+                        .child(Self::field("Frame W", 48., &fields.frame_tiles_w, cx))
+                        .child(Self::field("Frame H", 48., &fields.frame_tiles_h, cx))
                         .child(
                             Label::new(if frame_count == 0 {
                                 "frame size exceeds the crop".to_string()
                             } else {
-                                format!("{frame_count} frames (px, blank = whole crop)")
+                                format!("{frame_count} frames (tiles, blank = whole crop)")
                             })
                             .size(LabelSize::XSmall)
                             .color(if frame_count == 0 {
@@ -2557,6 +2567,10 @@ mod tests {
     /// The sprite cut's default is ONE frame at the crop bounds; a set
     /// frame size tiles the crop (whole frames only, crop-origin offset);
     /// an oversize frame yields no frames.
+    ///
+    /// The cut is counted in whole TILES, not pixels -- the hardware has no
+    /// sub-tile frame, so a pixel field just invited cuts (`8`) that cannot
+    /// exist. `Some(1)` here is one tile wide, i.e. `TILE_PX` px.
     #[test]
     fn frame_rects_defaults_to_one_frame_at_the_crop() {
         let crop = Region {
@@ -2567,7 +2581,7 @@ mod tests {
         };
         assert_eq!(frame_rects(crop, (None, None)), vec![crop]);
         assert_eq!(
-            frame_rects(crop, (Some(16), None)),
+            frame_rects(crop, (Some(1), None)),
             vec![
                 Region {
                     x: 4,
@@ -2581,9 +2595,34 @@ mod tests {
                     w: 16,
                     h: 16
                 },
-            ]
+            ],
+            "one TILE wide, so the 32px crop cuts into two frames"
         );
-        assert!(frame_rects(crop, (Some(64), None)).is_empty());
+        assert_eq!(
+            frame_rects(crop, (Some(2), None)),
+            vec![crop],
+            "two tiles spans the whole 32px crop"
+        );
+        assert!(
+            frame_rects(crop, (Some(4), None)).is_empty(),
+            "4 tiles is wider than the crop, so the commit refuses loudly"
+        );
+    }
+
+    /// A blank field keeps meaning "one frame at the whole crop", even when
+    /// the crop is not a whole number of tiles -- an uncropped import is the
+    /// raw image size, which no drag has snapped. Switching the FIELD to
+    /// tiles must not quietly floor the DEFAULT to 2x1 tiles and drop the
+    /// leftover 8x8 px.
+    #[test]
+    fn a_blank_cut_still_spans_a_crop_that_is_not_whole_tiles() {
+        let crop = Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 24,
+        };
+        assert_eq!(frame_rects(crop, (None, None)), vec![crop]);
     }
 
     #[test]
@@ -2595,7 +2634,7 @@ mod tests {
     }
 
     /// "Import as sprite" writes the `.spr`/`.til`/`.pal` trio, frames cut
-    /// at the given size (the 32x16 fixture at a 16px frame W = 2 frames),
+    /// at the given size (the 32x16 fixture at a 1-TILE frame W = 2 frames),
     /// and hands off the `.spr`.
     #[gpui::test]
     async fn test_sprite_import_writes_the_spr_trio(cx: &mut TestAppContext) {
@@ -2606,7 +2645,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.as_sprite = true;
-                open.frame_cut = (Some(TILE_PX), None);
+                open.frame_tiles = (Some(1), None);
             }
             let (imported, _source) = panel.commit(cx).expect("commit succeeds");
             assert_eq!(imported.asset_rel, "art/hero.spr");
@@ -3410,7 +3449,7 @@ mod tests {
     /// and `sync_dest_fields` -- typed numbers parse (whitespace and all),
     /// junk and zero fall back to "the crop's own extent", i.e. one frame.
     #[gpui::test]
-    async fn test_frame_fields_sync_typed_text_into_the_frame_cut(cx: &mut TestAppContext) {
+    async fn test_frame_fields_sync_typed_text_into_the_frame_tiles(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         // The form fields are real `Editor`s, which need the settings store.
         cx.update(|cx| {
@@ -3420,29 +3459,35 @@ mod tests {
         let cx = cx.add_empty_window();
 
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.ensure_fields(window, cx)));
-        let (frame_w, frame_h) = panel.read_with(cx, |panel, _| {
+        let (frame_tiles_w, frame_tiles_h) = panel.read_with(cx, |panel, _| {
             let fields = ready(panel).fields.as_ref().expect("fields built");
-            (fields.frame_w.clone(), fields.frame_h.clone())
+            (fields.frame_tiles_w.clone(), fields.frame_tiles_h.clone())
         });
 
+        // Typed as TILES, so `2` is a 32px-wide frame, not a 2px one.
         cx.update(|window, cx| {
-            frame_w.update(cx, |editor, cx| editor.set_text("16", window, cx));
-            frame_h.update(cx, |editor, cx| editor.set_text(" 8 ", window, cx));
+            frame_tiles_w.update(cx, |editor, cx| editor.set_text("2", window, cx));
+            frame_tiles_h.update(cx, |editor, cx| editor.set_text(" 1 ", window, cx));
         });
         panel.update(cx, |panel, cx| {
             panel.sync_dest_fields(cx);
-            assert_eq!(ready(panel).frame_cut, (Some(16), Some(8)));
-        });
-
-        cx.update(|window, cx| {
-            frame_w.update(cx, |editor, cx| editor.set_text("junk", window, cx));
-            frame_h.update(cx, |editor, cx| editor.set_text("0", window, cx));
-        });
-        panel.update(cx, |panel, cx| {
-            panel.sync_dest_fields(cx);
-            assert_eq!(ready(panel).frame_cut, (None, None), "junk means default");
+            assert_eq!(ready(panel).frame_tiles, (Some(2), Some(1)));
             assert_eq!(
-                frame_rects(ready(panel).crop(), ready(panel).frame_cut),
+                frame_rects(ready(panel).crop(), ready(panel).frame_tiles),
+                vec![ready(panel).crop()],
+                "2x1 tiles is exactly the 32x16 crop"
+            );
+        });
+
+        cx.update(|window, cx| {
+            frame_tiles_w.update(cx, |editor, cx| editor.set_text("junk", window, cx));
+            frame_tiles_h.update(cx, |editor, cx| editor.set_text("0", window, cx));
+        });
+        panel.update(cx, |panel, cx| {
+            panel.sync_dest_fields(cx);
+            assert_eq!(ready(panel).frame_tiles, (None, None), "junk means default");
+            assert_eq!(
+                frame_rects(ready(panel).crop(), ready(panel).frame_tiles),
                 vec![ready(panel).crop()],
                 "which is one frame at the crop bounds"
             );
@@ -3835,7 +3880,7 @@ mod tests {
                     h: 16,
                 }));
                 open.wizard.set_reserve_transparent(true);
-                open.frame_cut = (Some(8), None);
+                open.frame_tiles = (Some(1), None);
             }
             panel.commit(cx).expect("commit succeeds");
         });
@@ -3845,7 +3890,7 @@ mod tests {
         assert_eq!(record.source, "assets/art/hero.png", "project-relative");
         assert_eq!(record.crop, Some((0, 0, 16, 16)));
         assert!(record.reserve_transparent);
-        assert_eq!(record.frame_w, Some(8));
+        assert_eq!(record.frame_tiles_w, Some(1));
         assert_ne!(record.mtime, 0);
 
         // A fresh wizard on the same destination replays the record.
@@ -3867,7 +3912,7 @@ mod tests {
                 })
             );
             assert!(open.wizard.reserve_transparent);
-            assert_eq!(open.frame_cut, (Some(8), None));
+            assert_eq!(open.frame_tiles, (Some(1), None));
         });
 
         // The tileset panel's route: load by `.til`, land with the record
