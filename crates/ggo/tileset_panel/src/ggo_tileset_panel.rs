@@ -1401,6 +1401,20 @@ impl TilesetPanel {
         }
     }
 
+    /// The status-line note for a live float.
+    ///
+    /// Nothing else on screen distinguishes "floating" from "committed",
+    /// and escape means two different things depending on which you are in,
+    /// so the state has to be said out loud.
+    fn float_status(&self) -> Option<&'static str> {
+        match &self.state {
+            ViewerState::Ready(open) if open.float.is_some() => {
+                Some("floating — escape cancels, click away to place")
+            }
+            _ => None,
+        }
+    }
+
     /// The tile index and in-tile pixel under the cursor, for the status
     /// line. The tile index appeared nowhere in the UI except the Focus
     /// button's label, so there was no way to tell tile 12 from tile 13.
@@ -2207,6 +2221,8 @@ impl TilesetPanel {
         let (cols, tile_count) = (open.cols, open.store.state().tile_count);
         let show_lines = open.show_lines;
         let accent = cx.theme().colors().border_focused;
+        let floating = matches!(&self.state, ViewerState::Ready(open) if open.float.is_some());
+        let float_accent = cx.theme().colors().text_accent;
         let zoom = open.zoom as f32;
         let (move_dx, move_dy) = open.move_offset();
         let selection = self.selection_rect().map(|(x0, y0, x1, y1)| {
@@ -2244,7 +2260,28 @@ impl TilesetPanel {
                             px((y1 - y0 + 1) as f32 * zoom),
                         ),
                     );
-                    window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                    if floating {
+                        // Dashed, in a different colour, with a halo one
+                        // pixel out: a lifted region has to look unlike a
+                        // committed marquee at a glance, because escape
+                        // means something different in each.
+                        window.paint_quad(gpui::outline(
+                            rect,
+                            float_accent,
+                            gpui::BorderStyle::Dashed,
+                        ));
+                        let halo = Bounds::new(
+                            gpui::point(rect.origin.x - px(1.), rect.origin.y - px(1.)),
+                            gpui::size(rect.size.width + px(2.), rect.size.height + px(2.)),
+                        );
+                        window.paint_quad(gpui::outline(
+                            halo,
+                            float_accent,
+                            gpui::BorderStyle::Dashed,
+                        ));
+                    } else {
+                        window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                    }
                 }
                 for &(x, y) in &preview {
                     if x < 0 || y < 0 {
@@ -2501,6 +2538,10 @@ impl TilesetPanel {
         if let Some(hover) = self.hover_status() {
             summary.push_str(" · ");
             summary.push_str(&hover);
+        }
+        if let Some(note) = self.float_status() {
+            summary.push_str(" · ");
+            summary.push_str(note);
         }
         v_flex()
             .gap_0p5()
@@ -6188,6 +6229,31 @@ mod tests {
             assert_eq!(state.indices[idx(1, 5, 0)], 1, "it landed");
             assert_eq!(state.indices[idx(1, 0, 0)], 0, "and vacated its origin");
             assert!(ready(panel).selection.is_none(), "marquee still cleared");
+        });
+    }
+
+    /// A float has to be legible as a float: the sheet already shows the
+    /// moved art, so without this nothing distinguishes it from a committed
+    /// move -- and escape means something different in each state.
+    #[gpui::test]
+    async fn test_the_status_line_says_when_a_selection_is_floating(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            assert_eq!(panel.float_status(), None, "a marquee alone is not a float");
+
+            panel.move_selection((3, 0), cx);
+            assert!(
+                panel.float_status().is_some_and(|s| s.contains("floating")),
+                "the state is said out loud while lifted"
+            );
+
+            panel.commit_float(cx);
+            assert_eq!(panel.float_status(), None, "and goes quiet once placed");
         });
     }
 
