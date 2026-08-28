@@ -111,6 +111,10 @@ actions!(
         DeleteSelection,
         /// Copies the selected region, then clears it.
         CutSelection,
+        /// Appends a copy of the focused (or selected) tile to the sheet.
+        DuplicateFocusedTile,
+        /// Appends one new blank tile to the sheet.
+        AppendBlankTile,
     ]
 );
 
@@ -634,6 +638,58 @@ impl TilesetPanel {
             .and_then(|(x0, y0, ..)| self.doc_pixel(x0, y0))
             .map_or(0, |(tile, ..)| tile);
         self.enter_focus(tile, cx);
+    }
+
+    /// The tile a tile-level command acts on: the focused one, else the
+    /// one under the marquee's top-left. `None` -- rather than
+    /// `focus_tile_impl`'s fallback to tile 0 -- so a stray keypress with
+    /// nothing targeted does nothing instead of silently acting on tile 0.
+    fn target_tile(&self) -> Option<usize> {
+        if let ViewerState::Ready(open) = &self.state
+            && let Some(tile) = open.focus
+        {
+            return Some(tile);
+        }
+        self.selection_rect()
+            .and_then(|(x0, y0, ..)| self.doc_pixel(x0, y0))
+            .map(|(tile, ..)| tile)
+    }
+
+    /// Append a copy of [`Self::target_tile`] to the end of the sheet.
+    ///
+    /// The range guard is deliberately HERE rather than in worldlib:
+    /// `TilesetOp::DuplicateTile` slices `indices[start..start +
+    /// TILE_PIXELS]` unchecked and would panic on an out-of-range tile, and
+    /// worldlib is a separate repository.
+    fn duplicate_tile(&mut self, cx: &mut Context<Self>) {
+        let Some(tile) = self.target_tile() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if tile >= open.store.state().tile_count {
+            return;
+        }
+        open.store
+            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::DuplicateTile { tile });
+        // In focus mode the sheet IS one tile, so follow the copy -- landing
+        // on a magnified view of the tile you just left would look like the
+        // duplicate silently failed.
+        if open.focus.is_some() {
+            open.focus = Some(open.store.state().tile_count - 1);
+        }
+        self.recompose_grid(cx);
+    }
+
+    /// Append one blank tile to the end of the sheet.
+    fn append_tile(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.store
+            .apply(ggo_worldlib::sprites::tileset_doc::TilesetOp::AppendTile);
+        self.recompose_grid(cx);
     }
 
     /// Escape: leave focus if in it, else drop the selection.
@@ -1871,11 +1927,23 @@ impl TilesetPanel {
                     .tooltip(ui::Tooltip::text("Leave focus (escape); ←/→ step tiles"))
                     .on_click(cx.listener(|this, _, _, cx| this.leave_focus(cx))),
                 None => Button::new("ggo-tileset-focus", "Focus")
-                    .tooltip(ui::Tooltip::text(
-                        "Magnify one tile (f, or double-click a tile)",
-                    ))
+                    .tooltip(ui::Tooltip::text("Magnify one tile (f)"))
                     .on_click(cx.listener(|this, _, _, cx| this.focus_tile_impl(cx))),
             })
+            .child(
+                Button::new("ggo-tileset-duplicate", "Duplicate")
+                    .disabled(self.target_tile().is_none())
+                    .tooltip(ui::Tooltip::text(
+                        "Append a copy of the focused or selected tile (ctrl-d)",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.duplicate_tile(cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-append", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Append one blank tile"))
+                    .on_click(cx.listener(|this, _, _, cx| this.append_tile(cx))),
+            )
             .child(div().w_2())
             .child(Label::new(zoom_label).size(LabelSize::XSmall))
             .child(
@@ -2108,6 +2176,8 @@ impl Render for TilesetPanel {
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.cut_selection(cx)))
             .on_action(cx.listener(|this, _: &DeleteSelection, _, cx| this.erase_selection(cx)))
+            .on_action(cx.listener(|this, _: &DuplicateFocusedTile, _, cx| this.duplicate_tile(cx)))
+            .on_action(cx.listener(|this, _: &AppendBlankTile, _, cx| this.append_tile(cx)))
             .on_action(
                 cx.listener(|this, _: &PasteSelection, _window, cx| this.paste_clipboard(cx)),
             )
@@ -3867,7 +3937,7 @@ mod tests {
     /// ZoomOut and SelectWholeSheet all sat unbound.
     #[test]
     fn every_ggo_tileset_action_is_bound_or_allowlisted() {
-        const UNBOUND_BY_DESIGN: &[&str] = &[];
+        const UNBOUND_BY_DESIGN: &[&str] = &["AppendBlankTile"];
         let actions = [
             "Undo",
             "Redo",
@@ -3919,6 +3989,148 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[gpui::test]
+    async fn test_duplicate_appends_a_copy_of_the_focused_tile(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_focus(1, cx);
+            panel.duplicate_tile(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.tile_count, 4);
+            for y in 0..TILE_PX {
+                for x in 0..TILE_PX {
+                    assert_eq!(state.indices[idx(3, x, y)], state.indices[idx(1, x, y)]);
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_duplicate_targets_the_tile_under_the_marquee(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((2 * TILE_PX, 0), (2 * TILE_PX + 3, 3)));
+            }
+            panel.duplicate_tile(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.tile_count, 4);
+            assert_eq!(state.indices[idx(3, 7, 7)], state.indices[idx(2, 7, 7)]);
+            assert_eq!(ready(panel).focus, None, "duplicating did not enter focus");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_duplicate_with_no_focus_and_no_marquee_is_a_no_op(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.duplicate_tile(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.tile_count, 3);
+            assert!(!state.dirty);
+        });
+    }
+
+    /// A marquee anchored on a pad cell resolves to no tile. worldlib's
+    /// DuplicateTile slices `indices[start..start + TILE_PIXELS]` raw and
+    /// would panic, so the guard has to live here.
+    #[gpui::test]
+    async fn test_duplicate_from_a_pad_cell_marquee_is_a_no_op(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(2, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                // 3 tiles at 2 cols: the second row's right cell is padding.
+                open.selection = Some(((TILE_PX, TILE_PX), (TILE_PX + 3, TILE_PX + 3)));
+            }
+            panel.duplicate_tile(cx);
+            assert_eq!(ready(panel).store.state().tile_count, 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_undo_after_duplicate_restores_the_tile_count_and_grid_size(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let before = ready(panel).grid_size;
+            panel.enter_focus(0, cx);
+            panel.leave_focus(cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (3, 3)));
+            }
+            panel.duplicate_tile(cx);
+            assert_eq!(ready(panel).store.state().tile_count, 4);
+            assert_ne!(ready(panel).grid_size, before, "the sheet grew");
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().tile_count, 3);
+            assert_eq!(ready(panel).grid_size, before, "and the view shrank back");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_append_adds_one_blank_tile_and_undo_removes_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.append_tile(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.tile_count, 4);
+            assert!(
+                (0..TILE_PX).all(|y| (0..TILE_PX).all(|x| state.indices[idx(3, x, y)] == 0)),
+                "the appended tile is blank"
+            );
+            panel.undo_impl(cx);
+            assert_eq!(ready(panel).store.state().tile_count, 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_duplicating_while_focused_moves_focus_to_the_copy(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_focus(1, cx);
+            panel.duplicate_tile(cx);
+            assert_eq!(ready(panel).focus, Some(3), "the view follows the copy");
+            assert_eq!(
+                ready(panel).grid_size,
+                (TILE_PX as u32, TILE_PX as u32),
+                "still one magnified tile"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_duplicate_on_a_partial_last_row_fills_the_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(2, cx);
+            assert_eq!(
+                grid_regions(3, 2),
+                vec![(0, 1, 2), (1, 1, 1)],
+                "partial row"
+            );
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (3, 3)));
+            }
+            panel.duplicate_tile(cx);
+            assert_eq!(ready(panel).store.state().tile_count, 4);
+            assert_eq!(
+                grid_regions(4, 2),
+                vec![(0, 2, 2)],
+                "the row is full, so no partial block is stroked"
+            );
+        });
     }
 
     #[gpui::test]

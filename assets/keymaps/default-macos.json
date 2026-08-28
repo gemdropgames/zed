@@ -1745,6 +1745,7 @@
       "cmd-a": "ggo_tileset::SelectWholeSheet",
       "delete": "ggo_tileset::DeleteSelection",
       "backspace": "ggo_tileset::DeleteSelection",
+      "cmd-d": "ggo_tileset::DuplicateFocusedTile",
       "cmd-=": "ggo_tileset::ZoomIn",
       "cmd--": "ggo_tileset::ZoomOut",
       "b": "ggo_tileset::UsePencil",
