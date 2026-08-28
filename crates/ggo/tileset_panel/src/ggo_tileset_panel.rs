@@ -312,6 +312,11 @@ struct OpenTileset {
     clipboard: Option<(usize, usize, Vec<u8>)>,
     /// Whether the tile-boundary lines draw over the sheet.
     show_lines: bool,
+    /// Expand the marquee to whole tiles. Off by default: this is a pixel
+    /// editor first, and snapping every selection would make sub-tile
+    /// selection impossible without a modifier. Per-session, like
+    /// `paste_opaque`.
+    snap_tiles: bool,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -356,6 +361,7 @@ impl OpenTileset {
             selection: None,
             clipboard: None,
             show_lines: loaded.lines.unwrap_or(true),
+            snap_tiles: false,
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -762,7 +768,8 @@ impl TilesetPanel {
 
     fn scroll_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
         if self.selection_rect().is_some() {
-            self.move_selection((dx as i32, dy as i32), cx);
+            let step = self.nudge_step();
+            self.move_selection((dx as i32 * step, dy as i32 * step), cx);
             return;
         }
         if matches!(&self.state, ViewerState::Ready(open) if open.focus.is_some()) && dx != 0.0 {
@@ -1111,7 +1118,33 @@ impl TilesetPanel {
             return None;
         };
         let ((ax, ay), (hx, hy)) = open.selection?;
-        Some((ax.min(hx), ay.min(hy), ax.max(hx), ay.max(hy)))
+        let (x0, y0, x1, y1) = (ax.min(hx), ay.min(hy), ax.max(hx), ay.max(hy));
+        if !open.snap_tiles {
+            return Some((x0, y0, x1, y1));
+        }
+        // Expand the NORMALIZED rect outward. Snapping the raw anchor down
+        // and the raw head up is wrong for an up-left drag: the head would
+        // land below the anchor and normalization would then eat both outer
+        // halves. `open.selection` itself stays raw, so toggling snap off is
+        // lossless.
+        let (sheet_w, sheet_h) = (open.grid_size.0 as usize, open.grid_size.1 as usize);
+        let up =
+            |v: usize, max: usize| ((v / TILE_PX + 1) * TILE_PX - 1).min(max.saturating_sub(1));
+        Some((
+            x0 / TILE_PX * TILE_PX,
+            y0 / TILE_PX * TILE_PX,
+            up(x1, sheet_w),
+            up(y1, sheet_h),
+        ))
+    }
+
+    /// One arrow press moves the marquee by a whole tile when snapping is
+    /// on, otherwise by one pixel.
+    fn nudge_step(&self) -> i32 {
+        match &self.state {
+            ViewerState::Ready(open) if open.snap_tiles => TILE_PX as i32,
+            _ => 1,
+        }
     }
 
     /// The pixels of a sheet-space rect, row-major (pad cells read as 0).
@@ -1997,6 +2030,20 @@ impl TilesetPanel {
                         weak.update(cx, |this, cx| this.set_zoom(zoom, cx)).ok();
                     }
                 }),
+            )
+            .child(
+                IconButton::new("ggo-tileset-snap", IconName::Maximize)
+                    .icon_size(IconSize::XSmall)
+                    .toggle_state(open.snap_tiles)
+                    .tooltip(ui::Tooltip::text(
+                        "Snap the selection to whole tiles (arrows then nudge by a tile)",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let ViewerState::Ready(open) = &mut this.state {
+                            open.snap_tiles = !open.snap_tiles;
+                            cx.notify();
+                        }
+                    })),
             )
             .child(
                 IconButton::new("ggo-tileset-paste-opaque", IconName::Copy)
@@ -4327,6 +4374,120 @@ mod tests {
                 ready(panel).store.state().tile_count,
                 3,
                 "a paste never grows the sheet"
+            );
+        });
+    }
+
+    /// Snapping expands the NORMALIZED rect outward, which is why an
+    /// up-left drag works: snapping the raw anchor down and the raw head up
+    /// would put the head below the anchor and normalization would then eat
+    /// both outer halves.
+    #[gpui::test]
+    async fn test_snap_expands_the_marquee_to_whole_tiles(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, _| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.snap_tiles = true;
+                // A bare click inside tile 1.
+                open.selection = Some(((TILE_PX + 4, 5), (TILE_PX + 4, 5)));
+            }
+            assert_eq!(
+                panel.selection_rect(),
+                Some((TILE_PX, 0, 2 * TILE_PX - 1, TILE_PX - 1)),
+                "a click selects exactly one tile"
+            );
+
+            if let ViewerState::Ready(open) = &mut panel.state {
+                // Dragged UP-LEFT: head is above/left of the anchor.
+                open.selection = Some(((TILE_PX + 1, 3), (2, 2)));
+            }
+            assert_eq!(
+                panel.selection_rect(),
+                Some((0, 0, 2 * TILE_PX - 1, TILE_PX - 1)),
+                "expanded outward in both directions"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_snap_clamps_to_the_sheet_edge(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(2, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.snap_tiles = true;
+                open.selection = Some(((TILE_PX + 1, TILE_PX + 1), (TILE_PX + 2, TILE_PX + 2)));
+            }
+            let (w, h) = ready(panel).grid_size;
+            let (_, _, x1, y1) = panel.selection_rect().expect("a rect");
+            assert!(
+                x1 < w as usize && y1 < h as usize,
+                "clamped inside the sheet"
+            );
+            // Must not panic when the region is read back.
+            panel.copy_selection(cx);
+            assert!(ready(panel).clipboard.is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_snap_off_keeps_pixel_precision(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, _| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.snap_tiles = false;
+                open.selection = Some(((2, 2), (5, 4)));
+            }
+            assert_eq!(
+                panel.selection_rect(),
+                Some((2, 2, 5, 4)),
+                "a pixel editor must still select pixels"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_arrows_nudge_by_a_whole_tile_when_snapping(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.snap_tiles = true;
+                open.selection = Some(((TILE_PX + 2, 2), (TILE_PX + 2, 2)));
+            }
+            assert_eq!(panel.nudge_step(), TILE_PX as i32);
+            panel.scroll_by(1.0, 0.0, cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(2, 7, 7)],
+                1,
+                "tile 1's art moved a whole tile right, into tile 2"
+            );
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 7, 7)],
+                0,
+                "and vacated the tile it left"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_snap_in_focus_mode_selects_the_whole_focused_tile(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_focus(1, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.snap_tiles = true;
+                open.selection = Some(((3, 4), (3, 4)));
+            }
+            assert_eq!(
+                panel.selection_rect(),
+                Some((0, 0, TILE_PX - 1, TILE_PX - 1)),
+                "the focus sheet IS one tile"
             );
         });
     }
