@@ -244,28 +244,6 @@ enum Tool {
     Ellipse,
 }
 
-/// The single key that selects `tool`, shown in its toolbar tooltip and
-/// bound in the default keymaps. `f` is deliberately absent -- it is
-/// already `FocusTile` -- so Fill takes `g`, the bucket key.
-fn tool_shortcut(tool: Tool) -> &'static str {
-    match tool {
-        Tool::Pencil => "b",
-        Tool::Eraser => "e",
-        Tool::Picker => "i",
-        Tool::Select => "m",
-        Tool::Fill => "g",
-        Tool::Line => "l",
-        Tool::Rect => "r",
-        Tool::Ellipse => "o",
-    }
-}
-
-/// A tool button's tooltip: its description with its key appended, the
-/// same `"... (key)"` shape the brush and flip buttons already use.
-fn tool_tip(description: &str, tool: Tool) -> String {
-    format!("{description} ({})", tool_shortcut(tool))
-}
-
 impl Tool {
     /// Drag-to-shape tools: preview while dragging, commit on release.
     fn is_shape(self) -> bool {
@@ -2737,11 +2715,34 @@ impl TilesetPanel {
 
     /// The toolbar across the top of the center view: pencil/eraser
     /// toggle and zoom on the left, undo/redo/save on the right.
+    /// The toolbar. Every button backed by an action renders its tooltip
+    /// with [`ui::Tooltip::for_action_in`]/[`with_meta_in`] against this
+    /// panel's focus handle, so the shortcut shown is read LIVE from the
+    /// `GgoTilesetPanel` keymap context instead of being baked into a
+    /// string that drifts the moment someone rebinds a key. Modifier prose
+    /// ("shift: filled") rides in the tooltip's meta line. Only the
+    /// action-less controls -- the cols steppers, the zoom slider -- keep
+    /// plain text tooltips.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_toolbar is only called in the Ready state");
         };
         let zoom_label = format!("{}x", open.zoom);
+        let fh = self.focus_handle.clone();
+        macro_rules! tip {
+            ($title:expr, $action:expr) => {{
+                let fh = fh.clone();
+                move |_: &mut Window, cx: &mut App| {
+                    ui::Tooltip::for_action_in($title, &$action, &fh, cx)
+                }
+            }};
+            ($title:expr, $action:expr, $meta:expr) => {{
+                let fh = fh.clone();
+                move |_: &mut Window, cx: &mut App| {
+                    ui::Tooltip::with_meta_in($title, Some(&$action), $meta, &fh, cx)
+                }
+            }};
+        }
         h_flex()
             .gap_1()
             .items_center()
@@ -2752,80 +2753,76 @@ impl TilesetPanel {
                 IconButton::new("ggo-tileset-pencil", IconName::Pencil)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Pencil)
-                    .tooltip(ui::Tooltip::text(tool_tip("Pencil", Tool::Pencil)))
+                    .tooltip(tip!("Pencil", UsePencil))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Pencil, cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-eraser", IconName::Eraser)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Eraser)
-                    .tooltip(ui::Tooltip::text(tool_tip(
-                        "Eraser, paints transparent",
-                        Tool::Eraser,
-                    )))
+                    .tooltip(tip!(
+                        "Eraser",
+                        UseEraser,
+                        "paints transparent; right-drag erases with any tool"
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Eraser, cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-picker", IconName::Crosshair)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Picker)
-                    .tooltip(ui::Tooltip::text(tool_tip(
+                    .tooltip(tip!(
                         "Pick color from the sheet",
-                        Tool::Picker,
-                    )))
+                        UsePicker,
+                        "alt-click samples with any tool"
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Picker, cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-select", IconName::SquareDot)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.tool == Tool::Select)
-                    .tooltip(ui::Tooltip::text(tool_tip(
-                        "Select region; ctrl-c copy, ctrl-v paste, arrows nudge",
-                        Tool::Select,
-                    )))
+                    .tooltip(tip!(
+                        "Select region",
+                        UseSelect,
+                        "drag moves · alt-drag copies · shift-drag swaps · arrows nudge"
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Select, cx))),
             )
-            .children(
-                [
-                    (
-                        Tool::Fill,
-                        "ggo-tileset-fill",
-                        IconName::Sparkle,
-                        "Fill this tile (shift: whole sheet)",
-                    ),
-                    (
-                        Tool::Line,
-                        "ggo-tileset-line",
-                        IconName::Dash,
-                        "Line (ctrl = 45 degrees)",
-                    ),
-                    (
-                        Tool::Rect,
-                        "ggo-tileset-rect",
-                        IconName::Maximize,
-                        "Rectangle (shift = filled, ctrl = square)",
-                    ),
-                    (
-                        Tool::Ellipse,
-                        "ggo-tileset-ellipse",
-                        IconName::Circle,
-                        "Ellipse (shift = filled, ctrl = circle)",
-                    ),
-                ]
-                .map(|(tool, id, icon, tip)| {
-                    IconButton::new(id, icon)
-                        .icon_size(IconSize::Small)
-                        .toggle_state(open.tool == tool)
-                        .tooltip(ui::Tooltip::text(tool_tip(tip, tool)))
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_tool(tool, cx)))
-                }),
+            .child(
+                IconButton::new("ggo-tileset-fill", IconName::Blocks)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Fill)
+                    .tooltip(tip!("Fill this tile", UseFill, "shift: whole sheet"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Fill, cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-line", IconName::Slash)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Line)
+                    .tooltip(tip!("Line", UseLine, "ctrl: 45 degrees"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Line, cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-rect", IconName::Maximize)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Rect)
+                    .tooltip(tip!("Rectangle", UseRect, "shift: filled · ctrl: square"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Rect, cx))),
+            )
+            .child(
+                IconButton::new("ggo-tileset-ellipse", IconName::Circle)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(open.tool == Tool::Ellipse)
+                    .tooltip(tip!("Ellipse", UseEllipse, "shift: filled · ctrl: circle"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_tool(Tool::Ellipse, cx))),
             )
             .child(div().w_2())
             .child(
                 IconButton::new("ggo-tileset-brush-down", IconName::Dash)
                     .icon_size(IconSize::XSmall)
                     .disabled(open.brush <= MIN_BRUSH)
-                    .tooltip(ui::Tooltip::text("Smaller brush ([)"))
+                    .tooltip(tip!("Smaller brush", BrushSmaller))
                     .on_click(cx.listener(|this, _, _, cx| this.step_brush(-1, cx))),
             )
             .child(Label::new(format!("{}px", open.brush)).size(LabelSize::XSmall))
@@ -2833,14 +2830,17 @@ impl TilesetPanel {
                 IconButton::new("ggo-tileset-brush-up", IconName::Plus)
                     .icon_size(IconSize::XSmall)
                     .disabled(open.brush >= MAX_BRUSH)
-                    .tooltip(ui::Tooltip::text("Larger brush (])"))
+                    .tooltip(tip!("Larger brush", BrushLarger))
                     .on_click(cx.listener(|this, _, _, cx| this.step_brush(1, cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-mirror-h", IconName::ArrowRightLeft)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.mirror_h)
-                    .tooltip(ui::Tooltip::text("Mirror horizontally within the tile"))
+                    .tooltip(tip!(
+                        "Mirror horizontally within the tile",
+                        ToggleMirrorHorizontal
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let ViewerState::Ready(open) = &mut this.state {
                             open.mirror_h = !open.mirror_h;
@@ -2852,7 +2852,10 @@ impl TilesetPanel {
                 IconButton::new("ggo-tileset-mirror-v", IconName::ExpandVertical)
                     .icon_size(IconSize::Small)
                     .toggle_state(open.mirror_v)
-                    .tooltip(ui::Tooltip::text("Mirror vertically within the tile"))
+                    .tooltip(tip!(
+                        "Mirror vertically within the tile",
+                        ToggleMirrorVertical
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let ViewerState::Ready(open) = &mut this.state {
                             open.mirror_v = !open.mirror_v;
@@ -2864,38 +2867,37 @@ impl TilesetPanel {
             .child(
                 Button::new("ggo-tileset-flip-h", "Flip H")
                     .disabled(open.selection.is_none())
-                    .tooltip(ui::Tooltip::text(
-                        "Flip the selection horizontally (shift-h)",
-                    ))
+                    .tooltip(tip!("Flip the selection horizontally", FlipHorizontal))
                     .on_click(cx.listener(|this, _, _, cx| this.flip_selection(true, cx))),
             )
             .child(
                 Button::new("ggo-tileset-flip-v", "Flip V")
                     .disabled(open.selection.is_none())
-                    .tooltip(ui::Tooltip::text("Flip the selection vertically (shift-v)"))
+                    .tooltip(tip!("Flip the selection vertically", FlipVertical))
                     .on_click(cx.listener(|this, _, _, cx| this.flip_selection(false, cx))),
             )
             .child(div().w_2())
             .child(match open.focus {
                 Some(tile) => Button::new("ggo-tileset-focus", format!("Tile {tile} — Back"))
-                    .tooltip(ui::Tooltip::text("Leave focus (escape); ←/→ step tiles"))
+                    .tooltip(tip!("Leave focus", Cancel, "←/→ step tiles, ↑/↓ step rows"))
                     .on_click(cx.listener(|this, _, _, cx| this.leave_focus(cx))),
                 None => Button::new("ggo-tileset-focus", "Focus")
-                    .tooltip(ui::Tooltip::text("Magnify one tile (f)"))
+                    .tooltip(tip!("Magnify one tile", FocusTile))
                     .on_click(cx.listener(|this, _, _, cx| this.focus_tile_impl(cx))),
             })
             .child(
                 Button::new("ggo-tileset-duplicate", "Duplicate")
                     .disabled(self.target_tile().is_none())
-                    .tooltip(ui::Tooltip::text(
-                        "Append a copy of the focused or selected tile (ctrl-d)",
+                    .tooltip(tip!(
+                        "Append a copy of the focused or selected tile",
+                        DuplicateFocusedTile
                     ))
                     .on_click(cx.listener(|this, _, _, cx| this.duplicate_tile(cx))),
             )
             .child(
-                IconButton::new("ggo-tileset-append", IconName::Plus)
+                IconButton::new("ggo-tileset-append", IconName::SquarePlus)
                     .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Append one blank tile"))
+                    .tooltip(tip!("Append one blank tile", AppendBlankTile))
                     .on_click(cx.listener(|this, _, _, cx| this.append_tile(cx))),
             )
             .child(div().w_2())
@@ -2915,11 +2917,13 @@ impl TilesetPanel {
                 }),
             )
             .child(
-                IconButton::new("ggo-tileset-snap", IconName::Maximize)
+                IconButton::new("ggo-tileset-snap", IconName::Table)
                     .icon_size(IconSize::XSmall)
                     .toggle_state(open.snap_tiles)
-                    .tooltip(ui::Tooltip::text(
-                        "Snap the selection to whole tiles (arrows then nudge by a tile)",
+                    .tooltip(tip!(
+                        "Snap the selection to whole tiles",
+                        ToggleSnapTiles,
+                        "arrows then nudge by a tile"
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let ViewerState::Ready(open) = &mut this.state {
@@ -2929,11 +2933,13 @@ impl TilesetPanel {
                     })),
             )
             .child(
-                IconButton::new("ggo-tileset-paste-opaque", IconName::Copy)
+                IconButton::new("ggo-tileset-paste-opaque", IconName::Replace)
                     .icon_size(IconSize::XSmall)
                     .toggle_state(open.paste_opaque)
-                    .tooltip(ui::Tooltip::text(
-                        "Paste writes transparent pixels too (off: composite over)",
+                    .tooltip(tip!(
+                        "Opaque paste",
+                        TogglePasteOpaque,
+                        "writes transparent pixels too; off composites over"
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let ViewerState::Ready(open) = &mut this.state {
@@ -2946,7 +2952,7 @@ impl TilesetPanel {
                 IconButton::new("ggo-tileset-lines", IconName::Hash)
                     .icon_size(IconSize::XSmall)
                     .toggle_state(open.show_lines)
-                    .tooltip(ui::Tooltip::text("Toggle tile boundary lines"))
+                    .tooltip(tip!("Toggle tile boundary lines", ToggleLines))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_lines(cx))),
             )
             .child(div().w_2())
@@ -2971,7 +2977,7 @@ impl TilesetPanel {
             .child(
                 IconButton::new("ggo-tileset-cols-up", IconName::Plus)
                     .icon_size(IconSize::XSmall)
-                    .disabled(open.cols >= open.store.state().tile_count.max(1))
+                    .disabled(open.cols >= open.store.tile_count().max(1))
                     .tooltip(ui::Tooltip::text("Wider grid"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let ViewerState::Ready(open) = &this.state {
@@ -2984,19 +2990,19 @@ impl TilesetPanel {
             .child(
                 IconButton::new("ggo-tileset-undo", IconName::Undo)
                     .icon_size(IconSize::XSmall)
-                    .tooltip(ui::Tooltip::text("Undo"))
+                    .tooltip(tip!("Undo", Undo))
                     .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
             )
             .child(
                 IconButton::new("ggo-tileset-redo", IconName::RotateCw)
                     .icon_size(IconSize::XSmall)
-                    .tooltip(ui::Tooltip::text("Redo"))
+                    .tooltip(tip!("Redo", Redo))
                     .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
             )
             .child(
                 Button::new("ggo-tileset-save", "Save")
                     .disabled(!open.store.dirty())
-                    .tooltip(ui::Tooltip::text("Save (.til + .pal)"))
+                    .tooltip(tip!("Save (.til + .pal)", Save))
                     .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
             )
             .into_any_element()
@@ -4905,34 +4911,6 @@ mod tests {
         });
     }
 
-    /// Every tool has its own key, and none of them collide with a key the
-    /// panel already binds -- `f` is `FocusTile`, which is why Fill is `g`.
-    #[test]
-    fn every_tool_has_a_distinct_shortcut_that_is_not_already_taken() {
-        let tools = [
-            Tool::Pencil,
-            Tool::Eraser,
-            Tool::Picker,
-            Tool::Select,
-            Tool::Fill,
-            Tool::Line,
-            Tool::Rect,
-            Tool::Ellipse,
-        ];
-        let keys: Vec<&str> = tools.into_iter().map(tool_shortcut).collect();
-        for (i, key) in keys.iter().enumerate() {
-            assert!(!key.is_empty(), "{:?} has no shortcut", tools[i]);
-            assert!(
-                !["f", "[", "]", "escape"].contains(key),
-                "{key} is already bound in this panel"
-            );
-        }
-        let mut sorted = keys.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), keys.len(), "shortcuts collide: {keys:?}");
-    }
-
     /// Pressing outside the panel drops the marquee; anything inside it,
     /// such as reaching for a toolbar button, leaves the selection alone.
     #[gpui::test]
@@ -5155,6 +5133,23 @@ mod tests {
                     "{action} has no binding in {path}"
                 );
             }
+
+            // No key bound twice within the panel context: the tooltip
+            // shortcuts are rendered live from this block, so a duplicate
+            // here means two buttons claim the same key.
+            let mut keys: Vec<&str> = block
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    line.starts_with('"')
+                        .then(|| line[1..].split('"').next())
+                        .flatten()
+                })
+                .collect();
+            let total = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), total, "a key is bound twice in {path}");
         }
     }
 
