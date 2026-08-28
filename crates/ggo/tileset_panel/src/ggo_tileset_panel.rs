@@ -886,6 +886,11 @@ impl TilesetPanel {
     /// and Flip buttons all operate on the selection, so a press inside the
     /// panel must never clear it.
     fn clear_selection_on_click_out(&mut self, cx: &mut Context<Self>) {
+        // A press outside the panel ends the gesture, so put any float down
+        // first. Clearing the marquee and leaving it live would strand it:
+        // the art shows moved, nothing says it is uncommitted, and a later
+        // escape would silently take it back.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -6157,6 +6162,32 @@ mod tests {
                 1,
                 "the move landed before the sheet grew"
             );
+        });
+    }
+
+    /// A press outside the panel ends the gesture, so it must put a float
+    /// down. Clearing the marquee and leaving the float alive strands it:
+    /// the art shows moved, nothing says it is uncommitted, and escape
+    /// would silently take it back.
+    #[gpui::test]
+    async fn test_pressing_outside_the_panel_commits_a_float(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            panel.move_selection((5, 0), cx);
+            assert!(ready(panel).float.is_some());
+
+            panel.clear_selection_on_click_out(cx);
+
+            assert!(ready(panel).float.is_none(), "the float was put down");
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 5, 0)], 1, "it landed");
+            assert_eq!(state.indices[idx(1, 0, 0)], 0, "and vacated its origin");
+            assert!(ready(panel).selection.is_none(), "marquee still cleared");
         });
     }
 
