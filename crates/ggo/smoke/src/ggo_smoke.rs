@@ -1321,4 +1321,225 @@ mod tests {
             );
         });
     }
+
+    // ------------------------------------------------ world edit journeys
+
+    /// Entity 0's `Transform.pos` in the world fixture below. World
+    /// PIXELS as `f64`, which is the world document's own coordinate type
+    /// (`Transform.pos` is a TOML float array, Q16.16-snapped on write).
+    const WORLD_START: [f64; 2] = [4.0, 4.0];
+
+    /// Plain arrow-key nudge step, world px --
+    /// `ggo_worldlib::drag_ops::NUDGE_STEP_PX`.
+    const WORLD_NUDGE_PX: f64 = 1.0;
+    /// Shift-arrow nudge step, world px --
+    /// `ggo_worldlib::sprites::tileset_doc::TILE_PX`, which
+    /// `drag_ops::nudge_delta` uses for the Shift case.
+    const WORLD_NUDGE_TILE: f64 = 16.0;
+
+    /// A ONE-entity world at `worlds/test.toml`, written through
+    /// worldlib's own `write_world` so the panel's loader reads exactly
+    /// what the format's round-trip tests produce.
+    ///
+    /// Deliberately one entity, no instances and no backgrounds: the
+    /// journeys below assert on entity 0's position, `ctrl-a` selects
+    /// entities AND instances (so an instance would change the selected
+    /// count), and `DeleteSelected` puts a "Remove N instances?" confirm
+    /// in front of the delete branch when the set holds any.
+    fn write_world_fixture(root: &Path) {
+        let doc = ggo_worldlib::world_file::WorldFile {
+            entities: vec![ggo_worldlib::world_file::WorldEntity {
+                components: serde_json::json!({
+                    "Transform": { "pos": WORLD_START, "z": 0.0 },
+                    "Text": { "content": "hi", "max_width": 16.0, "max_height": 12.0 },
+                })
+                .as_object()
+                .expect("the fixture components are a json object")
+                .clone(),
+            }],
+            instances: vec![],
+            backgrounds: vec![],
+        };
+        ggo_worldlib::world_file::write_world(root, "worlds/test.toml", &doc)
+            .expect("worldlib writes the world fixture");
+    }
+
+    /// Write the fixture and open it the way a user does: the project
+    /// panel's click funnel offers `worlds/test.toml` to the fork's
+    /// interceptors, the world interceptor claims it, loads it into the
+    /// dock panel and opens the center-pane canvas tab FOCUSED -- the tab
+    /// shares the panel's focus handle, which is what puts the
+    /// `GgoWorldPanel` keymap context under the following keystrokes.
+    async fn open_fixture_world(
+        workspace: &Entity<Workspace>,
+        root: &Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<ggo_world_panel::WorldPanel> {
+        write_world_fixture(root);
+        assert!(
+            offer_open(workspace, cx, "worlds/test.toml"),
+            "the world interceptor claimed the fixture"
+        );
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_world_panel::WorldCanvasItem>(cx)
+                .next()
+                .expect("the interceptor opened the world canvas tab")
+                .read(cx)
+                .test_panel()
+                .expect("the tab's panel is alive")
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_ready(), "the world loaded");
+            assert_eq!(panel.test_entity_count(), 1, "the fixture's one entity");
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(WORLD_START),
+                "at the position the fixture wrote"
+            );
+            assert!(!panel.test_is_dirty(), "a freshly loaded world is clean");
+        });
+        panel
+    }
+
+    /// The world editing spine through the REAL keymap: select all, nudge
+    /// by pixels and by a tile, walk the run back and forth with
+    /// undo/redo, ctrl-s, and reread the toml through worldlib.
+    ///
+    /// Undo granularity is the panel's own, not one-per-keypress: a RUN of
+    /// nudges shares a gesture id, so the store amends its top entry and
+    /// ONE ctrl-z takes the whole `right right right shift-right` run back
+    /// to where it started (`WorldPanel::nudge_impl`'s documented
+    /// deviation from ggo-ide). The run is sealed by undo/redo, a click,
+    /// or a new selection.
+    #[gpui::test]
+    async fn smoke_world_select_all_nudge_and_save_round_trip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        let panel = open_fixture_world(&workspace, dir.path(), cx).await;
+
+        cx.simulate_keystrokes("ctrl-a");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.test_selected_count() >= 1,
+                "ctrl-a selected the world's entities and instances"
+            );
+        });
+
+        cx.simulate_keystrokes("right right right shift-right");
+        let nudged = [
+            WORLD_START[0] + 3.0 * WORLD_NUDGE_PX + WORLD_NUDGE_TILE,
+            WORLD_START[1],
+        ];
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(nudged),
+                "three 1px nudges and one 16px tile nudge on x, nothing on y"
+            );
+            assert!(panel.test_is_dirty(), "and the document went dirty");
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(WORLD_START),
+                "the four nudges coalesced into ONE undo entry"
+            );
+        });
+        cx.simulate_keystrokes("ctrl-shift-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(nudged),
+                "and redo replays the whole run"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_dirty(), "ctrl-s cleared the dirty flag");
+        });
+
+        let on_disk = ggo_worldlib::world_file::read_world(dir.path(), "worlds/test.toml")
+            .expect("worldlib reopens what ctrl-s wrote");
+        assert_eq!(on_disk.entities.len(), 1, "still one entity on disk");
+        let pos = on_disk.entities[0]
+            .components
+            .get("Transform")
+            .and_then(|t| t.get("pos"))
+            .and_then(|pos| pos.as_array())
+            .expect("the saved entity kept its Transform.pos");
+        assert_eq!(
+            (pos[0].as_f64(), pos[1].as_f64()),
+            (Some(nudged[0]), Some(nudged[1])),
+            "the file holds the position the panel shows"
+        );
+    }
+
+    /// The three "the keystroke did something else" branches of the same
+    /// panel, which only a whole-journey test tells apart from a dead
+    /// binding: escape really drops the selection (so the next arrow pans
+    /// the CAMERA instead of moving the entity -- the panel's documented
+    /// no-selection behaviour -- and the document stays clean), ctrl-d
+    /// appends a copy that one undo removes, and delete empties the world
+    /// that one undo brings back intact.
+    #[gpui::test]
+    async fn smoke_world_escape_delete_and_duplicate_branches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        let panel = open_fixture_world(&workspace, dir.path(), cx).await;
+
+        cx.simulate_keystrokes("ctrl-a");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_selected_count(), 1, "the one entity");
+        });
+        cx.simulate_keystrokes("escape");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_selected_count(), 0, "escape cleared it");
+        });
+
+        cx.simulate_keystrokes("right");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(WORLD_START),
+                "an arrow with nothing selected pans the camera, not the entity"
+            );
+            assert!(
+                !panel.test_is_dirty(),
+                "and touches the document not at all"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-a ctrl-d");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_entity_count(), 2, "ctrl-d appended a copy");
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_entity_count(), 1, "one undo took the copy back");
+        });
+
+        cx.simulate_keystrokes("ctrl-a delete");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_entity_count(), 0, "delete emptied the world");
+            assert_eq!(panel.test_selected_count(), 0, "and left nothing selected");
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_entity_count(), 1, "one undo brought it back");
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(WORLD_START),
+                "where it was, not at some default"
+            );
+        });
+    }
 }

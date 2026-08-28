@@ -38,6 +38,14 @@ impl WorldCanvasItem {
             focus_handle: cx.focus_handle(),
         }
     }
+
+    /// The panel this tab views, for cross-crate journey tests
+    /// (`ggo_smoke`). Weak by construction, so a panel the workspace tore
+    /// down surfaces as `None` rather than a stale handle.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_panel(&self) -> Option<Entity<WorldPanel>> {
+        self.panel.upgrade()
+    }
 }
 
 impl EventEmitter<WorldCanvasEvent> for WorldCanvasItem {}

@@ -1848,6 +1848,60 @@ impl WorldPanel {
         self.dirty_world_name().is_some()
     }
 
+    /// The panel has a loaded world (not Empty/Loading/Error).
+    ///
+    /// `test-support` only, for `ggo_smoke`'s world journeys: the panel
+    /// state machine is crate-private, and a smoke test that asserted
+    /// "Ready" by poking at rendered text would pass on a panel that had
+    /// silently failed to load.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_ready(&self) -> bool {
+        matches!(self.state, ViewerState::Ready(_))
+    }
+
+    /// The open document has unsaved edits. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_dirty(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.store.state().dirty)
+    }
+
+    /// How many `[[entity]]` blocks the open document holds.
+    /// `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_entity_count(&self) -> usize {
+        match &self.state {
+            ViewerState::Ready(open) => open.store.state().entities.len(),
+            _ => 0,
+        }
+    }
+
+    /// Entity `index`'s `Transform.pos`, or `None` when the entity does
+    /// not exist or has no (numeric, 2-element) Transform.
+    ///
+    /// The coordinate type is the document's own: WORLD PIXELS as
+    /// `[f64; 2]`, not an integer pair -- `Transform.pos` is a TOML float
+    /// array (Q16.16-snapped on write by `world_file::write_world`), and
+    /// both the drag and the nudge paths do their arithmetic in `f64`.
+    /// `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_entity_position(&self, index: usize) -> Option<[f64; 2]> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        inspector::entity_pos(&open.store.state(), index)
+    }
+
+    /// How many entities/instances are selected. Selection is an ordered
+    /// `Vec<Selection>` whose LAST element is the primary, so this counts
+    /// the whole set, not just the primary. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_selected_count(&self) -> usize {
+        match &self.state {
+            ViewerState::Ready(open) => open.selected.len(),
+            _ => 0,
+        }
+    }
+
     /// The open world's display path when it has unsaved edits, else
     /// `None`. Drives both the close guard and (indirectly) the title's
     /// dirty dot.
