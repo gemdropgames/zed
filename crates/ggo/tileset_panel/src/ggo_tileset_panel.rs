@@ -36,7 +36,7 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage, ScrollHandle,
-    Styled, Task, WeakEntity, Window, actions, div, img, point, px,
+    ScrollWheelEvent, Styled, Task, WeakEntity, Window, actions, div, img, point, px,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -343,6 +343,13 @@ struct OpenTileset {
     /// Whether shift was held during the in-flight shape drag, so the
     /// preview draws what a release would actually paint.
     shape_filled: bool,
+    /// Whether ctrl was held during the in-flight shape drag: squares,
+    /// circles and 45-degree lines.
+    ///
+    /// Ctrl and not shift, deliberately. Shift already means "filled" on
+    /// these exact tools, and it is spoken for twice more on this sheet --
+    /// whole-sheet fill, and the shape commit itself.
+    shape_constrained: bool,
     /// The in-flight stroke is a right-drag, which paints the transparent
     /// slot. Aseprite's secondary colour; in a 16-slot indexed palette
     /// where slot 0 IS transparency, erase is what a secondary is for.
@@ -396,6 +403,7 @@ impl OpenTileset {
             show_lines: loaded.lines.unwrap_or(true),
             snap_tiles: false,
             shape_filled: false,
+            shape_constrained: false,
             secondary_paint: false,
             hover: None,
             paste_opaque: false,
@@ -441,7 +449,12 @@ impl OpenTileset {
         let Some(((ax, ay), (hx, hy))) = self.shape_drag else {
             return Vec::new();
         };
-        let (a, b) = ((ax as i32, ay as i32), (hx as i32, hy as i32));
+        let a = (ax as i32, ay as i32);
+        let b = if self.shape_constrained {
+            constrain_head(a, (hx as i32, hy as i32), self.tool)
+        } else {
+            (hx as i32, hy as i32)
+        };
         let raw = match self.tool {
             Tool::Line => pixel_tools::line(a, b),
             Tool::Rect => pixel_tools::rect(a, b, filled),
@@ -827,6 +840,15 @@ impl TilesetPanel {
         cx.notify();
     }
 
+    /// Ctrl-wheel zooms; a plain wheel is left to the scroll container.
+    fn on_sheet_scroll(&mut self, dy: f32, zoom_modifier: bool, cx: &mut Context<Self>) -> bool {
+        if !zoom_modifier || dy == 0.0 {
+            return false;
+        }
+        self.zoom_by(if dy > 0.0 { 1 } else { -1 }, cx);
+        true
+    }
+
     fn scroll_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
         if self.selection_rect().is_some() {
             let step = self.nudge_step();
@@ -1134,10 +1156,16 @@ impl TilesetPanel {
         }
     }
 
-    fn on_sheet_mouse_move(&mut self, pos: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
+    fn on_sheet_mouse_move(
+        &mut self,
+        pos: Point<Pixels>,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
         let hover = self.sheet_px_at(pos);
         if let ViewerState::Ready(open) = &mut self.state {
-            open.shape_filled = shift;
+            open.shape_filled = modifiers.shift;
+            open.shape_constrained = modifiers.control;
             if open.hover != hover {
                 open.hover = hover;
                 cx.notify();
@@ -1892,6 +1920,19 @@ impl TilesetPanel {
                                                 },
                                             ),
                                         )
+                                        .on_scroll_wheel(cx.listener(
+                                            |this, event: &ScrollWheelEvent, _, cx| {
+                                                let dy =
+                                                    f32::from(event.delta.pixel_delta(px(20.)).y);
+                                                if this.on_sheet_scroll(
+                                                    dy,
+                                                    event.modifiers.control,
+                                                    cx,
+                                                ) {
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
                                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                                             if !*hovered {
                                                 this.clear_hover(cx);
@@ -1901,7 +1942,7 @@ impl TilesetPanel {
                                             |this, event: &MouseMoveEvent, _, cx| {
                                                 this.on_sheet_mouse_move(
                                                     event.position,
-                                                    event.modifiers.shift,
+                                                    event.modifiers,
                                                     cx,
                                                 );
                                             },
@@ -2107,18 +2148,23 @@ impl TilesetPanel {
                         IconName::Sparkle,
                         "Fill this tile (shift: whole sheet)",
                     ),
-                    (Tool::Line, "ggo-tileset-line", IconName::Dash, "Line"),
+                    (
+                        Tool::Line,
+                        "ggo-tileset-line",
+                        IconName::Dash,
+                        "Line (ctrl = 45 degrees)",
+                    ),
                     (
                         Tool::Rect,
                         "ggo-tileset-rect",
                         IconName::Maximize,
-                        "Rectangle (shift = filled)",
+                        "Rectangle (shift = filled, ctrl = square)",
                     ),
                     (
                         Tool::Ellipse,
                         "ggo-tileset-ellipse",
                         IconName::Circle,
-                        "Ellipse (shift = filled)",
+                        "Ellipse (shift = filled, ctrl = circle)",
                     ),
                 ]
                 .map(|(tool, id, icon, tip)| {
@@ -2580,6 +2626,35 @@ fn grid_regions(tile_count: usize, cols: usize) -> Vec<(usize, usize, usize)> {
 /// zoom would need tens of thousands of quads at that size, so the cell
 /// doubles until the count is under [`CHECKER_MAX_CELLS`]. Bounded work per
 /// frame, and a coarser check on a huge sheet is not worth a stutter.
+/// Pull `head` onto the nearest constrained position from `anchor`: a
+/// square for Rect and Ellipse, one of eight directions for Line.
+///
+/// A zero-length axis resolves positive so a drag that has not moved yet
+/// still produces a well-formed shape rather than collapsing.
+fn constrain_head(anchor: (i32, i32), head: (i32, i32), tool: Tool) -> (i32, i32) {
+    let (ax, ay) = anchor;
+    let (dx, dy) = (head.0 - ax, head.1 - ay);
+    let sign = |v: i32| if v < 0 { -1 } else { 1 };
+    match tool {
+        Tool::Rect | Tool::Ellipse => {
+            let side = dx.abs().max(dy.abs());
+            (ax + side * sign(dx), ay + side * sign(dy))
+        }
+        Tool::Line => {
+            let (adx, ady) = (dx.abs(), dy.abs());
+            if adx > ady * 2 {
+                (head.0, ay)
+            } else if ady > adx * 2 {
+                (ax, head.1)
+            } else {
+                let run = adx.max(ady);
+                (ax + run * sign(dx), ay + run * sign(dy))
+            }
+        }
+        _ => head,
+    }
+}
+
 fn checker_cell_px(w: f32, h: f32) -> f32 {
     let mut cell = 8.0_f32;
     while cell < 4096.0 && (w / cell).ceil() * (h / cell).ceil() > CHECKER_MAX_CELLS {
@@ -3027,9 +3102,9 @@ mod tests {
             let drag = pixel_pos(ready(panel), 0, 1, 0);
             let after = pixel_pos(ready(panel), 0, 2, 0);
             panel.on_sheet_mouse_down(down, false, cx);
-            panel.on_sheet_mouse_move(drag, false, cx);
+            panel.on_sheet_mouse_move(drag, gpui::Modifiers::default(), cx);
             panel.on_sheet_mouse_up(false, cx);
-            panel.on_sheet_mouse_move(after, false, cx);
+            panel.on_sheet_mouse_move(after, gpui::Modifiers::default(), cx);
 
             let state = ready(panel).store.state();
             assert_eq!(state.indices[0], 1, "the mouse-down pixel painted");
@@ -3329,7 +3404,7 @@ mod tests {
             let from = pixel_pos(ready(panel), 1, 0, 0);
             let to = pixel_pos(ready(panel), 1, 1, 1);
             panel.on_sheet_mouse_down(from, false, cx);
-            panel.on_sheet_mouse_move(to, false, cx);
+            panel.on_sheet_mouse_move(to, gpui::Modifiers::default(), cx);
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(
                 panel.selection_rect(),
@@ -3741,7 +3816,7 @@ mod tests {
             let a = pixel_pos(ready(panel), 0, 0, 0);
             let b = pixel_pos(ready(panel), 0, 5, 3);
             panel.on_sheet_mouse_down(a, false, cx);
-            panel.on_sheet_mouse_move(b, false, cx);
+            panel.on_sheet_mouse_move(b, gpui::Modifiers::default(), cx);
             assert_eq!(
                 ready(panel).store.state().indices[idx(0, 0, 0)],
                 0,
@@ -3775,13 +3850,13 @@ mod tests {
             let a = pixel_pos(ready(panel), 0, 1, 1);
             let b = pixel_pos(ready(panel), 0, 4, 4);
             panel.on_sheet_mouse_down(a, false, cx);
-            panel.on_sheet_mouse_move(b, false, cx);
+            panel.on_sheet_mouse_move(b, gpui::Modifiers::default(), cx);
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
             assert_eq!(state.indices[idx(0, 1, 1)], 1);
             assert_eq!(state.indices[idx(0, 2, 2)], 0, "outline leaves the middle");
             panel.on_sheet_mouse_down(a, false, cx);
-            panel.on_sheet_mouse_move(b, false, cx);
+            panel.on_sheet_mouse_move(b, gpui::Modifiers::default(), cx);
             panel.on_sheet_mouse_up(true, cx);
             assert_eq!(
                 ready(panel).store.state().indices[idx(0, 2, 2)],
@@ -3963,13 +4038,21 @@ mod tests {
             panel.on_sheet_mouse_up(false, cx);
             panel.set_tool(Tool::Select, cx);
             panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 0, 0), false, cx);
-            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 2, 2), false, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 2, 2),
+                gpui::Modifiers::default(),
+                cx,
+            );
             panel.on_sheet_mouse_up(false, cx);
             assert_eq!(ready(panel).selection, Some(((0, 0), (2, 2))));
 
             // Drag from inside the marquee by (+3, 0).
             panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), false, cx);
-            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 4, 1), false, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 4, 1),
+                gpui::Modifiers::default(),
+                cx,
+            );
             assert_eq!(ready(panel).move_offset(), (3, 0));
             panel.on_sheet_mouse_up(false, cx);
             let state = ready(panel).store.state();
@@ -4826,7 +4909,14 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.set_tool(Tool::Rect, cx);
             panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 2, 2), false, cx);
-            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 8, 8), true, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 8, 8),
+                gpui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                cx,
+            );
 
             let open = ready(panel);
             assert!(open.shape_filled, "the drag recorded the modifier");
@@ -4842,7 +4932,11 @@ mod tests {
             );
 
             // Releasing the modifier mid-drag must flip the preview back.
-            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 0, 8, 8), false, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 8, 8),
+                gpui::Modifiers::default(),
+                cx,
+            );
             let open = ready(panel);
             assert!(!open.shape_filled);
             assert!(
@@ -5001,7 +5095,11 @@ mod tests {
         panel.update(cx, |panel, cx| {
             assert_eq!(panel.hover_status(), None, "nothing hovered yet");
 
-            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 1, 3, 4), false, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 1, 3, 4),
+                gpui::Modifiers::default(),
+                cx,
+            );
             assert_eq!(
                 panel.hover_status().as_deref(),
                 Some("tile 1 · px 3,4"),
@@ -5032,7 +5130,7 @@ mod tests {
                 px((TILE_PX as f32 + 4.0) * z),
                 px((TILE_PX as f32 + 4.0) * z),
             );
-            panel.on_sheet_mouse_move(pos, false, cx);
+            panel.on_sheet_mouse_move(pos, gpui::Modifiers::default(), cx);
             assert_eq!(panel.hover_status().as_deref(), Some("pad cell"));
         });
     }
@@ -5051,6 +5149,98 @@ mod tests {
             );
             assert!(cell >= 8.0, "never finer than 8px");
         }
+    }
+
+    /// Ctrl constrains, NOT shift: shift already means "filled" on these
+    /// exact tools, and is spoken for twice more on this sheet.
+    #[test]
+    fn constrain_head_squares_boxes_and_snaps_lines_to_eight_directions() {
+        let a = (10, 10);
+        // Rect/Ellipse: the longer axis wins, sign preserved.
+        assert_eq!(constrain_head(a, (20, 13), Tool::Rect), (20, 20));
+        assert_eq!(constrain_head(a, (13, 20), Tool::Rect), (20, 20));
+        assert_eq!(constrain_head(a, (2, 13), Tool::Ellipse), (2, 18));
+        assert_eq!(
+            constrain_head(a, (4, 4), Tool::Rect),
+            (4, 4),
+            "up-left stays square"
+        );
+
+        // Line: shallow -> horizontal, steep -> vertical, else diagonal.
+        assert_eq!(constrain_head(a, (30, 12), Tool::Line), (30, 10));
+        assert_eq!(constrain_head(a, (12, 30), Tool::Line), (10, 30));
+        assert_eq!(constrain_head(a, (20, 18), Tool::Line), (20, 20));
+        assert_eq!(
+            constrain_head(a, (0, 20), Tool::Line),
+            (0, 20),
+            "an exact down-left 45 is left alone"
+        );
+        assert_eq!(
+            constrain_head(a, (0, 22), Tool::Line),
+            (-2, 22),
+            "a near-45 extends along the LONGER axis, even off-sheet"
+        );
+
+        // A drag that has not moved must still be well-formed.
+        assert_eq!(constrain_head(a, a, Tool::Rect), a);
+        // Non-shape tools are untouched.
+        assert_eq!(constrain_head(a, (3, 7), Tool::Pencil), (3, 7));
+    }
+
+    #[gpui::test]
+    async fn test_ctrl_constrains_a_rect_drag_to_a_square(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Rect, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 2, 2), false, cx);
+            panel.on_sheet_mouse_move(
+                pixel_pos(ready(panel), 0, 10, 4),
+                gpui::Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+                cx,
+            );
+            let open = ready(panel);
+            assert!(open.shape_constrained, "the drag recorded ctrl");
+            let points = open.shape_points(false);
+            // 2,2 -> 10,4 constrained is 2,2 -> 10,10: a square outline.
+            assert!(points.contains(&(10, 10)), "the far corner squared up");
+            assert!(
+                points.contains(&(5, 10)),
+                "the square's bottom edge runs at y=10"
+            );
+            assert!(
+                !points.contains(&(5, 4)),
+                "not the raw 8x2 box, whose bottom edge was y=4"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_ctrl_wheel_zooms_and_a_plain_wheel_does_not(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let before = ready(panel).zoom;
+            assert!(
+                !panel.on_sheet_scroll(20.0, false, cx),
+                "plain wheel declines"
+            );
+            assert_eq!(ready(panel).zoom, before, "so the container can scroll");
+
+            assert!(panel.on_sheet_scroll(20.0, true, cx));
+            assert_eq!(ready(panel).zoom, before + 1);
+            assert!(panel.on_sheet_scroll(-20.0, true, cx));
+            assert_eq!(ready(panel).zoom, before);
+
+            assert!(
+                !panel.on_sheet_scroll(0.0, true, cx),
+                "a zero delta is not a zoom"
+            );
+        });
     }
 
     #[gpui::test]
