@@ -152,6 +152,13 @@ const EMPTY_MESSAGE: &str = "Right-click a .png in the project panel → Import 
 /// The quantized preview strip's height.
 const PREVIEW_HEIGHT: Pixels = px(120.);
 
+/// The transparency checkerboard behind the source and the preview -- same
+/// square size and greys as the tileset panel's sheet backdrop, so
+/// transparency reads identically across the fork's panels.
+const CHECKER_PX: f32 = 8.0;
+const CHECKER_LIGHT: u32 = 0x6b6b6b;
+const CHECKER_DARK: u32 = 0x4a4a4a;
+
 /// Palette swatch box (px, square) -- same size `ggo_tileset_panel` draws.
 const SWATCH_PX: f32 = 16.0;
 
@@ -1743,10 +1750,32 @@ impl ImportPanel {
             (Some(image), Some(preview)) => div()
                 .p_1()
                 .child(
-                    img(image.clone())
-                        .nearest(true)
+                    // Slot 0 quantizes to transparent; without the backdrop
+                    // the preview's holes are indistinguishable from dark
+                    // paint, exactly the sheet's old problem.
+                    div()
+                        .relative()
                         .w(px(preview.w as f32))
-                        .h(px(preview.h as f32)),
+                        .h(px(preview.h as f32))
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full()
+                                .bg(rgb(CHECKER_DARK))
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .bg(gpui::checkerboard(rgb(CHECKER_LIGHT), CHECKER_PX)),
+                                ),
+                        )
+                        .child(
+                            img(image.clone())
+                                .nearest(true)
+                                .w(px(preview.w as f32))
+                                .h(px(preview.h as f32)),
+                        ),
                 )
                 .into_any_element(),
             _ => Label::new("No preview")
@@ -2084,6 +2113,15 @@ fn paint_crop(scene: &CropScene, canvas: Bounds<Pixels>, window: &mut Window) {
             return;
         }
         let image_bounds = image_rect(canvas, scene.pan, scene.zoom, 0, 0, scene.w, scene.h);
+        // The transparency backdrop, exactly under the image: a source PNG's
+        // alpha holes were invisible against the editor background on a dark
+        // theme. checkerboard() is a shader-backed Background, so this is
+        // two quads regardless of zoom.
+        window.paint_quad(fill(image_bounds, rgb(CHECKER_DARK)));
+        window.paint_quad(fill(
+            image_bounds,
+            gpui::checkerboard(rgb(CHECKER_LIGHT), CHECKER_PX),
+        ));
         if let Some(image) = &scene.image {
             let _ = window.paint_image(
                 image_bounds,
