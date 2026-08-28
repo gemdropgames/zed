@@ -856,6 +856,178 @@ mod tests {
         workspace.read_with(cx, |_, _| ());
     }
 
+    /// Alt's precedence rule, end to end: alt only starts a copy-drag
+    /// INSIDE a Select marquee. Anywhere else it keeps its sampling
+    /// meaning, and the two must not blur into each other -- an alt-click
+    /// on distant art that lifted a float instead of sampling would
+    /// silently arm a paste nobody asked for.
+    #[gpui::test]
+    async fn smoke_alt_click_outside_the_marquee_samples_instead_of_lifting(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        let zoom = panel.read_with(cx, |panel, _| panel.test_zoom()) as f32;
+        let tile0_at = |cx: &mut gpui::VisualTestContext, x: f32| {
+            let base = tile1_at(&panel, cx, x, 0.0);
+            gpui::point(base.x - gpui::px(16.0 * zoom), base.y)
+        };
+        let click = |cx: &mut gpui::VisualTestContext, at: gpui::Point<gpui::Pixels>| {
+            cx.simulate_mouse_down(at, gpui::MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(at, gpui::MouseButton::Left, Default::default());
+        };
+
+        // A slot-2 marker in tile 0 to sample from later.
+        cx.simulate_keystrokes("b .");
+        let marker = tile0_at(cx, 0.0);
+        click(cx, marker);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(0, 0, 0), Some(2), "marker painted");
+        });
+
+        // Step back to slot 1 and prove it, so the sample below has
+        // something to change.
+        cx.simulate_keystrokes(",");
+        let calibration = tile0_at(cx, 8.0);
+        click(cx, calibration);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(0, 8, 0), Some(1), "the slot is back to 1");
+        });
+
+        marquee_tile1(&panel, cx);
+        let alt = gpui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(marker, gpui::MouseButton::Left, alt);
+        cx.simulate_mouse_up(marker, gpui::MouseButton::Left, Default::default());
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "no copy-drag started out here");
+            assert_eq!(
+                panel.test_pixel(0, 1, 0),
+                Some(0),
+                "and nothing was painted"
+            );
+        });
+
+        // The sample landed: the pencil now writes the marker's slot.
+        cx.simulate_keystrokes("b");
+        let proof = tile0_at(cx, 12.0);
+        click(cx, proof);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_pixel(0, 12, 0),
+                Some(2),
+                "the alt-click sampled the marker's slot instead of lifting"
+            );
+        });
+    }
+
+    /// A modifier click inside the marquee that never becomes a drag must
+    /// not arm the NEXT gesture. The mouse-up resets the pending mode, so
+    /// the following keyboard nudge lifts a plain Move -- a leaked Swap or
+    /// Copy would show up here as art the commit failed to vacate.
+    #[gpui::test]
+    async fn smoke_modifier_click_without_a_drag_commits_as_a_move(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        marquee_tile1(&panel, cx);
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let inside = tile1_at(&panel, cx, 0.0, 0.0);
+        cx.simulate_mouse_down(inside, gpui::MouseButton::Left, shift);
+        cx.simulate_mouse_up(inside, gpui::MouseButton::Left, Default::default());
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "no movement, no float");
+        });
+
+        cx.simulate_keystrokes("right right right right");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_floating(), "the nudges lifted a float");
+        });
+        let away = tile1_at(&panel, cx, 12.0, 12.0);
+        cx.simulate_mouse_down(away, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(away, gpui::MouseButton::Left, Default::default());
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "the click away placed it");
+            assert_eq!(
+                panel.test_pixel(1, 0, 0),
+                Some(0),
+                "a Move vacated the origin: the stale Swap intent did not leak"
+            );
+            assert_eq!(panel.test_pixel(1, 4, 0), Some(1), "landed 4 right");
+        });
+    }
+
+    /// The two cancel routes off a modifier float, which differ from a
+    /// Move's: escape drops a Swap without exchanging anything, and delete
+    /// on a Copy is a cancel rather than a source-blank, because neither
+    /// float ever owed the document a write.
+    #[gpui::test]
+    async fn smoke_escape_cancels_a_swap_and_delete_cancels_a_copy(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let panel = open_fixture_tileset(&workspace, dir.path(), cx).await;
+
+        let zoom = panel.read_with(cx, |panel, _| panel.test_zoom()) as f32;
+        cx.simulate_keystrokes("b .");
+        let marker = {
+            let base = tile1_at(&panel, cx, 0.0, 0.0);
+            gpui::point(base.x - gpui::px(16.0 * zoom), base.y)
+        };
+        cx.simulate_mouse_down(marker, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(marker, gpui::MouseButton::Left, Default::default());
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_pixel(0, 0, 0), Some(2), "marker painted");
+        });
+
+        marquee_tile1(&panel, cx);
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let from = tile1_at(&panel, cx, 0.0, 0.0);
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, shift);
+        cx.simulate_mouse_move(marker, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(marker, gpui::MouseButton::Left, Default::default());
+        cx.simulate_keystrokes("escape");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "escape dropped the swap");
+            assert_eq!(panel.test_pixel(0, 0, 0), Some(2), "the marker stayed");
+            assert_eq!(panel.test_pixel(1, 0, 0), Some(1), "and so did tile 1");
+        });
+
+        // Escape also drops the marquee, so the copy drag needs a new one.
+        marquee_tile1(&panel, cx);
+        let alt = gpui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let from = tile1_at(&panel, cx, 0.0, 0.0);
+        let to = gpui::point(from.x - gpui::px(8.0 * zoom), from.y);
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, alt);
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default());
+        cx.simulate_keystrokes("delete");
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_floating(), "delete consumed the copy");
+            assert_eq!(
+                panel.test_pixel(1, 0, 0),
+                Some(1),
+                "deleting a copy is a cancel, not a source-blank"
+            );
+            assert_eq!(panel.test_pixel(0, 8, 0), Some(0), "and nothing stamped");
+        });
+    }
+
     /// The journey that crashed the editor this morning: a `.png` dropped
     /// on a pane whose active item is an EDITOR. The drop reaches the
     /// fork's interceptor through `Pane::handle_external_paths_drop` with
