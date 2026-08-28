@@ -2747,35 +2747,24 @@ impl TilesetPanel {
             return div().into_any_element();
         }
         let (add_tip, remove_tip) = match (horizontal, at_start) {
-            (true, true) => (
-                "Add row above",
-                "Delete top row — removes its art (ctrl-z undoes)",
-            ),
-            (true, false) => (
-                "Add row below",
-                "Delete bottom row — removes its art (ctrl-z undoes)",
-            ),
-            (false, true) => (
-                "Add column left",
-                "Delete left column — removes its art (ctrl-z undoes)",
-            ),
-            (false, false) => (
-                "Add column right",
-                "Delete right column — removes its art (ctrl-z undoes)",
-            ),
+            (true, true) => ("Add row above", "Delete top row"),
+            (true, false) => ("Add row below", "Delete bottom row"),
+            (false, true) => ("Add column left", "Delete left column"),
+            (false, false) => ("Add column right", "Delete right column"),
         };
         // The destructive half is coloured, not just glyph-different: it
         // sits inside an 18px strip next to the additive one, and a misclick
-        // takes a whole row or column of art with it.
+        // takes a whole row or column of art with it. Its tooltip names the
+        // LIVE undo binding -- baking "ctrl-z" here told macOS users the
+        // wrong key for a destructive action.
         let half = |glyph: &'static str, tip: &'static str, index: usize, destructive: bool| {
-            div()
+            let button = div()
                 .id((id, index))
                 .flex_1()
                 .flex()
                 .justify_center()
                 .items_center()
                 .cursor_pointer()
-                .tooltip(ui::Tooltip::text(tip))
                 .child(
                     Label::new(glyph)
                         .size(LabelSize::Small)
@@ -2784,7 +2773,21 @@ impl TilesetPanel {
                         } else {
                             Color::Muted
                         }),
-                )
+                );
+            if destructive {
+                button.tooltip(move |window, cx| {
+                    let undo_key = ui::text_for_action(&Undo, window, cx)
+                        .unwrap_or_else(|| "undo".to_string());
+                    ui::Tooltip::with_meta(
+                        tip,
+                        None,
+                        format!("removes its art — {undo_key} undoes"),
+                        cx,
+                    )
+                })
+            } else {
+                button.tooltip(ui::Tooltip::text(tip))
+            }
         };
         div()
             .id(id)
@@ -2875,18 +2878,18 @@ impl TilesetPanel {
             unreachable!("render_toolbar is only called in the Ready state");
         };
         let zoom_label = format!("{}x", open.zoom);
-        let fh = self.focus_handle.clone();
+        let focus_handle = self.focus_handle.clone();
         macro_rules! tip {
             ($title:expr, $action:expr) => {{
-                let fh = fh.clone();
+                let focus_handle = focus_handle.clone();
                 move |_: &mut Window, cx: &mut App| {
-                    ui::Tooltip::for_action_in($title, &$action, &fh, cx)
+                    ui::Tooltip::for_action_in($title, &$action, &focus_handle, cx)
                 }
             }};
             ($title:expr, $action:expr, $meta:expr) => {{
-                let fh = fh.clone();
+                let focus_handle = focus_handle.clone();
                 move |_: &mut Window, cx: &mut App| {
-                    ui::Tooltip::with_meta_in($title, Some(&$action), $meta, &fh, cx)
+                    ui::Tooltip::with_meta_in($title, Some(&$action), $meta, &focus_handle, cx)
                 }
             }};
         }
