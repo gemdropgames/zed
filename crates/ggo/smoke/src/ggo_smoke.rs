@@ -1028,6 +1028,246 @@ mod tests {
         });
     }
 
+    /// A two-frame sprite imported through the wizard, opened in the
+    /// sprite panel: a 32x16 PNG of two SOLID halves (red, blue) framed
+    /// at one tile wide, so the trio lands with two distinct pool tiles
+    /// (nothing to dedup) and two one-cell frames -- frame 0 showing
+    /// tile 0, frame 1 showing tile 1. Known pixels the edit journeys
+    /// below can assert against without depending on the quantizer.
+    async fn open_imported_duo_sprite(
+        workspace: &Entity<Workspace>,
+        root: &Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (Entity<ggo_sprite_panel::SpritePanel>, String) {
+        // Row-major: each of the 16 rows is 16 red pixels then 16 blue
+        // ones, which is the two solid halves side by side.
+        let row: Vec<u8> = [255u8, 0, 0, 255]
+            .repeat(16)
+            .into_iter()
+            .chain([0u8, 0, 255, 255].repeat(16))
+            .collect();
+        let rgba = row.repeat(16);
+        let mut encoded = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut encoded),
+            &rgba,
+            32,
+            16,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let png = root.join("assets/art/duo.png");
+        std::fs::write(&png, &encoded).unwrap();
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_external_paths_drop(&gpui::ExternalPaths(vec![png].into()), window, cx)
+        });
+        cx.run_until_parked();
+        let wizard = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_import_panel::ImportItem>(cx)
+                .next()
+                .expect("wizard")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        cx.run_until_parked();
+        let asset_rel = wizard.update(cx, |wizard, cx| {
+            wizard.test_set_as_sprite(true);
+            wizard.test_set_frame_tiles((Some(1), None));
+            wizard.test_commit(cx).expect("commit succeeds")
+        });
+        assert!(asset_rel.ends_with(".spr"), "the wizard wrote a sprite");
+        cx.run_until_parked();
+
+        assert!(
+            offer_open(workspace, cx, &format!("assets/{asset_rel}")),
+            "the sprite interceptor claims the written .spr"
+        );
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx)
+                .next()
+                .expect("sprite tab")
+                .read(cx)
+                .test_panel()
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_ready(), "the sprite panel loaded the trio");
+            assert_eq!(
+                panel.test_frame_cell(0, 0),
+                Some(0),
+                "frame 0 shows the red tile"
+            );
+            assert_eq!(
+                panel.test_frame_cell(1, 0),
+                Some(1),
+                "frame 1 shows the blue tile"
+            );
+        });
+        (panel, asset_rel)
+    }
+
+    /// Screen point at the center of picker sheet cell `col` of the first
+    /// row -- the picker lays 24px squares out left-to-right.
+    fn picker_cell_center(
+        panel: &Entity<ggo_sprite_panel::SpritePanel>,
+        cx: &mut gpui::VisualTestContext,
+        col: usize,
+    ) -> gpui::Point<gpui::Pixels> {
+        panel.read_with(cx, |panel, _| {
+            let bounds = panel.test_picker_bounds().expect("picker painted");
+            gpui::point(
+                bounds.origin.x + gpui::px(col as f32 * 24.0 + 12.0),
+                bounds.origin.y + gpui::px(12.0),
+            )
+        })
+    }
+
+    /// Screen point at the center of the frame preview. The fixture's
+    /// frames are one tile, so any point inside the preview is cell 0.
+    fn preview_center(
+        panel: &Entity<ggo_sprite_panel::SpritePanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> gpui::Point<gpui::Pixels> {
+        panel.read_with(cx, |panel, _| {
+            let bounds = panel.test_preview_bounds().expect("preview painted");
+            bounds.center()
+        })
+    }
+
+    /// A picker click, the way a user makes one: press and release on the
+    /// same cell (a press-drag-release would be a marquee instead).
+    fn click(cx: &mut gpui::VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+        cx.simulate_mouse_down(at, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(at, gpui::MouseButton::Left, Default::default());
+    }
+
+    /// The sprite editing spine, end to end through the real keymap: pick
+    /// a pool tile out of the picker, stamp it on the preview, walk the
+    /// edit back and forth with undo/redo, then ctrl-s and reopen the
+    /// trio from disk. Every panel feature here is covered in isolation
+    /// by the crate's own tests -- what this journey adds is that the
+    /// picker's selection, the preview's hit mapping, the undo stack, and
+    /// the save path all agree about the SAME cell.
+    #[gpui::test]
+    async fn smoke_sprite_assign_undo_and_save_round_trip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let (panel, asset_rel) = open_imported_duo_sprite(&workspace, dir.path(), cx).await;
+
+        let cell1 = picker_cell_center(&panel, cx, 1);
+        click(cx, cell1);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_selected_tile(),
+                Some(1),
+                "clicking the picker's second cell selects the blue tile"
+            );
+        });
+
+        let preview = preview_center(&panel, cx);
+        click(cx, preview);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_frame_cell(0, 0),
+                Some(1),
+                "the preview click stamped the selection on frame 0"
+            );
+            assert!(panel.test_is_dirty(), "and the document went dirty");
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_frame_cell(0, 0), Some(0), "undo puts red back");
+        });
+        cx.simulate_keystrokes("ctrl-shift-z");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_frame_cell(0, 0), Some(1), "redo re-stamps blue");
+        });
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_dirty(), "ctrl-s cleared the dirty dot");
+        });
+
+        // The trio is framed against `assets/`, not the worktree root.
+        let opened = ggo_worldlib::sprites::io::open_sprite(&dir.path().join("assets"), &asset_rel)
+            .expect("worldlib reopens the saved trio");
+        assert_eq!(
+            opened
+                .state
+                .frames
+                .first()
+                .and_then(|frame| frame.map.first()),
+            Some(&1),
+            "the stamped tile reached the file"
+        );
+    }
+
+    /// The two "a click does nothing" branches of the same panel, which
+    /// only a whole-journey test can tell apart from a broken click: with
+    /// the picker deselected by escape, a preview click must leave the
+    /// document alone (and CLEAN, so no empty undo step was pushed), and
+    /// space must still reach the transport rather than the deselected
+    /// picker.
+    #[gpui::test]
+    async fn smoke_sprite_deselect_and_playback_branches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot(cx, dir.path()).await;
+        let (panel, _) = open_imported_duo_sprite(&workspace, dir.path(), cx).await;
+
+        let cell1 = picker_cell_center(&panel, cx, 1);
+        click(cx, cell1);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_selected_tile(), Some(1), "blue is selected");
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_selected_tile(),
+                None,
+                "escape drops the picker selection"
+            );
+        });
+
+        let preview = preview_center(&panel, cx);
+        click(cx, preview);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_frame_cell(0, 0),
+                Some(0),
+                "a deselected picker stamps nothing"
+            );
+            assert!(!panel.test_is_dirty(), "and pushes no op onto the stack");
+        });
+
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_playing(), "space starts the transport");
+        });
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_playing(), "and space again stops it");
+        });
+    }
+
     /// The journey that crashed the editor this morning: a `.png` dropped
     /// on a pane whose active item is an EDITOR. The drop reaches the
     /// fork's interceptor through `Pane::handle_external_paths_drop` with

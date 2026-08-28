@@ -94,6 +94,12 @@ impl SpriteEditorItem {
         &self.rel
     }
 
+    /// Smoke-test hook: `ggo_smoke` reaches the panel through the tab.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_panel(&self) -> Entity<SpritePanel> {
+        self.panel.clone()
+    }
+
     pub(crate) fn panel(&self) -> &Entity<SpritePanel> {
         &self.panel
     }

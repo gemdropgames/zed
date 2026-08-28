@@ -1207,6 +1207,66 @@ pub struct SpritePanel {
 }
 
 impl SpritePanel {
+    #[cfg(feature = "test-support")]
+    pub fn test_is_ready(&self) -> bool {
+        matches!(self.state, ViewerState::Ready(_))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_is_dirty(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.store.dirty())
+    }
+
+    /// The tile picker sheet's on-screen bounds, recorded at the last
+    /// prepaint.
+    #[cfg(feature = "test-support")]
+    pub fn test_picker_bounds(&self) -> Option<gpui::Bounds<Pixels>> {
+        match &self.state {
+            ViewerState::Ready(open) => *open.picker_bounds.borrow(),
+            _ => None,
+        }
+    }
+
+    /// The frame preview's on-screen bounds, recorded at the last
+    /// prepaint.
+    #[cfg(feature = "test-support")]
+    pub fn test_preview_bounds(&self) -> Option<gpui::Bounds<Pixels>> {
+        match &self.state {
+            ViewerState::Ready(open) => *open.preview_bounds.borrow(),
+            _ => None,
+        }
+    }
+
+    /// The pool tile that frame `frame`'s tile map names at `cell`.
+    #[cfg(feature = "test-support")]
+    pub fn test_frame_cell(&self, frame: usize, cell: usize) -> Option<u16> {
+        match &self.state {
+            ViewerState::Ready(open) => open
+                .store
+                .state()
+                .frames
+                .get(frame)
+                .and_then(|frame| frame.map.get(cell))
+                .copied(),
+            _ => None,
+        }
+    }
+
+    /// The picker's active single-tile selection -- `None` while nothing
+    /// is selected, and also while a multi-tile marquee block is.
+    #[cfg(feature = "test-support")]
+    pub fn test_selected_tile(&self) -> Option<u16> {
+        match &self.state {
+            ViewerState::Ready(open) => open.selection.as_ref().and_then(tiles::TileBlock::single),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_is_playing(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.playing.is_some())
+    }
+
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
