@@ -107,6 +107,10 @@ actions!(
         UseRect,
         /// Selects the Ellipse tool.
         UseEllipse,
+        /// Clears the selected region to the transparent slot.
+        DeleteSelection,
+        /// Copies the selected region, then clears it.
+        CutSelection,
     ]
 );
 
@@ -1086,6 +1090,27 @@ impl TilesetPanel {
             open.clipboard = Some(region);
             cx.notify();
         }
+    }
+
+    /// Blank the selected region to slot 0 as one undo step.
+    ///
+    /// Distinct from [`Cancel`], which only drops the marquee. Without this
+    /// the only way to clear a region was to switch to the eraser and scrub
+    /// it with a brush capped at 4px.
+    fn erase_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((x0, y0, x1, y1)) = self.selection_rect() else {
+            return;
+        };
+        let cells: Vec<(i32, i32, u8)> = (y0..=y1)
+            .flat_map(|y| (x0..=x1).map(move |x| (x as i32, y as i32, 0u8)))
+            .collect();
+        self.write_cells(&cells, cx);
+    }
+
+    /// Copy the selection, then blank it.
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+        self.erase_selection(cx);
     }
 
     /// Write per-point colours as ONE undo step; later cells win.
@@ -2081,6 +2106,8 @@ impl Render for TilesetPanel {
                 cx.listener(|this, _: &ScrollDown, _window, cx| this.scroll_by(0.0, 1.0, cx)),
             )
             .on_action(cx.listener(|this, _: &CopySelection, _window, cx| this.copy_selection(cx)))
+            .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.cut_selection(cx)))
+            .on_action(cx.listener(|this, _: &DeleteSelection, _, cx| this.erase_selection(cx)))
             .on_action(
                 cx.listener(|this, _: &PasteSelection, _window, cx| this.paste_clipboard(cx)),
             )
@@ -3720,6 +3747,178 @@ mod tests {
                 "and so is any half-finished move"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_delete_selection_clears_to_slot_zero_in_one_undo_step(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
+            }
+            panel.erase_selection(cx);
+            let state = ready(panel).store.state();
+            for y in 0..TILE_PX {
+                for x in 0..TILE_PX {
+                    assert_eq!(state.indices[idx(1, x, y)], 0, "({x},{y}) cleared");
+                }
+            }
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 7, 7)],
+                1,
+                "one undo restores the whole region"
+            );
+            panel.redo_impl(cx);
+            assert_eq!(ready(panel).store.state().indices[idx(1, 7, 7)], 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_without_a_marquee_is_a_no_op(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.erase_selection(cx);
+            let state = ready(panel).store.state();
+            assert!(!state.dirty, "no marquee, nothing written");
+            assert_eq!(state.indices[idx(1, 7, 7)], 1, "the art is untouched");
+        });
+    }
+
+    /// Blanking an already-blank region must not push an undo entry --
+    /// `apply_stroke_paint` drops a same-colour write.
+    #[gpui::test]
+    async fn test_deleting_an_already_blank_region_pushes_no_undo_entry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            // Tile 0 is all zeros in the fixture.
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (TILE_PX - 1, TILE_PX - 1)));
+            }
+            panel.erase_selection(cx);
+            assert!(!ready(panel).store.state().dirty, "nothing changed");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cut_copies_then_clears_and_paste_restores(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (2 * TILE_PX - 1, TILE_PX - 1)));
+            }
+            panel.cut_selection(cx);
+            let open = ready(panel);
+            let (w, h, data) = open.clipboard.clone().expect("cut filled the clipboard");
+            assert_eq!((w, h), (TILE_PX, TILE_PX));
+            assert!(data.iter().all(|&v| v == 1), "the copy took the art");
+            assert_eq!(
+                open.store.state().indices[idx(1, 7, 7)],
+                0,
+                "and the region is blank"
+            );
+
+            panel.paste_clipboard(cx);
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 7, 7)],
+                1,
+                "paste puts it back"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_over_pad_cells_does_not_panic(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.set_cols(2, cx);
+            panel.select_whole_sheet(cx);
+            panel.erase_selection(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.tile_count, 3, "no tile was added or removed");
+            for tile in 0..3 {
+                assert_eq!(state.indices[idx(tile, 0, 0)], 0, "tile {tile} cleared");
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_in_focus_mode_clears_only_the_focused_tile(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_focus(1, cx);
+            panel.select_whole_sheet(cx);
+            panel.erase_selection(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.indices[idx(1, 7, 7)], 0, "the focused tile cleared");
+            assert_eq!(state.indices[idx(2, 7, 7)], 1, "tile 2 untouched");
+        });
+    }
+
+    /// Every action this panel defines is reachable from a key, or is
+    /// explicitly allowlisted as toolbar-only. Catches an action that ships
+    /// with a handler but no way to invoke it -- which is how ZoomIn,
+    /// ZoomOut and SelectWholeSheet all sat unbound.
+    #[test]
+    fn every_ggo_tileset_action_is_bound_or_allowlisted() {
+        const UNBOUND_BY_DESIGN: &[&str] = &[];
+        let actions = [
+            "Undo",
+            "Redo",
+            "Save",
+            "ScrollLeft",
+            "ScrollRight",
+            "ScrollUp",
+            "ScrollDown",
+            "CopySelection",
+            "PasteSelection",
+            "CutSelection",
+            "DeleteSelection",
+            "ZoomIn",
+            "ZoomOut",
+            "SelectWholeSheet",
+            "BrushSmaller",
+            "BrushLarger",
+            "FlipHorizontal",
+            "FlipVertical",
+            "Cancel",
+            "FocusTile",
+            "UsePencil",
+            "UseEraser",
+            "UsePicker",
+            "UseSelect",
+            "UseFill",
+            "UseLine",
+            "UseRect",
+            "UseEllipse",
+        ];
+        for keymap in [
+            "/../../../assets/keymaps/default-linux.json",
+            "/../../../assets/keymaps/default-macos.json",
+            "/../../../assets/keymaps/default-windows.json",
+        ] {
+            let path = format!("{}{keymap}", env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(&path).expect("keymap readable");
+            let start = text
+                .find(r#""context": "GgoTilesetPanel""#)
+                .unwrap_or_else(|| panic!("no GgoTilesetPanel block in {path}"));
+            let block = &text[start..start + text[start..].find("\n  },").expect("block ends")];
+            for action in actions {
+                if UNBOUND_BY_DESIGN.contains(&action) {
+                    continue;
+                }
+                assert!(
+                    block.contains(&format!("ggo_tileset::{action}\"")),
+                    "{action} has no binding in {path}"
+                );
+            }
+        }
     }
 
     #[gpui::test]
