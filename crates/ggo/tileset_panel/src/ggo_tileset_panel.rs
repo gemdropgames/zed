@@ -141,6 +141,9 @@ actions!(
 /// The zoom focus mode uses when the sheet's own zoom is smaller.
 const FOCUS_MIN_ZOOM: usize = 8;
 
+/// Upper bound on transparency-checker quads per frame.
+const CHECKER_MAX_CELLS: f32 = 8192.0;
+
 /// Brush size bounds (px, square).
 const MIN_BRUSH: usize = 1;
 const MAX_BRUSH: usize = 4;
@@ -344,6 +347,9 @@ struct OpenTileset {
     /// slot. Aseprite's secondary colour; in a 16-slot indexed palette
     /// where slot 0 IS transparency, erase is what a secondary is for.
     secondary_paint: bool,
+    /// The sheet pixel under the cursor, for the status readout. `None`
+    /// once the pointer leaves the sheet.
+    hover: Option<(usize, usize)>,
     /// Paste writes the clipboard's transparent pixels too, punching holes
     /// in the destination. Off = composite over. Per-session ink mode, so
     /// unlike `show_lines` it is not persisted.
@@ -391,6 +397,7 @@ impl OpenTileset {
             snap_tiles: false,
             shape_filled: false,
             secondary_paint: false,
+            hover: None,
             paste_opaque: false,
             brush: MIN_BRUSH,
             mirror_h: false,
@@ -1128,8 +1135,13 @@ impl TilesetPanel {
     }
 
     fn on_sheet_mouse_move(&mut self, pos: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
+        let hover = self.sheet_px_at(pos);
         if let ViewerState::Ready(open) = &mut self.state {
             open.shape_filled = shift;
+            if open.hover != hover {
+                open.hover = hover;
+                cx.notify();
+            }
         }
         let (tool, painting) = match &self.state {
             ViewerState::Ready(open) => (open.tool, open.painting),
@@ -1186,6 +1198,31 @@ impl TilesetPanel {
             // not -- it samples and gives you your tool straight back.
             open.tool = Tool::Pencil;
             cx.notify();
+        }
+    }
+
+    /// Drop the hover readout when the pointer leaves the sheet, so a
+    /// stale tile index does not sit in the status line.
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.hover.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// The tile index and in-tile pixel under the cursor, for the status
+    /// line. The tile index appeared nowhere in the UI except the Focus
+    /// button's label, so there was no way to tell tile 12 from tile 13.
+    fn hover_status(&self) -> Option<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let (sx, sy) = open.hover?;
+        match self.doc_pixel(sx, sy) {
+            Some((tile, x, y)) => Some(format!("tile {tile} · px {x},{y}")),
+            // A pad cell backs no tile; say so rather than showing nothing.
+            None => Some("pad cell".to_string()),
         }
     }
 
@@ -1819,9 +1856,22 @@ impl TilesetPanel {
                                 ))
                                 .child(
                                     div()
+                                        .id("ggo-tileset-canvas")
                                         .relative()
                                         .w(px(w))
                                         .h(px(h))
+                                        .child(
+                                            gpui::canvas(
+                                                |_, _, _| (),
+                                                |bounds, (), window, _cx| {
+                                                    paint_checkerboard(bounds, window);
+                                                },
+                                            )
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .size_full(),
+                                        )
                                         .child(
                                             img(open.grid.clone()).nearest(true).w(px(w)).h(px(h)),
                                         )
@@ -1842,6 +1892,11 @@ impl TilesetPanel {
                                                 },
                                             ),
                                         )
+                                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                            if !*hovered {
+                                                this.clear_hover(cx);
+                                            }
+                                        }))
                                         .on_mouse_move(cx.listener(
                                             |this, event: &MouseMoveEvent, _, cx| {
                                                 this.on_sheet_mouse_move(
@@ -1967,10 +2022,14 @@ impl TilesetPanel {
         };
         let (w, h) = open.grid_size;
         let state = open.store.state();
-        let summary = format!(
+        let mut summary = format!(
             "{} tiles · {}x{} px · {} cols",
             state.tile_count, w, h, open.cols
         );
+        if let Some(hover) = self.hover_status() {
+            summary.push_str(" · ");
+            summary.push_str(&hover);
+        }
         v_flex()
             .gap_0p5()
             .p_1()
@@ -2513,6 +2572,59 @@ fn grid_regions(tile_count: usize, cols: usize) -> Vec<(usize, usize, usize)> {
         regions.push((full_rows, 1, remainder));
     }
     regions
+}
+
+/// The checkerboard cell size in SCREEN px for a sheet drawn `w` x `h`.
+///
+/// 8px reads as a backdrop rather than as art, but a big sheet at a high
+/// zoom would need tens of thousands of quads at that size, so the cell
+/// doubles until the count is under [`CHECKER_MAX_CELLS`]. Bounded work per
+/// frame, and a coarser check on a huge sheet is not worth a stutter.
+fn checker_cell_px(w: f32, h: f32) -> f32 {
+    let mut cell = 8.0_f32;
+    while cell < 4096.0 && (w / cell).ceil() * (h / cell).ceil() > CHECKER_MAX_CELLS {
+        cell *= 2.0;
+    }
+    cell
+}
+
+/// Paint the transparency checkerboard across `bounds`.
+///
+/// Nothing rendered transparency AS transparency: slot 0 composes to alpha
+/// 0, so on a dark theme it was indistinguishable from a near-black palette
+/// entry and you could not tell a hole from a colour.
+fn paint_checkerboard(bounds: Bounds<Pixels>, window: &mut Window) {
+    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let cell = checker_cell_px(w, h);
+    let light = gpui::rgb(0x6b6b6b);
+    let dark = gpui::rgb(0x4a4a4a);
+    let mut row = 0usize;
+    let mut y = 0.0_f32;
+    while y < h {
+        let mut col = 0usize;
+        let mut x = 0.0_f32;
+        while x < w {
+            let color = if (row + col).is_multiple_of(2) {
+                light
+            } else {
+                dark
+            };
+            window.paint_quad(gpui::fill(
+                Bounds::new(
+                    gpui::point(bounds.origin.x + px(x), bounds.origin.y + px(y)),
+                    gpui::size(px(cell.min(w - x)), px(cell.min(h - y))),
+                ),
+                color,
+            ));
+            x += cell;
+            col += 1;
+        }
+        y += cell;
+        row += 1;
+    }
 }
 
 fn paint_tile_borders(bounds: Bounds<Pixels>, tile_count: usize, cols: usize, window: &mut Window) {
@@ -4877,6 +4989,68 @@ mod tests {
             assert_eq!(open.slot, 1);
             assert_eq!(open.tool, Tool::Pencil, "unchanged behaviour");
         });
+    }
+
+    /// The tile index appeared nowhere in the UI except the Focus button's
+    /// label, so there was no way to tell tile 12 from tile 13.
+    #[gpui::test]
+    async fn test_the_status_line_reports_the_tile_under_the_cursor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.hover_status(), None, "nothing hovered yet");
+
+            panel.on_sheet_mouse_move(pixel_pos(ready(panel), 1, 3, 4), false, cx);
+            assert_eq!(
+                panel.hover_status().as_deref(),
+                Some("tile 1 · px 3,4"),
+                "the tile AND the in-tile pixel"
+            );
+
+            panel.clear_hover(cx);
+            assert_eq!(
+                panel.hover_status(),
+                None,
+                "cleared when the pointer leaves"
+            );
+        });
+    }
+
+    /// A pad cell backs no tile. Say so rather than reporting nothing or,
+    /// worse, a neighbouring tile's index.
+    #[gpui::test]
+    async fn test_the_status_line_names_a_pad_cell(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| panel.set_cols(2, cx));
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            // 3 tiles at 2 cols: the second row's right cell is padding.
+            let z = ready(panel).zoom as f32;
+            let pos = point(
+                px((TILE_PX as f32 + 4.0) * z),
+                px((TILE_PX as f32 + 4.0) * z),
+            );
+            panel.on_sheet_mouse_move(pos, false, cx);
+            assert_eq!(panel.hover_status().as_deref(), Some("pad cell"));
+        });
+    }
+
+    /// The checker cell grows so a huge sheet cannot cost tens of thousands
+    /// of quads a frame.
+    #[test]
+    fn checker_cell_stays_within_its_quad_budget() {
+        assert_eq!(checker_cell_px(192.0, 64.0), 8.0, "a small sheet gets 8px");
+        for (w, h) in [(192.0, 64.0), (4096.0, 4096.0), (16384.0, 16384.0)] {
+            let cell = checker_cell_px(w, h);
+            let cells = (w / cell).ceil() * (h / cell).ceil();
+            assert!(
+                cells <= CHECKER_MAX_CELLS,
+                "{w}x{h} needs {cells} cells at {cell}px"
+            );
+            assert!(cell >= 8.0, "never finer than 8px");
+        }
     }
 
     #[gpui::test]
