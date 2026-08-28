@@ -855,6 +855,62 @@ mod tests {
         assert!(!is_raster_image_path(Path::new("/tmp/README")));
     }
 
+    /// `is_raster_image_path` gates on `Img::extensions()`, which lists seven
+    /// formats gpui's own `ImageFormat` cannot name -- so a dropped `.qoi`
+    /// passes the gate, sniffs to `image::ImageFormat::Qoi`, and reaches a
+    /// mapping that has no arm for it. That used to be a `debug_panic!`,
+    /// which is a hard crash in a debug build. Reading a format we cannot
+    /// carry is an ordinary outcome of opening a user's file, not a violated
+    /// invariant: decline it and let the caller fall through to its
+    /// non-image handling.
+    #[test]
+    fn test_an_unmappable_image_format_is_declined_not_panicked() {
+        for extension in ["avif", "tga", "dds", "hdr", "exr", "ff", "qoi"] {
+            let path = Path::new("/tmp/dropped").with_extension(extension);
+            assert!(
+                is_raster_image_path(&path),
+                ".{extension} gets past the drop gate, so the mapping must survive it"
+            );
+        }
+
+        for format in [
+            image::ImageFormat::Qoi,
+            image::ImageFormat::Tga,
+            image::ImageFormat::Dds,
+            image::ImageFormat::Hdr,
+            image::ImageFormat::OpenExr,
+            image::ImageFormat::Farbfeld,
+            image::ImageFormat::Avif,
+        ] {
+            assert_eq!(
+                image_format_from_external_content(format),
+                None,
+                "{format:?} has no gpui equivalent and must be declined quietly"
+            );
+        }
+
+        // The whole reachable path, through a real file on disk: QOI is the
+        // one unmappable format `image::guess_format` detects by magic, so a
+        // 14-byte header is enough to sniff as one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dropped.qoi");
+        let mut header = b"qoif".to_vec();
+        header.extend_from_slice(&1u32.to_be_bytes()); // width
+        header.extend_from_slice(&1u32.to_be_bytes()); // height
+        header.extend_from_slice(&[4, 0]); // channels, colorspace
+        std::fs::write(&path, &header).unwrap();
+        assert_eq!(
+            image::guess_format(&header).unwrap(),
+            image::ImageFormat::Qoi,
+            "the fixture really does sniff as QOI"
+        );
+
+        assert!(
+            load_external_image_from_path(&path, &"Image".into()).is_none(),
+            "dropping a .qoi declines instead of taking the window down"
+        );
+    }
+
     #[test]
     fn test_disambiguated_labels_dedupe_identical_uris() {
         // Mentioning the same file twice must not escalate the duplicates to
@@ -993,8 +1049,13 @@ fn image_format_from_external_content(format: image::ImageFormat) -> Option<Imag
         image::ImageFormat::Tiff => Some(ImageFormat::Tiff),
         image::ImageFormat::Ico => Some(ImageFormat::Ico),
         image::ImageFormat::Pnm => Some(ImageFormat::Pnm),
+        // Not an invariant violation: `is_raster_image_path` gates on
+        // `Img::extensions()`, which admits `avif`/`tga`/`dds`/`hdr`/`exr`/
+        // `ff`/`qoi`, and the sniff runs on whatever bytes the file actually
+        // holds. Every caller treats `None` as "not an image I can attach"
+        // and falls through, so decline rather than crash a debug build.
         _ => {
-            debug_panic!("An unhandled image format: {format:?}");
+            log::debug!("declining a dropped image in an unsupported format: {format:?}");
             None
         }
     }
