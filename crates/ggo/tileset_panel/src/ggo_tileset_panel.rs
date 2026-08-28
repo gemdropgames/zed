@@ -728,6 +728,9 @@ impl TilesetPanel {
     /// content, so only the zero edge needs guarding here.
     /// Enter focus on `tile`: the sheet becomes that one tile, magnified.
     fn enter_focus(&mut self, tile: usize, cx: &mut Context<Self>) {
+        // Focus reinterprets sheet coords as focused-tile coords, so a
+        // float measured against the sheet must land before the switch.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -746,6 +749,7 @@ impl TilesetPanel {
     }
 
     fn leave_focus(&mut self, cx: &mut Context<Self>) {
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -900,10 +904,17 @@ impl TilesetPanel {
             return;
         }
         // A press outside a float puts it down before anything else acts.
-        if let Some(rect) = self.float_rect()
-            && let Some((sx, sy)) = self.sheet_px_at(position)
-            && (sx < rect.0 || sx > rect.2 || sy < rect.1 || sy > rect.3)
-        {
+        // An entirely off-sheet float has no rect to be inside, so any
+        // press puts it down (which cancels it, preserving the source).
+        let float_alive = matches!(&self.state, ViewerState::Ready(open) if open.float.is_some());
+        let outside = match (self.float_rect(), self.sheet_px_at(position)) {
+            (Some(rect), Some((sx, sy))) => {
+                sx < rect.0 || sx > rect.2 || sy < rect.1 || sy > rect.3
+            }
+            (None, _) => true,
+            _ => false,
+        };
+        if float_alive && outside {
             self.commit_float(cx);
         }
         if let ViewerState::Ready(open) = &mut self.state {
@@ -1066,7 +1077,8 @@ impl TilesetPanel {
     }
 
     fn scroll_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
-        if self.selection_rect().is_some() {
+        let floating = matches!(&self.state, ViewerState::Ready(open) if open.float.is_some());
+        if self.selection_rect().is_some() || floating {
             let step = self.nudge_step();
             self.move_selection((dx as i32 * step, dy as i32 * step), cx);
             return;
@@ -1691,7 +1703,8 @@ impl TilesetPanel {
         if (dx, dy) == (0, 0) {
             return;
         }
-        if !self.lift_selection(cx) {
+        let floating = matches!(&self.state, ViewerState::Ready(open) if open.float.is_some());
+        if !floating && !self.lift_selection(cx) {
             return;
         }
         if let ViewerState::Ready(open) = &mut self.state
@@ -1773,6 +1786,15 @@ impl TilesetPanel {
     /// Cells outside the sheet are dropped HERE and only here -- while
     /// floating they are still carried.
     fn commit_float(&mut self, cx: &mut Context<Self>) {
+        // Fully off-sheet: every destination cell would be dropped while a
+        // Move still blanks its source -- a silent deletion. Placing
+        // nothing is a cancel.
+        if matches!(&self.state, ViewerState::Ready(open) if open.float.is_some())
+            && self.float_rect().is_none()
+        {
+            self.cancel_float(cx);
+            return;
+        }
         let (float, skip_transparent) = match &self.state {
             ViewerState::Ready(open) => match &open.float {
                 Some(float) => (float.clone(), !open.paste_opaque),
@@ -2119,6 +2141,9 @@ impl TilesetPanel {
 
     /// Ctrl-A: equip the Select tool and select the whole sheet.
     fn select_whole_sheet(&mut self, cx: &mut Context<Self>) {
+        // Assigns the tool inline rather than via set_tool, so it has to
+        // put a float down itself or copy/delete keep acting on it.
+        self.commit_float(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -2164,6 +2189,11 @@ impl TilesetPanel {
         // above, so clearing any earlier would paint the primary slot.
         if let ViewerState::Ready(open) = &mut self.state {
             open.secondary_paint = false;
+            // A modifier click that never became a drag must not arm the
+            // NEXT gesture with its copy/swap intent.
+            if open.float.is_none() {
+                open.pending_float_mode = FloatMode::Move;
+            }
         }
         cx.notify();
     }
@@ -2256,6 +2286,12 @@ impl TilesetPanel {
     }
 
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        // A pending float IS the most recent change: undo reverts it and
+        // consumes the press. Without this the store rewinds UNDER the
+        // float, and the eventual commit stamps the undone pixels back.
+        if self.cancel_float(cx) {
+            return;
+        }
         let restored = {
             let ViewerState::Ready(open) = &mut self.state else {
                 return;
@@ -2281,6 +2317,9 @@ impl TilesetPanel {
     }
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
+        // A pending float commits first. It is a new edit, and a new edit
+        // clears the redo history here like it does everywhere else.
+        self.commit_float(cx);
         let restored = {
             let ViewerState::Ready(open) = &mut self.state else {
                 return;
@@ -6784,6 +6823,153 @@ mod tests {
             assert!(
                 !ready(panel).store.state().dirty,
                 "deleting a copy float owes the document nothing"
+            );
+        });
+    }
+
+    /// Undo with a float pending cancels the float -- it IS the most recent
+    /// pending change -- and consumes the press without rewinding the store.
+    /// Redo commits it first: a new edit, so the redo history dies, which is
+    /// what a new edit does everywhere else.
+    #[gpui::test]
+    async fn test_undo_cancels_a_pending_float_and_redo_commits_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            // A real prior op, so a mis-routed undo would visibly rewind it.
+            panel.select_slot(2, cx);
+            panel.set_tool(Tool::Pencil, cx);
+            panel.on_sheet_mouse_down(pixel_pos(ready(panel), 0, 1, 1), false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert_eq!(ready(panel).store.state().indices[idx(0, 1, 1)], 2);
+
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            panel.move_selection((4, 0), cx);
+            panel.undo_impl(cx);
+            let state = ready(panel).store.state();
+            assert!(ready(panel).float.is_none(), "undo cancelled the float");
+            assert_eq!(
+                state.indices[idx(0, 1, 1)],
+                2,
+                "and did NOT rewind the paint underneath it"
+            );
+            assert_eq!(state.indices[idx(1, 0, 0)], 1, "source untouched");
+
+            // Redo with a float pending commits it.
+            panel.move_selection((0, 4), cx);
+            panel.redo_impl(cx);
+            assert!(ready(panel).float.is_none(), "redo placed the float");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 0, 4)],
+                1,
+                "the move landed"
+            );
+        });
+    }
+
+    /// Focus changes reinterpret sheet coordinates as focused-tile
+    /// coordinates, so a float must be put down before the space changes
+    /// under it -- entering, leaving, and select-all alike.
+    #[gpui::test]
+    async fn test_focus_changes_and_select_all_commit_a_pending_float(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            panel.move_selection((4, 0), cx);
+            panel.enter_focus(1, cx);
+            assert!(ready(panel).float.is_none(), "entering focus placed it");
+            assert_eq!(
+                ready(panel).store.state().indices[idx(1, 4, 0)],
+                1,
+                "in SHEET space, before the reinterpretation"
+            );
+            panel.leave_focus(cx);
+
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((0, 0), (1, 0)));
+            }
+            panel.move_selection((0, 2), cx);
+            panel.select_whole_sheet(cx);
+            assert!(ready(panel).float.is_none(), "select-all placed it");
+        });
+    }
+
+    /// A float carried fully off the sheet is not stranded: the arrows keep
+    /// nudging it (the marquee has nothing to show, but the float exists),
+    /// and a commit while nothing of it is on the sheet is a CANCEL -- not a
+    /// blank-the-source-and-place-nothing deletion.
+    #[gpui::test]
+    async fn test_a_fully_off_sheet_float_is_not_stranded_or_destroyed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 3, 0)));
+            }
+            for _ in 0..40 {
+                panel.move_selection((-1, 0), cx);
+            }
+            assert!(panel.float_rect().is_none(), "fully off the left edge");
+
+            // The arrows still address the float even with no marquee.
+            panel.scroll_by(1.0, 0.0, cx);
+            assert!(
+                ready(panel).float.is_some(),
+                "the nudge moved the float rather than scrolling"
+            );
+
+            // Push it back off and commit: that must be a cancel.
+            panel.scroll_by(-1.0, 0.0, cx);
+            panel.commit_float(cx);
+            assert!(ready(panel).float.is_none());
+            let state = ready(panel).store.state();
+            assert!(!state.dirty, "no write happened");
+            assert_eq!(
+                state.indices[idx(1, 0, 0)],
+                1,
+                "the source art was NOT blanked"
+            );
+        });
+    }
+
+    /// A modifier click inside the marquee that never becomes a drag must
+    /// not arm the NEXT gesture with its mode: releasing without moving
+    /// resets the pending mode to Move.
+    #[gpui::test]
+    async fn test_a_modifier_click_without_a_drag_does_not_arm_the_next_nudge(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        place_sheet_at_origin(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.set_tool(Tool::Select, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.selection = Some(((TILE_PX, 0), (TILE_PX + 1, 0)));
+            }
+            let shift = gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            };
+            // Shift-click inside the marquee, release without moving.
+            panel.on_sheet_click(pixel_pos(ready(panel), 1, 0, 0), 1, shift, false, cx);
+            panel.on_sheet_mouse_up(false, cx);
+            assert!(ready(panel).float.is_none(), "no drag, no float");
+
+            // The next keyboard nudge lifts in MOVE mode, not Swap.
+            panel.move_selection((1, 0), cx);
+            assert_eq!(
+                ready(panel).float.as_ref().map(|f| f.mode),
+                Some(FloatMode::Move),
+                "the stale Swap intent did not leak into the nudge"
             );
         });
     }
