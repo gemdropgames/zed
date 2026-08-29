@@ -151,7 +151,7 @@ impl Item for MapEditorItem {
         let result = self.panel.update(cx, |panel, cx| {
             panel.save_impl(cx);
             match &panel.state {
-                ViewerState::Ready(open) => match &open.save_error {
+                ViewerState::Ready(open) => match &open.session.save_error {
                     Some(e) => Err(anyhow::anyhow!(e.clone())),
                     None => Ok(()),
                 },
