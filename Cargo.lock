@@ -7619,16 +7619,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_emu_mcp"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ggo_emu_remote",
+ "image",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "ggo_emu_panel"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "cpal",
  "editor",
  "ggo-db",
  "ggo-emu-core",
  "ggo_charts_panel",
  "ggo_common",
+ "ggo_emu_remote",
  "ggo_world_panel",
  "gpui",
  "image",
@@ -7649,6 +7662,15 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+]
+
+[[package]]
+name = "ggo_emu_remote"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

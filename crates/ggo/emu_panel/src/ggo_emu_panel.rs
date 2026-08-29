@@ -77,6 +77,7 @@
 
 pub mod audio;
 mod debug;
+pub mod agent_remote;
 mod drive;
 mod emu_item;
 mod hardware;
@@ -156,6 +157,10 @@ const DEBUG_COLUMN_PX: f32 = 360.0;
 const DEBUG_SWATCH_PX: f32 = 12.0;
 
 pub fn init(cx: &mut App) {
+    // Agent remote-control host (unix socket + on-disk advertisement) --
+    // see `agent_remote`'s module doc.
+    agent_remote::init(cx);
+
     // Explorer-driven routing: clicking a `.cart` in the project panel
     // selects it HERE instead of opening a (binary, unreadable) editor tab.
     // This is the panel's only way in -- there is no in-panel cart picker.
@@ -461,6 +466,9 @@ pub struct EmuPanel {
     /// The window the watch restarts run in -- `emulate_world` needs one
     /// and a worktree event has none.
     watch_window: Option<AnyWindowHandle>,
+    /// The window this panel lives in, captured at construction for the
+    /// agent remote host (`agent_remote::dispatch` needs one to boot/stop).
+    remote_window: Option<AnyWindowHandle>,
     _watch_subscription: Option<Subscription>,
     _watch_debounce: Option<Task<()>>,
     /// An `emd pack-ggo` is in flight: a second one would race it on the
@@ -523,6 +531,7 @@ impl EmuPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let remote_window = window.as_ref().map(|w| w.window_handle());
         let _focus_out = window.map(|window| {
             cx.on_focus_out(&focus_handle, window, |this, _event, _window, cx| {
                 this.release_all_buttons(cx);
@@ -584,6 +593,7 @@ impl EmuPanel {
             watched_world: None,
             watch_rebuilds: 0,
             watch_window: None,
+            remote_window,
             _watch_subscription: None,
             _watch_debounce: None,
             building: false,
@@ -1010,6 +1020,11 @@ impl EmuPanel {
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
+        if let Some(root) = self.project_root.clone() {
+            let panel = cx.weak_entity();
+            let window = self.remote_window;
+            cx.defer(move |cx| agent_remote::register_panel(root, panel, window, cx));
+        }
         cx.notify();
     }
 
@@ -1068,7 +1083,7 @@ impl EmuPanel {
     /// Start the selected cart. A run already in flight is stopped first,
     /// so Run is idempotent-ish (restart) rather than a way to end up
     /// with two emulator threads fighting over one pane.
-    fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(root), Some(cart)) = (self.project_root.clone(), self.selected.clone()) else {
             self.report_failure("no cart selected".to_string(), cx);
             return;
@@ -1528,7 +1543,7 @@ impl EmuPanel {
     /// come to retire them through the double buffer. The run's perf
     /// snapshot and console lines are collected off-thread by
     /// [`Self::finish_run`].
-    fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.session.is_none() && self.latest_frame.is_none() {
             return;
         }
@@ -2731,6 +2746,90 @@ impl EmuPanel {
     #[cfg(feature = "test-support")]
     pub fn test_is_running(&self) -> bool {
         self.is_running()
+    }
+
+    // ---- Agent remote-control surface (see `agent_remote`) ----------
+
+    /// Status row for `agent_remote`'s `status` command.
+    pub(crate) fn remote_status(&self, workspace: String) -> ggo_emu_remote::protocol::WorkspaceStatus {
+        ggo_emu_remote::protocol::WorkspaceStatus {
+            workspace,
+            cart: self.session.as_ref().map(|s| s.cart.clone()).or_else(|| self.selected.clone()),
+            running: self.session.is_some(),
+            paused: self.is_paused(),
+            frame: self.frame,
+        }
+    }
+
+    /// Select `cart` (project-relative path) and start it — the remote
+    /// analog of explorer-select + Run.
+    pub(crate) fn remote_boot(
+        &mut self,
+        cart: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.project_root.is_none() {
+            return Err("panel has no project root yet".to_string());
+        }
+        self.selected = Some(cart);
+        self.run(window, cx);
+        match (&self.status_is_error, &self.status) {
+            (true, Some(status)) => Err(status.clone()),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn remote_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        self.stop(window, cx);
+        Ok(())
+    }
+
+    fn remote_session(&self) -> Result<&drive::Session, String> {
+        self.session.as_ref().ok_or_else(|| "no run live — boot a cart first".to_string())
+    }
+
+    /// Latch the pad mask (level-triggered, exactly like held keys).
+    pub(crate) fn remote_input(&self, mask: u32) -> Result<(), String> {
+        self.remote_session()?.set_input(mask);
+        Ok(())
+    }
+
+    pub(crate) fn remote_pause(&self) -> Result<(), String> {
+        self.remote_session()?.pause();
+        Ok(())
+    }
+
+    pub(crate) fn remote_resume(&self) -> Result<(), String> {
+        self.remote_session()?.resume();
+        Ok(())
+    }
+
+    /// While paused, queue exactly `frames` more frames.
+    pub(crate) fn remote_step(&self, frames: u32) -> Result<(), String> {
+        let session = self.remote_session()?;
+        if !session.is_paused() {
+            return Err("not paused — pause first, then step".to_string());
+        }
+        for _ in 0..frames {
+            session.step();
+        }
+        Ok(())
+    }
+
+    /// The last delivered frame as (width, height, BGRA8 bytes).
+    pub(crate) fn remote_screenshot(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let bytes = self.latest_frame.as_ref()?.as_bytes(0)?;
+        Some((drive::WIDTH, drive::HEIGHT, bytes.to_vec()))
+    }
+
+    /// Tail of the run's diagnostic log (whole log when `tail` is None).
+    pub(crate) fn remote_uart(&self, tail: Option<usize>) -> Vec<String> {
+        let lines = self.console.as_ref().map(|c| c.lines()).unwrap_or_default();
+        match tail {
+            Some(n) if n < lines.len() => lines[lines.len() - n..].to_vec(),
+            _ => lines,
+        }
     }
 
     /// The live run is paused. `test-support` only.

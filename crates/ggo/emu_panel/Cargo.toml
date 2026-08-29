@@ -38,6 +38,8 @@ log.workspace = true # GGO -- R6: the cpal stream-error callback runs on a realt
 project.workspace = true
 serde_json.workspace = true
 smol.workspace = true # GGO -- `yield_now` between pumped frames, see `EmuPanel::run`
+base64.workspace = true # GGO -- remote screenshot payloads, see `remote`
+ggo_emu_remote.workspace = true # GGO -- agent remote-control protocol/registry
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # Same pure-Rust SQLite engine ggo-db's migrate() takes a connection from.
 # Mirrors ggo_charts_panel's Cargo.toml (and ggo-ide's own): the ingest
