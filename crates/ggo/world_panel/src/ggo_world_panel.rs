@@ -49,14 +49,18 @@ use ui::{Checkbox, ContextMenu, Divider, DropdownMenu, PopoverMenu, ToggleState}
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::{SplitDirection, Workspace};
 
+use ggo_map_panel::PaintSession;
+use ggo_map_panel::loader::map_stem;
 use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::merge_candidates::merge_candidates;
 use ggo_worldlib::render::{
-    AssetLoads, DrawItem, Selection, active_camera_origin, build_draw_list_multi, hit_test,
-    items_in_rect, world_label,
+    AssetLoads, DrawItem, Loadable, RgbaImage, Selection, active_camera_origin,
+    build_draw_list_multi, hit_test, items_in_rect, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
+use ggo_worldlib::sprites::map_doc::MapDocStore;
+use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 use ggo_worldlib::sprites::{io, palette565};
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
 use ggo_worldlib::world_file::write_world;
@@ -549,6 +553,33 @@ struct InspectorEntry {
     _subscription: Subscription,
 }
 
+/// Which `.map` paint mode is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintTarget {
+    /// A `[[background]]` slot of the OPEN document, by layer.
+    BgSlot(u8),
+    /// Entity index, the same frame `Selection::Entity` indexes in.
+    ///
+    /// Resolved by [`WorldPanel::paint_target_rel`] but not yet reachable
+    /// from the UI -- the "Paint tiles" entry point on a `Tilemap` entity
+    /// is its own step. The anchor arithmetic lands with the rest of the
+    /// target resolution rather than being split across two commits; the
+    /// expectation below goes unfulfilled (and so warns) the moment an
+    /// entry point constructs this.
+    #[expect(dead_code, reason = "entry point lands with the Tilemap-entity step")]
+    TilemapEntity(usize),
+}
+
+/// What the canvas gesture does. `Entities` is the world editor proper;
+/// `Paint` is the in-world map editor (spec 2026-08-29), which takes over
+/// the canvas gestures, Escape and undo/redo for as long as it is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EditMode {
+    #[default]
+    Entities,
+    Paint(PaintTarget),
+}
+
 /// A loaded world plus its render-side caches and editor state.
 struct OpenWorld {
     /// The world's listing RELATIVE TO [`Self::root`] (e.g. stem
@@ -619,6 +650,21 @@ struct OpenWorld {
     /// ([`WorldPanel::refresh_stem_completion`]), so the directory walk
     /// runs once per focus, not per frame.
     stem_completion: Option<StemCompletion>,
+    mode: EditMode,
+    /// One session per `.map` REL edited since this world opened. Keyed by
+    /// rel rather than by target: a map reachable from two targets (a
+    /// background slot and a `Tilemap` entity) is ONE document with one
+    /// undo history. Sessions outlive the mode -- leaving paint mode must
+    /// not throw away undo history the user can still reach by re-entering
+    /// -- and die with the `OpenWorld`.
+    sessions: HashMap<String, PaintSession>,
+    /// The in-flight session load, if any. Replacing it cancels the
+    /// previous load, which is how a fast switch between two targets
+    /// resolves to the one the user asked for last.
+    _session_loading: Option<Task<()>>,
+    /// Why paint mode could not open, shown on the toolbar. Cleared by the
+    /// next entry attempt.
+    paint_error: Option<String>,
 }
 
 /// What an Asset field's row shows -- see [`WorldPanel::asset_field_view`].
@@ -697,6 +743,10 @@ impl OpenWorld {
             _audio_size_task: None,
             color_picker: None,
             stem_completion: None,
+            mode: EditMode::default(),
+            sessions: HashMap::new(),
+            _session_loading: None,
+            paint_error: None,
         }
     }
 }
@@ -1440,6 +1490,14 @@ impl WorldPanel {
     /// document's own slot list) is what the draw list reads, and a newly
     /// linked stem has no composed image until it is asked for.
     fn refresh_backgrounds(&mut self, cx: &mut Context<Self>) {
+        // A slot change can pull the map out from under paint mode (a
+        // clear, or an undo of the add that linked it). Fall back to
+        // entity editing rather than sit in a mode whose target no longer
+        // exists -- one that would swallow the next undo without being
+        // able to act on it.
+        if self.in_paint_mode() && self.active_paint_target().is_none() {
+            self.exit_paint_mode(cx);
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1455,6 +1513,308 @@ impl WorldPanel {
         match &self.state {
             ViewerState::Ready(open) => open.store.state().backgrounds,
             _ => Vec::new(),
+        }
+    }
+
+    // --------------------------------------------------------- paint mode
+
+    /// The `.map` a paint target names and the world-space pixel its
+    /// top-left cell sits at, or `None` when the target no longer resolves
+    /// (slot cleared, entity deleted, `Tilemap` component removed).
+    ///
+    /// Resolved fresh on every use rather than captured at entry: an undo
+    /// can unlink the slot out from under an active paint session, and a
+    /// captured rel would keep painting a map the document no longer
+    /// references.
+    fn paint_target_rel(&self, target: &PaintTarget) -> Option<(String, [f64; 2])> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let state = open.store.state();
+        match *target {
+            PaintTarget::BgSlot(layer) => {
+                let background = state.backgrounds.iter().find(|bg| bg.layer == layer)?;
+                // Through `stem()`, so a slot written without the
+                // extension resolves to the same rel as one with it.
+                let stem = background.stem();
+                (!stem.is_empty()).then(|| (format!("{stem}.map"), [0.0, 0.0]))
+            }
+            PaintTarget::TilemapEntity(index) => {
+                let fields = state
+                    .entities
+                    .get(index)?
+                    .components
+                    .get("Tilemap")?
+                    .as_object()?;
+                let stem = fields.get("stem")?.as_str()?;
+                if stem.is_empty() {
+                    return None;
+                }
+                let pos = inspector::entity_pos(&state, index)?;
+                // `render.rs::push_tilemap_item`'s arithmetic, which is
+                // what puts the composed image on the canvas -- the cell
+                // grid has to start where the pixels do.
+                let field = |name: &str| fields.get(name).and_then(Value::as_f64).unwrap_or(0.0);
+                let anchor = [
+                    pos[0] + field("col") * TILE_PX as f64,
+                    pos[1] + field("row") * TILE_PX as f64,
+                ];
+                Some((format!("{stem}.map"), anchor))
+            }
+        }
+    }
+
+    /// The active paint target's rel + anchor, `None` in entity mode.
+    fn active_paint_target(&self) -> Option<(String, [f64; 2])> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let EditMode::Paint(target) = open.mode else {
+            return None;
+        };
+        self.paint_target_rel(&target)
+    }
+
+    fn in_paint_mode(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.mode != EditMode::Entities)
+    }
+
+    /// Open `target` for painting: reuse the cached session if this world
+    /// has already loaded that map, otherwise load it off-thread and enter
+    /// when it lands. Returns whether the target resolved to a map at all
+    /// -- `false` is an empty slot or a non-`Tilemap` entity, which is a
+    /// refusal, not a failure.
+    ///
+    /// Entry is deliberately NOT optimistic: the mode flips only once
+    /// there is a session behind it, so a missing or unreadable `.map`
+    /// leaves the world editor exactly as it was, with the reason on the
+    /// toolbar.
+    fn enter_paint_mode(&mut self, target: PaintTarget, cx: &mut Context<Self>) -> bool {
+        let Some((rel, _)) = self.paint_target_rel(&target) else {
+            return false;
+        };
+        let Some(project_root) = self.project_root.clone() else {
+            return false;
+        };
+        // A world load in flight (or since) invalidates this entry -- the
+        // same guard `load_rel_path` uses, so a session cannot install
+        // over a world it was never loaded for.
+        let generation = self.load_generation;
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        open.paint_error = None;
+        if open.sessions.contains_key(&rel) {
+            open.mode = EditMode::Paint(target);
+            Self::end_canvas_gestures(open);
+            // Unconditionally, not only on a fresh load: what the canvas
+            // must show is the SESSION's pixels, and a re-entry follows an
+            // arbitrary amount of editing the map's load entry may predate.
+            self.refresh_paint_image(&rel, cx);
+            return true;
+        }
+
+        let root = open.root.clone();
+        let load = cx.background_spawn({
+            let rel = rel.clone();
+            async move { PaintSession::load(&root, &rel, &project_root) }
+        });
+        open._session_loading = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                if this.load_generation != generation {
+                    return;
+                }
+                let ViewerState::Ready(open) = &mut this.state else {
+                    return;
+                };
+                let entered = match result {
+                    Ok(session) => {
+                        open.sessions.insert(rel.clone(), session);
+                        open.mode = EditMode::Paint(target);
+                        Self::end_canvas_gestures(open);
+                        true
+                    }
+                    Err(e) => {
+                        open.paint_error = Some(e);
+                        false
+                    }
+                };
+                if entered {
+                    this.refresh_paint_image(&rel, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        true
+    }
+
+    /// Back to entity editing. The sessions stay: their undo history and
+    /// unsaved edits are the document's, not the mode's.
+    fn exit_paint_mode(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.mode = EditMode::Entities;
+        open.paint_error = None;
+        cx.notify();
+    }
+
+    /// Drop any in-flight entity gesture -- entering paint mode mid-drag
+    /// must not leave a marquee drawn or a placement drag armed to resume
+    /// on the next move event.
+    fn end_canvas_gestures(open: &mut OpenWorld) {
+        open.edit_drag = None;
+        open.marquee = None;
+        open.nudge_gesture = None;
+    }
+
+    /// Recompose the session's live document into the map load map and the
+    /// image cache, keyed by STEM -- so a map drawn in several places (a
+    /// background slot and a `Tilemap` entity at once) updates everywhere
+    /// from one compose.
+    fn refresh_paint_image(&mut self, rel: &str, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        // `None` is an unbound map: it has no pixels to show, and blanking
+        // the load entry would replace the placeholder the canvas already
+        // draws for it with nothing.
+        let Some((rgba, w, h)) = open.sessions.get(rel).and_then(PaintSession::live_rgba) else {
+            return;
+        };
+        open.map_loads.insert(
+            map_stem(rel).to_string(),
+            Loadable::Ready(RgbaImage {
+                rgba: rgba.into(),
+                w,
+                h,
+            }),
+        );
+        Self::replace_images(open, &mut self.retired_images);
+        cx.notify();
+    }
+
+    /// Apply the active tool at canvas-relative `local` px. `press` starts
+    /// a gesture, carrying the shift modifier the terrain tool reads as
+    /// "erase" (read once, at the gesture's start, so a drag keeps
+    /// erasing); `None` continues the gesture already in flight.
+    fn paint_at_local(&mut self, local: [f64; 2], press: Option<bool>, cx: &mut Context<Self>) {
+        let Some((rel, anchor)) = self.active_paint_target() else {
+            return;
+        };
+        let Some(view) = self.canvas_view() else {
+            return;
+        };
+        let world = drag_ops::screen_to_world(local[0], local[1], &view);
+        let cell = canvas::paint_cell_at(world, anchor);
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(session) = open.sessions.get_mut(&rel) else {
+            return;
+        };
+        if let Some(shift) = press {
+            session.paint_erase = shift;
+        }
+        // An inert gesture (unbound tileset, terrain tool with no terrain)
+        // is skipped rather than repainted: `paint_at` would return false
+        // anyway, and a notify per drag move buys nothing.
+        if !session.can_paint() {
+            return;
+        }
+        if session.paint_at(cell) {
+            self.refresh_paint_image(&rel, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Gesture release while painting: a rect-fill preview becomes its op,
+    /// a select drag settles into the session's cell selection.
+    fn end_paint_gesture(&mut self, cx: &mut Context<Self>) {
+        let Some((rel, _)) = self.active_paint_target() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(session) = open.sessions.get_mut(&rel) else {
+            return;
+        };
+        session.commit_selection();
+        if session.commit_rect() {
+            self.refresh_paint_image(&rel, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Escape while painting: drop the cell selection if there is one,
+    /// otherwise leave the mode -- the standalone editor's escape
+    /// semantics, one level up (spec 2026-08-29).
+    fn escape_paint_mode(&mut self, cx: &mut Context<Self>) {
+        let cleared = self
+            .active_paint_target()
+            .and_then(|(rel, _)| match &mut self.state {
+                ViewerState::Ready(open) => open.sessions.get_mut(&rel),
+                _ => None,
+            })
+            .is_some_and(|session| {
+                let had = session.selection.is_some() || session.sel_pending.is_some();
+                session.selection = None;
+                session.sel_pending = None;
+                had
+            });
+        if cleared {
+            cx.notify();
+            return;
+        }
+        self.exit_paint_mode(cx);
+    }
+
+    /// Undo/redo while painting drives the TARGET MAP's history, not the
+    /// world's (spec: undo is mode-scoped; there is no unified timeline).
+    /// Returns whether paint mode consumed the step.
+    fn step_paint_history(
+        &mut self,
+        step: fn(&mut MapDocStore) -> bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.in_paint_mode() {
+            return false;
+        }
+        let project_root = self.project_root.clone();
+        let Some((rel, _)) = self.active_paint_target() else {
+            // The target died under us -- hand the step back to the world
+            // store rather than swallow it into a dead mode.
+            self.exit_paint_mode(cx);
+            return false;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return true;
+        };
+        let stepped = open
+            .sessions
+            .get_mut(&rel)
+            .is_some_and(|session| session.step_history(step, project_root.as_deref()));
+        if stepped {
+            self.refresh_paint_image(&rel, cx);
+        }
+        true
+    }
+
+    /// The image the paint target draws with, which the canvas holds at
+    /// full strength while it dims the rest ([`canvas::Scene::paint_focus`]).
+    fn paint_focus_key(&self) -> Option<usize> {
+        let (rel, _) = self.active_paint_target()?;
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        match open.map_loads.get(map_stem(&rel)) {
+            Some(Loadable::Ready(image)) => Some(canvas::image_key(image)),
+            _ => None,
         }
     }
 
@@ -1521,6 +1881,10 @@ impl WorldPanel {
     }
 
     fn clear_selection_impl(&mut self, cx: &mut Context<Self>) {
+        if self.in_paint_mode() {
+            self.escape_paint_mode(cx);
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1802,6 +2166,9 @@ impl WorldPanel {
     }
 
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        if self.step_paint_history(MapDocStore::undo, cx) {
+            return;
+        }
         self.end_nudge_run();
         // The undo stack is opaque about WHAT it reversed, so the cheap
         // honest test is to compare the slot list across the step: at
@@ -1820,6 +2187,9 @@ impl WorldPanel {
     }
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
+        if self.step_paint_history(MapDocStore::redo, cx) {
+            return;
+        }
         self.end_nudge_run();
         let backgrounds_before = self.backgrounds_now();
         let ViewerState::Ready(open) = &mut self.state else {
@@ -1971,6 +2341,36 @@ impl WorldPanel {
         self.backgrounds_now()
     }
 
+    /// Enter paint mode on background layer `layer`, reporting whether the
+    /// slot resolved to a map (the session may still be loading -- pump
+    /// the executor, then read [`Self::test_paint_mode_rel`]).
+    ///
+    /// `test-support` only, for `ggo_smoke`'s map-edit journeys: the rail
+    /// button that carries this in the UI is a `Button` inside a rendered
+    /// row, and a journey that clicked it by id would still need this to
+    /// tell "entered" from "refused".
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_enter_paint_bg(&mut self, layer: u8, cx: &mut Context<Self>) -> bool {
+        self.enter_paint_mode(PaintTarget::BgSlot(layer), cx)
+    }
+
+    /// The `.map` paint mode is editing, `None` in entity mode.
+    /// `test-support` only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_paint_mode_rel(&self) -> Option<String> {
+        self.active_paint_target().map(|(rel, _)| rel)
+    }
+
+    /// The cached session for `rel`, if this world has loaded one.
+    /// `test-support` only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_paint_session(&self, rel: &str) -> Option<&PaintSession> {
+        match &self.state {
+            ViewerState::Ready(open) => open.sessions.get(rel),
+            _ => None,
+        }
+    }
+
     /// How many `[[entity]]` blocks the open document holds.
     /// `test-support` only.
     #[cfg(feature = "test-support")]
@@ -2048,6 +2448,12 @@ impl WorldPanel {
     /// the selection, and empty space starts a rubber-band (additive with
     /// shift) instead of just deselecting.
     fn canvas_primary_down_with(&mut self, local: [f64; 2], shift: bool, cx: &mut Context<Self>) {
+        // Paint mode owns the canvas: entity hit-testing, the marquee and
+        // placement drags are all off while a map is under the brush.
+        if self.in_paint_mode() {
+            self.paint_at_local(local, Some(shift), cx);
+            return;
+        }
         let Some(view) = self.canvas_view() else {
             return;
         };
@@ -2106,6 +2512,12 @@ impl WorldPanel {
     /// gesture id (the store coalesces them into ONE undo entry) --
     /// ggo-ide's `Moved` arm, snap included.
     fn canvas_drag_to(&mut self, local: [f64; 2], cx: &mut Context<Self>) {
+        if self.in_paint_mode() {
+            // Re-fire the tool at every move, the way ggo-ide's map canvas
+            // does: a brush drag is a stream of applications, not one.
+            self.paint_at_local(local, None, cx);
+            return;
+        }
         let Some(view) = self.canvas_view() else {
             return;
         };
@@ -2134,6 +2546,10 @@ impl WorldPanel {
     /// the selection (bbox overlap; additive keeps what was there), a
     /// placement drag simply ends.
     fn canvas_primary_up(&mut self, cx: &mut Context<Self>) {
+        if self.in_paint_mode() {
+            self.end_paint_gesture(cx);
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -2215,11 +2631,16 @@ impl WorldPanel {
 
     /// Canvas-relative position for an in-flight placement drag's move
     /// event; cancels the drag when the left button is no longer held.
+    ///
+    /// Paint mode has no armed-drag state to consult -- the left button
+    /// being down IS the gesture -- so it passes every held-button move
+    /// through to [`Self::canvas_drag_to`].
     fn edit_drag_local(&mut self, event: &MouseMoveEvent) -> Option<[f64; 2]> {
+        let painting = self.in_paint_mode();
         let ViewerState::Ready(open) = &mut self.state else {
             return None;
         };
-        if open.edit_drag.is_none() && open.marquee.is_none() {
+        if !painting && open.edit_drag.is_none() && open.marquee.is_none() {
             return None;
         }
         if event.pressed_button != Some(MouseButton::Left) {
@@ -3435,6 +3856,13 @@ impl WorldPanel {
                 ggo_common::CopyableText::new("ggo-world-paste-error-copy", e.clone())
                     .size(LabelSize::Small)
             }))
+            .children(open.paint_error.as_ref().map(|e| {
+                ggo_common::CopyableText::new(
+                    "ggo-world-paint-error-copy",
+                    format!("cannot paint: {e}"),
+                )
+                .size(LabelSize::Small)
+            }))
             .into_any_element()
     }
 
@@ -3532,7 +3960,22 @@ impl WorldPanel {
             );
             rail = rail.child(match backgrounds.iter().find(|bg| bg.layer == layer) {
                 Some(background) => slot
-                    .child(Label::new(background.stem().to_string()).size(LabelSize::XSmall))
+                    .child(
+                        // The map's name IS the paint-mode entry (spec:
+                        // "click a linked slot in the layers rail"), and
+                        // its toggled state is what says which layer the
+                        // brush is on.
+                        Button::new(
+                            SharedString::from(format!("ggo-world-bg-paint-{layer}")),
+                            background.stem().to_string(),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .toggle_state(open.mode == EditMode::Paint(PaintTarget::BgSlot(layer)))
+                        .tooltip(ui::Tooltip::text("Paint this background layer"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.enter_paint_mode(PaintTarget::BgSlot(layer), cx);
+                        })),
+                    )
                     .child(
                         IconButton::new(("ggo-world-bg-clear", layer as usize), IconName::Trash)
                             .icon_size(IconSize::Small)
@@ -3613,6 +4056,7 @@ impl WorldPanel {
             ]
         });
         let items = draw_items(open);
+        let paint_focus = self.paint_focus_key();
         let screen_origin = active_camera_origin(&open.store.state());
         let world_center = canvas::camera_center(screen_origin);
         let images = open.images.clone();
@@ -3644,6 +4088,7 @@ impl WorldPanel {
                     grid,
                     background,
                     text_color,
+                    paint_focus,
                 }
             },
             move |canvas_bounds, scene, window, cx| {
@@ -9069,5 +9514,179 @@ mod tests {
             io::open_map(dir.path(), "maps/test.bg2.map").is_ok(),
             "clearing unlinks the slot; it never deletes the map"
         );
+    }
+
+    // -------------------------------------------------------- paint mode
+
+    #[gpui::test]
+    async fn test_paint_mode_loads_a_session_and_brush_edits_the_map_doc(cx: &mut TestAppContext) {
+        use ggo_worldlib::sprites::map_doc::{CELL_BLANK, pack_cell};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        focus_the_panel(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            // Nothing selected: a paint-mode click must not put an entity
+            // back in the selection.
+            panel.clear_selection_impl(cx);
+            assert!(
+                panel.test_enter_paint_bg(0, cx),
+                "a linked slot resolves to a map"
+            );
+            assert_eq!(
+                panel.test_paint_mode_rel(),
+                None,
+                "the session loads off-thread; the mode waits for it"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/test.bg0.map"),
+                "the loaded session put the panel in paint mode"
+            );
+            // Identity camera (`ready_panel_in_window` pins pan/zoom), and
+            // a background anchors at the world origin, so canvas px are
+            // world px are `TILE_PX`-scaled cells. [10, 10] also sits on
+            // the fixture's first Text entity: in entity mode this exact
+            // click selects it.
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert!(
+                open_of(panel).selected.is_empty(),
+                "entity hit-testing is off while painting"
+            );
+            let session = panel
+                .test_paint_session("maps/test.bg0.map")
+                .expect("the session stays cached under its rel");
+            let state = session.store.state();
+            assert_eq!(
+                state.cells[0],
+                pack_cell(0, 0, false, false),
+                "the brush stamped cell (0, 0)"
+            );
+            assert!(session.dirty(), "and the document knows it changed");
+            assert!(
+                matches!(
+                    open_of(panel).map_loads.get("maps/test.bg0"),
+                    Some(Loadable::Ready(_))
+                ),
+                "the live compose replaced the on-disk image"
+            );
+            assert!(
+                panel.paint_focus_key().is_some(),
+                "and the canvas knows which image to hold at full strength"
+            );
+        });
+
+        // Escape leaves paint mode; the session (and its undo history)
+        // survives in the map.
+        cx.simulate_keystrokes("escape");
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.test_paint_mode_rel(), None, "escape exits the mode");
+            assert!(
+                panel.test_paint_session("maps/test.bg0.map").is_some(),
+                "the session outlives the mode"
+            );
+            assert!(
+                panel.test_enter_paint_bg(0, cx),
+                "re-entry reuses the cached session"
+            );
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/test.bg0.map"),
+                "a cached session enters synchronously -- no second load"
+            );
+            panel.undo_impl(cx);
+            let session = panel.test_paint_session("maps/test.bg0.map").unwrap();
+            assert_eq!(
+                session.store.state().cells[0],
+                CELL_BLANK,
+                "undo is mode-scoped: it reversed the brush, not the world edit"
+            );
+            assert!(!session.dirty());
+            assert_eq!(
+                panel.test_backgrounds().len(),
+                1,
+                "the world's own slot list must be untouched by a paint undo"
+            );
+        });
+
+        // Unlinking the slot under the brush hands the canvas back to the
+        // world editor -- and the next undo with it, which is the whole
+        // point: a mode whose target is gone must not swallow the step
+        // that would bring it back.
+        panel.update(cx, |panel, cx| {
+            panel.clear_background_impl(0, cx);
+            assert_eq!(
+                panel.test_paint_mode_rel(),
+                None,
+                "a cleared slot cannot stay under the brush"
+            );
+            panel.undo_impl(cx);
+            assert_eq!(
+                panel.test_backgrounds().len(),
+                1,
+                "and the undo reached the world store, relinking the slot"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_paint_mode_on_a_missing_map_is_an_error_state_not_a_crash(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::SetBackground {
+                    layer: 0,
+                    map: Some("maps/ghost.map".to_string()),
+                },
+                cx,
+            );
+            assert!(
+                panel.test_enter_paint_bg(0, cx),
+                "the slot names a map, so entry is attempted"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.test_paint_mode_rel(),
+                None,
+                "a failed load must leave the panel in entity mode"
+            );
+            assert!(
+                panel.test_paint_session("maps/ghost.map").is_none(),
+                "and cache nothing"
+            );
+            let error = open_of(panel)
+                .paint_error
+                .clone()
+                .expect("the failure is surfaced, not swallowed");
+            assert!(error.contains("ghost"), "with the reason: {error}");
+            // The canvas still routes to entities.
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            assert_eq!(
+                open_of(panel).selected.len(),
+                1,
+                "entity editing is still live after a refused entry"
+            );
+        });
+
+        // An empty slot has nothing to paint at all.
+        panel.update(cx, |panel, cx| {
+            panel.clear_background_impl(0, cx);
+            assert!(!panel.test_enter_paint_bg(0, cx), "no map, no paint mode");
+        });
     }
 }

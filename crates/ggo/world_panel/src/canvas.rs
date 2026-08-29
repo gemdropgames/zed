@@ -17,6 +17,7 @@ use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::render::{
     AssetLoads, DEVICE_SCREEN_H, DEVICE_SCREEN_W, DrawItem, DrawKind, Loadable, RgbaImage,
 };
+use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 
 // ------------------------------------------------------------ camera math
 
@@ -129,6 +130,18 @@ pub fn dragged_pos(
     pos
 }
 
+/// The map cell a world-space point lands in, for a map whose top-left
+/// pixel sits at `anchor` (world origin for a background slot,
+/// `Transform.pos + (col, row) * TILE_PX` for a `Tilemap` entity).
+///
+/// Floors per axis, so a point ABOVE or LEFT of the anchor yields a
+/// negative cell rather than clamping onto row/column 0 -- an off-map
+/// click has to read as off-map, not as an edit of the first cell.
+pub fn paint_cell_at(world: [f64; 2], anchor: [f64; 2]) -> (i32, i32) {
+    let cell = |w: f64, a: f64| ((w - a) / TILE_PX as f64).floor() as i32;
+    (cell(world[0], anchor[0]), cell(world[1], anchor[1]))
+}
+
 // -------------------------------------------------------- BGRA conversion
 
 /// Key an [`RgbaImage`] by its shared pixel buffer's address --
@@ -197,6 +210,22 @@ pub struct Scene {
     pub text_color: Hsla,
     /// An in-flight rubber-band, `[x, y, w, h]` in world px.
     pub marquee: Option<[f64; 4]>,
+    /// Paint mode's target image ([`image_key`]), which draws at full
+    /// strength while everything else dims. `None` in entity mode.
+    pub paint_focus: Option<usize>,
+}
+
+/// Opacity of the paint-mode wash: how much canvas background is laid over
+/// the scene the brush is NOT editing.
+const PAINT_DIM_ALPHA: f32 = 0.45;
+
+/// The image an item draws, if it draws one -- the only [`DrawKind`] a
+/// paint target can be.
+fn item_image_key(item: &DrawItem) -> Option<usize> {
+    match &item.kind {
+        DrawKind::Image { image } => Some(image_key(image)),
+        _ => None,
+    }
 }
 
 pub fn paint_scene(
@@ -222,6 +251,21 @@ pub fn paint_scene(
             }
             for item in &scene.items {
                 paint_item(scene, item, &view, canvas_bounds, window, cx);
+            }
+            // Dimming, wash-and-redraw rather than per-item opacity:
+            // gpui's `with_element_opacity` is crate-private and
+            // `paint_image` takes no alpha, so the only way to hold ONE
+            // item at full strength is to fade the finished scene behind
+            // it and draw it again on top.
+            if let Some(focus) = scene.paint_focus {
+                let mut wash = scene.background;
+                wash.a = PAINT_DIM_ALPHA;
+                window.paint_quad(fill(canvas_bounds, wash));
+                for item in &scene.items {
+                    if item_image_key(item) == Some(focus) {
+                        paint_item(scene, item, &view, canvas_bounds, window, cx);
+                    }
+                }
             }
             paint_device_screen(scene, &view, canvas_bounds, window, cx);
             if let Some([x, y, w, h]) = scene.marquee {
@@ -676,6 +720,17 @@ mod tests {
         // And a pathologically low zoom is capped rather than unbounded.
         let (xs, _) = grid_lines(&view_at(1e-9, [0.0, 0.0]), 4096.0, 4096.0);
         assert_eq!(xs.len(), GRID_MAX_LINES);
+    }
+
+    #[test]
+    fn paint_cell_at_floors_into_the_anchored_tile_grid() {
+        assert_eq!(paint_cell_at([0.0, 0.0], [0.0, 0.0]), (0, 0));
+        assert_eq!(paint_cell_at([31.9, 16.0], [0.0, 0.0]), (1, 1));
+        // Above the anchor is a NEGATIVE cell, not cell 0: a map painted
+        // through a floor-to-zero cast would take an off-map click as an
+        // edit of its first row.
+        assert_eq!(paint_cell_at([-0.1, 0.0], [0.0, 0.0]), (-1, 0));
+        assert_eq!(paint_cell_at([40.0, 40.0], [32.0, 32.0]), (0, 0));
     }
 
     #[test]
