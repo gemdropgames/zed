@@ -563,16 +563,19 @@ struct InspectorEntry {
 enum PaintTarget {
     /// A `[[background]]` slot of the OPEN document, by layer.
     BgSlot(u8),
-    /// Entity index, the same frame `Selection::Entity` indexes in.
-    ///
-    /// Resolved by [`WorldPanel::paint_target_rel`] but not yet reachable
-    /// from the UI -- the "Paint tiles" entry point on a `Tilemap` entity
-    /// is its own step. The anchor arithmetic lands with the rest of the
-    /// target resolution rather than being split across two commits; the
-    /// expectation below goes unfulfilled (and so warns) the moment an
-    /// entry point constructs this.
-    #[expect(dead_code, reason = "entry point lands with the Tilemap-entity step")]
+    /// A `Tilemap` entity's map, by entity index -- the same frame
+    /// `Selection::Entity` indexes in.
     TilemapEntity(usize),
+}
+
+/// The `Tilemap` component's fields, when `entity` has one naming a
+/// non-empty stem. This is what makes an entity a paint target, so every
+/// entry point ("Paint tiles", double-click) gates on it and
+/// [`WorldPanel::paint_target_rel`] reads the anchor out of the same map.
+fn tilemap_fields(entity: &WorldEntity) -> Option<&serde_json::Map<String, Value>> {
+    let fields = entity.components.get("Tilemap")?.as_object()?;
+    let stem = fields.get("stem")?.as_str()?;
+    (!stem.is_empty()).then_some(fields)
 }
 
 /// What the canvas gesture does. `Entities` is the world editor proper;
@@ -1570,16 +1573,8 @@ impl WorldPanel {
                 (!stem.is_empty()).then(|| (format!("{stem}.map"), [0.0, 0.0]))
             }
             PaintTarget::TilemapEntity(index) => {
-                let fields = state
-                    .entities
-                    .get(index)?
-                    .components
-                    .get("Tilemap")?
-                    .as_object()?;
+                let fields = tilemap_fields(state.entities.get(index)?)?;
                 let stem = fields.get("stem")?.as_str()?;
-                if stem.is_empty() {
-                    return None;
-                }
                 let pos = inspector::entity_pos(&state, index)?;
                 // `render.rs::push_tilemap_item`'s arithmetic, which is
                 // what puts the composed image on the canvas -- the cell
@@ -2480,6 +2475,19 @@ impl WorldPanel {
         self.enter_paint_mode(PaintTarget::BgSlot(layer), cx)
     }
 
+    /// Enter paint mode on entity `index`'s `Tilemap` map, reporting
+    /// whether it resolved to one (the session may still be loading --
+    /// pump the executor, then read [`Self::test_paint_mode_rel`]).
+    ///
+    /// `test-support` only, the entity counterpart of
+    /// [`Self::test_enter_paint_bg`]: the UI paths that carry this are a
+    /// context-menu entry and a canvas double-click, neither of which can
+    /// tell a caller "entered" from "refused".
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_enter_paint_entity(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        self.enter_paint_mode(PaintTarget::TilemapEntity(index), cx)
+    }
+
     /// The `.map` paint mode is editing, `None` in entity mode.
     /// `test-support` only.
     #[cfg(any(test, feature = "test-support"))]
@@ -2631,6 +2639,31 @@ impl WorldPanel {
             _ => None,
         };
         cx.notify();
+    }
+
+    /// Second click of a double-click at canvas-relative `local` px: if a
+    /// `Tilemap` entity is under it, that entity's map goes under the
+    /// brush (spec: "Paint tiles" on a Tilemap entity, context menu or
+    /// double-click). Reports whether it entered, so the caller can fall
+    /// back to the ordinary select-and-arm-a-drag on anything else.
+    fn canvas_double_click(&mut self, local: [f64; 2], cx: &mut Context<Self>) -> bool {
+        if self.in_paint_mode() {
+            return false;
+        }
+        let Some(view) = self.canvas_view() else {
+            return false;
+        };
+        let index = {
+            let ViewerState::Ready(open) = &self.state else {
+                return false;
+            };
+            let world = drag_ops::screen_to_world(local[0], local[1], &view);
+            match hit_test(&draw_items(open), world[0], world[1]) {
+                Some(Selection::Entity(index)) => index,
+                _ => return false,
+            }
+        };
+        self.enter_paint_mode(PaintTarget::TilemapEntity(index), cx)
     }
 
     /// Continue the in-flight placement drag to canvas-relative `local`
@@ -3392,7 +3425,16 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &self.state else {
             return div().into_any_element();
         };
-        let rows = entity_list_rows(&open.store.state());
+        let state = open.store.state();
+        let rows = entity_list_rows(&state);
+        // Collected once, not re-derived per row: `store.state()` clones
+        // the whole document, so asking `paint_target_rel` per row would
+        // make rendering the list quadratic in entity count.
+        let paintable: Vec<bool> = state
+            .entities
+            .iter()
+            .map(|entity| tilemap_fields(entity).is_some())
+            .collect();
         let selected_bg = cx.theme().colors().element_selected;
         div()
             .id("ggo-world-entity-list")
@@ -3402,7 +3444,7 @@ impl WorldPanel {
             .overflow_y_scroll()
             .child(v_flex().children(rows.into_iter().map(|(target, label)| {
                 let selected = open.selected.contains(&target);
-                div()
+                let row = div()
                     .id(SharedString::from(format!("ggo-world-list-{target:?}")))
                     .px_1()
                     .cursor_pointer()
@@ -3417,7 +3459,28 @@ impl WorldPanel {
                         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
                             this.select_from_list(target, event.modifiers.shift, cx)
                         }),
-                    )
+                    );
+                let Selection::Entity(index) = target else {
+                    return row.into_any_element();
+                };
+                if !paintable.get(index).copied().unwrap_or(false) {
+                    return row.into_any_element();
+                }
+                let weak = cx.weak_entity();
+                ui::right_click_menu(SharedString::from(format!("ggo-world-list-menu-{index}")))
+                    .trigger(move |_menu_open, _window, _cx| row)
+                    .menu(move |window, cx| {
+                        let weak = weak.clone();
+                        ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                            menu.entry("Paint tiles", None, move |_window, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.enter_paint_mode(PaintTarget::TilemapEntity(index), cx);
+                                })
+                                .ok();
+                            })
+                        })
+                    })
+                    .into_any_element()
             })))
             .into_any_element()
     }
@@ -4269,6 +4332,13 @@ impl WorldPanel {
                             f64::from(event.position.y - bounds.origin.y),
                         ]
                     };
+                    // A double-click that opens a Tilemap entity for
+                    // painting must NOT also arm a placement drag on it:
+                    // the first click already selected it, and the drag
+                    // would move the entity out from under the brush.
+                    if event.click_count >= 2 && this.canvas_double_click(local, cx) {
+                        return;
+                    }
                     this.canvas_primary_down_with(local, event.modifiers.shift, cx);
                 }),
             )
@@ -10302,6 +10372,108 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.clear_background_impl(0, cx);
             assert!(!panel.test_enter_paint_bg(0, cx), "no map, no paint mode");
+        });
+    }
+
+    /// Spec 2026-08-29: "Paint tiles" on a `Tilemap` entity edits THAT
+    /// entity's map, and the cell grid has to start where the composed
+    /// image starts -- `render.rs::push_tilemap_item` draws it at
+    /// `Transform.pos + (col, row) * TILE_PX`. So the anchor pixel is
+    /// cell (0, 0), while the entity's own `Transform.pos` -- one tile to
+    /// the left with `col: 1` -- is cell (-1, 0), off the map entirely.
+    #[gpui::test]
+    async fn test_tilemap_entity_paints_its_map_anchored_at_the_composed_image(
+        cx: &mut TestAppContext,
+    ) {
+        use ggo_worldlib::sprites::map_doc::{CELL_BLANK, pack_cell};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        io::save_new_bound_map(dir.path(), "maps/deco.map", 16, 16, "tiles/bg.til").unwrap();
+        write_world(
+            dir.path(),
+            "worlds/deco.toml",
+            &WorldFile {
+                entities: vec![
+                    entity(json!({
+                        "Transform": { "pos": [32.0, 16.0], "z": 0.0 },
+                        "Tilemap": { "stem": "maps/deco", "col": 1.0, "row": 0.0 }
+                    })),
+                    entity(json!({
+                        "Transform": { "pos": [0.0, 0.0], "z": 0.0 },
+                        "Camera": { "is_active": true }
+                    })),
+                ],
+                instances: vec![],
+                backgrounds: vec![],
+            },
+        )
+        .unwrap();
+        panel.update(cx, |panel, cx| panel.load_rel_path("worlds/deco.toml", cx));
+        cx.run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            open_of(panel).view.borrow_mut().pan = Some([0.0, 0.0]);
+        });
+        focus_the_panel(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            assert!(
+                !panel.test_enter_paint_entity(1, cx),
+                "an entity with no Tilemap is a refusal, not a paint target"
+            );
+            assert!(
+                !panel.test_enter_paint_entity(9, cx),
+                "and neither is an index no entity occupies"
+            );
+            assert!(
+                panel.test_enter_paint_entity(0, cx),
+                "the Tilemap entity resolves to its map"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/deco.map"),
+                "the loaded session put the brush on the entity's own map"
+            );
+            // Identity camera (`ready_panel_in_window` pins pan/zoom, and
+            // the load above was re-pinned), so canvas px are world px.
+            panel.canvas_primary_down_with([32., 16.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert_eq!(
+                paint_cells(panel)[0],
+                CELL_BLANK,
+                "the entity's own pos is a tile left of the map's first cell"
+            );
+            panel.canvas_primary_down_with([48., 16.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert_eq!(
+                paint_cells(panel)[0],
+                pack_cell(0, 0, false, false),
+                "and the anchor pixel is cell (0, 0)"
+            );
+        });
+
+        // The canvas entry point, on the same entity.
+        cx.simulate_keystrokes("escape");
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.test_paint_mode_rel(), None, "escape exits the mode");
+            assert!(
+                !panel.canvas_double_click([4., 4.], cx),
+                "empty space is not a paint target"
+            );
+            assert!(
+                panel.canvas_double_click([50., 18.], cx),
+                "a double-click over the Tilemap entity enters paint mode"
+            );
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/deco.map"),
+                "the cached session enters synchronously"
+            );
         });
     }
 }
