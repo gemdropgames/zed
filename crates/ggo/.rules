@@ -19,3 +19,10 @@
   established pattern lives in `ggo_tileset_panel`, `ggo_import_panel` and
   `ggo_emerald_panel`; `ggo_smoke` is the consumer. Whole-journey tests
   belong in `ggo_smoke`, per-feature regressions in the panel's own crate.
+
+* `cargo fmt -p <crate>` is safe here NOW, but was not always: audio_panel
+  and emu_panel carried ~570 lines of drift until 2026-08-28's dedicated
+  formatting commit, and the ggo repo's worldlib still drifts (its own
+  `.rules` says so). Before running a package-wide fmt in any ggo crate,
+  `cargo fmt -p <crate> --check` first; if untouched files appear, format
+  in a dedicated commit, never inside a feature diff.
