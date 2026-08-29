@@ -2219,6 +2219,12 @@ mod tests {
         pump_until(&panel, cx, "the run's exit reason", |panel| {
             panel.test_status().as_deref() == Some("stopped")
         });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel.test_status_is_error(),
+                "the user asking a healthy run to stop is not a failure"
+            );
+        });
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
                 workspace
@@ -2265,10 +2271,9 @@ mod tests {
                 "the loader's own reason is what the pane shows: {status:?}"
             );
             assert!(
-                !panel.test_status_is_error(),
-                "and it arrives as a run's exit reason, not a refused precondition \
-                 -- FINDING: a cart that fails to load is styled like an ordinary \
-                 exit, so `status_is_error` cannot be used to spot it"
+                panel.test_status_is_error(),
+                "and a cart that FAILED to load reads as an error, not as an \
+                 ordinary exit -- the styling is what distinguishes it"
             );
             assert_eq!(panel.test_frame(), 0, "no frame was ever produced");
             assert_eq!(

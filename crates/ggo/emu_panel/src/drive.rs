@@ -137,6 +137,11 @@ pub struct PerfSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 struct RunOutcome {
     reason: String,
+    /// Whether `reason` describes a FAILURE rather than an ordinary end.
+    /// Carried as a flag rather than sniffed out of `reason`'s wording
+    /// because the panel styles the two differently and the wording is
+    /// free text (see [`FinishedRun::is_error`]).
+    is_error: bool,
     /// `None` when the run never built a core at all (unreadable file,
     /// unparseable cart) -- there is no perf sim to serialise.
     perf: Option<PerfSnapshot>,
@@ -147,6 +152,15 @@ struct RunOutcome {
 pub struct FinishedRun {
     /// Human-readable end-of-run line for the pane's status.
     pub reason: String,
+    /// True when the run ended BADLY -- an unreadable cart file, a cart
+    /// that would not parse, a CPU fault, or an emulator thread that
+    /// vanished. False for the ordinary ends: the panel asking the run to
+    /// stop, and the cart exiting under its own power (whatever its exit
+    /// code -- a non-zero code is the cart's own verdict on itself, not
+    /// the emulator failing to run it). The panel styles the status row
+    /// from this, so it must be decided here, where the reason is
+    /// written, rather than re-derived from the reason's words.
+    pub is_error: bool,
     pub perf: Option<PerfSnapshot>,
     /// The run's diagnostic lines, ingested into the `uart` table -- the
     /// driver's own per-run markers (`[run]`, `[run ended]`,
@@ -257,12 +271,20 @@ impl Session {
             let _ = join.join();
         }
         let outcome = self.outcome.lock().unwrap().take();
-        let (reason, perf) = match outcome {
-            Some(o) => (o.reason, o.perf),
-            None => ("the emulator thread ended unexpectedly".to_string(), None),
+        // No outcome means the thread never stored one -- it panicked on
+        // its way out. That is a failure, and the only one the panel can
+        // learn about from here.
+        let (reason, is_error, perf) = match outcome {
+            Some(o) => (o.reason, o.is_error, o.perf),
+            None => (
+                "the emulator thread ended unexpectedly".to_string(),
+                true,
+                None,
+            ),
         };
         FinishedRun {
             reason,
+            is_error,
             perf,
             uart: self.uart.lines(),
         }
@@ -383,8 +405,10 @@ fn run(
     let bytes = match std::fs::read(cart_path) {
         Ok(bytes) => bytes,
         Err(e) => {
+            // The cart file could not even be read: a failure.
             return RunOutcome {
                 reason: format!("{}: {e}", cart_path.display()),
+                is_error: true,
                 perf: None,
             };
         }
@@ -396,8 +420,10 @@ fn run(
             // cart that failed to load must say why in the console, not
             // just vanish behind a status word.
             uart.push_line(format!("[cart load failed] {e}"));
+            // The bytes are not a cart this emulator can load: a failure.
             return RunOutcome {
                 reason: format!("cart: {e}"),
+                is_error: true,
                 perf: None,
             };
         }
@@ -485,9 +511,14 @@ fn run(
     let start = Instant::now();
     let mut last_present = Instant::now();
 
-    let reason = loop {
+    // Every arm below breaks with `(reason, is_error)`, so each way out of
+    // the run states its own verdict rather than leaving the caller to
+    // guess one from the wording.
+    let (reason, is_error) = loop {
         if stop.load(Ordering::Acquire) {
-            break "stopped".to_string();
+            // The panel asked for this (Stop, a restart, the pane going
+            // away): not an error.
+            break ("stopped".to_string(), false);
         }
         let turn_started = Instant::now();
         let (event, _insns) = run_until_event(&mut cpu, &mut mmu, &mut p, PER_TURN_BUDGET, false);
@@ -518,7 +549,9 @@ fn run(
                     step_ms,
                 }) && e.is_closed()
                 {
-                    break "stopped".to_string();
+                    // The panel dropped the receiver -- the same stop
+                    // request, arriving by a different road: not an error.
+                    break ("stopped".to_string(), false);
                 }
                 // BEFORE the pacing hold, so the ring is fed as early in
                 // the period as it can be. `handle_vsync_wait` advanced
@@ -547,7 +580,8 @@ fn run(
                     park_while_paused(pause, step, stop, audio_writer.as_ref());
                 paused_total += parked;
                 if stop_requested {
-                    break "stopped".to_string();
+                    // Stopped out of the debugger's park: not an error.
+                    break ("stopped".to_string(), false);
                 }
                 last_present = Instant::now();
                 // AFTER the hold, not before it. `native::refresh_input`
@@ -577,12 +611,19 @@ fn run(
                     park_while_paused(pause, step, stop, audio_writer.as_ref());
                 paused_total += parked;
                 if stop_requested {
-                    break "stopped".to_string();
+                    // Stopped out of the debugger's park: not an error.
+                    break ("stopped".to_string(), false);
                 }
                 p.input_mask = input.load(Ordering::Acquire);
             }
-            FrameEvent::Exit(code) => break format!("cart exited with {code}"),
-            FrameEvent::Fault(trap) => break format!("cpu fault: {trap:?}"),
+            // The cart called exit: an ordinary end however it scores
+            // itself, so NOT an error even for a non-zero code -- the code
+            // is the cart's verdict on its own work, and the pane already
+            // shows it in the reason.
+            FrameEvent::Exit(code) => break (format!("cart exited with {code}"), false),
+            // The CPU trapped (bad instruction, bad access): the run died,
+            // which is an error however the cart got there.
+            FrameEvent::Fault(trap) => break (format!("cpu fault: {trap:?}"), true),
         }
     };
 
@@ -600,6 +641,7 @@ fn run(
 
     RunOutcome {
         reason,
+        is_error,
         perf: Some(PerfSnapshot {
             cart: title,
             // `ggo-ide`'s `CartStepper::perf_json`, argument for
@@ -1319,6 +1361,10 @@ mod tests {
             Some("[run ended] stopped"),
             "and closes with the terminal reason"
         );
+        assert!(
+            !finished.is_error,
+            "the panel asking a healthy run to stop is not a failure"
+        );
     }
 
     /// A path that isn't a cart fails loudly -- in the outcome AND in the
@@ -1336,6 +1382,10 @@ mod tests {
         );
         let finished = session.wait();
         assert!(finished.reason.starts_with("cart: "), "{}", finished.reason);
+        assert!(
+            finished.is_error,
+            "a cart that would not parse is a FAILED run, not an ordinary end"
+        );
         assert!(
             finished.perf.is_none(),
             "there is no perf sim for a cart that never loaded -- nothing to ingest"
@@ -1360,6 +1410,7 @@ mod tests {
         assert!(rx.recv_blocking().is_err());
         let finished = session.wait();
         assert!(finished.reason.contains("here.cart"), "{}", finished.reason);
+        assert!(finished.is_error, "an unreadable cart file is a FAILED run");
         assert!(finished.perf.is_none());
     }
 
@@ -1398,6 +1449,10 @@ mod tests {
         );
         let finished = session.wait();
         assert_eq!(finished.reason, "cart exited with 0");
+        assert!(
+            !finished.is_error,
+            "a cart that exited under its own power ended normally"
+        );
         let perf = finished.perf.expect("the core was built, so perf exists");
         assert_eq!(perf.cart, "Quit");
         assert_eq!(

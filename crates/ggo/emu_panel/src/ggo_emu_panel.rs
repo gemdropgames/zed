@@ -1198,10 +1198,10 @@ impl EmuPanel {
         let finish = cx.background_spawn(async move {
             let finished = session.wait();
             let status = ingest_finished_run(&finished, db_path_override, &label);
-            (finished.reason, status)
+            (finished.reason, finished.is_error, status)
         });
         cx.spawn(async move |this, cx| {
-            let (reason, status) = finish.await;
+            let (reason, is_error, status) = finish.await;
             let hop = this
                 .update(cx, |this, cx| {
                     if this.run_generation != generation {
@@ -1213,7 +1213,10 @@ impl EmuPanel {
                     }
                     if this.build_generation == owns_status {
                         this.status = Some(reason);
-                        this.status_is_error = false;
+                        // The run itself says whether it ended badly: a
+                        // cart that never loaded or faulted is a failure,
+                        // a stop or a plain exit is not.
+                        this.status_is_error = is_error;
                     }
                     this.ingest_status = status;
                     cx.notify();
@@ -5788,6 +5791,7 @@ mod tests {
         let db_path = dir.path().join("ggo_ide.db");
         let finished = drive::FinishedRun {
             reason: "cart exited".to_string(),
+            is_error: false,
             perf: Some(drive::PerfSnapshot {
                 cart: "Green Fix".to_string(),
                 perf_json: "this is not perf json".to_string(),
