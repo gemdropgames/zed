@@ -37,6 +37,14 @@ impl EmulatorItem {
     pub fn panel(&self) -> &Entity<EmuPanel> {
         &self.panel
     }
+
+    /// The wrapped panel, for the cross-crate journeys in `ggo_smoke` --
+    /// the tab is how a `.cart` opens, so the panel is only reachable
+    /// through the item.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_panel(&self) -> Entity<EmuPanel> {
+        self.panel.clone()
+    }
 }
 
 impl EventEmitter<EmuItemEvent> for EmulatorItem {}

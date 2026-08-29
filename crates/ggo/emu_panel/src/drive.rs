@@ -730,9 +730,10 @@ pub fn rgb565_to_bgra(fb: &[u16]) -> Vec<u8> {
     out
 }
 
-/// Hand-assembled cart fixtures, shared by this module's tests and the
-/// panel's.
-#[cfg(test)]
+/// Hand-assembled cart fixtures, shared by this module's tests, the
+/// panel's, and -- through the crate's `test-support` re-export --
+/// `ggo_smoke`'s emulator journeys.
+#[cfg(any(test, feature = "test-support"))]
 pub mod fixture {
 
     // There is no committed `.cart` anywhere in the ggo repo (checked:

@@ -2663,7 +2663,87 @@ impl EmuPanel {
     fn test_new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new(None, Some(window), cx)
     }
+
+    // ------------------------------------------------- test-support hooks
+
+    /// A cart is selected and its root has resolved, so `Run` has
+    /// everything it needs. `test-support` only, for `ggo_smoke`'s
+    /// emulator journeys -- `selected` and `project_root` are private.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_ready(&self) -> bool {
+        self.selected.is_some() && self.project_root.is_some()
+    }
+
+    /// A run is in flight. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_running(&self) -> bool {
+        self.is_running()
+    }
+
+    /// The live run is paused. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_paused(&self) -> bool {
+        self.is_paused()
+    }
+
+    /// The number of the last frame the emulator thread delivered -- the
+    /// count the transport readout prints. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_frame(&self) -> u32 {
+        self.frame
+    }
+
+    /// One pixel of the last delivered frame, BGRA8, in framebuffer
+    /// coordinates -- the proof that a cart's own output reached the
+    /// pane, through the real PPU compose and the real RGB565 -> BGRA
+    /// conversion. `None` before the first frame and after `Stop` (which
+    /// hands the frame's atlas tiles back). `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_frame_pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= drive::WIDTH || y >= drive::HEIGHT {
+            return None;
+        }
+        let bytes = self.latest_frame.as_ref()?.as_bytes(0)?;
+        let offset = ((y * drive::WIDTH + x) * 4) as usize;
+        bytes.get(offset..offset + 4)?.try_into().ok()
+    }
+
+    /// The status row's message: a run's exit reason (including a cart
+    /// that failed to load) or a refused precondition. `test-support`
+    /// only.
+    #[cfg(feature = "test-support")]
+    pub fn test_status(&self) -> Option<String> {
+        self.status.clone()
+    }
+
+    /// Whether [`Self::test_status`]'s message is shown as an error
+    /// rather than as a run's ordinary exit reason. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_status_is_error(&self) -> bool {
+        self.status_is_error
+    }
+
+    /// Point the perf ingest at `path` instead of `~/.ggo/ggo_ide.db`.
+    ///
+    /// The one WRITE hook here, and load-bearing rather than convenient:
+    /// a journey that runs a real cart to completion would otherwise
+    /// write a `run` row into the developer's actual database -- exactly
+    /// what `db_path_override` exists to prevent for this crate's own
+    /// tests, which set the same field directly. It redirects a
+    /// destination; it changes no emulator state. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_db_path(&mut self, path: PathBuf) {
+        self.db_path_override = Some(path);
+    }
 }
+
+/// The hand-assembled cart fixtures `drive`'s and this module's tests
+/// run, re-exported for `ggo_smoke`'s emulator journeys: there is no
+/// committed `.cart` anywhere in the fork, so a cross-crate test has no
+/// other way to get real machine code in front of the panel. `drive`
+/// itself stays private.
+#[cfg(any(test, feature = "test-support"))]
+pub use drive::fixture;
 
 /// Where the framebuffer lands inside `panel`: the largest aspect-true
 /// fit of 320x240, centered on floored whole-pixel origins -- the screen

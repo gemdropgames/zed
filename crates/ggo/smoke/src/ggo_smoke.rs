@@ -1855,4 +1855,440 @@ mod tests {
             assert_eq!(panel.test_cell(2, 1), Some(map_painted_cell()));
         });
     }
+
+    // ------------------------------------------------------------- audio
+
+    /// A real one-second PCM16 mono RIFF file at `root/rel` -- the shape
+    /// `ggo_audio::decode`'s wav path reads, hand-rolled because nothing
+    /// in the fork ships an audio fixture (the same reason
+    /// `ggo_audio_panel`'s own tests carry this writer).
+    ///
+    /// The clip is a triangle wave at a DELIBERATELY tiny amplitude
+    /// (+-64 of 32767, about -54 dBFS): the preview really does open the
+    /// emulator pane's cpal output on a developer's box, and a full-scale
+    /// tone would make every test run audible. The samples still vary, so
+    /// the decode, the waveform buckets and the ADPCM bake all have real
+    /// data to chew on.
+    ///
+    /// A full second is load-bearing: it keeps the preview thread alive
+    /// far longer than the journey takes, so "playing" is observable
+    /// without racing the clip's end.
+    fn write_beep_wav(root: &Path, rel: &str) {
+        const RATE: u32 = 32_000;
+        const PERIOD: usize = 40;
+        const PEAK: i32 = 64;
+        let samples: Vec<i16> = (0..RATE as usize)
+            .map(|i| {
+                let half = (PERIOD / 2) as i32;
+                let p = (i % PERIOD) as i32;
+                let v = if p < half {
+                    (p * 2 * PEAK / half) - PEAK
+                } else {
+                    PEAK - ((p - half) * 2 * PEAK / half)
+                };
+                v as i16
+            })
+            .collect();
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((36 + data.len()) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk length
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // mono
+        out.extend_from_slice(&RATE.to_le_bytes());
+        out.extend_from_slice(&(RATE * 2).to_le_bytes()); // bytes per second
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("rel has a parent")).unwrap();
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// The audio tab's transport through the REAL keymap: click a `.wav`
+    /// in the explorer, let it decode and bake, then drive `space` and
+    /// `l` in the `GgoAudioPanel` context.
+    ///
+    /// Nothing here asserts on sound. The preview writes into the
+    /// emulator pane's cpal ring, which is deliberately no-device-safe
+    /// (`preview.rs`: "`None` (no device) plays silently"), so on a
+    /// headless box the audio goes nowhere and there is nothing to read
+    /// back. What IS observable, and what this journey exists for, is
+    /// that the two bindings reach the two handlers with a real decoded
+    /// file behind them: `space` is a toggle rather than a restart, and
+    /// `l` flips the loop flag the next preview runs with.
+    #[gpui::test]
+    async fn smoke_audio_open_play_and_loop_toggle(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        write_beep_wav(dir.path(), "assets/audio/beep.wav");
+
+        assert!(
+            offer_open(&workspace, cx, "assets/audio/beep.wav"),
+            "the audio interceptor claims the .wav"
+        );
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_audio_panel::AudioItem>(cx)
+                .next()
+                .expect("the interceptor opened the audio tab")
+                .read(cx)
+                .test_panel()
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_ready(), "the wav decoded");
+            assert!(
+                panel.test_is_baked(),
+                "and the ADPCM bake the Baked-mode transport plays has landed"
+            );
+            assert!(!panel.test_is_playing(), "nothing plays until asked");
+            assert!(!panel.test_is_looping(), "and a file opens one-shot");
+        });
+
+        cx.simulate_keystrokes("space");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_error(),
+                None,
+                "the bake had landed, so PlayStop is not the \"still baking\" no-op"
+            );
+            assert!(
+                panel.test_is_playing(),
+                "space resolved to ggo_audio::PlayStop and started a preview"
+            );
+        });
+
+        cx.simulate_keystrokes("space");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel.test_is_playing(),
+                "a second space STOPS the preview -- `play_stop` branches on \
+                 the live preview, it does not restart from the top"
+            );
+        });
+
+        cx.simulate_keystrokes("l");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.test_is_looping(),
+                "l resolved to ggo_audio::ToggleLoop"
+            );
+            assert!(
+                !panel.test_is_playing(),
+                "toggling with nothing playing does not start playback"
+            );
+        });
+        cx.simulate_keystrokes("l");
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_looping(), "and toggles back");
+        });
+    }
+
+    // ---------------------------------------------------------- emulator
+
+    /// Drive the executor until `ready`, or fail at `what`.
+    ///
+    /// One task per turn rather than `run_until_parked`, and a wall-clock
+    /// deadline rather than a tick budget: the emulator is a REAL OS
+    /// thread pacing itself to 60 Hz, so no amount of `advance_clock`
+    /// moves it, and while a cart runs the executor may never go idle at
+    /// all. This is `ggo_emu_panel`'s own `await_first_frame` helper,
+    /// generalised over the condition -- including its
+    /// `std::thread::sleep` when the executor has nothing to run, which
+    /// is the only way to let the emulator thread make progress.
+    fn pump_until(
+        panel: &Entity<ggo_emu_panel::EmuPanel>,
+        cx: &mut gpui::VisualTestContext,
+        what: &str,
+        ready: impl Fn(&ggo_emu_panel::EmuPanel) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !panel.read_with(cx, |panel, _| ready(panel)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Pump until the pane's frame counter has been unchanged for a
+    /// quarter second, and return it.
+    ///
+    /// Pause lands as a flag the emulator thread reads at a frame
+    /// boundary, so frames already in flight still arrive after it: the
+    /// count settles rather than stopping dead. Waiting for silence
+    /// instead of a fixed window is exactly what `drive.rs`'s own
+    /// `pause_parks_step_advances_one_frame_and_resume_continues` does
+    /// ("a loaded box can delay the in-flight frame"), sleep and all.
+    fn settled_frame_count(
+        panel: &Entity<ggo_emu_panel::EmuPanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> u32 {
+        let quiet = std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = panel.read_with(cx, |panel, _| panel.test_frame());
+        let mut quiet_since = std::time::Instant::now();
+        while quiet_since.elapsed() < quiet {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the frame counter never settled -- frames kept arriving"
+            );
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let now = panel.read_with(cx, |panel, _| panel.test_frame());
+            if now != last {
+                last = now;
+                quiet_since = std::time::Instant::now();
+            }
+        }
+        last
+    }
+
+    /// Open `rel` through the fork's interceptor and hand back its
+    /// emulator panel, with the perf ingest pointed at a database inside
+    /// `root` -- without that redirect a run that reaches the end of
+    /// `finish_run` writes a row into the developer's real
+    /// `~/.ggo/ggo_ide.db`.
+    fn open_cart(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        root: &Path,
+        rel: &str,
+    ) -> Entity<ggo_emu_panel::EmuPanel> {
+        assert!(
+            offer_open(workspace, cx, rel),
+            "the cart interceptor claims {rel}"
+        );
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_emu_panel::EmulatorItem>(cx)
+                .next()
+                .expect("the interceptor opened the emulator tab")
+                .read(cx)
+                .test_panel()
+        });
+        panel.update(cx, |panel, _| {
+            panel.test_set_db_path(root.join("ggo_ide.db"));
+        });
+        cx.run_until_parked();
+        panel
+    }
+
+    /// The whole transport, on a cart that really executes: open the
+    /// `.cart` from the explorer, run it with `ctrl-alt-r`, prove the
+    /// green backdrop it sets reaches the pane's framebuffer, then pause,
+    /// step and stop through the REAL keymap.
+    ///
+    /// The fixture is `ggo_emu_panel`'s own hand-assembled RV32I cart:
+    /// `set_palette(0, 0, 0x07E0)` then `present`/`vsync_wait` forever.
+    /// Nothing else in the fork can prove the port end to end (header
+    /// parse -> XIP map -> interpret -> ecall -> PPU compose -> RGB565 ->
+    /// BGRA -> channel -> pane), and there is no committed `.cart` to
+    /// open instead.
+    #[gpui::test]
+    async fn smoke_cart_run_pause_step_stop(cx: &mut TestAppContext) {
+        // The emulator thread is real and self-paced, so the journey has
+        // to be allowed to wait on wall-clock time.
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        std::fs::write(
+            dir.path().join("game.cart"),
+            ggo_emu_panel::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let panel = open_cart(&workspace, cx, dir.path(), "game.cart");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.test_is_ready(),
+                "the cart is selected and its root resolved"
+            );
+            assert!(
+                !panel.test_is_running(),
+                "clicking a cart SELECTS it -- opening a tab must not start a run"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-alt-r");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.test_is_running(),
+                "ctrl-alt-r resolved to ggo_emu::Run and started the cart"
+            );
+        });
+
+        pump_until(
+            &panel,
+            cx,
+            "the first frame off the emulator thread",
+            |panel| panel.test_frame() > 0 && panel.test_frame_pixel(0, 0).is_some(),
+        );
+        panel.read_with(cx, |panel, _| {
+            let green = Some([0x00, 0xFF, 0x00, 0xFF]);
+            assert_eq!(
+                panel.test_frame_pixel(0, 0),
+                green,
+                "the cart's own backdrop -- RGB565 0x07E0 expanded to full-range \
+                 BGRA -- reached the pane, so the whole port really ran"
+            );
+            assert_eq!(
+                panel.test_frame_pixel(160, 120),
+                green,
+                "and the centre too"
+            );
+            assert_eq!(
+                panel.test_frame_pixel(320, 0),
+                None,
+                "and the probe is bounded to the 320x240 framebuffer rather \
+                 than indexing off the end of it"
+            );
+            assert!(!panel.test_is_paused(), "a run starts unpaused");
+        });
+
+        cx.simulate_keystrokes("ctrl-alt-p");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.test_is_paused(),
+                "ctrl-alt-p resolved to ggo_emu::TogglePause"
+            );
+            assert!(panel.test_is_running(), "a paused run is still a run");
+        });
+        let paused_at = settled_frame_count(&panel, cx);
+        assert!(paused_at > 0, "the cart had already produced frames");
+        let still_paused = settled_frame_count(&panel, cx);
+        assert_eq!(
+            still_paused, paused_at,
+            "a paused emulator publishes nothing: the counter is FROZEN"
+        );
+
+        // Step advances and RE-PARKS. Deliberately not `paused_at + 1`:
+        // `drive`'s frame channel is bounded at one frame and the
+        // emulator thread uses `try_send`, so a pane that is behind
+        // simply misses frames -- `test_frame` is the emulator's frame
+        // NUMBER, with gaps, not a count of frames delivered. A frame
+        // presented in the moment between the pause keystroke and the
+        // thread reaching its park can therefore be dropped, leaving the
+        // pane one number behind the emulator, and the step then lands
+        // two numbers on. The exact one-frame contract IS asserted, at
+        // the layer where it is observable: `drive.rs`'s
+        // `pause_parks_step_advances_one_frame_and_resume_continues`
+        // drains the channel itself. What this journey owns is the
+        // wiring -- the keystroke reaches `StepFrame`, the run advances,
+        // and it parks again instead of free-running.
+        cx.simulate_keystrokes("ctrl-alt-.");
+        pump_until(&panel, cx, "the stepped frame", |panel| {
+            panel.test_frame() > paused_at
+        });
+        let after_step = settled_frame_count(&panel, cx);
+        assert!(
+            after_step > paused_at,
+            "ctrl-alt-. resolved to ggo_emu::StepFrame and advanced the run"
+        );
+        assert_eq!(
+            settled_frame_count(&panel, cx),
+            after_step,
+            "and it PARKED again rather than resuming -- one step is not a resume"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_paused(), "and the step left it paused");
+        });
+
+        cx.simulate_keystrokes("ctrl-alt-s");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel.test_is_running(),
+                "ctrl-alt-s resolved to ggo_emu::Stop and ended the run"
+            );
+            assert!(!panel.test_is_paused());
+        });
+        // Let the end-of-run task join the emulator thread and land its
+        // perf data in the temp database, so neither outlives the test.
+        pump_until(&panel, cx, "the run's exit reason", |panel| {
+            panel.test_status().as_deref() == Some("stopped")
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_emu_panel::EmulatorItem>(cx)
+                    .count(),
+                1,
+                "and the tab is still there, ready to run again"
+            );
+        });
+    }
+
+    /// A cart that cannot load must fail LOUDLY and leave the pane
+    /// usable: the run ends on its own, the status row carries the
+    /// loader's reason, no frame is ever shown, and the tab survives to
+    /// run something else.
+    #[gpui::test]
+    async fn smoke_bad_cart_surfaces_an_error_and_survives(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        std::fs::write(dir.path().join("bad.cart"), b"not a cart, just bytes").unwrap();
+
+        let panel = open_cart(&workspace, cx, dir.path(), "bad.cart");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_ready(), "a junk cart still opens a tab");
+            assert!(!panel.test_is_running());
+        });
+
+        // No assertion that the run is briefly live: the loader fails on
+        // the first thing it does, so the frame channel can already be
+        // closed -- and the pump task already finished -- by the time
+        // `simulate_keystrokes`' own pump returns. The observable
+        // contract is what the failure LEFT BEHIND.
+        cx.simulate_keystrokes("ctrl-alt-r");
+        pump_until(&panel, cx, "the failed run to end itself", |panel| {
+            !panel.test_is_running() && panel.test_status().is_some()
+        });
+        panel.read_with(cx, |panel, _| {
+            let status = panel
+                .test_status()
+                .expect("the failure reaches the status row");
+            assert!(
+                status.starts_with("cart: "),
+                "the loader's own reason is what the pane shows: {status:?}"
+            );
+            assert!(
+                !panel.test_status_is_error(),
+                "and it arrives as a run's exit reason, not a refused precondition \
+                 -- FINDING: a cart that fails to load is styled like an ordinary \
+                 exit, so `status_is_error` cannot be used to spot it"
+            );
+            assert_eq!(panel.test_frame(), 0, "no frame was ever produced");
+            assert_eq!(
+                panel.test_frame_pixel(0, 0),
+                None,
+                "and nothing was painted into the pane"
+            );
+            assert!(
+                panel.test_is_ready(),
+                "the cart is still selected -- the pane is usable, not wedged"
+            );
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_emu_panel::EmulatorItem>(cx)
+                    .count(),
+                1,
+                "and the tab survived the failure"
+            );
+        });
+    }
 }

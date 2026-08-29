@@ -67,6 +67,14 @@ impl AudioItem {
     pub(crate) fn panel(&self) -> &Entity<AudioPanel> {
         &self.panel
     }
+
+    /// The wrapped panel, for the cross-crate journeys in `ggo_smoke` --
+    /// the tab is how a `.wav` opens, so the panel is only reachable
+    /// through the item.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_panel(&self) -> Entity<AudioPanel> {
+        self.panel.clone()
+    }
 }
 
 impl EventEmitter<AudioItemEvent> for AudioItem {}

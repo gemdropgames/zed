@@ -8,6 +8,14 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
+[features]
+# Cross-crate test hooks: `ggo_smoke`'s audio journey drives the panel
+# through the tab the open interceptor creates, and everything it reads
+# (the viewer state, the bake, the live preview, the loop flag) is
+# crate-private -- the same reason `ggo_map_panel`/`ggo_world_panel` carry
+# this feature. Read-only hooks only.
+test-support = []
+
 [lib]
 path = "src/ggo_audio_panel.rs"
 

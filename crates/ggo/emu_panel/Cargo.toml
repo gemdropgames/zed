@@ -8,6 +8,15 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
+[features]
+# Cross-crate test hooks: `ggo_smoke`'s emulator journeys drive the panel
+# through the tab the open interceptor creates, and everything they read
+# (the session, the frame counter, the delivered framebuffer, the status
+# row) is private -- the same reason `ggo_map_panel`/`ggo_world_panel`
+# carry this feature. It also re-exports `drive::fixture`, since there is
+# no committed `.cart` in the fork for another crate to open.
+test-support = []
+
 [lib]
 path = "src/ggo_emu_panel.rs"
 

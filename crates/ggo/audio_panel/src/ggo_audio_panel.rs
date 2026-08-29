@@ -537,6 +537,53 @@ impl AudioPanel {
         .detach();
     }
 
+    // --------------------------------------------------- test-support hooks
+
+    /// A file is decoded and the transport is on screen. `test-support`
+    /// only, for `ggo_smoke`'s audio journey -- `state` is crate-private,
+    /// so the tab is the only way in from another crate. Read-only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_ready(&self) -> bool {
+        matches!(self.state, ViewerState::Ready(_))
+    }
+
+    /// The bake behind the Baked-mode transport has landed. `PlayStop`
+    /// before this point is the documented "still baking" no-op rather
+    /// than a preview, so a journey has to wait for it. `test-support`
+    /// only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_baked(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.baked.is_some())
+    }
+
+    /// A preview run is live -- exactly the `self.preview.is_some()` the
+    /// transport button reads to decide between Play and Stop. Says
+    /// nothing about whether the preview THREAD has reached the end of
+    /// the clip: that only becomes visible to the panel when the playhead
+    /// task ticks. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_playing(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    /// The loop flag the next (or current) preview runs with.
+    /// `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_is_looping(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if open.looping)
+    }
+
+    /// The bake / import / playback problem shown under the transport, or
+    /// the load error for a file that never opened. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn test_error(&self) -> Option<String> {
+        match &self.state {
+            ViewerState::Error { message, .. } => Some(message.clone()),
+            ViewerState::Ready(open) => open.error.clone(),
+            _ => None,
+        }
+    }
+
     // --------------------------------------------------------------- render
 
     fn render_message(&self, message: String, cx: &Context<Self>) -> gpui::AnyElement {
