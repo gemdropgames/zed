@@ -795,9 +795,12 @@ impl MapPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        if open.session.step_history(step, project_root.as_deref()) {
-            Self::rebuild_image(open);
+        // An exhausted stack changes nothing, so it must not cost a
+        // recompose or a repaint.
+        if !open.session.step_history(step, project_root.as_deref()) {
+            return;
         }
+        Self::rebuild_image(open);
         cx.notify();
     }
 
@@ -865,17 +868,29 @@ impl MapPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        open.session.bind_tileset(til_rel, project_root.as_deref());
-        Self::rebuild_image(open);
+        // A REFUSED bind leaves the document -- and so the composed pixels
+        // -- untouched; only the error banner is new, so this repaints
+        // without recomposing.
+        if open.session.bind_tileset(til_rel, project_root.as_deref()) {
+            Self::rebuild_image(open);
+        }
         cx.notify();
     }
 
     /// One tool application at `cell`, then a recompose if the document
     /// moved -- [`PaintSession::paint_at`] is the tool state machine.
+    ///
+    /// An inert gesture ([`PaintSession::can_paint`]: no bound tileset, or
+    /// the Terrain tool with no terrain selected) returns without even a
+    /// repaint, because a drag over an unbound map fires this on EVERY
+    /// mouse move.
     fn paint_at(&mut self, cell: (i32, i32), cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        if !open.session.can_paint() {
+            return;
+        }
         if open.session.paint_at(cell) {
             Self::rebuild_image(open);
         }

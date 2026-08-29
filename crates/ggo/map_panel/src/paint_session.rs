@@ -228,22 +228,39 @@ impl PaintSession {
         self.store.apply(op);
     }
 
+    /// Whether a gesture could do ANYTHING right now -- the guard
+    /// [`Self::paint_at`] applies before it looks at the cell, exposed so a
+    /// host can skip the repaint an inert gesture would otherwise cost
+    /// (`false` here means `paint_at` is a guaranteed no-op, on the
+    /// document AND on session state).
+    ///
+    /// Two ways a gesture is inert. Without a bound tileset there is no
+    /// tile pool for a cell index to mean anything, so painting must not
+    /// write indices into a map nothing can resolve -- ggo-ide's
+    /// `on_map_surface_event` opens with the same `tileset_data.is_none()`
+    /// early return. And the Terrain tool paints a SELECTED terrain, so
+    /// with none selected there is nothing to resolve neighbours against.
+    pub fn can_paint(&self) -> bool {
+        if self.tileset.is_none() {
+            return false;
+        }
+        self.tool != MapTool::Terrain
+            || self
+                .terrain
+                .is_some_and(|index| index < self.terrains.len())
+    }
+
     /// One tool application at `cell` -- the canvas's primary-down /
     /// drag-move body, shared by both events (ggo-ide re-fires the same
     /// tool action on every `Moved` while painting).
     ///
     /// Returns true when the DOCUMENT changed, i.e. when the host has to
     /// recompose; Select, Eyedropper and a growing rect-fill mutate only
-    /// session state and return false.
-    ///
-    /// Gated on a bound tileset: without one there is no tile pool for a
-    /// cell index to mean anything, so painting is inert rather than
-    /// writing indices into a map nothing can resolve -- ggo-ide's
-    /// `on_map_surface_event` opens with the same `tileset_data.is_none()`
-    /// early return.
+    /// session state and return false, as does an inert gesture
+    /// ([`Self::can_paint`]).
     pub fn paint_at(&mut self, cell: (i32, i32)) -> bool {
         let (x, y) = cell;
-        if self.tileset.is_none() {
+        if !self.can_paint() {
             return false;
         }
         match self.tool {
@@ -272,6 +289,8 @@ impl PaintSession {
                 false
             }
             MapTool::Terrain => {
+                // `can_paint` already established there is one; this is the
+                // borrow, not a second gate.
                 let Some(terrain) = self.terrain.and_then(|i| self.terrains.get(i)) else {
                     return false;
                 };
@@ -305,9 +324,15 @@ impl PaintSession {
     }
 
     /// Gesture release for the rect-fill tool: the pending preview becomes
-    /// ONE `MapOp::RectFill`. Clears the preview whatever the tool is (a
-    /// tool switch mid-drag must not leave a stale rectangle on screen).
-    /// Returns true when the document changed.
+    /// ONE `MapOp::RectFill`. Returns true when the document changed.
+    ///
+    /// Deliberately NOT symmetric with [`Self::commit_selection`], which is
+    /// why they are two calls rather than one `end_gesture`: this clears
+    /// `rect_pending` whatever the tool is, because a tool switch mid-drag
+    /// must not leave a stale rectangle drawn on the canvas, while
+    /// `commit_selection` settles only under the Select tool, because a
+    /// settled `selection` is what Copy/Paste/Delete act on and must
+    /// survive the switch. Both halves are ggo-ide's, ported.
     pub fn commit_rect(&mut self) -> bool {
         let pending = self.rect_pending.take();
         let Some((x0, y0, x1, y1)) = (self.tool == MapTool::RectFill)
@@ -414,7 +439,13 @@ impl PaintSession {
     ///
     /// Synchronous, same call as [`Self::save`]: one tileset is a few tens
     /// of KB and the user is waiting on the result of their own click.
-    pub fn bind_tileset(&mut self, til_rel: String, project_root: Option<&Path>) {
+    ///
+    /// Returns true when the binding LANDED, i.e. when the host has to
+    /// recompose. A failure leaves the document (and therefore the composed
+    /// pixels) exactly as they were and only records
+    /// [`Self::tileset_error`], so a host that recomposed anyway would pay
+    /// a full map compose to redraw an identical image.
+    pub fn bind_tileset(&mut self, til_rel: String, project_root: Option<&Path>) -> bool {
         // Resolve FIRST: a binding the editor can't open must not reach
         // the document (see this fn's doc). The resolved tileset then goes
         // straight into the cache via `set_tileset`, so bind and
@@ -429,8 +460,12 @@ impl PaintSession {
                 });
                 self.set_tileset(Ok(tileset));
                 self.adopt_tileset_meta(meta);
+                true
             }
-            Err(e) => self.tileset_error = Some(e),
+            Err(e) => {
+                self.tileset_error = Some(e);
+                false
+            }
         }
     }
 
@@ -602,6 +637,13 @@ mod tests {
         session.commit_selection();
         assert_eq!(session.selection, Some((0, 0, 2, 1)));
 
+        session.tool = MapTool::Terrain;
+        assert!(
+            !session.can_paint(),
+            "the terrain tool with nothing selected has no terrain to resolve"
+        );
+        assert!(!session.paint_at((0, 0)));
+
         assert!(session.step_history(MapDocStore::undo, None));
         assert!(!session.dirty(), "one undo reverts the single brush");
     }
@@ -626,6 +668,30 @@ mod tests {
         );
     }
 
+    /// A bind the editor can't resolve must not reach the document -- and
+    /// must say so, since a host that recomposed on it would pay a full
+    /// map compose to redraw identical pixels.
+    #[test]
+    fn a_refused_bind_reports_false_and_leaves_the_document_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        assert!(!session.bind_tileset("tiles/absent.til".to_string(), None));
+        assert_eq!(
+            session.store.state().til_path,
+            "tiles/fx.til",
+            "the refused binding must not reach the store"
+        );
+        assert!(!session.dirty());
+        assert!(session.tileset.is_some(), "the old tileset stays cached");
+        assert!(session.tileset_error.is_some(), "with a reason to show");
+
+        assert!(session.bind_tileset("tiles/fx.til".to_string(), None));
+        assert!(session.tileset_error.is_none());
+    }
+
     #[test]
     fn painting_an_unbound_map_is_inert() {
         let dir = tempfile::tempdir().unwrap();
@@ -636,6 +702,7 @@ mod tests {
         assert!(session.tileset.is_none());
         assert!(session.tileset_error.is_some());
 
+        assert!(!session.can_paint(), "no tile pool, nothing to paint with");
         assert!(!session.paint_at((1, 1)), "no tile pool, no paint");
         assert!(!session.dirty());
         assert!(
