@@ -2526,6 +2526,30 @@ impl WorldPanel {
         }
     }
 
+    /// The WINDOW point that world-pixel position `world` is drawn at, or
+    /// `None` before the canvas element has laid out (no bounds, no pan).
+    ///
+    /// `test-support` only, for `ggo_smoke`'s paint journeys: a smoke test
+    /// clicks the real canvas with real mouse events, which means it needs
+    /// the canvas element's on-screen origin AND the live camera -- both
+    /// crate-private, and both moving targets (the first layout centres the
+    /// active camera, so the world origin is nowhere near the canvas
+    /// origin). A journey that guessed at either would silently click a
+    /// different cell than the one it names.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_canvas_point(&self, world: [f64; 2]) -> Option<gpui::Point<Pixels>> {
+        let view = self.canvas_view()?;
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let bounds = open.view.borrow().last_bounds?;
+        let local = drag_ops::world_to_screen(world[0], world[1], &view);
+        Some(gpui::point(
+            bounds.origin.x + px(local[0] as f32),
+            bounds.origin.y + px(local[1] as f32),
+        ))
+    }
+
     /// How many `[[entity]]` blocks the open document holds.
     /// `test-support` only.
     #[cfg(feature = "test-support")]
@@ -4208,20 +4232,39 @@ impl WorldPanel {
             rail = rail.child(match backgrounds.iter().find(|bg| bg.layer == layer) {
                 Some(background) => slot
                     .child(
-                        // The map's name IS the paint-mode entry (spec:
-                        // "click a linked slot in the layers rail"), and
-                        // its toggled state is what says which layer the
-                        // brush is on.
-                        Button::new(
-                            SharedString::from(format!("ggo-world-bg-paint-{layer}")),
-                            background.stem().to_string(),
-                        )
-                        .label_size(LabelSize::XSmall)
-                        .toggle_state(open.mode == EditMode::Paint(PaintTarget::BgSlot(layer)))
-                        .tooltip(ui::Tooltip::text("Paint this background layer"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.enter_paint_mode(PaintTarget::BgSlot(layer), cx);
-                        })),
+                        // The wrapper carries the `debug_selector` for the
+                        // same reason the Save button's does: `Button` is a
+                        // `RenderOnce` and records none of its own, and the
+                        // label here is the map's stem -- which a test that
+                        // resolved the button by label would have to
+                        // hard-code twice.
+                        div()
+                            // `flex_none` because `ButtonLike` sets it on
+                            // itself: without it this new wrapper becomes a
+                            // shrinkable flex item in the wrapping rail and
+                            // the label it holds could squeeze.
+                            .flex_none()
+                            .debug_selector(move || format!("ggo-world-bg-paint-{layer}"))
+                            .child(
+                                // The map's name IS the paint-mode entry
+                                // (spec: "click a linked slot in the layers
+                                // rail"), and its toggled state is what says
+                                // which layer the brush is on.
+                                Button::new(
+                                    SharedString::from(format!("ggo-world-bg-paint-{layer}")),
+                                    background.stem().to_string(),
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .toggle_state(
+                                    open.mode == EditMode::Paint(PaintTarget::BgSlot(layer)),
+                                )
+                                .tooltip(ui::Tooltip::text("Paint this background layer"))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.enter_paint_mode(PaintTarget::BgSlot(layer), cx);
+                                    },
+                                )),
+                            ),
                     )
                     .child(
                         IconButton::new(("ggo-world-bg-clear", layer as usize), IconName::Trash)
@@ -4236,44 +4279,56 @@ impl WorldPanel {
                     let root = open.root.clone();
                     let weak = cx.weak_entity();
                     slot.child(
-                        PopoverMenu::new(SharedString::from(format!("ggo-world-bg-menu-{layer}")))
-                            .trigger(
-                                Button::new(
-                                    SharedString::from(format!("ggo-world-bg-slot-{layer}")),
-                                    "Add…",
+                        // The wrapper carries the `debug_selector`: a
+                        // `PopoverMenu` trigger has to be `Toggleable`, so
+                        // the marker cannot go on a div INSIDE the trigger
+                        // slot, and the `Button` itself records none. Its
+                        // bounds are the trigger's -- the menu is deferred.
+                        div()
+                            .flex_none()
+                            .debug_selector(move || format!("ggo-world-bg-slot-{layer}"))
+                            .child(
+                                PopoverMenu::new(SharedString::from(format!(
+                                    "ggo-world-bg-menu-{layer}"
+                                )))
+                                .trigger(
+                                    Button::new(
+                                        SharedString::from(format!("ggo-world-bg-slot-{layer}")),
+                                        "Add…",
+                                    )
+                                    .label_size(LabelSize::XSmall),
                                 )
-                                .label_size(LabelSize::XSmall),
-                            )
-                            // Lazy on purpose: the tileset list is a
-                            // recursive walk of the asset root, and this
-                            // rail renders every frame. It also means a
-                            // tileset created while the world is open
-                            // shows up on the next open of the picker.
-                            .menu(move |window, cx| {
-                                let tilesets = io::list_tilesets(&root);
-                                let weak = weak.clone();
-                                Some(ContextMenu::build(
-                                    window,
-                                    cx,
-                                    move |mut menu, _window, _cx| {
-                                        for til in tilesets {
-                                            let weak = weak.clone();
-                                            menu = menu.entry(
-                                                SharedString::from(til.clone()),
-                                                None,
-                                                move |_window, cx| {
-                                                    let til = til.clone();
-                                                    weak.update(cx, |this, cx| {
-                                                        this.add_background_impl(layer, til, cx)
-                                                    })
-                                                    .ok();
-                                                },
-                                            );
-                                        }
-                                        menu
-                                    },
-                                ))
-                            }),
+                                // Lazy on purpose: the tileset list is a
+                                // recursive walk of the asset root, and this
+                                // rail renders every frame. It also means a
+                                // tileset created while the world is open
+                                // shows up on the next open of the picker.
+                                .menu(move |window, cx| {
+                                    let tilesets = io::list_tilesets(&root);
+                                    let weak = weak.clone();
+                                    Some(ContextMenu::build(
+                                        window,
+                                        cx,
+                                        move |mut menu, _window, _cx| {
+                                            for til in tilesets {
+                                                let weak = weak.clone();
+                                                menu = menu.entry(
+                                                    SharedString::from(til.clone()),
+                                                    None,
+                                                    move |_window, cx| {
+                                                        let til = til.clone();
+                                                        weak.update(cx, |this, cx| {
+                                                            this.add_background_impl(layer, til, cx)
+                                                        })
+                                                        .ok();
+                                                    },
+                                                );
+                                            }
+                                            menu
+                                        },
+                                    ))
+                                }),
+                            ),
                     )
                     .into_any_element()
                 }
@@ -4896,6 +4951,11 @@ impl WorldPanel {
         Some(
             div()
                 .id("ggo-world-paint")
+                // The column's own bounds, so a test can tell the tool
+                // rail's Select button (`ICON-Maximize`) from the PANE's
+                // zoom button, which shares that icon and therefore that
+                // debug selector in a whole-workspace test.
+                .debug_selector(|| "ggo-world-paint".into())
                 .w(PAINT_WIDTH)
                 .h_full()
                 .flex_none()

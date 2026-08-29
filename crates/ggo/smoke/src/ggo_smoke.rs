@@ -12,6 +12,8 @@
 mod tests {
     use std::path::Path;
 
+    use ggo_map_panel::PaintSession;
+    use ggo_worldlib::world_file;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use workspace::{AppState, MultiWorkspace, Workspace};
@@ -1518,6 +1520,571 @@ mod tests {
                 "where it was, not at some default"
             );
         });
+    }
+
+    // ----------------------------------------- world-hosted map journeys
+
+    /// The fixture background map's side, in cells.
+    const BG_MAP_DIM: u16 = 8;
+
+    /// The packed cell a canvas click paints with NOTHING selected in the
+    /// tileset strip. The strip's anchor/far both start at `(0, 0)`, so
+    /// `palette_sel_rect` + `build_stamp` give a 1x1 stamp of tile 0 with
+    /// palSub 0 and no flips -- `pack_cell(0, 0, false, false)`, i.e. `0`.
+    /// Blank is `CELL_BLANK` (`0x03FF`), so a painted cell and an unpainted
+    /// one are never confusable.
+    fn map_painted_cell() -> u16 {
+        ggo_worldlib::sprites::map_doc::pack_cell(0, 0, false, false)
+    }
+
+    /// A blank cell: worldlib's own sentinel, NOT zero.
+    fn map_blank_cell() -> u16 {
+        ggo_worldlib::sprites::map_doc::CELL_BLANK
+    }
+
+    /// The paint fixtures' two-tile tileset at `assets/art/mapfx.til`
+    /// (tile 0 transparent, tile 1 solid slot 1) -- the same hand-built
+    /// sheet the float journeys use, and the ONLY `.til` under the asset
+    /// root, so the layers rail's picker has exactly one entry to offer.
+    fn write_paint_tileset(root: &Path) {
+        let tile_pixels = ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+        let mut indices = vec![0u8; 2 * tile_pixels];
+        for value in &mut indices[tile_pixels..] {
+            *value = 1;
+        }
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800;
+        ggo_worldlib::sprites::io::save_tileset(
+            root,
+            "assets/art/mapfx.til",
+            &indices,
+            2,
+            &palette,
+        )
+        .expect("worldlib writes the fixture tileset");
+    }
+
+    /// A world under `assets/worlds/`, with whatever `[[background]]`
+    /// slots the journey needs, written through worldlib's own
+    /// `write_world`.
+    ///
+    /// Under `assets/` on purpose, unlike [`write_world_fixture`]'s
+    /// project-root world: the panel derives its ASSET ROOT by splitting
+    /// the clicked path at its `worlds/` segment, so this fixture's root
+    /// is `<project>/assets` and every path inside the documents
+    /// (`maps/...`, `art/mapfx.til`) is one segment shorter than its place
+    /// on disk. A world at the project root would make the two frames
+    /// identical and the asset-root-relative assertions below vacuous.
+    fn write_paint_world(root: &Path, stem: &str, backgrounds: Vec<world_file::Background>) {
+        write_paint_tileset(root);
+        world_file::write_world(
+            root,
+            &format!("assets/worlds/{stem}.toml"),
+            &world_file::WorldFile {
+                entities: vec![],
+                instances: vec![],
+                backgrounds,
+            },
+        )
+        .expect("worldlib writes the world fixture");
+    }
+
+    /// The paint round-trip's world: `assets/worlds/edit.toml`, its `bg0`
+    /// slot linked to an 8x8 all-blank map at `assets/maps/edit.bg0.map`
+    /// that is born BOUND to the fixture tileset.
+    ///
+    /// Bound at write time on purpose: binding is a picker flow of its own
+    /// (and the third journey below drives it), and what these two are
+    /// about is the EDIT session that follows one. The `til_path` inside
+    /// the map is ASSET-ROOT-relative (`art/mapfx.til`, no `assets/`
+    /// segment) -- the F4 `ggo-sprfix` contract, which the save half of
+    /// journey one re-reads off disk.
+    fn write_paint_fixture(root: &Path) {
+        write_paint_world(
+            root,
+            "edit",
+            vec![world_file::Background {
+                layer: 0,
+                map: "maps/edit.bg0.map".into(),
+            }],
+        );
+        std::fs::create_dir_all(root.join("assets/maps")).unwrap();
+        ggo_worldlib::sprites::io::save_map(
+            root,
+            "assets/maps/edit.bg0.map",
+            &ggo_worldlib::sprites::map_doc::MapState {
+                w: BG_MAP_DIM,
+                h: BG_MAP_DIM,
+                cells: vec![map_blank_cell(); BG_MAP_DIM as usize * BG_MAP_DIM as usize],
+                til_path: "art/mapfx.til".to_string(),
+                pal_path: "art/mapfx.pal".to_string(),
+                dirty: false,
+            },
+        )
+        .expect("worldlib writes the fixture background map");
+    }
+
+    /// Open `rel` the way a user does -- the project panel's click funnel
+    /// -- and hand back the loaded panel behind the canvas tab.
+    async fn open_world_tab(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        rel: &str,
+    ) -> Entity<ggo_world_panel::WorldPanel> {
+        assert!(
+            offer_open(workspace, cx, rel),
+            "the world interceptor claimed {rel}"
+        );
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_world_panel::WorldCanvasItem>(cx)
+                .next()
+                .expect("the interceptor opened the world canvas tab")
+                .read(cx)
+                .test_panel()
+                .expect("the tab's panel is alive")
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.test_is_ready(), "the world loaded");
+            assert!(!panel.test_is_dirty(), "a freshly loaded world is clean");
+        });
+        panel
+    }
+
+    /// Enter (or leave, when it is already on) paint mode on background
+    /// layer `layer` the way a user does: a click on that slot's button in
+    /// the layers rail. The button's label is the map's stem, so the
+    /// journeys resolve it by the rail's own `debug_selector` rather than
+    /// re-spelling the fixture's file name.
+    fn click_bg_slot(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let button = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} painted in the layers rail"));
+        click(cx, button.center());
+        cx.run_until_parked();
+    }
+
+    /// Screen point at the centre of background cell `(x, y)`. A
+    /// background slot's paint anchor is the world origin
+    /// (`paint_target_rel`), so a cell centre is plain tile arithmetic in
+    /// WORLD px -- put on screen through the panel's live camera, which is
+    /// neither at the canvas origin nor at zoom 1 by default.
+    fn bg_cell_center(
+        panel: &Entity<ggo_world_panel::WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        x: i32,
+        y: i32,
+    ) -> gpui::Point<gpui::Pixels> {
+        let tile = ggo_worldlib::sprites::tileset_doc::TILE_PX as f64;
+        panel.read_with(cx, |panel, _| {
+            panel
+                .test_canvas_point([(x as f64 + 0.5) * tile, (y as f64 + 0.5) * tile])
+                .expect("the canvas painted")
+        })
+    }
+
+    /// Click the centre of background cell `(x, y)`.
+    fn click_bg_cell(
+        panel: &Entity<ggo_world_panel::WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        x: i32,
+        y: i32,
+    ) {
+        let at = bg_cell_center(panel, cx, x, y);
+        click(cx, at);
+        cx.run_until_parked();
+    }
+
+    /// Cell `(x, y)` of the paint session editing `rel`.
+    fn bg_cell(
+        panel: &Entity<ggo_world_panel::WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        rel: &str,
+        x: usize,
+        y: usize,
+    ) -> u16 {
+        panel.read_with(cx, |panel, _| {
+            let state = panel
+                .test_paint_session(rel)
+                .expect("the world loaded a session for the painted map")
+                .store
+                .state();
+            state.cells[y * state.w as usize + x]
+        })
+    }
+
+    /// Switch to the Select tool the way a user does -- a click on the
+    /// paint column's tool rail. The map tools are rail-only (ggo-ide has
+    /// no letter hotkeys for them either), and an `IconButton`'s debug
+    /// selector is its ICON name, which `MapTool::Select`
+    /// (`IconName::Maximize`) shares with the PANE's zoom button. The
+    /// guard pins the hit inside the world panel's paint column, so a
+    /// wrong-button click fails here instead of silently doing something
+    /// else.
+    fn pick_select_tool(cx: &mut gpui::VisualTestContext) {
+        let column = cx
+            .debug_bounds("ggo-world-paint")
+            .expect("the paint column painted -- the panel is in paint mode");
+        let button = cx
+            .debug_bounds("ICON-Maximize")
+            .expect("the Select tool button painted");
+        assert!(
+            column.contains(&button.center()),
+            "the resolved button is the paint column's Select tool, not the pane's zoom button"
+        );
+        click(cx, button.center());
+        cx.run_until_parked();
+    }
+
+    /// The map editing spine, now hosted by the WORLD editor and driven
+    /// through the real funnel: click the world open, click its `bg0` slot
+    /// in the layers rail to put that map under the brush, click a canvas
+    /// cell to stamp the default brush into it, walk the edit back and
+    /// forth with undo/redo, ctrl-s, and reread the `.map` through
+    /// worldlib.
+    ///
+    /// The stamp is the interesting part of the fixture: nothing is
+    /// selected in the tileset strip, and the session still paints -- the
+    /// strip's anchor starts at tile 0, so "no selection" is a 1x1 stamp
+    /// of tile 0 rather than a dead brush.
+    ///
+    /// The two dirty flags are separate on purpose: painting a background
+    /// dirties the SESSION, never the world document (no `WorldOp` runs),
+    /// and one ctrl-s has to clean both.
+    #[gpui::test]
+    async fn smoke_world_paint_undo_and_save_round_trip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        write_paint_fixture(dir.path());
+        let panel = open_world_tab(&workspace, cx, "assets/worlds/edit.toml").await;
+
+        const MAP_REL: &str = "maps/edit.bg0.map";
+        click_bg_slot(cx, "ggo-world-bg-paint-0");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some(MAP_REL),
+                "the rail click put the bg0 map under the brush"
+            );
+            let session = panel
+                .test_paint_session(MAP_REL)
+                .expect("and loaded its session");
+            assert_eq!(
+                session.store.state().til_path,
+                "art/mapfx.til",
+                "already bound to the fixture tileset, asset-root-relative"
+            );
+            assert!(
+                session.tileset.is_some(),
+                "and that binding resolved to real art -- an unbound session paints nothing"
+            );
+            assert!(!session.dirty(), "a freshly loaded map is clean");
+        });
+
+        click_bg_cell(&panel, cx, 1, 1);
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel
+                    .test_paint_session(MAP_REL)
+                    .is_some_and(PaintSession::dirty),
+                "the click dirtied the map session"
+            );
+            assert!(
+                !panel.test_is_dirty(),
+                "and left the world document alone -- painting runs no WorldOp"
+            );
+        });
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 1, 1),
+            map_painted_cell(),
+            "the click stamped the default brush -- tile 0, palSub 0, no flips"
+        );
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 0, 0),
+            map_blank_cell(),
+            "and touched no other cell"
+        );
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 1, 1),
+            map_blank_cell(),
+            "one undo took the whole click-gesture back"
+        );
+        cx.simulate_keystrokes("ctrl-shift-z");
+        cx.run_until_parked();
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 1, 1),
+            map_painted_cell(),
+            "and redo replays it"
+        );
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel
+                    .test_paint_session(MAP_REL)
+                    .is_some_and(PaintSession::dirty),
+                "ctrl-s cleaned the map session"
+            );
+            assert!(!panel.test_is_dirty(), "and the world store with it");
+        });
+
+        let on_disk = ggo_worldlib::sprites::io::open_map(&dir.path().join("assets"), MAP_REL)
+            .expect("worldlib reopens what ctrl-s wrote");
+        assert_eq!(
+            (on_disk.w, on_disk.h),
+            (BG_MAP_DIM, BG_MAP_DIM),
+            "same size"
+        );
+        assert_eq!(
+            on_disk.til_path, "art/mapfx.til",
+            "the save kept the asset-root-relative binding"
+        );
+        let cell_index = |x: usize, y: usize| y * BG_MAP_DIM as usize + x;
+        assert_eq!(
+            on_disk.cells[cell_index(1, 1)],
+            map_painted_cell(),
+            "the file holds the cell the panel shows"
+        );
+        assert_eq!(
+            on_disk.cells[0],
+            map_blank_cell(),
+            "and left every other cell blank"
+        );
+    }
+
+    /// The selection branches of the world-hosted brush, which only a
+    /// whole journey tells apart from a dead binding: a Select-tool drag
+    /// on the WORLD canvas really settles a cell selection, escape drops
+    /// the selection before it drops the MODE (two levels, one key), and a
+    /// re-selected delete blanks exactly the selected cells as one undo
+    /// step.
+    #[gpui::test]
+    async fn smoke_world_paint_select_delete_and_escape_branches(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        write_paint_fixture(dir.path());
+        let panel = open_world_tab(&workspace, cx, "assets/worlds/edit.toml").await;
+
+        const MAP_REL: &str = "maps/edit.bg0.map";
+        click_bg_slot(cx, "ggo-world-bg-paint-0");
+        click_bg_cell(&panel, cx, 1, 1);
+        click_bg_cell(&panel, cx, 2, 1);
+        assert_eq!(bg_cell(&panel, cx, MAP_REL, 1, 1), map_painted_cell());
+        assert_eq!(bg_cell(&panel, cx, MAP_REL, 2, 1), map_painted_cell());
+
+        pick_select_tool(cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel
+                    .test_paint_session(MAP_REL)
+                    .expect("the session is live")
+                    .tool,
+                ggo_map_panel::MapTool::Select,
+                "the rail's button switched the tool"
+            );
+        });
+
+        let select_both = |cx: &mut gpui::VisualTestContext| {
+            let from = bg_cell_center(&panel, cx, 1, 1);
+            let to = bg_cell_center(&panel, cx, 2, 1);
+            cx.simulate_mouse_down(from, gpui::MouseButton::Left, Default::default());
+            cx.simulate_mouse_move(to, gpui::MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default());
+            cx.run_until_parked();
+        };
+        let selection = |cx: &mut gpui::VisualTestContext| {
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .test_paint_session(MAP_REL)
+                    .expect("the session is live")
+                    .selection
+            })
+        };
+        select_both(cx);
+        assert_eq!(
+            selection(cx),
+            Some((1, 1, 2, 1)),
+            "the drag settled a two-cell selection"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(selection(cx), None, "escape cleared the selection");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some(MAP_REL),
+                "and did NOT leave paint mode while there was a selection to clear"
+            );
+        });
+
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 1, 1),
+            map_painted_cell(),
+            "delete with nothing selected is a no-op"
+        );
+        assert_eq!(bg_cell(&panel, cx, MAP_REL, 2, 1), map_painted_cell());
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel(),
+                None,
+                "the SECOND escape left paint mode for entity editing"
+            );
+        });
+
+        click_bg_slot(cx, "ggo-world-bg-paint-0");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some(MAP_REL),
+                "the rail put the same map back under the brush"
+            );
+        });
+        select_both(cx);
+        assert_eq!(
+            selection(cx),
+            Some((1, 1, 2, 1)),
+            "the Select tool survived the round trip through entity mode"
+        );
+
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 1, 1),
+            map_blank_cell(),
+            "delete blanked the selected cells"
+        );
+        assert_eq!(bg_cell(&panel, cx, MAP_REL, 2, 1), map_blank_cell());
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 3, 1),
+            map_blank_cell(),
+            "and nothing outside them was ever painted"
+        );
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 1, 1),
+            map_painted_cell(),
+            "one undo restored both cells -- the delete is ONE rect fill"
+        );
+        assert_eq!(bg_cell(&panel, cx, MAP_REL, 2, 1), map_painted_cell());
+    }
+
+    /// The layers rail's add flow, end to end: a world with no
+    /// backgrounds, an empty slot's picker, a tileset pick that has to
+    /// GENERATE the `.map` before it can link it, and a paint + ctrl-s
+    /// that lands in both files at once.
+    ///
+    /// The generated map's name is the world's own stem plus the slot
+    /// (`background_map_rel`), so the link the document gains and the file
+    /// the pick wrote have to agree by construction, not by luck.
+    #[gpui::test]
+    async fn smoke_world_add_background_layer_journey(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, cx) = boot_all(cx, dir.path()).await;
+        write_paint_world(dir.path(), "blank", vec![]);
+        let panel = open_world_tab(&workspace, cx, "assets/worlds/blank.toml").await;
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.test_backgrounds().is_empty(),
+                "the fixture world links no background at all"
+            );
+        });
+
+        const MAP_REL: &str = "maps/blank.bg1.map";
+        assert!(
+            !dir.path().join("assets").join(MAP_REL).exists(),
+            "and nothing has generated its bg1 map yet"
+        );
+
+        click_bg_slot(cx, "ggo-world-bg-slot-1");
+        let entry = cx
+            .debug_bounds("MENU_ITEM-art/mapfx.til")
+            .expect("the empty slot's picker offered the asset root's one tileset");
+        click(cx, entry.center());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_backgrounds(),
+                vec![world_file::Background {
+                    layer: 1,
+                    map: MAP_REL.to_string(),
+                }],
+                "the pick linked slot 1 to the map named after the world's stem"
+            );
+            assert!(
+                panel.test_is_dirty(),
+                "the link is an undoable edit of the world document"
+            );
+        });
+        let generated = ggo_worldlib::sprites::io::open_map(&dir.path().join("assets"), MAP_REL)
+            .expect("the pick generated the map it linked");
+        assert_eq!(
+            generated.til_path, "art/mapfx.til",
+            "born bound to the picked tileset, asset-root-relative"
+        );
+        assert!(
+            generated.cells.iter().all(|&cell| cell == map_blank_cell()),
+            "and born blank"
+        );
+
+        click_bg_slot(cx, "ggo-world-bg-paint-1");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some(MAP_REL),
+                "the freshly linked slot is paintable straight away"
+            );
+        });
+        click_bg_cell(&panel, cx, 2, 3);
+        assert_eq!(
+            bg_cell(&panel, cx, MAP_REL, 2, 3),
+            map_painted_cell(),
+            "and paints with the tileset the pick bound"
+        );
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.test_is_dirty(), "ctrl-s cleaned the world document");
+            assert!(
+                !panel
+                    .test_paint_session(MAP_REL)
+                    .is_some_and(PaintSession::dirty),
+                "and the map session"
+            );
+        });
+
+        let world = world_file::read_world(&dir.path().join("assets"), "worlds/blank.toml")
+            .expect("worldlib reopens the saved world");
+        assert_eq!(
+            world.backgrounds,
+            vec![world_file::Background {
+                layer: 1,
+                map: MAP_REL.to_string(),
+            }],
+            "the file carries the [[background]] link"
+        );
+        let saved = ggo_worldlib::sprites::io::open_map(&dir.path().join("assets"), MAP_REL)
+            .expect("worldlib reopens the saved map");
+        assert_eq!(
+            saved.cells[3 * saved.w as usize + 2],
+            map_painted_cell(),
+            "and the map bytes hold the paint"
+        );
     }
 
     // ------------------------------------------------------------- audio
