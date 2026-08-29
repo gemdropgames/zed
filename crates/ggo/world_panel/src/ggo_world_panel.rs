@@ -3963,7 +3963,12 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_toolbar is only called in the Ready state");
         };
-        let dirty = open.store.state().dirty;
+        // The DOCUMENT's predicate, not the world store's: a brush stroke
+        // on a saved world leaves the store clean, and a disabled Save
+        // button in front of unwritten cells is an affordance that lies.
+        // One local drives all three of the dot, the title color and the
+        // button, so they cannot drift apart from each other.
+        let dirty = self.dirty_world_name().is_some();
         let has_selection = !open.selected.is_empty();
         let candidates = self.instance_candidates();
         let weak = cx.weak_entity();
@@ -4069,10 +4074,16 @@ impl WorldPanel {
                     .tooltip(ui::Tooltip::text("Redo"))
                     .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
             )
+            // The wrapper carries the `debug_selector`: `Button` is a
+            // `RenderOnce`, and a DISABLED button records no bounds of its
+            // own -- so a test that located it by id could never tell
+            // "greyed out" from "not rendered".
             .child(
-                Button::new("ggo-world-save", "Save")
-                    .disabled(!dirty)
-                    .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
+                div().debug_selector(|| "ggo-world-save".into()).child(
+                    Button::new("ggo-world-save", "Save")
+                        .disabled(!dirty)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
+                ),
             )
             .children(open.save_error.as_ref().map(|e| {
                 ggo_common::CopyableText::new(
@@ -10609,6 +10620,56 @@ mod tests {
             pack_cell(0, 0, false, false),
             "and it actually wrote the second cell to disk"
         );
+    }
+
+    /// The toolbar renders in paint mode too, and one `dirty` local drives
+    /// all three of its title dot, its title color and
+    /// `.disabled(!dirty)` on the Save button. That predicate has to be the
+    /// DOCUMENT's: after a brush stroke on a saved world the store is
+    /// clean, so a store-only predicate greys the only save affordance a
+    /// painting user has out from under them. Asserted through a real
+    /// CLICK, because `.disabled` filters the click handler out while
+    /// ctrl-S reaches the action either way -- a keystroke test cannot see
+    /// this regression.
+    #[gpui::test]
+    async fn test_the_toolbar_save_button_follows_paint_dirt(cx: &mut TestAppContext) {
+        use ggo_worldlib::sprites::map_doc::pack_cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = painting_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert!(
+                !panel.test_is_dirty(),
+                "the world store stays clean -- only the map moved"
+            );
+        });
+        cx.run_until_parked();
+
+        // The selector is on the button's WRAPPER, so it resolves whether
+        // the button is live or greyed out: the click below is what tells
+        // the two apart.
+        let bounds = cx
+            .debug_bounds("ggo-world-save")
+            .expect("the toolbar renders in paint mode");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            io::open_map(dir.path(), "maps/test.bg0.map").unwrap().cells[0],
+            pack_cell(0, 0, false, false),
+            "a disabled Save button would have swallowed the click and left \
+             the painted cell unwritten"
+        );
+        panel.update(cx, |panel, _| {
+            assert!(
+                panel.dirty_world_name().is_none(),
+                "and the same predicate that enabled the button now clears \
+                 the dot"
+            );
+        });
     }
 
     /// "Don't Save" reloads from disk, and discard has to mean discard:
