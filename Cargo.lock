@@ -7785,6 +7785,7 @@ dependencies = [
  "ggo-audio",
  "ggo-worldlib",
  "ggo_common",
+ "ggo_map_panel",
  "ggo_sprite_panel",
  "gpui",
  "log",

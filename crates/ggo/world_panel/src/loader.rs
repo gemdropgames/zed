@@ -34,6 +34,14 @@ pub struct LoadedWorld {
     pub map_loads: AssetLoads,
     pub meta_sprite_loads: AssetLoads,
     pub merged: Vec<MergedBackground>,
+    /// Each `[[instance]]`'d world's own `[[background]]` set, by stem --
+    /// the third input to [`merge_backgrounds`]. Retained (rather than
+    /// dropped once `merged` is computed) because editing the BASE
+    /// world's slots has to re-run the merge against exactly the same
+    /// instance sets, and re-reading every instance world file on the UI
+    /// thread for that would be a second, drifting copy of the load-time
+    /// read below.
+    pub instance_backgrounds: HashMap<String, Vec<Background>>,
     /// Inspector schema set: builtins + this project's manifest
     /// components (see [`manifest_schemas`]).
     pub schemas: Vec<ComponentSchema>,
@@ -111,12 +119,7 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
             loaded_bgs.insert(world.clone(), w.backgrounds);
         }
     }
-    let instances: Vec<(String, bool)> = state
-        .instances
-        .iter()
-        .map(|i| (i.world.clone(), i.background_priority))
-        .collect();
-    let merged = merge_backgrounds(&state.backgrounds, &instances, &loaded_bgs);
+    let merged = merged_backgrounds(&state, &loaded_bgs);
 
     // Asset composition -- ggo-ide's `dispatch_new_asset_loads` target set:
     // `collect_load_targets` for entities/subtrees, plus the merged
@@ -133,13 +136,7 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
         let load = settle(io::compose_map_rgba(project_dir, &stem).map_err(|e| e.to_string()));
         map_loads.insert(stem, load);
     }
-    for bg in &merged {
-        if !map_loads.contains_key(&bg.stem) {
-            let load =
-                settle(io::compose_map_rgba(project_dir, &bg.stem).map_err(|e| e.to_string()));
-            map_loads.insert(bg.stem.clone(), load);
-        }
-    }
+    fill_missing_background_loads(project_dir, &merged, &mut map_loads);
     let mut meta_sprite_loads = AssetLoads::new();
     for (stem, clip) in meta_targets {
         let key = render::meta_sprite_load_key(&stem, &clip);
@@ -153,8 +150,43 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
         map_loads,
         meta_sprite_loads,
         merged,
+        instance_backgrounds: loaded_bgs,
         schemas: schemas_near(project_dir),
     })
+}
+
+/// The merged `[[background]]` slot set for `state`, given every
+/// instance world's own slot list. Shared by [`load_world`] and by the
+/// panel's post-edit re-merge so that "which map fills which layer" has
+/// exactly one caller shape -- an add/clear/undo of a base-world slot has
+/// to answer it identically to the load that opened the world.
+pub fn merged_backgrounds(
+    state: &WorldState,
+    instance_backgrounds: &HashMap<String, Vec<Background>>,
+) -> Vec<MergedBackground> {
+    let instances: Vec<(String, bool)> = state
+        .instances
+        .iter()
+        .map(|i| (i.world.clone(), i.background_priority))
+        .collect();
+    merge_backgrounds(&state.backgrounds, &instances, instance_backgrounds)
+}
+
+/// Compose every merged background stem missing from `map_loads`, in
+/// place -- the background half of [`fill_missing_asset_loads`], and the
+/// only source of background map loads (`collect_load_targets` never
+/// reports background stems). Already-present stems are never recomposed:
+/// their pointer identity keys the panel's `RenderImage` cache.
+pub fn fill_missing_background_loads(
+    project_dir: &Path,
+    merged: &[MergedBackground],
+    map_loads: &mut AssetLoads,
+) {
+    for bg in merged {
+        map_loads.entry(bg.stem.clone()).or_insert_with(|| {
+            settle(io::compose_map_rgba(project_dir, &bg.stem).map_err(|e| e.to_string()))
+        });
+    }
 }
 
 // --------------------------------------------------- incremental (add time)

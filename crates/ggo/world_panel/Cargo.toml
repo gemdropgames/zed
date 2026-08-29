@@ -33,7 +33,16 @@ ggo-worldlib.workspace = true # GGO
 ggo-asset-formats.workspace = true # GGO
 ggo-audio.workspace = true # GGO -- the audio budget line sizes stems against the 384 KiB sample region
 ggo_common.workspace = true
+# GGO -- wired ahead of its first use (the layers rail lands before the
+# painting does): world-hosted map editing paints a background layer with
+# `ggo_map_panel`'s own `PaintSession`/`MapTool` rather than growing a
+# second copy of the painting engine here.
+ggo_map_panel.workspace = true # GGO
 [dev-dependencies]
+# The map panel's own read-back hooks are `test-support`-gated over there,
+# exactly as this crate gates its own; the world panel's painting tests
+# will read cells back through them.
+ggo_map_panel = { workspace = true, features = ["test-support"] } # GGO
 # Test-only: the asset jump goes through the path-open interceptor
 # registry, so the sprite panel's `init` is what makes a `.spr` land in a
 # sprite tab in the jump test. The panel itself has no sprite-panel dep.

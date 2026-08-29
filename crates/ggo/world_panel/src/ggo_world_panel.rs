@@ -45,7 +45,7 @@ use gpui::{
 };
 use serde_json::Value;
 use ui::prelude::*;
-use ui::{Checkbox, ContextMenu, Divider, DropdownMenu, ToggleState};
+use ui::{Checkbox, ContextMenu, Divider, DropdownMenu, PopoverMenu, ToggleState};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::{SplitDirection, Workspace};
 
@@ -57,10 +57,10 @@ use ggo_worldlib::render::{
     items_in_rect, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
-use ggo_worldlib::sprites::palette565;
+use ggo_worldlib::sprites::{io, palette565};
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
 use ggo_worldlib::world_file::write_world;
-use ggo_worldlib::world_file::{self, WorldEntity, fragment_to_toml, parse_fragment};
+use ggo_worldlib::world_file::{self, Background, WorldEntity, fragment_to_toml, parse_fragment};
 use ggo_worldlib::world_files::{self, WorldListing};
 use project::ProjectPath;
 
@@ -286,6 +286,14 @@ fn asset_rel_for_stem(
 /// not have to depend on worldlib for it.
 pub fn world_stem(rel: &str) -> Option<String> {
     split_world_path(rel).map(|(_, listing)| listing.stem)
+}
+
+/// Where the add-layer flow puts a world's generated background map. The
+/// leading `worlds/` is dropped but nesting is kept, so two worlds with
+/// the same basename in different subdirectories cannot collide.
+fn background_map_rel(world_stem: &str, layer: u8) -> String {
+    let stem = world_stem.strip_prefix("worlds/").unwrap_or(world_stem);
+    format!("maps/{stem}.bg{layer}.map")
 }
 
 /// `workspace::PathOpenInterceptor` for `**/worlds/**/*.toml`: claim the
@@ -567,6 +575,10 @@ struct OpenWorld {
     map_loads: AssetLoads,
     meta_sprite_loads: AssetLoads,
     merged: Vec<MergedBackground>,
+    /// The load's `[[instance]]` background sets, kept so an edit to THIS
+    /// world's slots can re-run the merge without re-reading every
+    /// instance world file -- see `loader::LoadedWorld`'s field doc.
+    instance_backgrounds: HashMap<String, Vec<Background>>,
     schemas: Vec<ComponentSchema>,
     /// One gpui `RenderImage` (BGRA) per composed worldlib image, built
     /// once at load time -- see `canvas::build_image_cache`.
@@ -659,6 +671,7 @@ impl OpenWorld {
             map_loads: loaded.map_loads,
             meta_sprite_loads: loaded.meta_sprite_loads,
             merged: loaded.merged,
+            instance_backgrounds: loaded.instance_backgrounds,
             schemas: loaded.schemas,
             images: Arc::new(images),
             view: Rc::new(RefCell::new(ViewShared {
@@ -1375,6 +1388,76 @@ impl WorldPanel {
         cx.notify();
     }
 
+    /// Layers rail "add": bind layer `layer` of the OPEN world to
+    /// `maps/<stem>.bg<layer>.map`, writing that map first if it is not
+    /// on disk yet -- blank and already bound to the picked tileset, so
+    /// the slot is paintable with no follow-up bind.
+    ///
+    /// The write is deliberately conditional. Undo unlinks the slot but
+    /// (like every `SetBackground`) leaves the file alone, so redo -- and
+    /// a deliberate re-add of a layer the user cleared earlier -- must
+    /// re-LINK the existing map rather than blank whatever was painted
+    /// into it.
+    fn add_background_impl(&mut self, layer: u8, til_rel: String, cx: &mut Context<Self>) {
+        /// Side of a freshly generated background map, in tiles --
+        /// `ggo_map_panel::geom::NEW_MAP_DIM`'s value for the same "new
+        /// map" idea (that module is crate-private over there).
+        const NEW_BG_DIM: u16 = 16;
+
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let map_rel = background_map_rel(&open.listing.stem, layer);
+        if io::open_map(&open.root, &map_rel).is_err()
+            && let Err(e) =
+                io::save_new_bound_map(&open.root, &map_rel, NEW_BG_DIM, NEW_BG_DIM, &til_rel)
+        {
+            open.save_error = Some(e.to_string());
+            cx.notify();
+            return;
+        }
+        self.apply_op(
+            WorldOp::SetBackground {
+                layer,
+                map: Some(map_rel),
+            },
+            cx,
+        );
+        self.refresh_backgrounds(cx);
+    }
+
+    /// Layers rail "clear": unlink `layer`. Never deletes the `.map` --
+    /// other worlds may share it, and unlink is undoable where deletion
+    /// would not be (`WorldOp::SetBackground`'s own contract).
+    fn clear_background_impl(&mut self, layer: u8, cx: &mut Context<Self>) {
+        self.apply_op(WorldOp::SetBackground { layer, map: None }, cx);
+        self.refresh_backgrounds(cx);
+    }
+
+    /// Re-run the background merge and refresh what the canvas paints
+    /// from it. Every path that can change a `[[background]]` slot --
+    /// add, clear, undo, redo -- ends here, because `merged` (not the
+    /// document's own slot list) is what the draw list reads, and a newly
+    /// linked stem has no composed image until it is asked for.
+    fn refresh_backgrounds(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open.merged = loader::merged_backgrounds(&open.store.state(), &open.instance_backgrounds);
+        loader::fill_missing_background_loads(&open.root, &open.merged, &mut open.map_loads);
+        Self::replace_images(open, &mut self.retired_images);
+        cx.notify();
+    }
+
+    /// The open document's own `[[background]]` slots (base world only --
+    /// merged instance slots are not this document's to edit).
+    fn backgrounds_now(&self) -> Vec<Background> {
+        match &self.state {
+            ViewerState::Ready(open) => open.store.state().backgrounds,
+            _ => Vec::new(),
+        }
+    }
+
     /// Delete the selected entity or instance (toolbar button and the
     /// `DeleteSelected` action). Bounds-guarded: a selection gone stale
     /// against an undo/redo restructure is a no-op, not a panic.
@@ -1720,16 +1803,25 @@ impl WorldPanel {
 
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
         self.end_nudge_run();
+        // The undo stack is opaque about WHAT it reversed, so the cheap
+        // honest test is to compare the slot list across the step: at
+        // most four entries, and only a real change pays for the re-merge
+        // and the recompose.
+        let backgrounds_before = self.backgrounds_now();
         if let ViewerState::Ready(open) = &mut self.state
             && open.store.undo()
         {
             open.prune_selection();
             cx.notify();
         }
+        if self.backgrounds_now() != backgrounds_before {
+            self.refresh_backgrounds(cx);
+        }
     }
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
         self.end_nudge_run();
+        let backgrounds_before = self.backgrounds_now();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1757,6 +1849,9 @@ impl WorldPanel {
             Self::refresh_asset_images(open, &mut self.retired_images);
         }
         cx.notify();
+        if self.backgrounds_now() != backgrounds_before {
+            self.refresh_backgrounds(cx);
+        }
     }
 
     /// `to_doc()` -> `write_world` -> `mark_saved`. Synchronous by choice:
@@ -1860,9 +1955,20 @@ impl WorldPanel {
     }
 
     /// The open document has unsaved edits. `test-support` only.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_is_dirty(&self) -> bool {
         matches!(&self.state, ViewerState::Ready(open) if open.store.state().dirty)
+    }
+
+    /// The open document's own `[[background]]` slots, in document order.
+    ///
+    /// `test-support` only, for `ggo_smoke`'s layers-rail journey: what
+    /// the rail edits is the base world's slot list, and a smoke test
+    /// that asserted on the rail's rendered labels would pass on a panel
+    /// that had linked the wrong layer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_backgrounds(&self) -> Vec<Background> {
+        self.backgrounds_now()
     }
 
     /// How many `[[entity]]` blocks the open document holds.
@@ -3400,6 +3506,92 @@ impl WorldPanel {
             .into_any_element()
     }
 
+    /// The layers rail: one row per hardware background slot of the OPEN
+    /// world. Linked slots show the map's stem and a clear button; empty
+    /// ones show a tileset picker whose pick generates and links a map.
+    ///
+    /// Base-world slots ONLY, deliberately: `open.merged` can be filled
+    /// by an `[[instance]]`'d world, and offering a "clear" on a slot
+    /// this document does not declare would silently do nothing (the
+    /// undoable `SetBackground` only ever edits the base list).
+    fn render_layers_rail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_layers_rail is only called in the Ready state");
+        };
+        let backgrounds = open.store.state().backgrounds;
+        let mut rail = h_flex().gap_2().px_1().pb_1().flex_wrap().child(
+            Label::new("Layers")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        );
+        for layer in 0..world_file::BACKGROUND_LAYER_COUNT as u8 {
+            let slot = h_flex().gap_1().child(
+                Label::new(format!("bg{layer}"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+            rail = rail.child(match backgrounds.iter().find(|bg| bg.layer == layer) {
+                Some(background) => slot
+                    .child(Label::new(background.stem().to_string()).size(LabelSize::XSmall))
+                    .child(
+                        IconButton::new(("ggo-world-bg-clear", layer as usize), IconName::Trash)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Unlink this background layer"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.clear_background_impl(layer, cx)
+                            })),
+                    )
+                    .into_any_element(),
+                None => {
+                    let root = open.root.clone();
+                    let weak = cx.weak_entity();
+                    slot.child(
+                        PopoverMenu::new(SharedString::from(format!("ggo-world-bg-menu-{layer}")))
+                            .trigger(
+                                Button::new(
+                                    SharedString::from(format!("ggo-world-bg-slot-{layer}")),
+                                    "Add…",
+                                )
+                                .label_size(LabelSize::XSmall),
+                            )
+                            // Lazy on purpose: the tileset list is a
+                            // recursive walk of the asset root, and this
+                            // rail renders every frame. It also means a
+                            // tileset created while the world is open
+                            // shows up on the next open of the picker.
+                            .menu(move |window, cx| {
+                                let tilesets = io::list_tilesets(&root);
+                                let weak = weak.clone();
+                                Some(ContextMenu::build(
+                                    window,
+                                    cx,
+                                    move |mut menu, _window, _cx| {
+                                        for til in tilesets {
+                                            let weak = weak.clone();
+                                            menu = menu.entry(
+                                                SharedString::from(til.clone()),
+                                                None,
+                                                move |_window, cx| {
+                                                    let til = til.clone();
+                                                    weak.update(cx, |this, cx| {
+                                                        this.add_background_impl(layer, til, cx)
+                                                    })
+                                                    .ok();
+                                                },
+                                            );
+                                        }
+                                        menu
+                                    },
+                                ))
+                            }),
+                    )
+                    .into_any_element()
+                }
+            });
+        }
+        rail.into_any_element()
+    }
+
     fn render_canvas(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_canvas is only called in the Ready state");
@@ -3980,6 +4172,7 @@ impl WorldPanel {
             .size_full()
             .child(toolbar)
             .child(self.render_view_controls(cx))
+            .child(self.render_layers_rail(cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -8684,6 +8877,197 @@ mod tests {
             FLASHED.with(|f| f.get()),
             1,
             "the button reached the registered flasher"
+        );
+    }
+
+    // ------------------------------------------------------- layers rail
+
+    /// A real 4-tile `.til`/`.pal` pair, so the maps the add-layer flow
+    /// binds to it actually COMPOSE (the world fixture itself is
+    /// deliberately image-free -- see `write_fixture`).
+    fn write_test_tileset(root: &std::path::Path, til_rel: &str) {
+        use ggo_worldlib::sprites::palette565::PAL_SLOTS;
+        use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+
+        const TILES: usize = 4;
+        let mut indices = vec![0u8; TILES * TILE_PIXELS];
+        for (tile, chunk) in indices.chunks_exact_mut(TILE_PIXELS).enumerate() {
+            chunk.fill((tile % PAL_SLOTS) as u8);
+        }
+        let mut palette = [0u16; PAL_SLOTS];
+        palette[1] = 0xF800; // pure 565 red
+        io::save_tileset(root, til_rel, &indices, TILES, &palette).unwrap();
+    }
+
+    #[test]
+    fn background_map_rel_strips_worlds_prefix_and_keeps_nesting() {
+        assert_eq!(background_map_rel("worlds/main", 0), "maps/main.bg0.map");
+        assert_eq!(
+            background_map_rel("worlds/nested/arena", 3),
+            "maps/nested/arena.bg3.map"
+        );
+        assert_eq!(background_map_rel("main", 1), "maps/main.bg1.map");
+    }
+
+    #[gpui::test]
+    async fn test_add_background_writes_bound_map_links_slot_and_undo_unlinks_only(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+
+        panel.update(cx, |panel, cx| {
+            assert!(
+                open_of(panel).images.is_empty(),
+                "the fixture world has no image assets before a layer is added"
+            );
+            panel.add_background_impl(1, "tiles/bg.til".into(), cx);
+            assert_eq!(
+                panel.test_backgrounds(),
+                vec![Background {
+                    layer: 1,
+                    map: "maps/test.bg1.map".into()
+                }]
+            );
+            assert!(panel.test_is_dirty());
+            let open = open_of(panel);
+            assert_eq!(
+                open.merged
+                    .iter()
+                    .map(|m| m.stem.as_str())
+                    .collect::<Vec<_>>(),
+                ["maps/test.bg1"],
+                "the merged set must include the freshly linked slot"
+            );
+            assert!(
+                matches!(
+                    open.map_loads.get("maps/test.bg1"),
+                    Some(ggo_worldlib::render::Loadable::Ready(_))
+                ),
+                "the new background must have composed from disk"
+            );
+            assert!(
+                !open.images.is_empty(),
+                "the canvas image cache must have picked it up"
+            );
+        });
+        // The map exists on disk, blank, bound to the picked tileset.
+        let data = io::open_map(dir.path(), "maps/test.bg1.map").unwrap();
+        assert_eq!(data.til_path, "tiles/bg.til");
+        assert_eq!(data.pal_path, "tiles/bg.pal");
+
+        panel.update(cx, |panel, cx| {
+            panel.undo_impl(cx);
+            assert!(panel.test_backgrounds().is_empty(), "undo unlinks the slot");
+            assert!(
+                open_of(panel).merged.is_empty(),
+                "undo must re-merge, not leave the canvas painting a dropped slot"
+            );
+        });
+        assert!(
+            io::open_map(dir.path(), "maps/test.bg1.map").is_ok(),
+            "undo never deletes the file (accepted orphan)"
+        );
+        panel.update(cx, |panel, cx| {
+            panel.redo_impl(cx);
+            assert_eq!(
+                panel.test_backgrounds().len(),
+                1,
+                "redo relinks the EXISTING file"
+            );
+            assert_eq!(open_of(panel).merged.len(), 1, "redo must re-merge too");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_add_background_links_an_existing_map_without_overwriting(
+        cx: &mut TestAppContext,
+    ) {
+        use ggo_worldlib::sprites::map_doc::{MapState, pack_cell};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+
+        let mut cells = ggo_worldlib::sprites::map_doc::blank_map_state(8, 8);
+        cells[9] = pack_cell(2, 0, false, false);
+        io::save_map(
+            dir.path(),
+            "maps/test.bg0.map",
+            &MapState {
+                w: 8,
+                h: 8,
+                cells: cells.clone(),
+                til_path: "tiles/bg.til".to_string(),
+                pal_path: "tiles/bg.pal".to_string(),
+                dirty: false,
+            },
+        )
+        .unwrap();
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            assert_eq!(
+                panel.test_backgrounds(),
+                vec![Background {
+                    layer: 0,
+                    map: "maps/test.bg0.map".into()
+                }]
+            );
+        });
+
+        let data = io::open_map(dir.path(), "maps/test.bg0.map").unwrap();
+        assert_eq!(
+            (data.w, data.h),
+            (8, 8),
+            "linking must not resize an existing map"
+        );
+        assert_eq!(data.cells, cells, "linking must not blank painted cells");
+    }
+
+    #[gpui::test]
+    async fn test_clear_background_unlinks_and_save_persists_the_toml(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(2, "tiles/bg.til".into(), cx);
+            panel.save_impl(cx);
+        });
+        // Draw the dock with the rail in its MIXED state -- one linked
+        // slot (label + clear button) and three empty ones (picker
+        // triggers) -- so both arms of the rail are exercised for real.
+        cx.run_until_parked();
+        assert_eq!(
+            read_world(dir.path(), "worlds/test.toml")
+                .unwrap()
+                .backgrounds,
+            vec![Background {
+                layer: 2,
+                map: "maps/test.bg2.map".into()
+            }]
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.clear_background_impl(2, cx);
+            assert!(panel.test_backgrounds().is_empty());
+            assert!(
+                open_of(panel).merged.is_empty(),
+                "clearing must re-merge the canvas set"
+            );
+            panel.save_impl(cx);
+        });
+        assert!(
+            read_world(dir.path(), "worlds/test.toml")
+                .unwrap()
+                .backgrounds
+                .is_empty()
+        );
+        assert!(
+            io::open_map(dir.path(), "maps/test.bg2.map").is_ok(),
+            "clearing unlinks the slot; it never deletes the map"
         );
     }
 }
