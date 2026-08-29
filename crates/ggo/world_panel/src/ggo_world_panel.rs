@@ -1575,6 +1575,16 @@ impl WorldPanel {
         self.paint_target_rel(&target)
     }
 
+    /// Paint mode is active, which the world editor's own mutations gate
+    /// on: the canvas gestures, Escape, undo/redo and every
+    /// entity-mutating action belong to the map under the brush while it
+    /// is (spec: "entity manipulation is disabled" while painting).
+    ///
+    /// Gating each action rather than clearing `open.selected` on entry is
+    /// deliberate: the selection has to survive the mode so that leaving
+    /// it puts the user back exactly where they were. Which means the
+    /// KEYBOARD paths need the gate too -- delete and the arrow keys reach
+    /// a live selection with no canvas gesture involved.
     fn in_paint_mode(&self) -> bool {
         matches!(&self.state, ViewerState::Ready(open) if open.mode != EditMode::Entities)
     }
@@ -1594,6 +1604,12 @@ impl WorldPanel {
             return false;
         };
         let Some(project_root) = self.project_root.clone() else {
+            // Same discipline as a failed load: a refusal the user cannot
+            // see is a refusal they will retry forever.
+            if let ViewerState::Ready(open) = &mut self.state {
+                open.paint_error = Some("no project folder is open".to_string());
+                cx.notify();
+            }
             return false;
         };
         // A world load in flight (or since) invalidates this entry -- the
@@ -1825,6 +1841,13 @@ impl WorldPanel {
     /// (ggo-ide confirms instance removal; an entity delete is one undo
     /// away and gets no prompt).
     fn delete_selected_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Paint mode's delete -- blanking the selected CELLS -- lands on
+        // this branch when the cell selection exists to delete (the
+        // strip/selection tool surface). Until then painting has no
+        // delete; what it must not have is the world's.
+        if self.in_paint_mode() {
+            return;
+        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -1867,6 +1890,9 @@ impl WorldPanel {
     }
 
     fn select_all_impl(&mut self, cx: &mut Context<Self>) {
+        if self.in_paint_mode() {
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1916,6 +1942,11 @@ impl WorldPanel {
         let Some(delta) = drag_ops::nudge_delta(key, tile) else {
             return;
         };
+        // Painting takes the entity selection out of play (see
+        // [`Self::in_paint_mode`]) without clearing it, so the arrows keep
+        // their look-around meaning there rather than moving an entity the
+        // user can't even see selected.
+        let painting = self.in_paint_mode();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1924,7 +1955,7 @@ impl WorldPanel {
         // `delta`'s sign is the world direction of the keypress, so the pan
         // step reuses it; the magnitude is the camera's own (screen px, not
         // the nudge's world px). No pan before first layout: nothing to do.
-        let Some(selection) = open.primary() else {
+        let Some(selection) = open.primary().filter(|_| !painting) else {
             let step = if tile {
                 CAMERA_PAN_STEP_PX * 4.0
             } else {
@@ -3022,6 +3053,12 @@ impl WorldPanel {
     }
 
     fn copy_impl(&mut self, cx: &mut Context<Self>) {
+        // In paint mode the clipboard is the CELL clipboard (a `Stamp`,
+        // when the selection tool surface lands); copying entities from
+        // under a brush would put the wrong thing on it.
+        if self.in_paint_mode() {
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -3111,6 +3148,11 @@ impl WorldPanel {
         instances: Vec<world_file::WorldInstance>,
         cx: &mut Context<Self>,
     ) {
+        // The mutation funnel both Paste and Duplicate reach: one gate
+        // keeps both out of the world while a map is under the brush.
+        if self.in_paint_mode() {
+            return;
+        }
         let delta = self.paste_delta(&entities, &instances);
         let candidates = self.instance_candidates();
         let ViewerState::Ready(open) = &mut self.state else {
@@ -9633,6 +9675,80 @@ mod tests {
                 panel.test_backgrounds().len(),
                 1,
                 "and the undo reached the world store, relinking the slot"
+            );
+        });
+    }
+
+    /// Spec: "entity manipulation is disabled" while painting -- and the
+    /// selection SURVIVES the mode, so the actions themselves have to be
+    /// what goes inert. The keyboard is the path that matters: delete and
+    /// the arrow keys reach a live selection with no canvas gesture in
+    /// sight.
+    #[gpui::test]
+    async fn test_entity_actions_are_inert_while_painting(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        focus_the_panel(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            // Written out, so the world store is clean going in: any
+            // entity edit that slips through shows up as dirty.
+            panel.save_impl(cx);
+            assert!(panel.test_enter_paint_bg(0, cx));
+        });
+        cx.run_until_parked();
+
+        let before = panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/test.bg0.map")
+            );
+            assert!(!panel.test_is_dirty(), "the world is written and clean");
+            let open = open_of(panel);
+            assert_eq!(
+                open.selected,
+                vec![Selection::Entity(0)],
+                "the fixture's selection survives entry -- exiting has to \
+                 put the user back where they were"
+            );
+            (open.store.state(), open.selected.clone())
+        });
+
+        cx.simulate_keystrokes("delete");
+        cx.simulate_keystrokes("right shift-down");
+        panel.update(cx, |panel, cx| {
+            panel.select_all_impl(cx);
+            panel.duplicate_impl(cx);
+            panel.copy_impl(cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            let (state, selected) = &before;
+            assert_eq!(
+                open.store.state().entities,
+                state.entities,
+                "no entity moved, and none was deleted or duplicated"
+            );
+            assert_eq!(open.store.state().instances.len(), state.instances.len());
+            assert_eq!(&open.selected, selected, "select-all is inert too");
+            assert!(
+                !panel.test_is_dirty(),
+                "the world store never saw an edit while the brush was out"
+            );
+        });
+
+        // Leaving the mode hands every one of them back.
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("right");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                inspector::entity_pos(&open_of(panel).store.state(), 0),
+                Some([5.0, 4.0]),
+                "the same arrow key nudges again once painting is over"
             );
         });
     }
