@@ -541,7 +541,9 @@ merged set and the canvas. First background editing UI -- until now the
 only way to edit [[background]] was the raw-TOML split pane."
 ```
 
----### Task 4: Paint mode — enter/exit, brush/eraser, live canvas
+---
+
+### Task 4: Paint mode — enter/exit, brush/eraser, live canvas
 
 **Files:**
 - Modify: `crates/ggo/world_panel/src/ggo_world_panel.rs`
