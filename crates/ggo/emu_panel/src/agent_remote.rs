@@ -13,17 +13,23 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use base64::Engine as _;
-use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Global, WeakEntity};
+use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Global, WeakEntity};
+use workspace::Workspace;
 use ggo_emu_remote::protocol::{Cmd, Request, Response, parse_request, response_line};
 use ggo_emu_remote::registry::{self, SessionInfo};
 
 use crate::EmuPanel;
 use crate::input::{SELECT_BIT, button_bit};
 
-/// Foreground registry of live panels, keyed by absolute project root.
+/// Foreground registry of live panels (keyed by absolute project root)
+/// and of every live workspace (keyed by entity id — its root is resolved
+/// live, since worktrees attach after construction). Workspaces let a
+/// remote boot OPEN the emu panel itself instead of requiring a human to
+/// have clicked a cart first.
 #[derive(Default)]
 pub struct RemotePanels {
     panels: HashMap<String, (WeakEntity<EmuPanel>, Option<AnyWindowHandle>)>,
+    workspaces: HashMap<u64, (WeakEntity<Workspace>, Option<AnyWindowHandle>)>,
 }
 
 impl Global for RemotePanels {}
@@ -51,6 +57,12 @@ fn publish_advertisement(cx: &App) {
         .try_global::<RemotePanels>()
         .map(|g| g.panels.keys().cloned().collect())
         .unwrap_or_default();
+    publish_advertisement_roots(workspaces);
+}
+
+fn publish_advertisement_roots(mut workspaces: Vec<String>) {
+    workspaces.sort();
+    workspaces.dedup();
     let dir = registry::dir();
     let pid = std::process::id();
     let (_, socket) = registry::session_paths(&dir, pid);
@@ -61,6 +73,21 @@ fn publish_advertisement(cx: &App) {
 pub fn init(cx: &mut App) {
     cx.set_global(RemotePanels::default());
     publish_advertisement(cx);
+
+    // Track every workspace from birth, so a remote boot can open the
+    // emu panel itself (same registration idiom as the dock panels).
+    cx.observe_new(|_: &mut Workspace, window, cx| {
+        let handle = window.map(|w| w.window_handle());
+        let weak = cx.weak_entity();
+        let id = cx.entity_id().as_u64();
+        cx.defer(move |cx| {
+            if cx.try_global::<RemotePanels>().is_none() {
+                cx.set_global(RemotePanels::default());
+            }
+            cx.global_mut::<RemotePanels>().workspaces.insert(id, (weak, handle));
+        });
+    })
+    .detach();
 
     let dir = registry::dir();
     let (_, sock_path) = registry::session_paths(&dir, std::process::id());
@@ -166,6 +193,33 @@ pub fn buttons_to_mask(buttons: &[String]) -> Result<u32, String> {
     Ok(mask)
 }
 
+/// Live (root, workspace, window) rows for every tracked workspace whose
+/// project has a visible worktree, pruning dropped entities.
+fn live_workspaces(cx: &mut App) -> Vec<(String, Entity<Workspace>, Option<AnyWindowHandle>)> {
+    let tracked: Vec<(u64, WeakEntity<Workspace>, Option<AnyWindowHandle>)> = cx
+        .try_global::<RemotePanels>()
+        .map(|g| g.workspaces.iter().map(|(id, (w, h))| (*id, w.clone(), *h)).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut dead = Vec::new();
+    for (id, weak, handle) in tracked {
+        let Some(workspace) = weak.upgrade() else {
+            dead.push(id);
+            continue;
+        };
+        let root = workspace.read(cx).project().read(cx).visible_worktrees(cx).next().map(
+            |worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned(),
+        );
+        if let Some(root) = root {
+            out.push((root, workspace, handle));
+        }
+    }
+    if !dead.is_empty() {
+        cx.global_mut::<RemotePanels>().workspaces.retain(|id, _| !dead.contains(id));
+    }
+    out
+}
+
 fn workspace_of(cmd: &Cmd) -> Option<&str> {
     match cmd {
         Cmd::Status => None,
@@ -189,83 +243,141 @@ async fn dispatch(req: Request, cx: &mut AsyncApp) -> Response {
 }
 
 async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value, String> {
-    let entries: Vec<(String, WeakEntity<EmuPanel>, Option<AnyWindowHandle>)> = cx
-        .update(|cx| {
-            cx.try_global::<RemotePanels>()
-                .map(|g| {
-                    g.panels
-                        .iter()
-                        .map(|(k, (p, w))| (k.clone(), p.clone(), *w))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        });
+    // Snapshot panels and live workspaces on the foreground.
+    struct Target {
+        root: String,
+        panel: Option<WeakEntity<EmuPanel>>,
+        workspace: Option<Entity<Workspace>>,
+        window: Option<AnyWindowHandle>,
+    }
+    let targets: Vec<Target> = cx.update(|cx| {
+        let panels: Vec<(String, WeakEntity<EmuPanel>, Option<AnyWindowHandle>)> = cx
+            .try_global::<RemotePanels>()
+            .map(|g| {
+                g.panels
+                    .iter()
+                    .map(|(k, (p, w))| (k.clone(), p.clone(), *w))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut targets: Vec<Target> = panels
+            .into_iter()
+            .map(|(root, panel, window)| Target {
+                root,
+                panel: Some(panel),
+                workspace: None,
+                window,
+            })
+            .collect();
+        for (root, workspace, window) in live_workspaces(cx) {
+            match targets.iter_mut().find(|t| t.root == root) {
+                Some(t) => t.workspace = Some(workspace),
+                None => targets.push(Target { root, panel: None, workspace: Some(workspace), window }),
+            }
+        }
+        // Keep the on-disk advertisement in step with live worktrees.
+        publish_advertisement_roots(targets.iter().map(|t| t.root.clone()).collect());
+        targets
+    });
 
     if let Cmd::Status = cmd {
         let mut rows = Vec::new();
-        for (root, panel, _) in &entries {
-            if let Ok(status) = panel.update(cx, |p, _| p.remote_status(root.clone())) {
-                rows.push(status);
-            }
+        for t in &targets {
+            let status = t
+                .panel
+                .as_ref()
+                .and_then(|p| p.update(cx, |p, _| p.remote_status(t.root.clone())).ok());
+            rows.push(status.unwrap_or(ggo_emu_remote::protocol::WorkspaceStatus {
+                workspace: t.root.clone(),
+                cart: None,
+                running: false,
+                paused: false,
+                frame: 0,
+            }));
         }
         return Ok(serde_json::json!({ "pid": std::process::id(), "workspaces": rows }));
     }
 
-    let keys: Vec<String> = entries.iter().map(|(k, ..)| k.clone()).collect();
-    let target = resolve_workspace(&keys, workspace_of(&cmd))?;
-    let (_, panel, window) = entries
+    let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
+    let target_root = resolve_workspace(&keys, workspace_of(&cmd))?;
+    let target = targets
         .into_iter()
-        .find(|(k, ..)| *k == target)
+        .find(|t| t.root == target_root)
         .expect("resolve_workspace returned a member of keys");
+    let window = target.window;
+    let panel = target.panel;
 
     match cmd {
         Cmd::Status => unreachable!("handled above"),
         Cmd::Boot { cart, .. } => {
-            let window = window.ok_or("panel has no window (headless test?)")?;
-            window
-                .update(cx, |_, window, app| {
-                    panel.update(app, |p, cx| p.remote_boot(cart, window, cx))
-                })
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())??;
+            let window = window.ok_or("workspace has no window (headless test?)")?;
+            // No panel yet? Open it — the whole point of a remote boot.
+            let result: Result<(), String> = match (panel, target.workspace) {
+                (Some(panel), _) => window
+                    .update(cx, |_, window, app| {
+                        panel.update(app, |p, cx| p.remote_boot(cart, window, cx))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?,
+                (None, Some(workspace)) => window
+                    .update(cx, |_, window, app| {
+                        workspace.update(app, |workspace, cx| {
+                            let mut outcome = Err("emu panel did not open".to_string());
+                            crate::open_emu_item(workspace, window, cx, |panel, window, cx| {
+                                outcome = panel.remote_boot(cart, window, cx);
+                            });
+                            outcome
+                        })
+                    })
+                    .map_err(|e| e.to_string())?,
+                (None, None) => Err("workspace vanished".to_string()),
+            };
+            result?;
             Ok(serde_json::json!({ "booted": true }))
         }
         Cmd::Stop { .. } => {
+            let panel = panel.ok_or("no emu panel open in this workspace")?;
             let window = window.ok_or("panel has no window (headless test?)")?;
             window
                 .update(cx, |_, window, app| {
                     panel.update(app, |p, cx| p.remote_stop(window, cx))
                 })
                 .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "stopped": true }))
         }
         Cmd::Input { buttons, .. } => {
             let mask = buttons_to_mask(&buttons)?;
+            let panel = panel.ok_or("no emu panel open — emu_boot first")?;
             panel
                 .update(cx, |p, _| p.remote_input(mask))
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "mask": mask }))
         }
         Cmd::Pause { .. } => {
+            let panel = panel.ok_or("no emu panel open — emu_boot first")?;
             panel
                 .update(cx, |p, _| p.remote_pause())
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "paused": true }))
         }
         Cmd::Resume { .. } => {
+            let panel = panel.ok_or("no emu panel open — emu_boot first")?;
             panel
                 .update(cx, |p, _| p.remote_resume())
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "paused": false }))
         }
         Cmd::Step { frames, .. } => {
+            let panel = panel.ok_or("no emu panel open — emu_boot first")?;
             panel
                 .update(cx, |p, _| p.remote_step(frames))
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "stepped": frames }))
         }
         Cmd::Screenshot { .. } => {
+            let panel = panel.ok_or("no emu panel open — emu_boot first")?;
             let (w, h, bgra) = panel
                 .update(cx, |p, _| p.remote_screenshot())
                 .map_err(|e| e.to_string())?
@@ -277,6 +389,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             }))
         }
         Cmd::Uart { tail, .. } => {
+            let panel = panel.ok_or("no emu panel open — emu_boot first")?;
             let lines = panel
                 .update(cx, |p, _| p.remote_uart(tail))
                 .map_err(|e| e.to_string())?;
