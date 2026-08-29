@@ -3,7 +3,9 @@
 //! the tab holds no document. Import writes a NEW file (the `.adp`) and
 //! opens it in its own tab.
 
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window,
+};
 use ui::prelude::*;
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};

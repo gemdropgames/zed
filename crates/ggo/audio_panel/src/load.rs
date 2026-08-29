@@ -31,8 +31,7 @@ pub fn is_adp(path: &Path) -> bool {
 pub fn load(path: &Path) -> Result<Loaded> {
     let (decoded, adp) = if is_adp(path) {
         let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
-        let decoded = ggo_audio::decode_adp(&bytes)
-            .with_context(|| path.display().to_string())?;
+        let decoded = ggo_audio::decode_adp(&bytes).with_context(|| path.display().to_string())?;
         (decoded, Some(Arc::new(bytes)))
     } else {
         (ggo_audio::decode(path)?, None)
@@ -70,7 +69,9 @@ mod tests {
 
     #[test]
     fn buckets_take_the_extremes_of_each_slice() {
-        let samples: Vec<i16> = (0..8).map(|i| if i % 2 == 0 { -100 * i } else { 100 * i }).collect();
+        let samples: Vec<i16> = (0..8)
+            .map(|i| if i % 2 == 0 { -100 * i } else { 100 * i })
+            .collect();
         // Slices of two: (0,100), (-200,300), (-400,500), (-600,700).
         assert_eq!(
             buckets(&samples, 4),

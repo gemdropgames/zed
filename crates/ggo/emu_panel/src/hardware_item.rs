@@ -9,9 +9,7 @@
 //! install steps, the streaming runner and the console all already live
 //! there and are tested there. This file renders them and nothing else.
 
-use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window,
-};
+use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window};
 use ui::prelude::*;
 use ui::{CommonAnimationExt, Disclosure, Tooltip};
 use workspace::Workspace;
@@ -363,7 +361,11 @@ impl Render for HardwareSetupItem {
                                     IconName::Warning
                                 })
                                 .size(IconSize::Small)
-                                .color(if ready { Color::Success } else { Color::Warning }),
+                                .color(if ready {
+                                    Color::Success
+                                } else {
+                                    Color::Warning
+                                }),
                             )
                             .child(
                                 Label::new(if ready {
@@ -457,7 +459,9 @@ impl Render for HardwareSetupItem {
                     // status row is what a run without one has.
                     .when(!layout.timeline, |el| {
                         el.children(status.map(|status| {
-                            Label::new(status).size(LabelSize::Small).color(Color::Muted)
+                            Label::new(status)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
                         }))
                     }),
             )
@@ -497,9 +501,9 @@ impl Render for HardwareSetupItem {
                                         .icon_size(IconSize::XSmall)
                                         .tooltip(Tooltip::text("Copy all output"))
                                         .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(
-                                                gpui::ClipboardItem::new_string(all.clone()),
-                                            );
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                all.clone(),
+                                            ));
                                         })
                                 }),
                         )
@@ -561,8 +565,8 @@ pub fn open_hardware_item(
 mod tests {
     use super::*;
     use crate::hardware::{FlashProgress, HardwareEnv};
-    use std::time::Duration;
     use gpui::TestAppContext;
+    use std::time::Duration;
 
     #[test]
     fn elapsed_is_minutes_and_padded_seconds() {
@@ -603,7 +607,10 @@ mod tests {
         let layout = page_layout(true, Some(&progress), None);
         assert!(layout.timeline);
         assert!(!layout.requirements_open);
-        assert!(!layout.log_open, "a healthy run does not need the transcript");
+        assert!(
+            !layout.log_open,
+            "a healthy run does not need the transcript"
+        );
     }
 
     /// A failure puts the cause on screen without a click: the log is
@@ -659,7 +666,10 @@ mod tests {
         assert_eq!(board.name, "Board");
         match &board.remedy {
             Remedy::Manual(what) => {
-                assert!(what.contains("dialout"), "the permission trap is named: {what}");
+                assert!(
+                    what.contains("dialout"),
+                    "the permission trap is named: {what}"
+                );
                 assert!(what.contains("connect the board"), "{what}");
             }
             other => panic!("a board cannot be installed: {other:?}"),
@@ -699,7 +709,9 @@ mod tests {
         assert!(rows.iter().all(|r| r.satisfied()));
         assert!(rows.iter().all(|r| r.remedy == Remedy::Satisfied));
         assert_eq!(
-            rows.iter().find(|r| r.name == "Board").and_then(|r| r.found.clone()),
+            rows.iter()
+                .find(|r| r.name == "Board")
+                .and_then(|r| r.found.clone()),
             Some("/dev/ttyUSB0".to_string()),
             "the row names the port that will be used"
         );

@@ -671,7 +671,10 @@ mod tests {
         assert!(body.cols.iter().all(|c| c.len() == MAX_FRAMES));
         assert!(body.extra_cols.iter().all(|c| c.len() == MAX_FRAMES));
         assert_eq!(body.truncated_frames, Some(MAX_FRAMES + 1));
-        assert_eq!(parse_output(&output_for("t", 3)).unwrap().truncated_frames, None);
+        assert_eq!(
+            parse_output(&output_for("t", 3)).unwrap().truncated_frames,
+            None
+        );
     }
 
     #[test]

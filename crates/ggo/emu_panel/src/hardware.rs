@@ -19,9 +19,7 @@ use std::time::Duration;
 
 use ggo_common::ProcRequest;
 
-use crate::menu::{
-    DEFAULT_DIAG_BIN, DIAG_BIN_ENV, DIAG_REPO_ENV, DIAG_TTY_ENV, SERIAL_BY_ID_DIR,
-};
+use crate::menu::{DEFAULT_DIAG_BIN, DIAG_BIN_ENV, DIAG_REPO_ENV, DIAG_TTY_ENV, SERIAL_BY_ID_DIR};
 
 /// Where a cloned GGO checkout lands when the user has none, under the
 /// same `~/.ggo` the databases already live in.
@@ -59,9 +57,9 @@ impl Missing {
     /// What the status row says, in the fork's "name the gap" style.
     pub fn label(self) -> String {
         match self {
-            Missing::Repo => format!(
-                "no GGO repo checkout -- set {DIAG_REPO_ENV}, or let ZedGG clone one"
-            ),
+            Missing::Repo => {
+                format!("no GGO repo checkout -- set {DIAG_REPO_ENV}, or let ZedGG clone one")
+            }
             Missing::Diag => format!(
                 "`{DEFAULT_DIAG_BIN}` is not on PATH -- set {DIAG_BIN_ENV}, or let ZedGG install it"
             ),
@@ -212,10 +210,9 @@ impl HardwareEnv {
                          or set {DIAG_REPO_ENV} to a real one",
                         self.clone_dest.display()
                     )),
-                    (None, true, false) => Remedy::Install(format!(
-                        "git clone into {}",
-                        self.clone_dest.display()
-                    )),
+                    (None, true, false) => {
+                        Remedy::Install(format!("git clone into {}", self.clone_dest.display()))
+                    }
                     (None, false, false) => Remedy::Manual(format!(
                         "install git, or set {DIAG_REPO_ENV} to an existing checkout"
                     )),
@@ -265,7 +262,6 @@ impl HardwareEnv {
             },
         ]
     }
-
 }
 
 /// `ggo-diag`'s argv for flashing `project` and booting it on `tty`.
@@ -491,7 +487,9 @@ impl FlashProgress {
     }
 
     pub fn running(&self) -> Option<&PhaseRow> {
-        self.rows.iter().find(|row| row.state == PhaseState::Running)
+        self.rows
+            .iter()
+            .find(|row| row.state == PhaseState::Running)
     }
 
     fn running_mut(&mut self) -> Option<&mut PhaseRow> {
@@ -899,7 +897,10 @@ mod tests {
                 status: "PASS".into()
             })
         );
-        assert_eq!(parse_stage("RESULT: PASS"), Some(Stage::Result { pass: true }));
+        assert_eq!(
+            parse_stage("RESULT: PASS"),
+            Some(Stage::Result { pass: true })
+        );
         assert_eq!(
             parse_stage("RESULT: FAIL"),
             Some(Stage::Result { pass: false })
@@ -913,10 +914,7 @@ mod tests {
     #[test]
     fn stage_labels_read_as_status_text() {
         assert_eq!(Stage::Phase("Flash board".into()).label(), "Flash board");
-        assert_eq!(
-            Stage::Component("ppu".into()).label(),
-            "place & route: ppu"
-        );
+        assert_eq!(Stage::Component("ppu".into()).label(), "place & route: ppu");
         assert_eq!(Stage::Boot("banner".into()).label(), "boot: banner");
         assert_eq!(Stage::Result { pass: true }.label(), "PASS");
     }
@@ -1019,7 +1017,11 @@ mod tests {
             Some("ggo-diag".to_string()),
             "a bare name resolves against PATH"
         );
-        assert_eq!(resolve_on_path("ggo-diag", None), None, "no PATH, no lookup");
+        assert_eq!(
+            resolve_on_path("ggo-diag", None),
+            None,
+            "no PATH, no lookup"
+        );
         assert_eq!(resolve_on_path("nope", Some(&path_env)), None);
 
         let explicit = bin.to_string_lossy().into_owned();
@@ -1072,10 +1074,7 @@ mod tests {
             home: dir.path().to_path_buf(),
             ..Default::default()
         };
-        assert!(matches!(
-            env.requirements()[1].remedy,
-            Remedy::Install(_)
-        ));
+        assert!(matches!(env.requirements()[1].remedy, Remedy::Install(_)));
         assert_eq!(setup_steps(&env)[0].request.args[0], "clone");
 
         // The destination exists but is not a checkout: cloning into it
@@ -1109,7 +1108,10 @@ mod tests {
     #[test]
     fn a_tilde_in_the_env_var_is_expanded() {
         let home = Path::new("/home/u");
-        assert_eq!(expand_home("~/.ggo/ggo", home), PathBuf::from("/home/u/.ggo/ggo"));
+        assert_eq!(
+            expand_home("~/.ggo/ggo", home),
+            PathBuf::from("/home/u/.ggo/ggo")
+        );
         assert_eq!(expand_home("~", home), PathBuf::from("/home/u"));
         assert_eq!(
             expand_home("/abs/path", home),
@@ -1142,7 +1144,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             FLASH_PHASES.to_vec(),
         );
-        assert!(progress.rows().iter().all(|row| row.state == PhaseState::Pending));
+        assert!(
+            progress
+                .rows()
+                .iter()
+                .all(|row| row.state == PhaseState::Pending)
+        );
         assert_eq!(progress.verdict(), None);
     }
 
@@ -1156,9 +1163,17 @@ mod tests {
 
         let rows = progress.rows();
         assert_eq!(rows[0].state, PhaseState::Done);
-        assert_eq!(rows[0].elapsed(secs(30)), secs(12), "a done phase stops counting");
+        assert_eq!(
+            rows[0].elapsed(secs(30)),
+            secs(12),
+            "a done phase stops counting"
+        );
         assert_eq!(rows[1].state, PhaseState::Running);
-        assert_eq!(rows[1].elapsed(secs(30)), secs(18), "the running one keeps counting");
+        assert_eq!(
+            rows[1].elapsed(secs(30)),
+            secs(18),
+            "the running one keeps counting"
+        );
         assert_eq!(rows[2].state, PhaseState::Pending);
     }
 
@@ -1248,7 +1263,10 @@ mod tests {
         progress.apply("==> Flash board", secs(0));
         progress.apply("RESULT: PASS", secs(2));
         assert!(
-            progress.rows().iter().all(|row| row.state == PhaseState::Done),
+            progress
+                .rows()
+                .iter()
+                .all(|row| row.state == PhaseState::Done),
             "{:?}",
             progress.rows(),
         );
@@ -1292,7 +1310,10 @@ mod tests {
         progress.apply("==> Sacrifice a goat", secs(2));
         let titles: Vec<&str> = progress.rows().iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles[1], "Sacrifice a goat");
-        assert_eq!(titles[2], "Provision SD card", "the known ones still follow");
+        assert_eq!(
+            titles[2], "Provision SD card",
+            "the known ones still follow"
+        );
         assert_eq!(progress.rows()[1].state, PhaseState::Running);
     }
 
@@ -1310,5 +1331,4 @@ mod tests {
         assert_eq!(progress.rows()[0].elapsed(secs(6)), secs(6));
         assert_eq!(progress.rows()[1].state, PhaseState::Running);
     }
-
 }

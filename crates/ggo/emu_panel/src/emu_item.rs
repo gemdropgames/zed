@@ -7,7 +7,9 @@
 //! this file only adapts it to the workspace's tab machinery. No
 //! dirty/save: the emulator holds no document.
 
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window,
+};
 use ui::prelude::*;
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};

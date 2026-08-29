@@ -71,13 +71,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ggo_emu_core::apu::Apu;
-use ggo_emu_core::ppu::PpuSnapshot;
-use ggo_emu_core::savefile;
 use ggo_emu_core::cart::Cart;
 use ggo_emu_core::cpu::Cpu;
 use ggo_emu_core::mmu::{CART_XIP_BASE, DEFAULT_MAIN_RAM_BYTES, DEFAULT_VRAM_BYTES, Mmu};
 use ggo_emu_core::peripherals::{Peripherals, SCREEN_HEIGHT, SCREEN_WIDTH};
+use ggo_emu_core::ppu::PpuSnapshot;
 use ggo_emu_core::run::{FrameEvent, run_until_event};
+use ggo_emu_core::savefile;
 
 use crate::audio::{AudioStatus, RingWriter};
 use crate::uart::UartLog;
@@ -529,8 +529,9 @@ fn run(
                 }
                 frames_presented = frames_presented.wrapping_add(1);
                 if p.save_dirty
-                    && last_save_flush
-                        .is_none_or(|f| frames_presented.wrapping_sub(f) >= savefile::FLUSH_INTERVAL_FRAMES)
+                    && last_save_flush.is_none_or(|f| {
+                        frames_presented.wrapping_sub(f) >= savefile::FLUSH_INTERVAL_FRAMES
+                    })
                 {
                     flush_save(&save_file, &title, &mut p, uart);
                     last_save_flush = Some(frames_presented);
@@ -869,21 +870,21 @@ pub mod fixture {
     pub fn saving_cart() -> Vec<u8> {
         let xip_base_hi20 = super::CART_XIP_BASE >> 12;
         let body: Vec<u32> = vec![
-            addi(A0, 0),                              // off 0
-            lui(A1, xip_base_hi20),                   // buf = CART_XIP_BASE
-            addi(A2, SAVING_CART_WRITE_LEN as i32),   // len
-            addi(A7, SYS_SAVE_WRITE),                 //
-            ECALL,                                    // save_write
-            addi(A0, 0),                              // bank 0
-            addi(A1, 0),                              // entry 0
-            addi(A2, GREEN as i32),                   // colour
-            addi(A7, SYS_SET_PALETTE),                //
-            ECALL,                                    //
-            addi(A7, SYS_PRESENT),                    // loop:
-            ECALL,                                    //
-            addi(A7, SYS_VSYNC_WAIT),                 //
-            ECALL,                                    //
-            jal_x0(-16),                              // back to `loop`
+            addi(A0, 0),                            // off 0
+            lui(A1, xip_base_hi20),                 // buf = CART_XIP_BASE
+            addi(A2, SAVING_CART_WRITE_LEN as i32), // len
+            addi(A7, SYS_SAVE_WRITE),               //
+            ECALL,                                  // save_write
+            addi(A0, 0),                            // bank 0
+            addi(A1, 0),                            // entry 0
+            addi(A2, GREEN as i32),                 // colour
+            addi(A7, SYS_SET_PALETTE),              //
+            ECALL,                                  //
+            addi(A7, SYS_PRESENT),                  // loop:
+            ECALL,                                  //
+            addi(A7, SYS_VSYNC_WAIT),               //
+            ECALL,                                  //
+            jal_x0(-16),                            // back to `loop`
         ];
         let body: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut h = [0u8; HEADER_LEN];
@@ -1485,7 +1486,10 @@ mod tests {
         let (session, rx) = start(path, "green.cart".to_string(), None);
 
         let first = rx.recv_blocking().expect("frames flow before pause");
-        assert!(session.snapshot().is_some(), "a presented frame fills the slot");
+        assert!(
+            session.snapshot().is_some(),
+            "a presented frame fills the slot"
+        );
         session.pause();
         assert!(session.is_paused());
         // Drain whatever was in flight when the flag landed, until the
@@ -1508,13 +1512,17 @@ mod tests {
                 }
                 false
             };
-            assert!(quiet_for(&rx, &mut last_number), "a paused run stops publishing frames");
+            assert!(
+                quiet_for(&rx, &mut last_number),
+                "a paused run stops publishing frames"
+            );
             last_number
         };
 
         let before_step = session.snapshot().map(|s| Arc::as_ptr(&s) as usize);
         session.step();
-        let stepped = recv_within(&rx, Duration::from_secs(2)).expect("step releases exactly one frame");
+        let stepped =
+            recv_within(&rx, Duration::from_secs(2)).expect("step releases exactly one frame");
         assert_eq!(stepped.number, last_number + 1, "one frame, the next one");
         assert_ne!(
             session.snapshot().map(|s| Arc::as_ptr(&s) as usize),
@@ -1586,7 +1594,11 @@ mod tests {
             &cart_bytes[code_start..code_start + fixture::SAVING_CART_WRITE_LEN],
             "the region's first bytes are what the cart wrote"
         );
-        assert!(payload[fixture::SAVING_CART_WRITE_LEN..].iter().all(|b| *b == 0));
+        assert!(
+            payload[fixture::SAVING_CART_WRITE_LEN..]
+                .iter()
+                .all(|b| *b == 0)
+        );
         assert!(
             !finished.uart.iter().any(|line| line.contains("[save]")),
             "no save complaint on the console: {:?}",

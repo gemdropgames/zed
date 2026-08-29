@@ -16,8 +16,8 @@ use gpui::{RenderImage, Task};
 
 use ggo_emu_core::peripherals::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use ggo_emu_core::ppu::{
-    BANK_BGFG, BANK_SPRITE, LAYER_COUNT, MAP_H, MAP_W, OAM_ENTRIES, OamEntry, PALETTES,
-    PAL_ENTRIES, PpuSnapshot, TILE_PX, VRAM_TILE_CAP,
+    BANK_BGFG, BANK_SPRITE, LAYER_COUNT, MAP_H, MAP_W, OAM_ENTRIES, OamEntry, PAL_ENTRIES,
+    PALETTES, PpuSnapshot, TILE_PX, VRAM_TILE_CAP,
 };
 
 /// The tile sheet: 1024 tiles as a 32×32 grid at 1×.
@@ -282,8 +282,9 @@ pub fn oam_composite_bgra(snapshot: &PpuSnapshot) -> Vec<u8> {
 /// OAM rows for the list: enabled entries first (by index), then the
 /// rest, each with its index.
 pub fn oam_rows(snapshot: &PpuSnapshot) -> Vec<(usize, OamEntry)> {
-    let mut rows: Vec<(usize, OamEntry)> =
-        (0..OAM_ENTRIES).map(|i| (i, snapshot.oam_entry(i))).collect();
+    let mut rows: Vec<(usize, OamEntry)> = (0..OAM_ENTRIES)
+        .map(|i| (i, snapshot.oam_entry(i)))
+        .collect();
     rows.sort_by_key(|(index, entry)| (!entry.enabled, *index));
     rows
 }
@@ -419,15 +420,29 @@ mod tests {
         assert_eq!(px(&composite, SCREEN_WIDTH, 10, 20), [0, 0xFF, 0, 0xFF]);
         assert_eq!(px(&composite, SCREEN_WIDTH, 25, 35), [0, 0xFF, 0, 0xFF]);
         assert_eq!(px(&composite, SCREEN_WIDTH, 26, 20), [0, 0, 0, 0]);
-        assert_eq!(px(&composite, SCREEN_WIDTH, 100, 100), [0, 0, 0, 0], "disabled");
-        assert_eq!(px(&composite, SCREEN_WIDTH, 0, 239), [0, 0xFF, 0, 0xFF], "clipped sprite still draws inside");
+        assert_eq!(
+            px(&composite, SCREEN_WIDTH, 100, 100),
+            [0, 0, 0, 0],
+            "disabled"
+        );
+        assert_eq!(
+            px(&composite, SCREEN_WIDTH, 0, 239),
+            [0, 0xFF, 0, 0xFF],
+            "clipped sprite still draws inside"
+        );
 
         let rows = oam_rows(&snap);
         assert_eq!(rows[0].0, 5);
         assert_eq!(rows[1].0, 9);
-        assert!(!rows[2].1.enabled, "disabled entries follow, in index order");
+        assert!(
+            !rows[2].1.enabled,
+            "disabled entries follow, in index order"
+        );
         assert_eq!(rows[2].0, 0);
-        assert!(oam_row_label(5, &rows[0].1).starts_with("#005   10,  20  tile    1  1x1  --  pal  2  prio 0"));
+        assert!(
+            oam_row_label(5, &rows[0].1)
+                .starts_with("#005   10,  20  tile    1  1x1  --  pal  2  prio 0")
+        );
     }
 
     #[test]
@@ -435,7 +450,10 @@ mod tests {
         assert_eq!(rgb565_label(0xF800), "#FF0000 (0xF800)");
         assert_eq!(rgb565_label(0x07E0), "#00FF00 (0x07E0)");
         assert_eq!(palette_cell_at(0.0, 0.0, 12.0), Some((0, 0, 0)));
-        assert_eq!(palette_cell_at(12.0 * 15.5, 12.0 * 16.0, 12.0), Some((1, 0, 15)));
+        assert_eq!(
+            palette_cell_at(12.0 * 15.5, 12.0 * 16.0, 12.0),
+            Some((1, 0, 15))
+        );
         assert_eq!(palette_cell_at(12.0 * 16.0, 0.0, 12.0), None);
         assert_eq!(palette_cell_at(0.0, 12.0 * 32.0, 12.0), None);
         assert_eq!(palette_cell_at(-1.0, 0.0, 12.0), None);
@@ -448,12 +466,18 @@ mod tests {
         let now = Instant::now();
         assert!(state.decode_due(&snap, true, now));
         state.last_decoded_ptr = Arc::as_ptr(&snap) as usize;
-        assert!(!state.decode_due(&snap, true, now), "same snapshot, already decoded");
+        assert!(
+            !state.decode_due(&snap, true, now),
+            "same snapshot, already decoded"
+        );
         let next = Arc::new(fixture());
         state.last_decode_started = Some(now);
         assert!(!state.decode_due(&next, false, now), "running: throttled");
         assert!(state.decode_due(&next, false, now + LIVE_DECODE_INTERVAL));
-        assert!(state.decode_due(&next, true, now), "paused: a new snapshot decodes at once");
+        assert!(
+            state.decode_due(&next, true, now),
+            "paused: a new snapshot decodes at once"
+        );
         let labels = layer_labels(&snap);
         assert_eq!(labels[0], "BG0 (off)");
     }
@@ -466,11 +490,26 @@ mod tests {
             let buffer = image::ImageBuffer::from_raw(1, 1, vec![n as u8; 4]).unwrap();
             Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
         };
-        state.set_decoded(Decoded { tab: DebugTab::Tiles, image: Some(image(1)), snapshot: snap.clone() });
-        state.set_decoded(Decoded { tab: DebugTab::Tiles, image: Some(image(2)), snapshot: snap });
+        state.set_decoded(Decoded {
+            tab: DebugTab::Tiles,
+            image: Some(image(1)),
+            snapshot: snap.clone(),
+        });
+        state.set_decoded(Decoded {
+            tab: DebugTab::Tiles,
+            image: Some(image(2)),
+            snapshot: snap,
+        });
         assert_eq!(state.retired.len(), 1);
-        assert!(state.take_retired_for_render().is_empty(), "first render: nothing old enough");
-        assert_eq!(state.take_retired_for_render().len(), 1, "second render: drops it");
+        assert!(
+            state.take_retired_for_render().is_empty(),
+            "first render: nothing old enough"
+        );
+        assert_eq!(
+            state.take_retired_for_render().len(),
+            1,
+            "second render: drops it"
+        );
         state.retire_all();
         assert_eq!(state.take_all_retired().len(), 1);
         let kept = state.decoded.as_ref().expect("the snapshot is kept");

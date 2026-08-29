@@ -77,8 +77,8 @@
 
 pub mod audio;
 mod debug;
-mod emu_item;
 mod drive;
+mod emu_item;
 mod hardware;
 mod hardware_item;
 mod ingest;
@@ -95,9 +95,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseMoveEvent,
-    Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription, Task,
-    WeakEntity, Window, actions, div, point, px, size,
+    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseMoveEvent, Pixels, Render,
+    RenderImage, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
+    actions, div, point, px, size,
 };
 use project::ProjectPath;
 use ui::Tooltip;
@@ -156,7 +156,6 @@ const DEBUG_COLUMN_PX: f32 = 360.0;
 const DEBUG_SWATCH_PX: f32 = 12.0;
 
 pub fn init(cx: &mut App) {
-
     // Explorer-driven routing: clicking a `.cart` in the project panel
     // selects it HERE instead of opening a (binary, unreadable) editor tab.
     // This is the panel's only way in -- there is no in-panel cart picker.
@@ -201,7 +200,6 @@ pub fn init(cx: &mut App) {
         window.defer(cx, move |window, cx| handler(window, cx));
         true
     });
-
 }
 
 /// Open (or focus) THE center-pane emulator tab and run `f` against its
@@ -272,7 +270,6 @@ fn intercept_cart_open(
         panel.open_rel_path(&rel, window, cx)
     })
 }
-
 
 // ------------------------------------------------------------- view state
 
@@ -746,83 +743,83 @@ impl EmuPanel {
         let task = cx.spawn({
             let what = what.clone();
             async move |this, cx| {
-            for request in requests {
-                let (line_tx, line_rx) = async_channel::unbounded::<String>();
-                // The command itself, so the console says which argv (and
-                // which of several `/dev/ttyUSB*`) this run used.
-                console.push_line(format!("$ {}", request.command_line()));
-                let run = {
-                    let console = console.clone();
-                    streamer(
-                        request,
-                        Box::new(move |line: &str| {
-                            console.push_line(line);
-                            line_tx.try_send(line.to_string()).ok();
-                        }),
-                    )
-                };
-                // Lines arrive while the child runs; each recognised one
-                // moves the status row.
-                let pump = {
-                    let this = this.clone();
-                    cx.spawn(async move |cx| {
-                    while let Ok(line) = line_rx.recv().await {
-                        // Notify for EVERY line, not only recognised
-                        // ones: `cargo install` matches none of the
-                        // grammar, and an unrepainted console during a
-                        // five-minute install is the opposite of the
-                        // streaming this exists to provide.
-                        if this
-                            .update(cx, |this, cx| {
-                                if let Some(flash) = &mut this.flash {
-                                    let at = flash.started.elapsed();
-                                    flash.progress.apply(&line, at);
+                for request in requests {
+                    let (line_tx, line_rx) = async_channel::unbounded::<String>();
+                    // The command itself, so the console says which argv (and
+                    // which of several `/dev/ttyUSB*`) this run used.
+                    console.push_line(format!("$ {}", request.command_line()));
+                    let run = {
+                        let console = console.clone();
+                        streamer(
+                            request,
+                            Box::new(move |line: &str| {
+                                console.push_line(line);
+                                line_tx.try_send(line.to_string()).ok();
+                            }),
+                        )
+                    };
+                    // Lines arrive while the child runs; each recognised one
+                    // moves the status row.
+                    let pump = {
+                        let this = this.clone();
+                        cx.spawn(async move |cx| {
+                            while let Ok(line) = line_rx.recv().await {
+                                // Notify for EVERY line, not only recognised
+                                // ones: `cargo install` matches none of the
+                                // grammar, and an unrepainted console during a
+                                // five-minute install is the opposite of the
+                                // streaming this exists to provide.
+                                if this
+                                    .update(cx, |this, cx| {
+                                        if let Some(flash) = &mut this.flash {
+                                            let at = flash.started.elapsed();
+                                            flash.progress.apply(&line, at);
+                                        }
+                                        cx.notify();
+                                    })
+                                    .is_err()
+                                {
+                                    return;
                                 }
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
+                            }
+                        })
+                    };
+                    let capture = run.await;
+                    // AWAITED, not dropped: the sink drops with the run
+                    // future, which closes the channel and ends the pump. A
+                    // drop here could lose the last line -- and the last line
+                    // is the verdict.
+                    pump.await;
+                    let Ok(verdict) = this.read_with(cx, |this, _| {
+                        this.flash.as_ref().and_then(|f| f.progress.verdict())
+                    }) else {
+                        // The panel is gone; a released tab must not keep
+                        // installing things.
+                        return;
+                    };
+                    if !capture.ok || verdict == Some(false) {
+                        let reason = hardware::failure_reason(&capture);
+                        this.update(cx, |this, cx| {
+                            this.retire_flash(false);
+                            this.report_failure(format!("{what} failed: {reason}"), cx);
+                        })
+                        .ok();
+                        return;
                     }
-                    })
-                };
-                let capture = run.await;
-                // AWAITED, not dropped: the sink drops with the run
-                // future, which closes the channel and ends the pump. A
-                // drop here could lose the last line -- and the last line
-                // is the verdict.
-                pump.await;
-                let Ok(verdict) = this.read_with(cx, |this, _| {
-                    this.flash.as_ref().and_then(|f| f.progress.verdict())
-                }) else {
-                    // The panel is gone; a released tab must not keep
-                    // installing things.
-                    return;
-                };
-                if !capture.ok || verdict == Some(false) {
-                    let reason = hardware::failure_reason(&capture);
-                    this.update(cx, |this, cx| {
-                        this.retire_flash(false);
-                        this.report_failure(format!("{what} failed: {reason}"), cx);
-                    })
-                    .ok();
-                    return;
                 }
-            }
-            this.update(cx, |this, cx| {
-                let passed = this.flash.as_ref().and_then(|f| f.progress.verdict());
-                this.retire_flash(true);
-                // Installing something changes what this machine can do.
-                this.invalidate_hardware();
-                this.status = Some(match passed {
-                    Some(true) => format!("{what}: PASS"),
-                    _ => format!("{what}: done"),
-                });
-                this.status_is_error = false;
-                cx.notify();
-            })
-            .ok();
+                this.update(cx, |this, cx| {
+                    let passed = this.flash.as_ref().and_then(|f| f.progress.verdict());
+                    this.retire_flash(true);
+                    // Installing something changes what this machine can do.
+                    this.invalidate_hardware();
+                    this.status = Some(match passed {
+                        Some(true) => format!("{what}: PASS"),
+                        _ => format!("{what}: done"),
+                    });
+                    this.status_is_error = false;
+                    cx.notify();
+                })
+                .ok();
             }
         });
         self.flash = Some(FlashRun {
@@ -1338,7 +1335,8 @@ impl EmuPanel {
                 .ok()
                 .flatten();
             let Some((request, runner, cart)) = prepared else {
-                this.update(cx, |this, cx| this.build_done(generation, cx)).ok();
+                this.update(cx, |this, cx| this.build_done(generation, cx))
+                    .ok();
                 return;
             };
             let capture = cx.background_spawn(async move { runner(request) }).await;
@@ -1550,7 +1548,9 @@ impl EmuPanel {
     }
 
     pub(crate) fn is_paused(&self) -> bool {
-        self.session.as_ref().is_some_and(|session| session.is_paused())
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.is_paused())
     }
 
     /// Hidden-tab pause: the emulator item was deactivated. Undone by the
@@ -1615,7 +1615,11 @@ impl EmuPanel {
                 "{} · frame {}{}",
                 session.cart,
                 self.frame,
-                if session.is_paused() { " · paused" } else { "" }
+                if session.is_paused() {
+                    " · paused"
+                } else {
+                    ""
+                }
             )
         })
     }
@@ -1777,7 +1781,8 @@ impl EmuPanel {
         // With no run the snapshot is static, so there is nothing to
         // throttle: a tab or selector change decodes at once, like a pause.
         let immediate = self.is_paused() || live.is_none();
-        let Some(snapshot) = live.or_else(|| self.debug.decoded.as_ref().map(|d| d.snapshot.clone()))
+        let Some(snapshot) =
+            live.or_else(|| self.debug.decoded.as_ref().map(|d| d.snapshot.clone()))
         else {
             return;
         };
@@ -1802,7 +1807,11 @@ impl EmuPanel {
                 debug::SHEET_PX,
                 debug::SHEET_PX,
             ),
-            debug::DebugTab::Map => (debug::map_bgra(snapshot, layer), debug::MAP_PX, debug::MAP_PX),
+            debug::DebugTab::Map => (
+                debug::map_bgra(snapshot, layer),
+                debug::MAP_PX,
+                debug::MAP_PX,
+            ),
             debug::DebugTab::Oam => (
                 debug::oam_composite_bgra(snapshot),
                 ggo_emu_core::peripherals::SCREEN_WIDTH,
@@ -1878,7 +1887,11 @@ impl EmuPanel {
                 .toggle_state(self.debug.tab == tab)
                 .on_click(cx.listener(move |this, _event, _window, cx| this.set_debug_tab(tab, cx)))
             }));
-        let decoded = self.debug.decoded.as_ref().filter(|d| d.tab == self.debug.tab);
+        let decoded = self
+            .debug
+            .decoded
+            .as_ref()
+            .filter(|d| d.tab == self.debug.tab);
         let body: gpui::AnyElement = match decoded {
             None => Label::new(if self.session.is_some() {
                 "decoding…"
@@ -1958,13 +1971,15 @@ impl EmuPanel {
             .w(px(width as f32))
             .h(px(height as f32))
             .child(canvas)
-            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
-                if let Some(bounds) = *bounds_cell.borrow() {
-                    let x: f32 = (event.position.x - bounds.origin.x).into();
-                    let y: f32 = (event.position.y - bounds.origin.y).into();
-                    on_hover(this, x, y, cx);
-                }
-            }))
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    if let Some(bounds) = *bounds_cell.borrow() {
+                        let x: f32 = (event.position.x - bounds.origin.x).into();
+                        let y: f32 = (event.position.y - bounds.origin.y).into();
+                        on_hover(this, x, y, cx);
+                    }
+                }),
+            )
             .into_any_element()
     }
 
@@ -1980,15 +1995,21 @@ impl EmuPanel {
             .gap_1()
             .items_center()
             .child(
-                IconButton::new(SharedString::from(format!("{id}-down")), IconName::ChevronLeft)
-                    .icon_size(IconSize::XSmall)
-                    .on_click(cx.listener(move |this, _event, _window, cx| down(this, -1, cx))),
+                IconButton::new(
+                    SharedString::from(format!("{id}-down")),
+                    IconName::ChevronLeft,
+                )
+                .icon_size(IconSize::XSmall)
+                .on_click(cx.listener(move |this, _event, _window, cx| down(this, -1, cx))),
             )
             .child(Label::new(label).size(LabelSize::Small))
             .child(
-                IconButton::new(SharedString::from(format!("{id}-up")), IconName::ChevronRight)
-                    .icon_size(IconSize::XSmall)
-                    .on_click(cx.listener(move |this, _event, _window, cx| on_delta(this, 1, cx))),
+                IconButton::new(
+                    SharedString::from(format!("{id}-up")),
+                    IconName::ChevronRight,
+                )
+                .icon_size(IconSize::XSmall)
+                .on_click(cx.listener(move |this, _event, _window, cx| on_delta(this, 1, cx))),
             )
             .into_any_element()
     }
@@ -2052,7 +2073,11 @@ impl EmuPanel {
             },
             cx,
         );
-        v_flex().gap_1().child(selectors).child(sheet).into_any_element()
+        v_flex()
+            .gap_1()
+            .child(selectors)
+            .child(sheet)
+            .into_any_element()
     }
 
     fn render_debug_map(
@@ -2061,21 +2086,26 @@ impl EmuPanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let labels = debug::layer_labels(&decoded.snapshot);
-        let selectors = h_flex().gap_1().px_1().children(
-            (0..ggo_emu_core::ppu::LAYER_COUNT).map(|layer| {
+        let selectors = h_flex()
+            .gap_1()
+            .px_1()
+            .children((0..ggo_emu_core::ppu::LAYER_COUNT).map(|layer| {
                 let enabled = decoded.snapshot.layer_enable[layer];
                 Button::new(
                     SharedString::from(format!("ggo-emu-debug-layer-{layer}")),
                     SharedString::from(labels[layer].clone()),
                 )
                 .toggle_state(self.debug.layer == layer)
-                .color(if enabled { Color::Default } else { Color::Muted })
+                .color(if enabled {
+                    Color::Default
+                } else {
+                    Color::Muted
+                })
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     let (bank, palette) = (this.debug.bank, this.debug.palette);
                     this.set_debug_selector(bank, palette, layer, cx)
                 }))
-            }),
-        );
+            }));
         let Some(image) = decoded.image.clone() else {
             return selectors.into_any_element();
         };
@@ -2102,13 +2132,14 @@ impl EmuPanel {
                     for dx in [0.0, -span] {
                         for dy in [0.0, -span] {
                             let rect = Bounds::new(
-                                point(
-                                    bounds.origin.x + px(sx + dx),
-                                    bounds.origin.y + px(sy + dy),
-                                ),
+                                point(bounds.origin.x + px(sx + dx), bounds.origin.y + px(sy + dy)),
                                 size(px(w), px(h)),
                             );
-                            window.paint_quad(gpui::outline(rect, accent, gpui::BorderStyle::Solid));
+                            window.paint_quad(gpui::outline(
+                                rect,
+                                accent,
+                                gpui::BorderStyle::Solid,
+                            ));
                         }
                     }
                 });
@@ -2133,7 +2164,11 @@ impl EmuPanel {
             },
             cx,
         );
-        v_flex().gap_1().child(selectors).child(map).into_any_element()
+        v_flex()
+            .gap_1()
+            .child(selectors)
+            .child(map)
+            .into_any_element()
     }
 
     fn render_debug_oam(
@@ -2222,27 +2257,29 @@ impl EmuPanel {
             .w(px(width))
             .h(px(height))
             .child(grid)
-            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
-                if let Some(bounds) = *bounds_cell.borrow() {
-                    let x: f32 = (event.position.x - bounds.origin.x).into();
-                    let y: f32 = (event.position.y - bounds.origin.y).into();
-                    if let Some((bank, palette, entry)) = debug::palette_cell_at(x, y, swatch) {
-                        let rgb = snapshot.palette_rgb565(bank, palette, entry);
-                        this.set_debug_hover(
-                            format!(
-                                "{} pal {palette} slot {entry} = {}",
-                                if bank == ggo_emu_core::ppu::BANK_SPRITE {
-                                    "sprite"
-                                } else {
-                                    "bg/fg"
-                                },
-                                debug::rgb565_label(rgb)
-                            ),
-                            cx,
-                        );
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    if let Some(bounds) = *bounds_cell.borrow() {
+                        let x: f32 = (event.position.x - bounds.origin.x).into();
+                        let y: f32 = (event.position.y - bounds.origin.y).into();
+                        if let Some((bank, palette, entry)) = debug::palette_cell_at(x, y, swatch) {
+                            let rgb = snapshot.palette_rgb565(bank, palette, entry);
+                            this.set_debug_hover(
+                                format!(
+                                    "{} pal {palette} slot {entry} = {}",
+                                    if bank == ggo_emu_core::ppu::BANK_SPRITE {
+                                        "sprite"
+                                    } else {
+                                        "bg/fg"
+                                    },
+                                    debug::rgb565_label(rgb)
+                                ),
+                                cx,
+                            );
+                        }
                     }
-                }
-            }))
+                }),
+            )
             .into_any_element()
     }
 
@@ -2262,17 +2299,20 @@ impl EmuPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                Button::new("ggo-emu-watch", if self.watch { "Watching" } else { "Watch" })
-                    .toggle_state(self.watch)
-                    .disabled(self.watched_world.is_none())
-                    .tooltip(Tooltip::text(match &self.watched_world {
-                        Some(world) => format!("Re-pack and restart {world} on every save"),
-                        None => "Emulate a world first".to_string(),
-                    }))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let on = !this.watch;
-                        this.set_watch(on, window, cx)
-                    })),
+                Button::new(
+                    "ggo-emu-watch",
+                    if self.watch { "Watching" } else { "Watch" },
+                )
+                .toggle_state(self.watch)
+                .disabled(self.watched_world.is_none())
+                .tooltip(Tooltip::text(match &self.watched_world {
+                    Some(world) => format!("Re-pack and restart {world} on every save"),
+                    None => "Emulate a world first".to_string(),
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let on = !this.watch;
+                    this.set_watch(on, window, cx)
+                })),
             )
             .when(self.watch && self.watch_rebuilds > 0, |el| {
                 el.child(
@@ -2298,7 +2338,9 @@ impl EmuPanel {
             .child(
                 Button::new("ggo-emu-pause", if paused { "Resume" } else { "Pause" })
                     .disabled(!running)
-                    .tooltip(Tooltip::text("Pause / resume at the next frame (ctrl-alt-p)"))
+                    .tooltip(Tooltip::text(
+                        "Pause / resume at the next frame (ctrl-alt-p)",
+                    ))
                     .on_click(cx.listener(|this, _event, _window, cx| this.toggle_pause(cx))),
             )
             .child(
@@ -2317,15 +2359,14 @@ impl EmuPanel {
                     } else {
                         "Flash this project to the board and run it"
                     }))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.flash_to_board(window, cx)
-                    }))
+                    .on_click(
+                        cx.listener(|this, _event, window, cx| this.flash_to_board(window, cx)),
+                    )
             })
-            .children(self.flash_status().map(|text| {
-                Label::new(text)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-            }))
+            .children(
+                self.flash_status()
+                    .map(|text| Label::new(text).size(LabelSize::XSmall).color(Color::Muted)),
+            )
             .children(
                 // Offered whenever this machine cannot flash yet -- not
                 // only after a failed press.
@@ -2343,8 +2384,12 @@ impl EmuPanel {
             .child(
                 Button::new("ggo-emu-debug", "Debug")
                     .toggle_state(self.debug.open)
-                    .tooltip(Tooltip::text("Tiles / map / OAM / palette viewers (ctrl-alt-d)"))
-                    .on_click(cx.listener(|this, _event, window, cx| this.toggle_debug(window, cx))),
+                    .tooltip(Tooltip::text(
+                        "Tiles / map / OAM / palette viewers (ctrl-alt-d)",
+                    ))
+                    .on_click(
+                        cx.listener(|this, _event, window, cx| this.toggle_debug(window, cx)),
+                    ),
             )
             // The selected cart, as plain text: the file explorer is the
             // picker now, so there is nothing here to click.
@@ -2413,19 +2458,22 @@ impl EmuPanel {
             return div()
                 .size_full()
                 .bg(cx.theme().colors().panel_background)
-                .child(gpui::canvas(
-                    |_bounds, _window, _cx| {},
-                    move |bounds, _prepaint, window, _cx| {
-                        let b = scaled_frame_bounds(bounds);
-                        // A zero-area panel has nothing to paint into;
-                        // paint_image only fails on that degenerate
-                        // clip, so log-and-drop beats poisoning the
-                        // frame with an unwrap.
-                        window
-                            .paint_image(b, b, gpui::Corners::default(), frame, 0, false, true)
-                            .log_err();
-                    },
-                ).size_full())
+                .child(
+                    gpui::canvas(
+                        |_bounds, _window, _cx| {},
+                        move |bounds, _prepaint, window, _cx| {
+                            let b = scaled_frame_bounds(bounds);
+                            // A zero-area panel has nothing to paint into;
+                            // paint_image only fails on that degenerate
+                            // clip, so log-and-drop beats poisoning the
+                            // frame with an unwrap.
+                            window
+                                .paint_image(b, b, gpui::Corners::default(), frame, 0, false, true)
+                                .log_err();
+                        },
+                    )
+                    .size_full(),
+                )
                 .into_any_element();
         }
         let message = match (self.is_running(), &self.selected) {
@@ -2523,9 +2571,7 @@ impl EmuPanel {
                 .icon_size(IconSize::XSmall)
                 .tooltip(ui::Tooltip::text("Copy console log"))
                 .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                        log.lines().join("\n"),
-                    ));
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(log.lines().join("\n")));
                 })
         };
 
@@ -2588,7 +2634,9 @@ impl Render for EmuPanel {
             .on_action(cx.listener(|this, _: &ToggleMute, _window, cx| this.toggle_mute(cx)))
             .on_action(cx.listener(|this, _: &TogglePause, _window, cx| this.toggle_pause(cx)))
             .on_action(cx.listener(|this, _: &StepFrame, _window, cx| this.step_frame(cx)))
-            .on_action(cx.listener(|this, _: &ToggleDebug, window, cx| this.toggle_debug(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleDebug, window, cx| this.toggle_debug(window, cx)),
+            )
             // The pad. Scoped by focus, not by keymap: these fire only
             // while the pane's focus handle owns the keyboard, so typing
             // `z` anywhere else never reaches a cart.
@@ -2611,10 +2659,14 @@ impl Render for EmuPanel {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(div().flex_1().min_w_0().size_full().child(self.render_screen(cx)))
-                    .children(
-                        self.debug.open.then(|| self.render_debug_column(cx)),
-                    ),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .size_full()
+                            .child(self.render_screen(cx)),
+                    )
+                    .children(self.debug.open.then(|| self.render_debug_column(cx))),
             )
             .children(self.render_stats())
             .children(self.status.as_ref().map(|status| {
@@ -2629,13 +2681,11 @@ impl Render for EmuPanel {
             .children(self.ingest_status.label().map(|label| {
                 ggo_common::CopyableText::new("ggo-emu-ingest-copy", label)
                     .size(LabelSize::XSmall)
-                    .color(
-                        if matches!(self.ingest_status, IngestStatus::Failed(_)) {
-                            Color::Error
-                        } else {
-                            Color::Muted
-                        },
-                    )
+                    .color(if matches!(self.ingest_status, IngestStatus::Failed(_)) {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    })
             }))
             .children(self.render_console(cx))
     }
@@ -2784,7 +2834,11 @@ mod tests {
             gpui::size(gpui::px(1000.), gpui::px(800.)),
         );
         let b = scaled_frame_bounds(panel);
-        assert_eq!(b.size.width, gpui::px(1000.), "width-limited: 3.125x of 320");
+        assert_eq!(
+            b.size.width,
+            gpui::px(1000.),
+            "width-limited: 3.125x of 320"
+        );
         assert_eq!(b.size.height, gpui::px(750.), "3.125x of 240 keeps 4:3");
         assert_eq!(b.origin.x, gpui::px(0.));
         assert_eq!(b.origin.y, gpui::px(25.), "(800-750)/2");
@@ -2909,12 +2963,8 @@ mod tests {
         // into one pane, moving (not closing) the splits' tabs.
         workspace.update_in(cx, |workspace, window, cx| {
             let active = workspace.active_pane().clone();
-            let new_pane = workspace.split_pane(
-                active,
-                workspace::SplitDirection::Right,
-                window,
-                cx,
-            );
+            let new_pane =
+                workspace.split_pane(active, workspace::SplitDirection::Right, window, cx);
             let extra = cx.new(workspace::item::test::TestItem::new);
             new_pane.update(cx, |pane, cx| {
                 pane.add_item(Box::new(extra), true, true, None, window, cx);
@@ -5313,7 +5363,10 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert!(!panel.is_paused(), "a run starts unpaused");
             assert!(
-                panel.transport_readout().unwrap().starts_with("green.cart · frame "),
+                panel
+                    .transport_readout()
+                    .unwrap()
+                    .starts_with("green.cart · frame "),
                 "{:?}",
                 panel.transport_readout()
             );
@@ -5385,11 +5438,18 @@ mod tests {
         });
         panel.update(cx, |panel, cx| {
             panel.set_debug_tab(debug::DebugTab::Oam, cx);
-            assert_eq!(panel.debug.last_decoded_ptr, 0, "a tab switch forces a re-decode");
+            assert_eq!(
+                panel.debug.last_decoded_ptr, 0,
+                "a tab switch forces a re-decode"
+            );
             panel.debug_decode_now(snapshot.clone());
             let decoded = panel.debug.decoded.as_ref().unwrap();
             assert_eq!(decoded.tab, debug::DebugTab::Oam);
-            assert_eq!(panel.debug.retired.len(), 1, "the tile sheet is queued for release");
+            assert_eq!(
+                panel.debug.retired.len(),
+                1,
+                "the tile sheet is queued for release"
+            );
             let image = decoded.image.as_ref().unwrap();
             assert_eq!(
                 image.size(0),
@@ -5397,12 +5457,18 @@ mod tests {
             );
             panel.set_debug_tab(debug::DebugTab::Palettes, cx);
             panel.debug_decode_now(snapshot.clone());
-            assert!(panel.debug.decoded.as_ref().unwrap().image.is_none(), "palettes paint directly");
+            assert!(
+                panel.debug.decoded.as_ref().unwrap().image.is_none(),
+                "palettes paint directly"
+            );
             assert_eq!(panel.debug.retired.len(), 2);
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert!(panel.debug.retired.is_empty(), "a render advanced the retire queue");
+            assert!(
+                panel.debug.retired.is_empty(),
+                "a render advanced the retire queue"
+            );
             assert_eq!(
                 panel.debug.retired_previous.len(),
                 2,
@@ -5461,11 +5527,21 @@ mod tests {
 
         cx.simulate_keystrokes("ctrl-alt-s");
         cx.run_until_parked();
-        panel.update(cx, |panel, cx| panel.set_debug_tab(debug::DebugTab::Palettes, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_debug_tab(debug::DebugTab::Palettes, cx)
+        });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            let decoded = panel.debug.decoded.as_ref().expect("re-decoded from the kept snapshot");
-            assert_eq!(decoded.tab, debug::DebugTab::Palettes, "the tab switch re-decoded without a session");
+            let decoded = panel
+                .debug
+                .decoded
+                .as_ref()
+                .expect("re-decoded from the kept snapshot");
+            assert_eq!(
+                decoded.tab,
+                debug::DebugTab::Palettes,
+                "the tab switch re-decoded without a session"
+            );
         });
     }
 
@@ -5512,17 +5588,26 @@ mod tests {
 
         hide(cx);
         panel.read_with(cx, |panel, _| {
-            assert!(panel.is_paused() && panel.auto_paused, "a hidden tab pauses");
+            assert!(
+                panel.is_paused() && panel.auto_paused,
+                "a hidden tab pauses"
+            );
         });
         show(cx);
         panel.read_with(cx, |panel, _| {
-            assert!(!panel.is_paused() && !panel.auto_paused, "coming back resumes");
+            assert!(
+                !panel.is_paused() && !panel.auto_paused,
+                "coming back resumes"
+            );
         });
 
         panel.update(cx, |panel, cx| panel.toggle_pause(cx));
         hide(cx);
         panel.read_with(cx, |panel, _| {
-            assert!(panel.is_paused() && !panel.auto_paused, "a user pause is not adopted");
+            assert!(
+                panel.is_paused() && !panel.auto_paused,
+                "a user pause is not adopted"
+            );
         });
         show(cx);
         panel.read_with(cx, |panel, _| {
@@ -5562,7 +5647,11 @@ mod tests {
         panel.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.input.mask(), 0, "the render while inactive released it");
+            assert_eq!(
+                panel.input.mask(),
+                0,
+                "the render while inactive released it"
+            );
         });
     }
 
@@ -5781,17 +5870,40 @@ mod tests {
     fn watch_triggers_skips_pack_output_sidecars_and_removals() {
         use project::PathChange;
         assert!(watch_triggers("assets/tiles/a.til", &PathChange::Updated));
-        assert!(watch_triggers("assets/worlds/main.toml", &PathChange::AddedOrUpdated));
-        assert!(!watch_triggers("target/ggo-emulate/worlds-main.ggo", &PathChange::Added));
-        assert!(!watch_triggers("game/target/ggo-emulate/x.ggo", &PathChange::Added), "nested project");
-        assert!(!watch_triggers("target", &PathChange::Added), "the output dir itself");
-        assert!(!watch_triggers(".ggo-ide/assets/tiles/a.til.editor.json", &PathChange::Updated));
-        assert!(watch_triggers("assets/tiles/a.til", &PathChange::Removed), "a deleted asset re-packs");
-        assert!(!watch_triggers("assets/tiles/a.til", &PathChange::Loaded), "the initial scan");
+        assert!(watch_triggers(
+            "assets/worlds/main.toml",
+            &PathChange::AddedOrUpdated
+        ));
+        assert!(!watch_triggers(
+            "target/ggo-emulate/worlds-main.ggo",
+            &PathChange::Added
+        ));
+        assert!(
+            !watch_triggers("game/target/ggo-emulate/x.ggo", &PathChange::Added),
+            "nested project"
+        );
+        assert!(
+            !watch_triggers("target", &PathChange::Added),
+            "the output dir itself"
+        );
+        assert!(!watch_triggers(
+            ".ggo-ide/assets/tiles/a.til.editor.json",
+            &PathChange::Updated
+        ));
+        assert!(
+            watch_triggers("assets/tiles/a.til", &PathChange::Removed),
+            "a deleted asset re-packs"
+        );
+        assert!(
+            !watch_triggers("assets/tiles/a.til", &PathChange::Loaded),
+            "the initial scan"
+        );
     }
 
     #[gpui::test]
-    async fn test_watch_mode_repacks_after_a_save_and_ignores_its_own_output(cx: &mut TestAppContext) {
+    async fn test_watch_mode_repacks_after_a_save_and_ignores_its_own_output(
+        cx: &mut TestAppContext,
+    ) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
@@ -5801,7 +5913,9 @@ mod tests {
         let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
-        let fs = workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).fs().clone());
+        let fs = workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).fs().clone()
+        });
         let fake_fs = fs.as_fake();
 
         panel.update_in(cx, |panel, window, cx| {
@@ -5828,8 +5942,12 @@ mod tests {
         let after_dirs = calls.lock().unwrap().len();
 
         // Two quick saves collapse into one re-pack.
-        fake_fs.insert_file("/proj/assets/tiles/a.til", b"til".to_vec()).await;
-        fake_fs.insert_file("/proj/assets/tiles/a.pal", b"pal".to_vec()).await;
+        fake_fs
+            .insert_file("/proj/assets/tiles/a.til", b"til".to_vec())
+            .await;
+        fake_fs
+            .insert_file("/proj/assets/tiles/a.pal", b"pal".to_vec())
+            .await;
         cx.run_until_parked();
         assert_eq!(calls.lock().unwrap().len(), after_dirs, "still debouncing");
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
@@ -5838,23 +5956,37 @@ mod tests {
         assert_eq!(after_save, after_dirs + 1, "one re-pack after the debounce");
 
         // The pack's own output landing in the worktree must not loop.
-        fake_fs.insert_file("/proj/target/ggo-emulate/worlds-main.ggo", b"cart".to_vec()).await;
+        fake_fs
+            .insert_file("/proj/target/ggo-emulate/worlds-main.ggo", b"cart".to_vec())
+            .await;
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), after_save, "no rebuild for the output");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            after_save,
+            "no rebuild for the output"
+        );
 
         // The debounce restarts on every change: two saves 200 ms apart
         // rebuild once, after the second.
-        fake_fs.insert_file("/proj/assets/tiles/c.til", b"til".to_vec()).await;
+        fake_fs
+            .insert_file("/proj/assets/tiles/c.til", b"til".to_vec())
+            .await;
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2 / 3);
         cx.run_until_parked();
-        fake_fs.insert_file("/proj/assets/tiles/d.til", b"til".to_vec()).await;
+        fake_fs
+            .insert_file("/proj/assets/tiles/d.til", b"til".to_vec())
+            .await;
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2 / 3);
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), after_save, "the second save re-armed the debounce");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            after_save,
+            "the second save re-armed the debounce"
+        );
         cx.executor().advance_clock(WATCH_DEBOUNCE);
         cx.run_until_parked();
         let after_pair = calls.lock().unwrap().len();
@@ -5865,7 +5997,9 @@ mod tests {
         });
 
         panel.update_in(cx, |panel, window, cx| panel.set_watch(false, window, cx));
-        fake_fs.insert_file("/proj/assets/tiles/b.til", b"til".to_vec()).await;
+        fake_fs
+            .insert_file("/proj/assets/tiles/b.til", b"til".to_vec())
+            .await;
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
@@ -5968,7 +6102,9 @@ mod tests {
 
         assert_eq!(calls.lock().unwrap().len(), 1, "one ggo-diag invocation");
         let args = &calls.lock().unwrap()[0].args;
-        assert!(args.contains(&"--project".to_string()) && args.contains(&"--skip-pnr".to_string()));
+        assert!(
+            args.contains(&"--project".to_string()) && args.contains(&"--skip-pnr".to_string())
+        );
         panel.read_with(cx, |panel, _| {
             assert!(!panel.is_flashing(), "the run finished");
             assert_eq!(panel.status.as_deref(), Some("flashing: PASS"));
@@ -6041,8 +6177,7 @@ mod tests {
     #[gpui::test]
     async fn test_a_failed_flash_leaves_the_dead_phase_on_the_page(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (streamer, _calls) =
-            fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
         panel.update(cx, |panel, cx| {
@@ -6124,7 +6259,11 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert!(panel.status_is_error, "a FAIL verdict is an error");
             assert!(
-                panel.status.as_deref().unwrap_or("").contains("flashing failed"),
+                panel
+                    .status
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("flashing failed"),
                 "{:?}",
                 panel.status
             );
@@ -6152,7 +6291,11 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert!(panel.status_is_error);
             assert!(
-                panel.status.as_deref().unwrap_or("").contains("fujprog: no board"),
+                panel
+                    .status
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("fujprog: no board"),
                 "the child's own words: {:?}",
                 panel.status
             );
@@ -6258,7 +6401,11 @@ mod tests {
             )
         });
         cx.executor().run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), 1, "stopped at the first failure");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "stopped at the first failure"
+        );
         panel.read_with(cx, |panel, _| {
             assert!(panel.status_is_error);
             assert!(panel.status.as_deref().unwrap_or("").contains("no network"));

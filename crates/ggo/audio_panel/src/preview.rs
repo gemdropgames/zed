@@ -19,8 +19,8 @@
 //! the thread alive for [`DRAIN_FRAMES`] after the last push so the tail
 //! in the ring is heard before the writer's drop silences it.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ggo_audio::Decoded;
@@ -349,7 +349,10 @@ mod tests {
         };
         let progress = AtomicU32::new(0);
         run(&Spec::Baked(blob), true, &mut sink, &stop, &progress, false);
-        assert_eq!(sink.pushes, 120, "the loop ran until Stop, not until the clip ended");
+        assert_eq!(
+            sink.pushes, 120,
+            "the loop ran until Stop, not until the clip ended"
+        );
         // Still audible at the end: the loop point kept feeding samples.
         let tail = &sink.out[sink.out.len() - 4000..];
         assert!(peak(tail) > 2000, "loop went silent, peak {}", peak(tail));
@@ -361,7 +364,14 @@ mod tests {
         let mut out = Vec::new();
         let stop = AtomicBool::new(false);
         let progress = AtomicU32::new(0);
-        run(&Spec::Source(decoded.clone()), false, &mut out, &stop, &progress, false);
+        run(
+            &Spec::Source(decoded.clone()),
+            false,
+            &mut out,
+            &stop,
+            &progress,
+            false,
+        );
         assert_eq!(out.len(), 1200, "every mono sample becomes an L/R pair");
         assert_eq!(&out[0..2], &[decoded.samples[0], decoded.samples[0]]);
         assert_eq!(progress.load(Ordering::Relaxed), PROGRESS_SCALE);
@@ -372,13 +382,27 @@ mod tests {
         let mut out = Vec::new();
         let stop = AtomicBool::new(false);
         let progress = AtomicU32::new(0);
-        run(&Spec::Baked(Arc::new(b"nope".to_vec())), false, &mut out, &stop, &progress, false);
+        run(
+            &Spec::Baked(Arc::new(b"nope".to_vec())),
+            false,
+            &mut out,
+            &stop,
+            &progress,
+            false,
+        );
         let empty = Arc::new(Decoded {
             samples: vec![],
             rate_hz: 16_000,
             source_channels: 1,
         });
-        run(&Spec::Source(empty), true, &mut out, &stop, &progress, false);
+        run(
+            &Spec::Source(empty),
+            true,
+            &mut out,
+            &stop,
+            &progress,
+            false,
+        );
         assert!(out.is_empty());
     }
 }

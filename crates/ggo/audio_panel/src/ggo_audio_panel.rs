@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use editor::Editor;
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
-    Task, WeakEntity, Window, actions, div, point, px, size,
+    App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Task,
+    WeakEntity, Window, actions, div, point, px, size,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -68,7 +68,6 @@ const PLAYHEAD_TICK: Duration = Duration::from_millis(33);
 pub fn init(cx: &mut App) {
     workspace::register_path_open_interceptor(cx, intercept_audio_open);
 }
-
 
 /// Whether `path` is a file this tab opens (extension only, case-insensitive).
 pub fn claims(path: &Path) -> bool {
@@ -662,7 +661,11 @@ impl AudioPanel {
                     },
                 )
                 .icon_size(IconSize::Small)
-                .tooltip(ui::Tooltip::text(if playing { "Stop (space)" } else { "Play (space)" }))
+                .tooltip(ui::Tooltip::text(if playing {
+                    "Stop (space)"
+                } else {
+                    "Play (space)"
+                }))
                 .on_click(cx.listener(|this, _, _, cx| this.play_stop(cx))),
             )
             .child(
@@ -702,7 +705,9 @@ impl AudioPanel {
                     .child(
                         Button::new("ggo-audio-import", "Import as .adp")
                             .disabled(!can_import)
-                            .on_click(cx.listener(|this, _, window, cx| this.import_impl(window, cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.import_impl(window, cx)),
+                            ),
                     )
             });
 
@@ -733,9 +738,11 @@ impl AudioPanel {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .children(audio_label.map(|label| {
-                        Label::new(label).size(LabelSize::Small).color(Color::Muted)
-                    })),
+                    .children(
+                        audio_label.map(|label| {
+                            Label::new(label).size(LabelSize::Small).color(Color::Muted)
+                        }),
+                    ),
             )
             .children(open.error.as_ref().map(|e| {
                 div().px_1().child(
@@ -766,7 +773,10 @@ impl AudioPanel {
                 let columns = width.max(1.0) as usize;
                 let mid_y = bounds.origin.y + px(height / 2.0);
                 window.paint_quad(gpui::fill(
-                    Bounds::new(point(bounds.origin.x, mid_y), size(bounds.size.width, px(1.))),
+                    Bounds::new(
+                        point(bounds.origin.x, mid_y),
+                        size(bounds.size.width, px(1.)),
+                    ),
                     midline,
                 ));
                 if !waveform.is_empty() {
@@ -855,9 +865,18 @@ mod tests {
 
     #[test]
     fn the_import_target_lands_under_assets_with_the_baked_extension() {
-        assert_eq!(default_import_target("audio-src/jump.wav"), "assets/jump.adp");
-        assert_eq!(default_import_target("assets/sfx/jump.wav"), "assets/sfx/jump.adp");
-        assert_eq!(default_import_target("assets/theme.ogg"), "assets/theme.adp");
+        assert_eq!(
+            default_import_target("audio-src/jump.wav"),
+            "assets/jump.adp"
+        );
+        assert_eq!(
+            default_import_target("assets/sfx/jump.wav"),
+            "assets/sfx/jump.adp"
+        );
+        assert_eq!(
+            default_import_target("assets/theme.ogg"),
+            "assets/theme.adp"
+        );
         assert_eq!(default_import_target("theme.ogg"), "assets/theme.adp");
     }
 
@@ -911,9 +930,8 @@ mod tests {
         });
         let root = root.to_path_buf();
         let rel = rel.to_string();
-        let (item, cx) = cx.add_window_view(|window, cx| {
-            AudioItem::new_for_test(rel, root, window, cx)
-        });
+        let (item, cx) =
+            cx.add_window_view(|window, cx| AudioItem::new_for_test(rel, root, window, cx));
         cx.run_until_parked();
         (item, cx)
     }
@@ -921,7 +939,9 @@ mod tests {
     fn ready(panel: &AudioPanel) -> &Open {
         match &panel.state {
             ViewerState::Ready(open) => open,
-            ViewerState::Error { rel, message } => panic!("expected Ready, got error {rel}: {message}"),
+            ViewerState::Error { rel, message } => {
+                panic!("expected Ready, got error {rel}: {message}")
+            }
             _ => panic!("expected Ready"),
         }
     }
@@ -984,7 +1004,12 @@ mod tests {
         });
 
         let (adp_item, cx) = cx.add_window_view(|window, cx| {
-            AudioItem::new_for_test("assets/jump.adp".into(), dir.path().to_path_buf(), window, cx)
+            AudioItem::new_for_test(
+                "assets/jump.adp".into(),
+                dir.path().to_path_buf(),
+                window,
+                cx,
+            )
         });
         cx.run_until_parked();
         let adp_panel = adp_item.read_with(cx, |item, _| item.panel().clone());
@@ -1071,7 +1096,11 @@ mod tests {
                 .collect()
         });
         items.sort();
-        assert_eq!(items, vec!["sfx/jump.wav", "sfx/theme.ogg"], "one tab per file");
+        assert_eq!(
+            items,
+            vec!["sfx/jump.wav", "sfx/theme.ogg"],
+            "one tab per file"
+        );
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(&project_path(worktree_id, "notes.txt"), window, cx)
