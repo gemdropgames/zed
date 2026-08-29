@@ -2345,24 +2345,45 @@ impl WorldPanel {
         }
     }
 
-    /// `to_doc()` -> `write_world` -> `mark_saved`. Synchronous by choice:
-    /// world files are small TOML, and the async save ggo-ide uses is an
-    /// iced task-architecture artifact, not an op-flow semantic (writing
-    /// then `mark_saved` in one step also avoids the marked-depth race a
-    /// mid-flight edit would cause).
+    /// `to_doc()` -> `write_world` -> `mark_saved`, then the same for every
+    /// dirty paint session. Synchronous by choice: world files are small
+    /// TOML, and the async save ggo-ide uses is an iced task-architecture
+    /// artifact, not an op-flow semantic (writing then `mark_saved` in one
+    /// step also avoids the marked-depth race a mid-flight edit would
+    /// cause).
+    ///
+    /// Every failure is attempted past, so one unwritable `.map` cannot
+    /// strand the others, but the FIRST error is what `save_error` reports
+    /// -- the world write's if it failed, since a document whose own TOML
+    /// did not land is the more serious of the two.
     fn save_impl(&mut self, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
         // `open.root`, NOT `self.project_root`: the doc must be written
         // back where it was read from (see the `OpenWorld::root` doc).
-        match write_world(&open.root, &open.listing.rel_path, &open.store.to_doc()) {
+        let mut error = match write_world(&open.root, &open.listing.rel_path, &open.store.to_doc())
+        {
             Ok(()) => {
                 open.store.mark_saved();
-                open.save_error = None;
+                None
             }
-            Err(e) => open.save_error = Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        for session in open.sessions.values_mut() {
+            // Clean sessions are skipped rather than rewritten: an
+            // untouched `.map` has nothing to write, and touching it would
+            // wake the emu panel's watch-mode repack over no edit at all.
+            if !session.dirty() {
+                continue;
+            }
+            if let Err(e) = session.save()
+                && error.is_none()
+            {
+                error = Some(e);
+            }
         }
+        open.save_error = error;
         cx.notify();
     }
 
@@ -2549,9 +2570,13 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
+        // Paint sessions count: a `.map` edited through this world is part
+        // of the same document as far as the tab dot, the close prompt and
+        // the emulate gate are concerned (spec 2026-08-29).
+        let dirty = open.store.state().dirty || open.sessions.values().any(PaintSession::dirty);
         // The CLICKED path, not the asset-root-relative one: the prompt has
         // to name the file the way the user sees it in the explorer.
-        open.store.state().dirty.then(|| open.source_rel.clone())
+        dirty.then(|| open.source_rel.clone())
     }
 
     /// The current camera transform, if the canvas has laid out.
@@ -10475,5 +10500,211 @@ mod tests {
                 "the cached session enters synchronously"
             );
         });
+    }
+
+    /// Set up a clean world with background layer 0 linked, painted, and
+    /// the panel sitting in paint mode over `maps/test.bg0.map`. The world
+    /// store is written out first, so every dirty bit the callers assert on
+    /// afterwards can only have come from the PAINT session.
+    async fn painting_panel<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (gpui::Entity<WorldPanel>, &'a mut gpui::VisualTestContext) {
+        let (panel, cx) = ready_panel_in_window(cx, root).await;
+        write_test_tileset(root, "tiles/bg.til");
+        focus_the_panel(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.save_impl(cx);
+            assert!(panel.test_enter_paint_bg(0, cx), "the slot resolves");
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/test.bg0.map")
+            );
+            assert!(
+                panel.dirty_world_name().is_none(),
+                "the fixture must start clean"
+            );
+        });
+        (panel, cx)
+    }
+
+    /// One brush stroke on a CLEAN world has to reach every consumer of
+    /// "this document has unsaved edits": the tab's dirty dot and close
+    /// prompt (`dirty_world_name`), the Save action (`save_impl` writes the
+    /// `.map` too), and the emulate gate (`save_if_open_and_dirty`, which
+    /// `emd pack-ggo` depends on because it reads the cart's assets off
+    /// DISK).
+    #[gpui::test]
+    async fn test_paint_dirt_reaches_the_tab_the_save_and_the_emulate_gate(
+        cx: &mut TestAppContext,
+    ) {
+        use ggo_worldlib::sprites::map_doc::pack_cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = painting_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert!(
+                panel
+                    .test_paint_session("maps/test.bg0.map")
+                    .is_some_and(PaintSession::dirty),
+                "the brush dirtied the map document"
+            );
+            assert!(
+                !panel.test_is_dirty(),
+                "and only the map document -- the world store is untouched"
+            );
+            assert_eq!(
+                panel.dirty_world_name().as_deref(),
+                Some("worlds/test.toml"),
+                "paint dirt alone must mark the tab"
+            );
+        });
+
+        // Through the KEYBINDING, not `save_impl` directly: the paint
+        // column has no save button of its own, so ctrl-S reaching the
+        // panel's Save action is the only affordance a painting user has.
+        cx.simulate_keystrokes("ctrl-s");
+        panel.update(cx, |panel, _| {
+            assert!(
+                panel.dirty_world_name().is_none(),
+                "the save cleared the paint dirt too"
+            );
+            assert!(
+                panel
+                    .test_paint_session("maps/test.bg0.map")
+                    .is_some_and(|session| !session.dirty()),
+                "the session itself is marked saved"
+            );
+        });
+        assert_eq!(
+            io::open_map(dir.path(), "maps/test.bg0.map").unwrap().cells[0],
+            pack_cell(0, 0, false, false),
+            "the painted cell reached disk"
+        );
+
+        // The emulate gate: a paint edit the user never saved must be
+        // flushed before a cart is built from the world.
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([26., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert_eq!(
+                panel.dirty_world_name().as_deref(),
+                Some("worlds/test.toml"),
+                "the second stroke re-dirties the document"
+            );
+            assert!(
+                panel.save_if_open_and_dirty("worlds/test.toml", cx),
+                "the flush must report success"
+            );
+        });
+        assert_eq!(
+            io::open_map(dir.path(), "maps/test.bg0.map").unwrap().cells[1],
+            pack_cell(0, 0, false, false),
+            "and it actually wrote the second cell to disk"
+        );
+    }
+
+    /// "Don't Save" reloads from disk, and discard has to mean discard:
+    /// the paint sessions hanging off `OpenWorld` go with it, along with
+    /// their undo history and unwritten cells.
+    #[gpui::test]
+    async fn test_reload_discards_paint_sessions(cx: &mut TestAppContext) {
+        use ggo_worldlib::sprites::map_doc::CELL_BLANK;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = painting_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert!(panel.dirty_world_name().is_some(), "edited");
+            panel.reload_from_disk("worlds/test.toml", cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert!(
+                open_of(panel).sessions.is_empty(),
+                "the reloaded world starts with no sessions"
+            );
+            assert!(
+                panel.dirty_world_name().is_none(),
+                "the discarded document is clean again"
+            );
+        });
+        assert_eq!(
+            io::open_map(dir.path(), "maps/test.bg0.map").unwrap().cells[0],
+            CELL_BLANK,
+            "and the discarded stroke never reached disk"
+        );
+    }
+
+    /// A world write that lands plus a map write that fails is a FAILED
+    /// save: `save_for_close` keys off `save_error`, so anything else would
+    /// let the close flow drop the painted cells on the floor.
+    #[gpui::test]
+    async fn test_failed_map_write_keeps_the_document_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = painting_panel(cx, dir.path()).await;
+
+        // A regular file where the session's asset root should be: the
+        // map's parent-dir creation then fails deterministically (the same
+        // blocker trick `world_canvas_item`'s save test uses on the world).
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [70.0, 80.0],
+                    gesture: None,
+                },
+                cx,
+            );
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.sessions
+                .get_mut("maps/test.bg0.map")
+                .expect("the session is cached under its rel")
+                .root = blocker;
+
+            assert!(
+                !panel.save_for_close(cx),
+                "a failed map write must not report the document as saved"
+            );
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(
+                open.save_error.is_some(),
+                "the failure must be visible on the toolbar"
+            );
+            assert!(
+                open.sessions["maps/test.bg0.map"].save_error.is_some(),
+                "and on the paint column that owns the write"
+            );
+            assert_eq!(
+                panel.dirty_world_name().as_deref(),
+                Some("worlds/test.toml"),
+                "the document stays dirty until the map actually lands"
+            );
+        });
+        assert_eq!(
+            read_world(dir.path(), "worlds/test.toml").unwrap().entities[0].components["Transform"]
+                ["pos"],
+            serde_json::json!([70, 80]),
+            "the world half of the save still landed"
+        );
     }
 }
