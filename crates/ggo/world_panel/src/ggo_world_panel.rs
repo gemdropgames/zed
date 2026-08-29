@@ -673,6 +673,15 @@ struct OpenWorld {
     /// Why paint mode could not open, shown on the toolbar. Cleared by the
     /// next entry attempt.
     paint_error: Option<String>,
+    /// True between the CANVAS's own primary-down and its matching up
+    /// while painting -- the retired standalone editor's `painting` flag,
+    /// ported for the same reason. Paint mode has no `edit_drag` to stand
+    /// in for "a gesture is armed", so without this flag any left-held
+    /// move over the canvas paints: a drag begun on the tile strip, on a
+    /// palette slider, or in another pane stamps cells the moment it
+    /// crosses the canvas, and it does so with no `begin_gesture` behind
+    /// it (stale `paint_erase`, ops that never fold into one undo entry).
+    paint_gesture: bool,
     /// The tileset strip's on-screen bounds, recorded at prepaint so the
     /// strip's mouse handlers can map window coords to a tile
     /// (`ggo_map_panel::paint_ui::strip_cell_at`).
@@ -765,6 +774,7 @@ impl OpenWorld {
             sessions: HashMap::new(),
             _session_loading: None,
             paint_error: None,
+            paint_gesture: false,
             strip_bounds: Rc::new(RefCell::new(None)),
             terrain_name: None,
             resize: None,
@@ -1491,10 +1501,20 @@ impl WorldPanel {
             return;
         };
         let map_rel = background_map_rel(&open.listing.stem, layer);
-        if io::open_map(&open.root, &map_rel).is_err()
-            && let Err(e) =
-                io::save_new_bound_map(&open.root, &map_rel, NEW_BG_DIM, NEW_BG_DIM, &til_rel)
-        {
+        // Absent and present-but-unopenable are different answers, and
+        // only the first one may be written: blanking a corrupt `.map`
+        // would destroy exactly the painted work the re-link promise above
+        // exists to keep. `io::IoError` carries no `io::ErrorKind`, so the
+        // existence probe -- not the open error -- is the honest
+        // discriminator; a file that exists but will not decode is
+        // reported and left alone, slot unlinked.
+        let map_full = open.root.join(&map_rel);
+        let write_result = if map_full.exists() {
+            io::open_map(&open.root, &map_rel).map(|_| ())
+        } else {
+            io::save_new_bound_map(&open.root, &map_rel, NEW_BG_DIM, NEW_BG_DIM, &til_rel)
+        };
+        if let Err(e) = write_result {
             open.save_error = Some(e.to_string());
             cx.notify();
             return;
@@ -1666,15 +1686,27 @@ impl WorldPanel {
                 if this.load_generation != generation {
                     return;
                 }
+                // The target can die (slot cleared, the add undone, the
+                // entity deleted) or be re-pointed at a DIFFERENT map
+                // while the load is in flight. Either way the mode the
+                // user asked for no longer exists, so the session is
+                // installed -- it is a document, not a mode, and its rel
+                // is still its rel -- but the panel stays in Entities.
+                // Silently: the mode was withdrawn by the user's own
+                // later edit, which is not an error to report.
+                let still_wanted =
+                    this.paint_target_rel(&target).is_some_and(|(now, _)| now == rel);
                 let ViewerState::Ready(open) = &mut this.state else {
                     return;
                 };
                 let entered = match result {
                     Ok(session) => {
                         open.sessions.insert(rel.clone(), session);
-                        open.mode = EditMode::Paint(target);
-                        Self::end_canvas_gestures(open);
-                        true
+                        if still_wanted {
+                            open.mode = EditMode::Paint(target);
+                            Self::end_canvas_gestures(open);
+                        }
+                        still_wanted
                     }
                     Err(e) => {
                         open.paint_error = Some(e);
@@ -1694,6 +1726,15 @@ impl WorldPanel {
     /// Back to entity editing. The sessions stay: their undo history and
     /// unsaved edits are the document's, not the mode's.
     fn exit_paint_mode(&mut self, cx: &mut Context<Self>) {
+        // Leaving mid-stroke (Escape, or the slot cleared out from under
+        // the brush) has to close the session's undo entry first: an
+        // abandoned stroke stays open in the store, and the next ops --
+        // a paste, a resize, the next gesture -- would fold into the
+        // PREVIOUS gesture's entry. Before the mode flips, because
+        // `end_paint_gesture` resolves its target through the mode.
+        if matches!(&self.state, ViewerState::Ready(open) if open.paint_gesture) {
+            self.end_canvas_paint(cx);
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1772,6 +1813,17 @@ impl WorldPanel {
         } else {
             cx.notify();
         }
+    }
+
+    /// Disarm the canvas paint gesture and close its undo entry -- every
+    /// way a stroke can end (mouse-up, a release this element never saw,
+    /// the cursor leaving the canvas, leaving the mode) goes through here,
+    /// so the flag and the store's open stroke can never disagree.
+    fn end_canvas_paint(&mut self, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.paint_gesture = false;
+        }
+        self.end_paint_gesture(cx);
     }
 
     /// Gesture release while painting: a rect-fill preview becomes its op,
@@ -2634,6 +2686,9 @@ impl WorldPanel {
         // Paint mode owns the canvas: entity hit-testing, the marquee and
         // placement drags are all off while a map is under the brush.
         if self.in_paint_mode() {
+            if let ViewerState::Ready(open) = &mut self.state {
+                open.paint_gesture = true;
+            }
             self.paint_at_local(local, Some(shift), cx);
             return;
         }
@@ -2755,7 +2810,7 @@ impl WorldPanel {
     /// placement drag simply ends.
     fn canvas_primary_up(&mut self, cx: &mut Context<Self>) {
         if self.in_paint_mode() {
-            self.end_paint_gesture(cx);
+            self.end_canvas_paint(cx);
             return;
         }
         let ViewerState::Ready(open) = &mut self.state else {
@@ -2837,23 +2892,38 @@ impl WorldPanel {
         cx.notify();
     }
 
-    /// Canvas-relative position for an in-flight placement drag's move
-    /// event; cancels the drag when the left button is no longer held.
+    /// Canvas-relative position for an in-flight canvas gesture's move
+    /// event; cancels the gesture when the left button is no longer held.
     ///
-    /// Paint mode has no armed-drag state to consult -- the left button
-    /// being down IS the gesture -- so it passes every held-button move
-    /// through to [`Self::canvas_drag_to`].
-    fn edit_drag_local(&mut self, event: &MouseMoveEvent) -> Option<[f64; 2]> {
+    /// Paint mode's armed state is [`OpenWorld::paint_gesture`], set by
+    /// the canvas's OWN primary-down: a held-button move whose press
+    /// landed anywhere else must not stamp cells on entry.
+    fn edit_drag_local(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> Option<[f64; 2]> {
         let painting = self.in_paint_mode();
         let ViewerState::Ready(open) = &mut self.state else {
             return None;
         };
-        if !painting && open.edit_drag.is_none() && open.marquee.is_none() {
+        let armed = if painting {
+            open.paint_gesture
+        } else {
+            open.edit_drag.is_some() || open.marquee.is_some()
+        };
+        if !armed {
             return None;
         }
         if event.pressed_button != Some(MouseButton::Left) {
             open.edit_drag = None;
             open.marquee = None;
+            // The button came up somewhere this element got no mouse-up
+            // for: close the stroke here rather than leave it open for the
+            // next gesture's ops to fold into.
+            if painting {
+                self.end_canvas_paint(cx);
+            }
             return None;
         }
         let v = open.view.borrow();
@@ -4458,7 +4528,11 @@ impl WorldPanel {
                 }),
             )
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                if !hovered && let ViewerState::Ready(open) = &mut this.state {
+                if *hovered {
+                    return;
+                }
+                let mut painting = false;
+                if let ViewerState::Ready(open) = &mut this.state {
                     open.view.borrow_mut().hover = None;
                     // A band released outside the canvas gets no mouse-up
                     // here; settle it as "nothing more" rather than leave
@@ -4466,6 +4540,14 @@ impl WorldPanel {
                     if open.marquee.take().is_some() {
                         cx.notify();
                     }
+                    painting = open.paint_gesture;
+                }
+                // Same reasoning for a stroke: the release may never come
+                // back to this element, so end it at the boundary. A drag
+                // that wanders off the canvas and returns is two undo
+                // entries -- the price of never leaving one open.
+                if painting {
+                    this.end_canvas_paint(cx);
                 }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
@@ -4481,7 +4563,7 @@ impl WorldPanel {
                 if this.handle_pan_move(event, cx) {
                     return;
                 }
-                let Some(local) = this.edit_drag_local(event) else {
+                let Some(local) = this.edit_drag_local(event, cx) else {
                     return;
                 };
                 this.canvas_drag_to(local, cx);
@@ -4980,6 +5062,20 @@ impl WorldPanel {
                         .child(stamp)
                         .children(terrains)
                         .child(strip)
+                        // The colors on screen then aren't the asset's
+                        // own, which is worth saying out loud -- the
+                        // retired standalone footer's warning, kept.
+                        .children(
+                            session
+                                .tileset
+                                .as_ref()
+                                .filter(|tileset| tileset.missing_pal)
+                                .map(|_| {
+                                    Label::new("no .pal — 16-gray fallback")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning)
+                                }),
+                        )
                         .child(h_flex().gap_1().flex_wrap().children(bind).children(resize))
                         .children(session.save_error.as_ref().map(|e| {
                             ggo_common::CopyableText::new(
@@ -8905,7 +9001,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
-        panel.update(cx, |panel, _cx| {
+        panel.update(cx, |panel, cx| {
             let ViewerState::Ready(open) = &mut panel.state else {
                 panic!("expected Ready");
             };
@@ -8918,7 +9014,7 @@ mod tests {
 
             let held = move_event(52.0, 30.0, Some(MouseButton::Left));
             assert_eq!(
-                panel.edit_drag_local(&held),
+                panel.edit_drag_local(&held, cx),
                 None,
                 "before the first layout there are no bounds to map through"
             );
@@ -8932,13 +9028,13 @@ mod tests {
                 gpui::size(px(400.), px(300.)),
             ));
             assert_eq!(
-                panel.edit_drag_local(&held),
+                panel.edit_drag_local(&held, cx),
                 Some([32.0, 20.0]),
                 "window coords map through the canvas origin"
             );
 
             let released = move_event(52.0, 30.0, None);
-            assert_eq!(panel.edit_drag_local(&released), None);
+            assert_eq!(panel.edit_drag_local(&released, cx), None);
             assert!(
                 open_of(panel).edit_drag.is_none(),
                 "a move without the left button held cancels the drag"
@@ -9907,6 +10003,49 @@ mod tests {
         assert_eq!(data.cells, cells, "linking must not blank painted cells");
     }
 
+    /// A present-but-undecodable `.map` is an ERROR, not an absence: the
+    /// add must leave its bytes alone (the re-link promise is exactly
+    /// about not destroying painted work), must not link the slot to a
+    /// file nothing can compose, and must say why.
+    #[gpui::test]
+    async fn test_add_background_over_a_corrupt_map_reports_and_writes_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+
+        let map_path = dir.path().join("maps").join("test.bg0.map");
+        std::fs::create_dir_all(dir.path().join("maps")).unwrap();
+        let garbage = b"this is not a .map file".to_vec();
+        std::fs::write(&map_path, &garbage).unwrap();
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            assert!(
+                panel.test_backgrounds().is_empty(),
+                "a map that will not open must not be linked"
+            );
+            assert!(
+                !panel.test_is_dirty(),
+                "and no op reached the document at all"
+            );
+            let error = open_of(panel)
+                .save_error
+                .as_deref()
+                .expect("the failure has to reach the user");
+            assert!(
+                error.contains("maps/test.bg0.map"),
+                "the error names the file: {error}"
+            );
+        });
+        assert_eq!(
+            std::fs::read(&map_path).unwrap(),
+            garbage,
+            "the corrupt file's bytes must survive untouched"
+        );
+    }
+
     #[gpui::test]
     async fn test_clear_background_unlinks_and_save_persists_the_toml(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -10069,6 +10208,140 @@ mod tests {
                 panel.test_backgrounds().len(),
                 1,
                 "and the undo reached the world store, relinking the slot"
+            );
+        });
+    }
+
+    /// The slot dies while its session load is still in flight (a clear,
+    /// or an undo of the add that linked it). The session installs -- it
+    /// is a document, and its rel is still its rel -- but the mode must
+    /// not flip into a target that no longer resolves, and a mode the
+    /// user's own later edit withdrew is not an error to report.
+    #[gpui::test]
+    async fn test_a_session_landing_after_its_target_died_stays_in_entity_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            assert!(panel.test_enter_paint_bg(0, cx));
+            assert_eq!(
+                panel.test_paint_mode_rel(),
+                None,
+                "the session loads off-thread; the mode waits for it"
+            );
+            panel.clear_background_impl(0, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.test_paint_mode_rel(),
+                None,
+                "a target that died mid-load must not become a dead paint mode"
+            );
+            assert!(
+                !panel.in_paint_mode(),
+                "and the panel is back on the entity tools, not stuck in Paint"
+            );
+            assert!(
+                panel.test_paint_session("maps/test.bg0.map").is_some(),
+                "the loaded session still installs, ready for a re-entry"
+            );
+            assert!(
+                open_of(panel).paint_error.is_none(),
+                "a mode the user's own edit withdrew is not a failure"
+            );
+        });
+    }
+
+    /// A drag that began somewhere ELSE -- the tileset strip, a palette
+    /// slider, another pane -- crosses the canvas with the left button
+    /// still held. Paint mode must stamp nothing on entry: only the
+    /// canvas's own primary-down arms a stroke. Then the ordinary
+    /// down-drag-up still paints, and the whole drag is one undo entry.
+    #[gpui::test]
+    async fn test_a_held_button_move_without_a_canvas_press_paints_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        use ggo_worldlib::sprites::map_doc::{CELL_BLANK, pack_cell};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        focus_the_panel(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            assert!(panel.test_enter_paint_bg(0, cx));
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/test.bg0.map")
+            );
+            // Canvas pinned at the window origin, so window px are canvas
+            // px are (identity camera) world px.
+            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(400.), px(300.)),
+            ));
+
+            let held = move_event(10., 10., Some(MouseButton::Left));
+            assert_eq!(
+                panel.edit_drag_local(&held, cx),
+                None,
+                "no canvas press armed this drag, so no move of it paints"
+            );
+            let session = panel.test_paint_session("maps/test.bg0.map").unwrap();
+            assert!(
+                session.store.state().cells.iter().all(|c| *c == CELL_BLANK),
+                "a drag that began elsewhere must not stamp on entry"
+            );
+            assert!(!session.dirty(), "and the document stays clean");
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            let held = move_event(26., 10., Some(MouseButton::Left));
+            let local = panel
+                .edit_drag_local(&held, cx)
+                .expect("the canvas press armed this stroke");
+            panel.canvas_drag_to(local, cx);
+            panel.canvas_primary_up(cx);
+
+            let state = panel
+                .test_paint_session("maps/test.bg0.map")
+                .unwrap()
+                .store
+                .state();
+            let stamp = pack_cell(0, 0, false, false);
+            assert_eq!(state.cells[0], stamp, "the press painted cell (0, 0)");
+            assert_eq!(state.cells[1], stamp, "the drag painted cell (1, 0)");
+
+            let after = move_event(42., 10., Some(MouseButton::Left));
+            assert_eq!(
+                panel.edit_drag_local(&after, cx),
+                None,
+                "the release disarmed the stroke; a held move after it is inert"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.undo_impl(cx);
+            let state = panel
+                .test_paint_session("maps/test.bg0.map")
+                .unwrap()
+                .store
+                .state();
+            assert!(
+                state.cells.iter().all(|c| *c == CELL_BLANK),
+                "press and drag folded into ONE undo entry"
             );
         });
     }
