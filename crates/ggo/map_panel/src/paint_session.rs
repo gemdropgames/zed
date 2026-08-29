@@ -32,7 +32,7 @@ use ggo_worldlib::sprites::map_doc::{
     CELL_BLANK, MapDocStore, MapOp, Stamp, build_stamp, palette_sel_rect, unpack_cell,
 };
 use ggo_worldlib::sprites::terrain::{self, Terrain};
-use ggo_worldlib::sprites::tileset_meta::TilesetMeta;
+use ggo_worldlib::sprites::tileset_meta::{TilesetMeta, load_tileset_meta, save_tileset_meta};
 
 use crate::geom;
 use crate::loader;
@@ -133,6 +133,10 @@ pub struct PaintSession {
     /// rect; `build_stamp` turns that rect into the active stamp.
     pub pal_anchor: (i32, i32),
     pub pal_far: (i32, i32),
+    /// A strip drag-select is in flight -- ggo-ide's `palDragging`. Lives
+    /// with the anchor/far corners it gates rather than on a host, so the
+    /// strip widget is one shareable piece (spec 2026-08-29).
+    pub pal_dragging: bool,
     /// Rect-fill drag preview, raw (unnormalized) corners -- ggo-ide's
     /// `rectPending`.
     pub rect_pending: Option<(i32, i32, i32, i32)>,
@@ -148,6 +152,8 @@ pub struct PaintSession {
     pub terrain: Option<usize>,
     /// The sidecar key for saving terrains; `None` outside the worktree.
     pub til_meta_rel: Option<String>,
+    /// The 8-neighbour mask the terrain editor assigns next.
+    pub mask_draft: u8,
     pub terrain_error: Option<String>,
     pub save_error: Option<String>,
 }
@@ -168,6 +174,7 @@ impl PaintSession {
             pal_sub: geom::PAL_SUB_MIN,
             pal_anchor: (0, 0),
             pal_far: (0, 0),
+            pal_dragging: false,
             rect_pending: None,
             sel_pending: None,
             selection: None,
@@ -175,6 +182,7 @@ impl PaintSession {
             terrains: loaded.tileset_meta.terrains,
             terrain: None,
             til_meta_rel: loaded.til_meta_rel,
+            mask_draft: 0,
             terrain_error: None,
             save_error: None,
         }
@@ -248,6 +256,42 @@ impl PaintSession {
             || self
                 .terrain
                 .is_some_and(|index| index < self.terrains.len())
+    }
+
+    /// Switch the active tool. Always discards the pending rect-fill and
+    /// select previews: a half-dragged rectangle must not survive into
+    /// another tool's gesture, nor arm the next drag with a stale anchor.
+    /// The SETTLED [`Self::selection`] deliberately survives -- Copy,
+    /// Paste and Delete act on it from any tool.
+    pub fn set_tool(&mut self, tool: MapTool) {
+        self.tool = tool;
+        self.rect_pending = None;
+        self.sel_pending = None;
+    }
+
+    /// Canvas primary-down: open a gesture whose every application folds
+    /// into ONE undo entry, reading `erase` (shift) once so a terrain drag
+    /// keeps erasing for its whole length.
+    ///
+    /// A new gesture starts from no pending rect and no pending selection:
+    /// [`Self::paint_at`]'s RectFill and Select arms EXTEND a pending
+    /// rectangle, so one whose release never arrived -- the button came up
+    /// off-canvas, or the window lost focus mid-drag -- would otherwise
+    /// turn the next single click into a drag from the abandoned anchor.
+    pub fn begin_gesture(&mut self, erase: bool) {
+        self.paint_erase = erase;
+        self.rect_pending = None;
+        self.sel_pending = None;
+        self.store.begin_stroke();
+    }
+
+    /// Canvas primary-up: close the undo entry, settle a select drag into
+    /// [`Self::selection`], and commit a pending rect-fill. Returns whether
+    /// the DOCUMENT changed (i.e. whether the host has to recompose).
+    pub fn end_gesture(&mut self) -> bool {
+        self.store.end_stroke();
+        self.commit_selection();
+        self.commit_rect()
     }
 
     /// One tool application at `cell` -- the canvas's primary-down /
@@ -360,6 +404,120 @@ impl PaintSession {
         {
             self.selection = Some(normalize_rect(rect));
         }
+    }
+
+    /// Drop the cell selection, settled and pending both. Returns whether
+    /// there was one to drop -- the branch Escape takes before it gives up
+    /// the mode.
+    pub fn clear_selection(&mut self) -> bool {
+        let had = self.selection.is_some() || self.sel_pending.is_some();
+        self.selection = None;
+        self.sel_pending = None;
+        had
+    }
+
+    /// The selected cells as a stamp, clipped to the map -- what Copy puts
+    /// on the host's cell clipboard.
+    pub fn selection_stamp(&self) -> Option<Stamp> {
+        let (x0, y0, x1, y1) = self.selection?;
+        let state = self.store.state();
+        let (x0, y0) = (x0.max(0), y0.max(0));
+        let (x1, y1) = (x1.min(state.w as i32 - 1), y1.min(state.h as i32 - 1));
+        if x1 < x0 || y1 < y0 {
+            return None;
+        }
+        let (w, h) = ((x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16);
+        let mut cells = Vec::with_capacity(w as usize * h as usize);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                cells.push(state.cells[y as usize * state.w as usize + x as usize]);
+            }
+        }
+        Some(Stamp { w, h, cells })
+    }
+
+    /// Stamp `stamp` with its top-left at `(x, y)` and leave the pasted
+    /// block selected. Returns whether the document changed.
+    ///
+    /// Ends any open stroke first, in both this and
+    /// [`Self::delete_selection`]: a paste or delete is its own undo step,
+    /// never an amendment of a drag whose release landed off-canvas and so
+    /// left the stroke open.
+    pub fn paste_stamp(&mut self, stamp: Stamp, (x, y): (i32, i32)) -> bool {
+        if self.tileset.is_none() {
+            return false;
+        }
+        let (w, h) = (stamp.w as i32, stamp.h as i32);
+        self.store.end_stroke();
+        self.apply(MapOp::Brush { x, y, stamp });
+        self.selection = Some((x, y, x + w - 1, y + h - 1));
+        true
+    }
+
+    /// Blank the selected cells as ONE `RectFill`, so one undo puts all of
+    /// them back. Returns whether the document changed.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((x0, y0, x1, y1)) = self.selection.filter(|_| self.tileset.is_some()) else {
+            return false;
+        };
+        self.store.end_stroke();
+        self.apply(MapOp::RectFill {
+            x0,
+            y0,
+            x1,
+            y1,
+            cell: CELL_BLANK,
+        });
+        true
+    }
+
+    /// Resize the document, clamping both dimensions to the editor's
+    /// limits ([`geom::clamp_dim`]) -- typing `9999` gives a 256-wide map
+    /// rather than a refusal.
+    pub fn resize(&mut self, w: u16, h: u16) {
+        self.apply(MapOp::Resize {
+            w: geom::clamp_dim(w as i64),
+            h: geom::clamp_dim(h as i64),
+        });
+    }
+
+    /// Strip primary-down on tile `cell`: arm a drag-select anchored
+    /// there. A miss -- off the strip, or in the sheet's zero-filled
+    /// partial-row padding -- arms nothing. Returns whether anything moved.
+    pub fn strip_press(&mut self, cell: Option<(i32, i32)>) -> bool {
+        let Some(cell) = cell else { return false };
+        self.pal_dragging = true;
+        self.pal_anchor = cell;
+        self.pal_far = cell;
+        true
+    }
+
+    /// Extend an in-flight strip drag-select to `cell`. `held` is whether
+    /// the left button is still down: a move without it means the release
+    /// happened outside the strip, which ends the drag. A miss while
+    /// dragging leaves the selection where it was rather than smearing it
+    /// to the sheet's edge. Returns whether anything moved.
+    pub fn strip_move(&mut self, cell: Option<(i32, i32)>, held: bool) -> bool {
+        if !self.pal_dragging {
+            return false;
+        }
+        if !held {
+            self.pal_dragging = false;
+            return false;
+        }
+        match cell {
+            Some(cell) => {
+                self.pal_far = cell;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Release over the strip: the drag-select is finished, keeping its
+    /// selection.
+    pub fn strip_release(&mut self) {
+        self.pal_dragging = false;
     }
 
     /// One eyedropper pick at cell `(x, y)` -- ggo-ide's `map_eyedrop`:
@@ -526,6 +684,89 @@ impl PaintSession {
         self.terrain_error = None;
     }
 
+    // ------------------------------------------------------------ terrains
+
+    /// The tile the terrain editor assigns: the stamp's first cell's tile,
+    /// or `None` when there is no tileset or the stamp is blank.
+    pub fn anchor_tile(&self) -> Option<u16> {
+        let cell = self.fill_cell();
+        (self.tileset.is_some() && cell != CELL_BLANK).then(|| unpack_cell(cell).tile)
+    }
+
+    /// Add a terrain and select it. An empty name is refused (the sidecar
+    /// keys terrains by name).
+    pub fn add_terrain(&mut self, name: String, project_root: Option<&Path>) {
+        if name.is_empty() || self.tileset.is_none() {
+            return;
+        }
+        self.terrains.push(Terrain {
+            name,
+            tiles: vec![],
+        });
+        self.terrain = Some(self.terrains.len() - 1);
+        self.save_terrains(project_root);
+    }
+
+    pub fn rename_terrain(&mut self, name: String, project_root: Option<&Path>) {
+        if name.is_empty() {
+            return;
+        }
+        let Some(terrain) = self.terrain.and_then(|i| self.terrains.get_mut(i)) else {
+            return;
+        };
+        terrain.name = name;
+        self.save_terrains(project_root);
+    }
+
+    pub fn remove_terrain(&mut self, project_root: Option<&Path>) {
+        let Some(index) = self.terrain.take().filter(|i| *i < self.terrains.len()) else {
+            return;
+        };
+        self.terrains.remove(index);
+        self.save_terrains(project_root);
+    }
+
+    /// Select terrain `index`, or deselect when it is out of range.
+    pub fn select_terrain(&mut self, index: usize) {
+        self.terrain = (index < self.terrains.len()).then_some(index);
+    }
+
+    /// Give [`Self::anchor_tile`] the drafted mask in the selected terrain.
+    pub fn assign_anchor_tile(&mut self, project_root: Option<&Path>) {
+        let mask = terrain::canonical(self.mask_draft);
+        let Some(tile) = self.anchor_tile() else {
+            return;
+        };
+        let Some(terrain) = self.terrain.and_then(|i| self.terrains.get_mut(i)) else {
+            return;
+        };
+        terrain.assign(tile, mask);
+        self.save_terrains(project_root);
+    }
+
+    pub fn unassign_tile(&mut self, tile: u16, project_root: Option<&Path>) {
+        let Some(terrain) = self.terrain.and_then(|i| self.terrains.get_mut(i)) else {
+            return;
+        };
+        terrain.remove_tile(tile);
+        self.save_terrains(project_root);
+    }
+
+    /// Write the terrains into the bound tileset's editor sidecar, keeping
+    /// whatever else (zoom, cols) the tileset panel stored there. A tileset
+    /// outside the worktree has no sidecar key, which is reported rather
+    /// than silently dropped.
+    pub fn save_terrains(&mut self, project_root: Option<&Path>) {
+        self.terrain_error = match (project_root, &self.til_meta_rel) {
+            (Some(root), Some(rel)) => {
+                let mut meta = load_tileset_meta(root, rel);
+                meta.terrains = self.terrains.clone();
+                save_tileset_meta(root, rel, &meta).err()
+            }
+            _ => Some("tileset is outside the worktree; terrains not saved".to_string()),
+        };
+    }
+
     /// Compose the LIVE document into straight-alpha RGBA8 plus its pixel
     /// size, for a host that keeps its own image cache. `None` while the
     /// map is unbound.
@@ -690,6 +931,200 @@ mod tests {
 
         assert!(session.bind_tileset("tiles/fx.til".to_string(), None));
         assert!(session.tileset_error.is_none());
+    }
+
+    /// The terrain tool resolves against worldlib's own 47-mask rule and
+    /// lands the whole neighbourhood as ONE op -- painting a second cell
+    /// must re-resolve the FIRST one too, and a single undo must take both
+    /// writes back together.
+    #[test]
+    fn terrain_paint_resolves_neighbours_and_lands_as_one_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tileset(root, "fx", 3);
+        let state = MapState {
+            w: 4,
+            h: 4,
+            cells: vec![CELL_BLANK; 16],
+            til_path: "tiles/fx.til".to_string(),
+            pal_path: "tiles/fx.pal".to_string(),
+            dirty: false,
+        };
+        io::save_map(root, "maps/m.map", &state).unwrap();
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        session.set_tool(MapTool::Terrain);
+        session.add_terrain("ground".to_string(), Some(root));
+        assert_eq!(session.terrain, Some(0), "a new terrain is selected");
+        assert!(
+            session.terrain_error.is_none(),
+            "and reaches the tileset's sidecar: {:?}",
+            session.terrain_error
+        );
+        // Tile 0 is the isolated tile, 1 has an east neighbour, 2 a west
+        // one -- the smallest fixture where a re-resolve is visible.
+        session.terrains[0].assign(0, 0);
+        session.terrains[0].assign(1, terrain::EAST);
+        session.terrains[0].assign(2, terrain::WEST);
+        session.save_terrains(Some(root));
+
+        assert!(session.can_paint(), "a selected terrain is paintable");
+        assert!(session.paint_at((0, 0)));
+        assert_eq!(unpack_cell(session.store.state().cells[0]).tile, 0);
+
+        // The second cell's write is what `terrain::resolve` says it is --
+        // asserted against worldlib itself, not a restatement of its rule.
+        let before = session.store.state();
+        let expected = terrain::resolve(
+            &before.cells,
+            before.w,
+            before.h,
+            &[(1, 0)],
+            &session.terrains[0],
+            true,
+        );
+        assert_eq!(expected.len(), 2, "the east paint re-resolves (0, 0) too");
+        assert!(session.paint_at((1, 0)));
+        let after = session.store.state();
+        for (x, y, cell) in expected {
+            assert_eq!(
+                after.cells[y as usize * after.w as usize + x as usize],
+                cell,
+                "cell ({x}, {y})"
+            );
+        }
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        let undone = session.store.state();
+        assert_eq!(
+            unpack_cell(undone.cells[0]).tile,
+            0,
+            "one undo took the whole 2-cell resolve back -- it is ONE SetCells"
+        );
+        assert_eq!(undone.cells[1], CELL_BLANK);
+    }
+
+    /// Copy/paste round-trip through a host-held clipboard: the selection
+    /// becomes a stamp, the stamp lands where the paste says, the pasted
+    /// block becomes the selection, and delete blanks exactly it.
+    #[test]
+    fn selection_copies_pastes_and_deletes_as_whole_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        let tile0 = pack_cell(0, 0, false, false);
+        assert!(session.paint_at((1, 1)));
+
+        session.set_tool(MapTool::Select);
+        session.begin_gesture(false);
+        session.paint_at((1, 1));
+        session.paint_at((2, 2));
+        assert!(!session.end_gesture(), "a select drag edits no cells");
+        assert_eq!(session.selection, Some((1, 1, 2, 2)));
+
+        // The host's clipboard: a plain `Stamp`, which is the whole point
+        // -- it survives switching to another map and back.
+        let clipboard = session.selection_stamp().expect("the selection copies");
+        assert_eq!((clipboard.w, clipboard.h), (2, 2));
+        assert_eq!(
+            clipboard.cells,
+            vec![tile0, CELL_BLANK, CELL_BLANK, CELL_BLANK]
+        );
+
+        assert!(session.paste_stamp(clipboard, (0, 2)));
+        let state = session.store.state();
+        assert_eq!(state.cells[2 * 4], tile0, "the block landed at (0, 2)");
+        assert_eq!(
+            session.selection,
+            Some((0, 2, 1, 3)),
+            "and the paste is what is selected afterwards"
+        );
+
+        assert!(session.delete_selection());
+        let state = session.store.state();
+        assert_eq!(state.cells[2 * 4], CELL_BLANK, "delete blanked the block");
+        assert_eq!(state.cells[4 + 1], tile0, "and nothing outside it");
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        assert_eq!(
+            session.store.state().cells[2 * 4],
+            tile0,
+            "one undo restores the whole block -- the delete is ONE rect fill"
+        );
+
+        assert!(session.clear_selection());
+        assert_eq!(session.selection, None);
+        assert!(
+            !session.clear_selection(),
+            "and there is nothing left to clear"
+        );
+        assert!(
+            !session.delete_selection(),
+            "delete with nothing selected is a no-op"
+        );
+    }
+
+    #[test]
+    fn resize_clamps_to_the_editor_limits_and_undoes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        session.resize(8, 2);
+        let state = session.store.state();
+        assert_eq!((state.w, state.h), (8, 2));
+
+        session.resize(9999, 0);
+        let state = session.store.state();
+        assert_eq!(
+            (state.w, state.h),
+            (geom::MAX_MAP_DIM, geom::MIN_MAP_DIM),
+            "both ends clamp rather than refusing"
+        );
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        let state = session.store.state();
+        assert_eq!((state.w, state.h), (8, 2), "a resize is one undo step");
+    }
+
+    /// The strip's drag-select trio, now that `pal_dragging` lives with the
+    /// corners it gates: a press arms and anchors, a held move extends
+    /// (misses hold), a release keeps the picked rect, and a move without
+    /// the button ends the drag instead of extending it.
+    #[test]
+    fn strip_drag_arms_extends_and_ends_with_the_button() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        assert!(!session.strip_press(None), "a press on a miss arms nothing");
+        assert!(!session.pal_dragging);
+
+        assert!(session.strip_press(Some((1, 0))));
+        assert!(session.pal_dragging);
+        assert_eq!((session.pal_anchor, session.pal_far), ((1, 0), (1, 0)));
+
+        assert!(session.strip_move(Some((0, 0)), true));
+        assert_eq!(session.pal_anchor, (1, 0), "the anchor holds");
+        assert_eq!(session.pal_far, (0, 0));
+        assert!(
+            !session.strip_move(None, true),
+            "a miss mid-drag leaves the selection put"
+        );
+        assert_eq!(session.pal_far, (0, 0));
+
+        session.strip_release();
+        assert!(!session.pal_dragging);
+        assert_eq!(session.current_stamp().cells.len(), 2, "a 2-tile stamp");
+
+        session.strip_press(Some((0, 0)));
+        assert!(!session.strip_move(Some((1, 0)), false));
+        assert!(!session.pal_dragging, "a move without the button ends it");
+        assert_eq!(session.pal_far, (0, 0), "without extending the selection");
     }
 
     #[test]

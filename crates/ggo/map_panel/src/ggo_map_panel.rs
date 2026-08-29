@@ -41,9 +41,11 @@ mod geom;
 pub mod loader;
 mod map_item;
 pub mod paint_session;
+pub mod paint_ui;
 
 pub use map_item::MapEditorItem;
 pub use paint_session::{MapTool, PaintSession};
+use paint_ui::PaintHost as _;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -59,16 +61,12 @@ use gpui::{
 };
 use project::ProjectPath;
 use ui::prelude::*;
-use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState, Tooltip};
+use ui::{Checkbox, ToggleState, Tooltip};
 
-use ggo_worldlib::sprites::terrain::{self, Terrain};
-use ggo_worldlib::sprites::tileset_meta::{load_tileset_meta, save_tileset_meta};
 use workspace::Workspace;
 
 use ggo_worldlib::sprites::io;
-use ggo_worldlib::sprites::map_doc::{
-    CELL_BLANK, MapDocStore, MapOp, Stamp, palette_sel_rect, unpack_cell,
-};
+use ggo_worldlib::sprites::map_doc::{MapDocStore, Stamp};
 
 actions!(
     ggo_map,
@@ -96,10 +94,6 @@ actions!(
 /// The panel's key-dispatch context (`.key_context`), which the
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoMapPanel";
-
-/// The tileset strip's height. Two rows of 16px tiles at
-/// [`geom::STRIP_ZOOM`] plus room to scroll a taller sheet.
-const STRIP_HEIGHT: Pixels = px(104.);
 
 /// The map extension this panel claims from the file explorer.
 const MAP_EXT: &str = "map";
@@ -417,12 +411,6 @@ struct PanDrag {
     start_pan: [f32; 2],
 }
 
-/// The two resize fields.
-struct ResizeFields {
-    w: Entity<Editor>,
-    h: Entity<Editor>,
-}
-
 /// A loaded map plus everything the VIEW needs. The document, the tileset
 /// cache and the tool state machine are the embedded [`PaintSession`]
 /// (which outlives this panel -- see that module's doc); what is left here
@@ -437,8 +425,6 @@ struct OpenMap {
     /// names.
     source_rel: String,
     session: PaintSession,
-    /// Every `.til` under the session's asset root, for the bind picker.
-    tilesets: Vec<String>,
     /// The composed map. Rebuilt after every mutation from the LIVE store
     /// (`PaintSession::live_image`), never per render.
     image: Option<Arc<RenderImage>>,
@@ -452,12 +438,9 @@ struct OpenMap {
     canvas_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     strip_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     pan_drag: Option<PanDrag>,
-    pal_dragging: bool,
     /// The cell under the cursor while it is over the canvas -- where a
     /// paste lands.
     hover_cell: Option<(i32, i32)>,
-    /// The 8-neighbour mask the terrain editor assigns next.
-    mask_draft: u8,
     /// The terrain editor's name input, created on the first Ready render.
     terrain_name: Option<Entity<Editor>>,
     /// True between the canvas's own primary-down and its matching up, for
@@ -465,7 +448,7 @@ struct OpenMap {
     /// for the same reason: it gates brush/eraser continuing to apply,
     /// eyedropper continuing to pick, AND rect-fill continuing to extend.
     painting: bool,
-    resize: Option<ResizeFields>,
+    resize: Option<paint_ui::ResizeFields>,
 }
 
 impl OpenMap {
@@ -477,7 +460,6 @@ impl OpenMap {
     ) -> Self {
         OpenMap {
             source_rel,
-            tilesets: std::mem::take(&mut loaded.tilesets),
             image: loaded.image.take(),
             session: PaintSession::new(rel_path, root, loaded),
             show_grid: true,
@@ -486,9 +468,7 @@ impl OpenMap {
             canvas_bounds: Rc::new(RefCell::new(None)),
             strip_bounds: Rc::new(RefCell::new(None)),
             pan_drag: None,
-            pal_dragging: false,
             hover_cell: None,
-            mask_draft: 0,
             terrain_name: None,
             painting: false,
             resize: None,
@@ -505,38 +485,11 @@ impl OpenMap {
         ])
     }
 
-    fn strip_local(&self, position: gpui::Point<Pixels>) -> Option<[f32; 2]> {
-        let bounds = (*self.strip_bounds.borrow())?;
-        Some([
-            f32::from(position.x - bounds.origin.x),
-            f32::from(position.y - bounds.origin.y),
-        ])
-    }
-
     /// The map cell under a window-space position.
     fn cell_at(&self, position: gpui::Point<Pixels>) -> Option<(i32, i32)> {
         let local = self.canvas_local(position)?;
         let state = self.session.store.state();
         geom::grid_cell_at(local, self.zoom, self.pan, state.w, state.h)
-    }
-
-    /// The strip cell under a window-space position, gated to tiles the
-    /// bound tileset actually has (ggo-ide's single `>= tile_count`
-    /// early-return, shared by the anchor and every dragged-over cell --
-    /// a drag into the sheet's zero-filled partial-row padding must not
-    /// move the selection there).
-    fn strip_cell_at(&self, position: gpui::Point<Pixels>) -> Option<(i32, i32)> {
-        let tileset = self.session.tileset.as_ref()?;
-        let local = self.strip_local(position)?;
-        let (c, r) = geom::grid_cell_at(
-            local,
-            geom::STRIP_ZOOM,
-            [0.0, 0.0],
-            tileset.cols as u16,
-            tileset.rows() as u16,
-        )?;
-        let cols = tileset.cols.max(1);
-        (r as usize * cols + (c as usize) < tileset.tile_count).then_some((c, r))
     }
 }
 
@@ -763,16 +716,6 @@ impl MapPanel {
 
     // ------------------------------------------------------------ editing
 
-    /// Apply one op to the open map's store, recompose, and repaint. Every
-    /// mutation funnels through here.
-    fn apply_op(&mut self, op: MapOp, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.session.apply(op);
-            Self::rebuild_image(open);
-            cx.notify();
-        }
-    }
-
     /// Refresh the canvas image from the session's live compose. Called
     /// once per mutation, never per render -- see
     /// [`PaintSession::live_image`] for why that matters.
@@ -860,23 +803,6 @@ impl MapPanel {
         open.session.store.dirty().then(|| open.source_rel.clone())
     }
 
-    /// Bind (or rebind) the tileset at asset-root-relative `til_rel`, then
-    /// recompose. [`PaintSession::bind_tileset`] is the resolve-then-apply
-    /// rule itself.
-    fn bind_tileset(&mut self, til_rel: String, cx: &mut Context<Self>) {
-        let project_root = self.project_root.clone();
-        let ViewerState::Ready(open) = &mut self.state else {
-            return;
-        };
-        // A REFUSED bind leaves the document -- and so the composed pixels
-        // -- untouched; only the error banner is new, so this repaints
-        // without recomposing.
-        if open.session.bind_tileset(til_rel, project_root.as_deref()) {
-            Self::rebuild_image(open);
-        }
-        cx.notify();
-    }
-
     /// One tool application at `cell`, then a recompose if the document
     /// moved -- [`PaintSession::paint_at`] is the tool state machine.
     ///
@@ -904,9 +830,7 @@ impl MapPanel {
             return;
         };
         open.painting = false;
-        open.session.store.end_stroke();
-        open.session.commit_selection();
-        if open.session.commit_rect() {
+        if open.session.end_gesture() {
             Self::rebuild_image(open);
         }
         cx.notify();
@@ -914,28 +838,9 @@ impl MapPanel {
 
     // ------------------------------------------------- selection clipboard
 
-    /// The selected cells as a stamp, clipped to the map.
-    fn selection_stamp(open: &OpenMap) -> Option<Stamp> {
-        let (x0, y0, x1, y1) = open.session.selection?;
-        let state = open.session.store.state();
-        let (x0, y0) = (x0.max(0), y0.max(0));
-        let (x1, y1) = (x1.min(state.w as i32 - 1), y1.min(state.h as i32 - 1));
-        if x1 < x0 || y1 < y0 {
-            return None;
-        }
-        let (w, h) = ((x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16);
-        let mut cells = Vec::with_capacity(w as usize * h as usize);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                cells.push(state.cells[y as usize * state.w as usize + x as usize]);
-            }
-        }
-        Some(Stamp { w, h, cells })
-    }
-
     fn copy_impl(&mut self, cx: &mut Context<Self>) {
         let Some(open) = self.ready_map() else { return };
-        if let Some(stamp) = Self::selection_stamp(open) {
+        if let Some(stamp) = open.session.selection_stamp() {
             self.clipboard = Some(stamp);
             cx.notify();
         }
@@ -953,387 +858,47 @@ impl MapPanel {
         let Some(stamp) = self.clipboard.clone() else {
             return;
         };
-        let Some(open) = self.ready_map() else { return };
-        if open.session.tileset.is_none() {
+        let Some(at) = self.ready_map().map(Self::paste_origin) else {
             return;
-        }
-        let (x, y) = Self::paste_origin(open);
-        let (w, h) = (stamp.w as i32, stamp.h as i32);
-        if let ViewerState::Ready(open) = &mut self.state {
-            // A paste is its own undo step, never part of a drag that
-            // ended off-canvas.
-            open.session.store.end_stroke();
-        }
-        self.apply_op(MapOp::Brush { x, y, stamp }, cx);
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.session.selection = Some((x, y, x + w - 1, y + h - 1));
-        }
+        };
+        self.update_paint_session(cx, |session| session.paste_stamp(stamp, at));
     }
 
     fn delete_selection_impl(&mut self, cx: &mut Context<Self>) {
-        let Some((x0, y0, x1, y1)) = self
-            .ready_map()
-            .filter(|open| open.session.tileset.is_some())
-            .and_then(|open| open.session.selection)
-        else {
-            return;
-        };
-        self.apply_op(
-            MapOp::RectFill {
-                x0,
-                y0,
-                x1,
-                y1,
-                cell: CELL_BLANK,
-            },
-            cx,
-        );
+        self.update_paint_session(cx, PaintSession::delete_selection);
     }
 
     fn clear_selection_impl(&mut self, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.session.selection = None;
-            open.session.sel_pending = None;
-            cx.notify();
-        }
-    }
-
-    // ------------------------------------------------------------ terrains
-
-    /// The tile the terrain editor assigns: the stamp's first cell.
-    fn anchor_tile(open: &OpenMap) -> Option<u16> {
-        let cell = open.session.fill_cell();
-        (open.session.tileset.is_some() && cell != CELL_BLANK).then(|| unpack_cell(cell).tile)
-    }
-
-    fn terrain_name_text(&self, cx: &App) -> String {
-        self.ready_map()
-            .and_then(|open| open.terrain_name.as_ref())
-            .map(|editor| editor.read(cx).text(cx).trim().to_string())
-            .unwrap_or_default()
-    }
-
-    fn add_terrain(&mut self, name: String, cx: &mut Context<Self>) {
-        if name.is_empty() {
-            return;
-        }
-        if let ViewerState::Ready(open) = &mut self.state
-            && open.session.tileset.is_some()
-        {
-            open.session.terrains.push(Terrain {
-                name,
-                tiles: vec![],
-            });
-            open.session.terrain = Some(open.session.terrains.len() - 1);
-        }
-        self.save_terrains(cx);
-    }
-
-    fn rename_terrain(&mut self, name: String, cx: &mut Context<Self>) {
-        if name.is_empty() {
-            return;
-        }
-        if let ViewerState::Ready(open) = &mut self.state
-            && let Some(terrain) = open
-                .session
-                .terrain
-                .and_then(|i| open.session.terrains.get_mut(i))
-        {
-            terrain.name = name;
-            self.save_terrains(cx);
-        }
-    }
-
-    fn remove_terrain(&mut self, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state
-            && let Some(index) = open.session.terrain.take()
-            && index < open.session.terrains.len()
-        {
-            open.session.terrains.remove(index);
-            self.save_terrains(cx);
-        }
-    }
-
-    fn select_terrain(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.session.terrain = (index < open.session.terrains.len()).then_some(index);
-            cx.notify();
-        }
-    }
-
-    /// Give the anchor tile the drafted mask in the selected terrain.
-    fn assign_anchor_tile(&mut self, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state
-            && let Some(tile) = Self::anchor_tile(open)
-            && let Some(terrain) = open
-                .session
-                .terrain
-                .and_then(|i| open.session.terrains.get_mut(i))
-        {
-            terrain.assign(tile, terrain::canonical(open.mask_draft));
-            self.save_terrains(cx);
-        }
-    }
-
-    fn unassign_tile(&mut self, tile: u16, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state
-            && let Some(terrain) = open
-                .session
-                .terrain
-                .and_then(|i| open.session.terrains.get_mut(i))
-        {
-            terrain.remove_tile(tile);
-            self.save_terrains(cx);
-        }
-    }
-
-    /// Write the terrains into the bound tileset's editor sidecar,
-    /// keeping whatever else (zoom, cols) the tileset panel stored there.
-    fn save_terrains(&mut self, cx: &mut Context<Self>) {
-        let project_root = self.project_root.clone();
-        let ViewerState::Ready(open) = &mut self.state else {
-            return;
-        };
-        open.session.terrain_error = match (&project_root, &open.session.til_meta_rel) {
-            (Some(root), Some(rel)) => {
-                let mut meta = load_tileset_meta(root, rel);
-                meta.terrains = open.session.terrains.clone();
-                save_tileset_meta(root, rel, &meta).err()
-            }
-            _ => Some("tileset is outside the worktree; terrains not saved".to_string()),
-        };
-        cx.notify();
-    }
-
-    /// The terrain editor, shown while the Terrain tool is active.
-    fn render_terrains(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let open = self
-            .ready_map()
-            .filter(|open| open.session.tool == MapTool::Terrain)?;
-        let selected = open
-            .session
-            .terrain
-            .and_then(|i| open.session.terrains.get(i));
-        let anchor = Self::anchor_tile(open);
-        let mask = open.mask_draft;
-        let name_field = open.terrain_name.as_ref().map(|editor| {
-            div()
-                .w(px(120.))
-                .px_1()
-                .border_1()
-                .border_color(cx.theme().colors().border_variant)
-                .rounded_sm()
-                .child(editor.clone())
+        self.update_paint_session(cx, |session| {
+            session.clear_selection();
+            false
         });
-        // Rows of the 3x3 neighbour pad; the centre is the anchor tile.
-        let pad = [
-            [
-                Some(terrain::NORTH_WEST),
-                Some(terrain::NORTH),
-                Some(terrain::NORTH_EAST),
-            ],
-            [Some(terrain::WEST), None, Some(terrain::EAST)],
-            [
-                Some(terrain::SOUTH_WEST),
-                Some(terrain::SOUTH),
-                Some(terrain::SOUTH_EAST),
-            ],
-        ];
-        Some(
-            v_flex()
-                .gap_1()
-                .p_1()
-                .border_b_1()
-                .border_color(cx.theme().colors().border)
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .flex_wrap()
-                        .children(name_field)
-                        .child(
-                            Button::new("ggo-map-terrain-add", "Add")
-                                .disabled(open.session.tileset.is_none())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let name = this.terrain_name_text(cx);
-                                    this.add_terrain(name, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("ggo-map-terrain-rename", "Rename")
-                                .disabled(selected.is_none())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let name = this.terrain_name_text(cx);
-                                    this.rename_terrain(name, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("ggo-map-terrain-remove", "Remove")
-                                .disabled(selected.is_none())
-                                .on_click(cx.listener(|this, _, _, cx| this.remove_terrain(cx))),
-                        )
-                        .children(open.session.terrains.iter().enumerate().map(|(i, t)| {
-                            Button::new(("ggo-map-terrain", i), t.name.clone())
-                                .toggle_state(open.session.terrain == Some(i))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.select_terrain(i, cx)),
-                                )
-                        })),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_start()
-                        .child(v_flex().children(pad.iter().enumerate().map(|(row, bits)| {
-                            h_flex().children(bits.iter().enumerate().map(|(col, bit)| {
-                                let id = ("ggo-map-mask", row * 3 + col);
-                                match bit {
-                                    Some(bit) => {
-                                        let bit = *bit;
-                                        Button::new(id, if mask & bit != 0 { "■" } else { "·" })
-                                            .toggle_state(mask & bit != 0)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let ViewerState::Ready(open) = &mut this.state {
-                                                    open.mask_draft ^= bit;
-                                                    cx.notify();
-                                                }
-                                            }))
-                                    }
-                                    None => Button::new(
-                                        id,
-                                        anchor.map_or("—".to_string(), |t| format!("T{t}")),
-                                    )
-                                    .disabled(true),
-                                }
-                            }))
-                        })))
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    Button::new("ggo-map-terrain-assign", "Assign")
-                                        .disabled(selected.is_none() || anchor.is_none())
-                                        .tooltip(Tooltip::text(
-                                            "Give the stamp's first tile this neighbour mask",
-                                        ))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.assign_anchor_tile(cx)
-                                        })),
-                                )
-                                .child(
-                                    Label::new(terrain::mask_glyphs(terrain::canonical(mask)))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                        )
-                        .child(h_flex().gap_1().flex_wrap().children(
-                            selected.into_iter().flat_map(|t| t.tiles.iter()).map(|tt| {
-                                let tile = tt.tile;
-                                h_flex()
-                                    .gap_0p5()
-                                    .child(
-                                        Label::new(format!(
-                                            "T{} {}",
-                                            tile,
-                                            terrain::mask_glyphs(tt.mask)
-                                        ))
-                                        .size(LabelSize::XSmall),
-                                    )
-                                    .child(
-                                        IconButton::new(
-                                            ("ggo-map-terrain-tile", tile as usize),
-                                            IconName::Close,
-                                        )
-                                        .icon_size(IconSize::XSmall)
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.unassign_tile(tile, cx)
-                                            }),
-                                        ),
-                                    )
-                            }),
-                        )),
-                )
-                .children(open.session.terrain_error.as_ref().map(|e| {
-                    Label::new(e.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning)
-                }))
-                .into_any_element(),
-        )
+    }
+
+    /// The terrain editor, shown while the Terrain tool is active --
+    /// [`paint_ui::render_terrain_editor`], which the world panel mounts
+    /// from the same call.
+    fn render_terrains(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let open = self.ready_map()?;
+        paint_ui::render_terrain_editor(&open.session, open.terrain_name.as_ref(), cx)
     }
 
     // -------------------------------------------------------- resize field
 
-    /// Keep the two resize inputs in sync with the document: create them on
-    /// the first Ready render (seeded from the current size), and afterwards
-    /// refresh any UNFOCUSED one whose text no longer matches the document
-    /// -- which is how an undo/redo of a `Resize`, or the clamp a resize
-    /// applied, shows up in the fields.
-    ///
-    /// Skipping the focused editor is `ggo_world_panel::ensure_inspector`'s
-    /// rule and matters for the same reason: a render must never yank the
-    /// digits out from under someone mid-type.
-    ///
-    /// There are exactly two, fixed, targets, so there is no
-    /// target-set-changed rebuild the way the world panel's inspector has.
+    /// Create the two resize inputs on the first Ready render, and keep
+    /// them in step with the document afterwards --
+    /// [`paint_ui::ensure_resize_fields`] is the create-or-sync rule.
     fn ensure_resize_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
         let state = open.session.store.state();
-        let Some(fields) = &open.resize else {
-            let w = Self::new_size_field(state.w, window, cx);
-            let h = Self::new_size_field(state.h, window, cx);
-            if let ViewerState::Ready(open) = &mut self.state {
-                open.resize = Some(ResizeFields { w, h });
-            }
-            return;
-        };
-        for (editor, value) in [(&fields.w, state.w), (&fields.h, state.h)] {
-            if editor.focus_handle(cx).is_focused(window) {
-                continue;
-            }
-            let text = value.to_string();
-            if editor.read(cx).text(cx) != text {
-                editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
-            }
-        }
-    }
-
-    fn new_size_field(value: u16, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
-        cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_text(value.to_string(), window, cx);
-            editor
-        })
-    }
-
-    /// Apply the resize fields. Explicit (the button, or Enter in a field),
-    /// never on blur: a stray focus change must not resize the document.
-    /// Unparsable text is a no-op; an out-of-range NUMBER clamps
-    /// ([`geom::parse_dim`]).
-    fn resize_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ViewerState::Ready(open) = &self.state else {
-            return;
-        };
-        let Some(fields) = &open.resize else {
-            return;
-        };
-        let (Some(w), Some(h)) = (
-            geom::parse_dim(&fields.w.read(cx).text(cx)),
-            geom::parse_dim(&fields.h.read(cx).text(cx)),
-        ) else {
-            return;
-        };
-        let (w_editor, h_editor) = (fields.w.clone(), fields.h.clone());
-        self.apply_op(MapOp::Resize { w, h }, cx);
-        // The clamp may have changed what the user typed, and the field is
-        // still focused (they just pressed Enter in it), so `ensure_resize_fields`
-        // would skip it -- write the applied value back here.
-        for (editor, value) in [(w_editor, w), (h_editor, h)] {
-            editor.update(cx, |editor, cx| {
-                editor.set_text(value.to_string(), window, cx)
-            });
+        // Cloned out before the call: making the editors needs `cx`, which
+        // must not be borrowed alongside `self.state`.
+        let existing = open.resize.clone();
+        let made = paint_ui::ensure_resize_fields(existing.as_ref(), state.w, state.h, window, cx);
+        if let (Some(made), ViewerState::Ready(open)) = (made, &mut self.state) {
+            open.resize = Some(made);
         }
     }
 
@@ -1410,19 +975,17 @@ impl MapPanel {
             .into_any_element()
     }
 
-    /// Tools + flips + palSub + grid + zoom.
+    /// Tools + flips + palSub + grid + zoom. The first two rails are
+    /// [`paint_ui`]'s (the world panel mounts the identical elements);
+    /// grid and zoom stay here because they are this panel's CAMERA, and
+    /// the world editor's camera is a different animal entirely.
     fn render_tools(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_tools is only called in the Ready state");
         };
-        let (tool, hflip, vflip, pal_sub, grid, zoom) = (
-            open.session.tool,
-            open.session.hflip,
-            open.session.vflip,
-            open.session.pal_sub,
-            open.show_grid,
-            open.zoom,
-        );
+        let (grid, zoom) = (open.show_grid, open.zoom);
+        let tools = paint_ui::render_tool_rail(&open.session, cx);
+        let stamp = paint_ui::render_paint_controls(&open.session, cx);
         let weak = cx.weak_entity();
         h_flex()
             .gap_1()
@@ -1430,66 +993,8 @@ impl MapPanel {
             .flex_wrap()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .children(MapTool::ALL.map(|t| {
-                IconButton::new(t.id(), t.icon())
-                    .icon_size(IconSize::Small)
-                    .toggle_state(tool == t)
-                    .tooltip(Tooltip::text(t.label()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_tool(t, cx)))
-            }))
-            .child(
-                IconButton::new("ggo-map-hflip", IconName::ArrowRightLeft)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(hflip)
-                    .tooltip(Tooltip::text("Flip stamp horizontally"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let ViewerState::Ready(open) = &mut this.state {
-                            open.session.hflip = !open.session.hflip;
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(
-                IconButton::new("ggo-map-vflip", IconName::ExpandVertical)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(vflip)
-                    .tooltip(Tooltip::text("Flip stamp vertically"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let ViewerState::Ready(open) = &mut this.state {
-                            open.session.vflip = !open.session.vflip;
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(
-                Label::new("pal")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(Label::new(pal_sub.to_string()).size(LabelSize::XSmall))
-            .child(
-                ui::Slider::new(
-                    "ggo-map-pal-sub",
-                    ui::slider_fraction(
-                        pal_sub as usize,
-                        geom::PAL_SUB_MIN as usize,
-                        geom::PAL_SUB_MAX as usize,
-                    ),
-                )
-                .width(px(64.))
-                .on_change({
-                    let weak = cx.weak_entity();
-                    move |value, _window, cx| {
-                        let pal_sub = ui::slider_step(
-                            value,
-                            geom::PAL_SUB_MIN as usize,
-                            geom::PAL_SUB_MAX as usize,
-                        ) as u16;
-                        weak.update(cx, |this, cx| this.set_pal_sub(pal_sub, cx))
-                            .ok();
-                    }
-                }),
-            )
+            .child(tools)
+            .child(stamp)
             .child(
                 Checkbox::new("ggo-map-grid", ToggleState::from(grid))
                     .label("Grid")
@@ -1522,19 +1027,6 @@ impl MapPanel {
             .into_any_element()
     }
 
-    /// Switch the active tool (the toolbar buttons). Always discards a
-    /// pending rect-fill preview: a half-dragged rect must not survive into
-    /// another tool's gesture, nor arm the next RectFill click with a stale
-    /// anchor.
-    fn set_tool(&mut self, tool: MapTool, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.session.tool = tool;
-            open.session.rect_pending = None;
-            open.session.sel_pending = None;
-            cx.notify();
-        }
-    }
-
     #[cfg(test)]
     fn step_zoom(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state {
@@ -1552,16 +1044,6 @@ impl MapPanel {
             let next = zoom.clamp(geom::MIN_ZOOM, geom::MAX_ZOOM);
             if next != open.zoom {
                 open.zoom = next;
-                cx.notify();
-            }
-        }
-    }
-
-    fn set_pal_sub(&mut self, pal_sub: u16, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            let next = pal_sub.clamp(geom::PAL_SUB_MIN, geom::PAL_SUB_MAX);
-            if next != open.session.pal_sub {
-                open.session.pal_sub = next;
                 cx.notify();
             }
         }
@@ -1732,21 +1214,10 @@ impl MapPanel {
         };
         if let ViewerState::Ready(open) = &mut self.state {
             open.painting = true;
-            open.session.paint_erase = shift;
-            open.session.sel_pending = None;
-            // Everything this gesture paints folds into one undo entry.
-            open.session.store.begin_stroke();
-            // A NEW gesture starts from no pending rect (fix round 1,
-            // BLOCKING 3). `paint_at`'s RectFill arm EXTENDS an existing
-            // pending rect, so a rect whose release never reached this
-            // element -- the button came up outside the canvas, or the
-            // window lost focus mid-drag -- would otherwise survive and
-            // turn the next single click into a fill from the abandoned
-            // anchor to wherever you clicked. (ggo-ide's
-            // cursor-leaves-canvas arm commits the pending rect instead;
-            // committing a gesture the user walked away from would be its
-            // own surprise, so this discards.)
-            open.session.rect_pending = None;
+            // Everything this gesture paints folds into one undo entry, and
+            // starts from no pending rect or selection --
+            // [`PaintSession::begin_gesture`] is both rules.
+            open.session.begin_gesture(shift);
         }
         self.paint_at(cell, cx);
     }
@@ -1779,176 +1250,51 @@ impl MapPanel {
         true
     }
 
-    /// The bound tileset's tiles, rect-selectable as a stamp.
+    /// The bound tileset's tiles, rect-selectable as a stamp -- or the
+    /// bind prompt when the map has no tileset. [`paint_ui::render_strip`]
+    /// is the whole widget, mouse math included; this panel supplies only
+    /// the bounds slot its hit-testing reads.
     fn render_strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_strip is only called in the Ready state");
         };
-        let Some(tileset) = &open.session.tileset else {
-            return div()
-                .h(STRIP_HEIGHT)
-                .p_1()
-                .border_t_1()
-                .border_color(cx.theme().colors().border)
-                .child(
-                    Label::new(
-                        open.session
-                            .tileset_error
-                            .clone()
-                            .unwrap_or_else(|| "No tileset bound".to_string()),
-                    )
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                )
-                .into_any_element();
-        };
-        let (w, h) =
-            geom::grid_pixel_size(tileset.cols as u16, tileset.rows() as u16, geom::STRIP_ZOOM);
-        let scene = StripScene {
-            image: open.session.strip.clone(),
-            sel: palette_sel_rect(open.session.pal_anchor, open.session.pal_far),
-            accent: gpui::rgb(0xebcb8b).into(),
-            background: cx.theme().colors().editor_background,
-        };
-        let bounds_slot = open.strip_bounds.clone();
-        let element = gpui::canvas(
-            move |canvas_bounds, _window, _cx| {
-                *bounds_slot.borrow_mut() = Some(canvas_bounds);
-                scene
-            },
-            move |canvas_bounds, scene, window, _cx| paint_strip(&scene, canvas_bounds, window),
-        )
-        .w(px(w))
-        .h(px(h));
-
-        div()
-            .id("ggo-map-strip")
-            .h(STRIP_HEIGHT)
-            .overflow_scroll()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
-            .child(element)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                    this.strip_primary_down(event.position, cx);
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                this.strip_drag_move(event, cx);
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
-                    this.strip_primary_up();
-                }),
-            )
-            .into_any_element()
+        paint_ui::render_strip(&open.session, &open.strip_bounds, cx)
     }
 
-    /// Strip primary-down at window-space `position`: arm a drag-select
-    /// anchored on the hit tile. A miss -- off the strip, or in the sheet's
-    /// zero-filled partial-row padding -- arms nothing.
-    fn strip_primary_down(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(cell) = self
-            .ready_map()
-            .and_then(|open| open.strip_cell_at(position))
-        else {
-            return;
-        };
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.pal_dragging = true;
-            open.session.pal_anchor = cell;
-            open.session.pal_far = cell;
-            cx.notify();
-        }
-    }
-
-    /// Extend an in-flight strip drag-select to the tile under the cursor.
-    /// The drag ends when the left button is no longer held (it came up
-    /// outside the strip); a miss while dragging leaves the selection where
-    /// it was rather than smearing it to the edge.
-    fn strip_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some((dragging, cell)) = self
-            .ready_map()
-            .map(|open| (open.pal_dragging, open.strip_cell_at(event.position)))
-        else {
-            return;
-        };
-        if !dragging {
-            return;
-        }
-        let ViewerState::Ready(open) = &mut self.state else {
-            return;
-        };
-        if event.pressed_button != Some(MouseButton::Left) {
-            open.pal_dragging = false;
-            return;
-        }
-        if let Some(cell) = cell {
-            open.session.pal_far = cell;
-            cx.notify();
-        }
-    }
-
-    /// Release over the strip: the drag-select is finished, keeping its
-    /// selection.
-    fn strip_primary_up(&mut self) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.pal_dragging = false;
-        }
-    }
-
-    /// The bind picker + the resize fields.
-    fn render_footer(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The bind picker + the resize fields, both [`paint_ui`]'s.
+    ///
+    /// The picker is rendered here only while a tileset IS bound: an
+    /// unbound map gets it in the strip's place instead
+    /// ([`paint_ui::render_strip`]), so exactly one picker is ever on
+    /// screen and it is where the eye already is.
+    fn render_footer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_footer is only called in the Ready state");
         };
-        let bound = open.session.store.state().til_path;
-        let candidates = open.tilesets.clone();
-        let weak = cx.weak_entity();
-        let tileset_menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-            for til in candidates {
-                let weak = weak.clone();
-                let label = til.clone();
-                menu = menu.entry(SharedString::from(label), None, move |_window, cx| {
-                    let til = til.clone();
-                    weak.update(cx, |this, cx| this.bind_tileset(til, cx)).ok();
-                });
-            }
-            menu
-        });
-        let label = if bound.is_empty() {
-            "Bind tileset…".to_string()
-        } else {
-            bound
-        };
-        let resize = open.resize.as_ref();
+        let bind = open
+            .session
+            .tileset
+            .is_some()
+            .then(|| paint_ui::render_bind_picker(&open.session, cx));
+        let resize = open
+            .resize
+            .as_ref()
+            .map(|fields| paint_ui::render_resize(fields, cx));
         h_flex()
             .gap_1()
             .p_1()
             .flex_wrap()
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .child(DropdownMenu::new("ggo-map-bind", label, tileset_menu))
+            .children(bind)
             .child(div().flex_1())
-            .children(resize.map(|fields| Self::size_field("W", &fields.w, cx)))
-            .children(resize.map(|fields| Self::size_field("H", &fields.h, cx)))
-            .child(
-                Button::new("ggo-map-resize", "Resize")
-                    .on_click(cx.listener(|this, _, window, cx| this.resize_impl(window, cx))),
-            )
+            .children(resize)
             .children(open.session.save_error.as_ref().map(|e| {
                 ggo_common::CopyableText::new(
                     "ggo-map-save-error-copy",
                     format!("save failed: {e}"),
                 )
                 .size(LabelSize::Small)
-            }))
-            .children(open.session.tileset_error.as_ref().map(|e| {
-                ggo_common::CopyableText::new("ggo-map-tileset-error-copy", e.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
             }))
             // Worth saying out loud, same as `ggo_tileset_panel` says it:
             // with no readable `.pal`, the colors on screen are worldlib's
@@ -1963,30 +1309,6 @@ impl MapPanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Warning)
                     }),
-            )
-            .into_any_element()
-    }
-
-    /// One labelled resize input, in the minimal bordered box the world
-    /// panel's inspector fields use (primitive gpui/ui components only --
-    /// no widget framework).
-    fn size_field(label: &str, editor: &Entity<Editor>, cx: &Context<Self>) -> gpui::AnyElement {
-        h_flex()
-            .gap_0p5()
-            .items_center()
-            .child(
-                Label::new(label.to_string())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                div()
-                    .w(px(44.))
-                    .px_1()
-                    .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .rounded_sm()
-                    .child(editor.clone()),
             )
             .into_any_element()
     }
@@ -2068,13 +1390,13 @@ impl MapPanel {
         }
     }
 
-    fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_ready(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let header = self.render_header(cx);
         let tools = self.render_tools(cx);
         let terrains = self.render_terrains(cx);
         let canvas = self.render_canvas(cx);
         let strip = self.render_strip(cx);
-        let footer = self.render_footer(window, cx);
+        let footer = self.render_footer(cx);
         v_flex()
             .size_full()
             .child(header)
@@ -2107,42 +1429,13 @@ struct MapScene {
     selection_color: Hsla,
 }
 
-struct StripScene {
-    image: Option<Arc<RenderImage>>,
-    sel: (i32, i32, i32, i32),
-    accent: Hsla,
-    background: Hsla,
-}
-
-/// Rect covering cells `[c0..=c1] x [r0..=r1]` in canvas space.
-fn cell_rect(
-    canvas: Bounds<Pixels>,
-    pan: [f32; 2],
-    zoom: usize,
-    c0: i32,
-    r0: i32,
-    c1: i32,
-    r1: i32,
-) -> Bounds<Pixels> {
-    let step = (ggo_worldlib::sprites::tileset_doc::TILE_PX * zoom.max(1)) as f32;
-    let x = canvas.origin.x + px(pan[0] + c0 as f32 * step);
-    let y = canvas.origin.y + px(pan[1] + r0 as f32 * step);
-    bounds(
-        point(x, y),
-        size(
-            px((c1 - c0 + 1) as f32 * step),
-            px((r1 - r0 + 1) as f32 * step),
-        ),
-    )
-}
-
 fn paint_map(scene: &MapScene, canvas: Bounds<Pixels>, window: &mut Window) {
     window.with_content_mask(Some(ContentMask { bounds: canvas }), |window| {
         window.paint_quad(fill(canvas, scene.background));
         if scene.cols == 0 || scene.rows == 0 {
             return;
         }
-        let map_bounds = cell_rect(
+        let map_bounds = paint_ui::cell_rect(
             canvas,
             scene.pan,
             scene.zoom,
@@ -2191,7 +1484,7 @@ fn paint_map(scene: &MapScene, canvas: Bounds<Pixels>, window: &mut Window) {
             }
         }
         if let Some((x0, y0, x1, y1)) = scene.rect {
-            let r = cell_rect(
+            let r = paint_ui::cell_rect(
                 canvas,
                 scene.pan,
                 scene.zoom,
@@ -2203,30 +1496,46 @@ fn paint_map(scene: &MapScene, canvas: Bounds<Pixels>, window: &mut Window) {
             window.paint_quad(outline(r, scene.accent, BorderStyle::default()));
         }
         if let Some((x0, y0, x1, y1)) = scene.selection {
-            let r = cell_rect(canvas, scene.pan, scene.zoom, x0, y0, x1, y1);
+            let r = paint_ui::cell_rect(canvas, scene.pan, scene.zoom, x0, y0, x1, y1);
             window.paint_quad(outline(r, scene.selection_color, BorderStyle::default()));
         }
     });
 }
 
-fn paint_strip(scene: &StripScene, canvas: Bounds<Pixels>, window: &mut Window) {
-    window.with_content_mask(Some(ContentMask { bounds: canvas }), |window| {
-        window.paint_quad(fill(canvas, scene.background));
-        if let Some(image) = &scene.image {
-            let _ = window.paint_image(
-                canvas,
-                canvas,
-                Corners::default(),
-                image.clone(),
-                0,
-                false,
-                true,
-            );
+/// The standalone panel as a [`paint_ui::PaintHost`]: one session, one
+/// composed image, and the two editor entities on [`OpenMap`]. The world
+/// panel's impl answers the same six questions against a session map --
+/// which is the compile-time proof that the widgets above are shareable
+/// rather than merely relocated.
+impl paint_ui::PaintHost for MapPanel {
+    fn paint_session(&self) -> Option<&PaintSession> {
+        self.ready_map().map(|open| &open.session)
+    }
+
+    fn paint_session_mut(&mut self) -> Option<&mut PaintSession> {
+        match &mut self.state {
+            ViewerState::Ready(open) => Some(&mut open.session),
+            _ => None,
         }
-        let (c0, r0, c1, r1) = scene.sel;
-        let r = cell_rect(canvas, [0.0, 0.0], geom::STRIP_ZOOM, c0, r0, c1, r1);
-        window.paint_quad(outline(r, scene.accent, BorderStyle::default()));
-    });
+    }
+
+    fn paint_session_changed(&mut self, _cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state {
+            Self::rebuild_image(open);
+        }
+    }
+
+    fn paint_project_root(&self) -> Option<PathBuf> {
+        self.project_root.clone()
+    }
+
+    fn paint_resize_fields(&self) -> Option<&paint_ui::ResizeFields> {
+        self.ready_map()?.resize.as_ref()
+    }
+
+    fn paint_terrain_name(&self) -> Option<&Entity<Editor>> {
+        self.ready_map()?.terrain_name.as_ref()
+    }
 }
 
 impl Render for MapPanel {
@@ -2243,7 +1552,7 @@ impl Render for MapPanel {
                 self.render_message(format!("Loading {rel_path}…"), cx)
             }
             ViewerState::Error(e) => self.render_load_error(format!("Failed to load: {e}"), cx),
-            ViewerState::Ready(_) => self.render_ready(window, cx),
+            ViewerState::Ready(_) => self.render_ready(cx),
         };
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -2263,7 +1572,9 @@ impl Render for MapPanel {
                 cx.listener(|this, _: &ClearSelection, _window, cx| this.clear_selection_impl(cx)),
             )
             .on_action(
-                cx.listener(|this, _: &ApplyResize, window, cx| this.resize_impl(window, cx)),
+                cx.listener(|this, _: &ApplyResize, window, cx| {
+                    this.apply_paint_resize(window, cx)
+                }),
             )
             .bg(cx.theme().colors().panel_background)
             .child(div().flex_1().min_h_0().child(body))
@@ -2279,8 +1590,9 @@ impl Focusable for MapPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggo_worldlib::sprites::map_doc::{MapState, pack_cell};
+    use ggo_worldlib::sprites::map_doc::{CELL_BLANK, MapState, pack_cell, unpack_cell};
     use ggo_worldlib::sprites::palette565::PAL_SLOTS;
+    use ggo_worldlib::sprites::terrain::{self, Terrain};
     use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
     use gpui::TestAppContext;
     use project::{FakeFs, Project, WorktreeId};
@@ -2531,9 +1843,9 @@ mod tests {
             assert!(open.image.is_some(), "the map must compose");
             assert!(open.session.strip.is_some(), "the strip must compose");
             assert_eq!(
-                open.tilesets,
+                io::list_tilesets(&open.session.root),
                 vec!["tiles/wide.til".to_string(), "tiles/world.til".to_string()],
-                "the bind picker offers every .til under the asset root"
+                "the bind picker walks the session's asset root for every .til"
             );
             assert_eq!(open.zoom, geom::DEFAULT_ZOOM);
             assert_eq!(open.session.tool, MapTool::Brush);
@@ -2798,7 +2110,7 @@ mod tests {
         cx.executor().run_until_parked();
 
         panel.update(cx, |panel, cx| {
-            panel.bind_tileset("tiles/nope.til".to_string(), cx);
+            panel.bind_paint_tileset("tiles/nope.til".to_string(), cx);
             assert!(ready(panel).session.tileset.is_none());
             assert!(ready(panel).session.tileset_error.is_some());
             assert!(
@@ -2806,7 +2118,7 @@ mod tests {
                 "a failed bind must not touch the document"
             );
 
-            panel.bind_tileset("tiles/world.til".to_string(), cx);
+            panel.bind_paint_tileset("tiles/world.til".to_string(), cx);
             let open = ready(panel);
             assert!(open.session.tileset_error.is_none());
             assert_eq!(open.session.store.state().til_path, "tiles/world.til");
@@ -2856,7 +2168,7 @@ mod tests {
         cx.executor().run_until_parked();
 
         panel.update(cx, |panel, cx| {
-            panel.bind_tileset("tiles/world.til".to_string(), cx);
+            panel.bind_paint_tileset("tiles/world.til".to_string(), cx);
             assert!(ready(panel).session.tileset.is_some());
             assert!(ready(panel).session.strip.is_some());
             assert!(ready(panel).image.is_some());
@@ -2904,7 +2216,7 @@ mod tests {
                 FIXTURE_TILES
             );
 
-            panel.bind_tileset("tiles/wide.til".to_string(), cx);
+            panel.bind_paint_tileset("tiles/wide.til".to_string(), cx);
             let open = ready(panel);
             assert_eq!(open.session.store.state().til_path, "tiles/wide.til");
             assert_eq!(
@@ -3046,7 +2358,7 @@ mod tests {
             cx.update(|window, cx| {
                 panel.update(cx, |panel, cx| {
                     let fields = ready(panel).resize.as_ref().expect("fields exist");
-                    let (we, he) = (fields.w.clone(), fields.h.clone());
+                    let (we, he) = fields.editors();
                     we.update(cx, |e, cx| e.set_text(w.clone(), window, cx));
                     he.update(cx, |e, cx| e.set_text(h.clone(), window, cx));
                 })
@@ -3054,7 +2366,7 @@ mod tests {
         };
 
         set(("6", "2"), cx);
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.resize_impl(window, cx)));
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.apply_paint_resize(window, cx)));
         panel.update(cx, |panel, _| {
             let state = ready(panel).session.store.state();
             assert_eq!((state.w, state.h), (6, 2));
@@ -3063,7 +2375,7 @@ mod tests {
 
         // Out of range clamps to the map-size limits.
         set(("9999", "0"), cx);
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.resize_impl(window, cx)));
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.apply_paint_resize(window, cx)));
         panel.update(cx, |panel, _| {
             let state = ready(panel).session.store.state();
             assert_eq!((state.w, state.h), (geom::MAX_MAP_DIM, geom::MIN_MAP_DIM));
@@ -3071,7 +2383,7 @@ mod tests {
 
         // Garbage is a no-op, not a resize to the minimum.
         set(("wide", "5"), cx);
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.resize_impl(window, cx)));
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.apply_paint_resize(window, cx)));
         panel.update(cx, |panel, cx| {
             let state = ready(panel).session.store.state();
             assert_eq!((state.w, state.h), (geom::MAX_MAP_DIM, geom::MIN_MAP_DIM));
@@ -3778,7 +3090,7 @@ mod tests {
             assert!(!state.dirty, "creating it is not an unsaved edit");
             assert!(open.session.tileset.is_none());
             assert_eq!(
-                open.tilesets,
+                io::list_tilesets(&open.session.root),
                 vec!["tiles/wide.til".to_string(), "tiles/world.til".to_string()],
                 "the bind picker must offer the project's tilesets"
             );
@@ -3808,7 +3120,13 @@ mod tests {
 
     // ------------------------------------------------------ strip mapping
 
-    /// `strip_local`/`strip_cell_at` map a WINDOW position through the
+    /// The strip cell under a window position, through the bounds the
+    /// strip's prepaint stamped.
+    fn strip_hit(open: &OpenMap, position: gpui::Point<Pixels>) -> Option<(i32, i32)> {
+        paint_ui::strip_cell_at(&open.session, *open.strip_bounds.borrow(), position)
+    }
+
+    /// [`paint_ui::strip_cell_at`] maps a WINDOW position through the
     /// stamped strip bounds onto a tile -- with the fixture's 4x1 sheet at
     /// [`geom::STRIP_ZOOM`] a cell is 32 px -- and the `tile_count` gate
     /// keeps a wide sheet's zero-filled partial-row padding unpickable.
@@ -3824,24 +3142,19 @@ mod tests {
                 let open = ready(panel);
                 *open.strip_bounds.borrow_mut() =
                     Some(bounds(point(px(50.), px(400.)), size(px(256.), px(64.))));
+                assert_eq!(strip_hit(open, point(px(83.), px(401.))), Some((1, 0)));
                 assert_eq!(
-                    open.strip_local(point(px(82.), px(410.))),
-                    Some([32.0, 10.0]),
-                    "strip-local px are window px minus the strip origin"
-                );
-                assert_eq!(open.strip_cell_at(point(px(83.), px(401.))), Some((1, 0)));
-                assert_eq!(
-                    open.strip_cell_at(point(px(49.), px(400.))),
+                    strip_hit(open, point(px(49.), px(400.))),
                     None,
                     "left of the strip is a miss, not cell 0"
                 );
                 assert_eq!(
-                    open.strip_cell_at(point(px(50. + 4. * 32.), px(400.))),
+                    strip_hit(open, point(px(50. + 4. * 32.), px(400.))),
                     None,
                     "past the 4-column sheet is a miss"
                 );
                 assert_eq!(
-                    open.strip_cell_at(point(px(50.), px(432.))),
+                    strip_hit(open, point(px(50.), px(432.))),
                     None,
                     "below the single row is a miss"
                 );
@@ -3849,20 +3162,94 @@ mod tests {
 
             // The wide sheet: 9 tiles across the 8-column fallback, so row
             // 1 holds one real tile and 7 padding cells.
-            panel.bind_tileset("tiles/wide.til".to_string(), cx);
+            panel.bind_paint_tileset("tiles/wide.til".to_string(), cx);
             let open = ready(panel);
             assert_eq!(
-                open.strip_cell_at(point(px(51.), px(433.))),
+                strip_hit(open, point(px(51.), px(433.))),
                 Some((0, 1)),
                 "tile 8 -- the last real tile -- is pickable"
             );
             assert_eq!(
-                open.strip_cell_at(point(px(83.), px(433.))),
+                strip_hit(open, point(px(83.), px(433.))),
                 None,
                 "the padding cell after it is not"
             );
         });
     }
+
+    /// The strip's mouse trio over REAL window positions: a press on a
+    /// miss arms nothing, a press on a tile anchors both corners, a held
+    /// move extends the far corner (a miss mid-drag does not smear it), a
+    /// release keeps the picked rect -- and the picked rect plus the live
+    /// palSub is exactly what the stamp folds in.
+    ///
+    /// Drives the same two pieces the strip element's listeners do
+    /// ([`paint_ui::strip_cell_at`] + the session's press/move/release), so
+    /// this covers the window-px-to-tile half that the pure session test
+    /// cannot see.
+    #[gpui::test]
+    async fn test_strip_mouse_trio_arms_extends_and_clears(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, _cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            *open.strip_bounds.borrow_mut() =
+                Some(bounds(point(px(0.), px(0.)), size(px(128.), px(32.))));
+            let slot = *open.strip_bounds.borrow();
+            let hit = |session: &PaintSession, x: f32, y: f32| {
+                paint_ui::strip_cell_at(session, slot, point(px(x), px(y)))
+            };
+
+            // A press on a miss (off the 4x1 sheet) arms nothing.
+            let miss = hit(&open.session, 0., 200.);
+            assert!(!open.session.strip_press(miss));
+            assert!(!open.session.pal_dragging);
+
+            let cell = hit(&open.session, 33., 1.);
+            assert!(open.session.strip_press(cell));
+            assert!(open.session.pal_dragging, "the press arms the drag");
+            assert_eq!(open.session.pal_anchor, (1, 0));
+            assert_eq!(
+                open.session.pal_far,
+                (1, 0),
+                "both corners start on the hit tile"
+            );
+
+            let cell = hit(&open.session, 65., 1.);
+            assert!(open.session.strip_move(cell, true));
+            assert_eq!(open.session.pal_anchor, (1, 0), "the anchor holds");
+            assert_eq!(
+                open.session.pal_far,
+                (2, 0),
+                "the held move extends the far corner"
+            );
+
+            let cell = hit(&open.session, 300., 300.);
+            assert!(!open.session.strip_move(cell, true));
+            assert_eq!(
+                open.session.pal_far,
+                (2, 0),
+                "a miss while dragging leaves the selection put"
+            );
+            assert!(open.session.pal_dragging, "and the drag stays alive");
+
+            open.session.strip_release();
+            assert!(!open.session.pal_dragging, "the release finishes the drag");
+
+            // The selection + the live palSub is what the brush stamps.
+            open.session.pal_sub = 5;
+            assert_eq!(
+                open.session.current_stamp().cells,
+                vec![pack_cell(1, 5, false, false), pack_cell(2, 5, false, false)],
+                "the picked tiles carry the palSub"
+            );
+        });
+    }
+
+    // ----------------------------------------------------- canvas gestures
 
     fn move_event(x: f32, y: f32, button: Option<MouseButton>) -> MouseMoveEvent {
         MouseMoveEvent {
@@ -3872,97 +3259,13 @@ mod tests {
         }
     }
 
-    /// The strip's mouse trio: down arms the drag and anchors both
-    /// corners, a held move extends the far corner (misses don't smear
-    /// it), up finishes keeping the selection -- and the picked rect plus
-    /// the live palSub is exactly what the stamp folds in.
-    #[gpui::test]
-    async fn test_strip_mouse_trio_arms_extends_and_clears(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-
-        panel.update(cx, |panel, cx| {
-            *ready(panel).strip_bounds.borrow_mut() =
-                Some(bounds(point(px(0.), px(0.)), size(px(128.), px(32.))));
-
-            // A down on a miss (off the 4x1 sheet) arms nothing.
-            panel.strip_primary_down(point(px(0.), px(200.)), cx);
-            assert!(!ready(panel).pal_dragging);
-
-            panel.strip_primary_down(point(px(33.), px(1.)), cx);
-            {
-                let open = ready(panel);
-                assert!(open.pal_dragging, "down arms the drag");
-                assert_eq!(open.session.pal_anchor, (1, 0));
-                assert_eq!(
-                    open.session.pal_far,
-                    (1, 0),
-                    "both corners start on the hit tile"
-                );
-            }
-
-            panel.strip_drag_move(&move_event(65., 1., Some(MouseButton::Left)), cx);
-            {
-                let open = ready(panel);
-                assert_eq!(open.session.pal_anchor, (1, 0), "the anchor holds");
-                assert_eq!(
-                    open.session.pal_far,
-                    (2, 0),
-                    "the held move extends the far corner"
-                );
-                assert!(open.pal_dragging);
-            }
-
-            panel.strip_drag_move(&move_event(300., 300., Some(MouseButton::Left)), cx);
-            {
-                let open = ready(panel);
-                assert_eq!(
-                    open.session.pal_far,
-                    (2, 0),
-                    "a miss while dragging leaves the selection put"
-                );
-                assert!(open.pal_dragging, "and the drag stays alive");
-            }
-
-            panel.strip_primary_up();
-            {
-                let open = ready(panel);
-                assert!(!open.pal_dragging, "up finishes the drag");
-                assert_eq!(
-                    (open.session.pal_anchor, open.session.pal_far),
-                    ((1, 0), (2, 0))
-                );
-            }
-
-            // The selection + the live palSub is what the brush stamps.
-            if let ViewerState::Ready(open) = &mut panel.state {
-                open.session.pal_sub = 5;
-            }
-            let stamp = ready(panel).session.current_stamp();
-            assert_eq!(
-                stamp.cells,
-                vec![pack_cell(1, 5, false, false), pack_cell(2, 5, false, false)],
-                "the picked tiles carry the palSub"
-            );
-
-            // A button that came up outside the strip cancels the next
-            // drag on its first move.
-            panel.strip_primary_down(point(px(1.), px(1.)), cx);
-            panel.strip_drag_move(&move_event(65., 1., None), cx);
-            let open = ready(panel);
-            assert!(
-                !open.pal_dragging,
-                "a move without the button ends the drag"
-            );
-            assert_eq!(
-                open.session.pal_far,
-                (0, 0),
-                "without extending the selection"
-            );
+    /// Switch the active tool the way the tool rail's button does.
+    fn set_tool(panel: &mut MapPanel, tool: MapTool, cx: &mut Context<MapPanel>) {
+        panel.update_paint_session(cx, |session| {
+            session.set_tool(tool);
+            false
         });
     }
-
-    // ----------------------------------------------------- canvas gestures
 
     /// Middle-drag pan, mirroring `ggo_world_panel`'s: the move handler
     /// applies the cursor delta to the drag's starting pan, a release
@@ -4070,11 +3373,11 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            panel.set_tool(MapTool::RectFill, cx);
+            set_tool(panel, MapTool::RectFill, cx);
             panel.paint_at((1, 1), cx);
             assert_eq!(ready(panel).session.rect_pending, Some((1, 1, 1, 1)));
 
-            panel.set_tool(MapTool::Eraser, cx);
+            set_tool(panel, MapTool::Eraser, cx);
             let open = ready(panel);
             assert_eq!(open.session.tool, MapTool::Eraser);
             assert!(
@@ -4185,8 +3488,8 @@ mod tests {
                 .resize
                 .as_ref()
                 .expect("the windowed render created the resize fields")
-                .w
-                .clone()
+                .editors()
+                .0
         });
 
         w_editor.update_in(cx, |editor, window, cx| {
@@ -4234,7 +3537,7 @@ mod tests {
         )
         .unwrap();
         panel.update(cx, |panel, cx| {
-            panel.bind_tileset("tiles/wide.til".to_string(), cx);
+            panel.bind_paint_tileset("tiles/wide.til".to_string(), cx);
             let open = ready(panel);
             assert_eq!(
                 open.session.tileset.as_ref().unwrap().cols,
@@ -4268,7 +3571,7 @@ mod tests {
             for y in 0..FIXTURE_H as i32 {
                 panel.paint_at((2, y), cx);
             }
-            panel.set_tool(MapTool::Fill, cx);
+            set_tool(panel, MapTool::Fill, cx);
             panel.paint_at((0, 0), cx);
             let filled = cells(panel);
             let tile0 = pack_cell(0, 0, false, false);
@@ -4315,7 +3618,7 @@ mod tests {
         let at = |x: i32, y: i32| y as usize * FIXTURE_W as usize + x as usize;
         panel.update(cx, |panel, cx| {
             panel.paint_at((1, 1), cx);
-            panel.set_tool(MapTool::Select, cx);
+            set_tool(panel, MapTool::Select, cx);
             panel.paint_at((2, 2), cx);
             panel.paint_at((1, 1), cx);
             panel.end_paint(cx);
@@ -4375,8 +3678,10 @@ mod tests {
                 .terrains
         };
         panel.update(cx, |panel, cx| {
-            panel.set_tool(MapTool::Terrain, cx);
-            panel.add_terrain("ground".to_string(), cx);
+            set_tool(panel, MapTool::Terrain, cx);
+            panel.edit_paint_terrains(cx, |session, root| {
+                session.add_terrain("ground".to_string(), root)
+            });
             assert_eq!(
                 ready(panel).session.terrain,
                 Some(0),
@@ -4386,12 +3691,12 @@ mod tests {
 
             // Tile 0 (the default stamp) is the isolated tile; 1 and 2
             // are the east- and west-neighbour tiles.
-            panel.assign_anchor_tile(cx);
+            panel.edit_paint_terrains(cx, PaintSession::assign_anchor_tile);
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.session.terrains[0].assign(1, terrain::EAST);
                 open.session.terrains[0].assign(2, terrain::WEST);
             }
-            panel.save_terrains(cx);
+            panel.edit_paint_terrains(cx, PaintSession::save_terrains);
             assert_eq!(sidecar(dir.path())[0].tiles.len(), 3);
 
             panel.paint_at((0, 0), cx);
@@ -4409,12 +3714,14 @@ mod tests {
             assert_eq!(now[at(1, 0)], CELL_BLANK, "shift-paint erases");
             assert_eq!(tile(now[at(0, 0)]), 0, "and re-resolves the neighbour");
 
-            panel.unassign_tile(2, cx);
-            panel.rename_terrain("dirt".to_string(), cx);
+            panel.edit_paint_terrains(cx, |session, root| session.unassign_tile(2, root));
+            panel.edit_paint_terrains(cx, |session, root| {
+                session.rename_terrain("dirt".to_string(), root)
+            });
             let saved = sidecar(dir.path());
             assert_eq!(saved[0].name, "dirt");
             assert_eq!(saved[0].tiles.len(), 2);
-            panel.remove_terrain(cx);
+            panel.edit_paint_terrains(cx, PaintSession::remove_terrain);
             assert!(sidecar(dir.path()).is_empty());
             assert_eq!(ready(panel).session.terrain, None);
         });

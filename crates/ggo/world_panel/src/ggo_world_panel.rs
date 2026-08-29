@@ -51,6 +51,7 @@ use workspace::{SplitDirection, Workspace};
 
 use ggo_map_panel::PaintSession;
 use ggo_map_panel::loader::map_stem;
+use ggo_map_panel::paint_ui::{self, PaintHost as _};
 use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::merge_candidates::merge_candidates;
@@ -59,7 +60,7 @@ use ggo_worldlib::render::{
     build_draw_list_multi, hit_test, items_in_rect, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
-use ggo_worldlib::sprites::map_doc::MapDocStore;
+use ggo_worldlib::sprites::map_doc::{MapDocStore, Stamp};
 use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 use ggo_worldlib::sprites::{io, palette565};
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
@@ -134,6 +135,10 @@ const DEFAULT_WIDTH: Pixels = px(360.);
 const INSPECTOR_WIDTH: Pixels = px(220.);
 /// The entity/instance list beside the inspector.
 const LIST_WIDTH: Pixels = px(140.);
+/// The paint column, which takes the list+inspector's place while a map is
+/// under the brush -- wider than the inspector because the tileset strip
+/// inside it is a picking surface, not a field.
+const PAINT_WIDTH: Pixels = px(280.);
 /// Paste/duplicate offset when the cursor is not over the canvas: one tile.
 const PASTE_OFFSET_PX: f64 = 16.0;
 
@@ -665,6 +670,16 @@ struct OpenWorld {
     /// Why paint mode could not open, shown on the toolbar. Cleared by the
     /// next entry attempt.
     paint_error: Option<String>,
+    /// The tileset strip's on-screen bounds, recorded at prepaint so the
+    /// strip's mouse handlers can map window coords to a tile
+    /// (`ggo_map_panel::paint_ui::strip_cell_at`).
+    strip_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// The terrain editor's name input and the two resize inputs. Both are
+    /// gpui entities, so they are the HOST's even though the widgets that
+    /// draw them are the paint library's; both are created lazily on the
+    /// first paint-mode render.
+    terrain_name: Option<Entity<Editor>>,
+    resize: Option<paint_ui::ResizeFields>,
 }
 
 /// What an Asset field's row shows -- see [`WorldPanel::asset_field_view`].
@@ -747,6 +762,9 @@ impl OpenWorld {
             sessions: HashMap::new(),
             _session_loading: None,
             paint_error: None,
+            strip_bounds: Rc::new(RefCell::new(None)),
+            terrain_name: None,
+            resize: None,
         }
     }
 }
@@ -1014,6 +1032,12 @@ pub struct WorldPanel {
     /// to `retired_previous` and drops what was there.
     retired_images: Vec<Arc<RenderImage>>,
     retired_previous: Vec<Arc<RenderImage>>,
+    /// Copied CELLS. Panel-level (not on `OpenWorld`, and not on a
+    /// session) so it survives switching paint targets and reopening the
+    /// mode, mirroring `ggo_map_panel::MapPanel::clipboard`. Separate from
+    /// the system clipboard the world's entity copy uses: a `Stamp` has no
+    /// text form, and pasting cells into an editor tab would be nonsense.
+    cell_clipboard: Option<Stamp>,
 }
 
 impl WorldPanel {
@@ -1046,6 +1070,7 @@ impl WorldPanel {
             _popout_task: None,
             retired_images: Vec::new(),
             retired_previous: Vec::new(),
+            cell_clipboard: None,
         }
     }
 
@@ -1354,6 +1379,11 @@ impl WorldPanel {
     /// the current view center, ggo-ide's `WorldMsg::AddEntity` -- then
     /// select it.
     fn add_entity_impl(&mut self, cx: &mut Context<Self>) {
+        // The toolbar stays on screen in paint mode, so its buttons are
+        // reachable: gate them like every other entity mutation.
+        if self.in_paint_mode() {
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -1394,7 +1424,7 @@ impl WorldPanel {
     /// undo returns it to the default spot, second removes it), select
     /// it, and resolve its subtree so it renders immediately.
     fn add_instance_impl(&mut self, stem: String, cx: &mut Context<Self>) {
-        if !self.instance_candidates().contains(&stem) {
+        if self.in_paint_mode() || !self.instance_candidates().contains(&stem) {
             return;
         }
         let ViewerState::Ready(open) = &mut self.state else {
@@ -1732,7 +1762,9 @@ impl WorldPanel {
             return;
         };
         if let Some(shift) = press {
-            session.paint_erase = shift;
+            // Everything one gesture paints folds into ONE undo entry, and
+            // starts from no pending rect or selection.
+            session.begin_gesture(shift);
         }
         // An inert gesture (unbound tileset, terrain tool with no terrain)
         // is skipped rather than repainted: `paint_at` would return false
@@ -1759,8 +1791,7 @@ impl WorldPanel {
         let Some(session) = open.sessions.get_mut(&rel) else {
             return;
         };
-        session.commit_selection();
-        if session.commit_rect() {
+        if session.end_gesture() {
             self.refresh_paint_image(&rel, cx);
         } else {
             cx.notify();
@@ -1777,12 +1808,7 @@ impl WorldPanel {
                 ViewerState::Ready(open) => open.sessions.get_mut(&rel),
                 _ => None,
             })
-            .is_some_and(|session| {
-                let had = session.selection.is_some() || session.sel_pending.is_some();
-                session.selection = None;
-                session.sel_pending = None;
-                had
-            });
+            .is_some_and(PaintSession::clear_selection);
         if cleared {
             cx.notify();
             return;
@@ -1821,6 +1847,75 @@ impl WorldPanel {
         true
     }
 
+    /// Stamp the cell clipboard down. Where it lands: the cell under the
+    /// cursor when the pointer is over the canvas, else the selection's
+    /// top-left, else the map's origin -- `ggo_map_panel`'s own paste
+    /// rule, restated against the world camera.
+    fn paste_cells(&mut self, cx: &mut Context<Self>) {
+        let Some(stamp) = self.cell_clipboard.clone() else {
+            return;
+        };
+        let Some(at) = self.paste_cell_origin() else {
+            return;
+        };
+        self.update_paint_session(cx, |session| session.paste_stamp(stamp, at));
+    }
+
+    fn paste_cell_origin(&self) -> Option<(i32, i32)> {
+        let (rel, anchor) = self.active_paint_target()?;
+        let view = self.canvas_view();
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let hover = open.view.borrow().hover;
+        let under_cursor = hover.zip(view).map(|(hover, view)| {
+            let world = drag_ops::screen_to_world(hover[0], hover[1], &view);
+            canvas::paint_cell_at(world, anchor)
+        });
+        Some(
+            under_cursor
+                .or_else(|| {
+                    open.sessions
+                        .get(&rel)
+                        .and_then(|session| session.selection)
+                        .map(|(x0, y0, _, _)| (x0, y0))
+                })
+                .unwrap_or((0, 0)),
+        )
+    }
+
+    /// Create the paint column's two editor entities (the terrain name and
+    /// the resize inputs) on the first paint-mode render, and keep the
+    /// resize inputs in step with the target map afterwards. Switching
+    /// targets re-seeds them through the same sync, so the fields always
+    /// describe the map actually under the brush.
+    fn ensure_paint_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dims) = self.paint_session().map(|session| {
+            let state = session.store.state();
+            (state.w, state.h)
+        }) else {
+            return;
+        };
+        let existing = match &self.state {
+            ViewerState::Ready(open) => open.resize.clone(),
+            _ => return,
+        };
+        let made = paint_ui::ensure_resize_fields(existing.as_ref(), dims.0, dims.1, window, cx);
+        let name = match &self.state {
+            ViewerState::Ready(open) => open.terrain_name.is_none(),
+            _ => false,
+        }
+        .then(|| cx.new(|cx| Editor::single_line(window, cx)));
+        if let ViewerState::Ready(open) = &mut self.state {
+            if let Some(made) = made {
+                open.resize = Some(made);
+            }
+            if let Some(name) = name {
+                open.terrain_name = Some(name);
+            }
+        }
+    }
+
     /// The image the paint target draws with, which the canvas holds at
     /// full strength while it dims the rest ([`canvas::Scene::paint_focus`]).
     fn paint_focus_key(&self) -> Option<usize> {
@@ -1841,11 +1936,11 @@ impl WorldPanel {
     /// (ggo-ide confirms instance removal; an entity delete is one undo
     /// away and gets no prompt).
     fn delete_selected_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Paint mode's delete -- blanking the selected CELLS -- lands on
-        // this branch when the cell selection exists to delete (the
-        // strip/selection tool surface). Until then painting has no
-        // delete; what it must not have is the world's.
+        // Paint mode's delete blanks the selected CELLS -- never the
+        // world's entities. With no cell selection it is a no-op, which is
+        // the point: the world's delete must not leak through.
         if self.in_paint_mode() {
+            self.update_paint_session(cx, PaintSession::delete_selection);
             return;
         }
         let ViewerState::Ready(open) = &self.state else {
@@ -3053,10 +3148,13 @@ impl WorldPanel {
     }
 
     fn copy_impl(&mut self, cx: &mut Context<Self>) {
-        // In paint mode the clipboard is the CELL clipboard (a `Stamp`,
-        // when the selection tool surface lands); copying entities from
-        // under a brush would put the wrong thing on it.
+        // In paint mode the clipboard is the CELL clipboard: copying
+        // entities from under a brush would put the wrong thing on it.
         if self.in_paint_mode() {
+            if let Some(stamp) = self.paint_session().and_then(PaintSession::selection_stamp) {
+                self.cell_clipboard = Some(stamp);
+                cx.notify();
+            }
             return;
         }
         let ViewerState::Ready(open) = &mut self.state else {
@@ -3076,6 +3174,14 @@ impl WorldPanel {
     }
 
     fn paste_impl(&mut self, cx: &mut Context<Self>) {
+        // Ahead of the system-clipboard read, not folded into
+        // `paste_fragment`'s gate: in paint mode the system clipboard is
+        // not even consulted, so whatever text happens to be on it cannot
+        // raise a "not world TOML" error over a paste that never wanted it.
+        if self.in_paint_mode() {
+            self.paste_cells(cx);
+            return;
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
@@ -4648,33 +4754,155 @@ impl WorldPanel {
         )
     }
 
-    /// The dock's Ready layout: toolbar, view controls, and the inspector
-    /// at full width. The CANVAS is deliberately absent -- it lives in the
-    /// center-pane `WorldCanvasItem` (spec 2026-08-20), which calls
+    /// The paint column: the tool rail, the stamp controls, the terrain
+    /// editor, the tileset strip (or the bind prompt) and the resize
+    /// fields -- every one of them
+    /// [`ggo_map_panel::paint_ui`]'s, mounted here exactly as the
+    /// standalone map panel mounts them.
+    ///
+    /// It TAKES THE PLACE of the entity list and the inspector rather than
+    /// joining them, for the same reason every entity action is gated
+    /// while painting (spec: "entity manipulation is disabled"): offering
+    /// entity rows and entity fields for a mode that will refuse to act on
+    /// them is worse than not offering them.
+    fn render_paint_column(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (rel, _) = self.active_paint_target()?;
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let session = open.sessions.get(&rel)?;
+        let state = session.store.state();
+        let tools = paint_ui::render_tool_rail(session, cx);
+        let stamp = paint_ui::render_paint_controls(session, cx);
+        let terrains = paint_ui::render_terrain_editor(session, open.terrain_name.as_ref(), cx);
+        let strip = paint_ui::render_strip(session, &open.strip_bounds, cx);
+        // The picker sits here only while a tileset IS bound; an unbound
+        // map gets it in the strip's place instead (`render_strip`), so
+        // exactly one is ever on screen.
+        let bind = session
+            .tileset
+            .is_some()
+            .then(|| paint_ui::render_bind_picker(session, cx));
+        let resize = open
+            .resize
+            .as_ref()
+            .map(|fields| paint_ui::render_resize(fields, cx));
+        Some(
+            div()
+                .id("ggo-world-paint")
+                .w(PAINT_WIDTH)
+                .h_full()
+                .flex_none()
+                .border_l_1()
+                .border_color(cx.theme().colors().border)
+                .overflow_y_scroll()
+                .child(
+                    v_flex()
+                        .p_1()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Label::new(rel).size(LabelSize::XSmall))
+                                .child(
+                                    Label::new(format!("{}x{}", state.w, state.h))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .child(tools)
+                        .child(stamp)
+                        .children(terrains)
+                        .child(strip)
+                        .child(h_flex().gap_1().flex_wrap().children(bind).children(resize))
+                        .children(session.save_error.as_ref().map(|e| {
+                            ggo_common::CopyableText::new(
+                                "ggo-world-paint-save-error-copy",
+                                format!("save failed: {e}"),
+                            )
+                            .size(LabelSize::XSmall)
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The dock's Ready layout: toolbar, view controls, and either the
+    /// entity list + inspector or the paint column. The CANVAS is
+    /// deliberately absent -- it lives in the center-pane
+    /// `WorldCanvasItem` (spec 2026-08-20), which calls
     /// [`Self::render_canvas`] against this same entity's state.
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let inspector = self.render_inspector(window, cx);
+        let paint = self.render_paint_column(cx);
+        let entities = paint.is_none().then(|| {
+            let inspector = self.render_inspector(window, cx);
+            (self.render_entity_list(cx), inspector)
+        });
         let toolbar = self.render_toolbar(window, cx);
+        let mut body = h_flex().flex_1().min_h_0().items_stretch();
+        if let Some((list, inspector)) = entities {
+            body = body.child(list).children(inspector);
+        }
         v_flex()
             .size_full()
             .child(toolbar)
             .child(self.render_view_controls(cx))
             .child(self.render_layers_rail(cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_stretch()
-                    .child(self.render_entity_list(cx))
-                    .children(inspector),
-            )
+            .child(body.children(paint))
             .into_any_element()
+    }
+}
+
+/// The world editor as a [`paint_ui::PaintHost`]. The session is looked up
+/// FRESH through [`Self::active_paint_target`] on every call rather than
+/// cached: an undo can unlink the slot under the brush, and a stale handle
+/// would keep editing a map the document no longer references.
+impl paint_ui::PaintHost for WorldPanel {
+    fn paint_session(&self) -> Option<&PaintSession> {
+        let (rel, _) = self.active_paint_target()?;
+        match &self.state {
+            ViewerState::Ready(open) => open.sessions.get(&rel),
+            _ => None,
+        }
+    }
+
+    fn paint_session_mut(&mut self) -> Option<&mut PaintSession> {
+        let (rel, _) = self.active_paint_target()?;
+        match &mut self.state {
+            ViewerState::Ready(open) => open.sessions.get_mut(&rel),
+            _ => None,
+        }
+    }
+
+    fn paint_session_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some((rel, _)) = self.active_paint_target() {
+            self.refresh_paint_image(&rel, cx);
+        }
+    }
+
+    fn paint_project_root(&self) -> Option<PathBuf> {
+        self.project_root.clone()
+    }
+
+    fn paint_resize_fields(&self) -> Option<&paint_ui::ResizeFields> {
+        match &self.state {
+            ViewerState::Ready(open) => open.resize.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn paint_terrain_name(&self) -> Option<&Entity<Editor>> {
+        match &self.state {
+            ViewerState::Ready(open) => open.terrain_name.as_ref(),
+            _ => None,
+        }
     }
 }
 
 impl Render for WorldPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inspector(window, cx);
+        self.ensure_paint_fields(window, cx);
         self.refresh_stem_completion(window, cx);
         self.schedule_audio_sizes(cx);
         // The canvas item drains this too; with no canvas tab open the dock
@@ -9751,6 +9979,277 @@ mod tests {
                 "the same arrow key nudges again once painting is over"
             );
         });
+    }
+
+    /// The paint tool surface, driven the way a user drives it: the tool
+    /// rail's Select button really is on screen and really switches the
+    /// tool, a canvas drag under it settles a CELL selection, Escape drops
+    /// that selection without dropping the mode, and delete blanks exactly
+    /// the selected cells with ONE undo putting them back.
+    ///
+    /// (The escape-clears-first branch had nothing to clear until this
+    /// task: no tool could make a session selection before the rail
+    /// existed.)
+    #[gpui::test]
+    async fn test_paint_tool_rail_select_marquee_escape_and_delete(cx: &mut TestAppContext) {
+        use ggo_worldlib::sprites::map_doc::{CELL_BLANK, pack_cell};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        focus_the_panel(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.clear_selection_impl(cx);
+            assert!(panel.test_enter_paint_bg(0, cx));
+        });
+        cx.run_until_parked();
+
+        // Identity camera: canvas px are world px are TILE_PX-scaled cells.
+        let paint_cell = |panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext, x: f64| {
+            panel.update(cx, |panel, cx| {
+                panel.canvas_primary_down_with([x, 10.], false, cx);
+                panel.canvas_primary_up(cx);
+            });
+        };
+        paint_cell(&panel, cx, 10.);
+        paint_cell(&panel, cx, 26.);
+        cx.run_until_parked();
+        let painted = pack_cell(0, 0, false, false);
+        panel.read_with(cx, |panel, _| {
+            let cells = paint_cells(panel);
+            assert_eq!(
+                (cells[0], cells[1]),
+                (painted, painted),
+                "two cells painted"
+            );
+        });
+
+        // The tool rail is on screen in paint mode, and its Select button
+        // is a real click target (`IconName::Maximize`, which nothing else
+        // in the dock draws).
+        let button = cx
+            .debug_bounds("ICON-Maximize")
+            .expect("the Select tool button painted in paint mode");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                paint_session_of(panel).tool,
+                ggo_map_panel::MapTool::Select,
+                "the rail's button switched the tool"
+            );
+        });
+
+        let drag_both = |panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext| {
+            panel.update(cx, |panel, cx| {
+                panel.canvas_primary_down_with([10., 10.], false, cx);
+                panel.canvas_drag_to([26., 10.], cx);
+                panel.canvas_primary_up(cx);
+            });
+        };
+        drag_both(&panel, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                paint_session_of(panel).selection,
+                Some((0, 0, 1, 0)),
+                "the drag settled a two-cell selection"
+            );
+        });
+
+        cx.simulate_keystrokes("escape");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                paint_session_of(panel).selection,
+                None,
+                "escape clears the selection first"
+            );
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/test.bg0.map"),
+                "and does NOT leave the mode while there was one to clear"
+            );
+        });
+
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let cells = paint_cells(panel);
+            assert_eq!(
+                (cells[0], cells[1]),
+                (painted, painted),
+                "delete with nothing selected is a no-op"
+            );
+        });
+
+        drag_both(&panel, cx);
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let cells = paint_cells(panel);
+            assert_eq!(
+                (cells[0], cells[1]),
+                (CELL_BLANK, CELL_BLANK),
+                "delete blanked exactly the selected cells"
+            );
+            assert_eq!(cells[2], CELL_BLANK, "and nothing outside them");
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let cells = paint_cells(panel);
+            assert_eq!(
+                (cells[0], cells[1]),
+                (painted, painted),
+                "one undo restored both -- the delete is ONE rect fill"
+            );
+        });
+    }
+
+    /// Copy/paste of CELLS, through the panel-level clipboard: the
+    /// clipboard is a `Stamp` on the panel, so it outlives leaving and
+    /// re-entering paint mode (and, on a real world, switching layers).
+    #[gpui::test]
+    async fn test_paint_copy_paste_round_trips_through_the_cell_clipboard(cx: &mut TestAppContext) {
+        use ggo_worldlib::sprites::map_doc::pack_cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        focus_the_panel(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.clear_selection_impl(cx);
+            assert!(panel.test_enter_paint_bg(0, cx));
+        });
+        cx.run_until_parked();
+
+        let painted = pack_cell(0, 0, false, false);
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            paint_session_mut_of(panel).set_tool(ggo_map_panel::MapTool::Select);
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert_eq!(paint_session_of(panel).selection, Some((0, 0, 0, 0)));
+            panel.copy_impl(cx);
+            assert!(
+                panel.cell_clipboard.is_some(),
+                "copy in paint mode fills the CELL clipboard, not the world one"
+            );
+        });
+
+        // Leaving and re-entering the mode must not cost the clipboard.
+        // Two escapes: the first drops the cell selection, the second the
+        // mode.
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("escape");
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.test_paint_mode_rel(), None);
+            assert!(panel.test_enter_paint_bg(0, cx));
+            // Where a paste lands: the cell under the cursor.
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            open.view.borrow_mut().hover = Some([34., 18.]);
+            panel.paste_impl(cx);
+            let session = paint_session_of(panel);
+            let state = session.store.state();
+            assert_eq!(
+                state.cells[state.w as usize + 2],
+                painted,
+                "the paste landed under the cursor -- cell (2, 1)"
+            );
+            assert_eq!(
+                session.selection,
+                Some((2, 1, 2, 1)),
+                "and the paste is what is selected afterwards"
+            );
+        });
+    }
+
+    /// A slot linked to a map with no tileset: paint mode opens, painting
+    /// is inert, and the bind picker's pick is what makes it paintable --
+    /// spec 2026-08-29's "paint mode opens with a bind-tileset prompt".
+    #[gpui::test]
+    async fn test_an_unbound_paint_target_binds_from_the_picker(cx: &mut TestAppContext) {
+        use ggo_map_panel::paint_ui::PaintHost as _;
+        use ggo_worldlib::sprites::map_doc::CELL_BLANK;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        io::save_new_map(dir.path(), "maps/loose.map", 8, 8).unwrap();
+        focus_the_panel(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::SetBackground {
+                    layer: 0,
+                    map: Some("maps/loose.map".to_string()),
+                },
+                cx,
+            );
+            assert!(panel.test_enter_paint_bg(0, cx));
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let session = paint_session_of(panel);
+            assert!(session.tileset.is_none(), "the map is unbound");
+            assert!(!session.can_paint(), "so painting is inert");
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert_eq!(
+                paint_session_of(panel).store.state().cells[0],
+                CELL_BLANK,
+                "an unbound map must not collect indices nothing can resolve"
+            );
+
+            // The picker's pick.
+            panel.bind_paint_tileset("tiles/bg.til".to_string(), cx);
+            let session = paint_session_of(panel);
+            assert_eq!(session.store.state().til_path, "tiles/bg.til");
+            assert!(session.tileset.is_some(), "and the strip has tiles now");
+
+            panel.canvas_primary_down_with([10., 10.], false, cx);
+            panel.canvas_primary_up(cx);
+            assert_ne!(
+                paint_session_of(panel).store.state().cells[0],
+                CELL_BLANK,
+                "a bound map paints"
+            );
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(
+                    open_of(panel).map_loads.get("maps/loose"),
+                    Some(Loadable::Ready(_))
+                ),
+                "the bind recomposed what the canvas draws"
+            );
+        });
+    }
+
+    /// The session under the brush.
+    fn paint_session_of(panel: &WorldPanel) -> &PaintSession {
+        use ggo_map_panel::paint_ui::PaintHost as _;
+        panel.paint_session().expect("a session is under the brush")
+    }
+
+    fn paint_session_mut_of(panel: &mut WorldPanel) -> &mut PaintSession {
+        use ggo_map_panel::paint_ui::PaintHost as _;
+        panel
+            .paint_session_mut()
+            .expect("a session is under the brush")
+    }
+
+    fn paint_cells(panel: &WorldPanel) -> Vec<u16> {
+        paint_session_of(panel).store.state().cells
     }
 
     #[gpui::test]

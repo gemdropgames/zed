@@ -90,8 +90,6 @@ pub struct LoadedMap {
     pub strip: Option<Arc<RenderImage>>,
     /// The composed map, from the SHARED disk compose (see the module doc).
     pub image: Option<Arc<RenderImage>>,
-    /// Every `.til` under the asset root, for the bind picker.
-    pub tilesets: Vec<String>,
 }
 
 /// How many columns to lay a `tile_count`-tile sheet out in -- the rule
@@ -231,7 +229,6 @@ pub fn load_map(root: &Path, rel: &str, project_root: &Path) -> Result<LoadedMap
         tileset_error,
         strip,
         image,
-        tilesets: io::list_tilesets(root),
     })
 }
 
