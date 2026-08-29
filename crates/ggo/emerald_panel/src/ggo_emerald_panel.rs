@@ -337,7 +337,7 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
 /// deferred into the entries' handlers via
 /// [`ggo_common::panel_entry_handler`], which run after the lease is
 /// released. The `is_file`/`is_dir` stats the two predicates make are not
-/// panel work and are legal here, same as in `ggo_map_panel`.
+/// panel work and are legal here, same as in `ggo_sprite_panel`.
 fn contribute_emerald_menu(
     workspace: &mut Workspace,
     path: &ProjectPath,
@@ -679,7 +679,7 @@ fn is_generate_dir(dir: &Path) -> bool {
 
 /// Walk up from `dir` (inclusive) to the nearest emerald project root,
 /// returning that project's `assets/` dir. Same helper (and same
-/// directory-inclusive start) as `ggo_map_panel`'s.
+/// directory-inclusive start) as `ggo_sprite_panel`'s `asset_root_of_dir`.
 fn emerald_asset_root(dir: &Path) -> Option<PathBuf> {
     let assets = emerald_project_root(dir)?.join(ASSETS_DIR);
     assets.is_dir().then_some(assets)
@@ -2709,8 +2709,9 @@ impl Panel for EmeraldPanel {
         // build/make-shaped glyph in this checkout (grep the `IconName`
         // enum: no wand, no gem, no factory). No other panel uses it as a
         // dock icon; `Blocks` is `ggo_tileset_panel`, `Public` is
-        // `ggo_world_panel`, `Image` is `ggo_sprite_panel`, `SquareDot` is
-        // `ggo_map_panel`.
+        // `ggo_world_panel`, `Image` is `ggo_sprite_panel`. (`SquareDot`
+        // was `ggo_map_panel`'s and is free again since that panel was
+        // retired.)
         Some(IconName::ToolHammer)
     }
 
@@ -2726,8 +2727,10 @@ impl Panel for EmeraldPanel {
         // Verified free at checkout: built-in panels use 0-7,
         // `ggo_world_panel` took 8, `ggo_sprite_panel` 9,
         // `ggo_charts_panel` 10, `ggo_emu_panel` 11,
-        // `ggo_tileset_panel` 12, `ggo_import_panel` 13,
-        // `ggo_map_panel` 14 (grep activation_priority across crates/).
+        // `ggo_tileset_panel` 12, `ggo_import_panel` 13 (grep
+        // activation_priority across crates/). 14 was `ggo_map_panel`'s
+        // and is free again since that panel was retired; this one keeps
+        // 15 rather than shuffling every dock's order for a gap.
         15
     }
 

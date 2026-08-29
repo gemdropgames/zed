@@ -780,7 +780,6 @@ fn main() {
         ggo_emerald_panel::init(cx); // GGO
         ggo_emu_panel::init(cx); // GGO
         ggo_import_panel::init(cx); // GGO
-        ggo_map_panel::init(cx); // GGO
         ggo_sprite_panel::init(cx); // GGO
         ggo_tileset_panel::init(cx); // GGO
         ggo_world_panel::init(cx); // GGO

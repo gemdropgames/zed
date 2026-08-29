@@ -25,8 +25,9 @@
 //! Loading a map resolves its bound tileset too -- the panel needs that
 //! tileset's pixels for the strip and for [`compose_live_rgba`] anyway, and
 //! an unbound or unreadable binding is a state the panel shows rather than
-//! an error that fails the open (a map created by "New Map…" starts
-//! unbound by design; see `ggo_map_panel`'s `new_map` doc).
+//! an error that fails the open (a freshly generated map starts unbound
+//! by design -- a GUESSED tileset would yield a file that looks authored
+//! and is wrong).
 
 use std::path::Path;
 use std::sync::Arc;

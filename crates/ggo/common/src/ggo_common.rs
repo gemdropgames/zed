@@ -108,8 +108,6 @@ pub fn bind_default_keymap(cx: &mut App) {
 /// here rather than in whichever panel test happened to use that key.
 #[cfg(any(test, feature = "test-support"))]
 pub const GGO_KEY_CONTEXTS: &[&str] = &[
-    "GgoMapPanel",
-    "GgoMapPanel > Editor",
     "GgoTilesetPanel",
     "GgoImportPanel",
     "GgoImportPanel && !Editor",
@@ -1115,7 +1113,11 @@ mod tests {
         assert!(streamed.contains(&"two".to_string()), "stderr streams too");
         let mut sorted = capture.lines;
         sorted.sort();
-        assert_eq!(sorted, vec!["one", "three", "two"], "and lands in the capture");
+        assert_eq!(
+            sorted,
+            vec!["one", "three", "two"],
+            "and lands in the capture"
+        );
     }
 
     /// A non-zero exit is a failed capture, and a binary that cannot be
@@ -1131,11 +1133,7 @@ mod tests {
         assert!(!capture.ok, "exit 3 is a failure");
         assert_eq!(failure_reason(&capture), "nope");
 
-        let missing = ProcRequest::new(
-            "ggo-not-a-real-binary",
-            std::env::temp_dir(),
-            Vec::new(),
-        );
+        let missing = ProcRequest::new("ggo-not-a-real-binary", std::env::temp_dir(), Vec::new());
         let capture = run_streaming(&missing, Box::new(|_| {}));
         assert!(!capture.ok);
         assert!(

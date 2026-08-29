@@ -1631,25 +1631,6 @@
   },
   // GGO: the fork's panels (bound here, not in code, so the keymap editor sees them)
   {
-    "context": "GgoMapPanel",
-    "bindings": {
-      "ctrl-z": "ggo_map::Undo",
-      "ctrl-shift-z": "ggo_map::Redo",
-      "ctrl-s": "ggo_map::Save",
-      "ctrl-c": "ggo_map::Copy",
-      "ctrl-v": "ggo_map::Paste",
-      "delete": "ggo_map::DeleteSelection",
-      "backspace": "ggo_map::DeleteSelection",
-      "escape": "ggo_map::ClearSelection",
-    },
-  },
-  {
-    "context": "GgoMapPanel > Editor",
-    "bindings": {
-      "enter": "ggo_map::ApplyResize",
-    },
-  },
-  {
     "context": "GgoTilesetPanel",
     "bindings": {
       "left": "ggo_tileset::ScrollLeft",

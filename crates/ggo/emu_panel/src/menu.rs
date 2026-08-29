@@ -17,7 +17,7 @@
 //! while `ProjectPanel` is leased (see
 //! `Workspace::context_menu_contributions`), so nothing here may touch a
 //! panel; the `is_file` stats and string splits it does make are not panel
-//! work and are legal, same as in `ggo_map_panel`/`ggo_emerald_panel`.
+//! work and are legal, same as in `ggo_sprite_panel`/`ggo_emerald_panel`.
 
 use std::path::{Path, PathBuf};
 

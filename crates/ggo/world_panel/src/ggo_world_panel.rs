@@ -1037,7 +1037,7 @@ pub struct WorldPanel {
     retired_previous: Vec<Arc<RenderImage>>,
     /// Copied CELLS. Panel-level (not on `OpenWorld`, and not on a
     /// session) so it survives switching paint targets and reopening the
-    /// mode, mirroring `ggo_map_panel::MapPanel::clipboard`. Separate from
+    /// mode, mirroring the retired map panel's own clipboard. Separate from
     /// the system clipboard the world's entity copy uses: a `Stamp` has no
     /// text form, and pasting cells into an editor tab would be nonsense.
     cell_clipboard: Option<Stamp>,
@@ -1482,9 +1482,9 @@ impl WorldPanel {
     /// re-LINK the existing map rather than blank whatever was painted
     /// into it.
     fn add_background_impl(&mut self, layer: u8, til_rel: String, cx: &mut Context<Self>) {
-        /// Side of a freshly generated background map, in tiles --
-        /// `ggo_map_panel::geom::NEW_MAP_DIM`'s value for the same "new
-        /// map" idea (that module is crate-private over there).
+        /// Side of a freshly generated background map, in tiles -- the
+        /// value the retired map editor's "New Map…" used (ggo-ide's
+        /// `NEW_MAP_DEFAULT_DIM`) for the same "new map" idea.
         const NEW_BG_DIM: u16 = 16;
 
         let ViewerState::Ready(open) = &mut self.state else {

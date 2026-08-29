@@ -1282,12 +1282,6 @@
   // `VimControl && !menu` tab/enter/escape at the same editor depth
   // (upstream does the same for SkillCreator/CommitEditor).
   {
-    "context": "GgoMapPanel > Editor",
-    "bindings": {
-      "enter": "ggo_map::ApplyResize",
-    },
-  },
-  {
     "context": "GgoSpritePanel > Editor",
     "bindings": {
       "enter": "ggo_sprite::CommitField",

@@ -559,14 +559,14 @@ impl PaintSession {
     ///   `tileset.is_none()` gate PASSES and you can paint an unbound map
     ///   and save a file full of tile indices with nothing to resolve them
     ///   against -- exactly the artifact a fresh map's unbound-by-design
-    ///   rationale (`ggo_map_panel::create_map_inline`) exists to prevent;
+    ///   rationale exists to prevent;
     /// - rebind A -> B, then undo: the canvas, the strip AND
     ///   `build_stamp`'s `row * cols + col` are all computed against B's
     ///   tile count and column layout while the document is bound to A.
     ///
     /// (ggo-ide has the same gap. Inherited, not a regression -- but it
-    /// defeats an invariant the map panel states in its own module doc, so
-    /// it is fixed here rather than ported.)
+    /// defeats an invariant this crate states in its own module doc, so it
+    /// is fixed here rather than ported.)
     pub fn step_history(
         &mut self,
         step: fn(&mut MapDocStore) -> bool,
@@ -840,6 +840,12 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// The second fixture tileset's tile count: 9 tiles lays out at
+    /// `grid_cols`' 8-column fallback across 2 rows -- a different SHAPE
+    /// from `fx`'s 2x1, which is what makes a rebind's coordinate system
+    /// observable rather than just its pixels.
+    const WIDE_TILES: usize = 9;
 
     /// A 4x4 blank map bound to a 2-tile tileset, under a fresh temp root.
     fn bound_fixture(root: &Path) {
@@ -1144,5 +1150,350 @@ mod tests {
             session.store.state().cells.iter().all(|&c| c == CELL_BLANK),
             "an unbound map must not collect indices nothing can resolve"
         );
+    }
+
+    /// A flood fill stops at the painted wall instead of covering the map,
+    /// and lands as one undo step.
+    #[test]
+    fn flood_fill_covers_only_the_connected_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        for y in 0..4 {
+            assert!(session.paint_at((2, y)));
+        }
+        session.set_tool(MapTool::Fill);
+        assert!(session.paint_at((0, 0)));
+
+        let tile0 = pack_cell(0, 0, false, false);
+        let state = session.store.state();
+        for y in 0..4usize {
+            assert_eq!(
+                &state.cells[y * 4..][..4],
+                &[tile0, tile0, tile0, CELL_BLANK],
+                "row {y}: column 3 is walled off by the painted column 2"
+            );
+        }
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        assert_eq!(
+            session.store.state().cells[0],
+            CELL_BLANK,
+            "the fill is its own undo step"
+        );
+    }
+
+    #[test]
+    fn the_eraser_blanks_a_painted_cell_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        assert!(session.paint_at((2, 0)));
+        let painted = session.store.state().cells;
+        assert_ne!(painted[2], CELL_BLANK);
+
+        session.set_tool(MapTool::Eraser);
+        assert!(session.paint_at((2, 0)));
+        assert_eq!(session.store.state().cells[2], CELL_BLANK);
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        assert_eq!(
+            session.store.state().cells,
+            painted,
+            "undo must restore the erased cell"
+        );
+    }
+
+    /// The eyedropper adopts the picked cell's flips and palSub and moves
+    /// the strip selection onto its source tile -- and a BLANK cell leaves
+    /// the selection alone (worldlib's own rule, ported from ggo-ide).
+    #[test]
+    fn the_eyedropper_adopts_the_cell_and_moves_the_strip_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tileset(root, "fx", 2);
+        let mut cells = vec![CELL_BLANK; 16];
+        cells[1] = pack_cell(1, 5, true, false);
+        io::save_map(
+            root,
+            "maps/m.map",
+            &MapState {
+                w: 4,
+                h: 4,
+                cells,
+                til_path: "tiles/fx.til".to_string(),
+                pal_path: "tiles/fx.pal".to_string(),
+                dirty: false,
+            },
+        )
+        .unwrap();
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        session.set_tool(MapTool::Eyedropper);
+        assert!(
+            !session.paint_at((1, 0)),
+            "picking must not edit the document"
+        );
+        assert_eq!(session.pal_sub, 5);
+        assert!(session.hflip);
+        assert!(!session.vflip);
+        assert_eq!(
+            session.pal_anchor,
+            (1, 0),
+            "tile 1 sits at (1, 0) in a 2-column strip"
+        );
+        assert_eq!(session.pal_far, (1, 0));
+        assert!(!session.dirty());
+
+        // A blank cell adopts the flips it reads (all false) but leaves the
+        // tile selection put -- it names no tile in range.
+        session.paint_at((3, 3));
+        assert_eq!(
+            session.pal_anchor,
+            (1, 0),
+            "a blank cell has no source tile"
+        );
+        assert_eq!(session.pal_sub, 0);
+    }
+
+    /// The whole `rect_pending` lifecycle: a drag previews without touching
+    /// the document, the release commits ONE fill, an abandoned gesture does
+    /// not arm the next one, and a tool switch discards the preview.
+    ///
+    /// The abandoned-gesture half is a regression (fix round 1 BLOCKING 3):
+    /// [`PaintSession::paint_at`]'s RectFill arm EXTENDS a pending rect, so
+    /// a gesture whose release never reached the canvas turned the next
+    /// one-cell click into a fill from the stale anchor.
+    #[test]
+    fn rect_fill_commits_once_on_release_and_never_from_a_stale_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+        let filled = pack_cell(0, 0, false, false);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        session.set_tool(MapTool::RectFill);
+        session.begin_gesture(false);
+        assert!(!session.paint_at((0, 0)));
+        assert!(!session.paint_at((2, 1)), "the drag extends the preview");
+        assert!(
+            session.store.state().cells.iter().all(|&c| c == CELL_BLANK),
+            "a rect-fill drag must not touch the document until release"
+        );
+        assert_eq!(session.rect_pending, Some((0, 0, 2, 1)));
+
+        assert!(session.end_gesture());
+        assert!(session.rect_pending.is_none());
+        let state = session.store.state();
+        for y in 0..2usize {
+            for x in 0..3usize {
+                assert_eq!(state.cells[y * 4 + x], filled, "({x}, {y})");
+            }
+        }
+        assert_eq!(state.cells[2 * 4], CELL_BLANK, "row 2 untouched");
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        assert!(
+            session.store.state().cells.iter().all(|&c| c == CELL_BLANK),
+            "one undo takes the whole rectangle back"
+        );
+
+        // Gesture 1: pressed at (0, 0), then abandoned -- no release ever
+        // arrives. Gesture 2 is a fresh one-cell click at (3, 2).
+        session.begin_gesture(false);
+        session.paint_at((0, 0));
+        assert_eq!(session.rect_pending, Some((0, 0, 0, 0)));
+        session.begin_gesture(false);
+        session.paint_at((3, 2));
+        assert_eq!(
+            session.rect_pending,
+            Some((3, 2, 3, 2)),
+            "a new gesture starts a NEW rect, it does not extend the abandoned one"
+        );
+        assert!(session.end_gesture());
+        let state = session.store.state();
+        assert_eq!(
+            state.cells.iter().filter(|&&c| c == filled).count(),
+            1,
+            "a one-cell click fills exactly one cell"
+        );
+        assert_eq!(state.cells[2 * 4 + 3], filled);
+        assert_eq!(
+            state.cells[0], CELL_BLANK,
+            "the abandoned anchor stays blank"
+        );
+
+        session.begin_gesture(false);
+        session.paint_at((1, 1));
+        assert!(session.rect_pending.is_some());
+        session.set_tool(MapTool::Eraser);
+        assert!(
+            session.rect_pending.is_none(),
+            "the pending rect must not survive the tool switch"
+        );
+    }
+
+    /// A strip drag-select picks a multi-tile stamp (flips and palSub folded
+    /// in), a brush lays that whole rectangle down per application, and the
+    /// drag's applications fold into ONE undo entry.
+    #[test]
+    fn a_multi_tile_stamp_paints_a_block_and_the_drag_undoes_as_one_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        session.pal_anchor = (0, 0);
+        session.pal_far = (1, 0);
+        session.hflip = true;
+        session.vflip = true;
+        session.pal_sub = 5;
+        let stamp = session.current_stamp();
+        assert_eq!((stamp.w, stamp.h), (2, 1));
+        assert_eq!(
+            stamp.cells,
+            vec![pack_cell(0, 5, true, true), pack_cell(1, 5, true, true)]
+        );
+
+        session.begin_gesture(false);
+        assert!(session.paint_at((0, 0)));
+        assert!(session.paint_at((0, 2)));
+        session.end_gesture();
+        let state = session.store.state();
+        assert_eq!(state.cells[0], pack_cell(0, 5, true, true));
+        assert_eq!(state.cells[1], pack_cell(1, 5, true, true));
+        assert_eq!(state.cells[2], CELL_BLANK, "the stamp is 2 wide, not 3");
+        assert_eq!(state.cells[2 * 4], pack_cell(0, 5, true, true));
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        assert!(
+            session.store.state().cells.iter().all(|&c| c == CELL_BLANK),
+            "one undo reverts the whole drag"
+        );
+        assert!(
+            !session.step_history(MapDocStore::undo, None),
+            "a second undo has nothing to revert"
+        );
+    }
+
+    /// **Regression, fix round 1 BLOCKING 1.** Undo/redo across a bind has
+    /// to drag the CACHED tileset along with the store's `til_path` --
+    /// [`PaintSession::step_history`]'s whole reason for existing.
+    ///
+    /// Both halves are asserted. Bind then undo: the cache must clear, or
+    /// `paint_at`'s unbound gate passes on an unbound document and the map
+    /// collects indices nothing can resolve. Rebind A -> B then undo: the
+    /// cache must follow the store BACK, tile count and columns included,
+    /// or the strip and `build_stamp`'s `row * cols + col` are computed
+    /// against the wrong sheet.
+    #[test]
+    fn undo_across_a_bind_resyncs_the_cached_tileset() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tileset(root, "fx", 2);
+        write_tileset(root, "wide", WIDE_TILES);
+        io::save_new_map(root, "maps/fresh.map", 4, 4).unwrap();
+
+        let mut session = PaintSession::load(root, "maps/fresh.map", root).unwrap();
+        assert!(session.tileset.is_none(), "a new map is born unbound");
+
+        assert!(session.bind_tileset("tiles/fx.til".to_string(), None));
+        assert!(session.strip.is_some());
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        assert_eq!(session.store.state().til_path, "", "the store unbinds");
+        assert!(
+            session.tileset.is_none(),
+            "and the cached tileset must unbind WITH it"
+        );
+        assert!(session.strip.is_none(), "the strip is gone too");
+        assert!(session.tileset_error.is_some(), "with a reason to show");
+        assert!(
+            !session.paint_at((0, 0)),
+            "painting an unbound map is inert again after the undo"
+        );
+        assert!(!session.dirty());
+
+        assert!(session.step_history(MapDocStore::redo, None));
+        assert_eq!(
+            session.tileset.as_ref().map(|ts| (ts.tile_count, ts.cols)),
+            Some((2, 2)),
+            "and the redo brings the cache back too"
+        );
+
+        assert!(session.bind_tileset("tiles/wide.til".to_string(), None));
+        assert_eq!(
+            session.tileset.as_ref().map(|ts| (ts.tile_count, ts.cols)),
+            Some((WIDE_TILES, 8))
+        );
+
+        assert!(session.step_history(MapDocStore::undo, None));
+        assert_eq!(session.store.state().til_path, "tiles/fx.til");
+        assert_eq!(
+            session.tileset.as_ref().map(|ts| (ts.tile_count, ts.cols)),
+            Some((2, 2)),
+            "the cached tileset must follow the store back"
+        );
+        assert!(session.strip.is_some(), "and the strip recomposes for it");
+
+        // The stamp coordinate system followed too: strip cell (0, 1) is
+        // tile 8 under an 8-wide sheet and does not exist at all in a
+        // 2-tile, 2-column one.
+        session.pal_anchor = (0, 1);
+        session.pal_far = (0, 1);
+        assert_eq!(
+            session.current_stamp().cells,
+            vec![CELL_BLANK],
+            "row 1 does not exist in a 2-tile, 2-column sheet"
+        );
+    }
+
+    /// The bound tileset's editor sidecar drives BOTH the strip's column
+    /// count and the terrain list, and an undo across the bind puts the
+    /// previous tileset's (absent) sidecar back.
+    #[test]
+    fn the_tileset_sidecar_drives_the_strip_cols_and_the_terrains() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+        write_tileset(root, "wide", WIDE_TILES);
+        save_tileset_meta(
+            root,
+            "tiles/wide.til",
+            &TilesetMeta {
+                cols: Some(3),
+                terrains: vec![Terrain {
+                    name: "grass".to_string(),
+                    tiles: vec![],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        assert!(session.bind_tileset("tiles/wide.til".to_string(), Some(root)));
+        assert_eq!(
+            session.tileset.as_ref().map(|ts| ts.cols),
+            Some(3),
+            "cols come from the sidecar, not the fallback"
+        );
+        assert_eq!(
+            session.terrains.first().map(|t| t.name.as_str()),
+            Some("grass")
+        );
+        assert_eq!(session.til_meta_rel.as_deref(), Some("tiles/wide.til"));
+
+        assert!(session.step_history(MapDocStore::undo, Some(root)));
+        assert_eq!(
+            session.tileset.as_ref().map(|ts| ts.cols),
+            Some(2),
+            "fx.til has no sidecar, so it is back to the default layout"
+        );
+        assert!(session.terrains.is_empty());
     }
 }

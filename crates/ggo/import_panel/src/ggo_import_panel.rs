@@ -4,8 +4,8 @@
 //! This is the unblock for the whole art pipeline the F5 spec resolved:
 //! draw tiles in Aseprite/GIMP -> **import here** -> assemble sprites and
 //! metasprites out of those tiles in the sprite panel -> paint levels in
-//! `ggo_map_panel`. Nothing in the fork paints pixels; this panel is where
-//! pixels arrive.
+//! `ggo_world_panel` (over `ggo_map_panel`'s paint library). Nothing in the
+//! fork paints pixels; this panel is where pixels arrive.
 //!
 //! **Tileset by default, sprite on request.** ggo-ide's `ImportWizard.tsx`
 //! had three modes (Tileset / Sprite / Metasprite); Tileset is the ported
@@ -136,7 +136,7 @@ const KEY_CONTEXT: &str = "GgoImportPanel";
 
 /// The assets subdirectory hanging off an emerald project root. Hardcoded
 /// upstream -- it is NOT a configurable `emerald.toml` key. Same constant
-/// `ggo_sprite_panel` and `ggo_map_panel` resolve their sidecars with; the
+/// `ggo_sprite_panel` and `ggo_world_panel` resolve their sidecars with; the
 /// project-root walk itself is `ggo_common::emerald_project_root`.
 const ASSETS_DIR: &str = "assets";
 
@@ -252,7 +252,8 @@ fn worktree_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
 /// `workspace::ContextMenuContributor` for a `.png` FILE: "Import as
 /// tileset…".
 ///
-/// Not gated to the `assets/` tree, unlike `ggo_map_panel`'s "New Map…". A
+/// Not gated to the `assets/` tree, unlike `ggo_sprite_panel`'s "New
+/// Sprite…" (and the retired "New Map…" before it). A
 /// source PNG is an INPUT, not an asset -- art often lands in `art/` or
 /// `raw/` beside the project, and ggo-ide's own wizard picked arbitrary
 /// files off disk. What must resolve inside `assets/` is the DESTINATION,
@@ -1340,8 +1341,9 @@ impl ImportPanel {
     /// delete offer, or `None` when the write failed (the status line then
     /// carries the error).
     ///
-    /// Synchronous, same call `ggo_map_panel::save_impl` makes: a tileset is
-    /// one small atomic write and the user is waiting on their own click.
+    /// Synchronous, same call `ggo_map_panel::PaintSession::save` makes: a
+    /// tileset is one small atomic write and the user is waiting on their
+    /// own click.
     #[allow(clippy::type_complexity)]
     fn commit(&mut self, cx: &mut Context<Self>) -> Option<(Imported, Option<(PathBuf, String)>)> {
         let project_root = self.project_root.clone();

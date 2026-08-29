@@ -1,27 +1,22 @@
-//! The map panel's PURE geometry and clamping: cell hit-testing under
-//! zoom/pan, on-screen sizes, the resize dimension rule, and the palSub /
-//! zoom clamps. Nothing here touches gpui, the store, or the filesystem, so
+//! The map editor's PURE geometry and clamping: cell hit-testing under
+//! zoom/pan, on-screen sizes, the resize dimension rule, and the palSub
+//! clamp. Nothing here touches gpui, the store, or the filesystem, so
 //! all of it is unit-tested directly -- the discipline `ggo_world_panel`'s
 //! `canvas` module established (spec risk 2: "keep the pure parts (stamp
 //! geometry, cell hit-testing, resize clamping) out of the gpui layer and
 //! unit-tested").
 //!
-//! **Camera model.** Both surfaces (the map canvas and the tileset strip)
-//! draw a tile grid at an INTEGER zoom with a pan offset in canvas-local
-//! CSS px, so one cell occupies `TILE_PX * zoom` px and the grid's top-left
-//! sits at `pan`. That is deliberately simpler than `ggo_world_panel`'s
-//! float camera: the map is pixel art composed at 1:1, and a fractional
-//! scale would resample 16x16 tiles into blur (the same call
-//! `ggo_tileset_panel` made for its sheet view).
+//! **Camera model.** The tileset strip draws its tile grid at an INTEGER
+//! zoom with a pan offset in strip-local CSS px, so one cell occupies
+//! `TILE_PX * zoom` px and the grid's top-left sits at `pan`. That is
+//! deliberately simpler than `ggo_world_panel`'s float camera: the sheet is
+//! pixel art composed at 1:1, and a fractional scale would resample 16x16
+//! tiles into blur (the same call `ggo_tileset_panel` made for its sheet
+//! view). The map CANVAS is the host's own problem -- the world editor
+//! draws it in world space under its float camera -- so nothing here
+//! assumes an integer camera on that side.
 
 use ggo_worldlib::sprites::tileset_doc::TILE_PX;
-
-/// Integer zoom bounds for both surfaces. 1x is unreadably small for
-/// 16x16 tiles on a HiDPI panel, so the default is 2x -- same ladder and
-/// default as `ggo_tileset_panel`.
-pub const MIN_ZOOM: usize = 1;
-pub const MAX_ZOOM: usize = 8;
-pub const DEFAULT_ZOOM: usize = 2;
 
 /// The tileset strip is a picker, not the working surface, so it gets its
 /// own (fixed, small) scale rather than following the canvas zoom.
@@ -33,9 +28,6 @@ pub const STRIP_ZOOM: usize = 2;
 /// composes ~16.8M pixels per repaint.
 pub const MIN_MAP_DIM: u16 = 1;
 pub const MAX_MAP_DIM: u16 = 256;
-
-/// A new map's default size -- ggo-ide's `NEW_MAP_DEFAULT_DIM`.
-pub const NEW_MAP_DIM: u16 = 16;
 
 /// The packed cell's palSub field range (4 bits, `[13:10]`) -- ggo-ide's
 /// `{PAL_SUB_MIN, PAL_SUB_MAX}`.
@@ -104,23 +96,6 @@ pub fn clamp_dim(raw: i64) -> u16 {
 /// minimum.
 pub fn parse_dim(text: &str) -> Option<u16> {
     text.trim().parse::<i64>().ok().map(clamp_dim)
-}
-
-/// Step the integer zoom by `delta`, clamped to the ladder ends.
-pub fn zoom_by(zoom: usize, delta: isize) -> usize {
-    (zoom as isize + delta).clamp(MIN_ZOOM as isize, MAX_ZOOM as isize) as usize
-}
-
-/// New pan such that the map pixel under canvas-local `cursor` stays under
-/// it after switching from `zoom` to `new_zoom` -- the cursor-anchored
-/// wheel zoom `ggo_world_panel::canvas::zoom_at` does, restated for this
-/// panel's integer camera (`screen = pan + world * zoom`).
-pub fn zoom_at(pan: [f32; 2], zoom: usize, cursor: [f32; 2], new_zoom: usize) -> [f32; 2] {
-    let (z, nz) = (zoom.max(1) as f32, new_zoom.max(1) as f32);
-    [
-        cursor[0] - (cursor[0] - pan[0]) / z * nz,
-        cursor[1] - (cursor[1] - pan[1]) / z * nz,
-    ]
 }
 
 #[cfg(test)]
@@ -229,28 +204,8 @@ mod tests {
         assert_eq!(parse_dim("12.5"), None);
     }
 
-    /// The cursor-anchored zoom invariant: the cell under the cursor before
-    /// the zoom is the cell under it after.
     #[test]
-    fn zoom_at_keeps_the_cell_under_the_cursor_fixed() {
-        let pan = [17.0, -9.0];
-        let cursor = [123.0, 77.0];
-        for (zoom, new_zoom) in [(1usize, 4usize), (4, 1), (2, 3), (8, 2)] {
-            let before = grid_cell_at(cursor, zoom, pan, 64, 64);
-            let new_pan = zoom_at(pan, zoom, cursor, new_zoom);
-            let after = grid_cell_at(cursor, new_zoom, new_pan, 64, 64);
-            assert_eq!(before, after, "{zoom}x -> {new_zoom}x");
-        }
-        // A no-op zoom is a no-op pan.
-        assert_eq!(zoom_at(pan, 3, cursor, 3), pan);
-    }
-
-    #[test]
-    fn zoom_and_pal_sub_clamp_at_both_ends() {
-        assert_eq!(zoom_by(DEFAULT_ZOOM, 1), DEFAULT_ZOOM + 1);
-        assert_eq!(zoom_by(MAX_ZOOM, 1), MAX_ZOOM);
-        assert_eq!(zoom_by(MIN_ZOOM, -1), MIN_ZOOM);
-        assert_eq!(zoom_by(MIN_ZOOM, -100), MIN_ZOOM);
+    fn pal_sub_clamps_at_both_ends() {
         assert_eq!(pal_sub_by(0, -1), PAL_SUB_MIN);
         assert_eq!(pal_sub_by(PAL_SUB_MAX, 1), PAL_SUB_MAX);
         assert_eq!(pal_sub_by(3, 2), 5);

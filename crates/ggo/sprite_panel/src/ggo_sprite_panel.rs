@@ -166,8 +166,8 @@ fn emerald_asset_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// Is `dir` the asset root of an emerald project, or a directory under it?
-/// The gate on "New Sprite…"/"New Metasprite…", for the same reason
-/// `ggo_map_panel` gates "New Map…" on it: the asset root is the frame a
+/// The gate on "New Sprite…"/"New Metasprite…", for the same reason the
+/// retired "New Map…" was gated on it: the asset root is the frame a
 /// `.spr`'s `til_path`/`pal_path` resolve in, so a sprite written outside
 /// that tree could not name its tileset correctly (the F4 `ggo-sprfix`
 /// contract).
@@ -288,7 +288,7 @@ pub fn open_sprite_item(
 /// leased (see `Workspace::context_menu_contributions`). All panel work is
 /// deferred into the handlers, which run after the lease is released.
 /// (The `is_file`/`is_dir` stats [`is_assets_dir`] makes are not panel
-/// work and are legal here, same as in `ggo_map_panel`.)
+/// work and are legal here, same as in `ggo_emerald_panel`.)
 fn contribute_sprite_menu(
     workspace: &mut Workspace,
     path: &ProjectPath,
@@ -695,8 +695,8 @@ fn default_tileset_choice(choices: &[TilesetChoice]) -> usize {
 /// returning the new file's worktree-relative path.
 ///
 /// **The new sprite is BOUND, to a tileset the user picked in the panel**
-/// -- the one place this diverges from `ggo_map_panel::create_blank_map`,
-/// and for a reason that comes from the format rather than from taste.
+/// -- the one place this diverges from the map editor's own blank-map
+/// write, and for a reason that comes from the format rather than taste.
 /// M2 chose *unbound* for a new `.map` because a map's cells are pool
 /// indices, so a GUESSED tileset yields a file that looks authored and is
 /// wrong. Every word of that applies to a `.spr` -- its frame cells are
