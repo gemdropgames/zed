@@ -2776,6 +2776,13 @@ impl EmuPanel {
         if self.project_root.is_none() {
             self.project_root = Some(root);
         }
+        let abs = self.project_root.as_ref().expect("set above").join(&cart);
+        if !abs.is_file() {
+            return Err(format!(
+                "no cart at {} — pack one first (emd pack-ggo [--world <stem>])",
+                abs.display()
+            ));
+        }
         self.selected = Some(cart);
         self.run(window, cx);
         match (&self.status_is_error, &self.status) {

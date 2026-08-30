@@ -50,6 +50,12 @@ pub fn session_paths(dir: &Path, pid: u32) -> (PathBuf, PathBuf) {
 /// Write (or rewrite) this process's advertisement file.
 pub fn publish(dir: &Path, info: &SessionInfo) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    // The socket grants emulator control: keep the dir owner-only, like
+    // $XDG_RUNTIME_DIR itself (matters for the /tmp fallback).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let (json_path, _) = session_paths(dir, info.pid);
     let tmp = json_path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(info).expect("SessionInfo serializes"))?;
