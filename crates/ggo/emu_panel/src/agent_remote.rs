@@ -311,11 +311,12 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         Cmd::Status => unreachable!("handled above"),
         Cmd::Boot { cart, .. } => {
             let window = window.ok_or("workspace has no window (headless test?)")?;
+            let root = std::path::PathBuf::from(&target.root);
             // No panel yet? Open it — the whole point of a remote boot.
             let result: Result<(), String> = match (panel, target.workspace) {
                 (Some(panel), _) => window
                     .update(cx, |_, window, app| {
-                        panel.update(app, |p, cx| p.remote_boot(cart, window, cx))
+                        panel.update(app, |p, cx| p.remote_boot(cart, root, window, cx))
                     })
                     .map_err(|e| e.to_string())?
                     .map_err(|e| e.to_string())?,
@@ -324,7 +325,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                         workspace.update(app, |workspace, cx| {
                             let mut outcome = Err("emu panel did not open".to_string());
                             crate::open_emu_item(workspace, window, cx, |panel, window, cx| {
-                                outcome = panel.remote_boot(cart, window, cx);
+                                outcome = panel.remote_boot(cart, root, window, cx);
                             });
                             outcome
                         })

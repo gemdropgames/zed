@@ -2762,15 +2762,19 @@ impl EmuPanel {
     }
 
     /// Select `cart` (project-relative path) and start it — the remote
-    /// analog of explorer-select + Run.
+    /// analog of explorer-select + Run. `root` is the caller's live
+    /// project root: a panel opened BY the remote boot hasn't run
+    /// `refresh_root` yet (it defers, and cannot read the workspace
+    /// mid-update), so the dispatcher supplies the root it resolved.
     pub(crate) fn remote_boot(
         &mut self,
         cart: String,
+        root: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if self.project_root.is_none() {
-            return Err("panel has no project root yet".to_string());
+            self.project_root = Some(root);
         }
         self.selected = Some(cart);
         self.run(window, cx);
