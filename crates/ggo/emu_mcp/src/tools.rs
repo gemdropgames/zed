@@ -2,15 +2,17 @@
 //! session from the registry, sends one protocol line over its socket,
 //! and shapes the answer into MCP content.
 //!
-//! Emulation is script-only: `emu_script` submits one complete
-//! start -> finish run (boot, frame-scheduled inputs/screenshots, auto
-//! stop) and returns the report — labeled PNG frames, uart, run length.
+//! Emulation is LOCK-STEP: `emu_start` boots a cart paused and returns
+//! the cart's own world-state JSON; each `emu_next_frame` latches pad
+//! input, runs exactly one frame, and returns the new world state (plus
+//! an optional screenshot); `emu_stop` ends the run with the uart log.
+//! A script, an AI, or any other caller can play the emulator.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use ggo_emu_remote::protocol::{Cmd, Request, Response, Script};
+use ggo_emu_remote::protocol::{Cmd, Request, Response};
 use ggo_emu_remote::registry::{self, SessionInfo};
 use serde_json::{Value, json};
 
@@ -32,14 +34,9 @@ pub fn socket_call(socket: &Path, line: &str, timeout: Duration) -> std::io::Res
     Ok(reply)
 }
 
-/// Quick calls (status/discovery) get a short leash.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A script runs ~60 frames/second plus scheduling slack; budget
-/// generously — the host enforces its own frame cap.
-fn script_timeout(frames: u32) -> Duration {
-    Duration::from_secs(30) + Duration::from_millis(u64::from(frames) * 50)
-}
+/// Every lock-step call is bounded host-side (one frame, or a 5s boot
+/// wait); a wedged Zed surfaces as an error within this.
+const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The MCP `tools/list` payload.
 pub fn tool_list() -> Value {
@@ -59,17 +56,16 @@ pub fn tool_list() -> Value {
           "description": "List running Zed sessions hosting a GGO emulator panel: pid, workspaces, and what each panel is doing.",
           "inputSchema": { "type": "object", "properties": {} } },
         { "name": "emu_status", "description": "What the target session's emulator panels are doing.", "inputSchema": with(json!({})) },
-        { "name": "emu_script",
-          "description": "Run one complete emulation script in the Zed emulator panel and report. Boots the cart (pack first: emd pack-ggo [--world <stem>]), steps `frames` frames applying scheduled steps, then stops. Steps: {at, input?: [buttons held from that frame; names z x a s up down left right q w e r t y u i enter select; [] releases], screenshot?: label}. A screenshot at frame N captures after N frames; input at N applies from frame N. The final frame is always captured as 'final'. Report: labeled PNG frames + the cart's uart log.",
+        { "name": "emu_start",
+          "description": "Boot a cart in the Zed emulator panel and pause at the first frame boundary (lock-step). Pack first: emd pack-ggo [--world <stem>]. Returns the initial world-state JSON — worlds that declare `InspectWorld = {}` under [resources] serialize every entity's registered components; others return null. Drive with emu_next_frame; end with emu_stop.",
+          "inputSchema": with(json!({ "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. wilds.ggo" } })) },
+        { "name": "emu_next_frame",
+          "description": "Latch the held pad buttons (names: z x a s up down left right q w e r t y u i enter select; empty/omitted releases all), run exactly ONE frame, and return the new world-state JSON. Set screenshot=true to also get the presented frame as PNG. Call repeatedly to play.",
           "inputSchema": with(json!({
-              "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. wilds.ggo" },
-              "frames": { "type": "number", "description": "Total frames to run (60 = 1 second; max 7200)" },
-              "steps": { "type": "array", "items": { "type": "object", "properties": {
-                  "at": { "type": "number" },
-                  "input": { "type": "array", "items": { "type": "string" } },
-                  "screenshot": { "type": "string" }
-              }, "required": ["at"] } }
+              "buttons": { "type": "array", "items": { "type": "string" } },
+              "screenshot": { "type": "boolean" }
           })) },
+        { "name": "emu_stop", "description": "End the lock-step run; returns the cart's uart log.", "inputSchema": with(json!({})) },
     ] })
 }
 
@@ -133,7 +129,7 @@ fn call_tool_inner(
     if name == "zed_sessions" {
         let mut rows = Vec::new();
         for s in &sessions {
-            let status = send(&s.socket, Cmd::Status, STATUS_TIMEOUT, connect)
+            let status = send(&s.socket, Cmd::Status, CALL_TIMEOUT, connect)
                 .map(|d| d.to_string())
                 .unwrap_or_else(|e| format!("(unreachable: {e})"));
             rows.push(format!("pid {} workspaces {:?} status {status}", s.pid, s.workspaces));
@@ -146,19 +142,50 @@ fn call_tool_inner(
     let session = resolve_session(&sessions, arg_u32(args, "session"), workspace.as_deref())?;
     match name {
         "emu_status" => {
-            let data = send(&session.socket, Cmd::Status, STATUS_TIMEOUT, connect)?;
+            let data = send(&session.socket, Cmd::Status, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
-        "emu_script" => {
-            let script: Script = serde_json::from_value(json!({
-                "cart": args.get("cart").cloned().unwrap_or(Value::Null),
-                "frames": args.get("frames").cloned().unwrap_or(Value::Null),
-                "steps": args.get("steps").cloned().unwrap_or(json!([])),
-            }))
-            .map_err(|e| format!("bad script: {e}"))?;
-            let timeout = script_timeout(script.frames);
-            let data = send(&session.socket, Cmd::Script { workspace, script }, timeout, connect)?;
-            report_content(&data)
+        "emu_start" => {
+            let cart = arg_str(args, "cart").ok_or("missing required argument: cart")?;
+            let data = send(&session.socket, Cmd::Start { workspace, cart }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "emu_next_frame" => {
+            let buttons = args
+                .get("buttons")
+                .and_then(|b| b.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let screenshot = args.get("screenshot").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut data = send(
+                &session.socket,
+                Cmd::NextFrame { workspace, buttons, screenshot },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            let shot = data.as_object_mut().and_then(|o| o.remove("screenshot"));
+            let mut content = vec![json!({ "type": "text", "text": data.to_string() })];
+            if let Some(shot) = shot {
+                use base64::Engine as _;
+                let bgra = base64::engine::general_purpose::STANDARD
+                    .decode(shot["bgra_base64"].as_str().unwrap_or_default())
+                    .map_err(|e| e.to_string())?;
+                let (w, h) = (
+                    shot["width"].as_u64().unwrap_or(0) as u32,
+                    shot["height"].as_u64().unwrap_or(0) as u32,
+                );
+                let png = bgra_to_png(w, h, &bgra)?;
+                content.push(json!({
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&png),
+                }));
+            }
+            Ok(content)
+        }
+        "emu_stop" => {
+            let data = send(&session.socket, Cmd::Stop { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         other => Err(format!("unknown tool {other:?}")),
     }
@@ -166,53 +193,6 @@ fn call_tool_inner(
 
 /// Shape a script report into MCP content: a text summary (frames + uart),
 /// then each captured frame as a labeled PNG image.
-fn report_content(data: &Value) -> Result<Vec<Value>, String> {
-    use base64::Engine as _;
-    let mut content = Vec::new();
-    let frames = data.get("frames").and_then(|v| v.as_u64()).unwrap_or(0);
-    let uart: Vec<String> = data
-        .get("uart")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    let shots = data.get("screenshots").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let labels: Vec<String> = shots
-        .iter()
-        .map(|s| {
-            format!(
-                "{} @ frame {}",
-                s["label"].as_str().unwrap_or("?"),
-                s["at"].as_u64().unwrap_or(0)
-            )
-        })
-        .collect();
-    let uart_text =
-        if uart.is_empty() { "(no uart output)".to_string() } else { uart.join("\n") };
-    content.push(json!({
-        "type": "text",
-        "text": format!(
-            "script completed: {frames} frames run\nscreenshots: {}\nuart:\n{uart_text}",
-            labels.join(", ")
-        ),
-    }));
-    for shot in &shots {
-        let bgra = base64::engine::general_purpose::STANDARD
-            .decode(shot["bgra_base64"].as_str().unwrap_or_default())
-            .map_err(|e| e.to_string())?;
-        let (w, h) = (
-            shot["width"].as_u64().unwrap_or(0) as u32,
-            shot["height"].as_u64().unwrap_or(0) as u32,
-        );
-        let png = bgra_to_png(w, h, &bgra)?;
-        content.push(json!({
-            "type": "image",
-            "mimeType": "image/png",
-            "data": base64::engine::general_purpose::STANDARD.encode(&png),
-        }));
-    }
-    Ok(content)
-}
-
 fn send(socket: &Path, cmd: Cmd, timeout: Duration, connect: &Connector) -> Result<Value, String> {
     let req = Request { id: 1, cmd };
     let line = serde_json::to_string(&req).expect("Request serializes");
@@ -261,48 +241,49 @@ mod tests {
     }
 
     #[test]
-    fn emu_script_sends_script_cmd_and_shapes_the_report() {
+    fn emu_start_and_next_frame_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            if line.contains(r#""cmd":"start""#) {
+                assert!(line.contains(r#""cart":"wilds.ggo""#), "{line}");
+                Ok(r#"{"id":1,"ok":true,"data":{"started":true,"frame":2,"world":{"entities":[]}}}"#.to_string())
+            } else {
+                assert!(line.contains(r#""cmd":"next_frame""#), "{line}");
+                assert!(line.contains(r#""buttons":["right"]"#), "{line}");
+                Ok(r#"{"id":1,"ok":true,"data":{"frame":3,"world":{"entities":[{"id":5,"components":{}}]}}}"#.to_string())
+            }
+        };
+        let (content, is_err) =
+            call_tool("emu_start", &json!({"cart": "wilds.ggo"}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""frame":2"#));
+
+        let (content, is_err) =
+            call_tool("emu_next_frame", &json!({"buttons": ["right"]}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""id":5"#));
+    }
+
+    #[test]
+    fn next_frame_screenshot_becomes_png_image_content() {
         use base64::Engine as _;
         let dir = tempfile::tempdir().unwrap();
         fake_session(dir.path(), std::process::id());
         let bgra = base64::engine::general_purpose::STANDARD.encode([0u8, 0, 255, 255]); // red px
         let reply = format!(
-            r#"{{"id":1,"ok":true,"data":{{"frames":120,"uart":["[run] wilds.ggo"],"screenshots":[{{"label":"mid","at":60,"width":1,"height":1,"bgra_base64":"{bgra}"}}]}}}}"#
+            r#"{{"id":1,"ok":true,"data":{{"frame":9,"world":null,"screenshot":{{"width":1,"height":1,"bgra_base64":"{bgra}"}}}}}}"#
         );
-        let connect = move |_: &Path, line: &str, timeout: Duration| -> std::io::Result<String> {
-            assert!(line.contains(r#""cmd":"script""#), "{line}");
-            assert!(line.contains(r#""cart":"wilds.ggo""#), "{line}");
-            assert!(line.contains(r#""frames":120"#), "{line}");
-            assert!(line.contains(r#""screenshot":"mid""#), "{line}");
-            assert!(timeout >= Duration::from_secs(30), "script timeout must scale");
-            Ok(reply.clone())
-        };
-        let args = json!({
-            "cart": "wilds.ggo",
-            "frames": 120,
-            "steps": [ { "at": 0, "input": ["right"] }, { "at": 60, "screenshot": "mid" } ],
-        });
-        let (content, is_err) = call_tool("emu_script", &args, dir.path(), &connect);
+        let connect = move |_: &Path, _: &str, _: Duration| -> std::io::Result<String> { Ok(reply.clone()) };
+        let (content, is_err) =
+            call_tool("emu_next_frame", &json!({"screenshot": true}), dir.path(), &connect);
         assert!(!is_err, "{content:?}");
-        let text = content[0]["text"].as_str().unwrap();
-        assert!(text.contains("120 frames") && text.contains("mid @ frame 60") && text.contains("[run] wilds.ggo"), "{text}");
         assert_eq!(content[1]["type"], "image");
         let png = base64::engine::general_purpose::STANDARD
             .decode(content[1]["data"].as_str().unwrap())
             .unwrap();
         let img = image::load_from_memory(&png).unwrap().to_rgba8();
         assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
-    }
-
-    #[test]
-    fn emu_script_with_missing_fields_is_a_tool_error() {
-        let dir = tempfile::tempdir().unwrap();
-        fake_session(dir.path(), std::process::id());
-        let connect =
-            |_: &Path, _: &str, _: Duration| -> std::io::Result<String> { panic!("must not connect") };
-        let (content, is_err) = call_tool("emu_script", &json!({}), dir.path(), &connect);
-        assert!(is_err);
-        assert!(content[0]["text"].as_str().unwrap().contains("bad script"));
     }
 
     #[test]
@@ -313,29 +294,16 @@ mod tests {
             Ok(r#"{"id":1,"ok":false,"error":"no cart at /proj/nope.ggo"}"#.to_string())
         };
         let (content, is_err) =
-            call_tool("emu_script", &json!({"cart": "nope.ggo", "frames": 10}), dir.path(), &connect);
+            call_tool("emu_start", &json!({"cart": "nope.ggo"}), dir.path(), &connect);
         assert!(is_err);
         assert_eq!(content[0]["text"], "no cart at /proj/nope.ggo");
     }
 
     #[test]
-    fn interactive_tools_are_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        fake_session(dir.path(), std::process::id());
-        let connect =
-            |_: &Path, _: &str, _: Duration| -> std::io::Result<String> { panic!("must not connect") };
-        for name in ["emu_boot", "emu_input", "emu_pause", "emu_step", "emu_screenshot", "emu_stop"] {
-            let (content, is_err) = call_tool(name, &json!({}), dir.path(), &connect);
-            assert!(is_err, "{name} should be unknown");
-            assert!(content[0]["text"].as_str().unwrap().contains("unknown tool"));
-        }
-    }
-
-    #[test]
-    fn tool_list_names_exactly_the_script_surface() {
+    fn tool_list_names_exactly_the_lockstep_surface() {
         let list = tool_list();
         let names: Vec<&str> =
             list["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["zed_sessions", "emu_status", "emu_script"]);
+        assert_eq!(names, ["zed_sessions", "emu_status", "emu_start", "emu_next_frame", "emu_stop"]);
     }
 }

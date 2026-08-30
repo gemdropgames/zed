@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Global, WeakEntity};
 use workspace::Workspace;
-use ggo_emu_remote::protocol::{Cmd, Request, Response, Script, Shot, parse_request, response_line};
+use ggo_emu_remote::protocol::{Cmd, Request, Response, parse_request, response_line};
 use ggo_emu_remote::registry::{self, SessionInfo};
 
 use crate::EmuPanel;
@@ -232,10 +232,6 @@ fn live_workspaces(cx: &mut App) -> Vec<(String, Entity<Workspace>, Option<AnyWi
     out
 }
 
-/// Upper bound on one script's length: two minutes of frames. Long
-/// soaks should be several scripts, each reporting.
-const MAX_SCRIPT_FRAMES: u32 = 7200;
-
 async fn dispatch(req: Request, cx: &mut AsyncApp) -> Response {
     let id = req.id;
     match dispatch_inner(req.cmd, cx).await {
@@ -246,8 +242,8 @@ async fn dispatch(req: Request, cx: &mut AsyncApp) -> Response {
 
 /// Poll the panel until its delivered-frame counter reaches
 /// `target_frame`, the run dies (its failure status becomes the error),
-/// or `timeout` passes. This is what makes the report mean "it actually
-/// happened": the emulator thread and the frame pump are asynchronous.
+/// or `timeout` passes — the emulator thread and frame pump are
+/// asynchronous, so only this makes a reply mean "the frame happened".
 async fn await_frame(
     panel: &WeakEntity<EmuPanel>,
     cx: &mut AsyncApp,
@@ -270,34 +266,30 @@ async fn await_frame(
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "timed out at frame {frame} waiting for frame {target_frame} — is the run auto-paused (emulator tab hidden)?"
+                "timed out at frame {frame} waiting for frame {target_frame}"
             ));
         }
-        cx.background_executor().timer(std::time::Duration::from_millis(10)).await;
+        cx.background_executor().timer(std::time::Duration::from_millis(5)).await;
     }
 }
 
-/// Validate a script before touching the emulator: frame bounds, button
-/// vocabulary, and (for now) the reserved event slot.
-fn validate_script(script: &Script) -> Result<(), String> {
-    if script.frames == 0 || script.frames > MAX_SCRIPT_FRAMES {
-        return Err(format!("frames must be 1..={MAX_SCRIPT_FRAMES}, got {}", script.frames));
+/// The world half of a lock-step reply: the cart's inspection JSON parsed
+/// into a value (`null` for worlds that don't declare `InspectWorld`).
+fn world_value(panel: &WeakEntity<EmuPanel>, cx: &mut AsyncApp) -> serde_json::Value {
+    let dump = panel.update(cx, |p, _| p.remote_world_json()).ok().flatten();
+    match dump {
+        Some((seq, json)) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("tap_seq".to_string(), serde_json::json!(seq));
+                }
+                v
+            }
+            // Truncated tap (dump exceeded the cap): ship raw for debugging.
+            Err(_) => serde_json::json!({ "tap_seq": seq, "truncated_raw": &**json }),
+        },
+        None => serde_json::Value::Null,
     }
-    for step in &script.steps {
-        if step.at > script.frames {
-            return Err(format!("step at frame {} is past the script's {} frames", step.at, script.frames));
-        }
-        if let Some(buttons) = &step.input {
-            buttons_to_mask(buttons)?;
-        }
-        if step.event.is_some() {
-            return Err(
-                "scripted world events (component insertion/removal, world edits) are reserved but not implemented yet — the engine has no mid-run mutation channel"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
 }
 
 async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value, String> {
@@ -355,28 +347,30 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         targets
     });
 
-    let (workspace_arg, script) = match cmd {
-        Cmd::Status => {
-            let mut rows = Vec::new();
-            for t in &targets {
-                let status = t
-                    .panel
-                    .as_ref()
-                    .and_then(|p| p.update(cx, |p, _| p.remote_status(t.root.clone())).ok());
-                rows.push(status.unwrap_or(ggo_emu_remote::protocol::WorkspaceStatus {
-                    workspace: t.root.clone(),
-                    cart: None,
-                    running: false,
-                    paused: false,
-                    frame: 0,
-                }));
-            }
-            return Ok(serde_json::json!({ "pid": std::process::id(), "workspaces": rows }));
+    if let Cmd::Status = cmd {
+        let mut rows = Vec::new();
+        for t in &targets {
+            let status = t
+                .panel
+                .as_ref()
+                .and_then(|p| p.update(cx, |p, _| p.remote_status(t.root.clone())).ok());
+            rows.push(status.unwrap_or(ggo_emu_remote::protocol::WorkspaceStatus {
+                workspace: t.root.clone(),
+                cart: None,
+                running: false,
+                paused: false,
+                frame: 0,
+            }));
         }
-        Cmd::Script { workspace, script } => (workspace, script),
-    };
-    validate_script(&script)?;
+        return Ok(serde_json::json!({ "pid": std::process::id(), "workspaces": rows }));
+    }
 
+    let workspace_arg = match &cmd {
+        Cmd::Status => unreachable!("handled above"),
+        Cmd::Start { workspace, .. }
+        | Cmd::NextFrame { workspace, .. }
+        | Cmd::Stop { workspace } => workspace.clone(),
+    };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
     let target = targets
@@ -384,132 +378,101 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         .find(|t| t.root == target_root)
         .expect("resolve_workspace returned a member of keys");
     let window = target.window.ok_or("workspace has no window (headless test?)")?;
-    let root = std::path::PathBuf::from(&target.root);
 
-    // ---- start: boot (opening the panel if none is live) -------------
-    let cart = script.cart.clone();
-    let booted: Result<WeakEntity<EmuPanel>, String> = match (target.panel, target.workspace) {
-        (Some(panel), _) => window
-            .update(cx, |_, window, app| {
-                panel
-                    .update(app, |p, cx| p.remote_boot(cart, root, window, cx))
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r)
-                    .map(|()| panel.clone())
-            })
-            .map_err(|e| e.to_string())?,
-        (None, Some(workspace)) => window
-            .update(cx, |_, window, app| {
-                workspace.update(app, |workspace, cx| {
-                    let mut outcome = Err("emu panel did not open".to_string());
-                    crate::open_emu_item(workspace, window, cx, |panel, window, cx| {
-                        outcome = panel.remote_boot(cart, root, window, cx);
-                    });
-                    let panel = workspace
-                        .items_of_type::<crate::EmulatorItem>(cx)
-                        .next()
-                        .map(|item| item.read(cx).panel().downgrade());
-                    outcome.and_then(|()| panel.ok_or("emu panel did not open".to_string()))
-                })
-            })
-            .map_err(|e| e.to_string())?,
-        (None, None) => Err("workspace vanished".to_string()),
-    };
-    let panel = booted?;
-    cx.update(|cx| {
-        if cx.try_global::<RemotePanels>().is_none() {
-            cx.set_global(RemotePanels::default());
-        }
-        cx.global_mut::<RemotePanels>()
-            .panels
-            .insert(target_root.clone(), (panel.clone(), Some(window)));
-    });
-    // Only a delivered frame proves the boot took (load failures surface
-    // asynchronously on the emulator thread).
-    await_frame(&panel, cx, 1, std::time::Duration::from_secs(5)).await?;
-
-    // Park, let the pause land, and take the baseline frame: script
-    // frame 0 is wherever the pause settled.
-    panel.update(cx, |p, _| p.remote_pause()).map_err(|e| e.to_string())??;
-    cx.background_executor().timer(std::time::Duration::from_millis(60)).await;
-    let baseline = panel
-        .update(cx, |p, _| p.remote_progress().0)
-        .map_err(|e| e.to_string())?;
-
-    // ---- body: step to each mark, then apply its actions -------------
-    let mut marks: std::collections::BTreeMap<u32, Vec<&ggo_emu_remote::protocol::Step>> =
-        std::collections::BTreeMap::new();
-    for step in &script.steps {
-        marks.entry(step.at).or_default().push(step);
-    }
-    marks.entry(script.frames).or_default(); // implicit finish mark
-
-    let mut shots: Vec<Shot> = Vec::new();
-    let mut current: u32 = 0;
-    let run_result: Result<(), String> = async {
-        for (&at, steps) in &marks {
-            let chunk = at - current;
-            if chunk > 0 {
-                panel
-                    .update(cx, |p, _| p.remote_step(chunk))
-                    .map_err(|e| e.to_string())??;
-                let timeout = std::time::Duration::from_millis(100 * u64::from(chunk) + 2000);
-                await_frame(&panel, cx, baseline + at, timeout).await?;
-            }
-            current = at;
-            for step in steps {
-                if let Some(buttons) = &step.input {
-                    let mask = buttons_to_mask(buttons)?;
-                    panel
-                        .update(cx, |p, _| p.remote_input(mask))
-                        .map_err(|e| e.to_string())??;
+    match cmd {
+        Cmd::Status => unreachable!("handled above"),
+        Cmd::Start { cart, .. } => {
+            let root = std::path::PathBuf::from(&target.root);
+            // No panel yet? Open it — a remote start must not need a
+            // human to have clicked a cart first.
+            let booted: Result<WeakEntity<EmuPanel>, String> = match (target.panel, target.workspace)
+            {
+                (Some(panel), _) => window
+                    .update(cx, |_, window, app| {
+                        panel
+                            .update(app, |p, cx| p.remote_boot(cart, root, window, cx))
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                            .map(|()| panel.clone())
+                    })
+                    .map_err(|e| e.to_string())?,
+                (None, Some(workspace)) => window
+                    .update(cx, |_, window, app| {
+                        workspace.update(app, |workspace, cx| {
+                            let mut outcome = Err("emu panel did not open".to_string());
+                            crate::open_emu_item(workspace, window, cx, |panel, window, cx| {
+                                outcome = panel.remote_boot(cart, root, window, cx);
+                            });
+                            let panel = workspace
+                                .items_of_type::<crate::EmulatorItem>(cx)
+                                .next()
+                                .map(|item| item.read(cx).panel().downgrade());
+                            outcome.and_then(|()| panel.ok_or("emu panel did not open".to_string()))
+                        })
+                    })
+                    .map_err(|e| e.to_string())?,
+                (None, None) => Err("workspace vanished".to_string()),
+            };
+            let panel = booted?;
+            // Register the booted panel deterministically — its own
+            // deferred refresh_root registration only fires on later UI
+            // activity.
+            cx.update(|cx| {
+                if cx.try_global::<RemotePanels>().is_none() {
+                    cx.set_global(RemotePanels::default());
                 }
-                if let Some(label) = &step.screenshot {
-                    let (width, height, bgra) = panel
-                        .update(cx, |p, _| p.remote_screenshot())
-                        .map_err(|e| e.to_string())?
-                        .ok_or("no frame available for screenshot")?;
-                    shots.push(Shot {
-                        label: label.clone(),
-                        at,
-                        width,
-                        height,
-                        bgra_base64: base64::engine::general_purpose::STANDARD.encode(&bgra),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-    .await;
-
-    // ---- finish: always capture the final frame and stop the run -----
-    if run_result.is_ok() {
-        if let Ok(Some((width, height, bgra))) = panel.update(cx, |p, _| p.remote_screenshot()) {
-            shots.push(Shot {
-                label: "final".to_string(),
-                at: current,
-                width,
-                height,
-                bgra_base64: base64::engine::general_purpose::STANDARD.encode(&bgra),
+                cx.global_mut::<RemotePanels>()
+                    .panels
+                    .insert(target_root.clone(), (panel.clone(), Some(window)));
             });
+            // Only a delivered frame proves the boot took, then park at
+            // the next boundary and settle: that parked frame is the
+            // lock-step baseline.
+            await_frame(&panel, cx, 1, std::time::Duration::from_secs(5)).await?;
+            panel.update(cx, |p, _| p.remote_pause()).map_err(|e| e.to_string())??;
+            cx.background_executor().timer(std::time::Duration::from_millis(60)).await;
+            let frame = panel
+                .update(cx, |p, _| p.remote_progress().0)
+                .map_err(|e| e.to_string())?;
+            let world = world_value(&panel, cx);
+            Ok(serde_json::json!({ "started": true, "frame": frame, "world": world }))
+        }
+        Cmd::NextFrame { buttons, screenshot, .. } => {
+            let panel = target.panel.ok_or("no run in lock-step — emu_start first")?;
+            let mask = buttons_to_mask(&buttons)?;
+            let start = panel
+                .update(cx, |p, _| -> Result<u32, String> {
+                    p.remote_input(mask)?;
+                    p.remote_step(1)?;
+                    Ok(p.remote_progress().0)
+                })
+                .map_err(|e| e.to_string())??;
+            let frame =
+                await_frame(&panel, cx, start + 1, std::time::Duration::from_secs(3)).await?;
+            let world = world_value(&panel, cx);
+            let mut reply = serde_json::json!({ "frame": frame, "world": world });
+            if screenshot {
+                if let Ok(Some((w, h, bgra))) = panel.update(cx, |p, _| p.remote_screenshot()) {
+                    reply["screenshot"] = serde_json::json!({
+                        "width": w,
+                        "height": h,
+                        "bgra_base64": base64::engine::general_purpose::STANDARD.encode(&bgra),
+                    });
+                }
+            }
+            Ok(reply)
+        }
+        Cmd::Stop { .. } => {
+            let panel = target.panel.ok_or("no emu panel open in this workspace")?;
+            let uart = panel.update(cx, |p, _| p.remote_uart(None)).unwrap_or_default();
+            window
+                .update(cx, |_, window, app| {
+                    panel.update(app, |p, cx| p.remote_stop(window, cx)).ok();
+                })
+                .ok();
+            Ok(serde_json::json!({ "stopped": true, "uart": uart }))
         }
     }
-    let uart = panel
-        .update(cx, |p, _| p.remote_uart(None))
-        .unwrap_or_default();
-    window
-        .update(cx, |_, window, app| {
-            panel.update(app, |p, cx| p.remote_stop(window, cx)).ok();
-        })
-        .ok();
-
-    run_result?;
-    Ok(serde_json::json!({
-        "frames": script.frames,
-        "screenshots": shots,
-        "uart": uart,
-    }))
 }
 
 #[cfg(test)]
@@ -528,44 +491,6 @@ mod tests {
     fn buttons_to_mask_rejects_unknown_names() {
         let err = buttons_to_mask(&["jump".to_string()]).unwrap_err();
         assert!(err.contains("unknown button \"jump\""), "{err}");
-    }
-
-    #[test]
-    fn validate_script_rejects_bad_frames_marks_buttons_and_events() {
-        use ggo_emu_remote::protocol::{Script, Step};
-        let ok = Script {
-            cart: "a.ggo".into(),
-            frames: 120,
-            steps: vec![Step { at: 0, input: Some(vec!["right".into()]), ..Default::default() }],
-        };
-        assert_eq!(validate_script(&ok), Ok(()));
-
-        let zero = Script { cart: "a.ggo".into(), frames: 0, steps: vec![] };
-        assert!(validate_script(&zero).unwrap_err().contains("frames"));
-
-        let too_long = Script { cart: "a.ggo".into(), frames: MAX_SCRIPT_FRAMES + 1, steps: vec![] };
-        assert!(validate_script(&too_long).unwrap_err().contains("frames"));
-
-        let past_end = Script {
-            cart: "a.ggo".into(),
-            frames: 10,
-            steps: vec![Step { at: 11, ..Default::default() }],
-        };
-        assert!(validate_script(&past_end).unwrap_err().contains("past"));
-
-        let bad_button = Script {
-            cart: "a.ggo".into(),
-            frames: 10,
-            steps: vec![Step { at: 0, input: Some(vec!["jump".into()]), ..Default::default() }],
-        };
-        assert!(validate_script(&bad_button).unwrap_err().contains("unknown button"));
-
-        let event = Script {
-            cart: "a.ggo".into(),
-            frames: 10,
-            steps: vec![Step { at: 0, event: Some(serde_json::json!({"insert": {}})), ..Default::default() }],
-        };
-        assert!(validate_script(&event).unwrap_err().contains("not implemented"));
     }
 
     #[test]

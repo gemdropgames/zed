@@ -187,6 +187,11 @@ pub struct Session {
     pause: Arc<AtomicBool>,
     /// Frames still owed to [`Self::step`] while paused.
     step: Arc<AtomicU32>,
+    /// The cart's own world-inspection dump as of the last presented
+    /// frame, if the running world declares `InspectWorld` (see
+    /// emerald-world's `inspect` module): `(tap seq, JSON bytes)`. Written
+    /// by the thread every vsync from the guest's magic-tagged tap buffer.
+    world_json: Arc<Mutex<Option<(u32, Arc<String>)>>>,
     /// The PPU as of the last presented frame, for the debug viewers --
     /// written by the thread every vsync, read by the pane whenever it
     /// renders a viewer. A slot, not a channel: the pane wants the latest,
@@ -245,6 +250,13 @@ impl Session {
     /// been presented.
     pub fn snapshot(&self) -> Option<Arc<PpuSnapshot>> {
         self.snapshot.lock().unwrap().clone()
+    }
+
+    /// The cart's world-inspection JSON as of the last presented frame
+    /// (`None` until the running world's first tap write — a world that
+    /// doesn't declare `InspectWorld` never produces one).
+    pub fn world_json(&self) -> Option<(u32, Arc<String>)> {
+        self.world_json.lock().unwrap().clone()
     }
 
     /// The live diagnostic log, for the pane's console.
@@ -326,6 +338,7 @@ pub fn start(
     let pause = Arc::new(AtomicBool::new(false));
     let step = Arc::new(AtomicU32::new(0));
     let snapshot: Arc<Mutex<Option<Arc<PpuSnapshot>>>> = Arc::new(Mutex::new(None));
+    let world_json: Arc<Mutex<Option<(u32, Arc<String>)>>> = Arc::new(Mutex::new(None));
     let uart = UartLog::new();
     let outcome: Arc<Mutex<Option<RunOutcome>>> = Arc::new(Mutex::new(None));
 
@@ -338,6 +351,7 @@ pub fn start(
             pause: pause.clone(),
             step: step.clone(),
             snapshot: snapshot.clone(),
+            world_json: world_json.clone(),
         };
         let (uart, outcome) = (uart.clone(), outcome.clone());
         std::thread::Builder::new()
@@ -357,6 +371,7 @@ pub fn start(
         pause,
         step,
         snapshot,
+        world_json,
         uart,
         outcome,
         join: Some(join),
@@ -373,6 +388,7 @@ struct Controls {
     pause: Arc<AtomicBool>,
     step: Arc<AtomicU32>,
     snapshot: Arc<Mutex<Option<Arc<PpuSnapshot>>>>,
+    world_json: Arc<Mutex<Option<(u32, Arc<String>)>>>,
 }
 
 /// Where a run's save file lives: the standalone's rule (`<card dir>/savs/
@@ -401,7 +417,12 @@ fn run(
         pause,
         step,
         snapshot,
+        world_json,
     } = controls;
+    // Cached guest address of the world-inspection tap (see
+    // emerald-world's `inspect` module); scanned for lazily since a world
+    // that never opts in never writes one.
+    let mut tap_addr: Option<usize> = None;
     let bytes = match std::fs::read(cart_path) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -540,6 +561,7 @@ fn run(
                 // BEFORE the frame goes out: the snapshot describes this
                 // frame, and the pane reads it on the frame's arrival.
                 publish_snapshot(&p.ppu, snapshot);
+                publish_world_tap(&mmu, &mut tap_addr, world_json);
                 // Full channel = the UI hasn't drained the previous
                 // frame yet; drop this one. Closed = the panel dropped
                 // the receiver (Stop, or the panel itself went away).
@@ -749,6 +771,52 @@ fn pump_audio(apu: &Apu, cursor: u64, scratch: &mut Vec<i16>, writer: &RingWrite
 /// what `native::Display::present`'s `if elapsed < hold` does.
 pub fn pace_sleep(elapsed: Duration, frame_time: Duration) -> Option<Duration> {
     frame_time.checked_sub(elapsed).filter(|d| !d.is_zero())
+}
+
+/// First bytes of emerald-world's inspection tap: `"EMWD"` (LE u32
+/// 0x4457_4D45). Layout after it: `seq u32, len u32, cap u32`, then `cap`
+/// bytes of JSON (`len` valid). Kept in sync with
+/// `emerald-world/src/inspect.rs` by value — zed does not link emerald.
+const TAP_MAGIC: [u8; 4] = *b"EMWD";
+const TAP_HEADER_BYTES: usize = 16;
+
+/// Copy the cart's world-inspection JSON (if the running world writes
+/// one) out of guest RAM into the session slot. The tap is a static in
+/// the cart, so its address is scanned for once and then only re-verified.
+fn publish_world_tap(
+    mmu: &ggo_emu_core::mmu::Mmu,
+    tap_addr: &mut Option<usize>,
+    slot: &Mutex<Option<(u32, Arc<String>)>>,
+) {
+    let ram: &[u8] = &mmu.main_ram;
+    let addr = match *tap_addr {
+        Some(a) if ram.get(a..a + 4).is_some_and(|m| m == TAP_MAGIC) => a,
+        _ => {
+            let Some(found) = ram
+                .chunks_exact(4)
+                .position(|c| c == TAP_MAGIC)
+                .map(|i| i * 4)
+            else {
+                return; // world never opted in (or hasn't written yet)
+            };
+            *tap_addr = Some(found);
+            found
+        }
+    };
+    let word = |off: usize| -> u32 {
+        ram.get(addr + off..addr + off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0)
+    };
+    let (seq, len, cap) = (word(4), word(8) as usize, word(12) as usize);
+    if seq == 0 || len > cap {
+        return;
+    }
+    let Some(bytes) = ram.get(addr + TAP_HEADER_BYTES..addr + TAP_HEADER_BYTES + len) else {
+        return;
+    };
+    let json = String::from_utf8_lossy(bytes).into_owned();
+    *slot.lock().unwrap() = Some((seq, Arc::new(json)));
 }
 
 /// RGB565 framebuffer -> BGRA8, gpui's `RenderImage` frame format.

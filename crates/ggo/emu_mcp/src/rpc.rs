@@ -113,7 +113,7 @@ mod tests {
             &*no_connect(),
         )
         .unwrap();
-        assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 5);
 
         let err = handle_line(
             r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,

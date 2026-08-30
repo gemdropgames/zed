@@ -16,60 +16,32 @@ pub struct Request {
 /// than one workspace; omitted, the host picks the only one and errors if
 /// that is ambiguous.
 ///
-/// Emulation is script-only by design: one `Script` is a whole
-/// start -> finish run — boot, frame-scheduled inputs/screenshots/events,
-/// automatic stop — answered by one report. There is no interactive
-/// drive surface to leave an emulator in a half-driven state.
+/// Emulation is LOCK-STEP: `Start` boots a cart and pauses at a frame
+/// boundary; each `NextFrame` latches the pad and runs exactly one frame;
+/// every reply carries the cart's own world-inspection JSON (worlds that
+/// declare `InspectWorld` — see emerald-world's `inspect`), so a script,
+/// an AI, or any other caller can play the emulator frame by frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Cmd {
     /// Workspaces this Zed process has, and what each emu panel is doing.
     Status,
-    /// Run one complete emulation script and report.
-    Script { workspace: Option<String>, script: Script },
-}
-
-/// A complete emulation run. Frame numbers are relative to the script's
-/// start (frame 0 = the first frame the script steps).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Script {
-    /// Worktree-relative cart path (pack one with
-    /// `emd pack-ggo [--world <stem>]` first).
-    pub cart: String,
-    /// Total frames to run before finishing. Capped by the host.
-    pub frames: u32,
-    /// Scheduled actions, applied in `at` order. A `screenshot` at frame
-    /// N captures the framebuffer after N frames have elapsed; an `input`
-    /// at frame N is latched before frame N runs.
-    #[serde(default)]
-    pub steps: Vec<Step>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Step {
-    pub at: u32,
-    /// Latch these held buttons from this frame on (empty = release all).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<Vec<String>>,
-    /// Capture a labeled screenshot at this frame.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub screenshot: Option<String>,
-    /// Scripted world event (component insertion/removal, world edits).
-    /// Reserved: rejected at validation until the engine grows a mid-run
-    /// mutation channel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event: Option<serde_json::Value>,
-}
-
-/// One captured screenshot inside a script report.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Shot {
-    pub label: String,
-    /// Script-relative frame the capture happened at.
-    pub at: u32,
-    pub width: u32,
-    pub height: u32,
-    pub bgra_base64: String,
+    /// Boot `cart` (worktree-relative; pack first with
+    /// `emd pack-ggo [--world <stem>]`), pause at the first frame
+    /// boundary, and report the initial world state.
+    Start { workspace: Option<String>, cart: String },
+    /// Latch `buttons` as the held pad (empty releases all), run exactly
+    /// one frame, and report the new world state. `screenshot` also
+    /// returns the presented framebuffer.
+    NextFrame {
+        workspace: Option<String>,
+        #[serde(default)]
+        buttons: Vec<String>,
+        #[serde(default)]
+        screenshot: bool,
+    },
+    /// End the run; the reply carries the cart's uart log.
+    Stop { workspace: Option<String> },
 }
 
 /// One response line. `data` is command-specific JSON; `error` is set
@@ -123,28 +95,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn script_request_round_trips_with_flattened_cmd() {
-        let line = r#"{"id":7,"cmd":"script","workspace":"/w","script":{"cart":"wilds.ggo","frames":120,"steps":[{"at":0,"input":["right"]},{"at":60,"screenshot":"mid"}]}}"#;
-        let req = parse_request(line).unwrap();
-        assert_eq!(req.id, 7);
-        let Cmd::Script { workspace, script } = &req.cmd else {
-            panic!("not a script: {:?}", req.cmd);
-        };
-        assert_eq!(workspace.as_deref(), Some("/w"));
-        assert_eq!(script.cart, "wilds.ggo");
-        assert_eq!(script.frames, 120);
-        assert_eq!(script.steps[0].input.as_deref(), Some(&["right".to_string()][..]));
-        assert_eq!(script.steps[1].screenshot.as_deref(), Some("mid"));
+    fn lockstep_requests_round_trip_with_flattened_cmd() {
+        let req = parse_request(r#"{"id":7,"cmd":"start","workspace":"/w","cart":"wilds.ggo"}"#).unwrap();
+        assert_eq!(
+            req.cmd,
+            Cmd::Start { workspace: Some("/w".to_string()), cart: "wilds.ggo".to_string() }
+        );
+        let req = parse_request(r#"{"id":8,"cmd":"next_frame","buttons":["right","z"],"screenshot":true}"#).unwrap();
+        assert_eq!(
+            req.cmd,
+            Cmd::NextFrame {
+                workspace: None,
+                buttons: vec!["right".to_string(), "z".to_string()],
+                screenshot: true,
+            }
+        );
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
     }
 
     #[test]
-    fn script_steps_default_empty_and_status_has_no_workspace() {
-        let req = parse_request(r#"{"id":1,"cmd":"script","script":{"cart":"a.ggo","frames":10}}"#).unwrap();
-        let Cmd::Script { workspace, script } = req.cmd else { panic!() };
-        assert_eq!(workspace, None);
-        assert!(script.steps.is_empty());
+    fn next_frame_defaults_release_all_and_no_screenshot() {
+        let req = parse_request(r#"{"id":1,"cmd":"next_frame"}"#).unwrap();
+        assert_eq!(req.cmd, Cmd::NextFrame { workspace: None, buttons: vec![], screenshot: false });
         assert_eq!(parse_request(r#"{"id":2,"cmd":"status"}"#).unwrap().cmd, Cmd::Status);
     }
 

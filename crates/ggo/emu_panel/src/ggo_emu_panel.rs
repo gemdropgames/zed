@@ -2844,6 +2844,12 @@ impl EmuPanel {
         }))
     }
 
+    /// The cart's world-inspection JSON `(tap seq, json)`, if the running
+    /// world declares `InspectWorld`.
+    pub(crate) fn remote_world_json(&self) -> Option<(u32, std::sync::Arc<String>)> {
+        self.session.as_ref().and_then(|s| s.world_json())
+    }
+
     /// The last delivered frame as (width, height, BGRA8 bytes).
     pub(crate) fn remote_screenshot(&self) -> Option<(u32, u32, Vec<u8>)> {
         let bytes = self.latest_frame.as_ref()?.as_bytes(0)?;
