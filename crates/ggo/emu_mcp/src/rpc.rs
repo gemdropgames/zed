@@ -72,7 +72,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn no_connect() -> Box<Connector> {
-        Box::new(|_: &Path, _: &str| panic!("must not connect"))
+        Box::new(|_: &Path, _: &str, _: std::time::Duration| panic!("must not connect"))
     }
 
     fn dir() -> PathBuf {
@@ -113,7 +113,7 @@ mod tests {
             &*no_connect(),
         )
         .unwrap();
-        assert!(reply["result"]["tools"].as_array().unwrap().len() >= 9);
+        assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 3);
 
         let err = handle_line(
             r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,
