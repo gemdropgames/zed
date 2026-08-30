@@ -402,6 +402,18 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 (None, None) => Err("workspace vanished".to_string()),
             };
             let panel = booted?;
+            // Register the booted panel HERE, deterministically: a panel
+            // opened by the remote boot only reaches `refresh_root` (and
+            // thus `register_panel`) on later UI activity, so without this
+            // the very next command would see "no emu panel open".
+            cx.update(|cx| {
+                if cx.try_global::<RemotePanels>().is_none() {
+                    cx.set_global(RemotePanels::default());
+                }
+                cx.global_mut::<RemotePanels>()
+                    .panels
+                    .insert(target_root.clone(), (panel.clone(), Some(window)));
+            });
             // A cart-load failure surfaces asynchronously on the emulator
             // thread; only a delivered frame proves the boot took.
             let frame = await_frame(&panel, cx, 1, std::time::Duration::from_secs(5)).await?;
