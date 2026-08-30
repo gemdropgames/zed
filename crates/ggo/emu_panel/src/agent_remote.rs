@@ -436,10 +436,19 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             await_frame(&panel, cx, 1, std::time::Duration::from_secs(5)).await?;
             panel.update(cx, |p, _| p.remote_pause()).map_err(|e| e.to_string())??;
             cx.background_executor().timer(std::time::Duration::from_millis(60)).await;
-            let frame = panel
+            let mut frame = panel
                 .update(cx, |p, _| p.remote_progress().0)
                 .map_err(|e| e.to_string())?;
-            let world = world_value(&panel, cx);
+            let mut world = world_value(&panel, cx);
+            if world.is_null() {
+                // The pause can land before any frame ran with the tap
+                // armed; one paused step produces the first dump (still
+                // null after that = cart built without the inspect
+                // feature).
+                panel.update(cx, |p, _| p.remote_step(1)).map_err(|e| e.to_string())??;
+                frame = await_frame(&panel, cx, frame + 1, std::time::Duration::from_secs(3)).await?;
+                world = world_value(&panel, cx);
+            }
             Ok(serde_json::json!({ "started": true, "frame": frame, "world": world }))
         }
         Cmd::NextFrame { buttons, screenshot, .. } => {
