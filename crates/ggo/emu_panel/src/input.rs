@@ -96,6 +96,12 @@ impl InputState {
         changed
     }
 
+    /// Replace the whole mask (the agent remote's level-triggered latch);
+    /// key events keep mutating it incrementally from here.
+    pub fn set_mask(&mut self, mask: u32) {
+        self.mask = mask;
+    }
+
     pub fn mask(&self) -> u32 {
         self.mask
     }

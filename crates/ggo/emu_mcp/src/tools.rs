@@ -17,6 +17,10 @@ pub type Connector = dyn Fn(&Path, &str) -> std::io::Result<String>;
 
 pub fn socket_call(socket: &Path, line: &str) -> std::io::Result<String> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    // A wedged Zed must surface as a tool error, not hang the agent.
+    let limit = Some(std::time::Duration::from_secs(10));
+    stream.set_read_timeout(limit)?;
+    stream.set_write_timeout(limit)?;
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     let mut reply = String::new();
@@ -31,7 +35,7 @@ pub fn tool_list() -> Value {
         "workspace": { "type": "string", "description": "Absolute project-root path (optional when the session has only one workspace)" },
     });
     let with = |extra: Value| -> Value {
-        let mut props = session_props.as_object().unwrap().clone();
+        let mut props = session_props.as_object().expect("json! object literal").clone();
         if let Some(map) = extra.as_object() {
             props.extend(map.clone());
         }
@@ -61,22 +65,37 @@ pub fn tool_list() -> Value {
     ] })
 }
 
-/// Pick the target session: explicit pid, else the only live one.
-pub fn resolve_session(sessions: &[SessionInfo], pid: Option<u32>) -> Result<SessionInfo, String> {
-    match pid {
-        Some(pid) => sessions
+/// Pick the target session: explicit pid; else the one advertising
+/// `workspace`; else the only live one.
+pub fn resolve_session(
+    sessions: &[SessionInfo],
+    pid: Option<u32>,
+    workspace: Option<&str>,
+) -> Result<SessionInfo, String> {
+    if let Some(pid) = pid {
+        return sessions
             .iter()
             .find(|s| s.pid == pid)
             .cloned()
-            .ok_or_else(|| format!("no live zed session with pid {pid}; run zed_sessions")),
-        None => match sessions {
-            [only] => Ok(only.clone()),
-            [] => Err("no live zed session found — is Zed running with a GGO project open?".to_string()),
-            many => Err(format!(
-                "multiple zed sessions live (pids {:?}) — pass `session`",
-                many.iter().map(|s| s.pid).collect::<Vec<_>>()
-            )),
-        },
+            .ok_or_else(|| format!("no live zed session with pid {pid}; run zed_sessions"));
+    }
+    if let Some(workspace) = workspace {
+        let hosting: Vec<&SessionInfo> =
+            sessions.iter().filter(|s| s.workspaces.iter().any(|w| w == workspace)).collect();
+        if let [only] = hosting[..] {
+            return Ok(only.clone());
+        }
+        // No unique host: fall through to the pid-free rules so a fresh
+        // session whose advertisement predates the workspace still works
+        // when it is the only one live.
+    }
+    match sessions {
+        [only] => Ok(only.clone()),
+        [] => Err("no live zed session found — is Zed running with a GGO project open?".to_string()),
+        many => Err(format!(
+            "multiple zed sessions live (pids {:?}) — pass `session`",
+            many.iter().map(|s| s.pid).collect::<Vec<_>>()
+        )),
     }
 }
 
@@ -115,8 +134,8 @@ fn call_tool_inner(
         return Ok(vec![json!({ "type": "text", "text": text })]);
     }
 
-    let session = resolve_session(&sessions, arg_u32(args, "session"))?;
     let workspace = arg_str(args, "workspace");
+    let session = resolve_session(&sessions, arg_u32(args, "session"), workspace.as_deref())?;
     let cmd = match name {
         "emu_boot" => Cmd::Boot {
             workspace,
@@ -200,10 +219,20 @@ mod tests {
     fn resolve_session_by_pid_single_and_ambiguous() {
         let a = SessionInfo { pid: 1, socket: "/a".into(), workspaces: vec![] };
         let b = SessionInfo { pid: 2, socket: "/b".into(), workspaces: vec![] };
-        assert_eq!(resolve_session(&[a.clone(), b.clone()], Some(2)).unwrap().pid, 2);
-        assert_eq!(resolve_session(std::slice::from_ref(&a), None).unwrap().pid, 1);
-        assert!(resolve_session(&[a, b], None).unwrap_err().contains("multiple"));
-        assert!(resolve_session(&[], None).unwrap_err().contains("no live"));
+        assert_eq!(resolve_session(&[a.clone(), b.clone()], Some(2), None).unwrap().pid, 2);
+        assert_eq!(resolve_session(std::slice::from_ref(&a), None, None).unwrap().pid, 1);
+        assert!(resolve_session(&[a, b], None, None).unwrap_err().contains("multiple"));
+        assert!(resolve_session(&[], None, None).unwrap_err().contains("no live"));
+    }
+
+    #[test]
+    fn resolve_session_picks_the_session_hosting_the_workspace() {
+        let a = SessionInfo { pid: 1, socket: "/a".into(), workspaces: vec!["/proj/a".to_string()] };
+        let b = SessionInfo { pid: 2, socket: "/b".into(), workspaces: vec!["/proj/b".to_string()] };
+        let sessions = [a, b];
+        assert_eq!(resolve_session(&sessions, None, Some("/proj/b")).unwrap().pid, 2);
+        // Unknown workspace with several sessions still asks for a pid.
+        assert!(resolve_session(&sessions, None, Some("/proj/c")).unwrap_err().contains("multiple"));
     }
 
     #[test]

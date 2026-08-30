@@ -2,7 +2,12 @@
 
 /// Encode a BGRA8 buffer (the panel's native frame format) as PNG.
 pub fn bgra_to_png(width: u32, height: u32, bgra: &[u8]) -> Result<Vec<u8>, String> {
-    if bgra.len() != (width * height * 4) as usize {
+    // u64 math + a sanity cap: a bogus host reply must be an error, not
+    // an overflow-wrapped guard pass that panics inside `image`.
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return Err(format!("implausible frame dimensions {width}x{height}"));
+    }
+    if bgra.len() as u64 != u64::from(width) * u64::from(height) * 4 {
         return Err(format!(
             "framebuffer is {} bytes, expected {}x{}x4 = {}",
             bgra.len(),

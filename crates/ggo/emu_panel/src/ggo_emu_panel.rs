@@ -2748,8 +2748,6 @@ impl EmuPanel {
         self.is_running()
     }
 
-    // ---- Agent remote-control surface (see `agent_remote`) ----------
-
     /// Status row for `agent_remote`'s `status` command.
     pub(crate) fn remote_status(&self, workspace: String) -> ggo_emu_remote::protocol::WorkspaceStatus {
         ggo_emu_remote::protocol::WorkspaceStatus {
@@ -2783,6 +2781,9 @@ impl EmuPanel {
                 abs.display()
             ));
         }
+        // Same bookkeeping as `open_rel_path`: a live world-watch would
+        // otherwise rebuild ITS cart over the agent's run on the next save.
+        self.forget_watched_world();
         self.selected = Some(cart);
         self.run(window, cx);
         match (&self.status_is_error, &self.status) {
@@ -2800,13 +2801,20 @@ impl EmuPanel {
         self.session.as_ref().ok_or_else(|| "no run live — boot a cart first".to_string())
     }
 
-    /// Latch the pad mask (level-triggered, exactly like held keys).
-    pub(crate) fn remote_input(&self, mask: u32) -> Result<(), String> {
+    /// Latch the pad mask (level-triggered, exactly like held keys). The
+    /// panel's own InputState is updated too, so every later
+    /// `publish_input` (watch restart, focus churn) republishes this mask
+    /// instead of silently zeroing it mid-probe.
+    pub(crate) fn remote_input(&mut self, mask: u32) -> Result<(), String> {
+        self.input.set_mask(mask);
         self.remote_session()?.set_input(mask);
         Ok(())
     }
 
-    pub(crate) fn remote_pause(&self) -> Result<(), String> {
+    /// Pause like `toggle_pause` does: clearing `auto_paused` so a later
+    /// tab re-activation's `auto_resume` cannot undo an explicit pause.
+    pub(crate) fn remote_pause(&mut self) -> Result<(), String> {
+        self.auto_paused = false;
         self.remote_session()?.pause();
         Ok(())
     }
@@ -2826,6 +2834,14 @@ impl EmuPanel {
             session.step();
         }
         Ok(())
+    }
+
+    /// Progress probe for the dispatcher's boot/step waits: the last
+    /// delivered frame number, and the failure status if the run died.
+    pub(crate) fn remote_progress(&self) -> (u32, bool, Option<String>) {
+        (self.frame, self.session.is_some(), self.status_is_error.then(|| {
+            self.status.clone().unwrap_or_else(|| "run failed".to_string())
+        }))
     }
 
     /// The last delivered frame as (width, height, BGRA8 bytes).

@@ -7,6 +7,12 @@ use serde_json::{Value, json};
 
 use crate::tools::{Connector, call_tool, tool_list};
 
+/// Protocol revisions this server actually implements (the initialize /
+/// tools/list / tools/call subset is identical across them). Anything
+/// else negotiates down to the newest supported instead of echoing a
+/// version whose semantics we do not speak.
+const SUPPORTED_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
 /// Handle one stdin line. `None` means "no reply" (notifications and
 /// unparseable garbage without an id).
 pub fn handle_line(line: &str, registry_dir: &Path, connect: &Connector) -> Option<Value> {
@@ -21,22 +27,29 @@ pub fn handle_line(line: &str, registry_dir: &Path, connect: &Connector) -> Opti
     match (method, id) {
         // Notifications (no id): nothing to answer, whatever the method.
         (_, None) => None,
-        ("initialize", Some(id)) => Some(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "zedgg-emu", "version": env!("CARGO_PKG_VERSION") },
-            },
-        })),
+        ("initialize", Some(id)) => {
+            let requested = msg["params"]["protocolVersion"].as_str().unwrap_or_default();
+            let version = if SUPPORTED_VERSIONS.contains(&requested) {
+                requested
+            } else {
+                SUPPORTED_VERSIONS[SUPPORTED_VERSIONS.len() - 1]
+            };
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": version,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "zedgg-emu", "version": env!("CARGO_PKG_VERSION") },
+                },
+            }))
+        }
         ("tools/list", Some(id)) => {
             Some(json!({ "jsonrpc": "2.0", "id": id, "result": tool_list() }))
         }
         ("tools/call", Some(id)) => {
             let name = msg["params"]["name"].as_str().unwrap_or_default();
-            let default_args = json!({});
-            let args = msg["params"].get("arguments").unwrap_or(&default_args);
+            let args = &msg["params"]["arguments"];
             let (content, is_error) = call_tool(name, args, registry_dir, connect);
             Some(json!({
                 "jsonrpc": "2.0",

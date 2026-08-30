@@ -20,15 +20,10 @@ pub struct SessionInfo {
 
 /// The advertisement dir (created if missing).
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| {
-        // SAFETY-free fallback: uid keeps parallel users out of each
-        // other's way on shared /tmp.
-        PathBuf::from(format!("/tmp/zedgg-emu-{}", uid()))
-    });
-    if base.ends_with("zedgg-emu") || base.to_string_lossy().contains("/tmp/zedgg-emu-") {
-        base
-    } else {
-        base.join("zedgg-emu")
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(base) => PathBuf::from(base).join("zedgg-emu"),
+        // uid keeps parallel users out of each other's way on shared /tmp.
+        None => PathBuf::from(format!("/tmp/zedgg-emu-{}", uid())),
     }
 }
 
