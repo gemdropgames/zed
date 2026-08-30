@@ -425,6 +425,11 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                     .panels
                     .insert(target_root.clone(), (panel.clone(), Some(window)));
             });
+            // Arm the cart's inspection tap FIRST — only remote lock-step
+            // runs serialize; the panel's own Run button never arms it.
+            panel
+                .update(cx, |p, _| p.remote_enable_inspect())
+                .map_err(|e| e.to_string())??;
             // Only a delivered frame proves the boot took, then park at
             // the next boundary and settle: that parked frame is the
             // lock-step baseline.

@@ -2844,8 +2844,14 @@ impl EmuPanel {
         }))
     }
 
-    /// The cart's world-inspection JSON `(tap seq, json)`, if the running
-    /// world declares `InspectWorld`.
+    /// Arm the cart's world-inspection tap — lock-step (remote) runs
+    /// only; ordinary Run leaves the cart serializing nothing.
+    pub(crate) fn remote_enable_inspect(&self) -> Result<(), String> {
+        self.remote_session()?.set_inspect(true);
+        Ok(())
+    }
+
+    /// The cart's world-inspection JSON `(tap seq, json)`, once armed.
     pub(crate) fn remote_world_json(&self) -> Option<(u32, std::sync::Arc<String>)> {
         self.session.as_ref().and_then(|s| s.world_json())
     }

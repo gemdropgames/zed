@@ -54,17 +54,20 @@ Pack a cart in the project first (`emd pack-ggo [--world <stem>]`), then:
 ## Where `world` comes from
 
 The emulator host cannot serialize the game — it only sees RV32 RAM. The
-CART serializes itself: emerald's `inspect` module dumps every entity's
-registered scene components to JSON each frame into a magic-tagged RAM
-buffer the host reads out. A world opts in by declaring
+CART serializes itself: emerald's `inspect` module (compiled only under
+the engine's `inspect` cargo feature — retail builds carry none of it)
+dumps every entity's registered scene components to JSON each frame into
+a magic-tagged RAM buffer the host reads out.
 
-```toml
-[resources]
-InspectWorld = {}
-```
+No world file opt-in exists. The tap ships DISARMED; `emu_start` arms it
+by writing the tap's `enabled` word in guest RAM, so every world booted
+through this MCP serializes automatically, and ordinary in-editor runs
+never pay for serialization at all.
 
-Worlds that don't opt in play fine but return `world: null` — drive by
-screenshot instead. `Fixed` values print as 4-decimal numbers; a `tap_seq`
-field counts dumps. Dumps are capped at 64 KiB (`truncated_raw` appears if
-clipped). Custom `SceneField` types must implement
-`emerald_world::JsonField` (compile error otherwise).
+Carts built without the feature play fine but return `world: null` —
+drive by screenshot instead (a game enables it via
+`emerald-world = { ..., features = ["inspect"] }`; drop for shipping).
+`Fixed` values print as 4-decimal numbers; a `tap_seq` field counts
+dumps. Dumps are capped at 64 KiB (`truncated_raw` appears if clipped).
+Custom `SceneField` types must implement `emerald_world::JsonField`
+(compile error otherwise).
