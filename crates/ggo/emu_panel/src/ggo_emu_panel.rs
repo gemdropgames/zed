@@ -6689,6 +6689,57 @@ mod tests {
         });
     }
 
+    /// Cancelling actually drops the run future -- the thing whose drop
+    /// kills the child. The flags saying "cancelled" while the future
+    /// lives on would be a ggo-diag that keeps flashing a board nobody
+    /// can stop.
+    #[gpui::test]
+    async fn test_cancel_drops_the_run_future(cx: &mut TestAppContext) {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = dropped.clone();
+        // A run that never finishes on its own, like a 20-minute PnR.
+        let streamer: ggo_common::ProcStreamer = Arc::new(move |_request, _on_line| {
+            let guard = DropFlag(flag.clone());
+            Box::pin(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                unreachable!("the run never completes; cancel must drop it")
+            })
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        panel.update_in(cx, |panel, _window, cx| {
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the run is in flight"
+        );
+        panel.update_in(cx, |panel, window, cx| {
+            panel.flash_to_board_with(None, false, window, cx);
+            assert!(!panel.is_flashing());
+        });
+        cx.run_until_parked();
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "cancel dropped the run future, which is what kills the child"
+        );
+    }
+
     /// A machine with nothing set up spawns NOTHING and names every gap.
     #[gpui::test]
     async fn test_flashing_without_the_prerequisites_spawns_nothing(cx: &mut TestAppContext) {

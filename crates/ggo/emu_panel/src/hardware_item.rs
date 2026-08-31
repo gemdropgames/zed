@@ -269,11 +269,13 @@ impl HardwareSetupItem {
     fn render_update_button(&self, busy: bool) -> AnyElement {
         Button::new("ggo-hardware-update-repo", "Update GGO repo")
             .disabled(busy)
-            .tooltip(Tooltip::text(
+            .tooltip(Tooltip::text(if busy {
+                "A run is using the repo -- wait for it to finish, or cancel it"
+            } else {
                 "Pull the latest GGO source into the managed clone \
                  (git pull --ff-only), then flash + rebuild gateware to put \
-                 the new gateware on the board",
-            ))
+                 the new gateware on the board"
+            }))
             .on_click({
                 let panel = self.panel.clone();
                 move |_, _window, cx| {

@@ -1645,13 +1645,13 @@ impl EmeraldPanel {
     /// **The timeout is a race, not a poll**: the run future and
     /// `background_executor().timer()` go into `smol::future::or`, so
     /// whichever finishes first wins and the loser is DROPPED -- and
-    /// dropping the run future kills `emd` (`runner`'s doc explains the
-    /// `kill_on_drop` chain). The panel therefore comes back to a usable
-    /// state with a real message instead of sitting on "Running…" forever,
-    /// and leaves no orphaned `emd` behind. It does NOT stop a `cargo
-    /// check` that `emd` had already started -- that grandchild is outside
-    /// the kill and runs to completion, still holding the project's
-    /// `target/` lock. The executor's timer, not `smol::Timer`, because it is the
+    /// dropping the run future kills `emd`'s whole process group
+    /// (`runner`'s doc explains the chain). The panel therefore comes back
+    /// to a usable state with a real message instead of sitting on
+    /// "Running…" forever, and leaves nothing behind: a `cargo check`
+    /// that `emd` had already started dies with it rather than running to
+    /// completion holding the project's `target/` lock.
+    /// The executor's timer, not `smol::Timer`, because it is the
     /// one clock the gpui test executor can advance (and the one this
     /// checkout's `clippy.toml` allows).
     fn start_run(

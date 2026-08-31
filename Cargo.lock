@@ -7584,6 +7584,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "image",
+ "libc",
  "log",
  "path",
  "project",

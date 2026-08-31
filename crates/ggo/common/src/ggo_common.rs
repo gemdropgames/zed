@@ -806,9 +806,8 @@ pub fn system_proc_runner() -> ProcRunner {
 /// child dies when the future is dropped -- so a caller that DOES have an
 /// executor (`ggo_emerald_panel`'s `cargo check`-backed mutations) can
 /// impose its own budget by racing the future against a timer and dropping
-/// it, and the child goes with it. Only the child, though: see
-/// [`run_capture_async`] on what a killed `emd`'s own `cargo` grandchild
-/// does next.
+/// it, and the child goes with it -- the whole process tree, in fact: see
+/// [`run_capture_async`].
 ///
 /// The child is `smol::process::Command`, not `std::process::Command`:
 /// this checkout's `clippy.toml` disallows the latter's `output`/`spawn`/
@@ -821,31 +820,6 @@ pub fn run_capture(request: &ProcRequest) -> ProcCapture {
     smol::block_on(run_capture_async(request))
 }
 
-/// [`run_capture`]'s async twin, and the only version that can be given a
-/// deadline: **dropping this future kills the child**.
-///
-/// That property is `Command::kill_on_drop(true)` plus how `async_process`
-/// is built -- `Command::output()`'s future owns the `Child`'s guard, so
-/// cancelling the future runs the guard's `Drop`, which sends the kill.
-/// Without the flag a dropped future would not even stop the process it
-/// spawned; it would merely stop LISTENING to it.
-///
-/// **What it does NOT do: kill grandchildren.** The signal goes to the
-/// child this command spawned and to nothing else -- it is not a process
-/// group kill -- so an `emd` that has itself shelled out to `cargo check`
-/// dies while that `cargo` is reparented and runs to completion, still
-/// holding the project's `target/` lock. Dropping the future therefore
-/// buys a caller two real things (the panel stops waiting, and no orphaned
-/// `emd` is left behind) and does not buy a third one it might be assumed
-/// to: the build that run started is not cancelled. Killing the whole tree
-/// would mean putting the child in its own process group and signalling
-/// that, which nothing in this fork does today.
-///
-/// Everything else -- the stdout-then-stderr capture order that lets a
-/// failing `emd`'s stderr trailer win, and the "a binary that cannot be
-/// spawned is a non-ok capture naming the command" rule -- is
-/// [`run_capture`]'s contract, unchanged; this is where both are actually
-/// implemented.
 /// A sink for a child's output lines, called as they arrive.
 pub type LineSink = Box<dyn FnMut(&str) + Send>;
 
@@ -893,9 +867,15 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
     use smol::stream::StreamExt;
     use std::sync::Mutex;
 
-    let child = Command::new(&request.bin)
-        .args(&request.args)
-        .current_dir(&request.cwd)
+    let mut command = session_command(request);
+    let child = command
+        // Null, not inherit: a `setsid` child has no controlling terminal,
+        // so a prompt on an inherited stdin (an https `git pull` asking
+        // for credentials) would not stop on SIGTTIN -- it would silently
+        // compete with the user's shell for keystrokes and hang the run.
+        // EOF makes it fail fast instead. On the ASYNC command: stdio set
+        // on the std one is dropped by the `From` conversion.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -912,6 +892,10 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
             };
         }
     };
+    // Declared after `child` on purpose: locals drop in reverse order, so
+    // on cancellation the guard signals the group while every member --
+    // the leader included -- is still alive.
+    let group = ProcessGroupGuard::new(child.id());
 
     // `on_line` and the transcript are shared by the two drain futures
     // below. They interleave within this one future and no lock is held
@@ -967,7 +951,14 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
         Err(poisoned) => poisoned.into_inner(),
     };
     let ok = match child.status().await {
-        Ok(status) => status.success(),
+        Ok(status) => {
+            // Only a reaped child disarms: after this the group id is free
+            // for reuse and must never be signalled. A failed wait leaves
+            // the guard armed -- the tree may still be up, and killing it
+            // is the whole point.
+            group.disarm();
+            status.success()
+        }
         Err(e) => {
             let line = format!("waiting on `{}`: {e}", request.command_line());
             on_line(&line);
@@ -978,13 +969,129 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
     ProcCapture { ok, lines }
 }
 
+/// The runner's command, with the child put in its own session so the
+/// whole tree is one process group. `kill_on_drop` reaches only the
+/// direct child, and the children this runs -- ggo-diag above all --
+/// spawn their own (sbt, nextpnr, fujprog): cancelling a flash by
+/// killing just ggo-diag orphans a place-and-route that keeps running
+/// for twenty more minutes, or a fujprog mid-write. `pre_exec(setsid)`
+/// runs in the child before exec, so unlike a parent-side `setpgid`
+/// there is no race to lose -- the same pattern as
+/// `util::set_pre_exec_to_start_new_session`.
+fn session_command(request: &ProcRequest) -> Command {
+    let mut command = std::process::Command::new(&request.bin);
+    command.args(&request.args).current_dir(&request.cwd);
+    // safety: setsid is on the async-signal-safe list. Its failure is
+    // load-bearing -- the guard's whole premise is pid == pgid -- so a
+    // child that could not move into its own session must not run at all.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Command::from(command)
+}
+
+/// TERMs a child's whole process group on drop, unless disarmed -- how a
+/// dropped runner future takes the child's OWN children down with it.
+/// Only meaningful for a child spawned via [`session_command`], whose
+/// pid IS its pgid. SIGTERM rather than SIGKILL so sbt and friends get
+/// to die cleanly; the leader still gets `kill_on_drop`'s SIGKILL as a
+/// backstop. The limit: a grandchild that IGNORES SIGTERM survives --
+/// `Drop` cannot sleep and escalate -- so the promise holds for
+/// well-behaved children (sbt, nextpnr, fujprog all are), not for
+/// arbitrary ones.
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+}
+
+impl ProcessGroupGuard {
+    #[cfg(unix)]
+    fn new(pid: u32) -> Self {
+        Self {
+            pgid: Some(pid as i32),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new(_pid: u32) -> Self {
+        Self {}
+    }
+
+    /// The child exited and reaped its own children; from here the group
+    /// id may be reused by an unrelated process, so the drop must not
+    /// signal it.
+    fn disarm(#[cfg_attr(not(unix), allow(unused_mut))] mut self) {
+        #[cfg(unix)]
+        {
+            self.pgid = None;
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            if unsafe { libc::killpg(pgid, libc::SIGTERM) } == -1 {
+                let error = std::io::Error::last_os_error();
+                // ESRCH is the group having already exited -- normal. Any
+                // other failure means the cancel did NOT happen, which is
+                // the orphaned-nextpnr bug back with no diagnostics.
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    log::warn!("cancelling process group {pgid}: {error}");
+                }
+            }
+        }
+    }
+}
+
+/// [`run_capture`]'s async twin, and the only version that can be given a
+/// deadline: **dropping this future kills the child's whole process
+/// tree.** The child is spawned into its own session ([`session_command`])
+/// and a dropped future signals that group -- so an `emd` that shelled out
+/// to `cargo check` takes the `cargo` down with it instead of leaving it
+/// reparented, compiling, and holding the project's `target/` lock.
+/// `kill_on_drop` still SIGKILLs the leader as a backstop.
+///
+/// Everything else -- the stdout-then-stderr capture order that lets a
+/// failing `emd`'s stderr trailer win, and the "a binary that cannot be
+/// spawned is a non-ok capture naming the command" rule -- is
+/// [`run_capture`]'s contract, unchanged; this is where both are actually
+/// implemented.
 pub async fn run_capture_async(request: &ProcRequest) -> ProcCapture {
-    let output = Command::new(&request.bin)
-        .args(&request.args)
-        .current_dir(&request.cwd)
+    let mut command = session_command(request);
+    let child = command
+        // Null for the same reason as `run_streaming_async`: an inherited
+        // stdin in a terminal-less session hangs on the first prompt.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await;
+        .spawn();
+    let output = match child {
+        Ok(child) => {
+            let pid = child.id();
+            // `output()` takes the child by value, so the guard has to be
+            // created after the future that owns it: locals drop in
+            // reverse order, and the guard must fire while the leader is
+            // still alive -- a reaped leader's group id is up for reuse.
+            let running = child.output();
+            let group = ProcessGroupGuard::new(pid);
+            let output = running.await;
+            if output.is_ok() {
+                group.disarm();
+            }
+            output
+        }
+        Err(e) => Err(e),
+    };
     let output = match output {
         Ok(output) => output,
         Err(e) => {
@@ -1163,6 +1270,60 @@ mod tests {
             vec!["one", "three", "two"],
             "and lands in the capture"
         );
+    }
+
+    /// Dropping the run future takes the child's OWN children down too.
+    /// `kill_on_drop` only signals the direct child; the process-group
+    /// guard is what reaches the grandchildren -- without it, cancelling
+    /// a flash leaves nextpnr place-and-routing for twenty more minutes.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_stream_kills_the_childs_own_children() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = mpsc::channel::<String>();
+        // The child prints its background child's pid, then waits on it
+        // forever -- a stand-in for ggo-diag sitting on nextpnr.
+        let request = ProcRequest::new(
+            "sh",
+            std::env::temp_dir(),
+            vec!["-c".to_string(), "sleep 600 & echo $!; wait".to_string()],
+        );
+        let task = smol::spawn(async move {
+            run_streaming_async(
+                &request,
+                Box::new(move |line: &str| {
+                    tx.send(line.to_string()).ok();
+                }),
+            )
+            .await
+        });
+        let grandchild: i32 = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child announces its grandchild")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert_eq!(
+            unsafe { libc::kill(grandchild, 0) },
+            0,
+            "the grandchild is alive while the run is"
+        );
+        drop(task); // the cancel button
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let gone = unsafe { libc::kill(grandchild, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if gone {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild outlived the cancel"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A non-zero exit is a failed capture, and a binary that cannot be

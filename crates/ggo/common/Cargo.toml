@@ -27,6 +27,10 @@ smol.workspace = true
 ui.workspace = true
 workspace.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# GGO -- setpgid/killpg for the process-group cancel, see ProcessGroupGuard.
+libc.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
