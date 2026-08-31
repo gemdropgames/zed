@@ -439,6 +439,30 @@ impl Render for HardwareSetupItem {
                             }
                         }),
                     )
+                    // A repo pull that changed the PPU/SoC needs a fresh
+                    // bitstream; the plain flash reuses the cached one.
+                    .when(!busy, |el| {
+                        el.child(
+                            Button::new("ggo-hardware-flash-full", "Flash + rebuild gateware")
+                                .disabled(!ready)
+                                .tooltip(Tooltip::text(if ready {
+                                    "Place-and-route the SoC (~20 min), flash the fresh \
+                                     bitstream, then run this project"
+                                } else {
+                                    "Still missing something above"
+                                }))
+                                .on_click({
+                                    let panel = self.panel.clone();
+                                    move |_, window, cx| {
+                                        panel
+                                            .update(cx, |panel, cx| {
+                                                panel.flash_to_board_with(true, window, cx)
+                                            })
+                                            .ok();
+                                    }
+                                }),
+                        )
+                    })
                     .child(
                         Button::new("ggo-hardware-recheck", "Re-check")
                             .disabled(busy)

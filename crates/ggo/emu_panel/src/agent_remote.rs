@@ -117,8 +117,7 @@ pub fn init(cx: &mut App) {
     .detach();
 
     // Socket side, entirely on the background executor.
-    let executor = cx.background_executor().clone();
-    let accept_executor = executor.clone();
+    let accept_executor = cx.background_executor().clone();
     cx.background_spawn(async move {
         let listener = match smol::net::unix::UnixListener::bind(&sock_path) {
             Ok(l) => l,

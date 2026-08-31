@@ -451,8 +451,9 @@ pub fn run_cart(
 /// boot it. Same registry pattern -- and the same reason -- as
 /// [`WorldEmulator`]: the flashing lives in `ggo_emu_panel`, which
 /// already depends on `ggo_world_panel`, so the world panel's flash
-/// button cannot call it directly.
-pub type BoardFlasher = fn(&mut Workspace, &mut Window, &mut Context<Workspace>) -> bool;
+/// button cannot call it directly. The `bool` is `rebuild_gateware`:
+/// place-and-route a fresh bitstream instead of flashing the cached one.
+pub type BoardFlasher = fn(&mut Workspace, bool, &mut Window, &mut Context<Workspace>) -> bool;
 
 #[derive(Default)]
 struct BoardFlashers(Vec<BoardFlasher>);
@@ -469,6 +470,7 @@ pub fn register_board_flasher(cx: &mut App, flasher: BoardFlasher) {
 /// swallowed, exactly as [`run_cart`] explains.
 pub fn flash_to_board(
     workspace: &mut Workspace,
+    rebuild_gateware: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
@@ -476,7 +478,9 @@ pub fn flash_to_board(
         Some(registry) if !registry.0.is_empty() => registry.0.clone(),
         _ => return false,
     };
-    flashers.iter().any(|flash| flash(workspace, window, cx))
+    flashers
+        .iter()
+        .any(|flash| flash(workspace, rebuild_gateware, window, cx))
 }
 
 /// A handler that can build and boot a world into an emulator pane. Same

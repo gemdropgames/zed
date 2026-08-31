@@ -190,13 +190,15 @@ pub fn init(cx: &mut App) {
     // explorer's "Emulate this world (cart)" entry uses, deferred because
     // that handler saves the world panel's doc and takes the workspace
     // itself -- neither may nest inside the caller's updates.
-    ggo_common::register_board_flasher(cx, |workspace, window, cx| {
-        open_emu_item(workspace, window, cx, |_emu, window, cx| {
+    ggo_common::register_board_flasher(cx, |workspace, rebuild_gateware, window, cx| {
+        open_emu_item(workspace, window, cx, move |_emu, window, cx| {
             // DEFERRED, like the world emulator below: this handler runs
             // inside `workspace.update`, and `flash_to_board` ->
             // `refresh_root` reads that same leased entity. Doing it here
             // is the double-lease panic, not a style preference.
-            cx.defer_in(window, |emu, window, cx| emu.flash_to_board(window, cx));
+            cx.defer_in(window, move |emu, window, cx| {
+                emu.flash_to_board_with(rebuild_gateware, window, cx)
+            });
         })
     });
 
@@ -647,6 +649,19 @@ impl EmuPanel {
     /// The flash-and-run button: flash the open project to the board and
     /// boot it, or -- while one is in flight -- cancel.
     pub fn flash_to_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flash_to_board_with(false, window, cx);
+    }
+
+    /// [`Self::flash_to_board`], with the choice of rebuilding the
+    /// gateware: `rebuild_gateware` drops `--skip-pnr` so the run
+    /// place-and-routes the SoC and flashes a fresh bitstream instead of
+    /// the cached one -- what a pulled GGO repo with PPU changes needs.
+    pub fn flash_to_board_with(
+        &mut self,
+        rebuild_gateware: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(flash) = self.flash.take() {
             // Cancelling is not failing: the timeline stays as it was,
             // with the phase it got to still marked running.
@@ -666,11 +681,15 @@ impl EmuPanel {
         // status row can carry neither, and "where did my flash go"
         // should have one answer.
         self.open_hardware_page(window, cx);
-        if let Ok(request) = hardware::flash_request(&env) {
+        if let Ok(request) = hardware::flash_request(&env, rebuild_gateware) {
             self.start_board_run(
                 vec![request],
                 "flashing".to_string(),
-                hardware::FlashProgress::flash(),
+                if rebuild_gateware {
+                    hardware::FlashProgress::flash_full()
+                } else {
+                    hardware::FlashProgress::flash()
+                },
                 cx,
             );
         }
@@ -2369,17 +2388,65 @@ impl EmuPanel {
             )
             .child({
                 let flashing = self.is_flashing();
-                IconButton::new("ggo-emu-flash", IconName::GgoFlashRun)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(flashing)
-                    .tooltip(Tooltip::text(if flashing {
-                        "Cancel the flash"
-                    } else {
-                        "Flash this project to the board and run it"
-                    }))
-                    .on_click(
-                        cx.listener(|this, _event, window, cx| this.flash_to_board(window, cx)),
-                    )
+                if flashing {
+                    // One click to cancel, no menu in the way.
+                    IconButton::new("ggo-emu-flash", IconName::GgoFlashRun)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(true)
+                        .tooltip(Tooltip::text("Cancel the flash"))
+                        .on_click(
+                            cx.listener(|this, _event, window, cx| {
+                                this.flash_to_board(window, cx)
+                            }),
+                        )
+                        .into_any_element()
+                } else {
+                    // A menu, not a one-click flash: the plain flash
+                    // reuses the cached bitstream, and pressing the wrong
+                    // one costs either a stale board or a ~20-minute
+                    // place-and-route.
+                    let weak = cx.weak_entity();
+                    ui::PopoverMenu::new("ggo-emu-flash-menu")
+                        .trigger(
+                            IconButton::new("ggo-emu-flash", IconName::GgoFlashRun)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Flash this project to the board")),
+                        )
+                        .menu(move |window, cx| {
+                            let weak = weak.clone();
+                            Some(ui::ContextMenu::build(
+                                window,
+                                cx,
+                                move |menu, _window, _cx| {
+                                    let flash = weak.clone();
+                                    let rebuild = weak;
+                                    menu.entry(
+                                        "Flash now (cached gateware)",
+                                        None,
+                                        move |window, cx| {
+                                            flash
+                                                .update(cx, |this, cx| {
+                                                    this.flash_to_board_with(false, window, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    )
+                                    .entry(
+                                        "Flash + rebuild gateware (~20 min)",
+                                        None,
+                                        move |window, cx| {
+                                            rebuild
+                                                .update(cx, |this, cx| {
+                                                    this.flash_to_board_with(true, window, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    )
+                                },
+                            ))
+                        })
+                        .into_any_element()
+                }
             })
             .children(
                 self.flash_status()
@@ -2816,11 +2883,6 @@ impl EmuPanel {
     pub(crate) fn remote_pause(&mut self) -> Result<(), String> {
         self.auto_paused = false;
         self.remote_session()?.pause();
-        Ok(())
-    }
-
-    pub(crate) fn remote_resume(&self) -> Result<(), String> {
-        self.remote_session()?.resume();
         Ok(())
     }
 
@@ -6230,7 +6292,7 @@ mod tests {
             true,
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6277,7 +6339,7 @@ mod tests {
             true,
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6321,7 +6383,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6352,7 +6414,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request.clone()],
@@ -6388,7 +6450,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: FAIL"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6420,7 +6482,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6451,7 +6513,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6570,7 +6632,7 @@ mod tests {
         let (workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::flash_to_board(workspace, window, cx)
+            ggo_common::flash_to_board(workspace, false, window, cx)
         });
         assert!(claimed, "init registers a board flasher");
         // The deferred `flash_to_board` runs here; before the fix this
@@ -6632,7 +6694,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path())).expect("ready");
+        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],

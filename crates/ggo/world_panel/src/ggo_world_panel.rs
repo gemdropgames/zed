@@ -3183,7 +3183,7 @@ impl WorldPanel {
     /// pane's board flasher. Deferred out of this click for the same
     /// reason [`Self::emulate_impl`] defers -- the handler updates the
     /// workspace, which is leased while a panel listener runs.
-    fn flash_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn flash_impl(&mut self, rebuild_gateware: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
@@ -3192,7 +3192,7 @@ impl WorldPanel {
                 return;
             };
             workspace.update(cx, |workspace, cx| {
-                if !ggo_common::flash_to_board(workspace, window, cx) {
+                if !ggo_common::flash_to_board(workspace, rebuild_gateware, window, cx) {
                     log::warn!("no emulator pane is available to flash this project");
                 }
             });
@@ -4121,12 +4121,41 @@ impl WorldPanel {
                     .on_click(cx.listener(|this, _, window, cx| this.emulate_impl(window, cx))),
             )
             .child(
-                IconButton::new("ggo-world-flash", IconName::GgoFlashRun)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text(
-                        "Flash this project to the board and run it",
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| this.flash_impl(window, cx))),
+                // A menu, not a one-click flash: the plain flash reuses the
+                // cached bitstream, and pressing the wrong one costs either
+                // a stale board or a ~20-minute place-and-route.
+                PopoverMenu::new("ggo-world-flash-menu")
+                    .trigger(
+                        IconButton::new("ggo-world-flash", IconName::GgoFlashRun)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Flash this project to the board")),
+                    )
+                    .menu({
+                        let weak = cx.weak_entity();
+                        move |window, cx| {
+                            let weak = weak.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                                let flash = weak.clone();
+                                let rebuild = weak;
+                                menu.entry("Flash now (cached gateware)", None, move |window, cx| {
+                                    flash
+                                        .update(cx, |this, cx| this.flash_impl(false, window, cx))
+                                        .ok();
+                                })
+                                .entry(
+                                    "Flash + rebuild gateware (~20 min)",
+                                    None,
+                                    move |window, cx| {
+                                        rebuild
+                                            .update(cx, |this, cx| {
+                                                this.flash_impl(true, window, cx)
+                                            })
+                                            .ok();
+                                    },
+                                )
+                            }))
+                        }
+                    }),
             )
             .child(
                 IconButton::new("ggo-world-emulate-popout", IconName::ArrowUpRight)
@@ -9823,6 +9852,7 @@ mod tests {
 
     fn recording_flasher(
         _workspace: &mut Workspace,
+        _rebuild_gateware: bool,
         _window: &mut Window,
         _cx: &mut Context<Workspace>,
     ) -> bool {
@@ -9848,7 +9878,7 @@ mod tests {
                 .expect("init() adds the panel")
         });
 
-        panel.update_in(cx, |panel, window, cx| panel.flash_impl(window, cx));
+        panel.update_in(cx, |panel, window, cx| panel.flash_impl(false, window, cx));
         cx.run_until_parked();
         assert_eq!(
             FLASHED.with(|f| f.get()),

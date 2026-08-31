@@ -269,16 +269,23 @@ impl HardwareEnv {
 /// `--skip-pnr` is not the CLI's default but IS the right default for a
 /// one-click button: without it step 3 place-and-routes the whole SoC
 /// (~20 minutes) before anything reaches the board, and a game change
-/// never needs new gateware. `--project` implies `--provision`, so the
-/// card image is rewritten with the freshly packed game every run.
-pub fn flash_args(project: &Path, tty: &str) -> Vec<String> {
-    vec![
+/// never needs new gateware. A GGO repo update that changes the PPU/SoC
+/// DOES need new gateware, which is what `rebuild_gateware` is for: it
+/// drops `--skip-pnr` so the run place-and-routes and flashes a fresh
+/// bitstream instead of the cached one. `--project` implies
+/// `--provision`, so the card image is rewritten with the freshly packed
+/// game every run.
+pub fn flash_args(project: &Path, tty: &str, rebuild_gateware: bool) -> Vec<String> {
+    let mut args = vec![
         "--project".to_string(),
         project.to_string_lossy().into_owned(),
         "--tty".to_string(),
         tty.to_string(),
-        "--skip-pnr".to_string(),
-    ]
+    ];
+    if !rebuild_gateware {
+        args.push("--skip-pnr".to_string());
+    }
+    args
 }
 
 /// The flash invocation, or the list of what is missing instead.
@@ -286,7 +293,7 @@ pub fn flash_args(project: &Path, tty: &str) -> Vec<String> {
 /// `cwd` is the GGO repo: that CLI finds the repo by walking up from its
 /// working directory, and this fork's worktree is the user's GAME
 /// project, not the repo.
-pub fn flash_request(env: &HardwareEnv) -> Result<ProcRequest, String> {
+pub fn flash_request(env: &HardwareEnv, rebuild_gateware: bool) -> Result<ProcRequest, String> {
     let missing = env.missing();
     if !missing.is_empty() {
         return Err(format!(
@@ -306,7 +313,11 @@ pub fn flash_request(env: &HardwareEnv) -> Result<ProcRequest, String> {
     ) else {
         return Err("flashing needs a board".to_string());
     };
-    Ok(ProcRequest::new(bin, repo, flash_args(&project, &tty)))
+    Ok(ProcRequest::new(
+        bin,
+        repo,
+        flash_args(&project, &tty, rebuild_gateware),
+    ))
 }
 
 /// A stage of the pipeline, parsed from `ggo-diag`'s own output. The
@@ -396,6 +407,18 @@ pub const FLASH_PHASES: [&str; 5] = [
     "Report",
 ];
 
+/// [`FLASH_PHASES`] plus the place-and-route phases a run without
+/// `--skip-pnr` announces (titles from `ggo-diag`'s `Phase5::title`).
+pub const FULL_FLASH_PHASES: [&str; 7] = [
+    "Compile firmware",
+    "Component PnR",
+    "Full SoC PnR",
+    "Provision SD card",
+    "Flash board",
+    "Boot verify (UART)",
+    "Report",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhaseState {
     Pending,
@@ -453,6 +476,17 @@ impl FlashProgress {
     /// A flash run: the expected pipeline, all pending.
     pub fn flash() -> Self {
         Self::steps(FLASH_PHASES.iter().map(|title| title.to_string()).collect())
+    }
+
+    /// A gateware-rebuilding flash run: the pipeline with both PnR
+    /// phases, all pending.
+    pub fn flash_full() -> Self {
+        Self::steps(
+            FULL_FLASH_PHASES
+                .iter()
+                .map(|title| title.to_string())
+                .collect(),
+        )
     }
 
     /// A run whose phases the caller names -- a setup run emits none of
@@ -822,14 +856,22 @@ mod tests {
     #[test]
     fn flash_args_pack_the_project_and_skip_place_and_route() {
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0"),
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", false),
             vec!["--project", "/game", "--tty", "/dev/ttyUSB0", "--skip-pnr"],
         );
     }
 
     #[test]
+    fn a_gateware_rebuild_does_not_skip_place_and_route() {
+        assert_eq!(
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", true),
+            vec!["--project", "/game", "--tty", "/dev/ttyUSB0"],
+        );
+    }
+
+    #[test]
     fn flash_request_runs_in_the_repo_not_the_project() {
-        let request = flash_request(&ready_env()).expect("a ready machine flashes");
+        let request = flash_request(&ready_env(), false).expect("a ready machine flashes");
         assert_eq!(request.bin, "ggo-diag");
         assert_eq!(
             request.cwd,
@@ -852,7 +894,7 @@ mod tests {
                 Missing::Port
             ]
         );
-        let error = flash_request(&env).expect_err("an empty machine cannot flash");
+        let error = flash_request(&env, false).expect_err("an empty machine cannot flash");
         for missing in env.missing() {
             assert!(
                 error.contains(&missing.label()),
