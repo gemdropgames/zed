@@ -118,6 +118,12 @@ pub struct HardwareEnv {
     /// This user's home directory -- the one place a setup step can be
     /// spawned into without creating it first.
     pub home: PathBuf,
+    /// `repo`'s HEAD commit, when it can be read off the filesystem. This
+    /// is the source the board's gateware and GemOS get built from.
+    pub repo_commit: Option<String>,
+    /// The commit the in-IDE emulator engine was compiled from, when the
+    /// build embedded one.
+    pub emu_commit: Option<String>,
 }
 
 impl HardwareEnv {
@@ -157,6 +163,56 @@ impl HardwareEnv {
     pub fn cwd_for_setup(&self) -> PathBuf {
         self.home.clone()
     }
+
+    /// The flash source and the emulator engine are at different commits:
+    /// `(flash_short, emu_short)`.
+    ///
+    /// The board renders whatever PPU the checkout in [`Self::repo`]
+    /// builds, while the in-IDE emulator renders the one it was compiled
+    /// from. Divergence is silent -- a board a thousand commits behind
+    /// just draws an older frame -- so the page has to say it. Only ever
+    /// `Some` when BOTH commits are known: an unreadable repo or a build
+    /// without git is "unknown", and warning on unknown would fire on
+    /// every machine that has neither.
+    pub fn version_skew(&self) -> Option<(String, String)> {
+        let (repo_commit, emu_commit) = (self.repo_commit.as_ref()?, self.emu_commit.as_ref()?);
+        (repo_commit != emu_commit).then(|| (short_commit(repo_commit), short_commit(emu_commit)))
+    }
+
+    /// Is [`Self::repo`] the clone this feature made, rather than a
+    /// checkout the user maintains?
+    pub fn repo_is_managed_clone(&self) -> bool {
+        self.repo.as_ref() == Some(&self.clone_dest)
+    }
+
+    /// `git pull --ff-only` in the managed clone, when there is one.
+    ///
+    /// Only the clone under `~/.ggo` is ours to move: a dev checkout is
+    /// the user's working copy, and pulling it out from under them could
+    /// discard work or drop them onto a different branch mid-edit.
+    ///
+    /// `--ff-only` rather than a plain pull: a clone that has diverged --
+    /// local commits, a rebased upstream -- must stop in the console with
+    /// git's own message, so the user sees the state their clone is in.
+    /// A silent merge commit would leave a checkout nobody chose to make
+    /// and a board built from it.
+    pub fn update_repo_request(&self) -> Option<ProcRequest> {
+        if !self.git || !self.repo_is_managed_clone() {
+            return None;
+        }
+        let repo = self.repo.clone()?;
+        Some(ProcRequest::new(
+            "git",
+            repo,
+            vec!["pull".to_string(), "--ff-only".to_string()],
+        ))
+    }
+}
+
+/// The first 10 characters of a commit hash -- long enough to be unique
+/// in any repo this fork touches, short enough for a status line.
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(10).collect()
 }
 
 /// What the setup page can do about one requirement.
@@ -759,6 +815,101 @@ pub fn is_repo(dir: &Path) -> bool {
     dir.join(crate::menu::REPO_FINGERPRINT).is_file()
 }
 
+/// `repo`'s HEAD commit, read straight off the filesystem.
+///
+/// No `git rev-parse`: this is called from `probe`, which runs on the
+/// foreground thread, and spawning a child there to answer a question
+/// three files can answer is a stall for a hash. It also keeps the
+/// function pure enough to test against a fixture tree.
+///
+/// Everything about a repo we cannot read is `None` rather than an error:
+/// the one caller ([`HardwareEnv::version_skew`]) treats unknown as "do
+/// not warn", so a shallow archive, a `.git` in a shape this does not
+/// handle, or no repo at all all land in the same harmless place.
+pub fn read_git_head(repo: &Path) -> Option<String> {
+    let dot_git = repo.join(".git");
+    // A worktree (and a submodule) has `.git` as a FILE holding
+    // `gitdir: <path>`, where the path may be relative to the worktree.
+    let git_dir = if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = Path::new(pointer.trim().strip_prefix("gitdir:")?.trim());
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            repo.join(target)
+        }
+    } else {
+        dot_git
+    };
+    // HEAD is per-worktree, so it always comes from the gitdir above.
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    // Detached: HEAD is the hash itself.
+    let Some(reference) = head.strip_prefix("ref:") else {
+        return is_commit_hash(head).then(|| head.to_string());
+    };
+    let reference = reference.trim();
+    // `refs/heads/*` are NOT per-worktree: a linked worktree's gitdir
+    // holds only its own HEAD and index, and `commondir` points at the
+    // main `.git` where the branches actually live. Without this hop a
+    // `git worktree` checkout resolves to nothing at all.
+    let common = read_common_dir(&git_dir);
+    // A loose ref file is the usual shape -- including for a freshly
+    // cloned repo, whose checked-out branch is written loose while
+    // `packed-refs` carries the remotes and tags. `git gc` is what later
+    // packs heads away too, and a repo that has not committed since then
+    // has its branch ONLY there.
+    read_loose_ref(&git_dir, reference)
+        .or_else(|| read_packed_ref(&git_dir, reference))
+        .or_else(|| {
+            let common = common?;
+            read_loose_ref(&common, reference).or_else(|| read_packed_ref(&common, reference))
+        })
+}
+
+/// The main `.git` a linked worktree's gitdir points back to, named by
+/// its `commondir` file (usually the relative `../..`). `None` for an
+/// ordinary repo, which has no such file and needs no hop.
+fn read_common_dir(git_dir: &Path) -> Option<PathBuf> {
+    let pointer = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let target = Path::new(pointer.trim());
+    if target.as_os_str().is_empty() {
+        return None;
+    }
+    Some(if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        git_dir.join(target)
+    })
+}
+
+/// `.git/<reference>`, when it holds a hash.
+fn read_loose_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let hash = std::fs::read_to_string(git_dir.join(reference)).ok()?;
+    let hash = hash.trim();
+    is_commit_hash(hash).then(|| hash.to_string())
+}
+
+/// `reference`'s hash out of `.git/packed-refs`, whose lines are
+/// `<hash> <ref>`.
+fn read_packed_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        // `#` is the header comment; `^<hash>` peels the PREVIOUS line's
+        // annotated tag to its commit and names no ref of its own.
+        if line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let (hash, name) = line.split_once(' ')?;
+        (name.trim() == reference && is_commit_hash(hash)).then(|| hash.to_string())
+    })
+}
+
+/// A hex object id: 40 characters for SHA-1, 64 for a SHA-256 repo.
+fn is_commit_hash(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Expand a leading `~` against `home`. Env vars are not shell words, so
 /// nothing else does this and a `~` reaches the filesystem literally.
 pub fn expand_home(value: &str, home: &Path) -> PathBuf {
@@ -987,6 +1138,7 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         Some(tty) => (vec![tty], false),
         None => scan_ports_rescuing(),
     };
+    let repo_commit = repo.as_deref().and_then(read_git_head);
     HardwareEnv {
         diag_bin,
         emd_bin,
@@ -1002,6 +1154,8 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         git: resolve_on_path("git", path_env).is_some(),
         clone_dest,
         home: home.to_path_buf(),
+        repo_commit,
+        emu_commit: ggo_emu_core::BUILT_FROM_COMMIT.map(str::to_string),
     }
 }
 
@@ -1023,7 +1177,32 @@ mod tests {
             git: true,
             clone_dest: PathBuf::from("/home/u/.ggo/ggo"),
             home: PathBuf::from("/home/u"),
+            repo_commit: None,
+            emu_commit: None,
         }
+    }
+
+    /// A repo fixture: `.git/HEAD` holding `head`, plus whatever loose
+    /// refs and `packed-refs` body the test wants.
+    fn git_fixture(
+        root: &Path,
+        head: &str,
+        loose: &[(&str, &str)],
+        packed: Option<&str>,
+    ) -> PathBuf {
+        let repo = root.join("repo");
+        let git_dir = repo.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), format!("{head}\n")).unwrap();
+        for (name, hash) in loose {
+            let path = git_dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{hash}\n")).unwrap();
+        }
+        if let Some(packed) = packed {
+            std::fs::write(git_dir.join("packed-refs"), packed).unwrap();
+        }
+        repo
     }
 
     #[test]
@@ -1411,6 +1590,223 @@ mod tests {
             expand_home("~user/x", home),
             PathBuf::from("~user/x"),
             "another user's home is not ours to guess"
+        );
+    }
+
+    // ------------------------------------------------- version skew
+
+    const HEAD_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// A detached HEAD names its commit directly.
+    #[test]
+    fn a_detached_head_is_the_commit_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_fixture(dir.path(), HEAD_HASH, &[], None);
+        assert_eq!(read_git_head(&repo), Some(HEAD_HASH.to_string()));
+    }
+
+    /// The usual shape: HEAD points at a branch, the branch is a file.
+    #[test]
+    fn a_symbolic_head_resolves_through_the_loose_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_fixture(
+            dir.path(),
+            "ref: refs/heads/main",
+            &[("refs/heads/main", HEAD_HASH)],
+            None,
+        );
+        assert_eq!(read_git_head(&repo), Some(HEAD_HASH.to_string()));
+    }
+
+    /// A freshly cloned (or `git gc`'d) repo keeps its refs packed, with
+    /// a comment header and tag peel lines that name no branch.
+    #[test]
+    fn a_packed_ref_resolves_past_comments_and_peel_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_fixture(
+            dir.path(),
+            "ref: refs/heads/main",
+            &[],
+            Some(&format!(
+                "# pack-refs with: peeled fully-peeled sorted \n\
+                 {OTHER_HASH} refs/tags/v1\n\
+                 ^{HEAD_HASH}\n\
+                 {HEAD_HASH} refs/heads/main\n"
+            )),
+        );
+        assert_eq!(
+            read_git_head(&repo),
+            Some(HEAD_HASH.to_string()),
+            "the peel line under the tag is not refs/heads/main"
+        );
+    }
+
+    /// A loose ref beats the packed one: `packed-refs` can be stale for a
+    /// branch that has moved since the last `git gc`.
+    #[test]
+    fn a_loose_ref_wins_over_a_stale_packed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_fixture(
+            dir.path(),
+            "ref: refs/heads/main",
+            &[("refs/heads/main", HEAD_HASH)],
+            Some(&format!("{OTHER_HASH} refs/heads/main\n")),
+        );
+        assert_eq!(read_git_head(&repo), Some(HEAD_HASH.to_string()));
+    }
+
+    /// A `git worktree` checkout, in its real layout: `.git` is a FILE
+    /// pointing at `<main>/.git/worktrees/<name>`, which holds this
+    /// worktree's own HEAD and a `commondir` back to the main `.git` --
+    /// where `refs/heads/*` actually live. Resolving the branch against
+    /// the per-worktree gitdir alone finds nothing.
+    #[test]
+    fn a_worktree_resolves_its_branch_through_the_common_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_git = dir.path().join("main/.git");
+        let worktree_git = main_git.join("worktrees/feature");
+        std::fs::create_dir_all(main_git.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        // The branch exists ONLY in the common dir, as git puts it.
+        std::fs::write(main_git.join("refs/heads/feature"), format!("{HEAD_HASH}\n")).unwrap();
+        std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+
+        let worktree = dir.path().join("feature-tree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        assert_eq!(read_git_head(&worktree), Some(HEAD_HASH.to_string()));
+
+        // The common dir's packed-refs is the other place to look.
+        std::fs::remove_file(main_git.join("refs/heads/feature")).unwrap();
+        assert_eq!(read_git_head(&worktree), None, "nothing holds the branch");
+        std::fs::write(
+            main_git.join("packed-refs"),
+            format!("{HEAD_HASH} refs/heads/feature\n"),
+        )
+        .unwrap();
+        assert_eq!(read_git_head(&worktree), Some(HEAD_HASH.to_string()));
+
+        // A `gitdir:` may be written relative to the worktree, and a
+        // detached worktree needs no common dir at all.
+        let detached = dir.path().join("detached-tree");
+        let detached_git = main_git.join("worktrees/detached");
+        std::fs::create_dir_all(&detached_git).unwrap();
+        std::fs::write(detached_git.join("HEAD"), format!("{OTHER_HASH}\n")).unwrap();
+        std::fs::create_dir_all(&detached).unwrap();
+        std::fs::write(
+            detached.join(".git"),
+            "gitdir: ../main/.git/worktrees/detached\n",
+        )
+        .unwrap();
+        assert_eq!(read_git_head(&detached), Some(OTHER_HASH.to_string()));
+    }
+
+    /// A SHA-256 repo's object ids are 64 hex characters, not 40.
+    #[test]
+    fn a_sha256_repo_reads_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "a".repeat(64);
+        let repo = git_fixture(dir.path(), &hash, &[], None);
+        assert_eq!(read_git_head(&repo), Some(hash));
+    }
+
+    /// Nothing readable is "unknown", never an error: the caller's whole
+    /// contract is that unknown does not warn.
+    #[test]
+    fn an_unreadable_repo_is_unknown_rather_than_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_git_head(&dir.path().join("gone")), None);
+
+        // A `.git` with no HEAD.
+        let empty = git_fixture(dir.path(), HEAD_HASH, &[], None);
+        std::fs::remove_file(empty.join(".git/HEAD")).unwrap();
+        assert_eq!(read_git_head(&empty), None);
+
+        // A symbolic HEAD whose ref is nowhere.
+        let dangling = tempfile::tempdir().unwrap();
+        let dangling = git_fixture(dangling.path(), "ref: refs/heads/main", &[], None);
+        assert_eq!(read_git_head(&dangling), None);
+
+        // Something that is not a hash where one belongs.
+        let junk = tempfile::tempdir().unwrap();
+        let junk = git_fixture(junk.path(), "not a hash at all", &[], None);
+        assert_eq!(read_git_head(&junk), None);
+
+        // A `.git` file that points nowhere useful.
+        let broken = dir.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(".git"), "this is not a gitdir line\n").unwrap();
+        assert_eq!(read_git_head(&broken), None);
+    }
+
+    /// The warning fires only when both sides are known and differ:
+    /// warning on unknown would fire on every tarball build.
+    #[test]
+    fn skew_needs_two_known_and_different_commits() {
+        let mut env = ready_env();
+        env.repo_commit = Some(HEAD_HASH.to_string());
+        env.emu_commit = Some(OTHER_HASH.to_string());
+        assert_eq!(
+            env.version_skew(),
+            Some(("0123456789".to_string(), "fedcba9876".to_string())),
+            "short enough for a status line, long enough to be unique"
+        );
+
+        env.emu_commit = Some(HEAD_HASH.to_string());
+        assert_eq!(env.version_skew(), None, "the same commit is no skew");
+
+        env.emu_commit = None;
+        assert_eq!(env.version_skew(), None, "a build without git never warns");
+
+        env.repo_commit = None;
+        env.emu_commit = Some(OTHER_HASH.to_string());
+        assert_eq!(
+            env.version_skew(),
+            None,
+            "an unreadable checkout never warns"
+        );
+    }
+
+    /// Only the clone ZedGG made can be pulled from the page, and only
+    /// fast-forward: a diverged clone has to fail loudly.
+    #[test]
+    fn only_the_managed_clone_offers_an_update() {
+        let mut env = ready_env();
+        env.repo = Some(env.clone_dest.clone());
+        let request = env
+            .update_repo_request()
+            .expect("the managed clone is ours to move");
+        assert_eq!(request.bin, "git");
+        assert_eq!(request.args, vec!["pull", "--ff-only"]);
+        assert_eq!(
+            request.cwd, env.clone_dest,
+            "the pull runs in the clone, not the home directory"
+        );
+
+        // A checkout the user maintains is not ours to pull.
+        env.repo = Some(PathBuf::from("/repo"));
+        assert!(env.update_repo_request().is_none());
+        assert!(!env.repo_is_managed_clone());
+
+        // No git, nothing to pull with.
+        env.repo = Some(env.clone_dest.clone());
+        env.git = false;
+        assert!(env.update_repo_request().is_none());
+
+        // And no repo at all is nothing to update.
+        let bare = HardwareEnv {
+            git: true,
+            ..Default::default()
+        };
+        assert!(
+            bare.update_repo_request().is_none(),
+            "an unset repo must not match an unset clone destination"
         );
     }
 

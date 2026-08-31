@@ -11,7 +11,7 @@
 
 use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, SharedString, WeakEntity, Window};
 use ui::prelude::*;
-use ui::{CommonAnimationExt, Disclosure, Tooltip};
+use ui::{Banner, CommonAnimationExt, Disclosure, Tooltip};
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};
 
@@ -59,6 +59,35 @@ pub(crate) fn page_layout(
         log_open: log_toggled
             .unwrap_or_else(|| progress.is_some_and(|progress| progress.verdict() == Some(false))),
     }
+}
+
+/// What the version-skew banner says.
+///
+/// Kept out of `render` for the same reason [`page_layout`] is: the
+/// wording IS the feature -- a hash pair on its own means nothing to the
+/// reader -- so it gets asserted without a window. `can_update` is
+/// whether the banner carries its own Update button; when it does not,
+/// the banner has to name the step the reader takes instead, or a dev
+/// checkout is left with a warning and no way out of it.
+///
+/// Two hashes cannot say WHICH side is ahead -- there is no ordering in
+/// them and this fork never asks git for one -- and the remedy differs
+/// by direction: a stale checkout needs a pull, but a checkout ahead of
+/// the emulator needs a newer ZedGG. So the text names the direction it
+/// cannot rule out rather than confidently prescribing the wrong fix.
+pub(crate) fn skew_banner_text(flash_short: &str, emu_short: &str, can_update: bool) -> String {
+    let mut text = format!(
+        "The flash repo is at {flash_short} but the emulator was built from {emu_short} \
+         -- the board may render differently than the emulator."
+    );
+    if !can_update {
+        text.push_str(" Update your checkout, then flash + rebuild gateware.");
+    }
+    text.push_str(
+        " If updating the GGO repo does not clear this, the checkout is ahead of the \
+         emulator and ZedGG itself needs rebuilding against it.",
+    );
+    text
 }
 
 /// `m:ss`, the only duration this page shows.
@@ -210,6 +239,27 @@ impl HardwareSetupItem {
             .into_any_element()
     }
 
+    /// The skew banner's remedy: pull the clone this fork manages. Only
+    /// ever built when [`crate::hardware::HardwareEnv::update_repo_request`]
+    /// has one, so a dev checkout never gets a button onto someone else's
+    /// working copy.
+    fn render_update_button(&self, busy: bool) -> AnyElement {
+        Button::new("ggo-hardware-update-repo", "Update GGO repo")
+            .disabled(busy)
+            .tooltip(Tooltip::text(
+                "Pull the latest GGO source into the managed clone \
+                 (git pull --ff-only), then flash + rebuild gateware to put \
+                 the new gateware on the board",
+            ))
+            .on_click({
+                let panel = self.panel.clone();
+                move |_, _window, cx| {
+                    panel.update(cx, |panel, cx| panel.update_ggo_repo(cx)).ok();
+                }
+            })
+            .into_any_element()
+    }
+
     /// One requirement's row: state, where it was found or why not, and
     /// what will be done about it.
     fn render_requirement(&self, requirement: &Requirement, cx: &Context<Self>) -> AnyElement {
@@ -281,7 +331,7 @@ impl Render for HardwareSetupItem {
                 .p_4()
                 .child(Label::new("The emulator pane is gone.").color(Color::Muted));
         };
-        let (requirements, ready, busy, status, log, progress, target) =
+        let (requirements, ready, busy, status, log, progress, target, skew, can_update) =
             panel.update(cx, |panel, _cx| {
                 let env = panel.hardware_env_cached();
                 let target = (
@@ -301,6 +351,8 @@ impl Render for HardwareSetupItem {
                         .flash_progress()
                         .map(|(progress, elapsed)| (progress.clone(), elapsed)),
                     target,
+                    env.version_skew(),
+                    env.update_repo_request().is_some(),
                 )
             });
         let layout = page_layout(
@@ -384,6 +436,28 @@ impl Render for HardwareSetupItem {
                         )
                     }),
             )
+            // Not a requirement row: nothing is missing, and flashing
+            // stays enabled. It is the one thing on this page the
+            // machine cannot detect as broken -- a board built from the
+            // wrong commit boots and runs, it just draws an older frame.
+            .when_some(skew, |el, (flash_short, emu_short)| {
+                el.child(
+                    Banner::new()
+                        .severity(Severity::Warning)
+                        .wrap_content(true)
+                        .child(
+                            Label::new(skew_banner_text(&flash_short, &emu_short, can_update))
+                                .size(LabelSize::Small),
+                        )
+                        // The remedy belongs in the warning that asked
+                        // for it, not in a button row three sections
+                        // down that says nothing about why it is there.
+                        .map(|banner| match can_update {
+                            true => banner.action_slot(self.render_update_button(busy)),
+                            false => banner,
+                        }),
+                )
+            })
             .when_some(
                 progress.as_ref().filter(|_| layout.timeline),
                 |el, (progress, elapsed)| {
@@ -739,6 +813,38 @@ mod tests {
             Some("/dev/ttyUSB0".to_string()),
             "the row names the port that will be used"
         );
+    }
+
+    /// The banner names both commits and does not scold a reader who has
+    /// a button for it; the reader who has none is told what to do.
+    #[test]
+    fn the_skew_banner_names_both_commits_and_the_way_out() {
+        let with_button = skew_banner_text("0123456789", "fedcba9876", true);
+        assert!(with_button.contains("0123456789") && with_button.contains("fedcba9876"));
+        assert!(
+            with_button.contains("render differently"),
+            "the consequence is the point: {with_button}"
+        );
+        assert!(
+            !with_button.contains("Update your checkout"),
+            "the button above is the way out: {with_button}"
+        );
+
+        let manual = skew_banner_text("0123456789", "fedcba9876", false);
+        assert!(
+            manual.contains("Update your checkout"),
+            "a dev checkout is the user's to move: {manual}"
+        );
+
+        // Two hashes do not say which side is ahead, and pulling a repo
+        // that is already ahead fixes nothing -- so the other direction
+        // is named rather than left as a dead end.
+        for text in [&with_button, &manual] {
+            assert!(
+                text.contains("ZedGG itself needs rebuilding"),
+                "the repo may be the newer side: {text}"
+            );
+        }
     }
 
     /// One page per workspace, and it opens the emulator pane it views.

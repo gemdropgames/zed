@@ -754,6 +754,37 @@ impl EmuPanel {
         );
     }
 
+    /// "Update GGO repo": pull the latest GGO source into the clone this
+    /// fork manages, so the board gets built from current source.
+    ///
+    /// This moves the clone toward its ORIGIN, not toward the emulator:
+    /// `emu_commit` was frozen when ZedGG itself was compiled, so a pull
+    /// closes the gap only when the clone is the side that is behind.
+    ///
+    /// Goes through the same runner the installs use, which streams into
+    /// the same console and re-probes when it ends -- so the page shows
+    /// the pulled commit without a Re-check.
+    pub fn update_ggo_repo(&mut self, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        self.invalidate_hardware();
+        let env = self.hardware_env_cached();
+        let Some(request) = env.update_repo_request() else {
+            self.report_failure(
+                "only the GGO clone ZedGG manages can be updated from here".to_string(),
+                cx,
+            );
+            return;
+        };
+        // Like a setup run, `git pull` announces none of `ggo-diag`'s
+        // phases, so it gets the console rather than a timeline.
+        self.start_board_run(
+            vec![request],
+            "updating the GGO repo".to_string(),
+            hardware::FlashProgress::steps(Vec::new()),
+            cx,
+        );
+    }
+
     /// Run `requests` in order through the streaming runner, feeding every
     /// line to the console and every recognised line to the status row.
     /// Stops at the first failure.
@@ -6275,6 +6306,8 @@ mod tests {
             git: true,
             clone_dest: root.join(".ggo/ggo"),
             home: root.to_path_buf(),
+            repo_commit: None,
+            emu_commit: None,
         }
     }
 
