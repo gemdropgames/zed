@@ -50,6 +50,11 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# GGO -- the USBDEVFS_CONNECT ioctl that reattaches the board's serial
+# driver after a flash tool detached it, see `hardware::reattach_kernel_driver`.
+libc.workspace = true
+
 [dev-dependencies]
 # The save-first half of "Emulate this world" can only be exercised with a
 # genuinely dirty world document in a real directory -- see that feature's

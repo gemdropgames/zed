@@ -7645,6 +7645,7 @@ dependencies = [
  "ggo_world_panel",
  "gpui",
  "image",
+ "libc",
  "log",
  "path",
  "project",

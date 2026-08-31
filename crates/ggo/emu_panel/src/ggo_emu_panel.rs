@@ -6269,6 +6269,7 @@ mod tests {
             repo: Some(root.join("repo")),
             emerald: None,
             ports: vec!["/dev/ttyUSB0".into()],
+            stuck_board: false,
             project: Some(root.join("game")),
             cargo: true,
             git: true,

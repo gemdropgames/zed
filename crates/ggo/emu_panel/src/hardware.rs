@@ -49,6 +49,9 @@ pub enum Missing {
     Emd,
     /// No serial device: nothing to flash or boot-verify against.
     Port,
+    /// The board is on the USB bus but its serial driver is detached and
+    /// the rescue could not bring it back -- replugging is what is left.
+    PortStuck,
     /// No project open, so there is no game to pack.
     Project,
 }
@@ -70,6 +73,10 @@ impl Missing {
             ),
             Missing::Port => format!(
                 "no serial device (looked in {SERIAL_BY_ID_DIR}) -- connect the board, or set {DIAG_TTY_ENV}"
+            ),
+            Missing::PortStuck => format!(
+                "the board is on USB but its serial driver is detached and could not \
+                 be reattached -- unplug and replug the board, or set {DIAG_TTY_ENV}"
             ),
             Missing::Project => "no game project is open".to_string(),
         }
@@ -96,6 +103,11 @@ pub struct HardwareEnv {
     pub emerald: Option<PathBuf>,
     /// Candidate serial devices, in scan order.
     pub ports: Vec<String>,
+    /// `ports` is empty but the board IS on the USB bus with its serial
+    /// driver detached, and the rescue did not bring a tty back. Changes
+    /// what the empty scan is called: "replug the board", not "connect
+    /// the board".
+    pub stuck_board: bool,
     /// The open game project, which is what gets packed.
     pub project: Option<PathBuf>,
     /// Can we install anything at all?
@@ -125,7 +137,11 @@ impl HardwareEnv {
             missing.push(Missing::Emd);
         }
         if self.ports.is_empty() {
-            missing.push(Missing::Port);
+            missing.push(if self.stuck_board {
+                Missing::PortStuck
+            } else {
+                Missing::Port
+            });
         }
         missing
     }
@@ -249,6 +265,9 @@ impl HardwareEnv {
                 found: self.ports.first().cloned(),
                 remedy: match self.ports.first() {
                     Some(_) => Remedy::Satisfied,
+                    None if self.stuck_board => {
+                        Remedy::Manual(Missing::PortStuck.label())
+                    }
                     // Not installable, so the row has to carry the whole
                     // remedy: the two things that actually cause an empty
                     // scan are an unplugged board and a user who is not in
@@ -776,6 +795,161 @@ pub fn resolve_on_path(bin: &str, path_env: Option<&str>) -> Option<String> {
         .then(|| bin.to_string())
 }
 
+// ------------------------------------------------- orphaned-board rescue
+//
+// The flash pipeline's `fujprog` talks to the FT231X over libusb, which
+// detaches the `ftdi_sio` kernel driver to claim the interface -- and on
+// exit nothing reattaches it. The board is still on the bus, but
+// `/dev/ttyUSB0` (and the `/dev/serial/by-id` symlink) are gone until the
+// user replugs, so the very next flash says "connect the board" at a board
+// that is connected. The rescue finds that state on sysfs and reattaches
+// the driver through usbfs's USBDEVFS_CONNECT ioctl -- the exact inverse
+// of what libusb did, and it needs no root: the udev `uaccess` ACL that
+// let fujprog claim the device covers the reattach too.
+
+/// Where Linux lists USB devices and their interfaces as siblings
+/// (`1-8` the device, `1-8:1.0` its interface).
+pub const USB_SYSFS_DIR: &str = "/sys/bus/usb/devices";
+
+/// The USB IDs the rescue recognizes as a board: the ULX3S's FT231X.
+const BOARD_USB_IDS: [(&str, &str); 1] = [("0403", "6015")];
+
+/// A board that is on the USB bus with no driver bound to its serial
+/// interface -- what a libusb flash tool leaves behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedBoard {
+    pub busnum: u32,
+    pub devnum: u32,
+    pub interface_number: i32,
+}
+
+/// A board on the bus whose serial interface has no driver, or `None`.
+/// Parametrized over the sysfs directory so it is testable against a
+/// fixture tree; an unreadable directory (any non-Linux host) is simply
+/// "no orphan".
+pub fn find_orphaned_board_at(usb_dir: &Path) -> Option<OrphanedBoard> {
+    let read = |dir: &Path, name: &str| -> Option<String> {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .map(|value| value.trim().to_string())
+    };
+    for entry in std::fs::read_dir(usb_dir).ok()?.flatten() {
+        let device = entry.path();
+        let (Some(vendor), Some(product)) = (read(&device, "idVendor"), read(&device, "idProduct"))
+        else {
+            continue;
+        };
+        if !BOARD_USB_IDS
+            .iter()
+            .any(|(v, p)| *v == vendor && *p == product)
+        {
+            continue;
+        }
+        let (Some(busnum), Some(devnum)) = (
+            read(&device, "busnum").and_then(|v| v.parse().ok()),
+            read(&device, "devnum").and_then(|v| v.parse().ok()),
+        ) else {
+            continue;
+        };
+        // Interfaces sit beside the device, named `<device>:<config>.<n>`.
+        let prefix = format!("{}:", entry.file_name().to_string_lossy());
+        for interface in std::fs::read_dir(usb_dir).ok()?.flatten() {
+            let name = interface.file_name().to_string_lossy().into_owned();
+            let Some(interface_number) = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(_, number)| number.parse().ok())
+            else {
+                continue;
+            };
+            if !interface.path().join("driver").exists() {
+                return Some(OrphanedBoard {
+                    busnum,
+                    devnum,
+                    interface_number,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Reattach the kernel serial driver to `board`'s interface, undoing a
+/// flash tool's libusb detach. Sends USBDEVFS_CONNECT through the usbfs
+/// device node, which is what `libusb_attach_kernel_driver` does.
+#[cfg(target_os = "linux")]
+pub fn reattach_kernel_driver(board: &OrphanedBoard) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct UsbdevfsIoctl {
+        ifno: libc::c_int,
+        ioctl_code: libc::c_int,
+        data: *mut libc::c_void,
+    }
+    // _IO('U', 23): USBDEVFS_CONNECT, carried inside _IOWR('U', 18,
+    // usbdevfs_ioctl) -- computed from the struct size rather than
+    // hardcoded so 32-bit pointers get the request number they need.
+    const USBDEVFS_CONNECT: libc::c_int = 0x5517;
+    let request: libc::c_ulong = (3 << 30)
+        | ((std::mem::size_of::<UsbdevfsIoctl>() as libc::c_ulong) << 16)
+        | (0x55 << 8)
+        | 18;
+    let node = format!("/dev/bus/usb/{:03}/{:03}", board.busnum, board.devnum);
+    let file = std::fs::OpenOptions::new().write(true).open(&node)?;
+    let mut command = UsbdevfsIoctl {
+        ifno: board.interface_number,
+        ioctl_code: USBDEVFS_CONNECT,
+        data: std::ptr::null_mut(),
+    };
+    if unsafe { libc::ioctl(file.as_raw_fd(), request, &mut command) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn reattach_kernel_driver(_board: &OrphanedBoard) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "kernel-driver reattach is Linux-only",
+    ))
+}
+
+/// The serial scan, with one rescue attempt when it comes up empty.
+/// Returns the ports and whether a board is stuck on the bus: present
+/// with its driver detached, and the rescue did not bring a tty back.
+pub fn scan_ports_rescuing() -> (Vec<String>, bool) {
+    let by_id = Path::new(SERIAL_BY_ID_DIR);
+    let dev = Path::new(crate::menu::DEV_DIR);
+    let scan = || crate::menu::scan_serial_ports_at(by_id, dev);
+    let ports = scan();
+    if !ports.is_empty() {
+        return (ports, false);
+    }
+    let Some(board) = find_orphaned_board_at(Path::new(USB_SYSFS_DIR)) else {
+        return (ports, false);
+    };
+    if let Err(error) = reattach_kernel_driver(&board) {
+        log::warn!(
+            "board on USB {:03}/{:03} has no serial driver, and reattaching failed: {error}",
+            board.busnum,
+            board.devnum
+        );
+        return (ports, true);
+    }
+    // The reattach kicks off the driver probe rather than completing it;
+    // the tty node follows within milliseconds. Bounded, so a probe on
+    // the foreground thread stalls a frame or two at worst, once.
+    for _ in 0..5 {
+        let ports = scan();
+        if !ports.is_empty() {
+            log::info!("reattached the board's serial driver: {}", ports[0]);
+            return (ports, false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (Vec::new(), true)
+}
+
 /// Probe this machine. `project` is the open game project (the worktree
 /// root), `home` is where a clone would land under. Every filesystem and
 /// env read the flash flow makes happens here, once.
@@ -806,15 +980,12 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         .and_then(|repo| repo.parent())
         .map(|parent| parent.join("emerald"))
         .filter(|emerald| emerald.join("crates/cli/Cargo.toml").is_file());
-    let ports = match std::env::var(DIAG_TTY_ENV)
+    let (ports, stuck_board) = match std::env::var(DIAG_TTY_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty())
     {
-        Some(tty) => vec![tty],
-        None => crate::menu::scan_serial_ports_at(
-            Path::new(SERIAL_BY_ID_DIR),
-            Path::new(crate::menu::DEV_DIR),
-        ),
+        Some(tty) => (vec![tty], false),
+        None => scan_ports_rescuing(),
     };
     HardwareEnv {
         diag_bin,
@@ -822,6 +993,7 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         repo,
         emerald,
         ports,
+        stuck_board,
         // The subject is an EMERALD project, not merely an open folder:
         // `ggo-diag --project` hands it to `emd pack-ggo`, which fails
         // deep inside itself on a folder that is not one.
@@ -845,6 +1017,7 @@ mod tests {
             repo: Some(PathBuf::from("/repo")),
             emerald: None,
             ports: vec!["/dev/ttyUSB0".into()],
+            stuck_board: false,
             project: Some(PathBuf::from("/game")),
             cargo: true,
             git: true,
@@ -1045,6 +1218,80 @@ mod tests {
         assert!(steps[0].request.args.contains(&"--git".to_string()));
         assert!(steps[0].request.args.contains(&GGO_DIAG_CRATE.to_string()));
         assert!(steps[1].request.args.contains(&EMD_CRATE.to_string()));
+    }
+
+    #[test]
+    fn a_driverless_board_on_the_bus_is_the_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let usb = dir.path();
+        let device = usb.join("1-8");
+        std::fs::create_dir_all(&device).unwrap();
+        for (name, value) in [
+            ("idVendor", "0403"),
+            ("idProduct", "6015"),
+            ("busnum", "1"),
+            ("devnum", "11"),
+        ] {
+            std::fs::write(device.join(name), format!("{value}\n")).unwrap();
+        }
+        let interface = usb.join("1-8:1.0");
+        std::fs::create_dir_all(&interface).unwrap();
+        assert_eq!(
+            find_orphaned_board_at(usb),
+            Some(OrphanedBoard {
+                busnum: 1,
+                devnum: 11,
+                interface_number: 0
+            }),
+        );
+
+        // Driver bound: a healthy board is not an orphan.
+        std::fs::write(interface.join("driver"), b"").unwrap();
+        assert_eq!(find_orphaned_board_at(usb), None);
+
+        // Some other vendor's driverless device is not the board.
+        let other = usb.join("1-9");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("idVendor"), "1b1c\n").unwrap();
+        std::fs::write(other.join("idProduct"), "0c29\n").unwrap();
+        std::fs::create_dir_all(usb.join("1-9:1.0")).unwrap();
+        assert_eq!(find_orphaned_board_at(usb), None);
+
+        // No sysfs at all (any non-Linux host): no orphan, no error.
+        assert_eq!(find_orphaned_board_at(&usb.join("gone")), None);
+    }
+
+    /// The whole rescue against a real board: detach its serial driver
+    /// first (`fujprog` does; so does usbfs USBDEVFS_DISCONNECT), then
+    /// run `cargo test -p ggo_emu_panel --lib -- --ignored rescued`.
+    #[test]
+    #[ignore = "needs the ULX3S attached"]
+    fn a_live_orphaned_board_is_rescued() {
+        let (ports, stuck) = scan_ports_rescuing();
+        assert!(!stuck, "board on the bus but the rescue failed");
+        assert!(!ports.is_empty(), "no board attached, or no tty came back");
+    }
+
+    #[test]
+    fn a_stuck_board_is_named_differently_from_a_missing_one() {
+        let mut env = ready_env();
+        env.ports.clear();
+        env.stuck_board = true;
+        assert_eq!(env.missing(), vec![Missing::PortStuck]);
+        assert!(!Missing::PortStuck.installable());
+        assert!(
+            Missing::PortStuck.label().contains("replug"),
+            "the remedy is a replug, not a connect: {}",
+            Missing::PortStuck.label()
+        );
+        let requirements = env.requirements();
+        let board_row = requirements
+            .last()
+            .expect("the board row is the last requirement");
+        match &board_row.remedy {
+            Remedy::Manual(what) => assert!(what.contains("replug"), "{what}"),
+            other => panic!("expected a manual remedy, got {other:?}"),
+        }
     }
 
     #[test]

@@ -265,7 +265,7 @@ pub fn diag_env(near: Option<&Path>) -> DiagEnv {
         .filter(|v| !v.trim().is_empty())
     {
         Some(tty) => vec![tty],
-        None => scan_serial_ports_at(Path::new(SERIAL_BY_ID_DIR), Path::new(DEV_DIR)),
+        None => crate::hardware::scan_ports_rescuing().0,
     };
     DiagEnv { bin, repo, ports }
 }
