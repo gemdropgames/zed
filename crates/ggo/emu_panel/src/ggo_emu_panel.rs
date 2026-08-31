@@ -190,14 +190,18 @@ pub fn init(cx: &mut App) {
     // explorer's "Emulate this world (cart)" entry uses, deferred because
     // that handler saves the world panel's doc and takes the workspace
     // itself -- neither may nest inside the caller's updates.
-    ggo_common::register_board_flasher(cx, |workspace, rebuild_gateware, window, cx| {
+    ggo_common::register_board_flasher(cx, |workspace, world, rebuild_gateware, window, cx| {
+        // Owned before the defer: the caller's world stem is borrowed
+        // from ITS document, which outlives neither this call nor the
+        // closure below.
+        let world = world.map(str::to_string);
         open_emu_item(workspace, window, cx, move |_emu, window, cx| {
             // DEFERRED, like the world emulator below: this handler runs
             // inside `workspace.update`, and `flash_to_board` ->
             // `refresh_root` reads that same leased entity. Doing it here
             // is the double-lease panic, not a style preference.
             cx.defer_in(window, move |emu, window, cx| {
-                emu.flash_to_board_with(rebuild_gateware, window, cx)
+                emu.flash_to_board_with(world.as_deref(), rebuild_gateware, window, cx)
             });
         })
     });
@@ -495,6 +499,21 @@ pub struct EmuPanel {
     last_flash: Option<(hardware::FlashProgress, Duration)>,
     /// The last hardware probe. `None` re-probes on the next ask.
     hardware: Option<hardware::HardwareEnv>,
+    /// The world stem (`worlds/arena`) the next flash bakes in as the
+    /// cart's boot world.
+    ///
+    /// Remembered rather than passed per press because the flash surfaces
+    /// are not all next to a world: the world panel's menu names one, but
+    /// the hardware page's buttons are a tab away from any document and
+    /// must re-flash the SAME world -- a page that silently fell back to
+    /// the project's `default_world` is exactly the divergence this
+    /// feature exists to end. Set by "Emulate this world" (once its build
+    /// has validated) and by the world panel's flash path, and cleared
+    /// when the project root changes out from under it. Read through
+    /// [`Self::flash_world`], never directly: `None` here still falls back
+    /// to the world panel's open document before it gives up and leaves
+    /// `default_world` alone.
+    flash_world: Option<String>,
 }
 
 /// A board run in progress: what stage it reached, and the task whose
@@ -606,6 +625,7 @@ impl EmuPanel {
             flash: None,
             last_flash: None,
             hardware: None,
+            flash_world: None,
         }
     }
 
@@ -646,31 +666,75 @@ impl EmuPanel {
         self.flash.is_some()
     }
 
+    /// The world the next flash will boot: the one this panel remembers,
+    /// else whatever world the docked world panel currently has open.
+    ///
+    /// The fallback is what stops the two flash buttons from disagreeing.
+    /// This panel only learns a world by being TOLD one (an emulate, or
+    /// the world panel's own flash button), so without it a user who has
+    /// a world open but has pressed neither gets `default_world` from the
+    /// emulator's toolbar and the open world from the world panel's
+    /// button an inch away -- the exact divergence this feature removes.
+    /// Reading another entity here is safe: a child view's `render` is
+    /// invoked from element layout, after the workspace's own render has
+    /// returned, so nothing above is leased.
+    pub(crate) fn flash_world(&self, cx: &App) -> Option<String> {
+        if let Some(world) = self.flash_world.clone() {
+            return Some(world);
+        }
+        let workspace = self.workspace.as_ref()?.upgrade()?;
+        let world_panel = workspace
+            .read(cx)
+            .panel::<ggo_world_panel::WorldPanel>(cx)?;
+        world_panel.read(cx).open_world_stem()
+    }
+
+    /// Remember the world a flash should boot, so the flash surfaces that
+    /// are a tab away from any document (the hardware page's buttons)
+    /// reach the same one.
+    pub(crate) fn remember_flash_world(&mut self, world: &str) {
+        self.flash_world = Some(world.to_string());
+    }
+
     /// The flash-and-run button: flash the open project to the board and
     /// boot it, or -- while one is in flight -- cancel.
     pub fn flash_to_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.flash_to_board_with(false, window, cx);
+        self.flash_to_board_with(None, false, window, cx);
     }
 
-    /// [`Self::flash_to_board`], with the choice of rebuilding the
-    /// gateware: `rebuild_gateware` drops `--skip-pnr` so the run
-    /// place-and-routes the SoC and flashes a fresh bitstream instead of
-    /// the cached one -- what a pulled GGO repo with PPU changes needs.
+    /// [`Self::flash_to_board`], with the world to boot and the choice of
+    /// rebuilding the gateware.
+    ///
+    /// `world` is the stem the PRESS names -- the world panel's button
+    /// knows one, this panel's own surfaces do not and pass `None`, which
+    /// leaves [`Self::flash_world`] to answer. `rebuild_gateware` drops
+    /// `--skip-pnr` so the run place-and-routes the SoC and flashes a
+    /// fresh bitstream instead of the cached one -- what a pulled GGO repo
+    /// with PPU changes needs.
     pub fn flash_to_board_with(
         &mut self,
+        world: Option<&str>,
         rebuild_gateware: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(flash) = self.flash.take() {
             // Cancelling is not failing: the timeline stays as it was,
-            // with the phase it got to still marked running.
+            // with the phase it got to still marked running. Before the
+            // world is remembered, too: this press started nothing, so it
+            // has no business changing what the next one boots.
             let elapsed = flash.started.elapsed();
             self.last_flash = Some((flash.progress, elapsed));
             self.status = Some("flash cancelled".to_string());
             self.status_is_error = false;
             cx.notify();
             return;
+        }
+        if let Some(world) = world {
+            // Remembered, not merely used: the hardware page this opens
+            // has flash buttons of its own, and they have to reach the
+            // same world.
+            self.remember_flash_world(world);
         }
         self.refresh_root(cx);
         self.invalidate_hardware();
@@ -681,18 +745,40 @@ impl EmuPanel {
         // status row can carry neither, and "where did my flash go"
         // should have one answer.
         self.open_hardware_page(window, cx);
-        if let Ok(request) = hardware::flash_request(&env, rebuild_gateware) {
-            self.start_board_run(
-                vec![request],
-                "flashing".to_string(),
-                if rebuild_gateware {
-                    hardware::FlashProgress::flash_full()
-                } else {
-                    hardware::FlashProgress::flash()
-                },
-                cx,
-            );
+        // The gap is the page's to explain, not a status line's -- see
+        // above; [`Self::flash_plan`]'s error names it either way.
+        if let Ok((request, what, progress)) = self.flash_plan(&env, rebuild_gateware, cx) {
+            self.start_board_run(vec![request], what, progress, cx);
         }
+    }
+
+    /// The whole shape of the flash `env` would run: what to spawn, what
+    /// the status row and timeline call it, and which phases to expect.
+    ///
+    /// Split out of [`Self::flash_to_board_with`] so the wiring that
+    /// actually matters -- that the remembered world reaches the child's
+    /// argv AND the line the user reads -- is assertable without a board,
+    /// a window or a spawn. The caller is then thin enough to read.
+    fn flash_plan(
+        &self,
+        env: &hardware::HardwareEnv,
+        rebuild_gateware: bool,
+        cx: &App,
+    ) -> Result<(ggo_common::ProcRequest, String, hardware::FlashProgress), String> {
+        let world = self.flash_world(cx);
+        let request = hardware::flash_request(env, world.as_deref(), rebuild_gateware)?;
+        let what = match &world {
+            // The timeline's own header: which world is on its way to the
+            // board is the one thing a flash cannot show.
+            Some(world) => format!("flashing {world}"),
+            None => "flashing".to_string(),
+        };
+        let progress = if rebuild_gateware {
+            hardware::FlashProgress::flash_full()
+        } else {
+            hardware::FlashProgress::flash()
+        };
+        Ok((request, what, progress))
     }
 
     /// Show the hardware setup page.
@@ -1064,12 +1150,21 @@ impl EmuPanel {
     /// workspace entity); see the deferrals in `set_active` and in
     /// [`Self::open_rel_path`].
     fn refresh_root(&mut self, cx: &mut Context<Self>) {
+        let previous_root = self.project_root.clone();
         self.project_root = self.root_override.clone().or_else(|| {
             let workspace = self.workspace.as_ref()?.upgrade()?;
             let project = workspace.read(cx).project().clone();
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
+        // A different project is a different `worlds/` tree, so a stem
+        // remembered from the old one would flash a world that no longer
+        // exists (or, worse, a same-named world in another game). Only a
+        // CHANGE clears it: the first discovery is `None -> Some`, which
+        // happens on the way into the very flash that just named a world.
+        if previous_root.is_some() && previous_root != self.project_root {
+            self.flash_world = None;
+        }
         if let Some(root) = self.project_root.clone() {
             let panel = cx.weak_entity();
             let window = self.remote_window;
@@ -1479,6 +1574,11 @@ impl EmuPanel {
         }
         let out = out_dir.join(menu::pack_out_name(&stem));
         let cart = menu::cart_selection(&root, &out);
+        // Only now, with every check past: a flash pressed after this
+        // should put the world being emulated on the board rather than the
+        // manifest's `default_world`, but a world that could not even be
+        // built is not one to aim a 20-minute place-and-route at.
+        self.remember_flash_world(&stem);
         Some((
             ggo_common::ProcRequest::emd(&project_dir, menu::world_pack_args(&out, &stem)),
             self.proc_runner.clone(),
@@ -2426,9 +2526,7 @@ impl EmuPanel {
                         .toggle_state(true)
                         .tooltip(Tooltip::text("Cancel the flash"))
                         .on_click(
-                            cx.listener(|this, _event, window, cx| {
-                                this.flash_to_board(window, cx)
-                            }),
+                            cx.listener(|this, _event, window, cx| this.flash_to_board(window, cx)),
                         )
                         .into_any_element()
                 } else {
@@ -2441,7 +2539,10 @@ impl EmuPanel {
                         .trigger(
                             IconButton::new("ggo-emu-flash", IconName::GgoFlashRun)
                                 .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Flash this project to the board")),
+                                .tooltip(Tooltip::text(ggo_common::flash_tooltip(
+                                    "Flash this project to the board",
+                                    self.flash_world(cx).as_deref(),
+                                ))),
                         )
                         .menu(move |window, cx| {
                             let weak = weak.clone();
@@ -2457,7 +2558,9 @@ impl EmuPanel {
                                         move |window, cx| {
                                             flash
                                                 .update(cx, |this, cx| {
-                                                    this.flash_to_board_with(false, window, cx)
+                                                    this.flash_to_board_with(
+                                                        None, false, window, cx,
+                                                    )
                                                 })
                                                 .ok();
                                         },
@@ -2468,7 +2571,7 @@ impl EmuPanel {
                                         move |window, cx| {
                                             rebuild
                                                 .update(cx, |this, cx| {
-                                                    this.flash_to_board_with(true, window, cx)
+                                                    this.flash_to_board_with(None, true, window, cx)
                                                 })
                                                 .ok();
                                         },
@@ -4927,11 +5030,16 @@ mod tests {
             calls[0].args.iter().any(|a| a == "worlds/main"),
             "the viewed world must be baked in as the boot world"
         );
-        panel.update(cx, |panel, _cx| {
+        panel.update(cx, |panel, cx| {
             assert_eq!(
                 panel.selected.as_deref(),
                 Some("target/ggo-emulate/worlds-main.ggo"),
                 "the built cartridge becomes the selection"
+            );
+            assert_eq!(
+                panel.flash_world(cx).as_deref(),
+                Some("worlds/main"),
+                "a flash pressed after an emulate puts THAT world on the board"
             );
         });
     }
@@ -4989,9 +5097,15 @@ mod tests {
         cx.run_until_parked();
 
         assert!(calls.lock().unwrap().is_empty(), "nothing was spawned");
-        panel.update(cx, |panel, _cx| {
+        panel.update(cx, |panel, cx| {
             let status = panel.status.clone().expect("a status was reported");
             assert!(status.contains("emerald.toml"), "{status}");
+            assert_eq!(
+                panel.flash_world(cx),
+                None,
+                "a world that could not even be built is not one to aim a \
+                 flash at"
+            );
         });
     }
 
@@ -6326,7 +6440,8 @@ mod tests {
             true,
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6373,7 +6488,8 @@ mod tests {
             true,
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6417,7 +6533,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6448,7 +6565,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request.clone()],
@@ -6484,7 +6602,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: FAIL"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6516,7 +6635,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6547,7 +6667,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6556,9 +6677,15 @@ mod tests {
                 cx,
             );
             assert!(panel.is_flashing());
-            panel.flash_to_board(window, cx);
+            panel.flash_to_board_with(Some("worlds/arena"), false, window, cx);
             assert!(!panel.is_flashing(), "the second press cancelled");
             assert_eq!(panel.status.as_deref(), Some("flash cancelled"));
+            assert_eq!(
+                panel.flash_world(cx),
+                None,
+                "a press that only cancelled started nothing, so it has no \
+                 business changing what the next flash boots"
+            );
         });
     }
 
@@ -6666,7 +6793,7 @@ mod tests {
         let (workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::flash_to_board(workspace, false, window, cx)
+            ggo_common::flash_to_board(workspace, None, false, window, cx)
         });
         assert!(claimed, "init registers a board flasher");
         // The deferred `flash_to_board` runs here; before the fix this
@@ -6695,6 +6822,118 @@ mod tests {
                 1,
                 "a missing prerequisite opens the setup page, not a status line"
             );
+        });
+    }
+
+    /// The world the world panel flashed is REMEMBERED, because the
+    /// hardware page the flash opens has flash buttons of its own and
+    /// they must reach the same world -- a page that fell back to the
+    /// project's `default_world` is the divergence this feature ends.
+    #[gpui::test]
+    async fn test_the_registered_flasher_remembers_the_world_for_the_hardware_page(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::flash_to_board(workspace, Some("worlds/arena"), false, window, cx)
+        });
+        cx.run_until_parked();
+
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<EmulatorItem>(cx)
+                .next()
+                .expect("the flasher opened the emulator tab")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.flash_world(cx).as_deref(), Some("worlds/arena"));
+            // The plan the hardware page's own buttons take -- they name
+            // no world of their own, so this is the whole of what makes
+            // them re-flash the same one.
+            let (request, what, _progress) = panel
+                .flash_plan(&ready_hardware(dir.path()), false, cx)
+                .expect("a ready machine flashes");
+            assert!(
+                request
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--world".to_string(), "worlds/arena".to_string()]),
+                "the page re-flashes the same world: {:?}",
+                request.args
+            );
+            assert_eq!(
+                what, "flashing worlds/arena",
+                "and the timeline says which world is on its way"
+            );
+        });
+
+        // A different project is a different `worlds/` tree: the stem must
+        // not survive into it.
+        let other = tempfile::tempdir().unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.root_override = Some(other.path().to_path_buf());
+            panel.refresh_root(cx);
+            assert_eq!(
+                panel.flash_world(cx),
+                None,
+                "a root change drops the world remembered from the old tree"
+            );
+            let (request, what, _progress) = panel
+                .flash_plan(&ready_hardware(dir.path()), false, cx)
+                .expect("a ready machine flashes");
+            assert!(
+                !request.args.contains(&"--world".to_string()),
+                "and the run falls back to the project's default_world: {:?}",
+                request.args
+            );
+            assert_eq!(what, "flashing");
+        });
+    }
+
+    /// A world open in the world panel is the world the user is working
+    /// on, whether or not they pressed anything: the emulator's own flash
+    /// surfaces fall back to it rather than silently booting
+    /// `default_world` while the world panel's button an inch away names
+    /// the open world.
+    #[gpui::test]
+    async fn test_the_flash_falls_back_to_the_world_panels_open_world(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_world_fixture(dir.path());
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.flash_world(cx), None, "nothing open, nothing to boot");
+        });
+
+        dirty_world_panel(&workspace, cx, dir.path());
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.flash_world(cx).as_deref(),
+                Some("worlds/main"),
+                "the open document answers when this panel has been told nothing"
+            );
+            let (request, what, _progress) = panel
+                .flash_plan(&ready_hardware(dir.path()), false, cx)
+                .expect("a ready machine flashes");
+            assert!(
+                request
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--world".to_string(), "worlds/main".to_string()]),
+                "{:?}",
+                request.args
+            );
+            assert_eq!(what, "flashing worlds/main");
+
+            // A world this panel WAS told about wins: it is the one the
+            // user last aimed at hardware.
+            panel.remember_flash_world("worlds/arena");
+            assert_eq!(panel.flash_world(cx).as_deref(), Some("worlds/arena"));
         });
     }
 
@@ -6728,7 +6967,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request = hardware::flash_request(&ready_hardware(dir.path()), false).expect("ready");
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],

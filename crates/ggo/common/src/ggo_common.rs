@@ -453,7 +453,14 @@ pub fn run_cart(
 /// already depends on `ggo_world_panel`, so the world panel's flash
 /// button cannot call it directly. The `bool` is `rebuild_gateware`:
 /// place-and-route a fresh bitstream instead of flashing the cached one.
-pub type BoardFlasher = fn(&mut Workspace, bool, &mut Window, &mut Context<Workspace>) -> bool;
+///
+/// The `Option<&str>` is the world stem to boot (`worlds/arena`), which
+/// is the whole point of flashing from the IDE: without it the cart boots
+/// the project's `default_world` and the board shows a different world
+/// than the one being edited. `None` keeps that default -- the honest
+/// answer for a caller that has no world open.
+pub type BoardFlasher =
+    fn(&mut Workspace, Option<&str>, bool, &mut Window, &mut Context<Workspace>) -> bool;
 
 #[derive(Default)]
 struct BoardFlashers(Vec<BoardFlasher>);
@@ -465,11 +472,13 @@ pub fn register_board_flasher(cx: &mut App, flasher: BoardFlasher) {
     cx.default_global::<BoardFlashers>().0.push(flasher);
 }
 
-/// Ask the registered flasher to put the open project on the board.
-/// `false` means no emulator pane exists in this build -- reported, not
-/// swallowed, exactly as [`run_cart`] explains.
+/// Ask the registered flasher to put the open project on the board,
+/// booting `world` (a stem like `worlds/arena`) rather than the project's
+/// `default_world`. `false` means no emulator pane exists in this build
+/// -- reported, not swallowed, exactly as [`run_cart`] explains.
 pub fn flash_to_board(
     workspace: &mut Workspace,
+    world: Option<&str>,
     rebuild_gateware: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
@@ -480,7 +489,23 @@ pub fn flash_to_board(
     };
     flashers
         .iter()
-        .any(|flash| flash(workspace, rebuild_gateware, window, cx))
+        .any(|flash| flash(workspace, world, rebuild_gateware, window, cx))
+}
+
+/// A flash button's tooltip: `base`, plus which world the board will boot
+/// when one is known.
+///
+/// Lives here rather than in either panel because BOTH flash surfaces
+/// (the world panel's menu and the emulator's toolbar/hardware page) have
+/// to say the same thing, and `ggo_world_panel` cannot see
+/// `ggo_emu_panel`. Silent when no world is known: the cart then boots
+/// whatever `default_world` the project names, which this fork has no
+/// business guessing at in a tooltip.
+pub fn flash_tooltip(base: &str, world: Option<&str>) -> String {
+    match world {
+        Some(world) => format!("{base} — boots {world}"),
+        None => base.to_string(),
+    }
 }
 
 /// A handler that can build and boot a world into an emulator pane. Same
@@ -1090,6 +1115,22 @@ pub fn pack_out_name(world_stem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flash button says which world the board will boot -- the answer
+    /// a flash cannot show until it has already booted the wrong one.
+    #[test]
+    fn a_flash_tooltip_names_the_world_when_there_is_one() {
+        assert_eq!(
+            flash_tooltip("Flash this project to the board", Some("worlds/arena")),
+            "Flash this project to the board — boots worlds/arena"
+        );
+        assert_eq!(
+            flash_tooltip("Flash this project to the board", None),
+            "Flash this project to the board",
+            "with no world named, the project's default_world stands and \
+             the tooltip does not guess at it"
+        );
+    }
 
     /// The streaming runner hands every line over as it arrives AND
     /// returns the same capture the blocking one would.

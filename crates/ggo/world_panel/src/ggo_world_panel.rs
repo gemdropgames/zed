@@ -3187,16 +3187,41 @@ impl WorldPanel {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
+        // The world THIS panel has open is what "flash the current world"
+        // means; without it the cart boots the manifest's `default_world`
+        // and the board shows a world nobody asked for.
+        let world = self.open_world_stem();
         window.defer(cx, move |window, cx| {
             let Some(workspace) = workspace.upgrade() else {
                 return;
             };
             workspace.update(cx, |workspace, cx| {
-                if !ggo_common::flash_to_board(workspace, rebuild_gateware, window, cx) {
+                if !ggo_common::flash_to_board(
+                    workspace,
+                    world.as_deref(),
+                    rebuild_gateware,
+                    window,
+                    cx,
+                ) {
                     log::warn!("no emulator pane is available to flash this project");
                 }
             });
         });
+    }
+
+    /// The open document's world stem (`worlds/arena`), by the same
+    /// [`world_stem`] rule the Emulate and popout builds use -- there is
+    /// exactly one `worlds/`-splitting rule in this fork and this is not a
+    /// second one. `None` while no world is open.
+    ///
+    /// Public because the emulator panel's own flash surfaces fall back to
+    /// it: a world open HERE is the world the user is working on, whether
+    /// or not they pressed anything in this panel.
+    pub fn open_world_stem(&self) -> Option<String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        world_stem(&open.source_rel)
     }
 
     fn emulate_popout_impl(&mut self, cx: &mut Context<Self>) {
@@ -4128,7 +4153,10 @@ impl WorldPanel {
                     .trigger(
                         IconButton::new("ggo-world-flash", IconName::GgoFlashRun)
                             .icon_size(IconSize::Small)
-                            .tooltip(ui::Tooltip::text("Flash this project to the board")),
+                            .tooltip(ui::Tooltip::text(ggo_common::flash_tooltip(
+                                "Flash this project to the board",
+                                self.open_world_stem().as_deref(),
+                            ))),
                     )
                     .menu({
                         let weak = cx.weak_entity();
@@ -9848,26 +9876,33 @@ mod tests {
 
     thread_local! {
         static FLASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static FLASHED_WORLD: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     fn recording_flasher(
         _workspace: &mut Workspace,
+        world: Option<&str>,
         _rebuild_gateware: bool,
         _window: &mut Window,
         _cx: &mut Context<Workspace>,
     ) -> bool {
         FLASHED.with(|f| f.set(f.get() + 1));
+        FLASHED_WORLD.with(|w| *w.borrow_mut() = world.map(str::to_string));
         true
     }
 
     /// The toolbar's flash button reaches the emulator pane through the
     /// registry, never by naming it: `ggo_emu_panel` depends on this
-    /// crate, so the edge only goes one way.
+    /// crate, so the edge only goes one way -- and it names the world this
+    /// panel has open, so the board boots what is being edited instead of
+    /// the manifest's `default_world`.
     #[gpui::test]
     async fn test_the_flash_button_routes_through_the_board_flasher(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let project = routed_project(cx, dir.path(), true).await;
         FLASHED.with(|f| f.set(0));
+        FLASHED_WORLD.with(|w| *w.borrow_mut() = None);
         cx.update(|cx| ggo_common::register_board_flasher(cx, recording_flasher));
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -9878,12 +9913,31 @@ mod tests {
                 .expect("init() adds the panel")
         });
 
+        // Nothing open yet: no world to name, and the project's own
+        // default stands.
         panel.update_in(cx, |panel, window, cx| panel.flash_impl(false, window, cx));
         cx.run_until_parked();
         assert_eq!(
             FLASHED.with(|f| f.get()),
             1,
             "the button reached the registered flasher"
+        );
+        assert_eq!(FLASHED_WORLD.with(|w| w.borrow().clone()), None);
+
+        // `routed_project` wrote the fixture into `dir`; the workspace's
+        // worktree is a fake fs, so the load reads through the override.
+        panel.update(cx, |panel, cx| {
+            panel.root_override = Some(dir.path().to_path_buf());
+            panel.refresh_worlds(cx);
+            panel.load_rel_path("worlds/test.toml", cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.flash_impl(false, window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            FLASHED_WORLD.with(|w| w.borrow().clone()),
+            Some("worlds/test".to_string()),
+            "the open document's stem is what the board boots"
         );
     }
 

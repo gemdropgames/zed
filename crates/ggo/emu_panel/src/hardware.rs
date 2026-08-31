@@ -350,13 +350,32 @@ impl HardwareEnv {
 /// bitstream instead of the cached one. `--project` implies
 /// `--provision`, so the card image is rewritten with the freshly packed
 /// game every run.
-pub fn flash_args(project: &Path, tty: &str, rebuild_gateware: bool) -> Vec<String> {
+///
+/// `world` is the stem (`worlds/arena`) the packed cart should boot,
+/// overriding the project's `default_world`. Without it the board boots
+/// whatever world the manifest names -- which is never the one the IDE
+/// was just editing, and reads on hardware as "my world is broken".
+///
+/// `--world` needs a `ggo-diag` built from a revision that HAS the flag:
+/// an older binary on `PATH` exits 2 on the unknown argument rather than
+/// ignoring it, and the transcript on the hardware page is where that
+/// shows up. The remedy is the page's own install/update buttons.
+pub fn flash_args(
+    project: &Path,
+    tty: &str,
+    world: Option<&str>,
+    rebuild_gateware: bool,
+) -> Vec<String> {
     let mut args = vec![
         "--project".to_string(),
         project.to_string_lossy().into_owned(),
         "--tty".to_string(),
         tty.to_string(),
     ];
+    if let Some(world) = world {
+        args.push("--world".to_string());
+        args.push(world.to_string());
+    }
     if !rebuild_gateware {
         args.push("--skip-pnr".to_string());
     }
@@ -368,7 +387,11 @@ pub fn flash_args(project: &Path, tty: &str, rebuild_gateware: bool) -> Vec<Stri
 /// `cwd` is the GGO repo: that CLI finds the repo by walking up from its
 /// working directory, and this fork's worktree is the user's GAME
 /// project, not the repo.
-pub fn flash_request(env: &HardwareEnv, rebuild_gateware: bool) -> Result<ProcRequest, String> {
+pub fn flash_request(
+    env: &HardwareEnv,
+    world: Option<&str>,
+    rebuild_gateware: bool,
+) -> Result<ProcRequest, String> {
     let missing = env.missing();
     if !missing.is_empty() {
         return Err(format!(
@@ -391,7 +414,7 @@ pub fn flash_request(env: &HardwareEnv, rebuild_gateware: bool) -> Result<ProcRe
     Ok(ProcRequest::new(
         bin,
         repo,
-        flash_args(&project, &tty, rebuild_gateware),
+        flash_args(&project, &tty, world, rebuild_gateware),
     ))
 }
 
@@ -1208,7 +1231,7 @@ mod tests {
     #[test]
     fn flash_args_pack_the_project_and_skip_place_and_route() {
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", false),
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", None, false),
             vec!["--project", "/game", "--tty", "/dev/ttyUSB0", "--skip-pnr"],
         );
     }
@@ -1216,14 +1239,54 @@ mod tests {
     #[test]
     fn a_gateware_rebuild_does_not_skip_place_and_route() {
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", true),
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", None, true),
             vec!["--project", "/game", "--tty", "/dev/ttyUSB0"],
+        );
+    }
+
+    /// The named world overrides the project's `default_world`, and sits
+    /// between the tty and the place-and-route switch in both shapes of
+    /// the run.
+    #[test]
+    fn a_named_world_is_what_the_board_boots() {
+        assert_eq!(
+            flash_args(
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                Some("worlds/arena"),
+                false
+            ),
+            vec![
+                "--project",
+                "/game",
+                "--tty",
+                "/dev/ttyUSB0",
+                "--world",
+                "worlds/arena",
+                "--skip-pnr"
+            ],
+        );
+        assert_eq!(
+            flash_args(
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                Some("worlds/arena"),
+                true
+            ),
+            vec![
+                "--project",
+                "/game",
+                "--tty",
+                "/dev/ttyUSB0",
+                "--world",
+                "worlds/arena"
+            ],
         );
     }
 
     #[test]
     fn flash_request_runs_in_the_repo_not_the_project() {
-        let request = flash_request(&ready_env(), false).expect("a ready machine flashes");
+        let request = flash_request(&ready_env(), None, false).expect("a ready machine flashes");
         assert_eq!(request.bin, "ggo-diag");
         assert_eq!(
             request.cwd,
@@ -1231,6 +1294,27 @@ mod tests {
             "ggo-diag walks up from its cwd to find the repo"
         );
         assert!(request.args.contains(&"/game".to_string()));
+        assert!(
+            !request.args.contains(&"--world".to_string()),
+            "no world named means the project's default_world stands: {:?}",
+            request.args
+        );
+    }
+
+    /// The world reaches the child, not just [`flash_args`].
+    #[test]
+    fn flash_request_carries_the_world_through() {
+        let request = flash_request(&ready_env(), Some("worlds/arena"), false)
+            .expect("a ready machine flashes");
+        assert_eq!(
+            request.args,
+            flash_args(
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                Some("worlds/arena"),
+                false
+            ),
+        );
     }
 
     #[test]
@@ -1246,7 +1330,7 @@ mod tests {
                 Missing::Port
             ]
         );
-        let error = flash_request(&env, false).expect_err("an empty machine cannot flash");
+        let error = flash_request(&env, None, false).expect_err("an empty machine cannot flash");
         for missing in env.missing() {
             assert!(
                 error.contains(&missing.label()),

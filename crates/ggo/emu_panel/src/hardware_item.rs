@@ -90,6 +90,29 @@ pub(crate) fn skew_banner_text(flash_short: &str, emu_short: &str, can_update: b
     text
 }
 
+/// What a flash button on this page promises, given the machine's state
+/// and the world the run would boot.
+///
+/// Kept out of `render` for the same reason [`skew_banner_text`] is: the
+/// world named here is the answer to "which world will the board show",
+/// which cost a day of debugging when the buttons could not say it, so it
+/// gets asserted without a window. A busy or unready button describes
+/// what pressing it does INSTEAD, so neither names a world.
+pub(crate) fn flash_button_tooltip(
+    busy: bool,
+    ready: bool,
+    base: &str,
+    world: Option<&str>,
+) -> String {
+    if busy {
+        return "Stop the run and kill the child process".to_string();
+    }
+    if !ready {
+        return "Still missing something above".to_string();
+    }
+    ggo_common::flash_tooltip(base, world)
+}
+
 /// `m:ss`, the only duration this page shows.
 fn elapsed_text(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
@@ -331,8 +354,8 @@ impl Render for HardwareSetupItem {
                 .p_4()
                 .child(Label::new("The emulator pane is gone.").color(Color::Muted));
         };
-        let (requirements, ready, busy, status, log, progress, target, skew, can_update) =
-            panel.update(cx, |panel, _cx| {
+        let (requirements, ready, busy, status, log, progress, target, skew, can_update, world) =
+            panel.update(cx, |panel, cx| {
                 let env = panel.hardware_env_cached();
                 let target = (
                     env.project
@@ -353,6 +376,7 @@ impl Render for HardwareSetupItem {
                     target,
                     env.version_skew(),
                     env.update_repo_request().is_some(),
+                    panel.flash_world(cx),
                 )
             });
         let layout = page_layout(
@@ -497,13 +521,12 @@ impl Render for HardwareSetupItem {
                             },
                         )
                         .disabled(!busy && !ready)
-                        .tooltip(Tooltip::text(if busy {
-                            "Stop the run and kill the child process"
-                        } else if ready {
-                            "Flash this project to the board and run it"
-                        } else {
-                            "Still missing something above"
-                        }))
+                        .tooltip(Tooltip::text(flash_button_tooltip(
+                            busy,
+                            ready,
+                            "Flash this project to the board and run it",
+                            world.as_deref(),
+                        )))
                         .on_click({
                             let panel = self.panel.clone();
                             move |_, window, cx| {
@@ -519,18 +542,19 @@ impl Render for HardwareSetupItem {
                         el.child(
                             Button::new("ggo-hardware-flash-full", "Flash + rebuild gateware")
                                 .disabled(!ready)
-                                .tooltip(Tooltip::text(if ready {
+                                .tooltip(Tooltip::text(flash_button_tooltip(
+                                    busy,
+                                    ready,
                                     "Place-and-route the SoC (~20 min), flash the fresh \
-                                     bitstream, then run this project"
-                                } else {
-                                    "Still missing something above"
-                                }))
+                                     bitstream, then run this project",
+                                    world.as_deref(),
+                                )))
                                 .on_click({
                                     let panel = self.panel.clone();
                                     move |_, window, cx| {
                                         panel
                                             .update(cx, |panel, cx| {
-                                                panel.flash_to_board_with(true, window, cx)
+                                                panel.flash_to_board_with(None, true, window, cx)
                                             })
                                             .ok();
                                     }
@@ -671,6 +695,32 @@ mod tests {
         assert_eq!(elapsed_text(Duration::from_secs(9)), "0:09");
         assert_eq!(elapsed_text(Duration::from_secs(65)), "1:05");
         assert_eq!(elapsed_text(Duration::from_secs(600)), "10:00");
+    }
+
+    /// The flash buttons say which world the board will boot; a button
+    /// that would do something else entirely says that instead.
+    #[test]
+    fn the_flash_buttons_name_the_world_they_will_boot() {
+        let base = "Flash this project to the board and run it";
+        assert_eq!(
+            flash_button_tooltip(false, true, base, Some("worlds/arena")),
+            format!("{base} — boots worlds/arena")
+        );
+        assert_eq!(
+            flash_button_tooltip(false, true, base, None),
+            base,
+            "no world remembered leaves the project's default_world"
+        );
+        assert_eq!(
+            flash_button_tooltip(true, true, base, Some("worlds/arena")),
+            "Stop the run and kill the child process",
+            "the button cancels while a run is in flight"
+        );
+        assert_eq!(
+            flash_button_tooltip(false, false, base, Some("worlds/arena")),
+            "Still missing something above",
+            "naming a world a disabled button cannot flash is noise"
+        );
     }
 
     /// A machine that cannot flash yet gets the checklist, not a
