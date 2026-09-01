@@ -42,7 +42,10 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `hw_flash { world?, rebuild_gateware? }` | flash a world to the BOARD and run it; returns once the flash STARTS |
 | `hw_flash_status` | snapshot: `{ active, phase, verdict, diag_run_id, perf_run_id }` |
 | `hw_flash_wait { timeout_s? }` | poll until the flash reaches a verdict (default 1800s) |
-| `perf_report { run }` | paste-ready summary of one perf run from `~/.ggo/ggo_ide.db` |
+| `list_ggo_reports { limit? }` | perf runs in `~/.ggo/ggo_ide.db`, newest first, with ggo-diag log paths |
+| `fetch_ggo_report { run }` | paste-ready summary of one perf run (+ its ggo-diag log path) |
+| `open_ggo_report { run }` | open the Reports tab in Zed on that run |
+| `close_ggo_report { run? }` | close the Reports tab (only if it shows `run`, when given) |
 
 ## Hardware
 
@@ -50,8 +53,9 @@ Flashing occupies the board (~20 min with `rebuild_gateware`) — CONFIRM
 WITH THE USER before `hw_flash`, and pass an explicit `world` stem: with
 none, the panel flashes whichever world it last remembered. Then
 `hw_flash_wait` → `verdict` (true=PASS) and, for a passed run,
-`perf_run_id` → `perf_report { run }`. `perf_report` reads the database
-directly, so it needs no live session.
+`perf_run_id` → `fetch_ggo_report { run }`. `list_ggo_reports` and
+`fetch_ggo_report` read the database directly, so they need no live
+session; `open_ggo_report`/`close_ggo_report` drive the Reports tab.
 
 This bridge is single-threaded: `main` reads one stdin line, serves it,
 and only then reads the next. Every other tool is bounded by a 15s socket

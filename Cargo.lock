@@ -7569,6 +7569,7 @@ dependencies = [
  "ggo-db",
  "ggo-worldlib",
  "ggo_common",
+ "ggo_emu_remote",
  "gpui",
  "project",
  "tempfile",

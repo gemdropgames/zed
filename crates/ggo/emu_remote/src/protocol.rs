@@ -53,6 +53,10 @@ pub enum Cmd {
     },
     /// Snapshot of the current/last flash.
     FlashStatus { workspace: Option<String> },
+    /// Open the Reports tab on perf run `run` (an id in ~/.ggo/ggo_ide.db).
+    OpenReport { workspace: Option<String>, run: i64 },
+    /// Close the Reports tab. With `run`, only if that is the run it shows.
+    CloseReport { workspace: Option<String>, run: Option<i64> },
 }
 
 /// One response line. `data` is command-specific JSON; `error` is set
@@ -180,6 +184,22 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"id":3,"cmd":"flash_status","workspace":"/w"}"#).unwrap().cmd,
             Cmd::FlashStatus { workspace: Some("/w".to_string()) }
+        );
+    }
+
+    #[test]
+    fn report_requests_round_trip() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"open_report","run":55}"#).unwrap().cmd,
+            Cmd::OpenReport { workspace: None, run: 55 }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"close_report"}"#).unwrap().cmd,
+            Cmd::CloseReport { workspace: None, run: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"close_report","workspace":"/w","run":55}"#).unwrap().cmd,
+            Cmd::CloseReport { workspace: Some("/w".to_string()), run: Some(55) }
         );
     }
 

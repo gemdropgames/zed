@@ -15,6 +15,7 @@ path = "src/ggo_charts_panel.rs"
 ggo-db.workspace = true # GGO
 ggo-worldlib.workspace = true # GGO -- LinearScale/nice_step, shared with ggo-ide's charts
 ggo_common.workspace = true
+ggo_emu_remote.workspace = true
 gpui.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # Same pure-Rust SQLite engine ggo-db's migrate() takes a connection from

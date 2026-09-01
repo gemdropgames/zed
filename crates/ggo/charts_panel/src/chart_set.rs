@@ -306,13 +306,38 @@ pub fn build_charts(samples: &RunSamples, prior: &[HistoricRunFrames]) -> Vec<Ch
     // (`frame.cyc` is `NOT NULL DEFAULT 0`): an emulator run would draw a
     // flat zero line saying nothing but "no such counter here".
     //
-    // `insert` rather than `push` because this is the one gated chart
-    // whose place is not at the end: it belongs directly under the wire
-    // chart it is the hardware counterpart of, and the always-on trio
-    // above stays a single literal.
+    // `insert` rather than `push` because these are the gated charts
+    // whose place is not at the end: the measured frame rate is the
+    // run's headline and goes FIRST, its raw-cycles twin directly under
+    // it, and the always-on trio above stays a single literal. The
+    // frame-cycles chart goes in first and the FPS chart is inserted
+    // above it, so the two land adjacent either way (see the index
+    // choice below for the run that gets no FPS chart at all).
     if gates::has_cyc(&frames) {
+        // The same measurement in the unit the question is asked in:
+        // `kpi::frame_fps`'s `60 * budget / cyc` (the budget IS one 60 Hz
+        // vsync period, so no clock constant appears). Only frames whose
+        // fps is derivable are plotted -- a bogus `cyc = 0` row (run 55's
+        // cold frame 1) must plot nothing, not an infinite or 0-fps
+        // point -- hence this chart's own x axis. The reference line is
+        // the 60 fps target, in this chart's own y unit (fps, where the
+        // charts above pass cycles).
+        let (fps_x, fps_values): (Vec<f32>, Vec<f32>) = frames
+            .iter()
+            .filter_map(|f| {
+                kpi::frame_fps(f.cyc, f.frame_budget_cycles).map(|fps| (f.n as f32, fps as f32))
+            })
+            .unzip();
+        // Frame cycles sits directly UNDER the FPS chart when there is
+        // one -- and, when there is not (a device run whose `run` row
+        // carries no `frame_budget_cycles`, so no fps is derivable),
+        // keeps its original place directly under the wire-budget chart
+        // it is the hardware counterpart of. Index 0 vs 1 is the whole
+        // difference; getting it wrong strands the cycles chart above
+        // the wire chart on exactly the runs nobody looks at twice.
+        let has_fps = !fps_values.is_empty();
         charts.insert(
-            1,
+            usize::from(!has_fps),
             line(
                 "Frame cycles",
                 &x,
@@ -320,6 +345,21 @@ pub fn build_charts(samples: &RunSamples, prior: &[HistoricRunFrames]) -> Vec<Ch
                 vec![series("cyc", C1, &frames, |f| f.cyc)],
             ),
         );
+        if has_fps {
+            charts.insert(
+                0,
+                line(
+                    "FPS",
+                    &fps_x,
+                    Some(kpi::TARGET_FPS as f32),
+                    vec![SeriesSpec {
+                        name: "fps".to_string(),
+                        color: C1,
+                        values: fps_values,
+                    }],
+                ),
+            );
+        }
     }
 
     if gates::has_syscalls(&frames) {
@@ -642,14 +682,15 @@ mod tests {
         );
     }
 
-    /// The EXACT top-to-bottom order of the full 14-chart set with every
+    /// The EXACT top-to-bottom order of the full 15-chart set with every
     /// gate tripped at once (syscalls, tile working set, profile rows,
     /// PPU, APU, a device cycle counter, a budget, prior runs). The
     /// membership tests around this each admit any ordering; this is the
     /// one place the reports page's vertical layout is pinned -- the
-    /// frame-cycles chart beside the wire chart, the per-function charts
-    /// between the tile-working-set chart and the histograms, the PPU
-    /// pair after them, instructions last.
+    /// measured-fps chart first, its frame-cycles twin under it, then
+    /// the always-on trio, the per-function charts between the
+    /// tile-working-set chart and the histograms, the PPU pair after
+    /// them, instructions last.
     #[test]
     fn the_fully_gated_chart_set_is_in_the_reports_pages_exact_order() {
         let mut samples = device_samples();
@@ -668,8 +709,9 @@ mod tests {
         assert_eq!(
             titles(&charts),
             vec![
-                "Wire cycles per frame vs budget",
+                "FPS",
                 "Frame cycles",
+                "Wire cycles per frame vs budget",
                 "Wire breakdown per frame",
                 "Cache misses per frame",
                 "Syscalls per frame",
@@ -786,16 +828,92 @@ mod tests {
         assert_eq!(chart.kind, ChartKind::Line { budget: None });
     }
 
-    /// It sits directly under "Wire cycles per frame vs budget": the two
-    /// budget charts are read together, one the emulator's modelled wire
-    /// cost and one the hardware's measured whole-frame cost.
+    /// A device run's report leads with the measurement that answers
+    /// "how fast is it actually running": FPS first, its raw-cycles twin
+    /// directly under it, and only then the emulator's modelled wire
+    /// cost.
     #[test]
-    fn the_frame_cycles_chart_sits_next_to_the_wire_budget_chart() {
+    fn the_fps_and_frame_cycles_charts_lead_the_device_report() {
         let charts = build_charts(&device_samples(), &[]);
         assert_eq!(
-            titles(&charts)[..2],
-            ["Wire cycles per frame vs budget", "Frame cycles"]
+            titles(&charts)[..3],
+            ["FPS", "Frame cycles", "Wire cycles per frame vs budget"]
         );
+    }
+
+    // -------------------------------------------------------------- fps
+
+    /// Same gate as the frame-cycles chart: only a device capture writes
+    /// `frame.cyc`, and an emulator run must show NO fps rather than a
+    /// wrong one.
+    #[test]
+    fn the_fps_chart_appears_only_for_a_run_with_a_cycle_counter() {
+        assert!(!titles(&build_charts(&plain_samples(), &[])).contains(&"FPS"));
+        assert!(titles(&build_charts(&device_samples(), &[])).contains(&"FPS"));
+    }
+
+    /// Run 55's real shape, hand-computed through `kpi::frame_fps`'s
+    /// `60 * budget / cyc`: a 1,111,100-cycle frame against the 555,549
+    /// budget is ~30 fps, a 1,666,650-cycle one ~20 fps -- and the
+    /// reference line sits at the 60 fps TARGET, in this chart's own y
+    /// unit (fps), not at the budget in cycles.
+    #[test]
+    fn the_fps_chart_plots_measured_fps_against_the_60fps_target() {
+        let mut samples = plain_samples();
+        for f in &mut samples.frames {
+            f.cyc = 1_111_100;
+        }
+        samples.frames[2].cyc = 1_666_650;
+        let charts = build_charts(&samples, &[]);
+        let chart = charts.iter().find(|c| c.title == "FPS").expect("gated in");
+        assert_eq!(chart.kind, ChartKind::Line { budget: Some(60.0) });
+        assert_eq!(chart.series.len(), 1);
+        assert_eq!(chart.series[0].name, "fps");
+        // Frame 0 is ignored; frames 1 and 2 remain.
+        assert_eq!(chart.x, vec![1.0, 2.0]);
+        assert!((chart.series[0].values[0] - 30.0).abs() < 0.01);
+        assert!((chart.series[0].values[1] - 20.0).abs() < 0.01);
+        assert!(!chart.selectable);
+        assert!(chart.historic.is_empty());
+    }
+
+    /// A bogus `cyc = 0` row inside an otherwise-measured device run
+    /// (run 55's cold frame 1) plots NOTHING -- the fps chart's own x
+    /// axis skips it, where a 0-fps or infinite point would lie.
+    #[test]
+    fn the_fps_chart_skips_frames_without_a_cycle_count() {
+        let mut samples = device_samples();
+        samples.frames[1].cyc = 0;
+        let charts = build_charts(&samples, &[]);
+        let chart = charts.iter().find(|c| c.title == "FPS").expect("gated in");
+        assert_eq!(chart.x, vec![2.0], "frame 0 ignored, frame 1 unmeasured");
+        // The frame-cycles chart still plots every surviving frame.
+        let cyc = charts.iter().find(|c| c.title == "Frame cycles").unwrap();
+        assert_eq!(cyc.x, vec![1.0, 2.0]);
+    }
+
+    /// No budget means fps is underivable (`kpi::frame_fps` is `None`
+    /// for every frame), so the chart is omitted entirely -- while the
+    /// frame-cycles chart, which needs no budget, stays.
+    #[test]
+    fn a_device_run_without_a_budget_gets_no_fps_chart() {
+        let mut samples = device_samples();
+        for f in &mut samples.frames {
+            f.frame_budget_cycles = None;
+        }
+        let charts = build_charts(&samples, &[]);
+        let t = titles(&charts);
+        assert!(!t.contains(&"FPS"));
+        // Membership is not enough: with no FPS chart to sit under, the
+        // cycles chart must fall back to its original slot BELOW the
+        // wire-budget chart it is the counterpart of -- not to index 0,
+        // where the no-fps branch would otherwise strand it.
+        assert_eq!(
+            t.iter().position(|&x| x == "Frame cycles"),
+            Some(1),
+            "{t:?}"
+        );
+        assert_eq!(t[0], "Wire cycles per frame vs budget", "{t:?}");
     }
 
     #[test]
@@ -1410,7 +1528,7 @@ mod tests {
             evicted: 1,
         }];
         let charts = build_charts(&samples, &[]);
-        assert_eq!(charts.len(), 14, "the full reports-page chart set");
+        assert_eq!(charts.len(), 15, "the full reports-page chart set");
         for c in &charts {
             assert!(c.has_data(), "{} has no data", c.title);
         }

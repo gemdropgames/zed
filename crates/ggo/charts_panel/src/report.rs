@@ -39,7 +39,9 @@ impl KpiTile {
     }
 }
 
-/// `reports.rs::kpi_row`'s tiles, in its exact order, over frames the
+/// `reports.rs::kpi_row`'s tiles, in its exact order plus ONE this panel
+/// adds that ggo-ide's `kpi_row` has no counterpart for -- the measured
+/// fps tile, first of the conditionals -- over frames the
 /// caller has ALREADY ignore-filtered (R1's concern (1): no derivation in
 /// `kpi` applies the filter itself, so passing raw frames here silently
 /// folds frame 0's cold-cache burst into every tile and the panel's
@@ -50,16 +52,22 @@ impl KpiTile {
 /// way ggo-ide reads it (the same column `FrameRow::frame_budget_cycles`
 /// carries, denormalized onto every frame by `run_frames`' join).
 ///
-/// The last five tiles are conditional and each is gated by its own
-/// `kpi::*_tile` returning `Some` -- NOT by
+/// The last six tiles are conditional and each is gated by its own
+/// `kpi` derivation returning `Some` -- NOT by
 /// `ggo_worldlib::charts::reports::gates`. That is ggo-ide's behaviour:
 /// `kpi_row` never consults `chart_gates`; the gates are for the
 /// conditional CHARTS, which is where `chart_set` uses them.
 ///
-/// **What an absent tile does and does not mean.** Three of the five hide
+/// **What an absent tile does and does not mean.** Three of the six hide
 /// at exactly zero (`peak_spr_line`, `apu_underruns`, `sc_upload`), so for
 /// those, absence does mean "this run never measured that" and a measured
-/// zero is never rendered as a `0` tile. The two working-set tiles are
+/// zero is never rendered as a `0` tile. The measured-fps tile is absent
+/// for a different reason again: `kpi::avg_fps` needs both a `cyc`
+/// counter (device captures only -- `frame.cyc` is `NOT NULL DEFAULT 0`,
+/// so every emulator row reads zero) and a `frame_budget_cycles` on the
+/// run row. Absent there means "not derivable on this run", never "0 fps"
+/// -- a run really achieving 0 fps would have produced no frames to
+/// average. The two working-set tiles are
 /// different: their threshold is `> kpi::TILE_CACHE_TILES` (64), not `> 0`
 /// (`RunPage.tsx:365/373` -- a working set that fits in the cache is not a
 /// finding worth a tile). So for those two, absence means "at or below the
@@ -104,6 +112,16 @@ pub fn kpi_tiles(frames: &[FrameRow], budget: Option<i64>) -> Vec<KpiTile> {
         ),
     ];
 
+    // First of the conditionals: the measured frame rate, from the
+    // device's `frame.cyc` counter -- `kpi::avg_fps` is `None` for an
+    // emulator run (every `cyc` is 0) or without a budget, so the tile
+    // simply doesn't render there rather than claiming a fake rate.
+    // "measured" in the label is deliberate: the config line's "60 fps
+    // target" is nominal, and this is the number that contradicts it
+    // (run 55: 29.5).
+    if let Some(fps) = kpi::avg_fps(frames, budget) {
+        tiles.push(KpiTile::new("Measured fps", format!("{fps:.1}")));
+    }
     if let Some(peak) = kpi::peak_spr_line_tile(frames) {
         tiles.push(KpiTile::new(
             "Peak sprites / scanline",
@@ -482,6 +500,7 @@ mod tests {
         let tiles = kpi_tiles(&frames, Some(555_549));
         assert_eq!(tiles.len(), 8, "only the unconditional eight");
         for absent in [
+            "Measured fps",
             "Peak sprites / scanline",
             "Sprite working set",
             "BG working set",
@@ -495,6 +514,35 @@ mod tests {
         // about counters the run never MEASURED, which is why it is
         // enforced as tile absence above and not as a value check.
         assert_eq!(value_of(&tiles, "Over-budget frames"), Some("0"));
+    }
+
+    /// A device run gets the measured-fps tile, valued by
+    /// `kpi::avg_fps`'s run-wide rate over the SAME ignore-filtered
+    /// frames as every other tile. Run 55's shape in miniature: frames
+    /// at 2x and 3x the 555,549 budget -> 60*555_549*2/(1_111_100 +
+    /// 1_666_650) = 24.0 fps. An emulator run (cyc all 0) or a run with
+    /// no budget shows no tile at all -- never a fake rate.
+    #[test]
+    fn a_device_run_gets_the_measured_fps_tile_an_emulator_run_does_not() {
+        let device: Vec<FrameRow> = [(1, 1_111_100), (2, 1_666_650)]
+            .into_iter()
+            .map(|(n, cyc)| FrameRow {
+                n,
+                cyc,
+                frame_budget_cycles: Some(555_549),
+                ..FrameRow::default()
+            })
+            .collect();
+        let tiles = kpi_tiles(&device, Some(555_549));
+        assert_eq!(value_of(&tiles, "Measured fps"), Some("24.0"));
+        assert_eq!(
+            value_of(&kpi_tiles(&device, None), "Measured fps"),
+            None,
+            "no budget, no fps"
+        );
+
+        let emulator = kpi_tiles(&sample_frames(), Some(555_549));
+        assert_eq!(value_of(&emulator, "Measured fps"), None);
     }
 
     /// Each conditional tile appears once its own counter crosses its own
@@ -614,7 +662,7 @@ mod tests {
         assert_eq!(
             build(&samples).config_line.as_deref(),
             Some(
-                "frame budget 555,549 cyc (60 fps) · scanout 164,400 · refill 100 · \
+                "frame budget 555,549 cyc (60 fps target) · scanout 164,400 · refill 100 · \
                  writeback 65 · wire wait 10 (calibrated)"
             )
         );

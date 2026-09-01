@@ -73,20 +73,32 @@ pub fn tool_list() -> Value {
               "rebuild_gateware": { "type": "boolean", "description": "Re-run place-and-route (~20 min) instead of reusing the cached bitstream; only needed after a gateware change" }
           })) },
         { "name": "hw_flash_status",
-          "description": "Non-blocking snapshot of the flash in flight (else the last one): {active, phase, verdict, diag_run_id, perf_run_id}. verdict is null while running, true=PASS, false=FAIL; perf_run_id is the run number to hand to perf_report, present only once a passed run's report has landed.",
+          "description": "Non-blocking snapshot of the flash in flight (else the last one): {active, phase, verdict, diag_run_id, perf_run_id}. verdict is null while running, true=PASS, false=FAIL; perf_run_id is the run number to hand to fetch_ggo_report, present only once a passed run's report has landed.",
           "inputSchema": with(json!({})) },
         { "name": "hw_flash_wait",
           "description": "Block until the flash in flight reaches a verdict, then return the same payload hw_flash_status returns (polling every 2s under the hood). Call it right after hw_flash; on its own it reports the LAST flash's verdict immediately. NOTE: this bridge serves ONE call at a time, so a long wait blocks every other tool here (including hw_flash_status) until it returns, and your client may time out first — nothing is lost if it does: the flash runs inside Zed, its status is per-run and persists, so call hw_flash_wait again to resume waiting on the same flash. Prefer a timeout_s you are willing to sit through (say 300) and re-call, over one long 1800s wait.",
           "inputSchema": with(json!({
               "timeout_s": { "type": "number", "description": "Give up after this many seconds; must be > 0 (omit for the default 1800)" }
           })) },
-        { "name": "perf_report",
-          "description": "Paste-ready summary of one perf run (emulator or board) from ~/.ggo/ggo_ide.db: cart, frame budget, wire/cache aggregates, over-budget frames. Takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from the Reports page. Reads the database directly — no Zed session needed.",
+        { "name": "list_ggo_reports",
+          "description": "Perf runs (emulator and board) in ~/.ggo/ggo_ide.db, newest first: run id, started_at, cart, label, and the ggo-diag log path for board runs. Reads the database directly — no Zed session needed.",
+          "inputSchema": json!({
+              "type": "object",
+              "properties": { "limit": { "type": "number", "description": "Newest N runs (default 20)" } },
+          }) },
+        { "name": "fetch_ggo_report",
+          "description": "Paste-ready summary of one perf run (emulator or board) from ~/.ggo/ggo_ide.db: cart, frame budget, wire/cache aggregates, over-budget frames, and the ggo-diag log path when the run has one. Takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from list_ggo_reports. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
               "type": "object",
               "properties": { "run": { "type": "number", "description": "Perf run id, e.g. perf_run_id from hw_flash_wait" } },
               "required": ["run"],
           }) },
+        { "name": "open_ggo_report",
+          "description": "Open the Reports tab in the user's Zed on one perf run (the same page a passed flash lands on).",
+          "inputSchema": with(json!({ "run": { "type": "number", "description": "Perf run id from list_ggo_reports" } })) },
+        { "name": "close_ggo_report",
+          "description": "Close the Reports tab in the user's Zed. With `run`, only if that is the run it shows. Returns {closed: false} when no tab is open.",
+          "inputSchema": with(json!({ "run": { "type": "number", "description": "Only close if the tab shows this run (optional)" } })) },
     ] })
 }
 
@@ -166,9 +178,13 @@ fn call_tool_inner(
         return Ok(vec![json!({ "type": "text", "text": text })]);
     }
 
-    if name == "perf_report" {
+    if name == "list_ggo_reports" {
+        let limit = arg_i64(args, "limit").filter(|n| *n > 0).unwrap_or(20) as usize;
+        return list_reports(&ggo_dir()?, limit);
+    }
+    if name == "fetch_ggo_report" {
         let run = arg_i64(args, "run").ok_or("missing required argument: run (a perf run id)")?;
-        return perf_report(&ggo_dir()?, run);
+        return fetch_report(&ggo_dir()?, run);
     }
 
     let workspace = arg_str(args, "workspace");
@@ -236,6 +252,19 @@ fn call_tool_inner(
             let data = send(&session.socket, Cmd::FlashStatus { workspace }, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
+        "open_ggo_report" => {
+            let run = arg_i64(args, "run").ok_or("missing required argument: run (a perf run id)")?;
+            // Checked here so a bad id is an error, not a Reports tab
+            // that silently lands on the runs list.
+            run_detail_or_missing(&ggo_dir()?, run)?;
+            let data = send(&session.socket, Cmd::OpenReport { workspace, run }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "close_ggo_report" => {
+            let run = arg_i64(args, "run");
+            let data = send(&session.socket, Cmd::CloseReport { workspace, run }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
         "hw_flash_wait" => {
             // A `timeout_s` of 0 (or negative) is a caller mistake, not a
             // request for the default: silently turning it into
@@ -271,7 +300,7 @@ const FLASH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Once a run PASSES, the Zed panel still has a database hop to make
 /// before it can name the cloned perf run. Waiting this long for it (in
 /// `poll` steps) is what lets `hw_flash_wait`'s answer carry the id the
-/// caller then hands to `perf_report`, instead of a null the agent has to
+/// caller then hands to `fetch_ggo_report`, instead of a null the agent has to
 /// go poll for itself.
 const PERF_ID_GRACE: Duration = Duration::from_secs(10);
 
@@ -333,10 +362,72 @@ fn ggo_dir() -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(home).join(".ggo"))
 }
 
+/// Every perf run in `<db_dir>/ggo_ide.db`, newest first, one line each,
+/// with the ggo-diag log path beside the board runs that have one.
+fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
+    use ggo_worldlib::charts::reports::{diag_db, perf_db};
+
+    let ide_db = db_dir.join("ggo_ide.db");
+    // Same best-effort clone as `fetch_report`: board runs reach this
+    // database only by being copied across, and a clone failure must not
+    // hide the emulator runs already here.
+    if let Err(e) = diag_db::clone_runs(&db_dir.join("diag.db"), &ide_db) {
+        eprintln!("list_ggo_reports: could not clone every device run: {e}");
+    }
+    if !ide_db.exists() {
+        return Ok(vec![json!({ "type": "text", "text": format!("no runs yet ({} does not exist)", ide_db.display()) })]);
+    }
+    let mut rows = Vec::new();
+    for cart in perf_db::carts(&ide_db).map_err(|e| format!("reading carts: {e:#}"))? {
+        for run in perf_db::cart_runs(&ide_db, cart.id)
+            .map_err(|e| format!("reading runs of cart {}: {e:#}", cart.name))?
+        {
+            rows.push((run.started_at, run.id, cart.name.clone(), run.label, run.frames));
+        }
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    let logs_dir = db_dir.join("diag").join("logs");
+    let lines: Vec<String> = rows
+        .iter()
+        .take(limit)
+        .map(|(started_at, id, cart, label, frames)| {
+            let log = ggo_emu_remote::diag_log_path(&logs_dir, started_at)
+                .map(|p| format!("  log={}", p.display()))
+                .unwrap_or_default();
+            format!(
+                "run {id}  {started_at}  {cart}  label={}  frames={frames}{log}",
+                label.as_deref().unwrap_or("-")
+            )
+        })
+        .collect();
+    let text = if lines.is_empty() { "no runs yet".to_string() } else { lines.join("\n") };
+    Ok(vec![json!({ "type": "text", "text": text })])
+}
+
 /// One perf run's paste-ready summary out of `<db_dir>/ggo_ide.db`.
 /// `db_dir` is a parameter so tests can point at a temp directory;
 /// production passes `~/.ggo`.
-fn perf_report(db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
+fn fetch_report(db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
+    use ggo_worldlib::charts::reports::perf_db;
+
+    let ide_db = db_dir.join("ggo_ide.db");
+    let detail = run_detail_or_missing(db_dir, run)?;
+    let frames =
+        perf_db::run_frames(&ide_db, run).map_err(|e| format!("reading run {run} frames: {e:#}"))?;
+    let mut text = perf_db::run_handoff_text(&detail, &frames);
+    let log = ggo_emu_remote::diag_log_path(&db_dir.join("diag").join("logs"), &detail.started_at);
+    text.push_str(&format!(
+        "\nggo_diag_log: {}\n",
+        log.map(|p| p.display().to_string()).unwrap_or_else(|| "- (emulator run, or log pruned)".to_string())
+    ));
+    Ok(vec![json!({ "type": "text", "text": text })])
+}
+
+/// The run's row, or the "no run" error naming both databases.
+fn run_detail_or_missing(
+    db_dir: &Path,
+    run: i64,
+) -> Result<ggo_worldlib::charts::reports::perf_db::RunDetail, String> {
     use ggo_worldlib::charts::reports::{diag_db, perf_db};
 
     let ide_db = db_dir.join("ggo_ide.db");
@@ -366,13 +457,9 @@ fn perf_report(db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
     if !ide_db.exists() {
         return Err(missing());
     }
-    let detail = perf_db::run_detail(&ide_db, run)
+    perf_db::run_detail(&ide_db, run)
         .map_err(|e| format!("reading run {run}: {e:#}"))?
-        .ok_or_else(missing)?;
-    let frames =
-        perf_db::run_frames(&ide_db, run).map_err(|e| format!("reading run {run} frames: {e:#}"))?;
-    let text = perf_db::run_handoff_text(&detail, &frames);
-    Ok(vec![json!({ "type": "text", "text": text })])
+        .ok_or_else(missing)
 }
 
 /// Shape a script report into MCP content: a text summary (frames + uart),
@@ -499,7 +586,10 @@ mod tests {
                 "hw_flash",
                 "hw_flash_status",
                 "hw_flash_wait",
-                "perf_report",
+                "list_ggo_reports",
+                "fetch_ggo_report",
+                "open_ggo_report",
+                "close_ggo_report",
             ]
         );
     }
@@ -771,19 +861,75 @@ mod tests {
     }
 
     #[test]
-    fn perf_report_renders_the_run_handoff_text() {
+    fn fetch_report_renders_the_run_handoff_text_and_its_log_path() {
         let dir = seeded_db_dir();
-        let content = perf_report(dir.path(), 7).unwrap();
+        let content = fetch_report(dir.path(), 7).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains("GemdropGo perf run #7"), "{text}");
         assert!(text.contains("wilds"), "{text}");
         assert!(text.contains("frame_rows_loaded: 2"), "{text}");
+        assert!(text.contains("ggo_diag_log: -"), "{text}");
+
+        let logs = dir.path().join("diag").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log = logs.join("main_abc1234_2026-08-31T00:00:00Z.log");
+        std::fs::write(&log, "").unwrap();
+        let content = fetch_report(dir.path(), 7).unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("ggo_diag_log: {}", log.display())), "{text}");
     }
 
     #[test]
-    fn perf_report_unknown_run_is_a_tool_error() {
+    fn list_reports_lists_runs_newest_first_with_their_logs() {
         let dir = seeded_db_dir();
-        let err = perf_report(dir.path(), 999).unwrap_err();
+        let logs = dir.path().join("diag").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log = logs.join("main_abc1234_2026-08-31T00:00:00Z.log");
+        std::fs::write(&log, "").unwrap();
+        let content = list_reports(dir.path(), 20).unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("run 7  2026-08-31T00:00:00Z  wilds  label=board  frames=2  log="), "{text}");
+        assert!(text.ends_with(&log.display().to_string()), "{text}");
+        assert_eq!(list_reports(dir.path(), 0).unwrap()[0]["text"], "no runs yet");
+    }
+
+    #[test]
+    fn list_reports_with_no_database_says_so_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("no runs yet"), "{text}");
+        assert!(!dir.path().join("ggo_ide.db").exists(), "must not create an empty db");
+    }
+
+    #[test]
+    fn open_report_rejects_an_unknown_run_before_touching_zed() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            panic!("no socket call for a run that does not exist")
+        };
+        let (content, is_err) = call_tool("open_ggo_report", &json!({"run": 999}), dir.path(), &connect);
+        assert!(is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains("no run 999"), "{content:?}");
+    }
+
+    #[test]
+    fn close_report_forwards_the_run_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""cmd":"close_report""#) && line.contains(r#""run":55"#), "{line}");
+            Ok(r#"{"id":1,"ok":true,"data":{"closed":true}}"#.to_string())
+        };
+        let (content, is_err) = call_tool("close_ggo_report", &json!({"run": 55}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""closed":true"#));
+    }
+
+    #[test]
+    fn fetch_report_unknown_run_is_a_tool_error() {
+        let dir = seeded_db_dir();
+        let err = fetch_report(dir.path(), 999).unwrap_err();
         assert!(err.contains("no run 999"), "{err}");
         assert!(err.contains("ggo_ide.db"), "{err}");
     }
@@ -792,9 +938,9 @@ mod tests {
     /// clone), and the missing ide db is the same "no such run" error --
     /// never a stray empty database left behind.
     #[test]
-    fn perf_report_with_no_databases_is_a_tool_error_and_creates_nothing() {
+    fn fetch_report_with_no_databases_is_a_tool_error_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let err = perf_report(dir.path(), 1).unwrap_err();
+        let err = fetch_report(dir.path(), 1).unwrap_err();
         assert!(err.contains("no run 1"), "{err}");
         assert!(!dir.path().join("ggo_ide.db").exists(), "must not create an empty db");
     }
@@ -825,7 +971,7 @@ mod tests {
     /// file: a diag.db that cannot be cloned must not fail a report the
     /// ide db can already answer -- which is every emulator run.
     #[test]
-    fn perf_report_still_reports_when_the_diag_clone_fails() {
+    fn fetch_report_still_reports_when_the_diag_clone_fails() {
         let dir = seeded_db_dir();
         seed_stale_diag_db(dir.path());
         // Pre-condition: this diag.db really does break the clone, with an
@@ -837,17 +983,17 @@ mod tests {
         .unwrap_err();
         assert!(clone_err.contains("no such column"), "{clone_err}");
 
-        let content = perf_report(dir.path(), 7).unwrap();
+        let content = fetch_report(dir.path(), 7).unwrap();
         assert!(content[0]["text"].as_str().unwrap().contains("GemdropGo perf run #7"));
     }
 
     /// ...and when the run really is missing, the swallowed clone error
     /// comes back as context, since it may be exactly why.
     #[test]
-    fn perf_report_unknown_run_carries_the_clone_failure_as_context() {
+    fn fetch_report_unknown_run_carries_the_clone_failure_as_context() {
         let dir = seeded_db_dir();
         seed_stale_diag_db(dir.path());
-        let err = perf_report(dir.path(), 999).unwrap_err();
+        let err = fetch_report(dir.path(), 999).unwrap_err();
         assert!(err.contains("no run 999"), "{err}");
         assert!(err.contains("no such column"), "{err}");
     }

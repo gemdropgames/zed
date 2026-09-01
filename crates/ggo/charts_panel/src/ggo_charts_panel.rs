@@ -70,7 +70,7 @@ mod report;
 pub use charts_item::ChartsItem;
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -425,7 +425,7 @@ pub struct ChartsPanel {
     /// Why the last Re-run click went nowhere, if it did.
     rerun_note: Option<&'static str>,
     /// `ggo-diag`'s consolidated log for the selected perf run, the file
-    /// the header's Copy button hands out -- see [`diag_log_path`].
+    /// the header's Copy button hands out -- see `ggo_emu_remote::diag_log_path`.
     run_log_path: Option<PathBuf>,
     /// Separate from `load_generation`: a run selection and a runs-list
     /// refresh are independent loads, and a stale one of either must not
@@ -597,7 +597,7 @@ impl ChartsPanel {
         self.run_log_path = self
             .diag_db_path()
             .and_then(|db| Some(db.parent()?.join("diag").join("logs")))
-            .and_then(|logs_dir| diag_log_path(&logs_dir, &started_at));
+            .and_then(|logs_dir| ggo_emu_remote::diag_log_path(&logs_dir, &started_at));
         let generation = self.detail_generation;
         self.detail = Some(DetailState::Loading);
         cx.notify();
@@ -1293,6 +1293,14 @@ impl ChartsPanel {
             )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+
+    /// The perf run on screen, if the panel is showing one.
+    pub fn selected_run_id(&self) -> Option<i64> {
+        match &self.selected {
+            Some(Selection::Perf(run)) => Some(run.id),
+            _ => None,
+        }
     }
 
     /// Copy the run's `ggo-diag` log path, for pasting into an agent's
@@ -2349,49 +2357,9 @@ impl Focusable for ChartsPanel {
     }
 }
 
-/// `ggo-diag`'s consolidated log for a run: the file under `logs_dir`
-/// (`~/.ggo/diag/logs`) whose name ends in `_<started_at>.log`. ggo-diag
-/// stamps it `{branch}_{commit}_{started_at}.log` and writes the same
-/// `started_at` onto the run row, which is the only link between the two
-/// -- no database column records the path. `None` for a run ggo-diag
-/// never saw (an emulator run) or whose log is gone.
-pub fn diag_log_path(logs_dir: &Path, started_at: &str) -> Option<PathBuf> {
-    if started_at.is_empty() {
-        return None;
-    }
-    let suffix = format!("_{started_at}.log");
-    let mut matches: Vec<PathBuf> = std::fs::read_dir(logs_dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(&suffix))
-        })
-        .collect();
-    matches.sort();
-    matches.into_iter().next()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_diag_log_is_found_by_the_runs_started_at_stamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let logs = dir.path();
-        std::fs::write(logs.join("main_5370a5a_2026-09-01_13-29-09.log"), "").unwrap();
-        std::fs::write(logs.join("main_7fe694e_2026-09-01_12-34-22.log"), "").unwrap();
-        assert_eq!(
-            diag_log_path(logs, "2026-09-01_13-29-09"),
-            Some(logs.join("main_5370a5a_2026-09-01_13-29-09.log"))
-        );
-        assert_eq!(diag_log_path(logs, "2026-09-01_00-00-00"), None);
-        assert_eq!(diag_log_path(logs, ""), None, "an empty stamp matches nothing");
-        assert_eq!(diag_log_path(&logs.join("missing"), "2026-09-01_13-29-09"), None);
-    }
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use workspace::{AppState, MultiWorkspace};
@@ -3058,7 +3026,7 @@ mod tests {
             assert_eq!(
                 panel.report().unwrap().config_line.as_deref(),
                 Some(
-                    "frame budget 555,549 cyc (60 fps) · scanout 164,400 · refill 100 · \
+                    "frame budget 555,549 cyc (60 fps target) · scanout 164,400 · refill 100 · \
                      writeback 65 · wire wait 10 (calibrated)"
                 )
             );

@@ -412,7 +412,9 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::NextFrame { workspace, .. }
         | Cmd::Stop { workspace }
         | Cmd::FlashWorld { workspace, .. }
-        | Cmd::FlashStatus { workspace } => workspace.clone(),
+        | Cmd::FlashStatus { workspace }
+        | Cmd::OpenReport { workspace, .. }
+        | Cmd::CloseReport { workspace, .. } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -555,6 +557,49 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 })
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "started": true }))
+        }
+        Cmd::OpenReport { run, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            window
+                .update(cx, |_, window, app| {
+                    workspace.update(app, |workspace, cx| {
+                        ggo_charts_panel::open_charts_item(workspace, window, cx, |charts, _, cx| {
+                            charts.open_run(run, cx)
+                        });
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "opened": true, "run": run }))
+        }
+        Cmd::CloseReport { run, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let closed = window
+                .update(cx, |_, window, app| {
+                    workspace.update(app, |workspace, cx| -> Result<bool, String> {
+                        let Some(item) =
+                            workspace.items_of_type::<ggo_charts_panel::ChartsItem>(cx).next()
+                        else {
+                            return Ok(false);
+                        };
+                        let showing = item.read(cx).panel().read(cx).selected_run_id();
+                        match (run, showing) {
+                            (Some(run), Some(showing)) if run != showing => {
+                                return Err(format!("the report tab shows run {showing}, not {run}"));
+                            }
+                            (Some(run), None) => {
+                                return Err(format!("the report tab is on the runs list, not run {run}"));
+                            }
+                            _ => {}
+                        }
+                        let pane = workspace.pane_for(&item).ok_or("report tab has no pane")?;
+                        pane.update(cx, |pane, cx| {
+                            pane.remove_item(item.entity_id(), false, true, window, cx)
+                        });
+                        Ok(true)
+                    })
+                })
+                .map_err(|e| e.to_string())??;
+            Ok(serde_json::json!({ "closed": closed }))
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;

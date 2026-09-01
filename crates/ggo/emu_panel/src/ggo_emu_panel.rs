@@ -1217,7 +1217,7 @@ impl EmuPanel {
                 // Each run is its own committed transaction, so an `Err`
                 // says nothing about whether THIS run made it across. Ask
                 // the database that instead of guessing from the error, the
-                // same correction `ggo_emu_mcp::tools`' `perf_report`
+                // same correction `ggo_emu_mcp::tools`' `fetch_ggo_report`
                 // makes.
                 if let Err(e) = diag_db::clone_runs(&diag_db_path, &ide_db_path) {
                     log::warn!("flashed run {diag_run_id}: could not clone every device run: {e}");
