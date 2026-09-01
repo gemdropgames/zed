@@ -65,8 +65,8 @@ pub(crate) fn page_layout(
 ///
 /// Kept out of `render` for the same reason [`page_layout`] is: the
 /// wording IS the feature -- a hash pair on its own means nothing to the
-/// reader -- so it gets asserted without a window. `can_update` is
-/// whether the banner carries its own Update button; when it does not,
+/// reader -- so it gets asserted without a window. `can_sync` is
+/// whether the banner carries its own Sync button; when it does not,
 /// the banner has to name the step the reader takes instead, or a dev
 /// checkout is left with a warning and no way out of it.
 ///
@@ -80,7 +80,7 @@ pub(crate) fn page_layout(
 pub(crate) fn skew_banner_text(
     flash_short: &str,
     emu_short: &str,
-    can_update: bool,
+    can_sync: bool,
     emu_commit_in_repo: Option<bool>,
 ) -> String {
     let mut text = format!(
@@ -93,24 +93,24 @@ pub(crate) fn skew_banner_text(
                 " The emulator's commit is not in the flash repo's history: it was built \
                  from unpushed work. Push that checkout to the GGO remote, then ",
             );
-            text.push_str(if can_update {
-                "update the GGO repo here."
+            text.push_str(if can_sync {
+                "sync the GGO repo here."
             } else {
                 "update your checkout."
             });
         }
         Some(true) => {
             text.push_str(
-                " The flash repo is ahead of the emulator: updating it cannot help, \
+                " The flash repo is ahead of the emulator: syncing it cannot help, \
                  ZedGG itself needs rebuilding against it.",
             );
         }
         None => {
-            if !can_update {
+            if !can_sync {
                 text.push_str(" Update your checkout, then flash + rebuild gateware.");
             }
             text.push_str(
-                " If updating the GGO repo does not clear this, the checkout is ahead of \
+                " If syncing the GGO repo does not clear this, the checkout is ahead of \
                  the emulator and ZedGG itself needs rebuilding against it.",
             );
         }
@@ -290,49 +290,25 @@ impl HardwareSetupItem {
             .into_any_element()
     }
 
-    /// The skew banner's remedy: pull the clone this fork manages. Only
-    /// ever built when [`crate::hardware::HardwareEnv::update_repo_request`]
-    /// has one, so a dev checkout never gets a button onto someone else's
-    /// working copy.
-    fn render_update_button(&self, busy: bool) -> AnyElement {
-        Button::new("ggo-hardware-update-repo", "Update GGO repo")
+    /// The skew banner's remedy: bring the clone this fork manages -- and
+    /// the installed `ggo-emu` -- to the GGO remote's head. Only ever
+    /// built when [`crate::hardware::HardwareEnv::sync_request`] has one,
+    /// so a dev checkout never gets a button onto someone else's working
+    /// copy.
+    fn render_sync_button(&self, busy: bool) -> AnyElement {
+        Button::new("ggo-hardware-sync-repo", "Sync GGO repo")
             .disabled(busy)
             .tooltip(Tooltip::text(if busy {
                 "A run is using the repo -- wait for it to finish, or cancel it"
             } else {
-                "Pull the latest GGO source into the managed clone \
-                 (git pull --ff-only), then flash + rebuild gateware to put \
-                 the new gateware on the board"
+                "Pull the latest GGO source into the managed clone -- \
+                 recloning it if the pull cannot fast-forward -- and \
+                 reinstall ggo-emu from it"
             }))
             .on_click({
                 let panel = self.panel.clone();
                 move |_, _window, cx| {
-                    panel.update(cx, |panel, cx| panel.update_ggo_repo(cx)).ok();
-                }
-            })
-            .into_any_element()
-    }
-
-    /// The pull's escape hatch, for a clone a pull cannot fix (diverged
-    /// history, corrupt objects): delete the managed clone and clone it
-    /// fresh. Built under the same gate as the update button, so it can
-    /// never delete a checkout the user maintains.
-    fn render_reclone_button(&self, busy: bool) -> AnyElement {
-        Button::new("ggo-hardware-force-reclone", "Force reclone GGO repo")
-            .disabled(busy)
-            .tooltip(Tooltip::text(if busy {
-                "A run is using the repo -- wait for it to finish, or cancel it"
-            } else {
-                "Delete the managed clone and clone it fresh. Use when \
-                 Update fails (diverged or corrupt clone); everything in \
-                 the managed clone is discarded"
-            }))
-            .on_click({
-                let panel = self.panel.clone();
-                move |_, _window, cx| {
-                    panel
-                        .update(cx, |panel, cx| panel.force_reclone_ggo_repo(cx))
-                        .ok();
+                    panel.update(cx, |panel, cx| panel.sync_ggo_repo(cx)).ok();
                 }
             })
             .into_any_element()
@@ -409,7 +385,7 @@ impl Render for HardwareSetupItem {
                 .p_4()
                 .child(Label::new("The emulator pane is gone.").color(Color::Muted));
         };
-        let (requirements, ready, busy, status, log, progress, target, skew, can_update, world) =
+        let (requirements, ready, busy, status, log, progress, target, skew, can_sync, world) =
             panel.update(cx, |panel, cx| {
                 let env = panel.hardware_env_cached();
                 let target = (
@@ -431,7 +407,7 @@ impl Render for HardwareSetupItem {
                     target,
                     env.version_skew()
                         .map(|(flash, emu)| (flash, emu, env.emu_commit_in_repo)),
-                    env.update_repo_request().is_some(),
+                    env.sync_request().is_some(),
                     panel.flash_world(cx),
                 )
             });
@@ -529,7 +505,7 @@ impl Render for HardwareSetupItem {
                             Label::new(skew_banner_text(
                                 &flash_short,
                                 &emu_short,
-                                can_update,
+                                can_sync,
                                 emu_commit_in_repo,
                             ))
                             .size(LabelSize::Small),
@@ -537,13 +513,8 @@ impl Render for HardwareSetupItem {
                         // The remedy belongs in the warning that asked
                         // for it, not in a button row three sections
                         // down that says nothing about why it is there.
-                        .map(|banner| match can_update {
-                            true => banner.action_slot(
-                                h_flex()
-                                    .gap_1()
-                                    .child(self.render_update_button(busy))
-                                    .child(self.render_reclone_button(busy)),
-                            ),
+                        .map(|banner| match can_sync {
+                            true => banner.action_slot(self.render_sync_button(busy)),
                             false => banner,
                         }),
                 )
@@ -975,7 +946,7 @@ mod tests {
             "an unreachable commit needs a push first: {unpushed}"
         );
         assert!(
-            unpushed.contains("update the GGO repo here"),
+            unpushed.contains("sync the GGO repo here"),
             "the button above is still the second step: {unpushed}"
         );
         assert!(
@@ -996,7 +967,7 @@ mod tests {
             "a repo past the emulator needs a newer ZedGG: {repo_ahead}"
         );
         assert!(
-            repo_ahead.contains("updating it cannot help") && !repo_ahead.contains("Push"),
+            repo_ahead.contains("syncing it cannot help") && !repo_ahead.contains("Push"),
             "no pull or push helps when the repo is ahead: {repo_ahead}"
         );
     }

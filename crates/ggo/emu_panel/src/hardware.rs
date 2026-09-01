@@ -192,61 +192,55 @@ impl HardwareEnv {
         self.repo.as_ref() == Some(&self.clone_dest)
     }
 
-    /// `git pull --ff-only` in the managed clone, when there is one.
+    /// Bring the managed clone AND the installed `ggo-emu` binary to the
+    /// GGO remote's head, as one shell script through the streaming
+    /// runner.
     ///
     /// Only the clone under `~/.ggo` is ours to move: a dev checkout is
     /// the user's working copy, and pulling it out from under them could
     /// discard work or drop them onto a different branch mid-edit.
     ///
-    /// `--ff-only` rather than a plain pull: a clone that has diverged --
-    /// local commits, a rebased upstream -- must stop in the console with
-    /// git's own message, so the user sees the state their clone is in.
-    /// A silent merge commit would leave a checkout nobody chose to make
-    /// and a board built from it.
-    pub fn update_repo_request(&self) -> Option<ProcRequest> {
+    /// The script tries `git pull --ff-only` first, and ANY failure --
+    /// diverged history, corrupt objects, a rebased upstream -- falls
+    /// back to deleting the clone and cloning fresh, which is safe
+    /// precisely because the clone is managed: nothing in it is the
+    /// user's to lose. `cargo install` then rebuilds `ggo-emu` from the
+    /// synced source, skipped only when the sync moved nothing and a
+    /// `ggo-emu` is already on PATH -- an install takes minutes and a
+    /// no-op sync should not.
+    ///
+    /// One `sh -c` request rather than several `ProcRequest`s because the
+    /// runner stops at the first failure, and "reclone" is only correct
+    /// AFTER the pull has failed.
+    pub fn sync_request(&self) -> Option<ProcRequest> {
         if !self.git || !self.repo_is_managed_clone() {
             return None;
         }
-        let repo = self.repo.clone()?;
+        let repo = shell_quote(&self.repo.clone()?);
+        let url = GGO_REPO_URL;
+        let script = format!(
+            "set -e\n\
+             pre=$(git -C {repo} rev-parse HEAD 2>/dev/null || echo none)\n\
+             git -C {repo} pull --ff-only || {{ rm -rf {repo}; git clone {url} {repo}; }}\n\
+             post=$(git -C {repo} rev-parse HEAD)\n\
+             if [ \"$pre\" != \"$post\" ] || ! command -v ggo-emu >/dev/null; then\n\
+                 cargo install --locked --path {repo}/tools/ggo-emu\n\
+             else\n\
+                 echo \"ggo-emu already matches $post\"\n\
+             fi"
+        );
         Some(ProcRequest::new(
-            "git",
-            repo,
-            vec!["pull".to_string(), "--ff-only".to_string()],
+            "sh",
+            self.cwd_for_setup(),
+            vec!["-c".to_string(), script],
         ))
     }
+}
 
-    /// Delete the managed clone and clone it fresh, for when a pull
-    /// cannot fix it (diverged history, corrupt objects, a rebased
-    /// upstream). Same gate as [`Self::update_repo_request`]: only the
-    /// clone under `~/.ggo` is ours to destroy -- a dev checkout may
-    /// hold uncommitted work.
-    ///
-    /// Two steps through the same runner so both stream into the
-    /// console; the clone runs from the home directory because its own
-    /// destination no longer exists once the first step lands.
-    pub fn force_reclone_requests(&self) -> Option<Vec<ProcRequest>> {
-        if !self.git || !self.repo_is_managed_clone() {
-            return None;
-        }
-        let repo = self.repo.clone()?;
-        let cwd = self.cwd_for_setup();
-        Some(vec![
-            ProcRequest::new(
-                "rm",
-                cwd.clone(),
-                vec!["-rf".to_string(), repo.to_string_lossy().into_owned()],
-            ),
-            ProcRequest::new(
-                "git",
-                cwd,
-                vec![
-                    "clone".to_string(),
-                    GGO_REPO_URL.to_string(),
-                    repo.to_string_lossy().into_owned(),
-                ],
-            ),
-        ])
-    }
+/// `path`, single-quoted for `sh -c`. Single quotes disable every shell
+/// expansion, and an embedded quote is spliced as `'\''`.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
 /// The first 10 characters of a commit hash -- long enough to be unique
@@ -2022,75 +2016,55 @@ mod tests {
         );
     }
 
-    /// Only the clone ZedGG made can be pulled from the page, and only
-    /// fast-forward: a diverged clone has to fail loudly.
+    /// Only the clone ZedGG made can be synced, and the script carries
+    /// every leg: fast-forward pull, reclone as the pull's fallback, and
+    /// the `ggo-emu` install guarded so a no-op sync skips it.
     #[test]
-    fn only_the_managed_clone_offers_an_update() {
+    fn only_the_managed_clone_offers_a_sync() {
         let mut env = ready_env();
         env.repo = Some(env.clone_dest.clone());
-        let request = env
-            .update_repo_request()
-            .expect("the managed clone is ours to move");
-        assert_eq!(request.bin, "git");
-        assert_eq!(request.args, vec!["pull", "--ff-only"]);
-        assert_eq!(
-            request.cwd, env.clone_dest,
-            "the pull runs in the clone, not the home directory"
+        let request = env.sync_request().expect("the managed clone is ours to move");
+        assert_eq!(request.bin, "sh");
+        assert_eq!(request.cwd, env.home, "a reclone leg needs a cwd that survives it");
+        let script = &request.args[1];
+        assert!(script.contains("pull --ff-only"), "fast-forward first: {script}");
+        assert!(
+            script.contains("|| { rm -rf") && script.contains("git clone"),
+            "reclone only as the pull's fallback: {script}"
+        );
+        assert!(
+            script.contains("cargo install --locked --path")
+                && script.contains("tools/ggo-emu"),
+            "the installed ggo-emu follows the synced source: {script}"
+        );
+        assert!(
+            script.contains("\"$pre\" != \"$post\""),
+            "a sync that moved nothing must not spend minutes reinstalling: {script}"
+        );
+        assert!(
+            script.contains(&format!("'{}'", env.clone_dest.display())),
+            "the clone path is quoted for the shell: {script}"
         );
 
-        // A checkout the user maintains is not ours to pull.
+        // A checkout the user maintains is not ours to pull or delete.
         env.repo = Some(PathBuf::from("/repo"));
-        assert!(env.update_repo_request().is_none());
+        assert!(env.sync_request().is_none());
         assert!(!env.repo_is_managed_clone());
 
-        // No git, nothing to pull with.
+        // No git, nothing to sync with.
         env.repo = Some(env.clone_dest.clone());
         env.git = false;
-        assert!(env.update_repo_request().is_none());
+        assert!(env.sync_request().is_none());
 
-        // And no repo at all is nothing to update.
+        // And no repo at all is nothing to sync.
         let bare = HardwareEnv {
             git: true,
             ..Default::default()
         };
         assert!(
-            bare.update_repo_request().is_none(),
+            bare.sync_request().is_none(),
             "an unset repo must not match an unset clone destination"
         );
-    }
-
-    /// A force reclone deletes the managed clone and clones it fresh,
-    /// under the same gate as the update: never on a user's checkout.
-    #[test]
-    fn force_reclone_removes_then_clones_the_managed_clone_only() {
-        let mut env = ready_env();
-        env.repo = Some(env.clone_dest.clone());
-        let requests = env
-            .force_reclone_requests()
-            .expect("the managed clone is ours to replace");
-        let dest = env.clone_dest.to_string_lossy().into_owned();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].bin, "rm");
-        assert_eq!(requests[0].args, vec!["-rf".to_string(), dest.clone()]);
-        assert_eq!(requests[1].bin, "git");
-        assert_eq!(
-            requests[1].args,
-            vec!["clone".to_string(), GGO_REPO_URL.to_string(), dest]
-        );
-        assert_eq!(
-            requests[1].cwd, env.home,
-            "the clone runs from home: its destination is gone by then"
-        );
-
-        env.repo = Some(PathBuf::from("/repo"));
-        assert!(
-            env.force_reclone_requests().is_none(),
-            "a user's checkout is never deleted"
-        );
-
-        env.repo = Some(env.clone_dest.clone());
-        env.git = false;
-        assert!(env.force_reclone_requests().is_none());
     }
 
     // ------------------------------------------------- flash progress

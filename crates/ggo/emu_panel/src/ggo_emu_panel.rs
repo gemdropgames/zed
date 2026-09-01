@@ -901,54 +901,34 @@ impl EmuPanel {
         );
     }
 
-    /// "Update GGO repo": pull the latest GGO source into the clone this
-    /// fork manages, so the board gets built from current source.
+    /// "Sync GGO repo": bring the clone this fork manages to the GGO
+    /// remote's head -- pulling, or recloning when the pull cannot
+    /// fast-forward -- and reinstall `ggo-emu` from the synced source.
     ///
     /// This moves the clone toward its ORIGIN, not toward the emulator:
-    /// `emu_commit` was frozen when ZedGG itself was compiled, so a pull
+    /// `emu_commit` was frozen when ZedGG itself was compiled, so a sync
     /// closes the gap only when the clone is the side that is behind.
     ///
     /// Goes through the same runner the installs use, which streams into
     /// the same console and re-probes when it ends -- so the page shows
-    /// the pulled commit without a Re-check.
-    pub fn update_ggo_repo(&mut self, cx: &mut Context<Self>) {
+    /// the synced commit without a Re-check.
+    pub fn sync_ggo_repo(&mut self, cx: &mut Context<Self>) {
         self.refresh_root(cx);
         self.invalidate_hardware();
         let env = self.hardware_env_cached();
-        let Some(request) = env.update_repo_request() else {
+        let Some(request) = env.sync_request() else {
             self.report_failure(
-                "only the GGO clone ZedGG manages can be updated from here".to_string(),
+                "only the GGO clone ZedGG manages can be synced from here".to_string(),
                 cx,
             );
             return;
         };
-        // Like a setup run, `git pull` announces none of `ggo-diag`'s
-        // phases, so it gets the console rather than a timeline.
+        // Like a setup run, git and `cargo install` announce none of
+        // `ggo-diag`'s phases, so it gets the console rather than a
+        // timeline.
         self.start_board_run(
             vec![request],
-            "updating the GGO repo".to_string(),
-            hardware::FlashProgress::steps(Vec::new()),
-            cx,
-        );
-    }
-
-    /// "Force reclone GGO repo": delete the managed clone and clone it
-    /// fresh, for when a pull cannot fix it. Same runner, same console,
-    /// same re-probe as an update.
-    pub fn force_reclone_ggo_repo(&mut self, cx: &mut Context<Self>) {
-        self.refresh_root(cx);
-        self.invalidate_hardware();
-        let env = self.hardware_env_cached();
-        let Some(requests) = env.force_reclone_requests() else {
-            self.report_failure(
-                "only the GGO clone ZedGG manages can be recloned from here".to_string(),
-                cx,
-            );
-            return;
-        };
-        self.start_board_run(
-            requests,
-            "recloning the GGO repo".to_string(),
+            "syncing the GGO repo".to_string(),
             hardware::FlashProgress::steps(Vec::new()),
             cx,
         );
