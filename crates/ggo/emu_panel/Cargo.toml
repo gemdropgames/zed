@@ -32,6 +32,11 @@ ggo-emu-core.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO -- S4's Re-run entry hands the run it just ingested to that panel
 ggo_common.workspace = true # GGO -- shared `default_db_path` + the child-process runner, also with the charts/emerald panels
 ggo_world_panel.workspace = true # GGO -- S4's "Emulate this world" saves that panel's doc and reuses its world-path rule
+# GGO -- `diag_db::{clone_runs, device_perf_run_id}`: after a PASS, the flash
+# pulls its own run's telemetry out of ggo-diag's `~/.ggo/diag.db` and looks
+# up the local perf run to open. Same crate (and same two functions) the
+# charts panel's device-run rail clones through.
+ggo-worldlib.workspace = true
 gpui.workspace = true
 image.workspace = true
 log.workspace = true # GGO -- R6: the cpal stream-error callback runs on a realtime audio thread, so it reports rather than panics

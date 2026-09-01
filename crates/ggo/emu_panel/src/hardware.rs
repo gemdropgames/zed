@@ -493,6 +493,22 @@ pub fn parse_stage(line: &str) -> Option<Stage> {
     None
 }
 
+/// The diag run id from `ggo-diag`'s `[db] run <id>: …` persistence line --
+/// the TEXT key everything about the finished hardware run is looked up by,
+/// including its perf data once `diag_db::clone_runs` has copied that into
+/// `~/.ggo/ggo_ide.db` under `run.label`.
+///
+/// NOT the `[db] device run <n> (…)` line printed beside it: that `<n>` is
+/// an INTEGER id in `diag.db`'s own perf tables, a different id space from
+/// both this one and the local `run.id` the charts panel opens. The
+/// `"[db] run "` prefix is what keeps the two apart, so it is matched
+/// whole rather than by a looser "starts with `[db]`" test.
+pub fn parse_db_run_id(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("[db] run ")?;
+    let (id, _) = rest.split_once(':')?;
+    Some(id.trim().to_string())
+}
+
 /// The phases a flash announces, in order. Pre-seeding them is what
 /// lets the page answer "how much is left" before the run gets there;
 /// the list is a hint, not a contract -- an unannounced phase is
@@ -568,6 +584,12 @@ pub struct FlashProgress {
     rows: Vec<PhaseRow>,
     diag_steps: Vec<DiagStep>,
     verdict: Option<bool>,
+    /// The run `ggo-diag` recorded this flash under, from its `[db] run …`
+    /// line (see [`parse_db_run_id`]). `None` for a run that recorded
+    /// nothing -- a setup or `git pull` run, a flash that died before the
+    /// Report phase, or a `ggo-diag` too old to print the line -- and that
+    /// is what the page's post-PASS hop to the run's report keys off.
+    pub diag_run_id: Option<String>,
 }
 
 impl FlashProgress {
@@ -603,6 +625,7 @@ impl FlashProgress {
                 .collect(),
             diag_steps: Vec::new(),
             verdict: None,
+            diag_run_id: None,
         }
     }
 
@@ -675,6 +698,13 @@ impl FlashProgress {
     /// Fold one output line in. Unrecognised lines move nothing -- they
     /// are the log's business.
     pub fn apply(&mut self, line: &str, at: Duration) {
+        // Before the stage guard, because the persistence line is not a
+        // stage: it moves no phase, it only names the run. First match
+        // wins -- one run records itself once, and a second `[db] run`
+        // line could only be a later run's, which is not this timeline's.
+        if self.diag_run_id.is_none() {
+            self.diag_run_id = parse_db_run_id(line);
+        }
         let Some(stage) = parse_stage(line) else {
             return;
         };
@@ -1387,6 +1417,59 @@ mod tests {
         assert_eq!(parse_stage(""), None);
         assert_eq!(parse_stage("warning: something"), None);
         assert_eq!(parse_stage("<-- component ppu: ok luts=123"), None);
+    }
+
+    /// The persistence line names the run everything about the finished
+    /// flash is keyed by. The `[db] device run …` line beside it is a
+    /// DIFFERENT id space (the perf `run` table's INTEGER id) and must not
+    /// be mistaken for it.
+    #[test]
+    fn parse_db_run_id_reads_ggo_diags_db_line() {
+        assert_eq!(
+            parse_db_run_id(
+                "[db] run 20260831T120000Z-abc123def0: 450 uart lines, 180 frames -> /home/x/.ggo/diag.db"
+            ),
+            Some("20260831T120000Z-abc123def0".to_string())
+        );
+        assert_eq!(
+            parse_db_run_id(
+                "[db] device run 7 (device:slop_battle): 180/180 FRAME packets -> diag.db"
+            ),
+            None
+        );
+        assert_eq!(parse_db_run_id("RESULT: PASS"), None);
+    }
+
+    /// The timeline carries the run id the transcript announced, so the
+    /// retired run still knows which report to open. A line that names no
+    /// run leaves it alone, and the first one wins.
+    #[test]
+    fn a_flash_remembers_the_run_ggo_diag_recorded_it_under() {
+        let mut progress = FlashProgress::flash();
+        assert_eq!(progress.diag_run_id, None);
+        progress.apply("==> Report", Duration::from_secs(1));
+        assert_eq!(progress.diag_run_id, None, "a phase names no run");
+        progress.apply(
+            "[db] run 20260831T120000Z-abc123def0: 450 uart lines, 180 frames -> /x/diag.db",
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            progress.diag_run_id.as_deref(),
+            Some("20260831T120000Z-abc123def0")
+        );
+        progress.apply(
+            "[db] run 20260901T000000Z-later00000: 1 uart lines, 0 frames -> /x/diag.db",
+            Duration::from_secs(3),
+        );
+        assert_eq!(
+            progress.diag_run_id.as_deref(),
+            Some("20260831T120000Z-abc123def0"),
+            "the first line is this run's; a second belongs to another"
+        );
+        assert!(
+            FlashProgress::steps(Vec::new()).diag_run_id.is_none(),
+            "a setup run records nothing"
+        );
     }
 
     #[test]

@@ -94,11 +94,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ggo_worldlib::charts::reports::diag_db;
 use gpui::{
-    AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseMoveEvent, Pixels, Render,
-    RenderImage, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
-    actions, div, point, px, size,
+    AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
+    MouseMoveEvent, Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Subscription,
+    Task, WeakEntity, Window, actions, div, point, px, size,
 };
 use project::ProjectPath;
 use ui::Tooltip;
@@ -363,6 +364,14 @@ pub struct EmuPanel {
     /// test that ran a real cart to completion would write a `run` row
     /// into the developer's actual database.
     db_path_override: Option<PathBuf>,
+    /// Test hook: pull a flashed run's rows out of THIS `diag.db` rather
+    /// than `~/.ggo/diag.db`. `ggo_charts_panel`'s `diag_db_path_override`,
+    /// same name and same reason; separate from `db_path_override` because
+    /// the two are files owned by two different tools (see
+    /// `ggo_common::default_diag_db_path`). Load-bearing for the same
+    /// reason as its neighbour: without it the post-flash hop would read
+    /// the developer's real database in a test.
+    diag_db_path_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
     /// The cart the file explorer last routed here, as a project-relative
     /// `/`-separated path. `None` until something is clicked.
@@ -497,6 +506,15 @@ pub struct EmuPanel {
     /// The last run's timeline and total, kept after the run ends so the
     /// page can still show what happened.
     last_flash: Option<(hardware::FlashProgress, Duration)>,
+    /// The window a started flash should open its report in --
+    /// [`Self::charts_for_run`]'s analog for the board, and armed for the
+    /// same reason: the run ends on a background task with no `Window` of
+    /// its own, and focusing a dock needs one.
+    ///
+    /// Armed only by [`Self::flash_to_board_with`] (the one entry that HAS
+    /// a window) and taken by the next [`Self::start_board_run`], so a
+    /// setup or `git pull` run never inherits a flash's arming.
+    flash_charts_window: Option<AnyWindowHandle>,
     /// The last hardware probe. `None` re-probes on the next ask.
     hardware: Option<hardware::HardwareEnv>,
     /// The world stem (`worlds/arena`) the next flash bakes in as the
@@ -584,6 +602,7 @@ impl EmuPanel {
             workspace,
             root_override: None,
             db_path_override: None,
+            diag_db_path_override: None,
             project_root: None,
             selected: None,
             run_generation: 0,
@@ -624,6 +643,7 @@ impl EmuPanel {
             proc_streamer: ggo_common::system_proc_streamer(),
             flash: None,
             last_flash: None,
+            flash_charts_window: None,
             hardware: None,
             flash_world: None,
         }
@@ -748,6 +768,12 @@ impl EmuPanel {
         // The gap is the page's to explain, not a status line's -- see
         // above; [`Self::flash_plan`]'s error names it either way.
         if let Ok((request, what, progress)) = self.flash_plan(&env, rebuild_gateware, cx) {
+            // Arm the "open this flash's report when it passes" for the run
+            // about to start. Here rather than in `start_board_run`, which
+            // also serves the windowless setup/pull runs -- and only on the
+            // branch that actually starts one, so a flash blocked by a
+            // missing prerequisite leaves no arming behind.
+            self.flash_charts_window = Some(window.window_handle());
             self.start_board_run(vec![request], what, progress, cx);
         }
     }
@@ -883,6 +909,24 @@ impl EmuPanel {
     ) {
         let console = self.console.get_or_insert_with(uart::UartLog::new).clone();
         let streamer = self.proc_streamer.clone();
+        // Taken, not read: this run spends the arming whatever it is, so a
+        // flash that recorded nothing cannot leave one for the next setup
+        // run to fire on. A run started without a window (setup, `git
+        // pull`, a test) simply has none, which is the hop's off switch.
+        let charts_window = self.flash_charts_window.take();
+        // Resolved here, on the thread the overrides live on: ggo-diag's
+        // own file to clone the flashed run out of, and ours to clone it
+        // into. `None` only when no home directory resolves at all, which
+        // is the one case with no report to open and nothing to say.
+        let report_dbs = self
+            .diag_db_path_override
+            .clone()
+            .or_else(ggo_common::default_diag_db_path)
+            .zip(
+                self.db_path_override
+                    .clone()
+                    .or_else(ggo_common::default_db_path),
+            );
         self.status = None;
         self.status_is_error = false;
         self.console_expanded = true;
@@ -964,6 +1008,36 @@ impl EmuPanel {
                     });
                     this.status_is_error = false;
                     cx.notify();
+                    // Only a PASS gets a report: a run that never reached a
+                    // verdict is a setup run, and a failed one has no
+                    // telemetry worth opening. The id comes off the retired
+                    // timeline, which is where `retire_flash` just put it.
+                    let Some(diag_run_id) = (match passed {
+                        Some(true) => this
+                            .last_flash
+                            .as_ref()
+                            .and_then(|(progress, _)| progress.diag_run_id.clone()),
+                        _ => None,
+                    }) else {
+                        return;
+                    };
+                    // A SEPARATE, detached task rather than an `await` out
+                    // here: `retire_flash` above dropped the `FlashRun`
+                    // that owns the handle to the task this closure is
+                    // running on, and a dropped `Task` is cancelled at its
+                    // next suspension point -- so anything awaited after
+                    // this line would silently never resume.
+                    cx.spawn(async move |this, cx| {
+                        Self::open_flashed_run_report(
+                            this,
+                            cx,
+                            diag_run_id,
+                            charts_window,
+                            report_dbs,
+                        )
+                        .await;
+                    })
+                    .detach();
                 })
                 .ok();
             }
@@ -989,6 +1063,88 @@ impl EmuPanel {
             flash.progress.fail(elapsed);
         }
         self.last_flash = Some((flash.progress, elapsed));
+    }
+
+    /// Open the charts item on the report for the run `ggo-diag` just
+    /// recorded -- the board's half of the emulator's "every stopped run
+    /// routes to its generated report" (see [`Self::charts_for_run`]).
+    ///
+    /// The rows have to be CLONED first: `~/.ggo/diag.db` is another
+    /// tool's file and nothing here may read it as a peer
+    /// (`ggo_charts_panel::history`'s module doc has the whole rule), so
+    /// `clone_runs` copies this run into our own `ggo_ide.db` and
+    /// `device_perf_run_id` then translates ggo-diag's TEXT run id into the
+    /// INTEGER `run.id` the charts panel opens by -- two different id
+    /// spaces, which is why the translation is a db lookup and not a cast.
+    ///
+    /// Every way this can come up empty leaves the PASS status exactly as
+    /// it is: a flash whose boot captured no telemetry, a `ggo-diag` old
+    /// enough to have written none, or a database that would not read are
+    /// all "there is no report to open", not "the flash went wrong". The
+    /// unexpected ones are logged rather than shown, because the run the
+    /// user asked for did succeed.
+    async fn open_flashed_run_report(
+        this: WeakEntity<Self>,
+        cx: &mut AsyncApp,
+        diag_run_id: String,
+        window: Option<AnyWindowHandle>,
+        report_dbs: Option<(PathBuf, PathBuf)>,
+    ) {
+        // No window means this run was not a flash (a setup run, a pull, a
+        // test) -- and focusing a dock needs one either way.
+        let (Some(window), Some((diag_db_path, ide_db_path))) = (window, report_dbs) else {
+            return;
+        };
+        // BLOCKING: both calls spin their own current-thread tokio runtime,
+        // the rule `ggo_charts_panel::history::load` carries too -- so they
+        // run on the background executor and never on the UI thread.
+        let local_id = cx
+            .background_spawn(async move {
+                // Never created, only read: `clone_runs` opens it through
+                // `ggo_db::open_existing`, and a machine whose ggo-diag has
+                // recorded nothing has no file at all.
+                if !diag_db_path.exists() {
+                    return None;
+                }
+                if let Err(e) = diag_db::clone_runs(&diag_db_path, &ide_db_path) {
+                    log::warn!("flashed run {diag_run_id}: could not clone its rows: {e}");
+                    return None;
+                }
+                match diag_db::device_perf_run_id(&ide_db_path, &diag_run_id) {
+                    Ok(local_id) => local_id,
+                    Err(e) => {
+                        log::warn!("flashed run {diag_run_id}: could not resolve its report: {e}");
+                        None
+                    }
+                }
+            })
+            .await;
+        let Some(local_id) = local_id else {
+            return;
+        };
+        let Some(workspace) = this
+            .read_with(cx, |this, _cx| this.workspace.clone())
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        window
+            .update(cx, |_root, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        ggo_charts_panel::open_charts_item(
+                            workspace,
+                            window,
+                            cx,
+                            |charts, _window, cx| {
+                                charts.open_run(local_id, cx);
+                            },
+                        );
+                    })
+                    .ok();
+            })
+            .ok();
     }
 
     /// The run to draw: the one in flight, else the last one to end.
@@ -6469,6 +6625,194 @@ mod tests {
                 console.lines()
             );
         });
+    }
+
+    /// The run id the scripted transcript announces, and the one the
+    /// seeded `diag.db` records that flash under.
+    const FLASHED_RUN: &str = "20260831T120000Z-abc123def0";
+
+    /// A `diag.db` holding one finished device run WITH telemetry: the
+    /// `runs` row `ggo-diag` writes, plus the `cart`/`run`/`frame` rows its
+    /// `perf_run_id` points at -- exactly what `diag_db::clone_runs` pulls
+    /// across into our own database.
+    fn seed_flashed_run(diag_db: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(diag_db).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
+                 hostname, state, verdict) VALUES (?1, '2026-08-31T12:00:00Z', 'main', \
+                 'abc123', 'v1.2.3', 'test-host', 'done', 'PASS')",
+                [FLASHED_RUN],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO cart(name) VALUES ('device:slop_battle')",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO run (cart_id, started_at, frames, frame_budget_cycles) \
+                 SELECT id, '2026-08-31T12:00:02Z', 2, 555549 FROM cart \
+                 WHERE name = 'device:slop_battle'",
+                (),
+            )
+            .await
+            .unwrap();
+            let perf_id = conn.last_insert_rowid();
+            for (n, cyc) in [(0i64, 111_000i64), (1, 999_999)] {
+                conn.execute(
+                    "INSERT INTO frame (run_id, n, cyc, wire_total, over_budget) \
+                     VALUES (?1, ?2, ?3, 0, ?4)",
+                    (perf_id, n, cyc, i64::from(cyc > 555_549)),
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE runs SET perf_run_id = ?2 WHERE id = ?1",
+                (FLASHED_RUN, perf_id),
+            )
+            .await
+            .unwrap();
+        });
+    }
+
+    /// The board's half of "every finished run routes to its report": a
+    /// flash that passes AND said which run it recorded opens the reports
+    /// page on that run's telemetry, cloned out of ggo-diag's own file.
+    #[gpui::test]
+    async fn test_a_passing_flash_opens_the_report_for_the_run_it_recorded(
+        cx: &mut TestAppContext,
+    ) {
+        // The clone and the lookup each block on their own tokio runtime.
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let diag_db = dir.path().join("diag.db");
+        let ide_db = dir.path().join("ggo_ide.db");
+        seed_flashed_run(&diag_db);
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let charts = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
+            workspace
+                .items_of_type::<ggo_charts_panel::ChartsItem>(cx)
+                .next()
+                .expect("open_charts_item adds the reports tab")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        // Both panels on the SAME temp database, so the run this flash
+        // clones is the run the charts panel then reads back.
+        charts.update(cx, |charts, _cx| {
+            charts.set_db_path_override(ide_db.clone());
+        });
+
+        let (streamer, _calls) = fake_streamer(
+            vec![
+                "==> Report",
+                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proc_streamer = streamer;
+            panel.db_path_override = Some(ide_db.clone());
+            panel.diag_db_path_override = Some(diag_db.clone());
+            // What `flash_to_board_with` arms. `start_board_run` is entered
+            // directly because that entry re-probes this machine for a
+            // board first, and a test has none.
+            panel.flash_charts_window = Some(window.window_handle());
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.status.as_deref(), Some("flashing: PASS"));
+            assert_eq!(
+                panel
+                    .last_flash
+                    .as_ref()
+                    .and_then(|(progress, _)| progress.diag_run_id.as_deref()),
+                Some(FLASHED_RUN),
+                "the retired timeline remembers which run this flash was"
+            );
+            assert!(
+                panel.flash_charts_window.is_none(),
+                "the arming is spent by the run that consumed it"
+            );
+        });
+        assert!(
+            diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
+                .expect("our own database reads")
+                .is_some(),
+            "the flash cloned its own telemetry into the db the page reads"
+        );
+        assert!(
+            cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
+            "a passing flash must hand focus to the report it just produced"
+        );
+    }
+
+    /// A run that never named a run id -- a `ggo-diag` too old to print the
+    /// line, and every setup or `git pull` run -- passes without hopping.
+    /// Nothing is cloned and nothing is opened; the PASS stands alone.
+    #[gpui::test]
+    async fn test_a_run_that_recorded_nothing_opens_no_report(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let diag_db = dir.path().join("diag.db");
+        let ide_db = dir.path().join("ggo_ide.db");
+        // Telemetry IS sitting there to be found: what is missing is the
+        // transcript line saying which run this flash was.
+        seed_flashed_run(&diag_db);
+
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proc_streamer = streamer;
+            panel.db_path_override = Some(ide_db.clone());
+            panel.diag_db_path_override = Some(diag_db.clone());
+            panel.flash_charts_window = Some(window.window_handle());
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.status.as_deref(), Some("flashing: PASS"));
+            assert!(!panel.status_is_error);
+            assert!(
+                panel
+                    .last_flash
+                    .as_ref()
+                    .and_then(|(progress, _)| progress.diag_run_id.as_deref())
+                    .is_none(),
+                "the transcript named no run"
+            );
+        });
+        assert!(
+            !ide_db.exists(),
+            "with no run to look up, nothing is cloned and no report opens"
+        );
     }
 
     /// The run's shape, not just its last line: every announced phase

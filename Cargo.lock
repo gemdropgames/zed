@@ -7640,6 +7640,7 @@ dependencies = [
  "editor",
  "ggo-db",
  "ggo-emu-core",
+ "ggo-worldlib",
  "ggo_charts_panel",
  "ggo_common",
  "ggo_emu_remote",
