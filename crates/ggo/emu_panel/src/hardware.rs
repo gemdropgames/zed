@@ -221,7 +221,7 @@ impl HardwareEnv {
         let script = format!(
             "set -e\n\
              pre=$(git -C {repo} rev-parse HEAD 2>/dev/null || echo none)\n\
-             git -C {repo} pull --ff-only || {{ rm -rf {repo}; git clone {url} {repo}; }}\n\
+             git -C {repo} pull --ff-only --progress || {{ rm -rf {repo}; git clone --progress {url} {repo}; }}\n\
              post=$(git -C {repo} rev-parse HEAD)\n\
              if [ \"$pre\" != \"$post\" ] || ! command -v ggo-emu >/dev/null; then\n\
                  cargo install --locked --path {repo}/tools/ggo-emu\n\

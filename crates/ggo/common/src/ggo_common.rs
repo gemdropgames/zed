@@ -863,8 +863,6 @@ pub fn run_streaming(request: &ProcRequest, on_line: LineSink) -> ProcCapture {
 /// [`run_capture_async`] does and for the same reason: that is what makes
 /// a cancel button possible.
 pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> ProcCapture {
-    use smol::io::{AsyncBufReadExt, BufReader};
-    use smol::stream::StreamExt;
     use std::sync::Mutex;
 
     let mut command = session_command(request);
@@ -928,22 +926,8 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
     // EOF neither of its arms matches and it falls through to
     // `Poll::Pending` for good. `zip` of two self-terminating drains is
     // the combinator that actually finishes.
-    let drain_out = async {
-        if let Some(stdout) = stdout {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next().await {
-                take(line);
-            }
-        }
-    };
-    let drain_err = async {
-        if let Some(stderr) = stderr {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Some(line) = lines.next().await {
-                take(line);
-            }
-        }
-    };
+    let drain_out = drain_split_lines(stdout, &take);
+    let drain_err = drain_split_lines(stderr, &take);
     smol::future::zip(drain_out, drain_err).await;
 
     let (mut on_line, mut lines) = match shared.into_inner() {
@@ -967,6 +951,49 @@ pub async fn run_streaming_async(request: &ProcRequest, on_line: LineSink) -> Pr
         }
     };
     ProcCapture { ok, lines }
+}
+
+/// Drain `reader`, handing every line to `take` as it lands. Lines are
+/// terminated by `\n` OR `\r`: `git --progress` and friends redraw a
+/// progress line in place with bare carriage returns and only ever end
+/// it with a newline, so a `\n`-only split would sit silent through an
+/// entire clone -- the exact minutes a live console exists for. Blank
+/// lines are dropped (each `\r\n` would otherwise produce one).
+async fn drain_split_lines<R: smol::io::AsyncRead + Unpin>(
+    reader: Option<R>,
+    take: &impl Fn(Result<String, std::io::Error>),
+) {
+    use smol::io::AsyncReadExt;
+    let Some(mut reader) = reader else {
+        return;
+    };
+    let mut pending = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => {
+                for &byte in &chunk[..read] {
+                    if byte == b'\n' || byte == b'\r' {
+                        if !pending.is_empty() {
+                            take(Ok(String::from_utf8_lossy(&pending).into_owned()));
+                            pending.clear();
+                        }
+                    } else {
+                        pending.push(byte);
+                    }
+                }
+            }
+            Err(e) => {
+                take(Err(e));
+                break;
+            }
+        }
+    }
+    // A child that dies mid-line still gets its last words recorded.
+    if !pending.is_empty() {
+        take(Ok(String::from_utf8_lossy(&pending).into_owned()));
+    }
 }
 
 /// The runner's command, with the child put in its own session so the
@@ -1269,6 +1296,34 @@ mod tests {
             sorted,
             vec!["one", "three", "two"],
             "and lands in the capture"
+        );
+    }
+
+    /// Progress redraws -- `git --progress` style bare `\r` updates --
+    /// stream as they land instead of sitting silent until the final
+    /// newline, and `\r\n` produces no phantom blank line.
+    #[test]
+    fn run_streaming_splits_on_carriage_returns() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let seen = seen.clone();
+            Box::new(move |line: &str| seen.lock().unwrap().push(line.to_string())) as LineSink
+        };
+        let request = ProcRequest::new(
+            "sh",
+            std::env::temp_dir(),
+            vec![
+                "-c".to_string(),
+                r"printf 'a 1%%\ra 2%%\r\na done\n'".to_string(),
+            ],
+        );
+        let capture = run_streaming(&request, sink);
+        assert!(capture.ok);
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["a 1%", "a 2%", "a done"],
+            "each redraw is its own line, with no blank between \\r and \\n"
         );
     }
 

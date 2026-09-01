@@ -56,8 +56,15 @@ pub(crate) fn page_layout(
         // A setup run announces no phases, so its progress has no rows
         // and the page stays on its console.
         timeline: progress.is_some_and(|progress| !progress.rows().is_empty()),
-        log_open: log_toggled
-            .unwrap_or_else(|| progress.is_some_and(|progress| progress.verdict() == Some(false))),
+        // Open for a failure (the child's words ARE the diagnosis) and
+        // for any run without a timeline (sync, installs): the console is
+        // the only place such a run shows life, and a closed one reads as
+        // a hang.
+        log_open: log_toggled.unwrap_or_else(|| {
+            progress.is_some_and(|progress| {
+                progress.rows().is_empty() || progress.verdict() == Some(false)
+            })
+        }),
     }
 }
 
@@ -615,12 +622,39 @@ impl Render for HardwareSetupItem {
                             }),
                     )
                     // The timeline already names the running phase; the
-                    // status row is what a run without one has.
+                    // status row is what a run without one has. While such
+                    // a run is in flight it gets a spinner and the clock --
+                    // the spin is also what repaints the page between
+                    // output lines, exactly as on the timeline's running
+                    // phase, so the clock actually moves.
                     .when(!layout.timeline, |el| {
                         el.children(status.map(|status| {
-                            Label::new(status)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .when(busy, |el| {
+                                    el.child(
+                                        Icon::new(IconName::ArrowCircle)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent)
+                                            .with_rotate_animation(2),
+                                    )
+                                })
+                                .child(
+                                    Label::new(status)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .children(
+                                    progress
+                                        .as_ref()
+                                        .filter(|_| busy)
+                                        .map(|(_, elapsed)| {
+                                            Label::new(elapsed_text(*elapsed))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                        }),
+                                )
                         }))
                     }),
             )
@@ -806,6 +840,17 @@ mod tests {
         progress.apply("==> Flash board", Duration::from_secs(0));
         progress.apply("RESULT: FAIL", Duration::from_secs(1));
         assert!(page_layout(true, Some(&progress), None).log_open);
+    }
+
+    /// A run with no timeline -- a sync, an install -- opens the log
+    /// while it runs: the console is the only place it shows life, and a
+    /// closed one reads as a hang.
+    #[test]
+    fn a_run_without_a_timeline_opens_the_log() {
+        let progress = FlashProgress::steps(Vec::new());
+        let layout = page_layout(true, Some(&progress), None);
+        assert!(!layout.timeline, "no phases to draw");
+        assert!(layout.log_open, "the console is the run's only face");
     }
 
     /// ...but the reader closing it wins. Auto-open is a default, not a
