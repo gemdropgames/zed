@@ -455,11 +455,24 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         };
         return Ok(serde_json::to_value(payload).expect("HwEnvPayload serializes"));
     }
+    // Also pre-window: cancelling touches the panel's own state and no
+    // window at all, and a flash in flight is exactly when demanding a
+    // window would deny the caller the one thing this tool is for.
+    if let Cmd::FlashCancel { .. } = cmd {
+        let panel = target.panel.ok_or("no emu panel open in this workspace")?;
+        let cancelled = panel
+            .update(cx, |p, cx| p.remote_flash_cancel(cx))
+            .map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({ "cancelled": cancelled }));
+    }
 
     let window = target.window.ok_or("workspace has no window (headless test?)")?;
 
     match cmd {
-        Cmd::Status | Cmd::FlashStatus { .. } | Cmd::HwEnv { .. } => unreachable!("handled above"),
+        Cmd::Status
+        | Cmd::FlashStatus { .. }
+        | Cmd::HwEnv { .. }
+        | Cmd::FlashCancel { .. } => unreachable!("handled above"),
         Cmd::Start { cart, .. } => {
             let root = std::path::PathBuf::from(&target.root);
             // No panel yet? Open it — a remote start must not need a
@@ -599,13 +612,6 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 })
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "closed": closed }))
-        }
-        Cmd::FlashCancel { .. } => {
-            let panel = target.panel.ok_or("no emu panel open in this workspace")?;
-            let cancelled = panel
-                .update(cx, |p, cx| p.remote_flash_cancel(cx))
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({ "cancelled": cancelled }))
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;

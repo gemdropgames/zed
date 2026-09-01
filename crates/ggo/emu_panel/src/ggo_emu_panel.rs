@@ -7558,10 +7558,26 @@ mod tests {
         let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, _cx| {
             let env = panel.remote_env();
-            // A temp worktree with no repo, no binaries on PATH: nothing
-            // is ready, and every reason has a code.
-            assert!(!env.ready);
-            assert!(env.missing.iter().all(|m| !m.code.is_empty() && !m.label.is_empty()), "{env:?}");
+            // Asserted against the payload's own internal consistency,
+            // never against this host: the probe reads the real PATH,
+            // HOME and /dev, so a developer machine with the board
+            // toolchain installed is as valid an answer as a bare one.
+            assert_eq!(env.ready, env.missing.is_empty(), "{env:?}");
+            for missing in &env.missing {
+                assert!(
+                    matches!(
+                        missing.code.as_str(),
+                        "project" | "repo" | "diag" | "emd" | "port" | "port_stuck"
+                    ),
+                    "{env:?}"
+                );
+                assert!(!missing.label.is_empty(), "{env:?}");
+            }
+            let blames_the_port = env
+                .missing
+                .iter()
+                .any(|missing| missing.code == "port" || missing.code == "port_stuck");
+            assert_eq!(env.ports.is_empty(), blames_the_port, "{env:?}");
         });
     }
 
