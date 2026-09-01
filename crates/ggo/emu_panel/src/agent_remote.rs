@@ -291,6 +291,15 @@ fn world_value(panel: &WeakEntity<EmuPanel>, cx: &mut AsyncApp) -> serde_json::V
     }
 }
 
+/// A framebuffer as the wire carries it; the bridge turns it into PNG.
+fn bgra_reply(width: u32, height: u32, bgra: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "width": width,
+        "height": height,
+        "bgra_base64": base64::engine::general_purpose::STANDARD.encode(bgra),
+    })
+}
+
 /// The workspace's emu panel, opening one if none is up.
 ///
 /// Two steps on purpose: the panel is opened INSIDE a `workspace.update`
@@ -416,7 +425,9 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::OpenReport { workspace, .. }
         | Cmd::CloseReport { workspace, .. }
         | Cmd::HwEnv { workspace }
-        | Cmd::FlashCancel { workspace } => workspace.clone(),
+        | Cmd::FlashCancel { workspace }
+        | Cmd::Screenshot { workspace }
+        | Cmd::Uart { workspace, .. } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -465,6 +476,20 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             .map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({ "cancelled": cancelled }));
     }
+    // Pre-window too, and deliberately not lock-step: both read state the
+    // panel already holds, so an agent can look at a free-running run
+    // without stepping it or stopping it.
+    if let Cmd::Screenshot { .. } = cmd {
+        let panel = target.panel.ok_or("no emu panel open in this workspace")?;
+        let shot = panel.update(cx, |p, _| p.remote_screenshot()).map_err(|e| e.to_string())?;
+        let (width, height, bgra) = shot.ok_or("no frame presented yet — start a run first")?;
+        return Ok(bgra_reply(width, height, &bgra));
+    }
+    if let Cmd::Uart { tail, .. } = &cmd {
+        let panel = target.panel.ok_or("no emu panel open in this workspace")?;
+        let lines = panel.update(cx, |p, _| p.remote_uart(*tail)).map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({ "lines": lines }));
+    }
 
     let window = target.window.ok_or("workspace has no window (headless test?)")?;
 
@@ -472,7 +497,9 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         Cmd::Status
         | Cmd::FlashStatus { .. }
         | Cmd::HwEnv { .. }
-        | Cmd::FlashCancel { .. } => unreachable!("handled above"),
+        | Cmd::FlashCancel { .. }
+        | Cmd::Screenshot { .. }
+        | Cmd::Uart { .. } => unreachable!("handled above"),
         Cmd::Start { cart, .. } => {
             let root = std::path::PathBuf::from(&target.root);
             // No panel yet? Open it — a remote start must not need a
@@ -559,11 +586,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             let mut reply = serde_json::json!({ "frame": frame, "world": world });
             if screenshot {
                 if let Ok(Some((w, h, bgra))) = panel.update(cx, |p, _| p.remote_screenshot()) {
-                    reply["screenshot"] = serde_json::json!({
-                        "width": w,
-                        "height": h,
-                        "bgra_base64": base64::engine::general_purpose::STANDARD.encode(&bgra),
-                    });
+                    reply["screenshot"] = bgra_reply(w, h, &bgra);
                 }
             }
             Ok(reply)

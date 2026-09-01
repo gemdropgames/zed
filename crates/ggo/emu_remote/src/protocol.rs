@@ -61,6 +61,17 @@ pub enum Cmd {
     HwEnv { workspace: Option<String> },
     /// Cancel the flash in flight. The reply says whether there was one.
     FlashCancel { workspace: Option<String> },
+    /// The last presented frame, `{width, height, bgra_base64}`. Works
+    /// whether the run is lock-step or free-running.
+    Screenshot { workspace: Option<String> },
+    /// The newest `tail` lines of the run's UART/console log (whole log
+    /// when omitted). Readable mid-run: `Stop` is not the only way to
+    /// see a panic.
+    Uart {
+        workspace: Option<String>,
+        #[serde(default)]
+        tail: Option<usize>,
+    },
 }
 
 /// What a flash runs with. Every field has a default, so `{}` is a
@@ -368,6 +379,22 @@ mod tests {
         assert!(json.contains(r#""missing":[{"code":"port","label":"no serial device"}]"#), "{json}");
         let back: HwEnvPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn screenshot_and_uart_requests_round_trip() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"screenshot"}"#).unwrap().cmd,
+            Cmd::Screenshot { workspace: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"uart","tail":40}"#).unwrap().cmd,
+            Cmd::Uart { workspace: None, tail: Some(40) }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"uart"}"#).unwrap().cmd,
+            Cmd::Uart { workspace: None, tail: None }
+        );
     }
 
     #[test]

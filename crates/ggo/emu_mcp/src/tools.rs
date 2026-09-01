@@ -66,6 +66,12 @@ pub fn tool_list() -> Value {
               "screenshot": { "type": "boolean" }
           })) },
         { "name": "emu_stop", "description": "End the lock-step run; returns the cart's uart log.", "inputSchema": with(json!({})) },
+        { "name": "emu_screenshot",
+          "description": "The emulator's last presented frame as PNG (320×240), for a lock-step or free-running run. Errors when no frame has been presented yet.",
+          "inputSchema": with(json!({})) },
+        { "name": "emu_uart",
+          "description": "The run's UART/console log, newest `tail` lines (default all), readable while the run is live — read a panic without stopping the run.",
+          "inputSchema": with(json!({ "tail": { "type": "number", "description": "Newest N lines (omit for the whole log)" } })) },
         { "name": "hw_flash",
           "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=115200, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
           "inputSchema": with(json!({
@@ -161,6 +167,24 @@ fn arg_i64(args: &Value, key: &str) -> Option<i64> {
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
 }
 
+/// A `{width, height, bgra_base64}` reply as MCP PNG image content.
+fn image_content(shot: &Value) -> Result<Value, String> {
+    use base64::Engine as _;
+    let bgra = base64::engine::general_purpose::STANDARD
+        .decode(shot["bgra_base64"].as_str().unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    let (width, height) = (
+        shot["width"].as_u64().unwrap_or(0) as u32,
+        shot["height"].as_u64().unwrap_or(0) as u32,
+    );
+    let png = bgra_to_png(width, height, &bgra)?;
+    Ok(json!({
+        "type": "image",
+        "mimeType": "image/png",
+        "data": base64::engine::general_purpose::STANDARD.encode(&png),
+    }))
+}
+
 /// Execute one MCP tool call. Returns (content, is_error).
 pub fn call_tool(name: &str, args: &Value, dir: &Path, connect: &Connector) -> (Vec<Value>, bool) {
     match call_tool_inner(name, args, dir, connect) {
@@ -225,26 +249,26 @@ fn call_tool_inner(
             let shot = data.as_object_mut().and_then(|o| o.remove("screenshot"));
             let mut content = vec![json!({ "type": "text", "text": data.to_string() })];
             if let Some(shot) = shot {
-                use base64::Engine as _;
-                let bgra = base64::engine::general_purpose::STANDARD
-                    .decode(shot["bgra_base64"].as_str().unwrap_or_default())
-                    .map_err(|e| e.to_string())?;
-                let (w, h) = (
-                    shot["width"].as_u64().unwrap_or(0) as u32,
-                    shot["height"].as_u64().unwrap_or(0) as u32,
-                );
-                let png = bgra_to_png(w, h, &bgra)?;
-                content.push(json!({
-                    "type": "image",
-                    "mimeType": "image/png",
-                    "data": base64::engine::general_purpose::STANDARD.encode(&png),
-                }));
+                content.push(image_content(&shot)?);
             }
             Ok(content)
         }
         "emu_stop" => {
             let data = send(&session.socket, Cmd::Stop { workspace }, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "emu_screenshot" => {
+            let data = send(&session.socket, Cmd::Screenshot { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![image_content(&data)?])
+        }
+        "emu_uart" => {
+            let tail = arg_i64(args, "tail").filter(|n| *n > 0).map(|n| n as usize);
+            let data = send(&session.socket, Cmd::Uart { workspace, tail }, CALL_TIMEOUT, connect)?;
+            let lines: Vec<String> = data["lines"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            Ok(vec![json!({ "type": "text", "text": lines.join("\n") })])
         }
         "hw_flash" => {
             // A zero or negative knob is a caller mistake, not a request
@@ -602,6 +626,30 @@ mod tests {
     }
 
     #[test]
+    fn emu_screenshot_is_png_and_emu_uart_is_joined_lines() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let bgra = base64::engine::general_purpose::STANDARD.encode([0u8, 0, 255, 255]);
+        let connect = move |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            if line.contains(r#""cmd":"screenshot""#) {
+                Ok(format!(
+                    r#"{{"id":1,"ok":true,"data":{{"width":1,"height":1,"bgra_base64":"{bgra}"}}}}"#
+                ))
+            } else {
+                assert!(line.contains(r#""cmd":"uart""#) && line.contains(r#""tail":2"#), "{line}");
+                Ok(r#"{"id":1,"ok":true,"data":{"lines":["a","panic: b"]}}"#.to_string())
+            }
+        };
+        let (content, is_err) = call_tool("emu_screenshot", &json!({}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert_eq!(content[0]["type"], "image");
+        let (content, is_err) = call_tool("emu_uart", &json!({"tail": 2}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert_eq!(content[0]["text"], "a\npanic: b");
+    }
+
+    #[test]
     fn host_error_becomes_tool_error() {
         let dir = tempfile::tempdir().unwrap();
         fake_session(dir.path(), std::process::id());
@@ -627,6 +675,8 @@ mod tests {
                 "emu_start",
                 "emu_next_frame",
                 "emu_stop",
+                "emu_screenshot",
+                "emu_uart",
                 "hw_flash",
                 "hw_flash_status",
                 "hw_flash_wait",
