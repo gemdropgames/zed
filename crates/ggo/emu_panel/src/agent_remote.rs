@@ -430,13 +430,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             Some(panel) => panel
                 .update(cx, |p, _| p.remote_flash_status())
                 .map_err(|e| e.to_string())?,
-            None => ggo_emu_remote::protocol::FlashStatusPayload {
-                active: false,
-                phase: None,
-                verdict: None,
-                diag_run_id: None,
-                perf_run_id: None,
-            },
+            None => ggo_emu_remote::protocol::FlashStatusPayload::idle(),
         };
         return Ok(serde_json::to_value(payload).expect("FlashStatusPayload serializes"));
     }

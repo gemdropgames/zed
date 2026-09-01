@@ -716,6 +716,14 @@ pub struct FlashProgress {
     /// Report phase, or a `ggo-diag` too old to print the line -- and that
     /// is what the page's post-PASS hop to the run's report keys off.
     pub diag_run_id: Option<String>,
+    /// What is being run ("flashing worlds/chase_cam"), for the agent
+    /// socket, which has no timeline header to read it off.
+    pub what: Option<String>,
+    /// The run's transcript on disk, once [`create_run_log`] made one.
+    pub transcript: Option<PathBuf>,
+    /// Why the run failed, in the child's own words. Set when the run
+    /// is retired, never while it is live.
+    pub failure: Option<String>,
 }
 
 impl FlashProgress {
@@ -749,9 +757,7 @@ impl FlashProgress {
                     finished: None,
                 })
                 .collect(),
-            diag_steps: Vec::new(),
-            verdict: None,
-            diag_run_id: None,
+            ..Self::default()
         }
     }
 

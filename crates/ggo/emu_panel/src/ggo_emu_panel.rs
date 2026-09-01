@@ -965,9 +965,10 @@ impl EmuPanel {
         &mut self,
         requests: Vec<ggo_common::ProcRequest>,
         what: String,
-        progress: hardware::FlashProgress,
+        mut progress: hardware::FlashProgress,
         cx: &mut Context<Self>,
     ) {
+        progress.what = Some(what.clone());
         let console = self.console.get_or_insert_with(uart::UartLog::new).clone();
         let streamer = self.proc_streamer.clone();
         // Taken, not read: this run spends the arming whatever it is, so a
@@ -997,6 +998,7 @@ impl EmuPanel {
         // paper trail.
         let run_log = hardware::create_run_log(&what).map(|(path, file)| {
             console.push_line(format!("transcript: {}", path.display()));
+            progress.transcript = Some(path);
             std::sync::Arc::new(std::sync::Mutex::new(file))
         });
         hardware::set_board_run_in_flight(true);
@@ -1065,7 +1067,7 @@ impl EmuPanel {
                         let reason = hardware::failure_reason(&capture);
                         log_run_line(&run_log, &format!("== {what} failed: {reason}"));
                         this.update(cx, |this, cx| {
-                            this.retire_flash(false);
+                            this.retire_flash(Some(reason.clone()));
                             // A failed run can still have changed the machine
                             // -- a reclone whose `rm -rf` landed before the
                             // clone failed has no repo at all any more, and a
@@ -1090,7 +1092,7 @@ impl EmuPanel {
                             }
                         ),
                     );
-                    this.retire_flash(true);
+                    this.retire_flash(None);
                     // Installing something changes what this machine can do.
                     this.invalidate_hardware();
                     this.status = Some(match passed {
@@ -1145,13 +1147,14 @@ impl EmuPanel {
     /// Move a finished run's timeline off the live slot and onto the
     /// page: which phase a run died in is exactly what someone looks at
     /// after it ends, and dropping it with the task loses that.
-    fn retire_flash(&mut self, passed: bool) {
+    fn retire_flash(&mut self, failure: Option<String>) {
         let Some(mut flash) = self.flash.take() else {
             return;
         };
         let elapsed = flash.started.elapsed();
-        if !passed {
+        if let Some(reason) = failure {
             flash.progress.fail(elapsed);
+            flash.progress.failure = Some(reason);
         }
         // Cloned, not moved: `FlashRun` has a `Drop` impl (the rescue
         // guard), and a type with one cannot be moved out of field-wise.
@@ -3293,14 +3296,62 @@ impl EmuPanel {
     /// What the board run in flight -- else the last one to end -- has
     /// reached, for `agent_remote`'s `flash_status`.
     pub(crate) fn remote_flash_status(&self) -> ggo_emu_remote::protocol::FlashStatusPayload {
-        let progress = self.flash_progress().map(|(progress, _elapsed)| progress);
+        use ggo_emu_remote::protocol::{FlashDiagStep, FlashPhase};
+        let Some((progress, elapsed)) = self.flash_progress() else {
+            return ggo_emu_remote::protocol::FlashStatusPayload::idle();
+        };
+        let progress = Some(progress);
         let diag_run_id = progress.and_then(|progress| progress.diag_run_id.clone());
+        let phases = progress
+            .map(|progress| {
+                progress
+                    .rows()
+                    .iter()
+                    .map(|row| FlashPhase {
+                        title: row.title.clone(),
+                        state: match row.state {
+                            hardware::PhaseState::Pending => "pending",
+                            hardware::PhaseState::Running => "running",
+                            hardware::PhaseState::Done => "done",
+                            hardware::PhaseState::Failed => "failed",
+                        }
+                        .to_string(),
+                        elapsed_s: row.elapsed(elapsed).as_secs(),
+                        detail: row.detail.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let diag_steps = progress
+            .map(|progress| {
+                progress
+                    .diag_steps()
+                    .iter()
+                    .map(|step| FlashDiagStep { index: step.index.clone(), status: step.status.clone() })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // ponytail: last 20 lines; the transcript path is there for the rest.
+        let lines = self.console_lines();
+        let console_tail = lines[lines.len().saturating_sub(20)..].to_vec();
         ggo_emu_remote::protocol::FlashStatusPayload {
             active: self.is_flashing(),
             phase: progress
                 .and_then(|progress| progress.current_phase())
                 .map(|row| row.title.clone()),
             verdict: progress.and_then(|progress| progress.verdict()),
+            what: progress.and_then(|progress| progress.what.clone()),
+            elapsed_s: Some(elapsed.as_secs()),
+            detail: progress
+                .and_then(|progress| progress.running())
+                .and_then(|row| row.detail.clone()),
+            phases,
+            diag_steps,
+            failure: progress.and_then(|progress| progress.failure.clone()),
+            transcript: progress
+                .and_then(|progress| progress.transcript.as_ref())
+                .map(|path| path.display().to_string()),
+            console_tail,
             // Resolved by the post-PASS hop, not here: translating
             // ggo-diag's run id blocks on two database calls, and this
             // runs on the UI thread. Handed out only when the stash names
@@ -7597,6 +7648,75 @@ mod tests {
                 status.perf_run_id,
                 Some(local_id),
                 "the same report id the page opened"
+            );
+        });
+    }
+
+    /// The running context an agent polls for: what is being flashed,
+    /// every phase with its state, the boot stage and budget the running
+    /// phase is on, the console tail -- and, once it dies, why.
+    #[gpui::test]
+    async fn test_remote_flash_status_carries_the_runs_context(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (streamer, _calls) = fake_streamer(
+            vec![
+                "==> Flash board",
+                "==> Boot verify (UART)",
+                "  [boot] boot-rom alive — next: SD ready (10s budget)",
+                "diag step 1: running",
+                "boot stalled at boot-rom alive",
+                "RESULT: FAIL",
+            ],
+            false,
+        );
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        panel.update(cx, |panel, cx| {
+            panel.proc_streamer = streamer;
+            panel.start_board_run(
+                vec![request],
+                "flashing worlds/arena".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let status = panel.remote_flash_status();
+            assert!(!status.active);
+            assert_eq!(status.what.as_deref(), Some("flashing worlds/arena"));
+            assert_eq!(status.verdict, Some(false));
+            assert_eq!(status.failure.as_deref(), Some("boot stalled at boot-rom alive"));
+            assert!(status.elapsed_s.is_some());
+            let states: Vec<(&str, &str)> = status
+                .phases
+                .iter()
+                .map(|phase| (phase.title.as_str(), phase.state.as_str()))
+                .collect();
+            assert_eq!(
+                states,
+                [
+                    ("Flash board", "done"),
+                    ("Boot verify (UART)", "failed"),
+                    ("Report", "pending"),
+                ],
+                "the skipped phases dropped out, the pending one stayed: {states:?}"
+            );
+            assert_eq!(
+                status.phases[1].detail.as_deref(),
+                Some("boot: boot-rom alive — next: SD ready (10s budget)"),
+                "the boot stage and its budget ride on the phase that ran it"
+            );
+            assert_eq!(
+                (status.diag_steps[0].index.as_str(), status.diag_steps[0].status.as_str()),
+                ("1", "running")
+            );
+            assert!(
+                status.console_tail.iter().any(|line| line == "RESULT: FAIL"),
+                "{:?}",
+                status.console_tail
             );
         });
     }

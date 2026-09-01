@@ -111,6 +111,76 @@ pub struct FlashStatusPayload {
     /// The cloned perf run id in ~/.ggo/ggo_ide.db, once the run passed
     /// and the clone resolved (same id the reports page opens).
     pub perf_run_id: Option<i64>,
+    /// What is being run, e.g. "flashing worlds/chase_cam".
+    #[serde(default)]
+    pub what: Option<String>,
+    /// Seconds since the run began (final total once it ended).
+    #[serde(default)]
+    pub elapsed_s: Option<u64>,
+    /// The running phase's sub-line: which component is placing, which
+    /// boot stage is up and the next stage's budget, which diag step runs.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Every phase of the run in order, pre-seeded with the ones still
+    /// to come -- "how much is left" as well as "where are we".
+    #[serde(default)]
+    pub phases: Vec<FlashPhase>,
+    /// Diagnostic-cart steps, latest status each.
+    #[serde(default)]
+    pub diag_steps: Vec<FlashDiagStep>,
+    /// Why the run failed, in ggo-diag's own words (the last line that
+    /// is not a progress banner). Only for a FAIL.
+    #[serde(default)]
+    pub failure: Option<String>,
+    /// The run's full transcript on disk (`~/.zed/logs/ggo-run-*.log`),
+    /// for when `console_tail` is not enough.
+    #[serde(default)]
+    pub transcript: Option<String>,
+    /// The newest console lines, oldest first.
+    #[serde(default)]
+    pub console_tail: Vec<String>,
+}
+
+/// One phase of a flash, as [`FlashStatusPayload::phases`] reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlashPhase {
+    pub title: String,
+    /// "pending" | "running" | "done" | "failed".
+    pub state: String,
+    /// How long the phase has taken so far (or took).
+    pub elapsed_s: u64,
+    /// The phase's newest sub-line, if it printed one.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// One diagnostic-cart step: `diag step <index>: <status>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlashDiagStep {
+    pub index: String,
+    /// "running" | "PASS" | "FAIL" | "info".
+    pub status: String,
+}
+
+impl FlashStatusPayload {
+    /// The "never ran" payload: every field but `active` absent.
+    pub fn idle() -> Self {
+        Self {
+            active: false,
+            phase: None,
+            verdict: None,
+            diag_run_id: None,
+            perf_run_id: None,
+            what: None,
+            elapsed_s: None,
+            detail: None,
+            phases: Vec::new(),
+            diag_steps: Vec::new(),
+            failure: None,
+            transcript: None,
+            console_tail: Vec::new(),
+        }
+    }
 }
 
 /// Parse one request line. Errors name the parse failure so the host can
@@ -206,32 +276,44 @@ mod tests {
     #[test]
     fn flash_status_payload_is_snake_case_on_the_wire() {
         let payload = FlashStatusPayload {
-            active: false,
+            active: true,
             phase: Some("Boot verify (UART)".to_string()),
-            verdict: Some(true),
+            verdict: None,
             diag_run_id: Some("20260831T120000Z-abc123def0".to_string()),
-            perf_run_id: Some(12),
+            perf_run_id: None,
+            what: Some("flashing worlds/chase_cam".to_string()),
+            elapsed_s: Some(95),
+            detail: Some("boot: SD ready — next: FAT32 mounted (10s budget)".to_string()),
+            phases: vec![
+                FlashPhase { title: "Flash board".into(), state: "done".into(), elapsed_s: 12, detail: None },
+                FlashPhase {
+                    title: "Boot verify (UART)".into(),
+                    state: "running".into(),
+                    elapsed_s: 4,
+                    detail: Some("boot: SD ready — next: FAT32 mounted (10s budget)".into()),
+                },
+                FlashPhase { title: "Report".into(), state: "pending".into(), elapsed_s: 0, detail: None },
+            ],
+            diag_steps: vec![FlashDiagStep { index: "1".into(), status: "PASS".into() }],
+            failure: None,
+            transcript: Some("/home/x/.zed/logs/ggo-run-20260901-132908-flashing.log".into()),
+            console_tail: vec!["  [boot] SD ready — next: FAT32 mounted (10s budget)".into()],
         };
         let json = serde_json::to_string(&payload).unwrap();
-        assert_eq!(
-            json,
-            r#"{"active":false,"phase":"Boot verify (UART)","verdict":true,"diag_run_id":"20260831T120000Z-abc123def0","perf_run_id":12}"#
-        );
+        assert!(json.contains(r#""elapsed_s":95"#), "{json}");
+        assert!(json.contains(r#""phases":[{"title":"Flash board","state":"done","elapsed_s":12,"detail":null}"#), "{json}");
+        assert!(json.contains(r#""diag_steps":[{"index":"1","status":"PASS"}]"#), "{json}");
         let back: FlashStatusPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
-        // Never ran: every field but `active` is absent-as-null.
-        let idle = serde_json::to_string(&FlashStatusPayload {
-            active: false,
-            phase: None,
-            verdict: None,
-            diag_run_id: None,
-            perf_run_id: None,
-        })
-        .unwrap();
-        assert_eq!(
-            idle,
-            r#"{"active":false,"phase":null,"verdict":null,"diag_run_id":null,"perf_run_id":null}"#
-        );
+    }
+
+    /// A host that predates the context fields still parses: the bridge
+    /// and the Zed build are installed separately.
+    #[test]
+    fn flash_status_payload_without_context_fields_is_the_idle_shape() {
+        let old = r#"{"active":false,"phase":null,"verdict":null,"diag_run_id":null,"perf_run_id":null}"#;
+        let back: FlashStatusPayload = serde_json::from_str(old).unwrap();
+        assert_eq!(back, FlashStatusPayload::idle());
     }
 
     #[test]
