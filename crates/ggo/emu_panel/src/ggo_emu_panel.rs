@@ -506,6 +506,15 @@ pub struct EmuPanel {
     /// The last run's timeline and total, kept after the run ends so the
     /// page can still show what happened.
     last_flash: Option<(hardware::FlashProgress, Duration)>,
+    /// The local `run.id` [`Self::last_flash`]'s run was cloned in as --
+    /// the report the post-PASS hop opened, remembered because the agent
+    /// socket is asked for it AFTER the fact and must not re-run two
+    /// blocking database calls on the UI thread to answer.
+    ///
+    /// Set by that hop (the only place the translation happens) and
+    /// cleared by every new board run, so it can never name a run other
+    /// than the one `last_flash` describes.
+    last_flash_perf_run: Option<i64>,
     /// The window a started flash should open its report in --
     /// [`Self::charts_for_run`]'s analog for the board, and armed for the
     /// same reason: the run ends on a background task with no `Window` of
@@ -643,6 +652,7 @@ impl EmuPanel {
             proc_streamer: ggo_common::system_proc_streamer(),
             flash: None,
             last_flash: None,
+            last_flash_perf_run: None,
             flash_charts_window: None,
             hardware: None,
             flash_world: None,
@@ -750,6 +760,29 @@ impl EmuPanel {
             cx.notify();
             return;
         }
+        // The gap a blocked flash leaves is the page's to explain, not a
+        // status line's -- see [`Self::start_flash`], whose error the
+        // button therefore drops.
+        self.start_flash(world, rebuild_gateware, window, cx).ok();
+    }
+
+    /// [`Self::flash_to_board_with`]'s start half, with the reason a
+    /// flash did not start RETURNED rather than left to the page.
+    ///
+    /// The button has a hardware page to read (a missing prerequisite is
+    /// a checklist with buttons there, not a one-line error) and so
+    /// ignores this; the agent socket has no page, so `flash_request`'s
+    /// "flashing needs a board: …" has to come back as its reply.
+    fn start_flash(
+        &mut self,
+        world: Option<&str>,
+        rebuild_gateware: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.is_flashing() {
+            return Err("a flash is already running".to_string());
+        }
         if let Some(world) = world {
             // Remembered, not merely used: the hardware page this opens
             // has flash buttons of its own, and they have to reach the
@@ -765,17 +798,15 @@ impl EmuPanel {
         // status row can carry neither, and "where did my flash go"
         // should have one answer.
         self.open_hardware_page(window, cx);
-        // The gap is the page's to explain, not a status line's -- see
-        // above; [`Self::flash_plan`]'s error names it either way.
-        if let Ok((request, what, progress)) = self.flash_plan(&env, rebuild_gateware, cx) {
-            // Arm the "open this flash's report when it passes" for the run
-            // about to start. Here rather than in `start_board_run`, which
-            // also serves the windowless setup/pull runs -- and only on the
-            // branch that actually starts one, so a flash blocked by a
-            // missing prerequisite leaves no arming behind.
-            self.flash_charts_window = Some(window.window_handle());
-            self.start_board_run(vec![request], what, progress, cx);
-        }
+        let (request, what, progress) = self.flash_plan(&env, rebuild_gateware, cx)?;
+        // Arm the "open this flash's report when it passes" for the run
+        // about to start. Here rather than in `start_board_run`, which
+        // also serves the windowless setup/pull runs -- and only after
+        // the plan succeeded, so a flash blocked by a missing
+        // prerequisite leaves no arming behind.
+        self.flash_charts_window = Some(window.window_handle());
+        self.start_board_run(vec![request], what, progress, cx);
+        Ok(())
     }
 
     /// The whole shape of the flash `env` would run: what to spawn, what
@@ -930,6 +961,9 @@ impl EmuPanel {
         self.status = None;
         self.status_is_error = false;
         self.console_expanded = true;
+        // This run is about to become `last_flash`; the previous run's
+        // report id must not outlive the timeline it belongs to.
+        self.last_flash_perf_run = None;
         let task = cx.spawn({
             let what = what.clone();
             async move |this, cx| {
@@ -1122,6 +1156,10 @@ impl EmuPanel {
         let Some(local_id) = local_id else {
             return;
         };
+        // Remembered before it is opened: `flash_status` over the agent
+        // socket answers with this rather than repeating the lookup.
+        this.update(cx, |this, _cx| this.last_flash_perf_run = Some(local_id))
+            .ok();
         let Some(workspace) = this
             .read_with(cx, |this, _cx| this.workspace.clone())
             .ok()
@@ -3146,6 +3184,44 @@ impl EmuPanel {
         match (&self.status_is_error, &self.status) {
             (true, Some(status)) => Err(status.clone()),
             _ => Ok(()),
+        }
+    }
+
+    /// Flash `world` to the board -- `agent_remote`'s `flash_world`, and
+    /// the same press the toolbar's "Flash now" is, page and report hop
+    /// included. The call RETURNS as soon as the run is spawned: a flash
+    /// is minutes (a gateware rebuild, twenty), so the caller polls
+    /// [`Self::remote_flash_status`] instead of holding the socket open.
+    ///
+    /// Unlike the button this never cancels: an agent asking to flash
+    /// while one is running has lost track of the board, and killing a
+    /// half-written flash on its behalf is not a reasonable reading of
+    /// "flash this world".
+    pub(crate) fn remote_flash(
+        &mut self,
+        world: Option<String>,
+        rebuild_gateware: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.start_flash(world.as_deref(), rebuild_gateware, window, cx)
+    }
+
+    /// What the board run in flight -- else the last one to end -- has
+    /// reached, for `agent_remote`'s `flash_status`.
+    pub(crate) fn remote_flash_status(&self) -> ggo_emu_remote::protocol::FlashStatusPayload {
+        let progress = self.flash_progress().map(|(progress, _elapsed)| progress);
+        ggo_emu_remote::protocol::FlashStatusPayload {
+            active: self.is_flashing(),
+            phase: progress
+                .and_then(|progress| progress.current_phase())
+                .map(|row| row.title.clone()),
+            verdict: progress.and_then(|progress| progress.verdict()),
+            diag_run_id: progress.and_then(|progress| progress.diag_run_id.clone()),
+            // Resolved by the post-PASS hop, not here: translating
+            // ggo-diag's run id blocks on two database calls, and this
+            // runs on the UI thread.
+            perf_run_id: self.last_flash_perf_run,
         }
     }
 
@@ -7100,6 +7176,122 @@ mod tests {
         // so the only thing being asserted here is that nothing ran.
         cx.run_until_parked();
         assert!(calls.lock().unwrap().is_empty(), "nothing was spawned");
+    }
+
+    /// The agent socket's flash gets the gap as an ERROR, not as a page:
+    /// there is nobody at the other end to read a checklist. Until then
+    /// its status is the honest "nothing has ever run here".
+    #[gpui::test]
+    async fn test_remote_flash_without_a_board_answers_with_the_reason(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec![], true);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        panel.update_in(cx, |panel, window, cx| {
+            let idle = panel.remote_flash_status();
+            assert!(!idle.active);
+            assert_eq!(
+                (idle.phase, idle.verdict, idle.diag_run_id, idle.perf_run_id),
+                (None, None, None, None),
+                "nothing has flashed in this panel yet"
+            );
+            // No project, no repo, no board -- the same gap the button
+            // draws as a checklist.
+            panel.root_override = None;
+            let err = panel
+                .remote_flash(Some("worlds/arena".to_string()), false, window, cx)
+                .expect_err("a machine with no board cannot flash");
+            assert!(err.starts_with("flashing needs a board"), "{err}");
+            assert!(!panel.is_flashing());
+        });
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty(), "nothing was spawned");
+    }
+
+    /// A remote flash while one is in flight is REFUSED, not treated as
+    /// the button's cancel: an agent that lost track of the board must
+    /// not kill a half-written flash by asking for another.
+    #[gpui::test]
+    async fn test_remote_flash_refuses_while_one_is_running(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+            let live = panel.remote_flash_status();
+            assert!(live.active && live.verdict.is_none(), "the run is in flight");
+            let err = panel
+                .remote_flash(None, false, window, cx)
+                .expect_err("one board, one flash");
+            assert_eq!(err, "a flash is already running");
+            assert!(panel.is_flashing(), "the running flash was left alone");
+        });
+    }
+
+    /// What the agent socket polls: a finished flash's phase, verdict,
+    /// ggo-diag run id, and the local report id its clone resolved to --
+    /// the last of which is remembered by the hop, never re-derived on
+    /// the UI thread.
+    #[gpui::test]
+    async fn test_remote_flash_status_reports_the_finished_run(cx: &mut TestAppContext) {
+        // The clone and the lookup each block on their own tokio runtime.
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let diag_db = dir.path().join("diag.db");
+        let ide_db = dir.path().join("ggo_ide.db");
+        seed_flashed_run(&diag_db);
+
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (streamer, _calls) = fake_streamer(
+            vec![
+                "==> Boot verify (UART)",
+                "==> Report",
+                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proc_streamer = streamer;
+            panel.db_path_override = Some(ide_db.clone());
+            panel.diag_db_path_override = Some(diag_db.clone());
+            panel.flash_charts_window = Some(window.window_handle());
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let local_id = diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
+            .expect("our own database reads")
+            .expect("the flash cloned its telemetry across");
+        panel.read_with(cx, |panel, _| {
+            let status = panel.remote_flash_status();
+            assert!(!status.active, "the run ended");
+            assert_eq!(
+                status.phase.as_deref(),
+                Some("Report"),
+                "the phase it got to, still named after the run ends"
+            );
+            assert_eq!(status.verdict, Some(true));
+            assert_eq!(status.diag_run_id.as_deref(), Some(FLASHED_RUN));
+            assert_eq!(
+                status.perf_run_id,
+                Some(local_id),
+                "the same report id the page opened"
+            );
+        });
     }
 
     /// The setup flow runs its steps in order and stops at the first

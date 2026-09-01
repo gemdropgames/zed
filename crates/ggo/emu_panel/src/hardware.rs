@@ -647,6 +647,19 @@ impl FlashProgress {
             .find(|row| row.state == PhaseState::Running)
     }
 
+    /// Where the run is, or -- once it has ended -- how far it got: the
+    /// running row, else the last one that started. What the page shows
+    /// as a highlighted line, and the only phase word a caller with no
+    /// page (the agent socket) can be given.
+    pub fn current_phase(&self) -> Option<&PhaseRow> {
+        self.running().or_else(|| {
+            self.rows
+                .iter()
+                .rev()
+                .find(|row| row.state != PhaseState::Pending)
+        })
+    }
+
     fn running_mut(&mut self) -> Option<&mut PhaseRow> {
         self.rows
             .iter_mut()

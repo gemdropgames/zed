@@ -291,6 +291,48 @@ fn world_value(panel: &WeakEntity<EmuPanel>, cx: &mut AsyncApp) -> serde_json::V
     }
 }
 
+/// The workspace's emu panel, opening one if none is up.
+///
+/// Two steps on purpose: the panel is opened INSIDE a `workspace.update`
+/// and then driven outside it, because the flash path reads the
+/// workspace itself (its root, and the world panel's open document) and
+/// would lease it twice from within.
+fn panel_or_open(
+    target_root: &str,
+    panel: Option<WeakEntity<EmuPanel>>,
+    workspace: Option<Entity<Workspace>>,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Result<WeakEntity<EmuPanel>, String> {
+    if let Some(panel) = panel {
+        return Ok(panel);
+    }
+    let workspace = workspace.ok_or("workspace vanished")?;
+    let panel = window
+        .update(cx, |_, window, app| {
+            workspace.update(app, |workspace, cx| {
+                crate::open_emu_item(workspace, window, cx, |_, _, _| {});
+                workspace
+                    .items_of_type::<crate::EmulatorItem>(cx)
+                    .next()
+                    .map(|item| item.read(cx).panel().downgrade())
+                    .ok_or_else(|| "emu panel did not open".to_string())
+            })
+        })
+        .map_err(|e| e.to_string())??;
+    // Registered here rather than left to the panel's own deferred
+    // `refresh_root`, so the very next `flash_status` finds it.
+    cx.update(|cx| {
+        if cx.try_global::<RemotePanels>().is_none() {
+            cx.set_global(RemotePanels::default());
+        }
+        cx.global_mut::<RemotePanels>()
+            .panels
+            .insert(target_root.to_string(), (panel.clone(), Some(window)));
+    });
+    Ok(panel)
+}
+
 async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value, String> {
     // Snapshot panels and live workspaces on the foreground.
     struct Target {
@@ -368,7 +410,9 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         Cmd::Status => unreachable!("handled above"),
         Cmd::Start { workspace, .. }
         | Cmd::NextFrame { workspace, .. }
-        | Cmd::Stop { workspace } => workspace.clone(),
+        | Cmd::Stop { workspace }
+        | Cmd::FlashWorld { workspace, .. }
+        | Cmd::FlashStatus { workspace } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -376,10 +420,29 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         .into_iter()
         .find(|t| t.root == target_root)
         .expect("resolve_workspace returned a member of keys");
+    // Answered before the window is demanded: a status read needs
+    // neither a window nor an open panel -- a workspace nobody has
+    // opened the emulator in has simply never flashed.
+    if let Cmd::FlashStatus { .. } = cmd {
+        let payload = match &target.panel {
+            Some(panel) => panel
+                .update(cx, |p, _| p.remote_flash_status())
+                .map_err(|e| e.to_string())?,
+            None => ggo_emu_remote::protocol::FlashStatusPayload {
+                active: false,
+                phase: None,
+                verdict: None,
+                diag_run_id: None,
+                perf_run_id: None,
+            },
+        };
+        return Ok(serde_json::to_value(payload).expect("FlashStatusPayload serializes"));
+    }
+
     let window = target.window.ok_or("workspace has no window (headless test?)")?;
 
     match cmd {
-        Cmd::Status => unreachable!("handled above"),
+        Cmd::Status | Cmd::FlashStatus { .. } => unreachable!("handled above"),
         Cmd::Start { cart, .. } => {
             let root = std::path::PathBuf::from(&target.root);
             // No panel yet? Open it — a remote start must not need a
@@ -474,6 +537,24 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 }
             }
             Ok(reply)
+        }
+        Cmd::FlashWorld { world, rebuild_gateware, .. } => {
+            // Like a remote boot, a remote flash must not need a human to
+            // have opened the emulator first -- the run needs a panel to
+            // live on, not a panel someone clicked.
+            let panel =
+                panel_or_open(&target_root, target.panel, target.workspace, window, cx)?;
+            // Returns as soon as the child is spawned: the reply says the
+            // flash STARTED, and `flash_status` says how it is going.
+            window
+                .update(cx, |_, window, app| {
+                    panel
+                        .update(app, |p, cx| p.remote_flash(world, rebuild_gateware, window, cx))
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                })
+                .map_err(|e| e.to_string())??;
+            Ok(serde_json::json!({ "started": true }))
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;

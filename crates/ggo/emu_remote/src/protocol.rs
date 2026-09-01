@@ -42,6 +42,17 @@ pub enum Cmd {
     },
     /// End the run; the reply carries the cart's uart log.
     Stop { workspace: Option<String> },
+    /// Start a hardware flash of `world` (stem, e.g. "worlds/chase_cam";
+    /// None = the project's default world). `rebuild_gateware` runs full
+    /// place-and-route (~20 min) instead of the cached bitstream.
+    FlashWorld {
+        workspace: Option<String>,
+        world: Option<String>,
+        #[serde(default)]
+        rebuild_gateware: bool,
+    },
+    /// Snapshot of the current/last flash.
+    FlashStatus { workspace: Option<String> },
 }
 
 /// One response line. `data` is command-specific JSON; `error` is set
@@ -77,6 +88,25 @@ pub struct WorkspaceStatus {
     pub paused: bool,
     /// Last delivered frame number.
     pub frame: u32,
+}
+
+/// `Cmd::FlashStatus`'s response payload: what the board run in flight
+/// (else the last one to end) reached. A flash outlives any single tool
+/// call -- a cached-gateware flash is minutes, a rebuild is twenty -- so
+/// the caller polls this rather than waiting on `FlashWorld`'s reply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlashStatusPayload {
+    /// A flash is currently running.
+    pub active: bool,
+    /// Current (or final) phase label, e.g. "Boot verify (UART)".
+    pub phase: Option<String>,
+    /// Some(true)=PASS, Some(false)=FAIL, None=still running / never ran.
+    pub verdict: Option<bool>,
+    /// ggo-diag's TEXT run id, once its `[db] run …` line streamed by.
+    pub diag_run_id: Option<String>,
+    /// The cloned perf run id in ~/.ggo/ggo_ide.db, once the run passed
+    /// and the clone resolved (same id the reports page opens).
+    pub perf_run_id: Option<i64>,
 }
 
 /// Parse one request line. Errors name the parse failure so the host can
@@ -119,6 +149,69 @@ mod tests {
         let req = parse_request(r#"{"id":1,"cmd":"next_frame"}"#).unwrap();
         assert_eq!(req.cmd, Cmd::NextFrame { workspace: None, buttons: vec![], screenshot: false });
         assert_eq!(parse_request(r#"{"id":2,"cmd":"status"}"#).unwrap().cmd, Cmd::Status);
+    }
+
+    #[test]
+    fn flash_requests_round_trip_and_default_to_the_cached_gateware() {
+        let req = parse_request(
+            r#"{"id":1,"cmd":"flash_world","world":"worlds/chase_cam","rebuild_gateware":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.cmd,
+            Cmd::FlashWorld {
+                workspace: None,
+                world: Some("worlds/chase_cam".to_string()),
+                rebuild_gateware: false,
+            }
+        );
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        // Omitted is the safe half of the pair: a place-and-route is
+        // twenty minutes, and no caller gets one by forgetting a field.
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"flash_world"}"#).unwrap().cmd,
+            Cmd::FlashWorld { workspace: None, world: None, rebuild_gateware: false }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"flash_status"}"#).unwrap().cmd,
+            Cmd::FlashStatus { workspace: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"flash_status","workspace":"/w"}"#).unwrap().cmd,
+            Cmd::FlashStatus { workspace: Some("/w".to_string()) }
+        );
+    }
+
+    #[test]
+    fn flash_status_payload_is_snake_case_on_the_wire() {
+        let payload = FlashStatusPayload {
+            active: false,
+            phase: Some("Boot verify (UART)".to_string()),
+            verdict: Some(true),
+            diag_run_id: Some("20260831T120000Z-abc123def0".to_string()),
+            perf_run_id: Some(12),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert_eq!(
+            json,
+            r#"{"active":false,"phase":"Boot verify (UART)","verdict":true,"diag_run_id":"20260831T120000Z-abc123def0","perf_run_id":12}"#
+        );
+        let back: FlashStatusPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, payload);
+        // Never ran: every field but `active` is absent-as-null.
+        let idle = serde_json::to_string(&FlashStatusPayload {
+            active: false,
+            phase: None,
+            verdict: None,
+            diag_run_id: None,
+            perf_run_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            idle,
+            r#"{"active":false,"phase":null,"verdict":null,"diag_run_id":null,"perf_run_id":null}"#
+        );
     }
 
     #[test]
