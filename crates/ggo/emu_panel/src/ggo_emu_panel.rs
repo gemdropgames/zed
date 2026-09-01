@@ -3417,6 +3417,17 @@ impl EmuPanel {
         Ok(())
     }
 
+    /// Resume like `toggle_pause` does from a paused run.
+    pub(crate) fn remote_resume(&mut self) -> Result<(), String> {
+        self.auto_paused = false;
+        let session = self.remote_session()?;
+        if !session.is_paused() {
+            return Err("not paused".to_string());
+        }
+        session.resume();
+        Ok(())
+    }
+
     /// While paused, queue exactly `frames` more frames.
     pub(crate) fn remote_step(&self, frames: u32) -> Result<(), String> {
         let session = self.remote_session()?;
@@ -7578,6 +7589,15 @@ mod tests {
                 .iter()
                 .any(|missing| missing.code == "port" || missing.code == "port_stuck");
             assert_eq!(env.ports.is_empty(), blames_the_port, "{env:?}");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_resume_only_resumes_a_paused_run(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.remote_resume().is_err(), "no run live");
         });
     }
 

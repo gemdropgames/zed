@@ -342,6 +342,64 @@ fn panel_or_open(
     Ok(panel)
 }
 
+/// Boot `cart` on the workspace's emu panel, reopening a closed panel,
+/// and register it with `RemotePanels` so later commands find it.
+///
+/// Shared by lock-step `Start` and free-running `Run`: the difference
+/// between them is what they do to the run AFTER it boots, never how it
+/// boots.
+async fn boot_cart(
+    panel: Option<WeakEntity<EmuPanel>>,
+    workspace: Option<Entity<Workspace>>,
+    target_root: &str,
+    cart: String,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Result<WeakEntity<EmuPanel>, String> {
+    let root = PathBuf::from(target_root);
+    // No panel yet? Open it — a remote boot must not need a human to
+    // have clicked a cart first.
+    let booted: Result<WeakEntity<EmuPanel>, String> = match (panel, workspace) {
+        (Some(panel), _) => window
+            .update(cx, |_, window, app| {
+                panel
+                    .update(app, |p, cx| p.remote_boot(cart, root, window, cx))
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                    .map(|()| panel.clone())
+            })
+            .map_err(|e| e.to_string())?,
+        (None, Some(workspace)) => window
+            .update(cx, |_, window, app| {
+                workspace.update(app, |workspace, cx| {
+                    let mut outcome = Err("emu panel did not open".to_string());
+                    crate::open_emu_item(workspace, window, cx, |panel, window, cx| {
+                        outcome = panel.remote_boot(cart, root, window, cx);
+                    });
+                    let panel = workspace
+                        .items_of_type::<crate::EmulatorItem>(cx)
+                        .next()
+                        .map(|item| item.read(cx).panel().downgrade());
+                    outcome.and_then(|()| panel.ok_or("emu panel did not open".to_string()))
+                })
+            })
+            .map_err(|e| e.to_string())?,
+        (None, None) => Err("workspace vanished".to_string()),
+    };
+    let panel = booted?;
+    // Register the booted panel deterministically — its own deferred
+    // refresh_root registration only fires on later UI activity.
+    cx.update(|cx| {
+        if cx.try_global::<RemotePanels>().is_none() {
+            cx.set_global(RemotePanels::default());
+        }
+        cx.global_mut::<RemotePanels>()
+            .panels
+            .insert(target_root.to_string(), (panel.clone(), Some(window)));
+    });
+    Ok(panel)
+}
+
 async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value, String> {
     // Snapshot panels and live workspaces on the foreground.
     struct Target {
@@ -427,7 +485,10 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::HwEnv { workspace }
         | Cmd::FlashCancel { workspace }
         | Cmd::Screenshot { workspace }
-        | Cmd::Uart { workspace, .. } => workspace.clone(),
+        | Cmd::Uart { workspace, .. }
+        | Cmd::Run { workspace, .. }
+        | Cmd::Pause { workspace }
+        | Cmd::Resume { workspace } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -490,6 +551,18 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         let lines = panel.update(cx, |p, _| p.remote_uart(*tail)).map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({ "lines": lines }));
     }
+    // Pausing and resuming likewise only touch the live session, so they
+    // stay usable on a run whose window the caller cannot supply.
+    if matches!(cmd, Cmd::Pause { .. } | Cmd::Resume { .. }) {
+        let panel = target.panel.ok_or("no run live — emu_run or emu_start first")?;
+        let paused = matches!(cmd, Cmd::Pause { .. });
+        panel
+            .update(cx, |p, _| if paused { p.remote_pause() } else { p.remote_resume() })
+            .map_err(|e| e.to_string())??;
+        let (frame, running, _) =
+            panel.update(cx, |p, _| p.remote_progress()).map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({ "paused": paused, "frame": frame, "running": running }));
+    }
 
     let window = target.window.ok_or("workspace has no window (headless test?)")?;
 
@@ -499,51 +572,12 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::HwEnv { .. }
         | Cmd::FlashCancel { .. }
         | Cmd::Screenshot { .. }
-        | Cmd::Uart { .. } => unreachable!("handled above"),
+        | Cmd::Uart { .. }
+        | Cmd::Pause { .. }
+        | Cmd::Resume { .. } => unreachable!("handled above"),
         Cmd::Start { cart, .. } => {
-            let root = std::path::PathBuf::from(&target.root);
-            // No panel yet? Open it — a remote start must not need a
-            // human to have clicked a cart first.
-            let booted: Result<WeakEntity<EmuPanel>, String> = match (target.panel, target.workspace)
-            {
-                (Some(panel), _) => window
-                    .update(cx, |_, window, app| {
-                        panel
-                            .update(app, |p, cx| p.remote_boot(cart, root, window, cx))
-                            .map_err(|e| e.to_string())
-                            .and_then(|r| r)
-                            .map(|()| panel.clone())
-                    })
-                    .map_err(|e| e.to_string())?,
-                (None, Some(workspace)) => window
-                    .update(cx, |_, window, app| {
-                        workspace.update(app, |workspace, cx| {
-                            let mut outcome = Err("emu panel did not open".to_string());
-                            crate::open_emu_item(workspace, window, cx, |panel, window, cx| {
-                                outcome = panel.remote_boot(cart, root, window, cx);
-                            });
-                            let panel = workspace
-                                .items_of_type::<crate::EmulatorItem>(cx)
-                                .next()
-                                .map(|item| item.read(cx).panel().downgrade());
-                            outcome.and_then(|()| panel.ok_or("emu panel did not open".to_string()))
-                        })
-                    })
-                    .map_err(|e| e.to_string())?,
-                (None, None) => Err("workspace vanished".to_string()),
-            };
-            let panel = booted?;
-            // Register the booted panel deterministically — its own
-            // deferred refresh_root registration only fires on later UI
-            // activity.
-            cx.update(|cx| {
-                if cx.try_global::<RemotePanels>().is_none() {
-                    cx.set_global(RemotePanels::default());
-                }
-                cx.global_mut::<RemotePanels>()
-                    .panels
-                    .insert(target_root.clone(), (panel.clone(), Some(window)));
-            });
+            let panel =
+                boot_cart(target.panel, target.workspace, &target_root, cart, window, cx).await?;
             // Arm the cart's inspection tap FIRST — only remote lock-step
             // runs serialize; the panel's own Run button never arms it.
             panel
@@ -569,6 +603,15 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 world = world_value(&panel, cx);
             }
             Ok(serde_json::json!({ "started": true, "frame": frame, "world": world }))
+        }
+        Cmd::Run { cart, .. } => {
+            // The same boot as `Start`, minus the tap and the pause: this
+            // run plays itself, and a delivered frame is all the reply
+            // has to prove.
+            let panel =
+                boot_cart(target.panel, target.workspace, &target_root, cart, window, cx).await?;
+            let frame = await_frame(&panel, cx, 1, std::time::Duration::from_secs(5)).await?;
+            Ok(serde_json::json!({ "started": true, "frame": frame, "running": true }))
         }
         Cmd::NextFrame { buttons, screenshot, .. } => {
             let panel = target.panel.ok_or("no run in lock-step — emu_start first")?;

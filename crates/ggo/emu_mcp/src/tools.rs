@@ -72,6 +72,11 @@ pub fn tool_list() -> Value {
         { "name": "emu_uart",
           "description": "The run's UART/console log, newest `tail` lines (default all), readable while the run is live — read a panic without stopping the run.",
           "inputSchema": with(json!({ "tail": { "type": "number", "description": "Newest N lines (omit for the whole log)" } })) },
+        { "name": "emu_run",
+          "description": "Boot a cart free-running in the Zed emulator panel — the panel's own Run button, no lock-step. The game plays itself; watch it with emu_screenshot and emu_uart, pause with emu_pause. Use emu_start instead when you need to drive input frame by frame. Pack first: cart_pack (or emd pack-ggo).",
+          "inputSchema": with(json!({ "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. target/ggo-emulate/worlds-arena.ggo" } })) },
+        { "name": "emu_pause", "description": "Pause the live run at the next frame boundary. Returns {paused, frame, running}.", "inputSchema": with(json!({})) },
+        { "name": "emu_resume", "description": "Resume a paused run. Returns {paused, frame, running}.", "inputSchema": with(json!({})) },
         { "name": "hw_flash",
           "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=115200, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
           "inputSchema": with(json!({
@@ -269,6 +274,19 @@ fn call_tool_inner(
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
             Ok(vec![json!({ "type": "text", "text": lines.join("\n") })])
+        }
+        "emu_run" => {
+            let cart = arg_str(args, "cart").ok_or("missing required argument: cart")?;
+            let data = send(&session.socket, Cmd::Run { workspace, cart }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "emu_pause" => {
+            let data = send(&session.socket, Cmd::Pause { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "emu_resume" => {
+            let data = send(&session.socket, Cmd::Resume { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "hw_flash" => {
             // A zero or negative knob is a caller mistake, not a request
@@ -650,6 +668,21 @@ mod tests {
     }
 
     #[test]
+    fn emu_run_requires_a_cart_and_forwards_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""cmd":"run""#) && line.contains(r#""cart":"a.ggo""#), "{line}");
+            Ok(r#"{"id":1,"ok":true,"data":{"started":true,"frame":1,"running":true}}"#.to_string())
+        };
+        let (content, is_err) = call_tool("emu_run", &json!({}), dir.path(), &connect);
+        assert!(is_err && content[0]["text"].as_str().unwrap().contains("cart"), "{content:?}");
+        let (content, is_err) = call_tool("emu_run", &json!({"cart": "a.ggo"}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""running":true"#));
+    }
+
+    #[test]
     fn host_error_becomes_tool_error() {
         let dir = tempfile::tempdir().unwrap();
         fake_session(dir.path(), std::process::id());
@@ -677,6 +710,9 @@ mod tests {
                 "emu_stop",
                 "emu_screenshot",
                 "emu_uart",
+                "emu_run",
+                "emu_pause",
+                "emu_resume",
                 "hw_flash",
                 "hw_flash_status",
                 "hw_flash_wait",

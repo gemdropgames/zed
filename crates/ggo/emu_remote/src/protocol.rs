@@ -72,6 +72,14 @@ pub enum Cmd {
         #[serde(default)]
         tail: Option<usize>,
     },
+    /// Boot `cart` free-running -- the panel's own Run button, no
+    /// lock-step, no inspection tap. Pair with `Pause`/`Resume`,
+    /// `Screenshot` and `Uart` to watch a game play itself.
+    Run { workspace: Option<String>, cart: String },
+    /// Pause the live run at the next frame boundary.
+    Pause { workspace: Option<String> },
+    /// Resume a paused run.
+    Resume { workspace: Option<String> },
 }
 
 /// What a flash runs with. Every field has a default, so `{}` is a
@@ -395,6 +403,16 @@ mod tests {
             parse_request(r#"{"id":3,"cmd":"uart"}"#).unwrap().cmd,
             Cmd::Uart { workspace: None, tail: None }
         );
+    }
+
+    #[test]
+    fn run_pause_resume_requests_round_trip() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"run","cart":"target/ggo-emulate/worlds-arena.ggo"}"#).unwrap().cmd,
+            Cmd::Run { workspace: None, cart: "target/ggo-emulate/worlds-arena.ggo".to_string() }
+        );
+        assert_eq!(parse_request(r#"{"id":2,"cmd":"pause"}"#).unwrap().cmd, Cmd::Pause { workspace: None });
+        assert_eq!(parse_request(r#"{"id":3,"cmd":"resume"}"#).unwrap().cmd, Cmd::Resume { workspace: None });
     }
 
     #[test]
