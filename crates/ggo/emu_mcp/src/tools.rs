@@ -78,7 +78,7 @@ pub fn tool_list() -> Value {
         { "name": "hw_flash_wait",
           "description": "Block until the flash in flight reaches a verdict, then return the same payload hw_flash_status returns (polling every 2s under the hood). Call it right after hw_flash; on its own it reports the LAST flash's verdict immediately. NOTE: this bridge serves ONE call at a time, so a long wait blocks every other tool here (including hw_flash_status) until it returns, and your client may time out first — nothing is lost if it does: the flash runs inside Zed, its status is per-run and persists, so call hw_flash_wait again to resume waiting on the same flash. Prefer a timeout_s you are willing to sit through (say 300) and re-call, over one long 1800s wait.",
           "inputSchema": with(json!({
-              "timeout_s": { "type": "number", "description": "Give up after this many seconds (default 1800)" }
+              "timeout_s": { "type": "number", "description": "Give up after this many seconds; must be > 0 (omit for the default 1800)" }
           })) },
         { "name": "perf_report",
           "description": "Paste-ready summary of one perf run (emulator or board) from ~/.ggo/ggo_ide.db: cart, frame budget, wire/cache aggregates, over-budget frames. Takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from the Reports page. Reads the database directly — no Zed session needed.",

@@ -898,9 +898,11 @@ impl ChartsPanel {
     ///
     /// Runs on every panel activation alongside [`Self::refresh_runs`]. The
     /// clone is idempotent (`diag_db::clone_runs` skips a run whose `runs`
-    /// row already exists), so re-running it is a `SELECT id FROM runs`
-    /// against a small local file, and a diag run that finished while the
-    /// panel sat open shows up the next time it is focused.
+    /// row it already holds unchanged AND whose linked device perf run it
+    /// has already cloned), so re-running it is a handful of `SELECT`s
+    /// against a small local file, and a diag run that finished -- or that
+    /// this build learned to copy more of -- while the panel sat open shows
+    /// up the next time it is focused.
     ///
     /// A panel with no resolvable home directory shows an EMPTY rail rather
     /// than an error: with no `~/.ggo` there is no `diag.db` either, which

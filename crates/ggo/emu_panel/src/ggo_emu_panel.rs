@@ -1118,6 +1118,12 @@ impl EmuPanel {
     /// all "there is no report to open", not "the flash went wrong". The
     /// unexpected ones are logged rather than shown, because the run the
     /// user asked for did succeed.
+    ///
+    /// A clone that reports a failure is one of those logged cases and
+    /// **not** a reason to stop: the failure may belong to some OTHER,
+    /// older run in ggo-diag's file (see the call site), while this run's
+    /// rows landed fine. `device_perf_run_id` is the question that
+    /// actually decides, so it is always asked.
     async fn open_flashed_run_report(
         this: WeakEntity<Self>,
         cx: &mut AsyncApp,
@@ -1145,9 +1151,18 @@ impl EmuPanel {
                 if !diag_db_path.exists() {
                     return None;
                 }
+                // Logged, never fatal. `clone_runs` reconciles EVERY run in
+                // ggo-diag's file and reports a failure in any of them --
+                // including historical runs this build cannot read (a
+                // `diag.db` behind on migrations, whose `frame` table has
+                // no `cyc`), which fail identically on every call forever.
+                // Each run is its own committed transaction, so an `Err`
+                // says nothing about whether THIS run made it across. Ask
+                // the database that instead of guessing from the error, the
+                // same correction `ggo_emu_mcp::tools`' `perf_report`
+                // makes.
                 if let Err(e) = diag_db::clone_runs(&diag_db_path, &ide_db_path) {
-                    log::warn!("flashed run {diag_run_id}: could not clone its rows: {e}");
-                    return None;
+                    log::warn!("flashed run {diag_run_id}: could not clone every device run: {e}");
                 }
                 match diag_db::device_perf_run_id(&ide_db_path, &diag_run_id) {
                     Ok(local_id) => local_id,
@@ -6857,6 +6872,128 @@ mod tests {
         assert!(
             cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
             "a passing flash must hand focus to the report it just produced"
+        );
+    }
+
+    /// Add an OLDER device run that this build can never clone, the way a
+    /// real `~/.ggo/diag.db` a migration behind cannot have its device runs
+    /// cloned (its `frame` table has no `cyc`). The cause here is a cart
+    /// with no name -- a per-run failure like that one, and one that can be
+    /// induced for a single run without disturbing the flashed run's rows.
+    /// Its id sorts FIRST, so it is attempted before the flashed run.
+    fn seed_unclonable_legacy_run(diag_db: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(diag_db).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
+                 hostname, state, verdict) VALUES ('20260101T000000Z-0000000000', \
+                 '2026-01-01T00:00:00Z', 'main', 'old123', 'v1.0.0', 'test-host', \
+                 'done', 'PASS')",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO cart(name) VALUES (NULL)", ())
+                .await
+                .unwrap();
+            let cart_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO run (cart_id, started_at, frames, frame_budget_cycles) \
+                 VALUES (?1, '2026-01-01T00:00:02Z', 1, 555549)",
+                [cart_id],
+            )
+            .await
+            .unwrap();
+            let perf_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE runs SET perf_run_id = ?1 WHERE id = '20260101T000000Z-0000000000'",
+                [perf_id],
+            )
+            .await
+            .unwrap();
+        });
+    }
+
+    /// **The hop may not be held hostage by somebody else's run.**
+    /// `clone_runs` reconciles every run in ggo-diag's file, so one
+    /// permanently-unclonable historical run makes it return `Err` on
+    /// EVERY call -- and on a real machine with a `diag.db` a migration
+    /// behind, that is every call forever. The just-flashed run still
+    /// cloned and committed (each run is its own transaction), so its
+    /// report must still open.
+    #[gpui::test]
+    async fn test_a_passing_flash_opens_its_report_despite_an_unclonable_older_run(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let diag_db = dir.path().join("diag.db");
+        let ide_db = dir.path().join("ggo_ide.db");
+        seed_unclonable_legacy_run(&diag_db);
+        seed_flashed_run(&diag_db);
+        // The premise, asserted rather than assumed: the clone really does
+        // fail, for the older run and not for this one.
+        let err = diag_db::clone_runs(&diag_db, &ide_db).expect_err("the older run cannot clone");
+        assert!(err.contains("20260101T000000Z-0000000000"), "{err}");
+        assert!(!err.contains(FLASHED_RUN), "{err}");
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let charts = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
+            workspace
+                .items_of_type::<ggo_charts_panel::ChartsItem>(cx)
+                .next()
+                .expect("open_charts_item adds the reports tab")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        charts.update(cx, |charts, _cx| {
+            charts.set_db_path_override(ide_db.clone());
+        });
+
+        let (streamer, _calls) = fake_streamer(
+            vec![
+                "==> Report",
+                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proc_streamer = streamer;
+            panel.db_path_override = Some(ide_db.clone());
+            panel.diag_db_path_override = Some(diag_db.clone());
+            panel.flash_charts_window = Some(window.window_handle());
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
+                .expect("our own database reads")
+                .is_some(),
+            "the flashed run's own telemetry cloned regardless of the older run"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.last_flash_perf_run.as_ref().map(|(id, _)| id.as_str()),
+                Some(FLASHED_RUN),
+                "the hop resolved the report id rather than bailing on the Err"
+            );
+        });
+        assert!(
+            cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
+            "and the report still opens"
         );
     }
 
