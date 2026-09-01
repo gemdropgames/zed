@@ -237,9 +237,16 @@ fn call_tool_inner(
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "hw_flash_wait" => {
-            let timeout = arg_i64(args, "timeout_s")
-                .filter(|s| *s > 0)
-                .map_or(DEFAULT_FLASH_TIMEOUT_S, |s| s as u64);
+            // A `timeout_s` of 0 (or negative) is a caller mistake, not a
+            // request for the default: silently turning it into
+            // `DEFAULT_FLASH_TIMEOUT_S` would block this single-flight
+            // bridge for half an hour on an argument that asked for the
+            // opposite. Omitting it is what asks for the default.
+            let timeout = match arg_i64(args, "timeout_s") {
+                Some(s) if s <= 0 => return Err("timeout_s must be > 0".to_string()),
+                Some(s) => s as u64,
+                None => DEFAULT_FLASH_TIMEOUT_S,
+            };
             flash_wait(
                 &session.socket,
                 workspace,
@@ -334,19 +341,28 @@ fn perf_report(db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
 
     let ide_db = db_dir.join("ggo_ide.db");
     let diag_db_path = db_dir.join("diag.db");
-    // Best effort: a board run only reaches the reports database once
-    // ggo-diag's rows are cloned across, and the panel's own clone may
-    // not have run since. No diag.db at all just means this machine has
-    // never run the device tooling -- emulator runs read fine without it.
-    if let Err(e) = diag_db::clone_runs(&diag_db_path, &ide_db)
-        && !e.contains("does not exist")
-    {
-        return Err(format!("reading {}: {e}", diag_db_path.display()));
-    }
+    // Best effort, unconditionally: a board run only reaches the reports
+    // database once ggo-diag's rows are cloned across, and the panel's own
+    // clone may not have run since -- but NO clone failure may fail this
+    // tool. Every reason it can fail (no diag.db at all, on a machine that
+    // has never run the device tooling; a diag.db a migration behind this
+    // build, which is ggo-diag's own file to repair) leaves the run the
+    // caller asked for exactly as readable as it already was -- and most
+    // runs asked about are emulator runs the clone has nothing to say
+    // about. The error is kept only as context for the "no run" case
+    // below, where it may well be WHY the run is missing.
+    let clone_error = diag_db::clone_runs(&diag_db_path, &ide_db).err();
     // Checked rather than left to the query: opening a missing database
     // CREATES it, and a stray empty ~/.ggo/ggo_ide.db is worse than the
     // error the caller gets either way.
-    let missing = || format!("no run {run} in {}", ide_db.display());
+    let missing = || match &clone_error {
+        Some(e) => format!(
+            "no run {run} in {} (and cloning device runs from {} failed: {e})",
+            ide_db.display(),
+            diag_db_path.display()
+        ),
+        None => format!("no run {run} in {}", ide_db.display()),
+    };
     if !ide_db.exists() {
         return Err(missing());
     }
@@ -628,6 +644,30 @@ mod tests {
         assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":false"#));
     }
 
+    /// `timeout_s: 0` asked for no wait at all; answering it with a
+    /// half-hour block on a bridge that serves one call at a time is the
+    /// worst possible reading of it. Omitting the argument is what asks
+    /// for [`DEFAULT_FLASH_TIMEOUT_S`].
+    #[test]
+    fn hw_flash_wait_rejects_a_non_positive_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            Ok(r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Done","verdict":true,"diag_run_id":"r1","perf_run_id":3}}"#.to_string())
+        };
+        for bad in [json!({"timeout_s": 0}), json!({"timeout_s": -5}), json!({"timeout_s": 0.0})] {
+            let (content, is_err) = call_tool("hw_flash_wait", &bad, dir.path(), &connect);
+            assert!(is_err, "{bad} must be rejected: {content:?}");
+            assert_eq!(content[0]["text"], "timeout_s must be > 0", "{bad}");
+        }
+
+        // Omitted is what asks for the default, and still runs normally.
+        let (content, is_err) = call_tool("hw_flash_wait", &json!({}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":true"#));
+        assert_eq!(DEFAULT_FLASH_TIMEOUT_S, 1800);
+    }
+
     /// A run passes before the panel's post-PASS database hop resolves the
     /// report id; waiting a beat for it is the whole point of the tool.
     #[test]
@@ -757,5 +797,58 @@ mod tests {
         let err = perf_report(dir.path(), 1).unwrap_err();
         assert!(err.contains("no run 1"), "{err}");
         assert!(!dir.path().join("ggo_ide.db").exists(), "must not create an empty db");
+    }
+
+    /// A `diag.db` this build cannot read -- here one whose `runs` table
+    /// predates `007_perf_run_id.sql`, which is how a real one goes stale:
+    /// ggo-diag owns that file, and only ggo-diag migrates it.
+    fn seed_stale_diag_db(dir: &Path) {
+        let path = dir.join("diag.db");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(&path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute("DROP TABLE runs", ()).await.unwrap();
+            conn.execute(
+                "CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT, branch TEXT,
+                                    commit_hash TEXT, git_describe TEXT, hostname TEXT,
+                                    verdict TEXT, boot_outcome TEXT, telem_overflows INTEGER,
+                                    state TEXT NOT NULL DEFAULT 'done', updated_at TEXT)",
+                (),
+            )
+            .await
+            .unwrap();
+        });
+    }
+
+    /// The clone is best effort for EVERY failure, not just a missing
+    /// file: a diag.db that cannot be cloned must not fail a report the
+    /// ide db can already answer -- which is every emulator run.
+    #[test]
+    fn perf_report_still_reports_when_the_diag_clone_fails() {
+        let dir = seeded_db_dir();
+        seed_stale_diag_db(dir.path());
+        // Pre-condition: this diag.db really does break the clone, with an
+        // error nothing here is allowed to special-case.
+        let clone_err = ggo_worldlib::charts::reports::diag_db::clone_runs(
+            &dir.path().join("diag.db"),
+            &dir.path().join("ggo_ide.db"),
+        )
+        .unwrap_err();
+        assert!(clone_err.contains("no such column"), "{clone_err}");
+
+        let content = perf_report(dir.path(), 7).unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains("GemdropGo perf run #7"));
+    }
+
+    /// ...and when the run really is missing, the swallowed clone error
+    /// comes back as context, since it may be exactly why.
+    #[test]
+    fn perf_report_unknown_run_carries_the_clone_failure_as_context() {
+        let dir = seeded_db_dir();
+        seed_stale_diag_db(dir.path());
+        let err = perf_report(dir.path(), 999).unwrap_err();
+        assert!(err.contains("no run 999"), "{err}");
+        assert!(err.contains("no such column"), "{err}");
     }
 }
