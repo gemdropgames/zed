@@ -229,7 +229,8 @@ pub fn drawable_prior_runs(samples: &RunSamples, prior: &[HistoricRunFrames]) ->
 /// victims by function`) appear only when the run carries profile rows,
 /// i.e. only for a native `ggo-emu --profile <elf>` capture; the syscall,
 /// tile-working-set, PPU and APU charts each have their own
-/// zero-columns gate ([`gates`]). Everything else is unconditional.
+/// zero-columns gate ([`gates`]), as does the frame-cycles chart, whose
+/// column only a device capture writes. Everything else is unconditional.
 ///
 /// `prior` is the run's historic overlay input -- up to five earlier runs
 /// of the same cart, newest first, as `loader::load_prior_runs` picked
@@ -296,6 +297,30 @@ pub fn build_charts(samples: &RunSamples, prior: &[HistoricRunFrames]) -> Vec<Ch
             ),
         ),
     ];
+
+    // The hardware's own whole-frame cycle count against the same 60fps
+    // budget the wire chart draws -- the emulator MODELS a frame's cost,
+    // the device MEASURES it, so a device run's `cyc` above that line is
+    // a frame that really missed 60fps rather than one predicted to.
+    // Gated on `has_cyc` because only a device capture writes the column
+    // (`frame.cyc` is `NOT NULL DEFAULT 0`): an emulator run would draw a
+    // flat zero line saying nothing but "no such counter here".
+    //
+    // `insert` rather than `push` because this is the one gated chart
+    // whose place is not at the end: it belongs directly under the wire
+    // chart it is the hardware counterpart of, and the always-on trio
+    // above stays a single literal.
+    if gates::has_cyc(&frames) {
+        charts.insert(
+            1,
+            line(
+                "Frame cycles",
+                &x,
+                budget,
+                vec![series("cyc", C1, &frames, |f| f.cyc)],
+            ),
+        );
+    }
 
     if gates::has_syscalls(&frames) {
         charts.push(stacked(
@@ -492,6 +517,20 @@ mod tests {
         }
     }
 
+    /// A DEVICE capture: `frame.cyc` -- the whole-frame elapsed cycle
+    /// count the hardware counts for itself -- is populated on every
+    /// frame, and frame 2 runs over the 555_549-cycle 60fps budget. An
+    /// emulator run leaves the column at its `NOT NULL DEFAULT 0`, which
+    /// is what [`plain_samples`] is.
+    fn device_samples() -> RunSamples {
+        let mut samples = plain_samples();
+        for f in &mut samples.frames {
+            f.cyc = 500_000 + f.n;
+        }
+        samples.frames[2].cyc = 900_000;
+        samples
+    }
+
     fn titles(charts: &[ChartSpec]) -> Vec<&str> {
         charts.iter().map(|c| c.title.as_str()).collect()
     }
@@ -543,9 +582,11 @@ mod tests {
         );
     }
 
-    /// A device run has no wire model: `frame_budget_cycles` is NULL, so
-    /// the wire chart draws without a reference line rather than with one
-    /// at zero.
+    /// A run whose `run` row never recorded a budget draws the wire chart
+    /// without a reference line rather than with one at zero. (Not a
+    /// device run -- `ggo-diag` writes the same 555_549 budget for those,
+    /// which is what the frame-cycles chart's 60fps line reads; a NULL
+    /// here is a run captured before that column was populated.)
     #[test]
     fn a_run_without_a_budget_draws_no_budget_line() {
         let mut samples = plain_samples();
@@ -601,16 +642,17 @@ mod tests {
         );
     }
 
-    /// The EXACT top-to-bottom order of the full 13-chart set with every
+    /// The EXACT top-to-bottom order of the full 14-chart set with every
     /// gate tripped at once (syscalls, tile working set, profile rows,
-    /// PPU, APU, a budget, prior runs). The membership tests around this
-    /// each admit any ordering; this is the one place the reports page's
-    /// vertical layout is pinned -- the per-function charts between the
-    /// tile-working-set chart and the histograms, the PPU pair after
-    /// them, instructions last.
+    /// PPU, APU, a device cycle counter, a budget, prior runs). The
+    /// membership tests around this each admit any ordering; this is the
+    /// one place the reports page's vertical layout is pinned -- the
+    /// frame-cycles chart beside the wire chart, the per-function charts
+    /// between the tile-working-set chart and the histograms, the PPU
+    /// pair after them, instructions last.
     #[test]
     fn the_fully_gated_chart_set_is_in_the_reports_pages_exact_order() {
-        let mut samples = plain_samples();
+        let mut samples = device_samples();
         samples.frames[1].sc_upload = 3;
         samples.frames[1].bg_tiles_distinct = 12;
         samples.frames[1].bg_evictions = 1;
@@ -627,6 +669,7 @@ mod tests {
             titles(&charts),
             vec![
                 "Wire cycles per frame vs budget",
+                "Frame cycles",
                 "Wire breakdown per frame",
                 "Cache misses per frame",
                 "Syscalls per frame",
@@ -673,6 +716,86 @@ mod tests {
         let mut samples = plain_samples();
         samples.frames[0].sc_upload = 99;
         assert!(!titles(&build_charts(&samples, &[])).contains(&"Syscalls per frame"));
+    }
+
+    // ------------------------------------------------------ frame cycles
+
+    /// Only a device capture writes `frame.cyc`, so the chart that plots
+    /// it is for hardware runs alone -- on an emulator run every frame's
+    /// `cyc` is 0 and a chart drawn flat along the x-axis would say
+    /// nothing except "this counter does not exist here".
+    #[test]
+    fn the_frame_cycles_chart_appears_only_for_a_run_with_a_cycle_counter() {
+        assert!(!titles(&build_charts(&plain_samples(), &[])).contains(&"Frame cycles"));
+        assert!(titles(&build_charts(&device_samples(), &[])).contains(&"Frame cycles"));
+    }
+
+    /// The gate reads the ignore-FILTERED frames, like every other gate
+    /// here: a `cyc` only ever recorded on frame 0 is not a device run's
+    /// worth of data.
+    #[test]
+    fn a_cycle_count_only_on_the_ignored_frame_does_not_add_the_chart() {
+        let mut samples = plain_samples();
+        samples.frames[0].cyc = 900_000;
+        assert!(!titles(&build_charts(&samples, &[])).contains(&"Frame cycles"));
+    }
+
+    /// The chart is the frame-rate verdict: the `cyc` series against the
+    /// run's own `frame_budget_cycles` as the dashed reference line, so a
+    /// point above the line IS a frame that missed 60fps.
+    #[test]
+    fn the_frame_cycles_chart_plots_cyc_against_the_runs_frame_budget() {
+        let charts = build_charts(&device_samples(), &[]);
+        let chart = charts
+            .iter()
+            .find(|c| c.title == "Frame cycles")
+            .expect("the gate is tripped");
+        assert_eq!(
+            chart.kind,
+            ChartKind::Line {
+                budget: Some(555_549.0)
+            },
+            "the 60fps line comes from the run's frame_budget_cycles"
+        );
+        assert_eq!(chart.series.len(), 1);
+        assert_eq!(chart.series[0].name, "cyc");
+        // Frame 0 is ignored; frames 1 and 2 remain, and frame 2 is the
+        // one over budget.
+        assert_eq!(chart.x, vec![1.0, 2.0]);
+        assert_eq!(chart.series[0].values, vec![500_001.0, 900_000.0]);
+        assert!(chart.series[0].values[1] > 555_549.0, "a missed frame");
+        // Not one of the four `onSelect`/`context` charts ggo-ide marks.
+        assert!(!chart.selectable);
+        assert!(chart.historic.is_empty());
+    }
+
+    /// A device run whose `run` row never recorded a budget draws the
+    /// series with no reference line, rather than one at zero -- the same
+    /// rule the wire chart follows.
+    #[test]
+    fn a_frame_cycles_chart_without_a_budget_draws_no_reference_line() {
+        let mut samples = device_samples();
+        for f in &mut samples.frames {
+            f.frame_budget_cycles = None;
+        }
+        let charts = build_charts(&samples, &[]);
+        let chart = charts
+            .iter()
+            .find(|c| c.title == "Frame cycles")
+            .expect("the gate is tripped");
+        assert_eq!(chart.kind, ChartKind::Line { budget: None });
+    }
+
+    /// It sits directly under "Wire cycles per frame vs budget": the two
+    /// budget charts are read together, one the emulator's modelled wire
+    /// cost and one the hardware's measured whole-frame cost.
+    #[test]
+    fn the_frame_cycles_chart_sits_next_to_the_wire_budget_chart() {
+        let charts = build_charts(&device_samples(), &[]);
+        assert_eq!(
+            titles(&charts)[..2],
+            ["Wire cycles per frame vs budget", "Frame cycles"]
+        );
     }
 
     #[test]
@@ -1274,7 +1397,7 @@ mod tests {
     /// blank canvas.
     #[test]
     fn every_produced_chart_has_data() {
-        let mut samples = plain_samples();
+        let mut samples = device_samples();
         samples.frames[1].sc_upload = 3;
         samples.frames[1].bg_tiles_distinct = 12;
         samples.frames[1].bg_evictions = 1;
@@ -1287,7 +1410,7 @@ mod tests {
             evicted: 1,
         }];
         let charts = build_charts(&samples, &[]);
-        assert_eq!(charts.len(), 13, "the full reports-page chart set");
+        assert_eq!(charts.len(), 14, "the full reports-page chart set");
         for c in &charts {
             assert!(c.has_data(), "{} has no data", c.title);
         }
