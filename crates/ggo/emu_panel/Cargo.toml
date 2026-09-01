@@ -22,6 +22,7 @@ path = "src/ggo_emu_panel.rs"
 
 [dependencies]
 async-channel.workspace = true
+chrono.workspace = true
 # GGO -- R6's audio output. Already a workspace dependency (`crates/audio`,
 # `livekit_client`, `settings_ui` all take it), and the same crate ggo-ide's
 # `emu/audio.rs` and the standalone `ggo-emu` binary use, so the pane's

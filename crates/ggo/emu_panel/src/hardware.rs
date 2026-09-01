@@ -243,6 +243,98 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
+/// Days a board-run transcript is kept before [`prune_run_logs`] deletes
+/// it, overridable via [`RUN_LOG_TTL_DAYS_ENV`].
+pub const DEFAULT_RUN_LOG_TTL_DAYS: u64 = 7;
+pub const RUN_LOG_TTL_DAYS_ENV: &str = "ZED_GGO_RUN_LOG_TTL_DAYS";
+
+/// The prefix every board-run transcript's filename carries. The prune
+/// only ever touches files matching it: `~/.zed/logs` is not this
+/// feature's directory to clean.
+pub const RUN_LOG_PREFIX: &str = "ggo-run-";
+
+/// Where board-run transcripts land: `~/.zed/logs`.
+pub fn run_log_dir(home: &Path) -> PathBuf {
+    home.join(".zed").join("logs")
+}
+
+/// `ggo-run-<stamp>-<what>.log`, with `what` reduced to filename-safe
+/// characters.
+pub fn run_log_name(what: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    let slug: String = what
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!(
+        "{RUN_LOG_PREFIX}{}-{}.log",
+        now.format("%Y%m%d-%H%M%S"),
+        slug.trim_matches('-')
+    )
+}
+
+/// Delete run transcripts in `dir` older than `ttl` (by mtime). Only
+/// files named [`RUN_LOG_PREFIX`]`*.log` are candidates. Errors are
+/// logged, not propagated: a transcript that cannot be pruned must never
+/// stop the run that wanted to write a new one.
+pub fn prune_run_logs(dir: &Path, ttl: Duration) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(RUN_LOG_PREFIX) || !name.ends_with(".log") {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > ttl);
+        if expired {
+            if let Err(error) = std::fs::remove_file(entry.path()) {
+                log::warn!("pruning old run log {name}: {error}");
+            }
+        }
+    }
+}
+
+/// The configured transcript lifetime: [`RUN_LOG_TTL_DAYS_ENV`] in days,
+/// else [`DEFAULT_RUN_LOG_TTL_DAYS`].
+pub fn run_log_ttl() -> Duration {
+    let days = std::env::var(RUN_LOG_TTL_DAYS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RUN_LOG_TTL_DAYS);
+    Duration::from_secs(days * 24 * 60 * 60)
+}
+
+/// Open a transcript file for a run named `what`, pruning expired ones
+/// first. `None` -- with a warning -- when the directory or file cannot
+/// be made: a run must never be blocked by its own paper trail.
+pub fn create_run_log(what: &str) -> Option<(PathBuf, std::fs::File)> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    let dir = run_log_dir(&home);
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        log::warn!("creating {}: {error}", dir.display());
+        return None;
+    }
+    prune_run_logs(&dir, run_log_ttl());
+    let path = dir.join(run_log_name(what, chrono::Local::now()));
+    match std::fs::File::create(&path) {
+        Ok(file) => Some((path, file)),
+        Err(error) => {
+            log::warn!("creating run log {}: {error}", path.display());
+            None
+        }
+    }
+}
+
 /// The first 10 characters of a commit hash -- long enough to be unique
 /// in any repo this fork touches, short enough for a status line.
 fn short_commit(commit: &str) -> String {
@@ -1165,6 +1257,18 @@ pub fn reattach_kernel_driver(_board: &OrphanedBoard) -> std::io::Result<()> {
     ))
 }
 
+/// True while a board run is in flight, set by the panel around every
+/// run and cleared when the run's handle drops. Global rather than
+/// threaded through, because port scans happen from places with no path
+/// to the panel (menu building, probes from render) and EVERY one of
+/// them must honor it.
+static BOARD_RUN_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_board_run_in_flight(in_flight: bool) {
+    BOARD_RUN_IN_FLIGHT.store(in_flight, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The serial scan, with one rescue attempt when it comes up empty.
 /// Returns the ports and whether a board is stuck on the bus: present
 /// with its driver detached, and the rescue did not bring a tty back.
@@ -1179,6 +1283,20 @@ pub fn scan_ports_rescuing() -> (Vec<String>, bool) {
     let Some(board) = find_orphaned_board_at(Path::new(USB_SYSFS_DIR)) else {
         return (ports, false);
     };
+    // A board with its driver detached DURING a run is not orphaned --
+    // it is openFPGALoader holding the USB interface to program it, and
+    // reattaching the kernel driver here rips the device out from under
+    // the write (which is exactly how a 20-minute flash died at 100%).
+    // Not stuck either: the run gives the port back when it ends.
+    if BOARD_RUN_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) {
+        log::info!(
+            "board on USB {:03}/{:03} has no serial driver, but a run is in flight -- \
+             leaving it alone",
+            board.busnum,
+            board.devnum
+        );
+        return (ports, false);
+    }
     if let Err(error) = reattach_kernel_driver(&board) {
         log::warn!(
             "board on USB {:03}/{:03} has no serial driver, and reattaching failed: {error}",
@@ -2014,6 +2132,39 @@ mod tests {
             None,
             "an unreadable checkout never warns"
         );
+    }
+
+    #[test]
+    fn run_log_names_are_filename_safe_and_prefixed() {
+        use chrono::TimeZone as _;
+        let now = chrono::Local.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap();
+        assert_eq!(
+            run_log_name("flashing world: arena!", now),
+            "ggo-run-20260901-100000-flashing-world--arena.log"
+        );
+    }
+
+    /// Only OUR expired transcripts die: a fresh one and a stranger's
+    /// file in the same directory survive every prune.
+    #[test]
+    fn prune_deletes_only_expired_run_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_age = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        let make = |name: &str, expired: bool| {
+            let path = dir.path().join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            if expired {
+                file.set_modified(old_age).unwrap();
+            }
+            path
+        };
+        let expired = make("ggo-run-20260824-100000-flashing.log", true);
+        let fresh = make("ggo-run-20260901-100000-flashing.log", false);
+        let stranger = make("Zed.log", true);
+        prune_run_logs(dir.path(), Duration::from_secs(7 * 24 * 60 * 60));
+        assert!(!expired.exists(), "eight days beats a seven-day lifetime");
+        assert!(fresh.exists(), "today's transcript stays");
+        assert!(stranger.exists(), "~/.zed/logs is not ours to clean");
     }
 
     /// Only the clone ZedGG made can be synced, and the script carries

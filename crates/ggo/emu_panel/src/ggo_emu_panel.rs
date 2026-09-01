@@ -560,6 +560,30 @@ struct FlashRun {
     _task: Task<()>,
 }
 
+impl Drop for FlashRun {
+    /// The one clear point every ending shares -- finish, failure,
+    /// cancel, a closed panel -- so the rescue guard can never stay
+    /// armed after its run.
+    fn drop(&mut self) {
+        hardware::set_board_run_in_flight(false);
+    }
+}
+
+/// Append one line to the run's on-disk transcript, when it has one.
+/// Every miss is tolerated -- a full disk must not take the run down --
+/// but not silently: `log_err` puts it in Zed's own log.
+fn log_run_line(run_log: &Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>, line: &str) {
+    let Some(run_log) = run_log else {
+        return;
+    };
+    // A poisoned lock means a writer panicked mid-line; the transcript is
+    // best effort, so skip rather than propagate.
+    if let Ok(mut file) = run_log.lock() {
+        use std::io::Write as _;
+        writeln!(file, "{line}").log_err();
+    }
+}
+
 /// How long after the last change the re-pack waits, so a save that
 /// writes several files (a `.til`/`.pal` pair, a sprite trio) packs once.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -758,7 +782,7 @@ impl EmuPanel {
             // world is remembered, too: this press started nothing, so it
             // has no business changing what the next one boots.
             let elapsed = flash.started.elapsed();
-            self.last_flash = Some((flash.progress, elapsed));
+            self.last_flash = Some((flash.progress.clone(), elapsed));
             self.status = Some("flash cancelled".to_string());
             self.status_is_error = false;
             cx.notify();
@@ -967,6 +991,15 @@ impl EmuPanel {
         self.status = None;
         self.status_is_error = false;
         self.console_expanded = true;
+        // The run's transcript on disk, surviving the console it also
+        // fills -- a failure found after the pane is gone still has its
+        // log. Best effort by design: a run is never blocked by its own
+        // paper trail.
+        let run_log = hardware::create_run_log(&what).map(|(path, file)| {
+            console.push_line(format!("transcript: {}", path.display()));
+            std::sync::Arc::new(std::sync::Mutex::new(file))
+        });
+        hardware::set_board_run_in_flight(true);
         let task = cx.spawn({
             let what = what.clone();
             async move |this, cx| {
@@ -974,12 +1007,16 @@ impl EmuPanel {
                     let (line_tx, line_rx) = async_channel::unbounded::<String>();
                     // The command itself, so the console says which argv (and
                     // which of several `/dev/ttyUSB*`) this run used.
-                    console.push_line(format!("$ {}", request.command_line()));
+                    let command_line = format!("$ {}", request.command_line());
+                    log_run_line(&run_log, &command_line);
+                    console.push_line(command_line);
                     let run = {
                         let console = console.clone();
+                        let run_log = run_log.clone();
                         streamer(
                             request,
                             Box::new(move |line: &str| {
+                                log_run_line(&run_log, line);
                                 console.push_line(line);
                                 line_tx.try_send(line.to_string()).ok();
                             }),
@@ -1026,6 +1063,7 @@ impl EmuPanel {
                     };
                     if !capture.ok || verdict == Some(false) {
                         let reason = hardware::failure_reason(&capture);
+                        log_run_line(&run_log, &format!("== {what} failed: {reason}"));
                         this.update(cx, |this, cx| {
                             this.retire_flash(false);
                             // A failed run can still have changed the machine
@@ -1042,6 +1080,16 @@ impl EmuPanel {
                 }
                 this.update(cx, |this, cx| {
                     let passed = this.flash.as_ref().and_then(|f| f.progress.verdict());
+                    log_run_line(
+                        &run_log,
+                        &format!(
+                            "== {what}: {}",
+                            match passed {
+                                Some(true) => "PASS",
+                                _ => "done",
+                            }
+                        ),
+                    );
                     this.retire_flash(true);
                     // Installing something changes what this machine can do.
                     this.invalidate_hardware();
@@ -1105,7 +1153,9 @@ impl EmuPanel {
         if !passed {
             flash.progress.fail(elapsed);
         }
-        self.last_flash = Some((flash.progress, elapsed));
+        // Cloned, not moved: `FlashRun` has a `Drop` impl (the rescue
+        // guard), and a type with one cannot be moved out of field-wise.
+        self.last_flash = Some((flash.progress.clone(), elapsed));
     }
 
     /// Open the charts item on the report for the run `ggo-diag` just
