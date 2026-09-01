@@ -1048,6 +1048,12 @@ impl EmuPanel {
                         let reason = hardware::failure_reason(&capture);
                         this.update(cx, |this, cx| {
                             this.retire_flash(false);
+                            // A failed run can still have changed the machine
+                            // -- a reclone whose `rm -rf` landed before the
+                            // clone failed has no repo at all any more, and a
+                            // page reading the pre-run probe would still show
+                            // one.
+                            this.invalidate_hardware();
                             this.report_failure(format!("{what} failed: {reason}"), cx);
                         })
                         .ok();
@@ -6709,6 +6715,7 @@ mod tests {
             home: root.to_path_buf(),
             repo_commit: None,
             emu_commit: None,
+            emu_commit_in_repo: None,
         }
     }
 

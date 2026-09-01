@@ -70,23 +70,51 @@ pub(crate) fn page_layout(
 /// the banner has to name the step the reader takes instead, or a dev
 /// checkout is left with a warning and no way out of it.
 ///
-/// Two hashes cannot say WHICH side is ahead -- there is no ordering in
-/// them and this fork never asks git for one -- and the remedy differs
-/// by direction: a stale checkout needs a pull, but a checkout ahead of
-/// the emulator needs a newer ZedGG. So the text names the direction it
-/// cannot rule out rather than confidently prescribing the wrong fix.
-pub(crate) fn skew_banner_text(flash_short: &str, emu_short: &str, can_update: bool) -> String {
+/// Two hashes have no ordering, but git can say whether the flash repo
+/// KNOWS the emulator's commit (`HardwareEnv::emu_commit_in_repo`), and
+/// the remedy differs by that answer: a commit the repo has never seen
+/// cannot be pulled -- the emulator was built from unpushed work -- while
+/// a known commit means the repo has moved past the emulator and ZedGG
+/// itself is the stale side. When git could not be asked, the text names
+/// both directions rather than confidently prescribing the wrong fix.
+pub(crate) fn skew_banner_text(
+    flash_short: &str,
+    emu_short: &str,
+    can_update: bool,
+    emu_commit_in_repo: Option<bool>,
+) -> String {
     let mut text = format!(
         "The flash repo is at {flash_short} but the emulator was built from {emu_short} \
          -- the board may render differently than the emulator."
     );
-    if !can_update {
-        text.push_str(" Update your checkout, then flash + rebuild gateware.");
+    match emu_commit_in_repo {
+        Some(false) => {
+            text.push_str(
+                " The emulator's commit is not in the flash repo's history: it was built \
+                 from unpushed work. Push that checkout to the GGO remote, then ",
+            );
+            text.push_str(if can_update {
+                "update the GGO repo here."
+            } else {
+                "update your checkout."
+            });
+        }
+        Some(true) => {
+            text.push_str(
+                " The flash repo is ahead of the emulator: updating it cannot help, \
+                 ZedGG itself needs rebuilding against it.",
+            );
+        }
+        None => {
+            if !can_update {
+                text.push_str(" Update your checkout, then flash + rebuild gateware.");
+            }
+            text.push_str(
+                " If updating the GGO repo does not clear this, the checkout is ahead of \
+                 the emulator and ZedGG itself needs rebuilding against it.",
+            );
+        }
     }
-    text.push_str(
-        " If updating the GGO repo does not clear this, the checkout is ahead of the \
-         emulator and ZedGG itself needs rebuilding against it.",
-    );
     text
 }
 
@@ -401,7 +429,8 @@ impl Render for HardwareSetupItem {
                         .flash_progress()
                         .map(|(progress, elapsed)| (progress.clone(), elapsed)),
                     target,
-                    env.version_skew(),
+                    env.version_skew()
+                        .map(|(flash, emu)| (flash, emu, env.emu_commit_in_repo)),
                     env.update_repo_request().is_some(),
                     panel.flash_world(cx),
                 )
@@ -491,14 +520,19 @@ impl Render for HardwareSetupItem {
             // stays enabled. It is the one thing on this page the
             // machine cannot detect as broken -- a board built from the
             // wrong commit boots and runs, it just draws an older frame.
-            .when_some(skew, |el, (flash_short, emu_short)| {
+            .when_some(skew, |el, (flash_short, emu_short, emu_commit_in_repo)| {
                 el.child(
                     Banner::new()
                         .severity(Severity::Warning)
                         .wrap_content(true)
                         .child(
-                            Label::new(skew_banner_text(&flash_short, &emu_short, can_update))
-                                .size(LabelSize::Small),
+                            Label::new(skew_banner_text(
+                                &flash_short,
+                                &emu_short,
+                                can_update,
+                                emu_commit_in_repo,
+                            ))
+                            .size(LabelSize::Small),
                         )
                         // The remedy belongs in the warning that asked
                         // for it, not in a button row three sections
@@ -901,7 +935,7 @@ mod tests {
     /// a button for it; the reader who has none is told what to do.
     #[test]
     fn the_skew_banner_names_both_commits_and_the_way_out() {
-        let with_button = skew_banner_text("0123456789", "fedcba9876", true);
+        let with_button = skew_banner_text("0123456789", "fedcba9876", true, None);
         assert!(with_button.contains("0123456789") && with_button.contains("fedcba9876"));
         assert!(
             with_button.contains("render differently"),
@@ -912,21 +946,59 @@ mod tests {
             "the button above is the way out: {with_button}"
         );
 
-        let manual = skew_banner_text("0123456789", "fedcba9876", false);
+        let manual = skew_banner_text("0123456789", "fedcba9876", false, None);
         assert!(
             manual.contains("Update your checkout"),
             "a dev checkout is the user's to move: {manual}"
         );
 
-        // Two hashes do not say which side is ahead, and pulling a repo
-        // that is already ahead fixes nothing -- so the other direction
-        // is named rather than left as a dead end.
+        // With no answer from git, two hashes do not say which side is
+        // ahead -- so the other direction is named rather than left as a
+        // dead end.
         for text in [&with_button, &manual] {
             assert!(
                 text.contains("ZedGG itself needs rebuilding"),
                 "the repo may be the newer side: {text}"
             );
         }
+    }
+
+    /// When git HAS said which side is ahead, the banner prescribes the
+    /// one remedy that works instead of hedging in both directions.
+    #[test]
+    fn the_skew_banner_prescribes_by_direction_when_git_answered() {
+        // The repo has never seen the emulator's commit: pulling cannot
+        // reach unpushed work, so the way out starts with a push.
+        let unpushed = skew_banner_text("0123456789", "fedcba9876", true, Some(false));
+        assert!(
+            unpushed.contains("unpushed work") && unpushed.contains("Push"),
+            "an unreachable commit needs a push first: {unpushed}"
+        );
+        assert!(
+            unpushed.contains("update the GGO repo here"),
+            "the button above is still the second step: {unpushed}"
+        );
+        assert!(
+            !unpushed.contains("ZedGG itself needs rebuilding"),
+            "rebuilding ZedGG cannot reach a commit the repo lacks: {unpushed}"
+        );
+        let unpushed_manual = skew_banner_text("0123456789", "fedcba9876", false, Some(false));
+        assert!(
+            unpushed_manual.contains("update your checkout"),
+            "a dev checkout is the user's to move: {unpushed_manual}"
+        );
+
+        // The repo knows the commit and has moved past it: pulling fixes
+        // nothing, ZedGG is the stale side.
+        let repo_ahead = skew_banner_text("0123456789", "fedcba9876", true, Some(true));
+        assert!(
+            repo_ahead.contains("ZedGG itself needs rebuilding"),
+            "a repo past the emulator needs a newer ZedGG: {repo_ahead}"
+        );
+        assert!(
+            repo_ahead.contains("updating it cannot help") && !repo_ahead.contains("Push"),
+            "no pull or push helps when the repo is ahead: {repo_ahead}"
+        );
     }
 
     /// One page per workspace, and it opens the emulator pane it views.

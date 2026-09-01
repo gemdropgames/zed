@@ -124,6 +124,13 @@ pub struct HardwareEnv {
     /// The commit the in-IDE emulator engine was compiled from, when the
     /// build embedded one.
     pub emu_commit: Option<String>,
+    /// Whether [`Self::emu_commit`] exists in [`Self::repo`]'s object
+    /// database, asked of git itself when the two commits diverge.
+    /// Disambiguates the skew banner's remedy: a commit the repo has
+    /// never seen cannot be pulled -- it was built from unpushed work --
+    /// while a known commit means the repo has moved past the emulator.
+    /// `None` when there is no skew, no git, or git could not be asked.
+    pub emu_commit_in_repo: Option<bool>,
 }
 
 impl HardwareEnv {
@@ -1238,6 +1245,16 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         None => scan_ports_rescuing(),
     };
     let repo_commit = repo.as_deref().and_then(read_git_head);
+    let emu_commit = ggo_emu_core::BUILT_FROM_COMMIT.map(str::to_string);
+    // Only asked when the banner will show: probe runs on the foreground
+    // thread, and one short-lived `git cat-file` on the cached path is
+    // the whole cost of a remedy that points the right way.
+    let emu_commit_in_repo = match (&repo, &repo_commit, &emu_commit) {
+        (Some(repo), Some(repo_commit), Some(emu_commit)) if repo_commit != emu_commit => {
+            commit_in_repo(repo, emu_commit)
+        }
+        _ => None,
+    };
     HardwareEnv {
         diag_bin,
         emd_bin,
@@ -1254,8 +1271,26 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         clone_dest,
         home: home.to_path_buf(),
         repo_commit,
-        emu_commit: ggo_emu_core::BUILT_FROM_COMMIT.map(str::to_string),
+        emu_commit,
+        emu_commit_in_repo,
     }
+}
+
+/// Does `commit` exist in `repo`'s object database? `None` when git could
+/// not be run at all; a clean "no" from git is `Some(false)`.
+fn commit_in_repo(repo: &Path, commit: &str) -> Option<bool> {
+    // `output()`, not `status()`: a missing object makes `cat-file -e`
+    // print to stderr, which is noise on every probe of a skewed repo.
+    // Blocking is `probe`'s own contract -- it already walks `/dev` and
+    // sleeps in its port rescue -- and `cat-file -e` neither touches the
+    // network nor takes locks.
+    #[allow(clippy::disallowed_methods)]
+    std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["cat-file", "-e", commit])
+        .output()
+        .ok()
+        .map(|output| output.status.success())
 }
 
 #[cfg(test)]
@@ -1278,6 +1313,7 @@ mod tests {
             home: PathBuf::from("/home/u"),
             repo_commit: None,
             emu_commit: None,
+            emu_commit_in_repo: None,
         }
     }
 
