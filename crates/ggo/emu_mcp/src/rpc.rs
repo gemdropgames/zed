@@ -113,7 +113,10 @@ mod tests {
             &*no_connect(),
         )
         .unwrap();
-        assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 5);
+        // Which tools, and their exact order, is pinned by
+        // `tools::tests::tool_list_names_exactly_the_lockstep_surface`;
+        // this method only has to hand that list through.
+        assert!(!reply["result"]["tools"].as_array().unwrap().is_empty());
 
         let err = handle_line(
             r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,

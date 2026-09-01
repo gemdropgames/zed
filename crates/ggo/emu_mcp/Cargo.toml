@@ -15,8 +15,16 @@ path = "src/main.rs"
 [dependencies]
 base64.workspace = true
 ggo_emu_remote.workspace = true
+# `perf_report`'s reads of ~/.ggo/ggo_ide.db (and the best-effort clone of
+# ggo-diag's device runs into it) -- the same query fns the charts panel
+# uses, so the tool and the Reports page can never disagree about a run.
+ggo-worldlib.workspace = true
 image.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Seeding a temp ggo_ide.db for `perf_report`'s tests through the real
+# schema, the way ggo-worldlib's own perf_db tests do.
+ggo-db.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt"] }

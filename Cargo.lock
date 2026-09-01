@@ -7624,10 +7624,13 @@ name = "ggo_emu_mcp"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "ggo-db",
+ "ggo-worldlib",
  "ggo_emu_remote",
  "image",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

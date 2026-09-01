@@ -66,6 +66,27 @@ pub fn tool_list() -> Value {
               "screenshot": { "type": "boolean" }
           })) },
         { "name": "emu_stop", "description": "End the lock-step run; returns the cart's uart log.", "inputSchema": with(json!({})) },
+        { "name": "hw_flash",
+          "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Returns as soon as the flash STARTS — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
+          "inputSchema": with(json!({
+              "world": { "type": "string", "description": "World stem to bake in as the boot world, e.g. worlds/chase_cam" },
+              "rebuild_gateware": { "type": "boolean", "description": "Re-run place-and-route (~20 min) instead of reusing the cached bitstream; only needed after a gateware change" }
+          })) },
+        { "name": "hw_flash_status",
+          "description": "Non-blocking snapshot of the flash in flight (else the last one): {active, phase, verdict, diag_run_id, perf_run_id}. verdict is null while running, true=PASS, false=FAIL; perf_run_id is the run number to hand to perf_report, present only once a passed run's report has landed.",
+          "inputSchema": with(json!({})) },
+        { "name": "hw_flash_wait",
+          "description": "Block until the flash in flight reaches a verdict, then return the same payload hw_flash_status returns (polling every 2s under the hood). Call it right after hw_flash; on its own it reports the LAST flash's verdict immediately.",
+          "inputSchema": with(json!({
+              "timeout_s": { "type": "number", "description": "Give up after this many seconds (default 1800)" }
+          })) },
+        { "name": "perf_report",
+          "description": "Paste-ready summary of one perf run (emulator or board) from ~/.ggo/ggo_ide.db: cart, frame budget, wire/cache aggregates, over-budget frames. Takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from the Reports page. Reads the database directly — no Zed session needed.",
+          "inputSchema": json!({
+              "type": "object",
+              "properties": { "run": { "type": "number", "description": "Perf run id, e.g. perf_run_id from hw_flash_wait" } },
+              "required": ["run"],
+          }) },
     ] })
 }
 
@@ -111,6 +132,13 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
     args.get(key)?.as_str().map(str::to_string)
 }
 
+/// A whole-number argument, tolerating the `12.0` an LLM client sometimes
+/// sends where the schema says a count or an id.
+fn arg_i64(args: &Value, key: &str) -> Option<i64> {
+    let v = args.get(key)?;
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
+
 /// Execute one MCP tool call. Returns (content, is_error).
 pub fn call_tool(name: &str, args: &Value, dir: &Path, connect: &Connector) -> (Vec<Value>, bool) {
     match call_tool_inner(name, args, dir, connect) {
@@ -136,6 +164,11 @@ fn call_tool_inner(
         }
         let text = if rows.is_empty() { "no live zed sessions".to_string() } else { rows.join("\n") };
         return Ok(vec![json!({ "type": "text", "text": text })]);
+    }
+
+    if name == "perf_report" {
+        let run = arg_i64(args, "run").ok_or("missing required argument: run (a perf run id)")?;
+        return perf_report(&ggo_dir()?, run);
     }
 
     let workspace = arg_str(args, "workspace");
@@ -187,8 +220,143 @@ fn call_tool_inner(
             let data = send(&session.socket, Cmd::Stop { workspace }, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
+        "hw_flash" => {
+            let world = arg_str(args, "world");
+            let rebuild_gateware =
+                args.get("rebuild_gateware").and_then(Value::as_bool).unwrap_or(false);
+            let data = send(
+                &session.socket,
+                Cmd::FlashWorld { workspace, world, rebuild_gateware },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "hw_flash_status" => {
+            let data = send(&session.socket, Cmd::FlashStatus { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "hw_flash_wait" => {
+            let timeout = arg_i64(args, "timeout_s")
+                .filter(|s| *s > 0)
+                .map_or(DEFAULT_FLASH_TIMEOUT_S, |s| s as u64);
+            flash_wait(
+                &session.socket,
+                workspace,
+                Duration::from_secs(timeout),
+                FLASH_POLL_INTERVAL,
+                connect,
+            )
+        }
         other => Err(format!("unknown tool {other:?}")),
     }
+}
+
+/// How long a flash may run before `hw_flash_wait` gives up: a gateware
+/// rebuild is ~20 minutes, so half an hour is "something is wrong", not
+/// "still going".
+const DEFAULT_FLASH_TIMEOUT_S: u64 = 1800;
+/// Gap between `FlashStatus` polls. Each poll is its own short socket
+/// call -- a flash outlives any socket read timeout, so waiting is a loop
+/// of cheap questions, never one long blocking read.
+const FLASH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Once a run PASSES, the Zed panel still has a database hop to make
+/// before it can name the cloned perf run. Waiting this long for it (in
+/// `poll` steps) is what lets `hw_flash_wait`'s answer carry the id the
+/// caller then hands to `perf_report`, instead of a null the agent has to
+/// go poll for itself.
+const PERF_ID_GRACE: Duration = Duration::from_secs(10);
+
+/// Poll `FlashStatus` until the run reaches a verdict (or `timeout`),
+/// then return the final payload as text content. `poll` is a parameter
+/// so tests don't sleep.
+fn flash_wait(
+    socket: &Path,
+    workspace: Option<String>,
+    timeout: Duration,
+    poll: Duration,
+    connect: &Connector,
+) -> Result<Vec<Value>, String> {
+    let started = std::time::Instant::now();
+    let mut last_phase: Option<String> = None;
+    let mut verdict_at: Option<std::time::Instant> = None;
+    loop {
+        let data = send(
+            socket,
+            Cmd::FlashStatus { workspace: workspace.clone() },
+            CALL_TIMEOUT,
+            connect,
+        )?;
+        if let Some(phase) = data.get("phase").and_then(Value::as_str) {
+            last_phase = Some(phase.to_string());
+        }
+        if let Some(verdict) = data.get("verdict").unwrap_or(&Value::Null).as_bool() {
+            // A FAIL never gets a report id, and a PASS that already has
+            // one is done; only a PASS still waiting on the clone lingers
+            // -- and never past the caller's own timeout, since a finished
+            // run's payload beats an error about a run that did finish.
+            let waiting_for_id = verdict && data.get("perf_run_id").is_none_or(Value::is_null);
+            let seen_at = verdict_at.get_or_insert_with(std::time::Instant::now);
+            if !waiting_for_id
+                || seen_at.elapsed() >= PERF_ID_GRACE
+                || started.elapsed() >= timeout
+            {
+                return Ok(vec![json!({ "type": "text", "text": data.to_string() })]);
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "flash still running after {}s (last phase: {}) — check the hardware tab in Zed, \
+                 or poll hw_flash_status",
+                timeout.as_secs(),
+                last_phase.as_deref().unwrap_or("unknown")
+            ));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// `~/.ggo` -- the same directory `ggo_common::default_db_path` resolves
+/// (duplicated as two lines rather than pulling a gpui-shaped crate into
+/// this bridge binary).
+fn ggo_dir() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or("cannot find your home directory (neither HOME nor USERPROFILE is set)")?;
+    Ok(std::path::PathBuf::from(home).join(".ggo"))
+}
+
+/// One perf run's paste-ready summary out of `<db_dir>/ggo_ide.db`.
+/// `db_dir` is a parameter so tests can point at a temp directory;
+/// production passes `~/.ggo`.
+fn perf_report(db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
+    use ggo_worldlib::charts::reports::{diag_db, perf_db};
+
+    let ide_db = db_dir.join("ggo_ide.db");
+    let diag_db_path = db_dir.join("diag.db");
+    // Best effort: a board run only reaches the reports database once
+    // ggo-diag's rows are cloned across, and the panel's own clone may
+    // not have run since. No diag.db at all just means this machine has
+    // never run the device tooling -- emulator runs read fine without it.
+    if let Err(e) = diag_db::clone_runs(&diag_db_path, &ide_db)
+        && !e.contains("does not exist")
+    {
+        return Err(format!("reading {}: {e}", diag_db_path.display()));
+    }
+    // Checked rather than left to the query: opening a missing database
+    // CREATES it, and a stray empty ~/.ggo/ggo_ide.db is worse than the
+    // error the caller gets either way.
+    let missing = || format!("no run {run} in {}", ide_db.display());
+    if !ide_db.exists() {
+        return Err(missing());
+    }
+    let detail = perf_db::run_detail(&ide_db, run)
+        .map_err(|e| format!("reading run {run}: {e:#}"))?
+        .ok_or_else(missing)?;
+    let frames =
+        perf_db::run_frames(&ide_db, run).map_err(|e| format!("reading run {run} frames: {e:#}"))?;
+    let text = perf_db::run_handoff_text(&detail, &frames);
+    Ok(vec![json!({ "type": "text", "text": text })])
 }
 
 /// Shape a script report into MCP content: a text summary (frames + uart),
@@ -304,6 +472,240 @@ mod tests {
         let list = tool_list();
         let names: Vec<&str> =
             list["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["zed_sessions", "emu_status", "emu_start", "emu_next_frame", "emu_stop"]);
+        assert_eq!(
+            names,
+            [
+                "zed_sessions",
+                "emu_status",
+                "emu_start",
+                "emu_next_frame",
+                "emu_stop",
+                "hw_flash",
+                "hw_flash_status",
+                "hw_flash_wait",
+                "perf_report",
+            ]
+        );
+    }
+
+    /// The user directive behind the tool: an agent must not occupy the
+    /// board without asking, so the warning has to be in the text the
+    /// agent actually reads.
+    #[test]
+    fn hw_flash_description_warns_to_confirm_with_the_user() {
+        let list = tool_list();
+        let flash = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "hw_flash")
+            .expect("hw_flash is listed");
+        let text = flash["description"].as_str().unwrap();
+        assert!(
+            text.contains(
+                "Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). \
+                 Confirm with the user before invoking."
+            ),
+            "{text}"
+        );
+        assert!(flash["inputSchema"]["properties"]["world"].is_object(), "{flash}");
+        assert!(flash["inputSchema"]["properties"]["rebuild_gateware"].is_object(), "{flash}");
+    }
+
+    #[test]
+    fn hw_flash_sends_flash_world_and_returns_the_started_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""cmd":"flash_world""#), "{line}");
+            assert!(line.contains(r#""world":"worlds/chase_cam""#), "{line}");
+            assert!(line.contains(r#""rebuild_gateware":true"#), "{line}");
+            Ok(r#"{"id":1,"ok":true,"data":{"started":true}}"#.to_string())
+        };
+        let (content, is_err) = call_tool(
+            "hw_flash",
+            &json!({"world": "worlds/chase_cam", "rebuild_gateware": true}),
+            dir.path(),
+            &connect,
+        );
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""started":true"#));
+    }
+
+    #[test]
+    fn hw_flash_status_returns_the_payload_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""cmd":"flash_status""#), "{line}");
+            Ok(r#"{"id":1,"ok":true,"data":{"active":true,"phase":"Boot verify (UART)","verdict":null,"diag_run_id":"r1","perf_run_id":null}}"#.to_string())
+        };
+        let (content, is_err) = call_tool("hw_flash_status", &json!({}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains(r#""phase":"Boot verify (UART)""#), "{text}");
+    }
+
+    /// Each poll is its own short socket call (never one long blocking
+    /// read), and the loop ends on the first verdict.
+    #[test]
+    fn hw_flash_wait_polls_until_a_verdict_lands() {
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let seen = polls.clone();
+        let connect = move |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""cmd":"flash_status""#), "{line}");
+            seen.set(seen.get() + 1);
+            Ok(match seen.get() {
+                1 => r#"{"id":1,"ok":true,"data":{"active":true,"phase":"Build","verdict":null,"diag_run_id":null,"perf_run_id":null}}"#,
+                2 => r#"{"id":1,"ok":true,"data":{"active":true,"phase":"Boot verify (UART)","verdict":null,"diag_run_id":"r7","perf_run_id":null}}"#,
+                _ => r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Done","verdict":true,"diag_run_id":"r7","perf_run_id":12}}"#,
+            }
+            .to_string())
+        };
+        let content = flash_wait(
+            Path::new("/fake.sock"),
+            None,
+            Duration::from_secs(1800),
+            Duration::ZERO,
+            &connect,
+        )
+        .unwrap();
+        assert_eq!(polls.get(), 3);
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains(r#""verdict":true"#), "{text}");
+        assert!(text.contains(r#""perf_run_id":12"#), "{text}");
+    }
+
+    #[test]
+    fn hw_flash_wait_timeout_is_an_error_naming_the_last_phase() {
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            Ok(r#"{"id":1,"ok":true,"data":{"active":true,"phase":"Place and route","verdict":null,"diag_run_id":null,"perf_run_id":null}}"#.to_string())
+        };
+        let err = flash_wait(
+            Path::new("/fake.sock"),
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+            &connect,
+        )
+        .unwrap_err();
+        assert!(err.contains("Place and route"), "{err}");
+    }
+
+    #[test]
+    fn hw_flash_wait_dispatches_with_the_callers_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""cmd":"flash_status""#), "{line}");
+            Ok(r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Boot verify (UART)","verdict":false,"diag_run_id":"r9","perf_run_id":null}}"#.to_string())
+        };
+        // `60.0`, not `60`: MCP clients routinely send whole numbers as floats.
+        let (content, is_err) =
+            call_tool("hw_flash_wait", &json!({"timeout_s": 60.0}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":false"#));
+    }
+
+    /// A run passes before the panel's post-PASS database hop resolves the
+    /// report id; waiting a beat for it is the whole point of the tool.
+    #[test]
+    fn hw_flash_wait_gives_a_passed_run_a_beat_to_publish_its_report_id() {
+        let seen = std::cell::Cell::new(0u32);
+        let connect = move |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            seen.set(seen.get() + 1);
+            Ok(if seen.get() < 3 {
+                r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Done","verdict":true,"diag_run_id":"r7","perf_run_id":null}}"#
+            } else {
+                r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Done","verdict":true,"diag_run_id":"r7","perf_run_id":30}}"#
+            }
+            .to_string())
+        };
+        let content = flash_wait(
+            Path::new("/fake.sock"),
+            None,
+            Duration::from_secs(1800),
+            Duration::ZERO,
+            &connect,
+        )
+        .unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""perf_run_id":30"#));
+
+        // A FAIL never gets a report id: return it immediately.
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            Ok(r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Boot verify (UART)","verdict":false,"diag_run_id":"r8","perf_run_id":null}}"#.to_string())
+        };
+        let content = flash_wait(
+            Path::new("/fake.sock"),
+            None,
+            Duration::from_secs(1800),
+            Duration::ZERO,
+            &connect,
+        )
+        .unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":false"#));
+    }
+
+    /// A temp `ggo_ide.db` through the real schema (`ggo_db::open`
+    /// migrates), seeded with the same INSERT shape ggo-worldlib's
+    /// `perf_db` tests use: one cart, one run, two frames.
+    fn seeded_db_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ggo_ide.db");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(&path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'wilds')", ()).await.unwrap();
+            conn.execute(
+                "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles,
+                                  scanout_wire_cycles, refill_cycles, writeback_cycles,
+                                  wire_wait_cycles, label)
+                 VALUES (7, 1, '2026-08-31T00:00:00Z', 2, 555549, 164400, 100, 65, 0, 'board')",
+                (),
+            )
+            .await
+            .unwrap();
+            for (n, wire_total, cyc) in [(0i64, 100_000i64, 700_000i64), (1, 600_000, 812_345)] {
+                conn.execute(
+                    "INSERT INTO frame (run_id, n, wire_total, i_misses, d_misses, over_budget,
+                                        apu_underruns, cyc)
+                     VALUES (7, ?1, ?2, 5, 2, 0, 0, ?3)",
+                    (n, wire_total, cyc),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        dir
+    }
+
+    #[test]
+    fn perf_report_renders_the_run_handoff_text() {
+        let dir = seeded_db_dir();
+        let content = perf_report(dir.path(), 7).unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("GemdropGo perf run #7"), "{text}");
+        assert!(text.contains("wilds"), "{text}");
+        assert!(text.contains("frame_rows_loaded: 2"), "{text}");
+    }
+
+    #[test]
+    fn perf_report_unknown_run_is_a_tool_error() {
+        let dir = seeded_db_dir();
+        let err = perf_report(dir.path(), 999).unwrap_err();
+        assert!(err.contains("no run 999"), "{err}");
+        assert!(err.contains("ggo_ide.db"), "{err}");
+    }
+
+    /// No `~/.ggo` at all: the missing diag.db is swallowed (nothing to
+    /// clone), and the missing ide db is the same "no such run" error --
+    /// never a stray empty database left behind.
+    #[test]
+    fn perf_report_with_no_databases_is_a_tool_error_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = perf_report(dir.path(), 1).unwrap_err();
+        assert!(err.contains("no run 1"), "{err}");
+        assert!(!dir.path().join("ggo_ide.db").exists(), "must not create an empty db");
     }
 }
