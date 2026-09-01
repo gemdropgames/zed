@@ -554,7 +554,9 @@ pub enum Stage {
     Phase(String),
     /// `--> component <name>`: place-and-route of one component started.
     Component(String),
-    /// `  [boot] <stage>` (optionally ` — <detail>`).
+    /// `  [boot] <stage>` (optionally ` — <detail>`), detail kept: it
+    /// carries the next stage's budget, the only "how long should this
+    /// take" a boot verify has.
     Boot(String),
     /// `diag step <n>: running|PASS|FAIL|info`.
     DiagStep { index: String, status: String },
@@ -599,9 +601,7 @@ pub fn parse_stage(line: &str) -> Option<Stage> {
     }
     let body = trimmed.trim_start();
     if let Some(rest) = body.strip_prefix("[boot] ") {
-        // `<stage>` or `<stage> — <detail>`; the stage alone is the label.
-        let stage = rest.split(" — ").next().unwrap_or(rest);
-        return Some(Stage::Boot(stage.trim().to_string()));
+        return Some(Stage::Boot(rest.trim().to_string()));
     }
     if let Some(rest) = body.strip_prefix("diag step ") {
         if let Some((index, status)) = rest.split_once(':') {
@@ -1588,9 +1588,9 @@ mod tests {
             Some(Stage::Boot("banner".into()))
         );
         assert_eq!(
-            parse_stage("  [boot] banner — GemOS 0.1"),
-            Some(Stage::Boot("banner".into())),
-            "the detail is console material, not status material"
+            parse_stage("  [boot] boot-rom alive — next: SD ready (10s budget)"),
+            Some(Stage::Boot("boot-rom alive — next: SD ready (10s budget)".into())),
+            "the detail is the stage budget, which the status row shows"
         );
         assert_eq!(
             parse_stage("diag step 3: PASS"),
@@ -2283,10 +2283,10 @@ mod tests {
             progress.running().and_then(|row| row.detail.clone()),
             Some("place & route: cpu".to_string()),
         );
-        progress.apply("  [boot] banner — GemOS", secs(2));
+        progress.apply("  [boot] banner — next: launched (30s budget)", secs(2));
         assert_eq!(
             progress.running().and_then(|row| row.detail.clone()),
-            Some("boot: banner".to_string()),
+            Some("boot: banner — next: launched (30s budget)".to_string()),
             "the newest detail replaces the last",
         );
     }
