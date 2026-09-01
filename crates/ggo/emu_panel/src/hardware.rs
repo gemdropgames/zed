@@ -83,6 +83,18 @@ impl Missing {
         }
     }
 
+    /// The wire code for [`Self::label`]'s prose.
+    pub fn code(self) -> &'static str {
+        match self {
+            Missing::Repo => "repo",
+            Missing::Diag => "diag",
+            Missing::Emd => "emd",
+            Missing::Port => "port",
+            Missing::PortStuck => "port_stuck",
+            Missing::Project => "project",
+        }
+    }
+
     /// Can ZedGG fix this itself? A missing board cannot be installed.
     pub fn installable(self) -> bool {
         matches!(self, Missing::Repo | Missing::Diag | Missing::Emd)
@@ -185,6 +197,27 @@ impl HardwareEnv {
     pub fn version_skew(&self) -> Option<(String, String)> {
         let (repo_commit, emu_commit) = (self.repo_commit.as_ref()?, self.emu_commit.as_ref()?);
         (repo_commit != emu_commit).then(|| (short_commit(repo_commit), short_commit(emu_commit)))
+    }
+
+    /// This probe as the agent socket reports it.
+    pub fn remote_payload(&self) -> ggo_emu_remote::protocol::HwEnvPayload {
+        use ggo_emu_remote::protocol::{HwEnvPayload, HwMissing};
+        HwEnvPayload {
+            ready: self.ready(),
+            missing: self
+                .missing()
+                .into_iter()
+                .map(|missing| HwMissing { code: missing.code().to_string(), label: missing.label() })
+                .collect(),
+            ports: self.ports.clone(),
+            stuck_board: self.stuck_board,
+            project: self.project.as_ref().map(|path| path.display().to_string()),
+            repo: self.repo.as_ref().map(|path| path.display().to_string()),
+            diag_bin: self.diag_bin.clone(),
+            emd_bin: self.emd_bin.clone(),
+            version_skew: self.version_skew(),
+            emu_commit_in_repo: self.emu_commit_in_repo,
+        }
     }
 
     /// Is [`Self::repo`] the clone this feature made, rather than a
@@ -1661,6 +1694,23 @@ mod tests {
         assert_eq!(env.missing(), vec![Missing::Port]);
         assert!(!env.ready());
         assert!(ready_env().ready());
+    }
+
+    #[test]
+    fn the_remote_payload_names_every_missing_prerequisite_by_code() {
+        let ready = ready_env().remote_payload();
+        assert!(ready.ready && ready.missing.is_empty(), "{ready:?}");
+        assert_eq!(ready.ports, vec!["/dev/ttyUSB0".to_string()]);
+
+        let mut env = ready_env();
+        env.ports.clear();
+        env.stuck_board = true;
+        env.emd_bin = None;
+        let payload = env.remote_payload();
+        assert!(!payload.ready);
+        let codes: Vec<&str> = payload.missing.iter().map(|m| m.code.as_str()).collect();
+        assert_eq!(codes, ["emd", "port_stuck"]);
+        assert!(payload.missing[1].label.contains("replug") || !payload.missing[1].label.is_empty());
     }
 
     #[test]

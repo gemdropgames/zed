@@ -42,6 +42,8 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `hw_flash { world?, rebuild_gateware?, tty?, baud?, collect_seconds?, telemetry? }` | flash a world to the BOARD and run it; returns once the flash STARTS, with the effective `config` (defaults: cached gateware, first serial port, 115200 baud, 120s capture) |
 | `hw_flash_status` | snapshot: `{ active, what, phase, detail, elapsed_s, phases[], diag_steps[], verdict, failure, diag_run_id, perf_run_id, transcript, console_tail[] }` — poll it for running context |
 | `hw_flash_wait { timeout_s? }` | poll until the flash reaches a verdict (default 1800s) |
+| `hw_env` | board readiness: `{ ready, missing[{code,label}], ports, version_skew }` — call before `hw_flash` |
+| `hw_flash_cancel` | cancel the flash in flight; `{ cancelled }` |
 | `list_ggo_reports { limit? }` | perf runs in `~/.ggo/ggo_ide.db`, newest first, with ggo-diag log paths |
 | `fetch_ggo_report { run }` | paste-ready summary of one perf run (+ its ggo-diag log path) |
 | `open_ggo_report { run }` | open the Reports tab in Zed on that run (`{requested: true}` — the panel lands on the runs list if its db lacks the run) |

@@ -84,6 +84,12 @@ pub fn tool_list() -> Value {
           "inputSchema": with(json!({
               "timeout_s": { "type": "number", "description": "Give up after this many seconds; must be > 0 (omit for the default 1800)" }
           })) },
+        { "name": "hw_env",
+          "description": "Is this machine ready to flash? {ready, missing[{code,label}], ports, stuck_board, project, repo, diag_bin, emd_bin, version_skew:[repo_commit, emu_commit]|null, emu_commit_in_repo}. Call before hw_flash: a missing prerequisite here is what hw_flash would fail on, and version_skew means the board would render a different PPU than the in-IDE emulator. Probes fresh each call.",
+          "inputSchema": with(json!({})) },
+        { "name": "hw_flash_cancel",
+          "description": "Cancel the flash in flight, the same as the user's Cancel button. Returns {cancelled: bool}; false when nothing was running. The timeline keeps the phase it reached; a cancelled run is not a failed one.",
+          "inputSchema": with(json!({})) },
         { "name": "list_ggo_reports",
           "description": "Perf runs (emulator and board) in ~/.ggo/ggo_ide.db, newest first: run id, started_at, cart, label, and the ggo-diag log path for board runs. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
@@ -266,6 +272,14 @@ fn call_tool_inner(
         }
         "hw_flash_status" => {
             let data = send(&session.socket, Cmd::FlashStatus { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "hw_env" => {
+            let data = send(&session.socket, Cmd::HwEnv { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "hw_flash_cancel" => {
+            let data = send(&session.socket, Cmd::FlashCancel { workspace }, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "open_ggo_report" => {
@@ -616,6 +630,8 @@ mod tests {
                 "hw_flash",
                 "hw_flash_status",
                 "hw_flash_wait",
+                "hw_env",
+                "hw_flash_cancel",
                 "list_ggo_reports",
                 "fetch_ggo_report",
                 "open_ggo_report",
@@ -720,6 +736,26 @@ mod tests {
         assert!(!is_err, "{content:?}");
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains(r#""phase":"Boot verify (UART)""#), "{text}");
+    }
+
+    #[test]
+    fn hw_env_and_cancel_forward_their_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            if line.contains(r#""cmd":"hw_env""#) {
+                Ok(r#"{"id":1,"ok":true,"data":{"ready":false,"missing":[{"code":"port","label":"no serial device"}]}}"#.to_string())
+            } else {
+                assert!(line.contains(r#""cmd":"flash_cancel""#), "{line}");
+                Ok(r#"{"id":1,"ok":true,"data":{"cancelled":true}}"#.to_string())
+            }
+        };
+        let (content, is_err) = call_tool("hw_env", &json!({}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""code":"port""#));
+        let (content, is_err) = call_tool("hw_flash_cancel", &json!({}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""cancelled":true"#));
     }
 
     /// Each poll is its own short socket call (never one long blocking

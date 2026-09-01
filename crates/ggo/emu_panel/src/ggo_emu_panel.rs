@@ -776,16 +776,7 @@ impl EmuPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(flash) = self.flash.take() {
-            // Cancelling is not failing: the timeline stays as it was,
-            // with the phase it got to still marked running. Before the
-            // world is remembered, too: this press started nothing, so it
-            // has no business changing what the next one boots.
-            let elapsed = flash.started.elapsed();
-            self.last_flash = Some((flash.progress.clone(), elapsed));
-            self.status = Some("flash cancelled".to_string());
-            self.status_is_error = false;
-            cx.notify();
+        if self.cancel_flash(cx) {
             return;
         }
         // The gap a blocked flash leaves is the page's to explain, not a
@@ -797,6 +788,22 @@ impl EmuPanel {
             ..Default::default()
         };
         self.start_flash(config, window, cx).ok();
+    }
+
+    /// Cancel the flash in flight, if any. Cancelling is not failing: the
+    /// timeline stays as it was, with the phase it got to still marked
+    /// running. Before any world is remembered, too: a cancel started
+    /// nothing, so it has no business changing what the next one boots.
+    fn cancel_flash(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(flash) = self.flash.take() else {
+            return false;
+        };
+        let elapsed = flash.started.elapsed();
+        self.last_flash = Some((flash.progress.clone(), elapsed));
+        self.status = Some("flash cancelled".to_string());
+        self.status_is_error = false;
+        cx.notify();
+        true
     }
 
     /// [`Self::flash_to_board_with`]'s start half, with the reason a
@@ -3369,6 +3376,18 @@ impl EmuPanel {
                 .map(|(_, local_id)| *local_id),
             diag_run_id,
         }
+    }
+
+    /// The board-readiness probe, re-run now: plugging the board in
+    /// changes the answer, and the agent asks exactly when it wonders.
+    pub(crate) fn remote_env(&mut self) -> ggo_emu_remote::protocol::HwEnvPayload {
+        self.invalidate_hardware();
+        self.hardware_env_cached().remote_payload()
+    }
+
+    /// The button's cancel, for the agent. `false` when nothing was running.
+    pub(crate) fn remote_flash_cancel(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_flash(cx)
     }
 
     pub(crate) fn remote_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
@@ -7504,6 +7523,45 @@ mod tests {
                 .expect_err("one board, one flash");
             assert_eq!(err, "a flash is already running");
             assert!(panel.is_flashing(), "the running flash was left alone");
+        });
+    }
+
+    /// The agent's cancel is the button's cancel: the timeline is kept
+    /// with its phase still running, and a second cancel finds nothing.
+    #[gpui::test]
+    async fn test_remote_flash_cancel_retires_the_run_without_failing_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        panel.update_in(cx, |panel, _window, cx| {
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+            assert!(panel.remote_flash_status().active);
+            assert!(panel.remote_flash_cancel(cx), "a live flash was cancelled");
+            let status = panel.remote_flash_status();
+            assert!(!status.active);
+            assert_eq!(status.verdict, None, "cancelled is not failed");
+            assert_eq!(panel.status.as_deref(), Some("flash cancelled"));
+            assert!(!panel.remote_flash_cancel(cx), "nothing left to cancel");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_env_reports_the_probe(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, _cx| {
+            let env = panel.remote_env();
+            // A temp worktree with no repo, no binaries on PATH: nothing
+            // is ready, and every reason has a code.
+            assert!(!env.ready);
+            assert!(env.missing.iter().all(|m| !m.code.is_empty() && !m.label.is_empty()), "{env:?}");
         });
     }
 

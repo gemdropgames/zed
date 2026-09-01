@@ -55,6 +55,12 @@ pub enum Cmd {
     OpenReport { workspace: Option<String>, run: i64 },
     /// Close the Reports tab. With `run`, only if that is the run it shows.
     CloseReport { workspace: Option<String>, run: Option<i64> },
+    /// The machine's board-readiness probe: what is missing, which
+    /// serial ports were found, whether the repo and the in-IDE
+    /// emulator are at different commits.
+    HwEnv { workspace: Option<String> },
+    /// Cancel the flash in flight. The reply says whether there was one.
+    FlashCancel { workspace: Option<String> },
 }
 
 /// What a flash runs with. Every field has a default, so `{}` is a
@@ -200,6 +206,32 @@ pub struct FlashDiagStep {
     pub status: String,
 }
 
+/// `Cmd::HwEnv`'s reply: `HardwareEnv` as the agent needs it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HwEnvPayload {
+    /// Nothing is missing; a flash would start.
+    pub ready: bool,
+    /// Every unmet precondition in fix order: `{code, label}` where
+    /// `code` is one of project | repo | diag | emd | port | port_stuck.
+    pub missing: Vec<HwMissing>,
+    pub ports: Vec<String>,
+    pub stuck_board: bool,
+    pub project: Option<String>,
+    pub repo: Option<String>,
+    pub diag_bin: Option<String>,
+    pub emd_bin: Option<String>,
+    /// `Some((repo_short, emu_short))` when the flash source and the
+    /// in-IDE emulator are at different commits.
+    pub version_skew: Option<(String, String)>,
+    pub emu_commit_in_repo: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HwMissing {
+    pub code: String,
+    pub label: String,
+}
+
 /// Parse one request line. Errors name the parse failure so the host can
 /// answer with a protocol-level error instead of dropping the connection.
 pub fn parse_request(line: &str) -> Result<Request, String> {
@@ -308,6 +340,34 @@ mod tests {
             parse_request(r#"{"id":3,"cmd":"close_report","workspace":"/w","run":55}"#).unwrap().cmd,
             Cmd::CloseReport { workspace: Some("/w".to_string()), run: Some(55) }
         );
+    }
+
+    #[test]
+    fn hw_env_and_flash_cancel_requests_round_trip() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"hw_env"}"#).unwrap().cmd,
+            Cmd::HwEnv { workspace: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"flash_cancel","workspace":"/w"}"#).unwrap().cmd,
+            Cmd::FlashCancel { workspace: Some("/w".to_string()) }
+        );
+        let payload = HwEnvPayload {
+            ready: false,
+            missing: vec![HwMissing { code: "port".into(), label: "no serial device".into() }],
+            ports: vec![],
+            stuck_board: false,
+            project: Some("/game".into()),
+            repo: Some("/repo".into()),
+            diag_bin: Some("ggo-diag".into()),
+            emd_bin: Some("emd".into()),
+            version_skew: Some(("5370a5a".into(), "7fe694e".into())),
+            emu_commit_in_repo: Some(true),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains(r#""missing":[{"code":"port","label":"no serial device"}]"#), "{json}");
+        let back: HwEnvPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, payload);
     }
 
     #[test]

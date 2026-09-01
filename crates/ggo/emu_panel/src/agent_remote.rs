@@ -414,7 +414,9 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::FlashWorld { workspace, .. }
         | Cmd::FlashStatus { workspace }
         | Cmd::OpenReport { workspace, .. }
-        | Cmd::CloseReport { workspace, .. } => workspace.clone(),
+        | Cmd::CloseReport { workspace, .. }
+        | Cmd::HwEnv { workspace }
+        | Cmd::FlashCancel { workspace } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -434,11 +436,30 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         };
         return Ok(serde_json::to_value(payload).expect("FlashStatusPayload serializes"));
     }
+    // Likewise, and it must answer BEFORE anything is opened: this is the
+    // tool an agent calls to find out whether flashing is possible at
+    // all, so with no panel registered it runs the same probe the panel
+    // would have run rather than demanding one be opened first.
+    if let Cmd::HwEnv { .. } = cmd {
+        let payload = match &target.panel {
+            Some(panel) => panel.update(cx, |p, _| p.remote_env()).map_err(|e| e.to_string())?,
+            None => crate::hardware::probe(
+                Some(std::path::Path::new(&target_root)),
+                std::env::var("PATH").ok().as_deref(),
+                &std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default(),
+            )
+            .remote_payload(),
+        };
+        return Ok(serde_json::to_value(payload).expect("HwEnvPayload serializes"));
+    }
 
     let window = target.window.ok_or("workspace has no window (headless test?)")?;
 
     match cmd {
-        Cmd::Status | Cmd::FlashStatus { .. } => unreachable!("handled above"),
+        Cmd::Status | Cmd::FlashStatus { .. } | Cmd::HwEnv { .. } => unreachable!("handled above"),
         Cmd::Start { cart, .. } => {
             let root = std::path::PathBuf::from(&target.root);
             // No panel yet? Open it — a remote start must not need a
@@ -578,6 +599,13 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 })
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "closed": closed }))
+        }
+        Cmd::FlashCancel { .. } => {
+            let panel = target.panel.ok_or("no emu panel open in this workspace")?;
+            let cancelled = panel
+                .update(cx, |p, cx| p.remote_flash_cancel(cx))
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "cancelled": cancelled }))
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;
