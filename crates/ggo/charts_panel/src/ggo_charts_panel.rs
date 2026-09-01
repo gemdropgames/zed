@@ -70,7 +70,7 @@ mod report;
 pub use charts_item::ChartsItem;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -424,6 +424,9 @@ pub struct ChartsPanel {
     device_log: Option<DeviceLogState>,
     /// Why the last Re-run click went nowhere, if it did.
     rerun_note: Option<&'static str>,
+    /// `ggo-diag`'s consolidated log for the selected perf run, the file
+    /// the header's Copy button hands out -- see [`diag_log_path`].
+    run_log_path: Option<PathBuf>,
     /// Separate from `load_generation`: a run selection and a runs-list
     /// refresh are independent loads, and a stale one of either must not
     /// clobber the other's result. Shared by BOTH selection kinds, which is
@@ -489,6 +492,7 @@ impl ChartsPanel {
             detail: None,
             device_log: None,
             rerun_note: None,
+            run_log_path: None,
             detail_generation: 0,
             _detail_task: None,
             history: HistoryState::Empty,
@@ -585,7 +589,15 @@ impl ChartsPanel {
             return;
         };
         let run_id = run.id;
+        let started_at = run.started_at.clone();
         self.begin_selection(Selection::Perf(run));
+        // ponytail: one read_dir of ~/.ggo/diag/logs on the UI thread per
+        // selection; move it into the detail load if the directory grows
+        // past a few thousand files.
+        self.run_log_path = self
+            .diag_db_path()
+            .and_then(|db| Some(db.parent()?.join("diag").join("logs")))
+            .and_then(|logs_dir| diag_log_path(&logs_dir, &started_at));
         let generation = self.detail_generation;
         self.detail = Some(DetailState::Loading);
         cx.notify();
@@ -651,6 +663,7 @@ impl ChartsPanel {
         self.detail = None;
         self.device_log = None;
         self.rerun_note = None;
+        self.run_log_path = None;
         self.hover = None;
         // A frame number and a chart index both mean something only
         // within one run's chart set, so neither survives a selection
@@ -736,6 +749,7 @@ impl ChartsPanel {
         self.detail = None;
         self.device_log = None;
         self.rerun_note = None;
+        self.run_log_path = None;
         self.hover = None;
         self.frame_inspect = None;
         self.historic_enabled = false;
@@ -1254,6 +1268,7 @@ impl ChartsPanel {
                                     ),
                             )
                             .child(self.render_rerun_button(cx))
+                            .child(self.render_copy_log_button())
                             .child(Label::new(title).size(LabelSize::Small))
                             .children(self.ignored_caption()),
                     )
@@ -1278,6 +1293,28 @@ impl ChartsPanel {
             )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+
+    /// Copy the run's `ggo-diag` log path, for pasting into an agent's
+    /// prompt. Disabled, with the reason in its tooltip, for a run with no
+    /// such log -- an emulator run, or one whose log was pruned.
+    fn render_copy_log_button(&self) -> gpui::AnyElement {
+        let button = IconButton::new("ggo-charts-copy-log-path", IconName::Copy);
+        match &self.run_log_path {
+            Some(path) => {
+                let text = path.to_string_lossy().into_owned();
+                button
+                    .tooltip(Tooltip::text(format!("Copy log path\n{text}")))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                    })
+                    .into_any_element()
+            }
+            None => button
+                .disabled(true)
+                .tooltip(Tooltip::text("No ggo-diag log for this run"))
+                .into_any_element(),
+        }
     }
 
     /// The Re-run entry -- see [`Self::rerun_selected`] for where it goes.
@@ -2312,9 +2349,49 @@ impl Focusable for ChartsPanel {
     }
 }
 
+/// `ggo-diag`'s consolidated log for a run: the file under `logs_dir`
+/// (`~/.ggo/diag/logs`) whose name ends in `_<started_at>.log`. ggo-diag
+/// stamps it `{branch}_{commit}_{started_at}.log` and writes the same
+/// `started_at` onto the run row, which is the only link between the two
+/// -- no database column records the path. `None` for a run ggo-diag
+/// never saw (an emulator run) or whose log is gone.
+pub fn diag_log_path(logs_dir: &Path, started_at: &str) -> Option<PathBuf> {
+    if started_at.is_empty() {
+        return None;
+    }
+    let suffix = format!("_{started_at}.log");
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(logs_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&suffix))
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_diag_log_is_found_by_the_runs_started_at_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path();
+        std::fs::write(logs.join("main_5370a5a_2026-09-01_13-29-09.log"), "").unwrap();
+        std::fs::write(logs.join("main_7fe694e_2026-09-01_12-34-22.log"), "").unwrap();
+        assert_eq!(
+            diag_log_path(logs, "2026-09-01_13-29-09"),
+            Some(logs.join("main_5370a5a_2026-09-01_13-29-09.log"))
+        );
+        assert_eq!(diag_log_path(logs, "2026-09-01_00-00-00"), None);
+        assert_eq!(diag_log_path(logs, ""), None, "an empty stamp matches nothing");
+        assert_eq!(diag_log_path(&logs.join("missing"), "2026-09-01_13-29-09"), None);
+    }
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use workspace::{AppState, MultiWorkspace};
