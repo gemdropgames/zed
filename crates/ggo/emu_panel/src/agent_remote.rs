@@ -430,7 +430,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             Some(panel) => panel
                 .update(cx, |p, _| p.remote_flash_status())
                 .map_err(|e| e.to_string())?,
-            None => ggo_emu_remote::protocol::FlashStatusPayload::idle(),
+            None => ggo_emu_remote::protocol::FlashStatusPayload::default(),
         };
         return Ok(serde_json::to_value(payload).expect("FlashStatusPayload serializes"));
     }
@@ -563,33 +563,17 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                     })
                 })
                 .map_err(|e| e.to_string())?;
-            Ok(serde_json::json!({ "opened": true, "run": run }))
+            // "requested", not "shown": the panel looks the run up
+            // off-thread and lands on the runs list if its own database
+            // has no such run.
+            Ok(serde_json::json!({ "requested": true, "run": run }))
         }
         Cmd::CloseReport { run, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
             let closed = window
                 .update(cx, |_, window, app| {
-                    workspace.update(app, |workspace, cx| -> Result<bool, String> {
-                        let Some(item) =
-                            workspace.items_of_type::<ggo_charts_panel::ChartsItem>(cx).next()
-                        else {
-                            return Ok(false);
-                        };
-                        let showing = item.read(cx).panel().read(cx).selected_run_id();
-                        match (run, showing) {
-                            (Some(run), Some(showing)) if run != showing => {
-                                return Err(format!("the report tab shows run {showing}, not {run}"));
-                            }
-                            (Some(run), None) => {
-                                return Err(format!("the report tab is on the runs list, not run {run}"));
-                            }
-                            _ => {}
-                        }
-                        let pane = workspace.pane_for(&item).ok_or("report tab has no pane")?;
-                        pane.update(cx, |pane, cx| {
-                            pane.remove_item(item.entity_id(), false, true, window, cx)
-                        });
-                        Ok(true)
+                    workspace.update(app, |workspace, cx| {
+                        ggo_charts_panel::close_charts_item(workspace, run, window, cx)
                     })
                 })
                 .map_err(|e| e.to_string())??;

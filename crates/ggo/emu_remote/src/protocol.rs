@@ -136,7 +136,7 @@ pub struct WorkspaceStatus {
 /// (else the last one to end) reached. A flash outlives any single tool
 /// call -- a cached-gateware flash is minutes, a rebuild is twenty -- so
 /// the caller polls this rather than waiting on `FlashWorld`'s reply.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FlashStatusPayload {
     /// A flash is currently running.
     pub active: bool,
@@ -198,27 +198,6 @@ pub struct FlashDiagStep {
     pub index: String,
     /// "running" | "PASS" | "FAIL" | "info".
     pub status: String,
-}
-
-impl FlashStatusPayload {
-    /// The "never ran" payload: every field but `active` absent.
-    pub fn idle() -> Self {
-        Self {
-            active: false,
-            phase: None,
-            verdict: None,
-            diag_run_id: None,
-            perf_run_id: None,
-            what: None,
-            elapsed_s: None,
-            detail: None,
-            phases: Vec::new(),
-            diag_steps: Vec::new(),
-            failure: None,
-            transcript: None,
-            console_tail: Vec::new(),
-        }
-    }
 }
 
 /// Parse one request line. Errors name the parse failure so the host can
@@ -371,7 +350,7 @@ mod tests {
     fn flash_status_payload_without_context_fields_is_the_idle_shape() {
         let old = r#"{"active":false,"phase":null,"verdict":null,"diag_run_id":null,"perf_run_id":null}"#;
         let back: FlashStatusPayload = serde_json::from_str(old).unwrap();
-        assert_eq!(back, FlashStatusPayload::idle());
+        assert_eq!(back, FlashStatusPayload::default());
     }
 
     #[test]

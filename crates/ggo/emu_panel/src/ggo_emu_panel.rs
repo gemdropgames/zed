@@ -831,7 +831,12 @@ impl EmuPanel {
         // should have one answer.
         self.open_hardware_page(window, cx);
         let (request, what, progress) = self.flash_plan(&env, &config, cx)?;
-        let effective = hardware::effective_config(&env, &config);
+        // The world the argv got is the remembered one (see `flash_plan`),
+        // and that -- not the caller's `None` -- is what the reply says.
+        let effective = hardware::effective_config(
+            &env,
+            &hardware::FlashConfig { world: self.flash_world(cx), ..config },
+        );
         // Arm the "open this flash's report when it passes" for the run
         // about to start. Here rather than in `start_board_run`, which
         // also serves the windowless setup/pull runs -- and only after
@@ -978,6 +983,7 @@ impl EmuPanel {
     ) {
         progress.what = Some(what.clone());
         let console = self.console.get_or_insert_with(uart::UartLog::new).clone();
+        progress.console_from = console.lines().len();
         let streamer = self.proc_streamer.clone();
         // Taken, not read: this run spends the arming whatever it is, so a
         // flash that recorded nothing cannot leave one for the next setup
@@ -3307,59 +3313,48 @@ impl EmuPanel {
     pub(crate) fn remote_flash_status(&self) -> ggo_emu_remote::protocol::FlashStatusPayload {
         use ggo_emu_remote::protocol::{FlashDiagStep, FlashPhase};
         let Some((progress, elapsed)) = self.flash_progress() else {
-            return ggo_emu_remote::protocol::FlashStatusPayload::idle();
+            return ggo_emu_remote::protocol::FlashStatusPayload::default();
         };
-        let progress = Some(progress);
-        let diag_run_id = progress.and_then(|progress| progress.diag_run_id.clone());
+        let diag_run_id = progress.diag_run_id.clone();
         let phases = progress
-            .map(|progress| {
-                progress
-                    .rows()
-                    .iter()
-                    .map(|row| FlashPhase {
-                        title: row.title.clone(),
-                        state: match row.state {
-                            hardware::PhaseState::Pending => "pending",
-                            hardware::PhaseState::Running => "running",
-                            hardware::PhaseState::Done => "done",
-                            hardware::PhaseState::Failed => "failed",
-                        }
-                        .to_string(),
-                        elapsed_s: row.elapsed(elapsed).as_secs(),
-                        detail: row.detail.clone(),
-                    })
-                    .collect()
+            .rows()
+            .iter()
+            .map(|row| FlashPhase {
+                title: row.title.clone(),
+                state: match row.state {
+                    hardware::PhaseState::Pending => "pending",
+                    hardware::PhaseState::Running => "running",
+                    hardware::PhaseState::Done => "done",
+                    hardware::PhaseState::Failed => "failed",
+                }
+                .to_string(),
+                elapsed_s: row.elapsed(elapsed).as_secs(),
+                detail: row.detail.clone(),
             })
-            .unwrap_or_default();
+            .collect();
         let diag_steps = progress
-            .map(|progress| {
-                progress
-                    .diag_steps()
-                    .iter()
-                    .map(|step| FlashDiagStep { index: step.index.clone(), status: step.status.clone() })
-                    .collect()
-            })
-            .unwrap_or_default();
-        // ponytail: last 20 lines; the transcript path is there for the rest.
+            .diag_steps()
+            .iter()
+            .map(|step| FlashDiagStep { index: step.index.clone(), status: step.status.clone() })
+            .collect();
+        // This run's lines only, and the last 20 of those; the transcript
+        // path is there for the rest. ponytail: a console REPLACED by a
+        // later emulator boot still shows through here -- track the
+        // console's identity too if that ever misleads.
         let lines = self.console_lines();
-        let console_tail = lines[lines.len().saturating_sub(20)..].to_vec();
+        let from = progress.console_from.min(lines.len());
+        let console_tail = lines[from.max(lines.len().saturating_sub(20))..].to_vec();
         ggo_emu_remote::protocol::FlashStatusPayload {
             active: self.is_flashing(),
-            phase: progress
-                .and_then(|progress| progress.current_phase())
-                .map(|row| row.title.clone()),
-            verdict: progress.and_then(|progress| progress.verdict()),
-            what: progress.and_then(|progress| progress.what.clone()),
+            phase: progress.current_phase().map(|row| row.title.clone()),
+            verdict: progress.verdict(),
+            what: progress.what.clone(),
             elapsed_s: Some(elapsed.as_secs()),
-            detail: progress
-                .and_then(|progress| progress.running())
-                .and_then(|row| row.detail.clone()),
+            detail: progress.running().and_then(|row| row.detail.clone()),
             phases,
             diag_steps,
-            failure: progress.and_then(|progress| progress.failure.clone()),
-            transcript: progress
-                .and_then(|progress| progress.transcript.as_ref())
-                .map(|path| path.display().to_string()),
+            failure: progress.failure.clone(),
+            transcript: progress.transcript.as_ref().map(|path| path.display().to_string()),
             console_tail,
             // Resolved by the post-PASS hop, not here: translating
             // ggo-diag's run id blocks on two database calls, and this

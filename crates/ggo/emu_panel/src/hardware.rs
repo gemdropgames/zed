@@ -15,11 +15,10 @@
 //! image. When that binary lands, it belongs here beside `flash_args`.
 
 use std::path::{Path, PathBuf};
-
-pub use ggo_emu_remote::protocol::FlashConfig;
 use std::time::Duration;
 
 use ggo_common::ProcRequest;
+pub use ggo_emu_remote::protocol::FlashConfig;
 
 use crate::menu::{DEFAULT_DIAG_BIN, DIAG_BIN_ENV, DIAG_REPO_ENV, DIAG_TTY_ENV, SERIAL_BY_ID_DIR};
 
@@ -544,6 +543,8 @@ pub fn effective_config(env: &HardwareEnv, config: &FlashConfig) -> FlashConfig 
 pub fn flash_request(env: &HardwareEnv, config: &FlashConfig) -> Result<ProcRequest, String> {
     // A port named by the caller stands in for the scan's: the scan is
     // how the panel finds one, not a rule that only scanned ports count.
+    // A STUCK board (`Missing::PortStuck`) is still a blocker: its driver
+    // is detached, so no name would open.
     let missing: Vec<Missing> = env
         .missing()
         .into_iter()
@@ -567,7 +568,9 @@ pub fn flash_request(env: &HardwareEnv, config: &FlashConfig) -> Result<ProcRequ
     ) else {
         return Err("flashing needs a board".to_string());
     };
-    Ok(ProcRequest::new(bin, repo, flash_args(&project, &tty, config)))
+    // The child gets every knob explicitly, so what `effective_config`
+    // reports is what runs even if ggo-diag's own defaults move.
+    Ok(ProcRequest::new(bin, repo, flash_args(&project, &tty, &effective_config(env, config))))
 }
 
 /// A stage of the pipeline, parsed from `ggo-diag`'s own output. The
@@ -750,6 +753,9 @@ pub struct FlashProgress {
     /// Why the run failed, in the child's own words. Set when the run
     /// is retired, never while it is live.
     pub failure: Option<String>,
+    /// How many console lines predate this run: the console is shared
+    /// across runs, and the agent's tail must not show the last one's.
+    pub console_from: usize,
 }
 
 impl FlashProgress {
@@ -1615,7 +1621,13 @@ mod tests {
     fn flash_request_carries_the_world_through() {
         let arena = FlashConfig { world: Some("worlds/arena".into()), ..Default::default() };
         let request = flash_request(&ready_env(), &arena).expect("a ready machine flashes");
-        assert_eq!(request.args, flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena));
+        assert_eq!(
+            request.args,
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", &effective_config(&ready_env(), &arena))
+        );
+        // Explicit, not left to ggo-diag: the reported set is the run set.
+        assert!(request.args.windows(2).any(|w| w == ["--baud", "115200"]), "{:?}", request.args);
+        assert!(request.args.windows(2).any(|w| w == ["--collect-seconds", "120"]), "{:?}", request.args);
     }
 
     #[test]

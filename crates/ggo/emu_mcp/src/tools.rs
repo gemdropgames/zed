@@ -241,12 +241,24 @@ fn call_tool_inner(
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "hw_flash" => {
+            // A zero or negative knob is a caller mistake, not a request
+            // for the default (`as u32` would wrap it into nonsense).
+            let baud = match arg_i64(args, "baud") {
+                Some(n) if n <= 0 || n > i64::from(u32::MAX) => return Err("baud must be > 0".to_string()),
+                Some(n) => Some(n as u32),
+                None => None,
+            };
+            let collect_seconds = match arg_i64(args, "collect_seconds") {
+                Some(n) if n <= 0 => return Err("collect_seconds must be > 0".to_string()),
+                Some(n) => Some(n as u64),
+                None => None,
+            };
             let config = FlashConfig {
                 world: arg_str(args, "world"),
                 rebuild_gateware: args.get("rebuild_gateware").and_then(Value::as_bool).unwrap_or(false),
                 tty: arg_str(args, "tty"),
-                baud: arg_i64(args, "baud").map(|n| n as u32),
-                collect_seconds: arg_i64(args, "collect_seconds").map(|n| n as u64),
+                baud,
+                collect_seconds,
                 telemetry: args.get("telemetry").and_then(Value::as_bool).unwrap_or(false),
             };
             let data = send(&session.socket, Cmd::FlashWorld { workspace, config }, CALL_TIMEOUT, connect)?;
@@ -374,12 +386,24 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
     let ide_db = db_dir.join("ggo_ide.db");
     // Same best-effort clone as `fetch_report`: board runs reach this
     // database only by being copied across, and a clone failure must not
-    // hide the emulator runs already here.
-    if let Err(e) = diag_db::clone_runs(&db_dir.join("diag.db"), &ide_db) {
-        eprintln!("list_ggo_reports: could not clone every device run: {e}");
-    }
+    // hide the emulator runs already here -- but an EMPTY list with a
+    // failed clone is told why, since the failure may be the reason.
+    // No diag.db is nothing to clone (a machine that never ran the
+    // device tooling), not a failure to report.
+    let diag_db_path = db_dir.join("diag.db");
+    let clone_error = diag_db_path
+        .exists()
+        .then(|| diag_db::clone_runs(&diag_db_path, &ide_db).err())
+        .flatten();
+    let none = |what: String| {
+        let text = match &clone_error {
+            Some(e) => format!("{what} (and cloning device runs from diag.db failed: {e})"),
+            None => what,
+        };
+        Ok(vec![json!({ "type": "text", "text": text })])
+    };
     if !ide_db.exists() {
-        return Ok(vec![json!({ "type": "text", "text": format!("no runs yet ({} does not exist)", ide_db.display()) })]);
+        return none(format!("no runs yet ({} does not exist)", ide_db.display()));
     }
     let mut rows = Vec::new();
     for cart in perf_db::carts(&ide_db).map_err(|e| format!("reading carts: {e:#}"))? {
@@ -404,8 +428,10 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
             )
         })
         .collect();
-    let text = if lines.is_empty() { "no runs yet".to_string() } else { lines.join("\n") };
-    Ok(vec![json!({ "type": "text", "text": text })])
+    if lines.is_empty() {
+        return none("no runs yet".to_string());
+    }
+    Ok(vec![json!({ "type": "text", "text": lines.join("\n") })])
 }
 
 /// One perf run's paste-ready summary out of `<db_dir>/ggo_ide.db`.
@@ -666,6 +692,23 @@ mod tests {
     }
 
     #[test]
+    fn hw_flash_rejects_a_non_positive_knob_before_touching_zed() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            panic!("a bad knob never reaches the socket")
+        };
+        for (args, word) in [
+            (json!({"world": "worlds/a", "baud": -1}), "baud"),
+            (json!({"world": "worlds/a", "collect_seconds": 0}), "collect_seconds"),
+        ] {
+            let (content, is_err) = call_tool("hw_flash", &args, dir.path(), &connect);
+            assert!(is_err, "{content:?}");
+            assert!(content[0]["text"].as_str().unwrap().contains(word), "{content:?}");
+        }
+    }
+
+    #[test]
     fn hw_flash_status_returns_the_payload_json() {
         let dir = tempfile::tempdir().unwrap();
         fake_session(dir.path(), std::process::id());
@@ -899,6 +942,10 @@ mod tests {
         assert!(text.starts_with("run 7  2026-08-31T00:00:00Z  wilds  label=board  frames=2  log="), "{text}");
         assert!(text.ends_with(&log.display().to_string()), "{text}");
         assert_eq!(list_reports(dir.path(), 0).unwrap()[0]["text"], "no runs yet");
+        assert!(
+            !dir.path().join("diag.db").exists(),
+            "a missing diag.db is nothing to clone, not a failure to report"
+        );
     }
 
     #[test]

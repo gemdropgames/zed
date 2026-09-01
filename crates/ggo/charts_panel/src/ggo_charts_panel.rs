@@ -265,6 +265,51 @@ pub fn open_charts_item(
 }
 
 
+/// Close the Reports tab. With `run`, only if that is the perf run it
+/// shows -- an agent closing "its" report must not take down the one
+/// the user switched to. `Ok(false)` when there is no tab.
+///
+/// The pane is updated from inside the workspace lease, which is safe:
+/// only `Workspace` is leased, and `Pane::remove_item` reaches the
+/// workspace through emitted events and `window.defer`, never inline.
+pub fn close_charts_item(
+    workspace: &mut Workspace,
+    run: Option<i64>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Result<bool, String> {
+    let Some(item) = workspace.items_of_type::<ChartsItem>(cx).next() else {
+        return Ok(false);
+    };
+    let showing = item.read(cx).panel().read(cx).selected_run_id();
+    match (run, showing) {
+        (Some(run), Some(showing)) if run != showing => {
+            return Err(format!("the report tab shows run {showing}, not {run}"));
+        }
+        (Some(run), None) => {
+            return Err(format!("the report tab is on the runs list, not run {run}"));
+        }
+        _ => {}
+    }
+    // `pane_for` reads an index filled by a deferred event, so a tab
+    // opened in this same update is not in it yet; the panes are.
+    let item_id = item.entity_id();
+    let pane = workspace
+        .pane_for(&item)
+        .or_else(|| {
+            workspace
+                .panes()
+                .iter()
+                .find(|pane| pane.read(cx).items().any(|it| it.item_id() == item_id))
+                .cloned()
+        })
+        .ok_or("report tab has no pane")?;
+    pane.update(cx, |pane, cx| {
+        pane.remove_item(item.entity_id(), false, true, window, cx)
+    });
+    Ok(true)
+}
+
 // ------------------------------------------------------------- view state
 
 enum LoadState {
@@ -2371,6 +2416,36 @@ mod tests {
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
+    }
+
+    /// The agent's close: gone when there is a tab, `false` when there
+    /// is not, and a refusal -- tab left alone -- when the run it names
+    /// is not the one on screen.
+    #[gpui::test]
+    async fn test_close_charts_item_closes_only_the_run_it_names(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_charts_item(workspace, window, cx, |_, _, _| {});
+            // The picker, not a run: a named run cannot be what it shows.
+            let err = close_charts_item(workspace, Some(5), window, cx).unwrap_err();
+            assert!(err.contains("runs list"), "{err}");
+            assert_eq!(workspace.items_of_type::<ChartsItem>(cx).count(), 1, "left alone");
+            assert_eq!(close_charts_item(workspace, None, window, cx), Ok(true));
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.items_of_type::<ChartsItem>(cx).count(), 0, "closed");
+            assert_eq!(close_charts_item(workspace, None, window, cx), Ok(false));
+        });
     }
 
     /// The reports view is a SINGLETON center tab: `open_charts_item`
