@@ -39,7 +39,7 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `emu_start { cart }` | boot + pause at the first frame boundary; returns initial world JSON |
 | `emu_next_frame { buttons?, screenshot? }` | latch pad, run EXACTLY one frame; returns new world JSON (+ PNG if asked) |
 | `emu_stop` | end the run; returns the cart's uart log |
-| `hw_flash { world?, rebuild_gateware? }` | flash a world to the BOARD and run it; returns once the flash STARTS |
+| `hw_flash { world?, rebuild_gateware?, tty?, baud?, collect_seconds?, telemetry? }` | flash a world to the BOARD and run it; returns once the flash STARTS, with the effective `config` (defaults: cached gateware, first serial port, 115200 baud, 120s capture) |
 | `hw_flash_status` | snapshot: `{ active, phase, verdict, diag_run_id, perf_run_id }` |
 | `hw_flash_wait { timeout_s? }` | poll until the flash reaches a verdict (default 1800s) |
 | `list_ggo_reports { limit? }` | perf runs in `~/.ggo/ggo_ide.db`, newest first, with ggo-diag log paths |

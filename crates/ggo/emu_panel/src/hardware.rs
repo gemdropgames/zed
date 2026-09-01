@@ -15,6 +15,8 @@
 //! image. When that binary lands, it belongs here beside `flash_args`.
 
 use std::path::{Path, PathBuf};
+
+pub use ggo_emu_remote::protocol::FlashConfig;
 use std::time::Duration;
 
 use ggo_common::ProcRequest;
@@ -486,26 +488,52 @@ impl HardwareEnv {
 /// an older binary on `PATH` exits 2 on the unknown argument rather than
 /// ignoring it, and the transcript on the hardware page is where that
 /// shows up. The remedy is the page's own install/update buttons.
-pub fn flash_args(
-    project: &Path,
-    tty: &str,
-    world: Option<&str>,
-    rebuild_gateware: bool,
-) -> Vec<String> {
+pub fn flash_args(project: &Path, tty: &str, config: &FlashConfig) -> Vec<String> {
     let mut args = vec![
         "--project".to_string(),
         project.to_string_lossy().into_owned(),
         "--tty".to_string(),
         tty.to_string(),
     ];
-    if let Some(world) = world {
+    if let Some(world) = &config.world {
         args.push("--world".to_string());
-        args.push(world.to_string());
+        args.push(world.clone());
     }
-    if !rebuild_gateware {
+    if !config.rebuild_gateware {
         args.push("--skip-pnr".to_string());
     }
+    // Unset knobs are NOT passed: ggo-diag's own default rules, whatever
+    // the mirrored constants say.
+    if let Some(baud) = config.baud {
+        args.push("--baud".to_string());
+        args.push(baud.to_string());
+    }
+    if let Some(seconds) = config.collect_seconds {
+        args.push("--collect-seconds".to_string());
+        args.push(seconds.to_string());
+    }
+    if config.telemetry {
+        args.push("--telemetry".to_string());
+    }
     args
+}
+
+/// `config` with every default filled in the way `env` would fill it:
+/// the serial port the scan found, ggo-diag's baud and capture window.
+/// What the agent is told a flash it started actually runs with.
+pub fn effective_config(env: &HardwareEnv, config: &FlashConfig) -> FlashConfig {
+    FlashConfig {
+        world: config.world.clone(),
+        rebuild_gateware: config.rebuild_gateware,
+        tty: config.tty.clone().or_else(|| env.ports.first().cloned()),
+        baud: Some(config.baud.unwrap_or(ggo_emu_remote::protocol::DEFAULT_BAUD)),
+        collect_seconds: Some(
+            config
+                .collect_seconds
+                .unwrap_or(ggo_emu_remote::protocol::DEFAULT_COLLECT_SECONDS),
+        ),
+        telemetry: config.telemetry,
+    }
 }
 
 /// The flash invocation, or the list of what is missing instead.
@@ -513,12 +541,14 @@ pub fn flash_args(
 /// `cwd` is the GGO repo: that CLI finds the repo by walking up from its
 /// working directory, and this fork's worktree is the user's GAME
 /// project, not the repo.
-pub fn flash_request(
-    env: &HardwareEnv,
-    world: Option<&str>,
-    rebuild_gateware: bool,
-) -> Result<ProcRequest, String> {
-    let missing = env.missing();
+pub fn flash_request(env: &HardwareEnv, config: &FlashConfig) -> Result<ProcRequest, String> {
+    // A port named by the caller stands in for the scan's: the scan is
+    // how the panel finds one, not a rule that only scanned ports count.
+    let missing: Vec<Missing> = env
+        .missing()
+        .into_iter()
+        .filter(|missing| !(config.tty.is_some() && *missing == Missing::Port))
+        .collect();
     if !missing.is_empty() {
         return Err(format!(
             "flashing needs a board: {}",
@@ -533,15 +563,11 @@ pub fn flash_request(
         env.diag_bin.clone(),
         env.repo.clone(),
         env.project.clone(),
-        env.ports.first().cloned(),
+        config.tty.clone().or_else(|| env.ports.first().cloned()),
     ) else {
         return Err("flashing needs a board".to_string());
     };
-    Ok(ProcRequest::new(
-        bin,
-        repo,
-        flash_args(&project, &tty, world, rebuild_gateware),
-    ))
+    Ok(ProcRequest::new(bin, repo, flash_args(&project, &tty, config)))
 }
 
 /// A stage of the pipeline, parsed from `ggo-diag`'s own output. The
@@ -1461,17 +1487,77 @@ mod tests {
     #[test]
     fn flash_args_pack_the_project_and_skip_place_and_route() {
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", None, false),
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", &FlashConfig::default()),
             vec!["--project", "/game", "--tty", "/dev/ttyUSB0", "--skip-pnr"],
         );
     }
 
     #[test]
     fn a_gateware_rebuild_does_not_skip_place_and_route() {
+        let config = FlashConfig { rebuild_gateware: true, ..Default::default() };
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", None, true),
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", &config),
             vec!["--project", "/game", "--tty", "/dev/ttyUSB0"],
         );
+    }
+
+    /// Every knob reaches the child, and an unset one passes no flag at
+    /// all -- ggo-diag's default is ggo-diag's to keep.
+    #[test]
+    fn every_set_knob_is_a_flag_and_every_unset_one_is_absent() {
+        let config = FlashConfig {
+            world: None,
+            rebuild_gateware: false,
+            tty: Some("/dev/ttyUSB3".into()),
+            baud: Some(9600),
+            collect_seconds: Some(30),
+            telemetry: true,
+        };
+        assert_eq!(
+            flash_args(Path::new("/game"), "/dev/ttyUSB3", &config),
+            vec![
+                "--project",
+                "/game",
+                "--tty",
+                "/dev/ttyUSB3",
+                "--skip-pnr",
+                "--baud",
+                "9600",
+                "--collect-seconds",
+                "30",
+                "--telemetry"
+            ],
+        );
+        let args = flash_args(Path::new("/game"), "/dev/ttyUSB0", &FlashConfig::default());
+        for flag in ["--baud", "--collect-seconds", "--telemetry", "--world"] {
+            assert!(!args.contains(&flag.to_string()), "{flag} in {args:?}");
+        }
+    }
+
+    /// The effective configuration names the port the scan found and
+    /// ggo-diag's defaults, so the agent learns what its flash runs with.
+    #[test]
+    fn the_effective_config_fills_the_scanned_port_and_the_diag_defaults() {
+        let effective = effective_config(&ready_env(), &FlashConfig::default());
+        assert_eq!(effective.tty.as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!(effective.baud, Some(115_200));
+        assert_eq!(effective.collect_seconds, Some(120));
+        let named = FlashConfig { tty: Some("/dev/ttyUSB7".into()), baud: Some(9600), ..Default::default() };
+        let effective = effective_config(&ready_env(), &named);
+        assert_eq!(effective.tty.as_deref(), Some("/dev/ttyUSB7"));
+        assert_eq!(effective.baud, Some(9600));
+    }
+
+    /// A caller-named port is a port: the scan finding none is no longer
+    /// a missing prerequisite.
+    #[test]
+    fn a_named_tty_stands_in_for_the_scan() {
+        let mut env = ready_env();
+        env.ports.clear();
+        assert!(flash_request(&env, &FlashConfig::default()).is_err());
+        let request = flash_request(&env, &FlashConfig { tty: Some("/dev/ttyUSB9".into()), ..Default::default() })
+            .expect("a named port flashes");
+        assert!(request.args.contains(&"/dev/ttyUSB9".to_string()), "{:?}", request.args);
     }
 
     /// The named world overrides the project's `default_world`, and sits
@@ -1479,13 +1565,9 @@ mod tests {
     /// the run.
     #[test]
     fn a_named_world_is_what_the_board_boots() {
+        let arena = FlashConfig { world: Some("worlds/arena".into()), ..Default::default() };
         assert_eq!(
-            flash_args(
-                Path::new("/game"),
-                "/dev/ttyUSB0",
-                Some("worlds/arena"),
-                false
-            ),
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena),
             vec![
                 "--project",
                 "/game",
@@ -1496,13 +1578,9 @@ mod tests {
                 "--skip-pnr"
             ],
         );
+        let arena_full = FlashConfig { rebuild_gateware: true, ..arena };
         assert_eq!(
-            flash_args(
-                Path::new("/game"),
-                "/dev/ttyUSB0",
-                Some("worlds/arena"),
-                true
-            ),
+            flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena_full),
             vec![
                 "--project",
                 "/game",
@@ -1516,7 +1594,8 @@ mod tests {
 
     #[test]
     fn flash_request_runs_in_the_repo_not_the_project() {
-        let request = flash_request(&ready_env(), None, false).expect("a ready machine flashes");
+        let request =
+            flash_request(&ready_env(), &FlashConfig::default()).expect("a ready machine flashes");
         assert_eq!(request.bin, "ggo-diag");
         assert_eq!(
             request.cwd,
@@ -1534,17 +1613,9 @@ mod tests {
     /// The world reaches the child, not just [`flash_args`].
     #[test]
     fn flash_request_carries_the_world_through() {
-        let request = flash_request(&ready_env(), Some("worlds/arena"), false)
-            .expect("a ready machine flashes");
-        assert_eq!(
-            request.args,
-            flash_args(
-                Path::new("/game"),
-                "/dev/ttyUSB0",
-                Some("worlds/arena"),
-                false
-            ),
-        );
+        let arena = FlashConfig { world: Some("worlds/arena".into()), ..Default::default() };
+        let request = flash_request(&ready_env(), &arena).expect("a ready machine flashes");
+        assert_eq!(request.args, flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena));
     }
 
     #[test]
@@ -1560,7 +1631,8 @@ mod tests {
                 Missing::Port
             ]
         );
-        let error = flash_request(&env, None, false).expect_err("an empty machine cannot flash");
+        let error =
+            flash_request(&env, &FlashConfig::default()).expect_err("an empty machine cannot flash");
         for missing in env.missing() {
             assert!(
                 error.contains(&missing.label()),

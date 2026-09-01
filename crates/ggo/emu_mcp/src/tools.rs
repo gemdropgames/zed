@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use ggo_emu_remote::protocol::{Cmd, Request, Response};
+use ggo_emu_remote::protocol::{Cmd, FlashConfig, Request, Response};
 use ggo_emu_remote::registry::{self, SessionInfo};
 use serde_json::{Value, json};
 
@@ -67,10 +67,14 @@ pub fn tool_list() -> Value {
           })) },
         { "name": "emu_stop", "description": "End the lock-step run; returns the cart's uart log.", "inputSchema": with(json!({})) },
         { "name": "hw_flash",
-          "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Returns as soon as the flash STARTS — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
+          "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=115200, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
           "inputSchema": with(json!({
               "world": { "type": "string", "description": "World stem to bake in as the boot world, e.g. worlds/chase_cam" },
-              "rebuild_gateware": { "type": "boolean", "description": "Re-run place-and-route (~20 min) instead of reusing the cached bitstream; only needed after a gateware change" }
+              "rebuild_gateware": { "type": "boolean", "description": "Re-run place-and-route (~20 min) instead of reusing the cached bitstream; only needed after a gateware change (default false)" },
+              "tty": { "type": "string", "description": "Serial device, e.g. /dev/ttyUSB0 (default: the first port the panel's scan found)" },
+              "baud": { "type": "number", "description": "UART baud (default 115200)" },
+              "collect_seconds": { "type": "number", "description": "How long the post-boot gameplay telemetry capture runs before the flash ends on its own (default 120)" },
+              "telemetry": { "type": "boolean", "description": "Force GemOS's telemetry feature on in the firmware build (default false; firmware already defaults it on)" }
           })) },
         { "name": "hw_flash_status",
           "description": "Non-blocking snapshot of the flash in flight (else the last one): {active, what, phase, detail, elapsed_s, phases[{title,state,elapsed_s,detail}], diag_steps[{index,status}], verdict, failure, diag_run_id, perf_run_id, transcript, console_tail[]}. Poll it while a flash runs: `phases` is the whole timeline including phases still pending, `detail` is what the running phase is doing right now (e.g. which boot stage is up and the next stage's time budget), `console_tail` the newest output lines and `transcript` the full log file. verdict is null while running, true=PASS, false=FAIL (then `failure` says why); perf_run_id is the run number to hand to fetch_ggo_report, present only once a passed run's report has landed.",
@@ -237,15 +241,15 @@ fn call_tool_inner(
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "hw_flash" => {
-            let world = arg_str(args, "world");
-            let rebuild_gateware =
-                args.get("rebuild_gateware").and_then(Value::as_bool).unwrap_or(false);
-            let data = send(
-                &session.socket,
-                Cmd::FlashWorld { workspace, world, rebuild_gateware },
-                CALL_TIMEOUT,
-                connect,
-            )?;
+            let config = FlashConfig {
+                world: arg_str(args, "world"),
+                rebuild_gateware: args.get("rebuild_gateware").and_then(Value::as_bool).unwrap_or(false),
+                tty: arg_str(args, "tty"),
+                baud: arg_i64(args, "baud").map(|n| n as u32),
+                collect_seconds: arg_i64(args, "collect_seconds").map(|n| n as u64),
+                telemetry: args.get("telemetry").and_then(Value::as_bool).unwrap_or(false),
+            };
+            let data = send(&session.socket, Cmd::FlashWorld { workspace, config }, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "hw_flash_status" => {
@@ -645,16 +649,20 @@ mod tests {
             assert!(line.contains(r#""cmd":"flash_world""#), "{line}");
             assert!(line.contains(r#""world":"worlds/chase_cam""#), "{line}");
             assert!(line.contains(r#""rebuild_gateware":true"#), "{line}");
-            Ok(r#"{"id":1,"ok":true,"data":{"started":true}}"#.to_string())
+            assert!(line.contains(r#""collect_seconds":30"#), "{line}");
+            assert!(line.contains(r#""tty":null"#), "an unset knob travels as null: {line}");
+            Ok(r#"{"id":1,"ok":true,"data":{"started":true,"config":{"world":"worlds/chase_cam","rebuild_gateware":true,"tty":"/dev/ttyUSB0","baud":115200,"collect_seconds":30,"telemetry":false}}}"#.to_string())
         };
         let (content, is_err) = call_tool(
             "hw_flash",
-            &json!({"world": "worlds/chase_cam", "rebuild_gateware": true}),
+            &json!({"world": "worlds/chase_cam", "rebuild_gateware": true, "collect_seconds": 30}),
             dir.path(),
             &connect,
         );
         assert!(!is_err, "{content:?}");
-        assert!(content[0]["text"].as_str().unwrap().contains(r#""started":true"#));
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains(r#""started":true"#), "{text}");
+        assert!(text.contains(r#""tty":"/dev/ttyUSB0""#), "the effective config comes back: {text}");
     }
 
     #[test]

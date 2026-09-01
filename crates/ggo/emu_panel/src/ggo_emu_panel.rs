@@ -791,7 +791,12 @@ impl EmuPanel {
         // The gap a blocked flash leaves is the page's to explain, not a
         // status line's -- see [`Self::start_flash`], whose error the
         // button therefore drops.
-        self.start_flash(world, rebuild_gateware, window, cx).ok();
+        let config = hardware::FlashConfig {
+            world: world.map(str::to_string),
+            rebuild_gateware,
+            ..Default::default()
+        };
+        self.start_flash(config, window, cx).ok();
     }
 
     /// [`Self::flash_to_board_with`]'s start half, with the reason a
@@ -803,15 +808,14 @@ impl EmuPanel {
     /// "flashing needs a board: …" has to come back as its reply.
     fn start_flash(
         &mut self,
-        world: Option<&str>,
-        rebuild_gateware: bool,
+        config: hardware::FlashConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) -> Result<hardware::FlashConfig, String> {
         if self.is_flashing() {
             return Err("a flash is already running".to_string());
         }
-        if let Some(world) = world {
+        if let Some(world) = &config.world {
             // Remembered, not merely used: the hardware page this opens
             // has flash buttons of its own, and they have to reach the
             // same world.
@@ -826,7 +830,8 @@ impl EmuPanel {
         // status row can carry neither, and "where did my flash go"
         // should have one answer.
         self.open_hardware_page(window, cx);
-        let (request, what, progress) = self.flash_plan(&env, rebuild_gateware, cx)?;
+        let (request, what, progress) = self.flash_plan(&env, &config, cx)?;
+        let effective = hardware::effective_config(&env, &config);
         // Arm the "open this flash's report when it passes" for the run
         // about to start. Here rather than in `start_board_run`, which
         // also serves the windowless setup/pull runs -- and only after
@@ -834,7 +839,7 @@ impl EmuPanel {
         // prerequisite leaves no arming behind.
         self.flash_charts_window = Some(window.window_handle());
         self.start_board_run(vec![request], what, progress, cx);
-        Ok(())
+        Ok(effective)
     }
 
     /// The whole shape of the flash `env` would run: what to spawn, what
@@ -847,18 +852,21 @@ impl EmuPanel {
     fn flash_plan(
         &self,
         env: &hardware::HardwareEnv,
-        rebuild_gateware: bool,
+        config: &hardware::FlashConfig,
         cx: &App,
     ) -> Result<(ggo_common::ProcRequest, String, hardware::FlashProgress), String> {
+        // `start_flash` remembered a named world already; the remembered
+        // one is what the argv gets either way, so the two never differ.
         let world = self.flash_world(cx);
-        let request = hardware::flash_request(env, world.as_deref(), rebuild_gateware)?;
+        let config = hardware::FlashConfig { world: world.clone(), ..config.clone() };
+        let request = hardware::flash_request(env, &config)?;
         let what = match &world {
             // The timeline's own header: which world is on its way to the
             // board is the one thing a flash cannot show.
             Some(world) => format!("flashing {world}"),
             None => "flashing".to_string(),
         };
-        let progress = if rebuild_gateware {
+        let progress = if config.rebuild_gateware {
             hardware::FlashProgress::flash_full()
         } else {
             hardware::FlashProgress::flash()
@@ -3283,14 +3291,15 @@ impl EmuPanel {
     /// while one is running has lost track of the board, and killing a
     /// half-written flash on its behalf is not a reasonable reading of
     /// "flash this world".
+    /// Returns the configuration the flash actually runs with -- every
+    /// default filled -- for the agent's reply.
     pub(crate) fn remote_flash(
         &mut self,
-        world: Option<String>,
-        rebuild_gateware: bool,
+        config: hardware::FlashConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        self.start_flash(world.as_deref(), rebuild_gateware, window, cx)
+    ) -> Result<hardware::FlashConfig, String> {
+        self.start_flash(config, window, cx)
     }
 
     /// What the board run in flight -- else the last one to end -- has
@@ -6816,7 +6825,7 @@ mod tests {
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -6940,7 +6949,7 @@ mod tests {
             true,
         );
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             panel.db_path_override = Some(ide_db.clone());
@@ -7073,7 +7082,7 @@ mod tests {
             true,
         );
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             panel.db_path_override = Some(ide_db.clone());
@@ -7123,7 +7132,7 @@ mod tests {
         let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             panel.db_path_override = Some(ide_db.clone());
@@ -7174,7 +7183,7 @@ mod tests {
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7219,7 +7228,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7251,7 +7260,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request.clone()],
@@ -7288,7 +7297,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: FAIL"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7321,7 +7330,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7353,7 +7362,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7400,7 +7409,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, _window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7463,7 +7472,11 @@ mod tests {
             // draws as a checklist.
             panel.root_override = None;
             let err = panel
-                .remote_flash(Some("worlds/arena".to_string()), false, window, cx)
+                .remote_flash(
+                    hardware::FlashConfig { world: Some("worlds/arena".to_string()), ..Default::default() },
+                    window,
+                    cx,
+                )
                 .expect_err("a machine with no board cannot flash");
             assert!(err.starts_with("flashing needs a board"), "{err}");
             assert!(!panel.is_flashing());
@@ -7481,7 +7494,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7492,7 +7505,7 @@ mod tests {
             let live = panel.remote_flash_status();
             assert!(live.active && live.verdict.is_none(), "the run is in flight");
             let err = panel
-                .remote_flash(None, false, window, cx)
+                .remote_flash(hardware::FlashConfig::default(), window, cx)
                 .expect_err("one board, one flash");
             assert_eq!(err, "a flash is already running");
             assert!(panel.is_flashing(), "the running flash was left alone");
@@ -7523,7 +7536,7 @@ mod tests {
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), first);
         let request = || {
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready")
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready")
         };
         // No charts window: no run's own hop looks anything up, so the
         // stash is the test's to play the landing hops itself.
@@ -7616,7 +7629,7 @@ mod tests {
             true,
         );
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             panel.db_path_override = Some(ide_db.clone());
@@ -7671,7 +7684,7 @@ mod tests {
             false,
         );
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.proc_streamer = streamer;
             panel.start_board_run(
@@ -7870,7 +7883,7 @@ mod tests {
             // no world of their own, so this is the whole of what makes
             // them re-flash the same one.
             let (request, what, _progress) = panel
-                .flash_plan(&ready_hardware(dir.path()), false, cx)
+                .flash_plan(&ready_hardware(dir.path()), &hardware::FlashConfig::default(), cx)
                 .expect("a ready machine flashes");
             assert!(
                 request
@@ -7898,7 +7911,7 @@ mod tests {
                 "a root change drops the world remembered from the old tree"
             );
             let (request, what, _progress) = panel
-                .flash_plan(&ready_hardware(dir.path()), false, cx)
+                .flash_plan(&ready_hardware(dir.path()), &hardware::FlashConfig::default(), cx)
                 .expect("a ready machine flashes");
             assert!(
                 !request.args.contains(&"--world".to_string()),
@@ -7932,7 +7945,7 @@ mod tests {
                 "the open document answers when this panel has been told nothing"
             );
             let (request, what, _progress) = panel
-                .flash_plan(&ready_hardware(dir.path()), false, cx)
+                .flash_plan(&ready_hardware(dir.path()), &hardware::FlashConfig::default(), cx)
                 .expect("a ready machine flashes");
             assert!(
                 request
@@ -7982,7 +7995,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
         let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],

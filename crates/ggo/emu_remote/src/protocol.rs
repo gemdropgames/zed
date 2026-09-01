@@ -42,14 +42,12 @@ pub enum Cmd {
     },
     /// End the run; the reply carries the cart's uart log.
     Stop { workspace: Option<String> },
-    /// Start a hardware flash of `world` (stem, e.g. "worlds/chase_cam";
-    /// None = the project's default world). `rebuild_gateware` runs full
-    /// place-and-route (~20 min) instead of the cached bitstream.
+    /// Start a hardware flash; see [`FlashConfig`] for the knobs and
+    /// their defaults.
     FlashWorld {
         workspace: Option<String>,
-        world: Option<String>,
-        #[serde(default)]
-        rebuild_gateware: bool,
+        #[serde(flatten)]
+        config: FlashConfig,
     },
     /// Snapshot of the current/last flash.
     FlashStatus { workspace: Option<String> },
@@ -58,6 +56,46 @@ pub enum Cmd {
     /// Close the Reports tab. With `run`, only if that is the run it shows.
     CloseReport { workspace: Option<String>, run: Option<i64> },
 }
+
+/// What a flash runs with. Every field has a default, so `{}` is a
+/// complete configuration: the project's own world, the cached
+/// bitstream, the first serial port found, ggo-diag's own baud and
+/// capture window.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct FlashConfig {
+    /// World stem baked in as the boot world, e.g. "worlds/chase_cam".
+    /// None = the project's `default_world` (or what the panel last
+    /// remembered).
+    #[serde(default)]
+    pub world: Option<String>,
+    /// Full place-and-route (~20 min) instead of the cached bitstream.
+    #[serde(default)]
+    pub rebuild_gateware: bool,
+    /// Serial device; None = the first port the panel's scan found.
+    #[serde(default)]
+    pub tty: Option<String>,
+    /// UART baud; None = ggo-diag's default ([`DEFAULT_BAUD`]).
+    #[serde(default)]
+    pub baud: Option<u32>,
+    /// How long the gameplay telemetry capture holds after boot before
+    /// the run ends on its own; None = ggo-diag's default
+    /// ([`DEFAULT_COLLECT_SECONDS`]).
+    #[serde(default)]
+    pub collect_seconds: Option<u64>,
+    /// Build GemOS with `--features telemetry` forced on (`--telemetry`).
+    /// Firmware defaults it on already; this only matters for a firmware
+    /// build that turned it off.
+    #[serde(default)]
+    pub telemetry: bool,
+}
+
+/// ggo-diag's `--baud` default. Mirrored here (not read from the CLI)
+/// so an effective configuration can be reported before the child runs;
+/// when the caller leaves the field unset the flag is NOT passed, so
+/// ggo-diag's own default still rules.
+pub const DEFAULT_BAUD: u32 = 115_200;
+/// ggo-diag's `--collect-seconds` default; same rule as [`DEFAULT_BAUD`].
+pub const DEFAULT_COLLECT_SECONDS: u64 = 120;
 
 /// One response line. `data` is command-specific JSON; `error` is set
 /// (and `ok` false) on failure.
@@ -235,8 +273,7 @@ mod tests {
             req.cmd,
             Cmd::FlashWorld {
                 workspace: None,
-                world: Some("worlds/chase_cam".to_string()),
-                rebuild_gateware: false,
+                config: FlashConfig { world: Some("worlds/chase_cam".to_string()), ..Default::default() },
             }
         );
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -245,8 +282,29 @@ mod tests {
         // twenty minutes, and no caller gets one by forgetting a field.
         assert_eq!(
             parse_request(r#"{"id":1,"cmd":"flash_world"}"#).unwrap().cmd,
-            Cmd::FlashWorld { workspace: None, world: None, rebuild_gateware: false }
+            Cmd::FlashWorld { workspace: None, config: FlashConfig::default() }
         );
+        // The knobs ride flat beside the command, as the bridge sends them.
+        let req = parse_request(
+            r#"{"id":4,"cmd":"flash_world","workspace":"/w","tty":"/dev/ttyUSB1","baud":9600,"collect_seconds":30,"telemetry":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.cmd,
+            Cmd::FlashWorld {
+                workspace: Some("/w".to_string()),
+                config: FlashConfig {
+                    world: None,
+                    rebuild_gateware: false,
+                    tty: Some("/dev/ttyUSB1".to_string()),
+                    baud: Some(9600),
+                    collect_seconds: Some(30),
+                    telemetry: true,
+                },
+            }
+        );
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
         assert_eq!(
             parse_request(r#"{"id":2,"cmd":"flash_status"}"#).unwrap().cmd,
             Cmd::FlashStatus { workspace: None }

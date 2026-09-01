@@ -534,7 +534,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             }
             Ok(reply)
         }
-        Cmd::FlashWorld { world, rebuild_gateware, .. } => {
+        Cmd::FlashWorld { config, .. } => {
             // Like a remote boot, a remote flash must not need a human to
             // have opened the emulator first -- the run needs a panel to
             // live on, not a panel someone clicked.
@@ -542,15 +542,15 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 panel_or_open(&target_root, target.panel, target.workspace, window, cx)?;
             // Returns as soon as the child is spawned: the reply says the
             // flash STARTED, and `flash_status` says how it is going.
-            window
+            let effective = window
                 .update(cx, |_, window, app| {
                     panel
-                        .update(app, |p, cx| p.remote_flash(world, rebuild_gateware, window, cx))
+                        .update(app, |p, cx| p.remote_flash(config, window, cx))
                         .map_err(|e| e.to_string())
                         .and_then(|r| r)
                 })
                 .map_err(|e| e.to_string())??;
-            Ok(serde_json::json!({ "started": true }))
+            Ok(serde_json::json!({ "started": true, "config": effective }))
         }
         Cmd::OpenReport { run, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
