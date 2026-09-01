@@ -506,17 +506,19 @@ pub struct EmuPanel {
     /// The last run's timeline and total, kept after the run ends so the
     /// page can still show what happened.
     last_flash: Option<(hardware::FlashProgress, Duration)>,
-    /// The local `run.id` [`Self::last_flash`]'s run was cloned in as --
-    /// the report the post-PASS hop opened, remembered because the agent
+    /// The last report the post-PASS hop resolved, as `(ggo-diag's run
+    /// id, our own local `run.id`)` -- remembered because the agent
     /// socket is asked for it AFTER the fact and must not re-run two
     /// blocking database calls on the UI thread to answer.
     ///
-    /// Cleared by every new board run and written only through
-    /// [`Self::remember_flash_perf_run`], which drops a result whose run
-    /// is no longer the one `last_flash` describes -- clearing alone
-    /// would not do it, because the hop that resolves this is detached
-    /// and its lookup can outlive the run that started it.
-    last_flash_perf_run: Option<i64>,
+    /// The ggo-diag id is stored WITH the value, and never dropped for
+    /// being old: the reader ([`Self::remote_flash_status`]) hands the
+    /// number out only when it is about to report that same run id, so a
+    /// report id can never appear beside another run's timeline. That is
+    /// a property of the read, not of who wrote last -- which is the only
+    /// thing that survives a hop whose lookup is detached, unbounded, and
+    /// free to land after the next board run has taken the page.
+    last_flash_perf_run: Option<(String, i64)>,
     /// The window a started flash should open its report in --
     /// [`Self::charts_for_run`]'s analog for the board, and armed for the
     /// same reason: the run ends on a background task with no `Window` of
@@ -963,9 +965,6 @@ impl EmuPanel {
         self.status = None;
         self.status_is_error = false;
         self.console_expanded = true;
-        // This run is about to become `last_flash`; the previous run's
-        // report id must not outlive the timeline it belongs to.
-        self.last_flash_perf_run = None;
         let task = cx.spawn({
             let what = what.clone();
             async move |this, cx| {
@@ -1087,27 +1086,6 @@ impl EmuPanel {
         cx.notify();
     }
 
-    /// Record the report id [`Self::open_flashed_run_report`] resolved
-    /// for `diag_run_id` -- but only while that run is still the one
-    /// [`Self::last_flash`] describes.
-    ///
-    /// Identity, not ordering, because ordering does not hold: the hop is
-    /// DETACHED and its lookup is an unbounded pair of database calls, so
-    /// a board run started meanwhile (a re-flash, a setup run, a `git
-    /// pull`) can own `last_flash` by the time this lands. Reporting the
-    /// old run's report id next to the new run's timeline is exactly the
-    /// mismatch `flash_status` must never produce, and a late result for
-    /// a run nobody is looking at any more is worth nothing anyway.
-    fn remember_flash_perf_run(&mut self, diag_run_id: &str, local_id: i64) {
-        let current = self
-            .last_flash
-            .as_ref()
-            .and_then(|(progress, _)| progress.diag_run_id.as_deref());
-        if current == Some(diag_run_id) {
-            self.last_flash_perf_run = Some(local_id);
-        }
-    }
-
     /// Move a finished run's timeline off the live slot and onto the
     /// page: which phase a run died in is exactly what someone looks at
     /// after it ends, and dropping it with the task loses that.
@@ -1185,8 +1163,11 @@ impl EmuPanel {
         };
         // Remembered before it is opened: `flash_status` over the agent
         // socket answers with this rather than repeating the lookup.
+        // Stored WITH the run it belongs to and written unconditionally
+        // -- a hop that lands after the next run started is harmless,
+        // because the reader pairs the ids rather than trusting order.
         this.update(cx, |this, _cx| {
-            this.remember_flash_perf_run(&flashed_run, local_id)
+            this.last_flash_perf_run = Some((flashed_run, local_id))
         })
         .ok();
         let Some(workspace) = this
@@ -3240,17 +3221,25 @@ impl EmuPanel {
     /// reached, for `agent_remote`'s `flash_status`.
     pub(crate) fn remote_flash_status(&self) -> ggo_emu_remote::protocol::FlashStatusPayload {
         let progress = self.flash_progress().map(|(progress, _elapsed)| progress);
+        let diag_run_id = progress.and_then(|progress| progress.diag_run_id.clone());
         ggo_emu_remote::protocol::FlashStatusPayload {
             active: self.is_flashing(),
             phase: progress
                 .and_then(|progress| progress.current_phase())
                 .map(|row| row.title.clone()),
             verdict: progress.and_then(|progress| progress.verdict()),
-            diag_run_id: progress.and_then(|progress| progress.diag_run_id.clone()),
             // Resolved by the post-PASS hop, not here: translating
             // ggo-diag's run id blocks on two database calls, and this
-            // runs on the UI thread.
-            perf_run_id: self.last_flash_perf_run,
+            // runs on the UI thread. Handed out only when the stash names
+            // the very run this payload is reporting -- so a report id
+            // stashed for an earlier flash cannot ride along beside a
+            // later run's timeline, whatever order the hops landed in.
+            perf_run_id: self
+                .last_flash_perf_run
+                .as_ref()
+                .filter(|(run, _)| Some(run.as_str()) == diag_run_id.as_deref())
+                .map(|(_, local_id)| *local_id),
+            diag_run_id,
         }
     }
 
@@ -7263,16 +7252,21 @@ mod tests {
         });
     }
 
-    /// The report lookup is detached and unbounded, so it can land after
-    /// the NEXT board run has taken over the page. A result for a run
-    /// that is no longer the last flash is dropped: `flash_status` must
-    /// never pair one run's timeline with another run's report id.
+    /// A report id is only ever reported beside the run it belongs to.
+    ///
+    /// The lookup that resolves it is detached and unbounded, so it can
+    /// land whenever -- including after the next board run has taken the
+    /// page. Rather than argue about that ordering, the id is stashed
+    /// WITH its run and surfaced only when the payload is reporting that
+    /// same run: every other arrangement reports `None`.
     #[gpui::test]
-    async fn test_a_late_report_lookup_cannot_pin_its_id_to_another_run(
+    async fn test_a_report_id_never_surfaces_beside_another_runs_timeline(
         cx: &mut TestAppContext,
     ) {
+        /// A second flash, with a run id of its own.
+        const LATER_RUN: &str = "20260901T090000Z-9999999999";
         let dir = tempfile::tempdir().unwrap();
-        let (streamer, _calls) = fake_streamer(
+        let (first, _calls) = fake_streamer(
             vec![
                 "==> Report",
                 "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
@@ -7280,14 +7274,15 @@ mod tests {
             ],
             true,
         );
-        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
-        // No charts window: this run's own hop returns without looking
-        // anything up, leaving the write to the test.
+        let (panel, cx) = flashable_panel(cx, dir.path(), first);
+        let request = || {
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready")
+        };
+        // No charts window: no run's own hop looks anything up, so the
+        // stash is the test's to play the landing hops itself.
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
-                vec![request],
+                vec![request()],
                 "flashing".to_string(),
                 hardware::FlashProgress::flash(),
                 cx,
@@ -7295,20 +7290,57 @@ mod tests {
         });
         cx.run_until_parked();
 
-        panel.update(cx, |panel, _cx| {
-            // A hop from an EARLIER flash, resuming now.
-            panel.remember_flash_perf_run("20260101T000000Z-0000000000", 7);
-            assert_eq!(
-                panel.remote_flash_status().perf_run_id,
-                None,
-                "a report id for a run this page no longer shows is dropped"
-            );
-            // This run's own hop.
-            panel.remember_flash_perf_run(FLASHED_RUN, 9);
+        let (second, _calls) = fake_streamer(
+            vec![
+                "==> Report",
+                "[db] run 20260901T090000Z-9999999999: 1 uart lines, 1 frames -> diag.db",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        panel.update(cx, |panel, cx| {
+            // Run A's hop, landing.
+            panel.last_flash_perf_run = Some((FLASHED_RUN.to_string(), 9));
             assert_eq!(
                 panel.remote_flash_status().perf_run_id,
                 Some(9),
-                "the run on the page keeps its own report id"
+                "run A's report id, beside run A's timeline"
+            );
+            // A hop from a flash older still, landing late.
+            panel.last_flash_perf_run = Some(("20260101T000000Z-0000000000".to_string(), 7));
+            assert_eq!(
+                panel.remote_flash_status().perf_run_id,
+                None,
+                "a report id for a run this page is not showing stays hidden"
+            );
+
+            // Run B takes the page while A's report id is still stashed:
+            // the live payload names no run at all, so the number cannot
+            // ride along with it.
+            panel.last_flash_perf_run = Some((FLASHED_RUN.to_string(), 9));
+            panel.proc_streamer = second;
+            panel.start_board_run(
+                vec![request()],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+            let live = panel.remote_flash_status();
+            assert!(live.active && live.diag_run_id.is_none(), "run B is in flight");
+            assert_eq!(
+                live.perf_run_id, None,
+                "a live run has no report yet, least of all the previous run's"
+            );
+        });
+        // And once B retires with a run id of its own, A's stashed id is
+        // still not B's -- the mismatch does not become permanent.
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let status = panel.remote_flash_status();
+            assert_eq!(status.diag_run_id.as_deref(), Some(LATER_RUN));
+            assert_eq!(
+                status.perf_run_id, None,
+                "run B's timeline never inherits run A's report"
             );
         });
     }
