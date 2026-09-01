@@ -511,9 +511,11 @@ pub struct EmuPanel {
     /// socket is asked for it AFTER the fact and must not re-run two
     /// blocking database calls on the UI thread to answer.
     ///
-    /// Set by that hop (the only place the translation happens) and
-    /// cleared by every new board run, so it can never name a run other
-    /// than the one `last_flash` describes.
+    /// Cleared by every new board run and written only through
+    /// [`Self::remember_flash_perf_run`], which drops a result whose run
+    /// is no longer the one `last_flash` describes -- clearing alone
+    /// would not do it, because the hop that resolves this is detached
+    /// and its lookup can outlive the run that started it.
     last_flash_perf_run: Option<i64>,
     /// The window a started flash should open its report in --
     /// [`Self::charts_for_run`]'s analog for the board, and armed for the
@@ -1085,6 +1087,27 @@ impl EmuPanel {
         cx.notify();
     }
 
+    /// Record the report id [`Self::open_flashed_run_report`] resolved
+    /// for `diag_run_id` -- but only while that run is still the one
+    /// [`Self::last_flash`] describes.
+    ///
+    /// Identity, not ordering, because ordering does not hold: the hop is
+    /// DETACHED and its lookup is an unbounded pair of database calls, so
+    /// a board run started meanwhile (a re-flash, a setup run, a `git
+    /// pull`) can own `last_flash` by the time this lands. Reporting the
+    /// old run's report id next to the new run's timeline is exactly the
+    /// mismatch `flash_status` must never produce, and a late result for
+    /// a run nobody is looking at any more is worth nothing anyway.
+    fn remember_flash_perf_run(&mut self, diag_run_id: &str, local_id: i64) {
+        let current = self
+            .last_flash
+            .as_ref()
+            .and_then(|(progress, _)| progress.diag_run_id.as_deref());
+        if current == Some(diag_run_id) {
+            self.last_flash_perf_run = Some(local_id);
+        }
+    }
+
     /// Move a finished run's timeline off the live slot and onto the
     /// page: which phase a run died in is exactly what someone looks at
     /// after it ends, and dropping it with the task loses that.
@@ -1129,6 +1152,10 @@ impl EmuPanel {
         let (Some(window), Some((diag_db_path, ide_db_path))) = (window, report_dbs) else {
             return;
         };
+        // Which run this hop is FOR, kept back from the closure that
+        // consumes it: by the time the lookup returns, "the last flash"
+        // may be somebody else's (see [`Self::remember_flash_perf_run`]).
+        let flashed_run = diag_run_id.clone();
         // BLOCKING: both calls spin their own current-thread tokio runtime,
         // the rule `ggo_charts_panel::history::load` carries too -- so they
         // run on the background executor and never on the UI thread.
@@ -1158,8 +1185,10 @@ impl EmuPanel {
         };
         // Remembered before it is opened: `flash_status` over the agent
         // socket answers with this rather than repeating the lookup.
-        this.update(cx, |this, _cx| this.last_flash_perf_run = Some(local_id))
-            .ok();
+        this.update(cx, |this, _cx| {
+            this.remember_flash_perf_run(&flashed_run, local_id)
+        })
+        .ok();
         let Some(workspace) = this
             .read_with(cx, |this, _cx| this.workspace.clone())
             .ok()
@@ -7231,6 +7260,56 @@ mod tests {
                 .expect_err("one board, one flash");
             assert_eq!(err, "a flash is already running");
             assert!(panel.is_flashing(), "the running flash was left alone");
+        });
+    }
+
+    /// The report lookup is detached and unbounded, so it can land after
+    /// the NEXT board run has taken over the page. A result for a run
+    /// that is no longer the last flash is dropped: `flash_status` must
+    /// never pair one run's timeline with another run's report id.
+    #[gpui::test]
+    async fn test_a_late_report_lookup_cannot_pin_its_id_to_another_run(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, _calls) = fake_streamer(
+            vec![
+                "==> Report",
+                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), None, false).expect("ready");
+        // No charts window: this run's own hop returns without looking
+        // anything up, leaving the write to the test.
+        panel.update(cx, |panel, cx| {
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _cx| {
+            // A hop from an EARLIER flash, resuming now.
+            panel.remember_flash_perf_run("20260101T000000Z-0000000000", 7);
+            assert_eq!(
+                panel.remote_flash_status().perf_run_id,
+                None,
+                "a report id for a run this page no longer shows is dropped"
+            );
+            // This run's own hop.
+            panel.remember_flash_perf_run(FLASHED_RUN, 9);
+            assert_eq!(
+                panel.remote_flash_status().perf_run_id,
+                Some(9),
+                "the run on the page keeps its own report id"
+            );
         });
     }
 
