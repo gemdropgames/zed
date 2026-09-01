@@ -932,6 +932,28 @@ impl EmuPanel {
         );
     }
 
+    /// "Force reclone GGO repo": delete the managed clone and clone it
+    /// fresh, for when a pull cannot fix it. Same runner, same console,
+    /// same re-probe as an update.
+    pub fn force_reclone_ggo_repo(&mut self, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        self.invalidate_hardware();
+        let env = self.hardware_env_cached();
+        let Some(requests) = env.force_reclone_requests() else {
+            self.report_failure(
+                "only the GGO clone ZedGG manages can be recloned from here".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.start_board_run(
+            requests,
+            "recloning the GGO repo".to_string(),
+            hardware::FlashProgress::steps(Vec::new()),
+            cx,
+        );
+    }
+
     /// Run `requests` in order through the streaming runner, feeding every
     /// line to the console and every recognised line to the status row.
     /// Stops at the first failure.

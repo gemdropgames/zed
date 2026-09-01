@@ -285,6 +285,31 @@ impl HardwareSetupItem {
             .into_any_element()
     }
 
+    /// The pull's escape hatch, for a clone a pull cannot fix (diverged
+    /// history, corrupt objects): delete the managed clone and clone it
+    /// fresh. Built under the same gate as the update button, so it can
+    /// never delete a checkout the user maintains.
+    fn render_reclone_button(&self, busy: bool) -> AnyElement {
+        Button::new("ggo-hardware-force-reclone", "Force reclone GGO repo")
+            .disabled(busy)
+            .tooltip(Tooltip::text(if busy {
+                "A run is using the repo -- wait for it to finish, or cancel it"
+            } else {
+                "Delete the managed clone and clone it fresh. Use when \
+                 Update fails (diverged or corrupt clone); everything in \
+                 the managed clone is discarded"
+            }))
+            .on_click({
+                let panel = self.panel.clone();
+                move |_, _window, cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.force_reclone_ggo_repo(cx))
+                        .ok();
+                }
+            })
+            .into_any_element()
+    }
+
     /// One requirement's row: state, where it was found or why not, and
     /// what will be done about it.
     fn render_requirement(&self, requirement: &Requirement, cx: &Context<Self>) -> AnyElement {
@@ -479,7 +504,12 @@ impl Render for HardwareSetupItem {
                         // for it, not in a button row three sections
                         // down that says nothing about why it is there.
                         .map(|banner| match can_update {
-                            true => banner.action_slot(self.render_update_button(busy)),
+                            true => banner.action_slot(
+                                h_flex()
+                                    .gap_1()
+                                    .child(self.render_update_button(busy))
+                                    .child(self.render_reclone_button(busy)),
+                            ),
                             false => banner,
                         }),
                 )

@@ -207,6 +207,39 @@ impl HardwareEnv {
             vec!["pull".to_string(), "--ff-only".to_string()],
         ))
     }
+
+    /// Delete the managed clone and clone it fresh, for when a pull
+    /// cannot fix it (diverged history, corrupt objects, a rebased
+    /// upstream). Same gate as [`Self::update_repo_request`]: only the
+    /// clone under `~/.ggo` is ours to destroy -- a dev checkout may
+    /// hold uncommitted work.
+    ///
+    /// Two steps through the same runner so both stream into the
+    /// console; the clone runs from the home directory because its own
+    /// destination no longer exists once the first step lands.
+    pub fn force_reclone_requests(&self) -> Option<Vec<ProcRequest>> {
+        if !self.git || !self.repo_is_managed_clone() {
+            return None;
+        }
+        let repo = self.repo.clone()?;
+        let cwd = self.cwd_for_setup();
+        Some(vec![
+            ProcRequest::new(
+                "rm",
+                cwd.clone(),
+                vec!["-rf".to_string(), repo.to_string_lossy().into_owned()],
+            ),
+            ProcRequest::new(
+                "git",
+                cwd,
+                vec![
+                    "clone".to_string(),
+                    GGO_REPO_URL.to_string(),
+                    repo.to_string_lossy().into_owned(),
+                ],
+            ),
+        ])
+    }
 }
 
 /// The first 10 characters of a commit hash -- long enough to be unique
@@ -1988,6 +2021,40 @@ mod tests {
             bare.update_repo_request().is_none(),
             "an unset repo must not match an unset clone destination"
         );
+    }
+
+    /// A force reclone deletes the managed clone and clones it fresh,
+    /// under the same gate as the update: never on a user's checkout.
+    #[test]
+    fn force_reclone_removes_then_clones_the_managed_clone_only() {
+        let mut env = ready_env();
+        env.repo = Some(env.clone_dest.clone());
+        let requests = env
+            .force_reclone_requests()
+            .expect("the managed clone is ours to replace");
+        let dest = env.clone_dest.to_string_lossy().into_owned();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].bin, "rm");
+        assert_eq!(requests[0].args, vec!["-rf".to_string(), dest.clone()]);
+        assert_eq!(requests[1].bin, "git");
+        assert_eq!(
+            requests[1].args,
+            vec!["clone".to_string(), GGO_REPO_URL.to_string(), dest]
+        );
+        assert_eq!(
+            requests[1].cwd, env.home,
+            "the clone runs from home: its destination is gone by then"
+        );
+
+        env.repo = Some(PathBuf::from("/repo"));
+        assert!(
+            env.force_reclone_requests().is_none(),
+            "a user's checkout is never deleted"
+        );
+
+        env.repo = Some(env.clone_dest.clone());
+        env.git = false;
+        assert!(env.force_reclone_requests().is_none());
     }
 
     // ------------------------------------------------- flash progress
