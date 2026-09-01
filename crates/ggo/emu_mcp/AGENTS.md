@@ -53,6 +53,16 @@ none, the panel flashes whichever world it last remembered. Then
 `perf_run_id` → `perf_report { run }`. `perf_report` reads the database
 directly, so it needs no live session.
 
+This bridge is single-threaded: `main` reads one stdin line, serves it,
+and only then reads the next. Every other tool is bounded by a 15s socket
+timeout, but `hw_flash_wait` blocks for as long as its `timeout_s` (default
+1800s) — and while it does, NO other call here is served, `hw_flash_status`
+included. Many MCP clients give up well before 1800s. Nothing is lost when
+that happens: the flash runs inside Zed, not here, and flash status is
+per-run and persists, so calling `hw_flash_wait` again resumes waiting on
+the same flash (likewise after a socket blip aborts one). Prefer a
+`timeout_s` you will actually sit through (~300) and re-call.
+
 ## The loop
 
 Pack a cart in the project first (`emd pack-ggo [--world <stem>]`), then:

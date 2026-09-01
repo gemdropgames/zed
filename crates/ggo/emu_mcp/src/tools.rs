@@ -76,7 +76,7 @@ pub fn tool_list() -> Value {
           "description": "Non-blocking snapshot of the flash in flight (else the last one): {active, phase, verdict, diag_run_id, perf_run_id}. verdict is null while running, true=PASS, false=FAIL; perf_run_id is the run number to hand to perf_report, present only once a passed run's report has landed.",
           "inputSchema": with(json!({})) },
         { "name": "hw_flash_wait",
-          "description": "Block until the flash in flight reaches a verdict, then return the same payload hw_flash_status returns (polling every 2s under the hood). Call it right after hw_flash; on its own it reports the LAST flash's verdict immediately.",
+          "description": "Block until the flash in flight reaches a verdict, then return the same payload hw_flash_status returns (polling every 2s under the hood). Call it right after hw_flash; on its own it reports the LAST flash's verdict immediately. NOTE: this bridge serves ONE call at a time, so a long wait blocks every other tool here (including hw_flash_status) until it returns, and your client may time out first — nothing is lost if it does: the flash runs inside Zed, its status is per-run and persists, so call hw_flash_wait again to resume waiting on the same flash. Prefer a timeout_s you are willing to sit through (say 300) and re-call, over one long 1800s wait.",
           "inputSchema": with(json!({
               "timeout_s": { "type": "number", "description": "Give up after this many seconds (default 1800)" }
           })) },
@@ -245,6 +245,7 @@ fn call_tool_inner(
                 workspace,
                 Duration::from_secs(timeout),
                 FLASH_POLL_INTERVAL,
+                PERF_ID_GRACE,
                 connect,
             )
         }
@@ -268,13 +269,15 @@ const FLASH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PERF_ID_GRACE: Duration = Duration::from_secs(10);
 
 /// Poll `FlashStatus` until the run reaches a verdict (or `timeout`),
-/// then return the final payload as text content. `poll` is a parameter
-/// so tests don't sleep.
+/// then return the final payload as text content. `poll` and `grace` are
+/// parameters so tests don't sleep (production passes
+/// [`FLASH_POLL_INTERVAL`] and [`PERF_ID_GRACE`]).
 fn flash_wait(
     socket: &Path,
     workspace: Option<String>,
     timeout: Duration,
     poll: Duration,
+    grace: Duration,
     connect: &Connector,
 ) -> Result<Vec<Value>, String> {
     let started = std::time::Instant::now();
@@ -297,10 +300,7 @@ fn flash_wait(
             // run's payload beats an error about a run that did finish.
             let waiting_for_id = verdict && data.get("perf_run_id").is_none_or(Value::is_null);
             let seen_at = verdict_at.get_or_insert_with(std::time::Instant::now);
-            if !waiting_for_id
-                || seen_at.elapsed() >= PERF_ID_GRACE
-                || started.elapsed() >= timeout
-            {
+            if !waiting_for_id || seen_at.elapsed() >= grace || started.elapsed() >= timeout {
                 return Ok(vec![json!({ "type": "text", "text": data.to_string() })]);
             }
         }
@@ -512,6 +512,25 @@ mod tests {
         assert!(flash["inputSchema"]["properties"]["rebuild_gateware"].is_object(), "{flash}");
     }
 
+    /// The bridge serves one call at a time, so a long wait starves every
+    /// other tool -- an agent can only budget for that if the tool says so.
+    #[test]
+    fn hw_flash_wait_description_discloses_that_it_blocks_the_bridge() {
+        let list = tool_list();
+        let text = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "hw_flash_wait")
+            .expect("hw_flash_wait is listed")["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("ONE call at a time"), "{text}");
+        assert!(text.contains("blocks every other tool"), "{text}");
+        assert!(text.contains("call hw_flash_wait again"), "{text}");
+    }
+
     #[test]
     fn hw_flash_sends_flash_world_and_returns_the_started_reply() {
         let dir = tempfile::tempdir().unwrap();
@@ -567,6 +586,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             Duration::ZERO,
+            Duration::from_secs(60),
             &connect,
         )
         .unwrap();
@@ -586,6 +606,7 @@ mod tests {
             None,
             Duration::ZERO,
             Duration::ZERO,
+            Duration::from_secs(60),
             &connect,
         )
         .unwrap_err();
@@ -626,12 +647,14 @@ mod tests {
             None,
             Duration::from_secs(1800),
             Duration::ZERO,
+            Duration::from_secs(60),
             &connect,
         )
         .unwrap();
         assert!(content[0]["text"].as_str().unwrap().contains(r#""perf_run_id":30"#));
 
-        // A FAIL never gets a report id: return it immediately.
+        // A FAIL never gets a report id: return it immediately, however
+        // much grace the caller allowed.
         let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
             Ok(r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Boot verify (UART)","verdict":false,"diag_run_id":"r8","perf_run_id":null}}"#.to_string())
         };
@@ -640,10 +663,37 @@ mod tests {
             None,
             Duration::from_secs(1800),
             Duration::ZERO,
+            Duration::from_secs(60),
             &connect,
         )
         .unwrap();
         assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":false"#));
+    }
+
+    /// The grace is bounded, not a second wait: a PASS whose report id
+    /// never lands comes back as the payload it has (null id), not an
+    /// error and not a hang.
+    #[test]
+    fn hw_flash_wait_returns_the_null_id_payload_once_the_grace_runs_out() {
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let seen = polls.clone();
+        let connect = move |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            seen.set(seen.get() + 1);
+            Ok(r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Done","verdict":true,"diag_run_id":"r7","perf_run_id":null}}"#.to_string())
+        };
+        let content = flash_wait(
+            Path::new("/fake.sock"),
+            None,
+            Duration::from_secs(1800),
+            Duration::ZERO,
+            Duration::ZERO,
+            &connect,
+        )
+        .unwrap();
+        assert_eq!(polls.get(), 1, "an exhausted grace must not keep polling");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains(r#""verdict":true"#), "{text}");
+        assert!(text.contains(r#""perf_run_id":null"#), "{text}");
     }
 
     /// A temp `ggo_ide.db` through the real schema (`ggo_db::open`
