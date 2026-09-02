@@ -1,0 +1,27 @@
+[package]
+name = "ggo_reports_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ggo_reports_panel.rs"
+
+[dependencies]
+ggo-worldlib.workspace = true # GGO
+ggo_charts_panel.workspace = true # GGO
+ggo_common.workspace = true # GGO
+gpui.workspace = true
+log.workspace = true
+ui.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

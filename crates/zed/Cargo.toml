@@ -118,6 +118,7 @@ ggo_emerald_panel.workspace = true # GGO
 ggo_emu_panel.workspace = true # GGO
 ggo_import_panel.workspace = true # GGO
 ggo_language.workspace = true # GGO
+ggo_reports_panel.workspace = true # GGO
 ggo_sprite_panel.workspace = true # GGO
 ggo_tileset_panel.workspace = true # GGO
 ggo_world_panel.workspace = true # GGO

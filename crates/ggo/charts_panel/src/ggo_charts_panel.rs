@@ -58,7 +58,9 @@ mod chart_paint;
 mod chart_set;
 mod charts_item;
 mod detail;
-mod history;
+// `pub`: `ggo_reports_panel`'s merged list is fed by the same device-run
+// history this panel's rail shows, through `load`/`HISTORY_LIMIT`.
+pub mod history;
 mod inspect;
 // `pub`: `ggo_emu_panel`'s ingest round-trip test reads its own writes back
 // through THESE query functions (as a dev-dependency), which is what proves
@@ -68,6 +70,7 @@ pub mod loader;
 mod report;
 
 pub use charts_item::ChartsItem;
+pub use history::RunSummary;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -84,7 +87,6 @@ use workspace::Workspace;
 
 use chart_geom::{ChartSpec, build_chart_scene};
 use ggo_worldlib::charts::reports::faults::{self, FaultDetail, FaultRow};
-use history::RunSummary;
 use loader::RunListing;
 
 /// The panel's key-dispatch context identifier. No bindings are scoped to
@@ -976,6 +978,16 @@ impl ChartsPanel {
     /// its own path through [`ggo_common::default_db_path`].
     pub fn set_db_path_override(&mut self, path: PathBuf) {
         self.db_path_override = Some(path);
+    }
+
+    /// Read the device-run history from `path` instead of
+    /// `~/.ggo/diag.db`. Public for the same reason as
+    /// [`Self::set_db_path_override`], and for a sharper one: the history
+    /// load CLONES `diag.db`'s runs into `ggo_ide.db`, so a cross-crate
+    /// test that leaves this at its default writes the developer's real
+    /// device runs into whatever database it is pointed at.
+    pub fn set_diag_db_path_override(&mut self, path: PathBuf) {
+        self.diag_db_path_override = Some(path);
     }
 
     /// Back to the run picker.

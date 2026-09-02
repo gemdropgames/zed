@@ -7740,6 +7740,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo_reports_panel"
+version = "0.1.0"
+dependencies = [
+ "ggo-worldlib",
+ "ggo_charts_panel",
+ "ggo_common",
+ "gpui",
+ "log",
+ "project",
+ "tempfile",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "ggo_smoke"
 version = "0.1.0"
 dependencies = [
@@ -24633,6 +24648,7 @@ dependencies = [
  "ggo_emu_panel",
  "ggo_import_panel",
  "ggo_language",
+ "ggo_reports_panel",
  "ggo_sprite_panel",
  "ggo_tileset_panel",
  "ggo_world_panel",

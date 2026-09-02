@@ -364,6 +364,7 @@ ggo_import_panel = { path = "crates/ggo/import_panel" } # GGO
 ggo_smoke = { path = "crates/ggo/smoke" } # GGO
 ggo_language = { path = "crates/ggo/language" } # GGO
 ggo_map_panel = { path = "crates/ggo/map_panel" } # GGO
+ggo_reports_panel = { path = "crates/ggo/reports_panel" } # GGO
 ggo_sprite_panel = { path = "crates/ggo/sprite_panel" } # GGO
 ggo_tileset_panel = { path = "crates/ggo/tileset_panel" } # GGO
 ggo_world_panel = { path = "crates/ggo/world_panel" } # GGO
