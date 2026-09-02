@@ -79,7 +79,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Context, FocusHandle, Focusable, IntoElement, MouseMoveEvent, Pixels, Render,
-    Styled, Task, WeakEntity, Window, div, px, uniform_list,
+    ScrollStrategy, Styled, Task, UniformListScrollHandle, WeakEntity, Window, div, px,
+    uniform_list,
 };
 use ui::prelude::*;
 use ui::{Checkbox, Tooltip};
@@ -397,7 +398,14 @@ enum DeviceLogState {
 #[derive(Debug)]
 enum FaultState {
     Loading,
-    Ready(Arc<FaultDetail>),
+    Ready {
+        detail: Arc<FaultDetail>,
+        /// `detail.text` with the fault line marked -- materialized by
+        /// the load, never by a render. A ring window is up to a few MB
+        /// of decoded lines, and rebuilding that Vec inside `render` cost
+        /// it on every frame the fault view was on screen.
+        text: Arc<Vec<String>>,
+    },
     Error(String),
 }
 
@@ -546,6 +554,17 @@ pub struct ChartsPanel {
     /// the decoded text answers the question on almost every dump, and
     /// the bytes are for the cases where it did not.
     fault_raw_expanded: bool,
+    /// The selected dump's bytes as hex rows, built on the first request
+    /// and kept until the selection changes. Lazy because most dumps are
+    /// never looked at this way, cached because the alternative was
+    /// re-formatting up to [`RAW_HEX_CAP`] bytes on every frame the
+    /// toggle was on.
+    fault_hex: Option<Arc<Vec<String>>>,
+    /// Where the fault view's decoded text is scrolled. The marked line
+    /// sits at the TAIL of the window -- `digest` takes the last line
+    /// matching the header -- so a list that opens at row 0 opens on
+    /// narration and not on the reason the dump exists.
+    fault_scroll: UniformListScrollHandle,
     /// The dump file the fault header's Copy button hands out, when it is
     /// still on disk -- `ggo-uartd` keeps only its last `KEEP_DUMPS`, and
     /// the row outlives the file. Resolved once per selection rather than
@@ -623,6 +642,8 @@ impl ChartsPanel {
             device_log: None,
             fault: None,
             fault_raw_expanded: false,
+            fault_hex: None,
+            fault_scroll: UniformListScrollHandle::new(),
             fault_raw_path: None,
             rerun_note: None,
             run_log_path: None,
@@ -798,7 +819,8 @@ impl ChartsPanel {
         }));
     }
 
-    /// The bookkeeping both selection paths share: adopt `next`, drop
+    /// The bookkeeping all three selection paths share -- perf run,
+    /// device run and fault dump: adopt `next`, drop
     /// whatever the previous selection left behind, and bump the generation
     /// so an in-flight load for the run being replaced cannot land on top.
     fn begin_selection(&mut self, next: Selection) {
@@ -807,6 +829,7 @@ impl ChartsPanel {
         self.device_log = None;
         self.fault = None;
         self.fault_raw_expanded = false;
+        self.fault_hex = None;
         self.fault_raw_path = None;
         self.rerun_note = None;
         self.run_log_path = None;
@@ -916,11 +939,8 @@ impl ChartsPanel {
         };
         self.detail_generation += 1;
         let generation = self.detail_generation;
-        // The load owns `id`; the warn and the raw path need it after.
-        let raw_path = self
-            .faults_dir()
-            .map(|dir| faults::raw_path(&dir, &id))
-            .filter(|path| path.is_file());
+        // The load owns `id`; the warn needs it after.
+        let faults_dir = self.faults_dir();
         let missing = id.clone();
         // The state of THIS load, whatever is on screen: opening a fault
         // while another one is showing swaps its body for the message
@@ -929,7 +949,20 @@ impl ChartsPanel {
         // where there is no fault view to put it in.
         self.fault = Some(FaultState::Loading);
         cx.notify();
-        let load = cx.background_spawn(async move { faults::load(&db_path, &id) });
+        // Everything the fault view needs is decided HERE, off-thread:
+        // the row, the marked text (a ring window is up to a few MB of
+        // lines) and whether the dump file is still on disk -- that last
+        // one a `stat`, which has no business on the UI thread.
+        let load = cx.background_spawn(async move {
+            let loaded = faults::load(&db_path, &id)?.map(|detail| {
+                let text = Arc::new(Self::mark_fault_line(&detail));
+                (Arc::new(detail), text)
+            });
+            let raw_path = faults_dir
+                .map(|dir| faults::raw_path(&dir, &id))
+                .filter(|path| path.is_file());
+            Ok::<_, String>((loaded, raw_path))
+        });
         cx.spawn(async move |this, cx| {
             let loaded = load.await;
             this.update(cx, |this, cx| {
@@ -937,12 +970,19 @@ impl ChartsPanel {
                     return;
                 }
                 match loaded {
-                    Ok(Some(detail)) => {
+                    Ok((Some((detail, text)), raw_path)) => {
                         this.begin_selection(Selection::Fault(detail.row.clone()));
-                        this.fault = Some(FaultState::Ready(Arc::new(detail)));
+                        // Before the state is stored, so the first layout
+                        // of the list already lands on the marked line
+                        // rather than scrolling after a frame at the top.
+                        if let Some(line) = detail.fault_line {
+                            this.fault_scroll
+                                .scroll_to_item(line, ScrollStrategy::Center);
+                        }
+                        this.fault = Some(FaultState::Ready { detail, text });
                         this.fault_raw_path = raw_path;
                     }
-                    Ok(None) => {
+                    Ok((None, _)) => {
                         log::warn!("fault {missing}: not imported, nothing to open");
                         // The selection is left where it was -- there is
                         // no row to select -- but the state must not stay
@@ -963,9 +1003,15 @@ impl ChartsPanel {
         .detach();
     }
 
-    /// Show or hide the selected dump's bytes.
+    /// Show or hide the selected dump's bytes, formatting them on the
+    /// first look and keeping them until the selection changes.
     fn toggle_fault_raw(&mut self, cx: &mut Context<Self>) {
         self.fault_raw_expanded = !self.fault_raw_expanded;
+        if self.fault_raw_expanded && self.fault_hex.is_none() {
+            if let Some(FaultState::Ready { detail, .. }) = &self.fault {
+                self.fault_hex = Some(Arc::new(Self::hex_rows(&detail.raw)));
+            }
+        }
         cx.notify();
     }
 
@@ -1009,6 +1055,7 @@ impl ChartsPanel {
         self.device_log = None;
         self.fault = None;
         self.fault_raw_expanded = false;
+        self.fault_hex = None;
         self.fault_raw_path = None;
         self.rerun_note = None;
         self.run_log_path = None;
@@ -1438,12 +1485,12 @@ impl ChartsPanel {
                 Self::fault_error_message(e),
                 cx,
             ),
-            Some(FaultState::Ready(detail)) => self.render_fault_digest(detail, cx),
+            Some(FaultState::Ready { detail, text }) => self.render_fault_digest(detail, text, cx),
         };
         // The window is the DETAIL's, not the row's, so it joins the
         // identity line only once the detail is there to say it.
         let window = match &self.fault {
-            Some(FaultState::Ready(detail)) => format!(" · last {}s", detail.window_s),
+            Some(FaultState::Ready { detail, .. }) => format!(" · last {}s", detail.window_s),
             _ => String::new(),
         };
 
@@ -1513,7 +1560,12 @@ impl ChartsPanel {
 
     /// The loaded dump's body: the digest tiles, the two diagnostic
     /// tables, then the decoded text.
-    fn render_fault_digest(&self, detail: &Arc<FaultDetail>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_fault_digest(
+        &self,
+        detail: &Arc<FaultDetail>,
+        text: &Arc<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // The tables read a `report::Diagnostics`, and a dump that decoded
         // no text is precisely that enum's `NoUart`: they must then say
         // "nothing was captured", never "nothing failed" -- the same
@@ -1526,7 +1578,6 @@ impl ChartsPanel {
                 panics: detail.panics.clone(),
             }
         };
-        let text = Arc::new(Self::mark_fault_line(detail));
         let cycles = match (detail.cyc_avg, detail.cyc_max) {
             (Some(avg), Some(max)) => format!(
                 "cycles avg/max: {}/{}",
@@ -1562,17 +1613,25 @@ impl ChartsPanel {
             )
             .child(self.render_failures_table(&diagnostics, cx))
             .child(self.render_panics_table(&diagnostics, cx))
-            .child(Self::render_log(LogKind::Fault, &text, cx))
+            // The one log surface that opens somewhere other than its
+            // top: the marked line is the reason the dump exists, and it
+            // sits at the tail of the window.
+            .child(Self::render_log_scrolled(
+                LogKind::Fault,
+                text,
+                Some(&self.fault_scroll),
+                cx,
+            ))
             // Under the decoded text, and only on request: the bytes are
             // the fallback for a decode that lost something, not the
-            // reading order.
-            .children(self.fault_raw_expanded.then(|| {
-                Self::render_log(
-                    LogKind::FaultRaw,
-                    &Arc::new(Self::hex_rows(&detail.raw)),
-                    cx,
-                )
-            }))
+            // reading order. Formatted by `toggle_fault_raw` on the first
+            // look, never here.
+            .children(
+                self.fault_raw_expanded
+                    .then(|| self.fault_hex.as_ref())
+                    .flatten()
+                    .map(|hex| Self::render_log(LogKind::FaultRaw, hex, cx)),
+            )
             .into_any_element()
     }
 
@@ -1967,6 +2026,19 @@ impl ChartsPanel {
     /// ~20 lines it would save, between two crates that already share the
     /// `uart` TABLE, which is the part that actually has to agree.
     fn render_log(kind: LogKind, lines: &Arc<Vec<String>>, cx: &mut Context<Self>) -> AnyElement {
+        Self::render_log_scrolled(kind, lines, None, cx)
+    }
+
+    /// [`Self::render_log`] with the list's scroll position owned by the
+    /// caller, so it can aim the view at a line. Only the fault text does
+    /// -- every other log here is read from the top, and handing them a
+    /// handle nobody drives would just be state to keep in step.
+    fn render_log_scrolled(
+        kind: LogKind,
+        lines: &Arc<Vec<String>>,
+        scroll: Option<&UniformListScrollHandle>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let selector = kind.selector();
         let section = v_flex()
             .w_full()
@@ -1993,6 +2065,7 @@ impl ChartsPanel {
                         })
                         .collect::<Vec<_>>()
                 })
+                .when_some(scroll, |list, handle| list.track_scroll(handle))
                 .h(LOG_HEIGHT)
                 .w_full()
                 .rounded_sm()
@@ -3041,7 +3114,7 @@ mod tests {
                 Some("2026-09-02_08-49-33_marker")
             );
             match &panel.fault {
-                Some(FaultState::Ready(detail)) => {
+                Some(FaultState::Ready { detail, .. }) => {
                     assert_eq!(detail.fault_line, Some(1));
                     assert_eq!(detail.row.boot_stage.as_deref(), Some("boot-rom alive"));
                 }
@@ -3142,6 +3215,127 @@ mod tests {
         assert!(ChartsPanel::hex_rows(&[]).is_empty(), "and an empty dump");
     }
 
+    /// The decoded text is marked ONCE, by the load, and the hex dump is
+    /// built once on first request -- neither is rebuilt per frame -- and
+    /// the view opens on the marked line rather than on the top of a
+    /// window that can be tens of thousands of lines long.
+    #[gpui::test]
+    async fn fault_text_is_built_once_and_the_view_opens_on_the_marked_line(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let ide_db = dir.path().join("ggo_ide.db");
+        let faults = dir.path().join("faults");
+        std::fs::create_dir_all(&faults).unwrap();
+        // The fault line at the TAIL of a long window: the whole point of
+        // the scroll is that nothing above it is the reason the dump was
+        // taken.
+        let mut dump =
+            "# ggo-uartd marker trap: mcause= \u{2014} last 5s of /dev/ttyUSB1\n".to_string();
+        const NOISE: usize = 400;
+        for line in 0..NOISE {
+            dump.push_str(&format!("f={line}| drawing\r\n"));
+        }
+        dump.push_str("trap: mcause=0x2\r\n");
+        std::fs::write(faults.join("2026-09-02_08-49-33_marker.log"), &dump).unwrap();
+        ggo_worldlib::charts::reports::faults::import(&faults, &ide_db).unwrap();
+
+        let panel = cx.new(|cx| ChartsPanel::new(None, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_db_path_override(ide_db.clone());
+            panel.set_faults_dir_override(faults.clone());
+            panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        let marked = panel.read_with(cx, |panel, _| {
+            let Some(FaultState::Ready { detail, text }) = &panel.fault else {
+                panic!("the fixture dump must load: {:?}", panel.fault);
+            };
+            assert_eq!(
+                detail.fault_line,
+                Some(NOISE),
+                "the marker is the last line of the window"
+            );
+            assert_eq!(text.len(), detail.text.len(), "one marked line per line");
+            assert!(text[NOISE].starts_with("\u{bb} "), "{}", text[NOISE]);
+            assert!(!text[0].starts_with("\u{bb} "), "and only that one");
+            assert_eq!(
+                panel.fault_scroll.logical_scroll_top_index(),
+                NOISE,
+                "the view opens on the fault line, not on the top of the window"
+            );
+            text.clone()
+        });
+
+        // Rendering does not rebuild it: the marked text the view paints
+        // is the one the load stored.
+        panel.update(cx, |panel, _| {
+            let Some(FaultState::Ready { text, .. }) = &panel.fault else {
+                panic!("still loaded");
+            };
+            assert!(Arc::ptr_eq(text, &marked), "the same Arc, not a rebuild");
+            assert!(panel.fault_hex.is_none(), "the bytes are not built unasked");
+        });
+
+        let hex = panel.update(cx, |panel, cx| {
+            panel.toggle_fault_raw(cx);
+            panel
+                .fault_hex
+                .clone()
+                .expect("the toggle builds them once")
+        });
+        panel.update(cx, |panel, cx| {
+            panel.toggle_fault_raw(cx);
+            panel.toggle_fault_raw(cx);
+            let again = panel.fault_hex.as_ref().expect("still cached");
+            assert!(
+                Arc::ptr_eq(again, &hex),
+                "a second look at the bytes reuses the first"
+            );
+        });
+
+        // The cache belongs to the selection, not to the panel.
+        panel.update(cx, |panel, cx| {
+            panel.clear_selection(cx);
+            assert!(panel.fault_hex.is_none(), "leaving the fault drops them");
+        });
+
+        // ...and the LIST really tracks that handle. Aiming a handle no
+        // element reads would satisfy every assertion above and scroll
+        // nothing on screen, so this loads the same dump into a painted
+        // panel: only a `uniform_list` bound to this handle writes its
+        // item size, and only a consumed deferred scroll moves the offset
+        // off zero.
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let (panel, cx) = cx.add_window_view(|_window, cx| ChartsPanel::new(None, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_db_path_override(ide_db.clone());
+            panel.set_faults_dir_override(faults.clone());
+            panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
+        });
+        cx.executor().run_until_parked();
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.fault_scroll.is_scrollable(),
+                "a uniform_list bound to this handle measured itself"
+            );
+            let offset = panel.fault_scroll.0.borrow().base_handle.offset().y;
+            assert!(
+                offset < px(0.),
+                "and the fault line pulled the list down off its top, at {offset:?}"
+            );
+        });
+    }
+
     /// The fault view paints, and paints its sections in the order the
     /// design gives them: digest tiles, then the two diagnostic tables,
     /// then the decoded text.
@@ -3179,7 +3373,7 @@ mod tests {
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
-            let Some(FaultState::Ready(detail)) = &panel.fault else {
+            let Some(FaultState::Ready { detail, .. }) = &panel.fault else {
                 panic!("the fixture dump must load");
             };
             assert_eq!(detail.panics.len(), 1, "the panic line is digested");
