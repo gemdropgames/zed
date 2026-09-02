@@ -275,6 +275,17 @@ pub struct ReportsPanel {
     /// loads skip the reconcile (see [`HISTORY_EVERY_TICKS`]) and must
     /// still merge those rows in rather than dropping them from the list.
     device: Vec<RunSummary>,
+    /// [`history::History::note`] from that same reconcile, carried for
+    /// the same reason its rows are: a load that skipped the reconcile
+    /// learned nothing new about the device history, and dropping the
+    /// reason would make it blink out of the empty state every tick.
+    device_note: Option<String>,
+    /// What went wrong that was not fatal to the load -- a fault import
+    /// that failed, a device history that could not be read. Shown only
+    /// when there is nothing to list (see [`Self::note`]): a reason is
+    /// what an empty panel owes the reader, and a populated list is never
+    /// blanked to make room for one.
+    notes: Vec<String>,
     /// Indices into `rows` that the filter chips let through, in display
     /// order -- what a click's `ix` means.
     visible: Vec<usize>,
@@ -302,6 +313,8 @@ impl ReportsPanel {
             position: DockPosition::Right,
             rows: Vec::new(),
             device: Vec::new(),
+            device_note: None,
+            notes: Vec::new(),
             visible: Vec::new(),
             state: LoadState::Empty,
             hidden: HashSet::new(),
@@ -378,6 +391,7 @@ impl ReportsPanel {
         let diag_db = reconcile_history.then(|| self.diag_db_path()).flatten();
         let faults_dir = self.faults_dir();
         let known_device = self.device.clone();
+        let known_device_note = self.device_note.clone();
         self.loading = true;
         // A refresh over an already-painted list must not blank it: the
         // poll runs every 5 s and would flash the loading line each time.
@@ -386,10 +400,19 @@ impl ReportsPanel {
         }
         cx.notify();
         let load = cx.background_spawn(async move {
+            // A failed import is NOT fatal -- the rows already in the
+            // database still list -- but it is also not nothing: the
+            // dumps the daemon wrote are then missing from a list that
+            // would otherwise read as complete. Same sentence the MCP's
+            // `import_failure_note` prints, so an agent and the dock
+            // describe one failure one way.
+            let mut notes = Vec::new();
             if let Some(dir) = faults_dir.as_ref()
                 && let Err(error) = faults::import(dir, &ide_db)
             {
-                log::warn!("reports: importing faults from {}: {error}", dir.display());
+                let note = format!("importing faults from {} failed: {error}", dir.display());
+                log::warn!("reports: {note}");
+                notes.push(note);
             }
             let mut failure = None;
             let perf = match loader::list_runs(&ide_db) {
@@ -399,10 +422,23 @@ impl ReportsPanel {
                     Vec::new()
                 }
             };
-            let device = match diag_db {
-                Some(diag_db) => history::load(&diag_db, &ide_db, HISTORY_LIMIT).runs,
-                None => known_device,
+            // `list_runs` has no LIMIT of its own -- the picker wants
+            // every run -- so the cap is the dock's, and it is applied
+            // BEFORE the merge: the list is newest-first and capped at
+            // the same `HISTORY_LIMIT` the other two sources already use,
+            // and sorting a full run table to throw most of it away is
+            // work the panel can decline.
+            let perf = perf.into_iter().take(HISTORY_LIMIT as usize).collect();
+            let (device, device_note) = match diag_db {
+                Some(diag_db) => {
+                    let history = history::load(&diag_db, &ide_db, HISTORY_LIMIT);
+                    (history.runs, history.note)
+                }
+                None => (known_device, known_device_note),
             };
+            if let Some(note) = device_note.as_ref() {
+                notes.push(note.clone());
+            }
             let faults = match faults::list(&ide_db, HISTORY_LIMIT) {
                 Ok(rows) => rows,
                 Err(error) => {
@@ -410,10 +446,16 @@ impl ReportsPanel {
                     Vec::new()
                 }
             };
-            (merge_rows(perf, device.clone(), faults), device, failure)
+            (
+                merge_rows(perf, device.clone(), faults),
+                device,
+                device_note,
+                notes,
+                failure,
+            )
         });
         self._load_task = Some(cx.spawn(async move |this, cx| {
-            let (rows, device, failure) = load.await;
+            let (rows, device, device_note, notes, failure) = load.await;
             this.update(cx, |this, cx| {
                 // The flag is cleared even for a superseded load: it
                 // guards the spawn, not the store.
@@ -423,6 +465,8 @@ impl ReportsPanel {
                 }
                 this.rows = rows;
                 this.device = device;
+                this.device_note = device_note;
+                this.notes = notes;
                 this.state = match failure {
                     Some(error) => LoadState::Error(error),
                     None if this.rows.is_empty() => LoadState::Empty,
@@ -558,9 +602,17 @@ impl ReportsPanel {
                             .gap_1()
                             .w_full()
                             .child(
-                                Icon::new(row.kind.icon())
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
+                                // The kind is otherwise a glyph and
+                                // nothing else: the filter chips name the
+                                // three, but a row on its own does not.
+                                div()
+                                    .id(("ggo-reports-row-kind", ix))
+                                    .tooltip(Tooltip::text(row.kind.label()))
+                                    .child(
+                                        Icon::new(row.kind.icon())
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    ),
                             )
                             .child(Label::new(row.title.clone()).size(LabelSize::Small))
                             .child(div().flex_1())
@@ -588,15 +640,26 @@ impl ReportsPanel {
             .into_any_element()
     }
 
-    /// The one line under the header when the list has nothing to say for
+    /// What goes under the header when the list has nothing to say for
     /// itself: a reason, never an empty panel.
+    ///
+    /// `None` once there are rows -- a note is the empty state's, and a
+    /// populated list is never blanked to make room for one. An empty
+    /// list prefers the non-fatal reasons the load collected over the
+    /// bare [`EMPTY_MESSAGE`], because "no reports yet" is a claim, and
+    /// a failed import means nobody is in a position to make it.
+    fn note(&self) -> Option<String> {
+        match &self.state {
+            LoadState::Empty if !self.notes.is_empty() => Some(self.notes.join("\n")),
+            LoadState::Empty => Some(EMPTY_MESSAGE.to_string()),
+            LoadState::Loading => Some(LOADING_MESSAGE.to_string()),
+            LoadState::Error(error) => Some(error.clone()),
+            LoadState::Ready => None,
+        }
+    }
+
     fn render_note(&self) -> Option<impl IntoElement> {
-        let note = match &self.state {
-            LoadState::Empty => EMPTY_MESSAGE.to_string(),
-            LoadState::Loading => LOADING_MESSAGE.to_string(),
-            LoadState::Error(error) => error.clone(),
-            LoadState::Ready => return None,
-        };
+        let note = self.note()?;
         Some(
             div().px_2().py_1().child(
                 ggo_common::CopyableText::new("ggo-reports-note", note).size(LabelSize::Small),
@@ -609,13 +672,9 @@ impl Render for ReportsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<AnyElement> = self
             .visible
-            .clone()
-            .into_iter()
+            .iter()
             .enumerate()
-            .filter_map(|(ix, row_ix)| {
-                let row = self.rows.get(row_ix).cloned()?;
-                Some(self.render_row(ix, &row, cx))
-            })
+            .filter_map(|(ix, row_ix)| Some(self.render_row(ix, self.rows.get(*row_ix)?, cx)))
             .collect();
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -936,6 +995,58 @@ mod tests {
              trap: mcause=0x2 mepc=0x80000010\n",
         )
         .expect("dump");
+    }
+
+    /// An empty list is a claim ("nothing was recorded"), and it must not
+    /// be made when the truth is "the sources could not be read". The
+    /// fixture is a database path the importer cannot create -- its
+    /// parent is a FILE, so no directory can be made there -- while both
+    /// list reads still return empty for the ordinary "no such file"
+    /// reason, which is the shape an unwritable home has.
+    #[gpui::test]
+    async fn an_empty_list_says_why_rather_than_claiming_there_is_nothing(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let faults_dir = temp.path().join("faults");
+        write_dump(&faults_dir, "2026-09-02_08-49-33_marker");
+        let blocker = temp.path().join("not-a-directory");
+        std::fs::write(&blocker, "").expect("blocker");
+        let unwritable = blocker.join("ggo_ide.db");
+        let panel = cx.update(|cx| cx.new(|cx| ReportsPanel::new(None, cx)));
+        panel.update(cx, |panel, cx| {
+            panel.set_db_path_override(unwritable);
+            panel.set_diag_db_path_override(temp.path().join("diag.db"));
+            panel.set_faults_dir_override(faults_dir.clone());
+            panel.refresh(cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert!(panel.all_rows().is_empty(), "nothing could be listed");
+            assert_eq!(panel.state, LoadState::Empty, "and no read failed outright");
+            let note = panel
+                .note()
+                .expect("an empty list owes the reader a reason");
+            assert_ne!(note, EMPTY_MESSAGE, "'no reports yet' would be a lie here");
+            assert!(note.contains("importing faults from"), "{note}");
+            assert!(
+                note.contains(&faults_dir.display().to_string()),
+                "the directory that could not be imported is named: {note}"
+            );
+            assert!(
+                note.contains("diag.db"),
+                "and the device history's own reason comes through too: {note}"
+            );
+
+            // A populated list is never blanked by a reason: the note is
+            // the empty state's, not the panel's.
+            panel.rows = merge_rows(
+                vec![perf(7, "2026-09-02T08:00:00Z")],
+                Vec::new(),
+                Vec::new(),
+            );
+            panel.state = LoadState::Ready;
+            assert_eq!(panel.note(), None, "rows outrank reasons");
+        });
     }
 
     /// End to end: the panel imports a dump the daemon left behind, lists
