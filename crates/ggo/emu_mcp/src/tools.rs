@@ -117,7 +117,7 @@ pub fn tool_list() -> Value {
           "description": "Cancel the flash in flight, the same as the user's Cancel button. Returns {cancelled: bool}; false when nothing was running (including when no emulator panel has ever been opened in the workspace). The timeline keeps the phase it reached; a cancelled run is not a failed one.",
           "inputSchema": with(json!({})) },
         { "name": "list_ggo_reports",
-          "description": "Every report in ~/.ggo/ggo_ide.db, as two newest-first sections, each under a header naming its time zone. Under `--- runs (UTC) ---`, the perf runs (emulator and board): run id, started_at (ISO-UTC), cart, label, and the ggo-diag log path for board runs. Under `--- faults (local time) ---`, the ggo-uartd fault dumps: fault id, timestamp (the daemon's local wall clock), kind: detail, and the probable perf run. The two zones are not comparable as text — line a fault up against a run only after converting. Fresh dumps are imported on the way. Reads the database directly — no Zed session needed.",
+          "description": "Every report in ~/.ggo/ggo_ide.db, as two newest-first sections, each under a header naming its time zone. Under `--- runs (perf stamps UTC, device stamps local time) ---`, the runs: run id, started_at (ISO-UTC for emulator perf runs, the local underscore stamp for ggo-diag device runs), cart, label, and the ggo-diag log path for board runs. Under `--- faults (local time) ---`, the ggo-uartd fault dumps: fault id, timestamp (the daemon's local wall clock), kind: detail, and the probable perf run. The two zones are not comparable as text — line a fault up against a run only after converting. Fresh dumps are imported on the way. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
               "type": "object",
               "properties": { "limit": { "type": "number", "description": "Newest N of each section (default 20)" } },
@@ -542,15 +542,16 @@ fn ggo_dir() -> Result<std::path::PathBuf, String> {
 /// The two report sections' headers. They carry the ZONE because the
 /// producers disagree about it and the stamps do not say so themselves: a
 /// perf run's `started_at` is ISO-UTC (ggo-server's ingest writes it that
-/// way), while a dump's id and `at` are `ggo-uartd`'s LOCAL wall clock
-/// off the file name. Listed together and unlabelled, one afternoon reads
+/// way), a device run's is the LOCAL underscore stamp ggo-diag names its
+/// run by (history's reconcile copies it as-is), and a dump's id and `at`
+/// are `ggo-uartd`'s LOCAL wall clock off the file name. Listed together and unlabelled, one afternoon reads
 /// as two, and a reader lining a fault up against the run it happened
 /// during is out by the machine's UTC offset.
 ///
 /// Each header is printed whenever its section has rows, a lone section
 /// included -- that is the case where there is nothing else on screen to
 /// infer the zone from.
-const RUNS_HEADER: &str = "--- runs (UTC) ---";
+const RUNS_HEADER: &str = "--- runs (perf stamps UTC, device stamps local time) ---";
 const FAULTS_HEADER: &str = "--- faults (local time) ---";
 
 /// Every perf run in `<db_dir>/ggo_ide.db`, newest first, one line each,
@@ -1635,7 +1636,7 @@ mod tests {
         // is ISO-UTC off ggo-server's ingest, a dump's stamp is the
         // daemon's local wall clock -- so each says which it is. Mixed
         // and unlabelled, the same afternoon reads as two.
-        assert_eq!(lines[0], "--- runs (UTC) ---", "{text}");
+        assert_eq!(lines[0], "--- runs (perf stamps UTC, device stamps local time) ---", "{text}");
         assert!(lines[1].starts_with("run 7  2026-08-31T00:00:00Z  wilds"), "{text}");
         assert_eq!(lines[2], "--- faults (local time) ---", "{text}");
         assert_eq!(
