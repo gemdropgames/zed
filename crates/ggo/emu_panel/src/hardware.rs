@@ -1350,13 +1350,18 @@ pub fn scan_ports_rescuing() -> (Vec<String>, bool) {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from);
     let relay = home.as_deref().map(crate::menu::uart_relay_link);
-    let scan = || crate::menu::scan_serial_ports_at(by_id, dev, relay.as_deref());
-    let ports = scan();
-    if !ports.is_empty() {
-        return (ports, false);
+    // The rescue keys on the PHYSICAL scan alone. `ggo-uartd` keeps its
+    // relay pty alive across a driver detach -- it merely polls for the
+    // device node to come back and cannot reattach a kernel driver -- so
+    // a resolving relay would otherwise mask an orphaned board and leave
+    // it stuck until a replug.
+    let physical = || crate::menu::scan_serial_ports_at(by_id, dev, None);
+    let ports = || crate::menu::scan_serial_ports_at(by_id, dev, relay.as_deref());
+    if !physical().is_empty() {
+        return (ports(), false);
     }
     let Some(board) = find_orphaned_board_at(Path::new(USB_SYSFS_DIR)) else {
-        return (ports, false);
+        return (ports(), false);
     };
     // A board with its driver detached DURING a run is not orphaned --
     // it is openFPGALoader holding the USB interface to program it, and
@@ -1370,7 +1375,7 @@ pub fn scan_ports_rescuing() -> (Vec<String>, bool) {
             board.busnum,
             board.devnum
         );
-        return (ports, false);
+        return (ports(), false);
     }
     if let Err(error) = reattach_kernel_driver(&board) {
         log::warn!(
@@ -1378,20 +1383,20 @@ pub fn scan_ports_rescuing() -> (Vec<String>, bool) {
             board.busnum,
             board.devnum
         );
-        return (ports, true);
+        return (ports(), true);
     }
     // The reattach kicks off the driver probe rather than completing it;
     // the tty node follows within milliseconds. Bounded, so a probe on
     // the foreground thread stalls a frame or two at worst, once.
     for _ in 0..5 {
-        let ports = scan();
-        if !ports.is_empty() {
-            log::info!("reattached the board's serial driver: {}", ports[0]);
-            return (ports, false);
+        let devices = physical();
+        if let Some(first) = devices.first() {
+            log::info!("reattached the board's serial driver: {first}");
+            return (ports(), false);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    (Vec::new(), true)
+    (ports(), true)
 }
 
 /// Probe this machine. `project` is the open game project (the worktree
@@ -1954,6 +1959,33 @@ mod tests {
         let (ports, stuck) = scan_ports_rescuing();
         assert!(!stuck, "board on the bus but the rescue failed");
         assert!(!ports.is_empty(), "no board attached, or no tty came back");
+    }
+
+    /// [`scan_ports_rescuing`] keys its rescue on the physical scan, not
+    /// on the list it returns: `ggo-uartd` keeps its relay pty alive while
+    /// the board's kernel driver is detached, so a resolving relay must
+    /// not read as "a board is here".
+    #[test]
+    fn a_resolving_relay_does_not_mask_an_empty_physical_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let by_id = dir.path().join("by-id");
+        let dev = dir.path().join("dev");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::create_dir_all(&dev).unwrap();
+        let target = dir.path().join("pts7");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.path().join("uart");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            crate::menu::scan_serial_ports_at(&by_id, &dev, None).is_empty(),
+            "the rescue decision sees no board"
+        );
+        assert_eq!(
+            crate::menu::scan_serial_ports_at(&by_id, &dev, Some(&link)),
+            [link.to_string_lossy().into_owned()],
+            "the returned list still leads with the relay"
+        );
     }
 
     #[test]
