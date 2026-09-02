@@ -975,9 +975,14 @@ impl ChartsPanel {
                         // Before the state is stored, so the first layout
                         // of the list already lands on the marked line
                         // rather than scrolling after a frame at the top.
-                        if let Some(line) = detail.fault_line {
-                            this.fault_scroll
-                                .scroll_to_item(line, ScrollStrategy::Center);
+                        // The handle owns its offset across selections, so a
+                        // dump with no fault line must be re-aimed at the top
+                        // or it opens where the previous dump left off.
+                        match detail.fault_line {
+                            Some(line) => this
+                                .fault_scroll
+                                .scroll_to_item(line, ScrollStrategy::Center),
+                            None => this.fault_scroll.scroll_to_item(0, ScrollStrategy::Top),
                         }
                         this.fault = Some(FaultState::Ready { detail, text });
                         this.fault_raw_path = raw_path;
@@ -3366,6 +3371,7 @@ mod tests {
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
             panel.db_path_override = Some(ide_db.clone());
+            panel.set_faults_dir_override(faults.clone());
             panel
         });
         panel.update(cx, |panel, cx| {
