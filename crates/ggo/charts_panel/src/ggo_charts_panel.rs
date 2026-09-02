@@ -527,6 +527,11 @@ pub struct ChartsPanel {
     /// from `db_path_override` because they are separate files owned by
     /// separate tools; see `history`'s module doc.
     diag_db_path_override: Option<PathBuf>,
+    /// Test hook for `ggo-uartd`'s dump directory. Without it a test that
+    /// opens a fault `stat`s the developer's real `~/.ggo/uartd/faults`,
+    /// so whether the Copy-dump button came out enabled depended on what
+    /// the daemon happened to have left on that machine.
+    faults_dir_override: Option<PathBuf>,
     state: LoadState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
@@ -609,6 +614,7 @@ impl ChartsPanel {
             workspace,
             db_path_override: None,
             diag_db_path_override: None,
+            faults_dir_override: None,
             state: LoadState::Empty,
             load_generation: 0,
             _load_task: None,
@@ -694,20 +700,14 @@ impl ChartsPanel {
             .or_else(ggo_common::default_diag_db_path)
     }
 
-    /// `ggo-uartd`'s dump directory, `~/.ggo/uartd/faults` -- the layout
-    /// that daemon's `control::faults_dir` writes, resolved by the same
-    /// HOME rule [`ggo_common::default_db_path`] uses so the two cannot
-    /// disagree about which directory `~/.ggo` is. Read-only from here:
+    /// `ggo-uartd`'s dump directory -- [`ggo_common::default_faults_dir`],
+    /// the same one `ggo_reports_panel` imports from. Read-only from here:
     /// the dumps belong to the daemon, and the panel only points a user
     /// at one.
     fn faults_dir(&self) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-        Some(
-            PathBuf::from(home)
-                .join(".ggo")
-                .join("uartd")
-                .join("faults"),
-        )
+        self.faults_dir_override
+            .clone()
+            .or_else(ggo_common::default_faults_dir)
     }
 
     /// Select a perf run and kick off its load -- same off-thread shape and
@@ -988,6 +988,15 @@ impl ChartsPanel {
     /// device runs into whatever database it is pointed at.
     pub fn set_diag_db_path_override(&mut self, path: PathBuf) {
         self.diag_db_path_override = Some(path);
+    }
+
+    /// Resolve dump paths under `path` instead of `~/.ggo/uartd/faults`.
+    /// Public for [`Self::set_db_path_override`]'s reason: the reports
+    /// dock's end-to-end test imports a fixture dump directory and the
+    /// tab it opens has to resolve the raw path in that same directory,
+    /// not in the developer's real one.
+    pub fn set_faults_dir_override(&mut self, path: PathBuf) {
+        self.faults_dir_override = Some(path);
     }
 
     /// Back to the run picker.
@@ -3022,6 +3031,7 @@ mod tests {
         let panel = cx.new(|cx| ChartsPanel::new(None, cx));
         panel.update(cx, |panel, cx| {
             panel.set_db_path_override(ide_db.clone());
+            panel.set_faults_dir_override(faults.clone());
             panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
         });
         cx.run_until_parked();

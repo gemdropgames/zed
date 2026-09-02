@@ -330,20 +330,13 @@ impl ReportsPanel {
             .or_else(ggo_common::default_diag_db_path)
     }
 
-    /// Where `ggo-uartd` drops its dumps. Same `HOME`/`USERPROFILE` rule
-    /// as [`ggo_common::default_db_path`], and the same directory the
-    /// charts panel resolves for a dump's raw path.
+    /// Where `ggo-uartd` drops its dumps --
+    /// [`ggo_common::default_faults_dir`], the same directory the charts
+    /// panel resolves a dump's raw path in.
     fn faults_dir(&self) -> Option<PathBuf> {
-        if let Some(dir) = self.faults_dir_override.clone() {
-            return Some(dir);
-        }
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-        Some(
-            PathBuf::from(home)
-                .join(".ggo")
-                .join("uartd")
-                .join("faults"),
-        )
+        self.faults_dir_override
+            .clone()
+            .or_else(ggo_common::default_faults_dir)
     }
 
     /// Reload everything, device history included. The activation and
@@ -978,6 +971,10 @@ mod tests {
             charts.update(cx, |charts, _| {
                 charts.set_db_path_override(ide_db.clone());
                 charts.set_diag_db_path_override(temp.path().join("diag.db"));
+                // The tab resolves the clicked dump's raw path itself; left
+                // at its default it would `stat` the developer's real
+                // ~/.ggo/uartd/faults instead of this fixture's.
+                charts.set_faults_dir_override(faults_dir.clone());
             });
             workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
         });

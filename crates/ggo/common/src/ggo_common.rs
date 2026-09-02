@@ -131,6 +131,10 @@ const DOT_GGO: &str = ".ggo";
 /// [`default_diag_db_path`]. Matches ggo-ide's
 /// `pages/device.rs::DIAG_DB_FILE` and `ggo-diag`'s own `diag::db::DB_FILE`.
 const DIAG_DB_FILE: &str = "diag.db";
+/// `ggo-uartd`'s dump directory under `~/.ggo/`, as that daemon's
+/// `control::faults_dir` lays it out -- see [`default_faults_dir`].
+const UARTD_DIR: &str = "uartd";
+const FAULTS_DIR: &str = "faults";
 
 /// `~/.ggo/ggo_ide.db`, matching `ggo-ide`'s `backend/db.rs::default_db_path`.
 /// `None` only if neither `HOME` nor `USERPROFILE` resolves (mirrors that
@@ -163,6 +167,31 @@ pub fn default_db_path() -> Option<PathBuf> {
 pub fn default_diag_db_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(PathBuf::from(home).join(DOT_GGO).join(DIAG_DB_FILE))
+}
+
+/// `ggo-uartd`'s dump directory, `~/.ggo/uartd/faults` -- the layout that
+/// daemon's `control::faults_dir` writes, resolved from the same `DOT_GGO`
+/// constant [`default_db_path`] uses so nothing here can disagree about
+/// which directory `~/.ggo` is.
+///
+/// Read-only from the fork's side: the dumps belong to the daemon, and the
+/// panels only import them and point a user at one. Shared by
+/// `ggo_charts_panel` (resolves a dump's raw path) and `ggo_reports_panel`
+/// (imports the directory on every load) for [`default_db_path`]'s reason
+/// -- both had their own copy of this join, and both take a test override,
+/// so a drift between them would never have failed a test.
+///
+/// `ggo_emu_mcp` deliberately keeps its own copy: it resolves the directory
+/// under a caller-supplied `db_dir` rather than under `HOME`, and depends
+/// on nothing gpui-shaped.
+pub fn default_faults_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(DOT_GGO)
+            .join(UARTD_DIR)
+            .join(FAULTS_DIR),
+    )
 }
 
 // ------------------------------------------------- unsaved-document guard
@@ -1560,6 +1589,21 @@ mod tests {
     fn default_db_path_is_dot_ggo_ggo_ide_db() {
         let path = default_db_path().expect("HOME resolves in the test env");
         assert!(path.ends_with(".ggo/ggo_ide.db"));
+    }
+
+    /// `default_faults_dir` must land on `~/.ggo/uartd/faults` -- the
+    /// directory `ggo-uartd` writes and the two panels import from. Both
+    /// resolve it through this one function, so a test that pins the
+    /// layout here pins it for both.
+    #[test]
+    fn default_faults_dir_is_dot_ggo_uartd_faults() {
+        let path = default_faults_dir().expect("HOME resolves in the test env");
+        assert!(path.ends_with(".ggo/uartd/faults"), "{}", path.display());
+        assert_eq!(
+            path.parent().and_then(|p| p.parent()),
+            default_db_path().expect("HOME resolves").parent(),
+            "the dumps live under the SAME ~/.ggo the databases do"
+        );
     }
 
     #[test]
