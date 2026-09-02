@@ -292,7 +292,7 @@ fn world_value(panel: &WeakEntity<EmuPanel>, cx: &mut AsyncApp) -> serde_json::V
 }
 
 /// A framebuffer as the wire carries it; the bridge turns it into PNG.
-fn bgra_reply(width: u32, height: u32, bgra: &[u8]) -> serde_json::Value {
+pub(crate) fn bgra_reply(width: u32, height: u32, bgra: &[u8]) -> serde_json::Value {
     serde_json::json!({
         "width": width,
         "height": height,
@@ -488,7 +488,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::Uart { workspace, .. }
         | Cmd::Run { workspace, .. }
         | Cmd::Pause { workspace }
-        | Cmd::Resume { workspace } => workspace.clone(),
+        | Cmd::Resume { workspace }
+        | Cmd::Debug { workspace, .. } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -563,6 +564,15 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             panel.update(cx, |p, _| p.remote_progress()).map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({ "paused": paused, "frame": frame, "running": running }));
     }
+    // Pre-window as well: every inspector view is decoded from the
+    // snapshot the drive thread already published, so an agent can look
+    // at a run it did not start and has no window handle for.
+    if let Cmd::Debug { view, bank, palette, layer, .. } = &cmd {
+        let panel = target.panel.ok_or("no run live — emu_run or emu_start first")?;
+        return panel
+            .update(cx, |p, _| p.remote_debug_view(*view, *bank, *palette, *layer))
+            .map_err(|e| e.to_string())?;
+    }
 
     let window = target.window.ok_or("workspace has no window (headless test?)")?;
 
@@ -574,7 +584,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::Screenshot { .. }
         | Cmd::Uart { .. }
         | Cmd::Pause { .. }
-        | Cmd::Resume { .. } => unreachable!("handled above"),
+        | Cmd::Resume { .. }
+        | Cmd::Debug { .. } => unreachable!("handled above"),
         Cmd::Start { cart, .. } => {
             let panel =
                 boot_cart(target.panel, target.workspace, &target_root, cart, window, cx).await?;

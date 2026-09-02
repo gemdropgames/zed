@@ -80,6 +80,32 @@ pub enum Cmd {
     Pause { workspace: Option<String> },
     /// Resume a paused run.
     Resume { workspace: Option<String> },
+    /// The frame-step debugger's views, for the run in flight (paused or
+    /// not): `{image?, rows?, palettes?, labels}`.
+    Debug {
+        workspace: Option<String>,
+        view: DebugView,
+        #[serde(default)]
+        bank: usize,
+        #[serde(default)]
+        palette: usize,
+        #[serde(default)]
+        layer: usize,
+    },
+}
+
+/// Which PPU inspector view `Cmd::Debug` renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebugView {
+    /// Every VRAM tile at 1x, colored by `bank`/`palette`.
+    Tiles,
+    /// One background layer composed at 1x.
+    Map,
+    /// The OAM sprites composited onto a blank screen, plus a row table.
+    Oam,
+    /// Both palette banks as RGB565 hex, no image.
+    Palettes,
 }
 
 /// What a flash runs with. Every field has a default, so `{}` is a
@@ -413,6 +439,19 @@ mod tests {
         );
         assert_eq!(parse_request(r#"{"id":2,"cmd":"pause"}"#).unwrap().cmd, Cmd::Pause { workspace: None });
         assert_eq!(parse_request(r#"{"id":3,"cmd":"resume"}"#).unwrap().cmd, Cmd::Resume { workspace: None });
+    }
+
+    #[test]
+    fn debug_requests_default_their_indices() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"debug","view":"tiles"}"#).unwrap().cmd,
+            Cmd::Debug { workspace: None, view: DebugView::Tiles, bank: 0, palette: 0, layer: 0 }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"debug","view":"map","layer":2}"#).unwrap().cmd,
+            Cmd::Debug { workspace: None, view: DebugView::Map, bank: 0, palette: 0, layer: 2 }
+        );
+        assert!(parse_request(r#"{"id":3,"cmd":"debug","view":"sprites"}"#).is_err());
     }
 
     #[test]

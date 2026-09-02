@@ -3475,6 +3475,92 @@ impl EmuPanel {
         }
     }
 
+    /// One inspector view over the run's latest PPU snapshot. Bounds are
+    /// checked here so a bad index is a named error, not a panic in the
+    /// decoder.
+    pub(crate) fn remote_debug_view(
+        &self,
+        view: ggo_emu_remote::protocol::DebugView,
+        bank: usize,
+        palette: usize,
+        layer: usize,
+    ) -> Result<serde_json::Value, String> {
+        use crate::agent_remote::bgra_reply;
+        use ggo_emu_core::ppu::{LAYER_COUNT, PAL_ENTRIES};
+        use ggo_emu_remote::protocol::DebugView;
+        let snapshot = self
+            .remote_session()?
+            .snapshot()
+            .ok_or("no PPU snapshot yet — the run has not presented a frame")?;
+        let palette_count = snapshot.palettes[0].len() / PAL_ENTRIES;
+        Ok(match view {
+            DebugView::Tiles => {
+                if bank > 1 {
+                    return Err("bank must be 0 (bg/fg) or 1 (sprites)".to_string());
+                }
+                if palette >= palette_count {
+                    return Err(format!("palette must be < {palette_count}"));
+                }
+                serde_json::json!({
+                    "view": "tiles",
+                    "bank": bank,
+                    "palette": palette,
+                    "image": bgra_reply(
+                        debug::SHEET_PX as u32,
+                        debug::SHEET_PX as u32,
+                        &debug::tile_sheet_bgra(&snapshot, bank, palette),
+                    ),
+                })
+            }
+            DebugView::Map => {
+                if layer >= LAYER_COUNT {
+                    return Err(format!("layer must be < {LAYER_COUNT}"));
+                }
+                let labels = debug::layer_labels(&snapshot);
+                serde_json::json!({
+                    "view": "map",
+                    "layer": layer,
+                    "label": labels[layer],
+                    "scroll": [snapshot.scroll[layer].0, snapshot.scroll[layer].1],
+                    "enabled": snapshot.layer_enable[layer],
+                    "priority": snapshot.layer_prio[layer],
+                    "image": bgra_reply(
+                        debug::MAP_PX as u32,
+                        debug::MAP_PX as u32,
+                        &debug::map_bgra(&snapshot, layer),
+                    ),
+                })
+            }
+            DebugView::Oam => {
+                let rows: Vec<String> = debug::oam_rows(&snapshot)
+                    .into_iter()
+                    .map(|(index, entry)| debug::oam_row_label(index, &entry))
+                    .collect();
+                serde_json::json!({
+                    "view": "oam",
+                    "rows": rows,
+                    "image": bgra_reply(
+                        drive::WIDTH,
+                        drive::HEIGHT,
+                        &debug::oam_composite_bgra(&snapshot),
+                    ),
+                })
+            }
+            DebugView::Palettes => {
+                let bank_hex = |bank: &[u16]| -> Vec<Vec<String>> {
+                    bank.chunks(PAL_ENTRIES)
+                        .map(|palette| palette.iter().map(|c| debug::rgb565_label(*c)).collect())
+                        .collect()
+                };
+                serde_json::json!({
+                    "view": "palettes",
+                    "bg_fg": bank_hex(&snapshot.palettes[0]),
+                    "sprites": bank_hex(&snapshot.palettes[1]),
+                })
+            }
+        })
+    }
+
     /// The live run is paused. `test-support` only.
     #[cfg(feature = "test-support")]
     pub fn test_is_paused(&self) -> bool {
@@ -7598,6 +7684,18 @@ mod tests {
         let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, _cx| {
             assert!(panel.remote_resume().is_err(), "no run live");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_debug_view_needs_a_run(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, _cx| {
+            let err = panel
+                .remote_debug_view(ggo_emu_remote::protocol::DebugView::Tiles, 0, 0, 0)
+                .unwrap_err();
+            assert!(err.contains("no run live"), "{err}");
         });
     }
 

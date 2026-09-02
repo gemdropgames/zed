@@ -77,6 +77,14 @@ pub fn tool_list() -> Value {
           "inputSchema": with(json!({ "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. target/ggo-emulate/worlds-arena.ggo" } })) },
         { "name": "emu_pause", "description": "Pause the live run at the next frame boundary. Returns {paused, frame, running}.", "inputSchema": with(json!({})) },
         { "name": "emu_resume", "description": "Resume a paused run. Returns {paused, frame, running}.", "inputSchema": with(json!({})) },
+        { "name": "emu_debug",
+          "description": "The PPU inspector for the run in flight — what the frame-step debugger shows a human. view=tiles: every VRAM tile at 1× as PNG, colored by bank (0 bg/fg, 1 sprites) and palette; view=map: one background layer (0–3) composed at 1× as PNG plus scroll/enable/priority; view=oam: the sprites composited on a blank 320×240 screen as PNG plus one text row per OAM entry; view=palettes: both palette banks as RGB565 hex (no image). Use it for 'why is this sprite garbage' — the answer is usually a wrong palette or tile index visible here.",
+          "inputSchema": with(json!({
+              "view": { "type": "string", "enum": ["tiles", "map", "oam", "palettes"] },
+              "bank": { "type": "number", "description": "tiles: 0 bg/fg, 1 sprites (default 0)" },
+              "palette": { "type": "number", "description": "tiles: palette index (default 0)" },
+              "layer": { "type": "number", "description": "map: layer 0–3 (default 0)" }
+          })) },
         { "name": "hw_flash",
           "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=115200, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
           "inputSchema": with(json!({
@@ -287,6 +295,36 @@ fn call_tool_inner(
         "emu_resume" => {
             let data = send(&session.socket, Cmd::Resume { workspace }, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "emu_debug" => {
+            let view = match arg_str(args, "view").as_deref() {
+                Some("tiles") => ggo_emu_remote::protocol::DebugView::Tiles,
+                Some("map") => ggo_emu_remote::protocol::DebugView::Map,
+                Some("oam") => ggo_emu_remote::protocol::DebugView::Oam,
+                Some("palettes") => ggo_emu_remote::protocol::DebugView::Palettes,
+                other => return Err(format!("view must be tiles|map|oam|palettes, got {other:?}")),
+            };
+            let index = |key: &str| arg_i64(args, key).filter(|n| *n >= 0).unwrap_or(0) as usize;
+            let mut data = send(
+                &session.socket,
+                Cmd::Debug {
+                    workspace,
+                    view,
+                    bank: index("bank"),
+                    palette: index("palette"),
+                    layer: index("layer"),
+                },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            // The image rides out as MCP image content, not as base64 in
+            // the text block: the rows/labels stay readable that way.
+            let image = data.as_object_mut().and_then(|o| o.remove("image"));
+            let mut content = vec![json!({ "type": "text", "text": data.to_string() })];
+            if let Some(image) = image {
+                content.push(image_content(&image)?);
+            }
+            Ok(content)
         }
         "hw_flash" => {
             // A zero or negative knob is a caller mistake, not a request
@@ -683,6 +721,31 @@ mod tests {
     }
 
     #[test]
+    fn emu_debug_splits_the_image_out_as_png_content() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let bgra = base64::engine::general_purpose::STANDARD.encode([0u8, 0, 255, 255]);
+        let connect = move |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""view":"map""#) && line.contains(r#""layer":2"#), "{line}");
+            Ok(format!(
+                r#"{{"id":1,"ok":true,"data":{{"view":"map","layer":2,"image":{{"width":1,"height":1,"bgra_base64":"{bgra}"}}}}}}"#
+            ))
+        };
+        let (content, is_err) =
+            call_tool("emu_debug", &json!({"view": "map", "layer": 2}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(
+            !content[0]["text"].as_str().unwrap().contains("bgra_base64"),
+            "image moved out of the text"
+        );
+        assert_eq!(content[1]["type"], "image");
+        let (content, is_err) =
+            call_tool("emu_debug", &json!({"view": "sprites"}), dir.path(), &connect);
+        assert!(is_err && content[0]["text"].as_str().unwrap().contains("view must be"), "{content:?}");
+    }
+
+    #[test]
     fn host_error_becomes_tool_error() {
         let dir = tempfile::tempdir().unwrap();
         fake_session(dir.path(), std::process::id());
@@ -713,6 +776,7 @@ mod tests {
                 "emu_run",
                 "emu_pause",
                 "emu_resume",
+                "emu_debug",
                 "hw_flash",
                 "hw_flash_status",
                 "hw_flash_wait",
