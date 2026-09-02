@@ -1346,7 +1346,11 @@ pub fn set_board_run_in_flight(in_flight: bool) {
 pub fn scan_ports_rescuing() -> (Vec<String>, bool) {
     let by_id = Path::new(SERIAL_BY_ID_DIR);
     let dev = Path::new(crate::menu::DEV_DIR);
-    let scan = || crate::menu::scan_serial_ports_at(by_id, dev);
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let relay = home.as_deref().map(crate::menu::uart_relay_link);
+    let scan = || crate::menu::scan_serial_ports_at(by_id, dev, relay.as_deref());
     let ports = scan();
     if !ports.is_empty() {
         return (ports, false);

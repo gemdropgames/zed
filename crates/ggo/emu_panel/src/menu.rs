@@ -131,34 +131,53 @@ pub const DEV_DIR: &str = "/dev";
 /// the one [`diag_request`] picks.
 const TTY_PREFIXES: [&str; 4] = ["ttyUSB", "ttyACM", "cu.usb", "tty.usb"];
 
-/// Scan for candidate serial devices: every entry under `by_id_dir` if it
+/// `~/.ggo/uart`: the pty `ggo-uartd` re-serves the board's line through
+/// when it is running. It leads the scan because reading the device
+/// directly would steal bytes from the daemon.
+pub fn uart_relay_link(home: &Path) -> PathBuf {
+    home.join(".ggo").join("uart")
+}
+
+/// Scan for candidate serial devices: [`uart_relay_link`] first when it
+/// is given and still resolves, then every entry under `by_id_dir` if it
 /// has any, else every entry under `dev_dir` whose name starts with
-/// `ttyUSB`/`ttyACM`. Sorted, deduped. Parametrized over both directories
-/// (rather than hardcoding the two constants above) so this is testable
-/// against a fixture tree instead of the real, host-dependent `/dev`. A
-/// missing/unreadable directory reads as "no ports there" rather than an
-/// error -- a board that is not plugged in is a normal state, not a
-/// failure.
-pub fn scan_serial_ports_at(by_id_dir: &Path, dev_dir: &Path) -> Vec<String> {
+/// `ttyUSB`/`ttyACM`. The devices are sorted and deduped, and the relay
+/// stays ahead of them because consumers take the first port.
+///
+/// Parametrized over all three paths (rather than hardcoding the two
+/// constants above) so this is testable against a fixture tree instead of
+/// the real, host-dependent `/dev`. A missing/unreadable directory reads
+/// as "no ports there" rather than an error -- a board that is not
+/// plugged in is a normal state, not a failure.
+pub fn scan_serial_ports_at(by_id_dir: &Path, dev_dir: &Path, relay: Option<&Path>) -> Vec<String> {
     let mut ports = Vec::new();
+    // A link that no longer resolves is a stale one the daemon left behind
+    // when it stopped; opening that path would fail.
+    if let Some(link) = relay
+        && std::fs::read_link(link).is_ok_and(|target| target.exists())
+    {
+        ports.push(link.to_string_lossy().into_owned());
+    }
+    let mut devices = Vec::new();
     if let Ok(entries) = std::fs::read_dir(by_id_dir) {
         for e in entries.flatten() {
-            ports.push(e.path().to_string_lossy().into_owned());
+            devices.push(e.path().to_string_lossy().into_owned());
         }
     }
-    if ports.is_empty()
+    if devices.is_empty()
         && let Ok(entries) = std::fs::read_dir(dev_dir)
     {
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
             if TTY_PREFIXES.iter().any(|p| name.starts_with(p)) {
-                ports.push(dev_dir.join(name.as_ref()).to_string_lossy().into_owned());
+                devices.push(dev_dir.join(name.as_ref()).to_string_lossy().into_owned());
             }
         }
     }
-    ports.sort();
-    ports.dedup();
+    devices.sort();
+    devices.dedup();
+    ports.extend(devices);
     ports
 }
 
@@ -530,20 +549,41 @@ mod tests {
         std::fs::write(dev.join("random"), b"").unwrap();
 
         assert_eq!(
-            scan_serial_ports_at(&by_id, &dev),
+            scan_serial_ports_at(&by_id, &dev, None),
             [dev.join("ttyUSB0").to_string_lossy().into_owned()],
             "an empty by-id falls through to ttyUSB*/ttyACM* only"
         );
 
         std::fs::write(by_id.join("usb-FTDI_board"), b"").unwrap();
         assert_eq!(
-            scan_serial_ports_at(&by_id, &dev),
+            scan_serial_ports_at(&by_id, &dev, None),
             [by_id.join("usb-FTDI_board").to_string_lossy().into_owned()],
             "by-id wins outright once it has an entry"
         );
 
         let missing = dir.path().join("nope");
-        assert!(scan_serial_ports_at(&missing, &missing).is_empty());
+        assert!(scan_serial_ports_at(&missing, &missing, None).is_empty());
+    }
+
+    /// `ggo-uartd` holds the board's device open, so its relay pty is the
+    /// only line left that can be read; consumers take `ports[0]`.
+    #[test]
+    fn the_relay_leads_the_port_list_when_it_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let by_id = dir.path().join("by-id");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::write(by_id.join("usb-ULX3S-if00-port0"), b"").unwrap();
+        let target = dir.path().join("pts3");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.path().join("uart");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let ports = scan_serial_ports_at(&by_id, dir.path(), Some(&link));
+        assert_eq!(ports[0], link.to_string_lossy());
+        assert_eq!(ports.len(), 2);
+        // A dangling link (daemon down, stale symlink) is ignored.
+        std::fs::remove_file(&target).unwrap();
+        let ports = scan_serial_ports_at(&by_id, dir.path(), Some(&link));
+        assert!(!ports.iter().any(|p| p.ends_with("uart")), "{ports:?}");
     }
 
     #[test]
