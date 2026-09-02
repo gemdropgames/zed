@@ -1194,10 +1194,12 @@ impl EmuPanel {
     /// INTEGER `run.id` the charts panel opens by -- two different id
     /// spaces, which is why the translation is a db lookup and not a cast.
     ///
-    /// Every way this can come up empty leaves the PASS status exactly as
-    /// it is: a flash whose boot captured no telemetry, a `ggo-diag` old
-    /// enough to have written none, or a database that would not read are
-    /// all "there is no report to open", not "the flash went wrong". The
+    /// A PASS whose run has no perf report -- a boot that captured no
+    /// telemetry, a `ggo-diag` too old to parse the packets -- still has
+    /// a UART log, so the tab opens on the device run instead and the
+    /// status says why that is all there is: "the flash passed, where is
+    /// my report" must have an answer on screen. A database that would
+    /// not read is the one case that opens nothing. The
     /// unexpected ones are logged rather than shown, because the run the
     /// user asked for did succeed.
     ///
@@ -1255,18 +1257,26 @@ impl EmuPanel {
                 }
             })
             .await;
-        let Some(local_id) = local_id else {
-            return;
+        match local_id {
+            // Remembered before it is opened: `flash_status` over the agent
+            // socket answers with this rather than repeating the lookup.
+            // Stored WITH the run it belongs to and written unconditionally
+            // -- a hop that lands after the next run started is harmless,
+            // because the reader pairs the ids rather than trusting order.
+            Some(local_id) => this
+                .update(cx, |this, _cx| {
+                    this.last_flash_perf_run = Some((flashed_run.clone(), local_id))
+                })
+                .ok(),
+            None => this
+                .update(cx, |this, cx| {
+                    if let Some(status) = this.status.as_mut() {
+                        status.push_str(" — no telemetry frames recorded; opened the run's UART log");
+                        cx.notify();
+                    }
+                })
+                .ok(),
         };
-        // Remembered before it is opened: `flash_status` over the agent
-        // socket answers with this rather than repeating the lookup.
-        // Stored WITH the run it belongs to and written unconditionally
-        // -- a hop that lands after the next run started is harmless,
-        // because the reader pairs the ids rather than trusting order.
-        this.update(cx, |this, _cx| {
-            this.last_flash_perf_run = Some((flashed_run, local_id))
-        })
-        .ok();
         let Some(workspace) = this
             .read_with(cx, |this, _cx| this.workspace.clone())
             .ok()
@@ -1282,8 +1292,9 @@ impl EmuPanel {
                             workspace,
                             window,
                             cx,
-                            |charts, _window, cx| {
-                                charts.open_run(local_id, cx);
+                            |charts, _window, cx| match local_id {
+                                Some(local_id) => charts.open_run(local_id, cx),
+                                None => charts.open_device_run(flashed_run, cx),
                             },
                         );
                     })
@@ -7067,6 +7078,98 @@ mod tests {
             )
             .await
             .unwrap();
+        });
+    }
+
+    /// A run ggo-diag recorded WITHOUT telemetry: the `runs` row and its
+    /// verdict, no perf run behind it -- what a boot whose `<<<FRAME…>>>`
+    /// packets went unparsed leaves behind (`[db] run …: N uart lines, 0
+    /// frames`).
+    fn seed_flashed_run_without_telemetry(diag_db: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(diag_db).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
+                 hostname, state, verdict) VALUES (?1, '2026-08-31T12:00:00Z', 'main', \
+                 'abc123', 'v1.2.3', 'test-host', 'done', 'PASS')",
+                [FLASHED_RUN],
+            )
+            .await
+            .unwrap();
+        });
+    }
+
+    /// A PASS with no telemetry has no perf report to open -- but it has a
+    /// UART log, and "the flash passed, where did my report go" is the
+    /// question this answers: the reports tab opens on the device run and
+    /// the status says why that is all there is.
+    #[gpui::test]
+    async fn test_a_passing_flash_without_telemetry_opens_its_uart_log(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let diag_db = dir.path().join("diag.db");
+        let ide_db = dir.path().join("ggo_ide.db");
+        seed_flashed_run_without_telemetry(&diag_db);
+
+        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let charts = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
+            workspace
+                .items_of_type::<ggo_charts_panel::ChartsItem>(cx)
+                .next()
+                .expect("open_charts_item adds the reports tab")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        charts.update(cx, |charts, _cx| {
+            charts.set_db_path_override(ide_db.clone());
+        });
+
+        let (streamer, _calls) = fake_streamer(
+            vec![
+                "==> Report",
+                "[db] run 20260831T120000Z-abc123def0: 6528 uart lines, 0 frames -> diag.db",
+                "RESULT: PASS",
+            ],
+            true,
+        );
+        let request =
+            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proc_streamer = streamer;
+            panel.db_path_override = Some(ide_db.clone());
+            panel.diag_db_path_override = Some(diag_db.clone());
+            panel.flash_charts_window = Some(window.window_handle());
+            panel.start_board_run(
+                vec![request],
+                "flashing".to_string(),
+                hardware::FlashProgress::flash(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
+                .expect("our own database reads")
+                .is_none(),
+            "no telemetry means no perf run to resolve"
+        );
+        charts.read_with(cx, |charts, _| {
+            assert_eq!(
+                charts.selected_device_run_id(),
+                Some(FLASHED_RUN),
+                "the reports tab opened on the device run's UART log"
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            let status = panel.status.as_deref().unwrap_or_default();
+            assert!(status.starts_with("flashing: PASS"), "{status}");
+            assert!(status.contains("no telemetry"), "the status says why there is no chart: {status}");
+            assert_eq!(panel.remote_flash_status().perf_run_id, None);
         });
     }
 

@@ -769,6 +769,38 @@ impl ChartsPanel {
         .detach();
     }
 
+    /// Show the device run ggo-diag recorded under `diag_run_id` -- its
+    /// UART log -- for a run that passed with no telemetry to chart. The
+    /// entry `ggo_emu_panel`'s post-PASS hop takes when
+    /// `device_perf_run_id` finds nothing; looked up through the same
+    /// reconciling load the history rail uses, so a run that landed a
+    /// moment ago is there. Generation-guarded like [`Self::open_run`].
+    pub fn open_device_run(&mut self, diag_run_id: String, cx: &mut Context<Self>) {
+        let (Some(db_path), Some(diag_db_path)) = (self.db_path(), self.diag_db_path()) else {
+            return;
+        };
+        self.detail_generation += 1;
+        let generation = self.detail_generation;
+        let load = cx.background_spawn(async move {
+            history::load(&diag_db_path, &db_path, history::HISTORY_LIMIT)
+        });
+        cx.spawn(async move |this, cx| {
+            let history = load.await;
+            let Some(run) = history.runs.into_iter().find(|run| run.id == diag_run_id) else {
+                log::warn!("device run {diag_run_id}: not in the cloned history, nothing to open");
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if this.detail_generation != generation {
+                    return;
+                }
+                this.select_device_run(run, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Read runs from `path` instead of `~/.ggo/ggo_ide.db`.
     ///
     /// Public only so `ggo_emu_panel`'s "Re-run hops to the charts panel"
@@ -1386,6 +1418,15 @@ impl ChartsPanel {
     pub fn selected_run_id(&self) -> Option<i64> {
         match &self.selected {
             Some(Selection::Perf(run)) => Some(run.id),
+            _ => None,
+        }
+    }
+
+    /// The device run (ggo-diag's TEXT id) on screen, if the panel is
+    /// showing one's UART log.
+    pub fn selected_device_run_id(&self) -> Option<&str> {
+        match &self.selected {
+            Some(Selection::Device(run)) => Some(run.id.as_str()),
             _ => None,
         }
     }

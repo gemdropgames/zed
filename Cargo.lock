@@ -7571,6 +7571,7 @@ dependencies = [
  "ggo_common",
  "ggo_emu_remote",
  "gpui",
+ "log",
  "project",
  "tempfile",
  "tokio",
