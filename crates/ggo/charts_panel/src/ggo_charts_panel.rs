@@ -54,9 +54,9 @@
 //! is still wired up now rather than added later).
 
 mod chart_geom;
-mod charts_item;
 mod chart_paint;
 mod chart_set;
+mod charts_item;
 mod detail;
 mod history;
 mod inspect;
@@ -75,9 +75,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, IntoElement,
-    MouseMoveEvent, Pixels, Render, Styled, Task, WeakEntity, Window, div, px,
-    uniform_list,
+    App, Bounds, Context, FocusHandle, Focusable, IntoElement, MouseMoveEvent, Pixels, Render,
+    Styled, Task, WeakEntity, Window, div, px, uniform_list,
 };
 use ui::prelude::*;
 use ui::{Checkbox, Tooltip};
@@ -87,15 +86,12 @@ use chart_geom::{ChartSpec, build_chart_scene};
 use history::RunSummary;
 use loader::RunListing;
 
-
-
 /// The panel's key-dispatch context identifier. No bindings are scoped to
 /// it yet (see `bind_panel_keys`) -- chart interaction is pointer-only so
 /// far -- but it exists so a later keyboard affordance (run navigation,
 /// chart zoom) has a context to land in without touching this module's
 /// `init`/`Render` wiring.
 const KEY_CONTEXT: &str = "GgoChartsPanel";
-
 
 /// Height of one chart canvas, matching ggo-ide's `CHART_HEIGHT` (240).
 const CHART_HEIGHT: Pixels = px(240.);
@@ -263,7 +259,6 @@ pub fn open_charts_item(
     });
     true
 }
-
 
 /// Close the Reports tab. With `run`, only if that is the perf run it
 /// shows -- an agent closing "its" report must not take down the one
@@ -1025,11 +1020,12 @@ impl ChartsPanel {
         let body = match &self.state {
             LoadState::Empty => Self::note("Select the panel to load runs").into_any_element(),
             LoadState::Loading => Self::note("Loading runs…").into_any_element(),
-            LoadState::Error(e) => {
-                ggo_common::CopyableText::new("ggo-charts-runs-error-copy", Self::runs_error_message(e))
-                    .color(Color::Muted)
-                    .into_any_element()
-            }
+            LoadState::Error(e) => ggo_common::CopyableText::new(
+                "ggo-charts-runs-error-copy",
+                Self::runs_error_message(e),
+            )
+            .color(Color::Muted)
+            .into_any_element(),
             LoadState::Ready(runs) if runs.is_empty() => {
                 Self::note("No perf runs recorded yet").into_any_element()
             }
@@ -1139,9 +1135,11 @@ impl ChartsPanel {
     fn render_device_detail(&self, run: &RunSummary, cx: &mut Context<Self>) -> gpui::AnyElement {
         let body = match &self.device_log {
             None | Some(DeviceLogState::Loading) => self.render_message("Loading log…", cx),
-            Some(DeviceLogState::Error(e)) => {
-                self.render_load_error("ggo-charts-log-error-copy", Self::device_log_error_message(e), cx)
-            }
+            Some(DeviceLogState::Error(e)) => self.render_load_error(
+                "ggo-charts-log-error-copy",
+                Self::device_log_error_message(e),
+                cx,
+            ),
             Some(DeviceLogState::Ready(lines)) => v_flex()
                 .id("ggo-charts-device-body")
                 .size_full()
@@ -1174,12 +1172,14 @@ impl ChartsPanel {
                                             IconName::ArrowLeft,
                                         )
                                         .tooltip(Tooltip::text("Back to runs"))
-                                        .on_click(Self::guarded_listener(
-                                            cx,
-                                            |this, _event, _window, cx| {
-                                                this.clear_selection(cx);
-                                            },
-                                        )),
+                                        .on_click(
+                                            Self::guarded_listener(
+                                                cx,
+                                                |this, _event, _window, cx| {
+                                                    this.clear_selection(cx);
+                                                },
+                                            ),
+                                        ),
                                     ),
                             )
                             .child(Label::new(run.started_at.clone()).size(LabelSize::Small)),
@@ -1209,9 +1209,11 @@ impl ChartsPanel {
 
         let body = match &self.detail {
             None | Some(DetailState::Loading) => self.render_message("Loading samples…", cx),
-            Some(DetailState::Error(e)) => {
-                self.render_load_error("ggo-charts-samples-error-copy", Self::samples_error_message(e), cx)
-            }
+            Some(DetailState::Error(e)) => self.render_load_error(
+                "ggo-charts-samples-error-copy",
+                Self::samples_error_message(e),
+                cx,
+            ),
             Some(DetailState::Ready(detail)) => {
                 let (charts, report) = (&detail.charts, &detail.report);
                 self.chart_bounds.borrow_mut().resize(charts.len(), None);
@@ -2438,12 +2440,20 @@ mod tests {
             // The picker, not a run: a named run cannot be what it shows.
             let err = close_charts_item(workspace, Some(5), window, cx).unwrap_err();
             assert!(err.contains("runs list"), "{err}");
-            assert_eq!(workspace.items_of_type::<ChartsItem>(cx).count(), 1, "left alone");
+            assert_eq!(
+                workspace.items_of_type::<ChartsItem>(cx).count(),
+                1,
+                "left alone"
+            );
             assert_eq!(close_charts_item(workspace, None, window, cx), Ok(true));
         });
         cx.run_until_parked();
         workspace.update_in(cx, |workspace, window, cx| {
-            assert_eq!(workspace.items_of_type::<ChartsItem>(cx).count(), 0, "closed");
+            assert_eq!(
+                workspace.items_of_type::<ChartsItem>(cx).count(),
+                0,
+                "closed"
+            );
             assert_eq!(close_charts_item(workspace, None, window, cx), Ok(false));
         });
     }
@@ -2496,12 +2506,8 @@ mod tests {
         // one pane, moving (not closing) the splits' tabs.
         workspace.update_in(cx, |workspace, window, cx| {
             let active = workspace.active_pane().clone();
-            let new_pane = workspace.split_pane(
-                active,
-                workspace::SplitDirection::Right,
-                window,
-                cx,
-            );
+            let new_pane =
+                workspace.split_pane(active, workspace::SplitDirection::Right, window, cx);
             let extra = cx.new(workspace::item::test::TestItem::new);
             new_pane.update(cx, |pane, cx| {
                 pane.add_item(Box::new(extra), true, true, None, window, cx);
@@ -2520,7 +2526,6 @@ mod tests {
             );
         });
     }
-
 
     /// A fixture db authored through `ggo_db::migrate` plus one inserted
     /// run (same pattern `ggo-ide`'s `backend/perf.rs` tests and
