@@ -559,12 +559,13 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
         .flatten();
     // Before the existence check below: a machine that has only ever run
     // the daemon has no ggo_ide.db until this import writes one.
-    import_faults(db_dir, &ide_db);
+    let import_error = import_faults(db_dir);
     let none = |what: String| {
         let text = match &clone_error {
             Some(e) => format!("{what} (and cloning device runs from diag.db failed: {e})"),
             None => what,
         };
+        let text = format!("{text}{}", import_failure_note(db_dir, import_error.as_ref()));
         Ok(vec![json!({ "type": "text", "text": text })])
     };
     if !ide_db.exists() {
@@ -619,6 +620,10 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
             lines.push("--- faults ---".to_string());
         }
         lines.extend(fault_lines);
+    } else if let Some(e) = &import_error {
+        // Runs to show but no faults: the caller would otherwise read the
+        // missing section as "no dumps", not "the dumps did not import".
+        lines.push(format!("faults: import failed: {e}"));
     }
     Ok(vec![json!({ "type": "text", "text": lines.join("\n") })])
 }
@@ -647,14 +652,32 @@ fn faults_dir(db_dir: &Path) -> std::path::PathBuf {
     db_dir.join("uartd").join("faults")
 }
 
-/// Pull every dump the reports database has not seen into it. Best
-/// effort, like the diag clone: an unreadable dump is the daemon's
-/// problem, and must not fail a tool the rows already answer. Dumps that
-/// individually fail to parse are skipped (and named) by `import` itself.
-fn import_faults(db_dir: &Path, ide_db: &Path) {
+/// Pull every dump the reports database has not seen into it, returning
+/// why it could not when it could not. Best effort, like the diag clone:
+/// an unreadable dump is the daemon's problem and must not fail a tool
+/// the rows already answer -- but a caller looking at an empty faults
+/// section is TOLD, since the failure may be exactly why it is empty.
+/// Dumps that individually fail to parse are skipped (and named on
+/// stderr) by `import` itself.
+fn import_faults(db_dir: &Path) -> Option<String> {
     let dir = faults_dir(db_dir);
-    if let Err(e) = ggo_worldlib::charts::reports::faults::import(&dir, ide_db) {
-        eprintln!("faults: importing {}: {e}", dir.display());
+    match ggo_worldlib::charts::reports::faults::import(&dir, &db_dir.join("ggo_ide.db")) {
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("faults: importing {}: {e}", dir.display());
+            Some(e)
+        }
+    }
+}
+
+/// The parenthetical both "nothing to show" messages carry when the
+/// import is why there is nothing.
+fn import_failure_note(db_dir: &Path, error: Option<&String>) -> String {
+    match error {
+        Some(e) => {
+            format!(" (and importing faults from {} failed: {e})", faults_dir(db_dir).display())
+        }
+        None => String::new(),
     }
 }
 
@@ -673,10 +696,16 @@ fn fetch_fault(db_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
     let ide_db = db_dir.join("ggo_ide.db");
     // A dump written seconds ago is fetchable by id straight from the
     // list, without the panel having been opened in between.
-    import_faults(db_dir, &ide_db);
+    let import_error = import_faults(db_dir);
     let detail = faults::load(&ide_db, id)
         .map_err(|e| format!("reading fault {id}: {e}"))?
-        .ok_or_else(|| format!("no fault {id} in {}", ide_db.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "no fault {id} in {}{}",
+                ide_db.display(),
+                import_failure_note(db_dir, import_error.as_ref())
+            )
+        })?;
     let row = &detail.row;
     let number = |value: Option<i64>| match value {
         Some(n) => n.to_string(),
@@ -760,12 +789,16 @@ fn open_report_cmd(db_dir: &Path, workspace: Option<String>, args: &Value) -> Re
         }
         (None, Some(fault)) => {
             let ide_db = db_dir.join("ggo_ide.db");
-            import_faults(db_dir, &ide_db);
+            let import_error = import_faults(db_dir);
             if faults::load(&ide_db, &fault)
                 .map_err(|e| format!("reading fault {fault}: {e}"))?
                 .is_none()
             {
-                return Err(format!("no fault {fault} in {}", ide_db.display()));
+                return Err(format!(
+                    "no fault {fault} in {}{}",
+                    ide_db.display(),
+                    import_failure_note(db_dir, import_error.as_ref())
+                ));
             }
             Ok(Cmd::OpenReport { workspace, run: None, fault: Some(fault) })
         }
@@ -1613,6 +1646,108 @@ mod tests {
         assert!(text.contains("\n» <<<PANIC>>> trap: mcause=0x2\n"), "{text}");
         assert!(text.contains("  still draining"), "{text}");
         assert!(text.contains(&format!("raw: {}", raw.display())), "{text}");
+    }
+
+    /// The one way `faults::import` actually reports failure: it skips a
+    /// bad dump file itself (and an absent or non-directory faults dir is
+    /// `Ok(0)`), so the error has to come from the database side -- here a
+    /// `~/.ggo` the process cannot write, so `ggo_ide.db` cannot be
+    /// created. Returns the dump path so a caller can assert on the dir.
+    fn seed_unwritable_fault_dump(db_dir: &Path) -> PathBuf {
+        let path = seed_fault_dump(db_dir);
+        let mut perms = std::fs::metadata(db_dir).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o555);
+        }
+        std::fs::set_permissions(db_dir, perms).unwrap();
+        path
+    }
+
+    fn restore_write_permission(db_dir: &Path) {
+        let mut perms = std::fs::metadata(db_dir).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(db_dir, perms).unwrap();
+    }
+
+    /// Running as root ignores the mode bits, so the fixture cannot fail
+    /// the import there.
+    fn running_as_root() -> bool {
+        std::fs::metadata("/proc/self").is_ok_and(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.uid() == 0
+        })
+    }
+
+    /// A dump that cannot be imported must not read as "no dumps": the
+    /// empty list has to say why it is empty.
+    #[test]
+    fn list_reports_says_why_the_faults_could_not_be_imported() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        seed_unwritable_fault_dump(dir.path());
+        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        restore_write_permission(dir.path());
+        assert!(text.starts_with("no runs yet"), "{text}");
+        assert!(text.contains("importing faults from"), "{text}");
+        assert!(text.contains("uartd/faults"), "{text}");
+    }
+
+    /// A `fault` table the import cannot write but the list CAN read: the
+    /// columns `list`'s SELECT names, and none of the rest, so `import`'s
+    /// INSERT fails on a missing column while every read still works.
+    /// `CREATE TABLE IF NOT EXISTS` leaves this shape alone.
+    fn seed_fault_table_the_import_cannot_write(db_dir: &Path) {
+        let path = db_dir.join("ggo_ide.db");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(&path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute("DROP TABLE fault", ()).await.unwrap();
+            conn.execute(
+                "CREATE TABLE fault (id TEXT PRIMARY KEY, source TEXT NOT NULL, at TEXT NOT NULL,
+                                     kind TEXT NOT NULL, detail TEXT NOT NULL, tty TEXT NOT NULL,
+                                     boot_stage TEXT, frames INTEGER NOT NULL, run_id TEXT)",
+                (),
+            )
+            .await
+            .unwrap();
+        });
+    }
+
+    /// Perf runs to show and no faults: the missing section reads as "no
+    /// dumps" unless the failure is stated on its own line.
+    #[test]
+    fn list_reports_flags_a_failed_import_beside_the_runs() {
+        let dir = seeded_db_dir();
+        seed_fault_dump(dir.path());
+        seed_fault_table_the_import_cannot_write(dir.path());
+        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("run 7  "), "{text}");
+        assert!(lines[1].starts_with("faults: import failed: "), "{text}");
+        assert!(!text.contains("--- faults ---"), "{text}");
+    }
+
+    #[test]
+    fn fetch_fault_unknown_id_names_the_failed_import_too() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        seed_unwritable_fault_dump(dir.path());
+        let err = fetch_fault(dir.path(), FAULT_ID).unwrap_err();
+        let open_err = open_report_cmd(dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap_err();
+        restore_write_permission(dir.path());
+        assert!(err.contains(&format!("no fault {FAULT_ID}")), "{err}");
+        assert!(err.contains("ggo_ide.db"), "{err}");
+        assert!(err.contains("importing faults from"), "{err}");
+        assert!(open_err.contains("importing faults from"), "{open_err}");
     }
 
     #[test]
