@@ -117,7 +117,7 @@ pub fn tool_list() -> Value {
           "description": "Cancel the flash in flight, the same as the user's Cancel button. Returns {cancelled: bool}; false when nothing was running (including when no emulator panel has ever been opened in the workspace). The timeline keeps the phase it reached; a cancelled run is not a failed one.",
           "inputSchema": with(json!({})) },
         { "name": "list_ggo_reports",
-          "description": "Every report in ~/.ggo/ggo_ide.db, as two newest-first sections. First the perf runs (emulator and board): run id, started_at, cart, label, and the ggo-diag log path for board runs. Then, after a `--- faults ---` line, the ggo-uartd fault dumps: fault id, timestamp, kind: detail, and the probable perf run. Fresh dumps are imported on the way. Reads the database directly — no Zed session needed.",
+          "description": "Every report in ~/.ggo/ggo_ide.db, as two newest-first sections, each under a header naming its time zone. Under `--- runs (UTC) ---`, the perf runs (emulator and board): run id, started_at (ISO-UTC), cart, label, and the ggo-diag log path for board runs. Under `--- faults (local time) ---`, the ggo-uartd fault dumps: fault id, timestamp (the daemon's local wall clock), kind: detail, and the probable perf run. The two zones are not comparable as text — line a fault up against a run only after converting. Fresh dumps are imported on the way. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
               "type": "object",
               "properties": { "limit": { "type": "number", "description": "Newest N of each section (default 20)" } },
@@ -539,9 +539,24 @@ fn ggo_dir() -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(home).join(".ggo"))
 }
 
+/// The two report sections' headers. They carry the ZONE because the
+/// producers disagree about it and the stamps do not say so themselves: a
+/// perf run's `started_at` is ISO-UTC (ggo-server's ingest writes it that
+/// way), while a dump's id and `at` are `ggo-uartd`'s LOCAL wall clock
+/// off the file name. Listed together and unlabelled, one afternoon reads
+/// as two, and a reader lining a fault up against the run it happened
+/// during is out by the machine's UTC offset.
+///
+/// Each header is printed whenever its section has rows, a lone section
+/// included -- that is the case where there is nothing else on screen to
+/// infer the zone from.
+const RUNS_HEADER: &str = "--- runs (UTC) ---";
+const FAULTS_HEADER: &str = "--- faults (local time) ---";
+
 /// Every perf run in `<db_dir>/ggo_ide.db`, newest first, one line each,
 /// with the ggo-diag log path beside the board runs that have one, then
-/// the daemon faults as a second newest-first section.
+/// the daemon faults as a second newest-first section. Both sections are
+/// headed with their zone -- see [`RUNS_HEADER`].
 fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
     use ggo_worldlib::charts::reports::{diag_db, faults, perf_db};
 
@@ -581,7 +596,7 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     let logs_dir = db_dir.join("diag").join("logs");
-    let mut lines: Vec<String> = rows
+    let run_lines: Vec<String> = rows
         .iter()
         .take(limit)
         .map(|(started_at, id, cart, label, frames)| {
@@ -608,17 +623,20 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
             )
         })
         .collect();
-    if lines.is_empty() && fault_lines.is_empty() {
+    if run_lines.is_empty() && fault_lines.is_empty() {
         return none("no runs yet".to_string());
     }
+    // Two sources, two orders AND two zones: perf runs are ordered by
+    // their start stamp and faults by the daemon's, so they are listed as
+    // two newest-first sections rather than one interleaved list that
+    // would claim an ordering between them.
+    let mut lines: Vec<String> = Vec::new();
+    if !run_lines.is_empty() {
+        lines.push(RUNS_HEADER.to_string());
+        lines.extend(run_lines);
+    }
     if !fault_lines.is_empty() {
-        // Two sources, two orders: perf runs are ordered by their start
-        // stamp and faults by the daemon's, so they are listed as two
-        // newest-first sections rather than one interleaved list that
-        // would claim an ordering between them.
-        if !lines.is_empty() {
-            lines.push("--- faults ---".to_string());
-        }
+        lines.push(FAULTS_HEADER.to_string());
         lines.extend(fault_lines);
     } else if let Some(e) = &import_error {
         // Runs to show but no faults: the caller would otherwise read the
@@ -1466,7 +1484,9 @@ mod tests {
         std::fs::write(&log, "").unwrap();
         let content = list_reports(dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
-        assert!(text.starts_with("run 7  2026-08-31T00:00:00Z  wilds  label=board  frames=2  log="), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], RUNS_HEADER, "{text}");
+        assert!(lines[1].starts_with("run 7  2026-08-31T00:00:00Z  wilds  label=board  frames=2  log="), "{text}");
         assert!(text.ends_with(&log.display().to_string()), "{text}");
         assert_eq!(list_reports(dir.path(), 0).unwrap()[0]["text"], "no runs yet");
         assert!(
@@ -1611,24 +1631,33 @@ mod tests {
         let content = list_reports(dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with("run 7  2026-08-31T00:00:00Z  wilds"), "{text}");
-        assert_eq!(lines[1], "--- faults ---", "{text}");
+        // The two sections are in DIFFERENT zones -- a run's `started_at`
+        // is ISO-UTC off ggo-server's ingest, a dump's stamp is the
+        // daemon's local wall clock -- so each says which it is. Mixed
+        // and unlabelled, the same afternoon reads as two.
+        assert_eq!(lines[0], "--- runs (UTC) ---", "{text}");
+        assert!(lines[1].starts_with("run 7  2026-08-31T00:00:00Z  wilds"), "{text}");
+        assert_eq!(lines[2], "--- faults (local time) ---", "{text}");
         assert_eq!(
-            lines[2],
+            lines[3],
             "fault 2026-09-02_08-49-33_marker  2026-09-02_08-49-33  marker: <<<PANIC>>>  run=-",
             "{text}"
         );
     }
 
     /// A machine that has only ever run the daemon still gets its faults:
-    /// an empty perf list is not an empty report list.
+    /// an empty perf list is not an empty report list. The faults section
+    /// still names its zone -- a lone section is the case where a reader
+    /// has nothing else to compare the stamps against.
     #[test]
-    fn list_reports_lists_a_fault_with_no_perf_runs_and_no_separator() {
+    fn list_reports_lists_a_fault_with_no_perf_runs() {
         let dir = tempfile::tempdir().unwrap();
         seed_fault_dump(dir.path());
         let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
-        assert!(text.starts_with("fault 2026-09-02_08-49-33_marker  "), "{text}");
-        assert!(!text.contains("--- faults ---"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], FAULTS_HEADER, "{text}");
+        assert!(lines[1].starts_with("fault 2026-09-02_08-49-33_marker  "), "{text}");
+        assert!(!text.contains(RUNS_HEADER), "no runs, no runs section: {text}");
     }
 
     #[test]
@@ -1691,8 +1720,13 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         seed_unwritable_fault_dump(dir.path());
-        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        // Restored before anything can panic: `TempDir`'s cleanup cannot
+        // unlink a file out of a directory it may not write, so a failure
+        // past this point would leave the fixture on disk for good.
+        let listed = list_reports(dir.path(), 20);
         restore_write_permission(dir.path());
+        let content = listed.unwrap();
+        let text = content[0]["text"].as_str().unwrap();
         assert!(text.starts_with("no runs yet"), "{text}");
         assert!(text.contains("importing faults from"), "{text}");
         assert!(text.contains("uartd/faults"), "{text}");
@@ -1729,9 +1763,10 @@ mod tests {
         seed_fault_table_the_import_cannot_write(dir.path());
         let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with("run 7  "), "{text}");
-        assert!(lines[1].starts_with("faults: import failed: "), "{text}");
-        assert!(!text.contains("--- faults ---"), "{text}");
+        assert_eq!(lines[0], RUNS_HEADER, "{text}");
+        assert!(lines[1].starts_with("run 7  "), "{text}");
+        assert!(lines[2].starts_with("faults: import failed: "), "{text}");
+        assert!(!text.contains(FAULTS_HEADER), "{text}");
     }
 
     #[test]
@@ -1741,9 +1776,13 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         seed_unwritable_fault_dump(dir.path());
-        let err = fetch_fault(dir.path(), FAULT_ID).unwrap_err();
-        let open_err = open_report_cmd(dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap_err();
+        // Restored before the first `unwrap_err`, for the reason
+        // `list_reports_says_why_the_faults_could_not_be_imported` gives.
+        let fetched = fetch_fault(dir.path(), FAULT_ID);
+        let opened = open_report_cmd(dir.path(), None, &json!({ "fault": FAULT_ID }));
         restore_write_permission(dir.path());
+        let err = fetched.unwrap_err();
+        let open_err = opened.unwrap_err();
         assert!(err.contains(&format!("no fault {FAULT_ID}")), "{err}");
         assert!(err.contains("ggo_ide.db"), "{err}");
         assert!(err.contains("importing faults from"), "{err}");
