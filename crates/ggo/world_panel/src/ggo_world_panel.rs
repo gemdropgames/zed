@@ -1177,12 +1177,27 @@ impl WorldPanel {
     }
 
     /// The root world stems are enumerated and resolved against: the open
-    /// document's derived asset root while one is loaded, else the
-    /// worktree root (nothing better is known before the first open).
+    /// document's derived asset root while one is loaded, else
+    /// `<worktree>/assets` when that is where the worlds live, else the
+    /// worktree root.
     fn asset_root(&self) -> Option<PathBuf> {
         match &self.state {
             ViewerState::Ready(open) => Some(open.root.clone()),
-            _ => self.project_root.clone(),
+            _ => {
+                let project_root = self.project_root.clone()?;
+                // No clicked path has named a root yet, so apply the rule
+                // [`split_world_path`] would have applied to a click on
+                // `assets/worlds/x.toml`. Without it a project with the
+                // usual asset-root layout enumerates NO worlds until a
+                // human opens one by hand -- which is exactly the state
+                // `remote_list` answers in.
+                let assets = project_root.join("assets");
+                Some(if assets.join("worlds").is_dir() {
+                    assets
+                } else {
+                    project_root
+                })
+            }
         }
     }
 
@@ -5691,6 +5706,43 @@ mod tests {
                     .unwrap_err()
                     .contains("worlds/test")
             );
+        });
+    }
+
+    /// The agent surface must see the worlds of an `assets/`-rooted
+    /// project (the `~/projects/wilds` layout) with nothing open yet --
+    /// `world_list` is what an agent calls FIRST, before any world has
+    /// been opened by hand.
+    #[gpui::test]
+    async fn test_remote_list_and_open_see_an_assets_rooted_project(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(&dir.path().join("assets"));
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = WorldPanel::new(None, cx);
+                panel.root_override = Some(dir.path().to_path_buf());
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            let listed = panel.remote_list(cx);
+            assert_eq!(
+                listed,
+                vec![
+                    ("worlds/sub".to_string(), "assets/worlds/sub.toml".to_string()),
+                    ("worlds/test".to_string(), "assets/worlds/test.toml".to_string()),
+                ]
+            );
+            assert_eq!(
+                panel.remote_open("worlds/test", cx).unwrap(),
+                "assets/worlds/test.toml"
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let read = panel.remote_read().expect("the asset-rooted world reads");
+            assert_eq!(read["stem"], "worlds/test");
+            assert_eq!(read["rel_path"], "assets/worlds/test.toml");
         });
     }
 
