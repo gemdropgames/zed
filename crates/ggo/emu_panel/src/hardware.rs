@@ -162,12 +162,14 @@ impl HardwareEnv {
         if self.emd_bin.is_none() {
             missing.push(Missing::Emd);
         }
-        if self.ports.is_empty() {
-            missing.push(if self.stuck_board {
-                Missing::PortStuck
-            } else {
-                Missing::Port
-            });
+        // A stuck board blocks even with a non-empty port list: while its
+        // serial driver is detached, `ggo-uartd`'s relay pty still
+        // resolves and leads the scan, so `ports[0]` would be a live pty
+        // with nothing behind it.
+        if self.stuck_board {
+            missing.push(Missing::PortStuck);
+        } else if self.ports.is_empty() {
+            missing.push(Missing::Port);
         }
         missing
     }
@@ -480,15 +482,15 @@ impl HardwareEnv {
                 why: "the ULX3S to flash and boot-verify over UART",
                 found: self.ports.first().cloned(),
                 remedy: match self.ports.first() {
-                    Some(_) => Remedy::Satisfied,
-                    None if self.stuck_board => {
-                        Remedy::Manual(Missing::PortStuck.label())
-                    }
+                    Some(_) if !self.stuck_board => Remedy::Satisfied,
+                    // A resolving relay pty is not a board: same reason
+                    // `missing` reports `PortStuck` regardless of `ports`.
+                    _ if self.stuck_board => Remedy::Manual(Missing::PortStuck.label()),
                     // Not installable, so the row has to carry the whole
                     // remedy: the two things that actually cause an empty
                     // scan are an unplugged board and a user who is not in
                     // the `dialout` group.
-                    None => Remedy::Manual(format!(
+                    _ => Remedy::Manual(format!(
                         "connect the board over USB; if it is connected, add \
                          yourself to the serial group (`sudo usermod -aG dialout \
                          $USER`, then log out and back in) or set {DIAG_TTY_ENV}"
@@ -1606,6 +1608,13 @@ mod tests {
         let request = flash_request(&env, &FlashConfig { tty: Some("/dev/ttyUSB9".into()), ..Default::default() })
             .expect("a named port flashes");
         assert!(request.args.contains(&"/dev/ttyUSB9".to_string()), "{:?}", request.args);
+
+        // A named tty stands in for a missing port, never for a stuck
+        // board: nothing would open while the driver is detached.
+        env.stuck_board = true;
+        let refused = flash_request(&env, &FlashConfig { tty: Some("/dev/ttyUSB9".into()), ..Default::default() })
+            .expect_err("a stuck board refuses even a named port");
+        assert!(refused.contains("replug"), "{refused}");
     }
 
     /// The named world overrides the project's `default_world`, and sits
@@ -1986,6 +1995,31 @@ mod tests {
             [link.to_string_lossy().into_owned()],
             "the returned list still leads with the relay"
         );
+    }
+
+    /// The relay pty outlives the board's serial driver, so a stuck board
+    /// hands back a non-empty port list. `PortStuck` keys on the flag, not
+    /// on emptiness, or the hardware page would call that pty a board.
+    #[test]
+    fn a_stuck_board_blocks_even_when_the_relay_still_resolves() {
+        let mut env = ready_env();
+        env.ports = vec!["/home/u/.ggo/uart".to_string()];
+        env.stuck_board = true;
+        assert_eq!(env.missing(), vec![Missing::PortStuck]);
+        assert!(!env.ready());
+        let board_row = env
+            .requirements()
+            .pop()
+            .expect("the board row is the last requirement");
+        assert!(
+            matches!(&board_row.remedy, Remedy::Manual(what) if what.contains("replug")),
+            "{:?}",
+            board_row.remedy
+        );
+
+        env.stuck_board = false;
+        assert!(env.missing().is_empty(), "{:?}", env.missing());
+        assert!(env.ready());
     }
 
     #[test]
