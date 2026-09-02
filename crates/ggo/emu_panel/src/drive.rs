@@ -270,9 +270,11 @@ impl Session {
     }
 
     /// Run `speed` frames per real frame period (clamped to
-    /// `1..=MAX_SPEED`). The cart's clock advances `speed` times as fast
-    /// too, so a fault that takes ten minutes of play arrives in one;
-    /// audio is silenced above 1x rather than played at chipmunk pitch.
+    /// `1..=MAX_SPEED`). Each frame is a whole frame of cart execution
+    /// with a whole vsync period on the cart's clock -- the same frames
+    /// the board would run, arriving `speed` times sooner -- never one
+    /// frame with a stretched delta. Audio is silenced above 1x rather
+    /// than played at chipmunk pitch.
     pub fn set_speed(&self, speed: u32) {
         self.speed.store(speed.clamp(1, MAX_SPEED), Ordering::Release);
     }
@@ -570,9 +572,11 @@ fn run(
 
     let start = Instant::now();
     let mut last_present = Instant::now();
-    // The cart's clock, accumulated per frame as real time times the
-    // speed in force for that frame -- so a speed change mid-run bends
-    // the clock forward rather than jumping it.
+    // The cart's clock. At 1x it follows real time, as the standalone
+    // emulator's does. Above 1x every frame is one vsync period of cart
+    // time regardless of how long the host took to run it -- the run is
+    // N frames per period, not one frame with a stretched delta, so the
+    // cart plays out exactly the frames it would on the board, sooner.
     let mut emulated = Duration::ZERO;
     let mut last_real = Duration::ZERO;
 
@@ -675,7 +679,11 @@ fn run(
                 // clock the cart reads next turn accounts for the pacing
                 // sleep it just went through.
                 let real = start.elapsed().saturating_sub(paused_total);
-                emulated += real.saturating_sub(last_real) * speed;
+                emulated += if speed == 1 {
+                    real.saturating_sub(last_real)
+                } else {
+                    FRAME_TIME
+                };
                 last_real = real;
                 p.set_ticks_ms(emulated.as_millis().min(u32::MAX as u128) as u32);
             }
