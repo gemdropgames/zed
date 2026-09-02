@@ -301,6 +301,23 @@ pub(crate) fn bgra_reply(width: u32, height: u32, bgra: &[u8]) -> serde_json::Va
     })
 }
 
+/// The workspace's World panel (a dock panel `ggo_world_panel::init`
+/// registers on every workspace), leased through its window.
+fn world_panel_for(
+    workspace: &Entity<Workspace>,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Result<Entity<ggo_world_panel::WorldPanel>, String> {
+    window
+        .update(cx, |_, _window, app| {
+            workspace
+                .read(app)
+                .panel::<ggo_world_panel::WorldPanel>(app)
+                .ok_or_else(|| "no World panel in this workspace".to_string())
+        })
+        .map_err(|e| e.to_string())?
+}
+
 /// The workspace's emu panel, opening one if none is up.
 ///
 /// Two steps on purpose: the panel is opened INSIDE a `workspace.update`
@@ -491,7 +508,10 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::Pause { workspace }
         | Cmd::Resume { workspace }
         | Cmd::Debug { workspace, .. }
-        | Cmd::PackWorld { workspace, .. } => workspace.clone(),
+        | Cmd::PackWorld { workspace, .. }
+        | Cmd::WorldList { workspace }
+        | Cmd::WorldOpen { workspace, .. }
+        | Cmd::WorldRead { workspace, .. } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -708,6 +728,43 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             let tail: Vec<&String> =
                 capture.lines.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect();
             Ok(serde_json::json!({ "cart": cart, "world": world, "lines": tail }))
+        }
+        Cmd::WorldList { .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = world_panel_for(&workspace, window, cx)?;
+            let worlds = panel.update(cx, |p, cx| p.remote_list(cx));
+            let rows: Vec<serde_json::Value> = worlds
+                .into_iter()
+                .map(|(stem, rel_path)| serde_json::json!({ "stem": stem, "rel_path": rel_path }))
+                .collect();
+            Ok(serde_json::json!({ "worlds": rows }))
+        }
+        Cmd::WorldOpen { world, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = world_panel_for(&workspace, window, cx)?;
+            let rel = panel.update(cx, |p, cx| p.remote_open(&world, cx))?;
+            Ok(serde_json::json!({ "opened": rel }))
+        }
+        Cmd::WorldRead { world, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = world_panel_for(&workspace, window, cx)?;
+            if let Some(world) = world {
+                panel.update(cx, |p, cx| p.remote_open(&world, cx))?;
+            }
+            // The load is off-thread; give it a bounded moment to land.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match panel.update(cx, |p, _| p.remote_read()) {
+                    Ok(value) => return Ok(value),
+                    Err(reason)
+                        if reason.contains("still loading")
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(reason) => return Err(reason),
+                }
+            }
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;

@@ -96,6 +96,19 @@ pub enum Cmd {
     /// path like `assets/worlds/arena.toml`), into the project's
     /// `target/ggo-emulate/`. The reply names the cart for `Start`/`Run`.
     PackWorld { workspace: Option<String>, world: String },
+    /// Every world file in the project: `[{stem, rel_path}]`.
+    WorldList { workspace: Option<String> },
+    /// Open `world` (stem or rel path) in the World panel, as a click
+    /// would; the reply names the rel path that opened.
+    WorldOpen { workspace: Option<String>, world: String },
+    /// The open world as authored: entities with their components,
+    /// instances, backgrounds, selection, dirty flag. With `world`, opens
+    /// it first.
+    WorldRead {
+        workspace: Option<String>,
+        #[serde(default)]
+        world: Option<String>,
+    },
 }
 
 /// Which PPU inspector view `Cmd::Debug` renders.
@@ -507,6 +520,19 @@ mod tests {
         let old = r#"{"active":false,"phase":null,"verdict":null,"diag_run_id":null,"perf_run_id":null}"#;
         let back: FlashStatusPayload = serde_json::from_str(old).unwrap();
         assert_eq!(back, FlashStatusPayload::default());
+    }
+
+    #[test]
+    fn world_requests_round_trip() {
+        assert_eq!(parse_request(r#"{"id":1,"cmd":"world_list"}"#).unwrap().cmd, Cmd::WorldList { workspace: None });
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"world_open","world":"worlds/arena"}"#).unwrap().cmd,
+            Cmd::WorldOpen { workspace: None, world: "worlds/arena".to_string() }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"world_read"}"#).unwrap().cmd,
+            Cmd::WorldRead { workspace: None, world: None }
+        );
     }
 
     #[test]

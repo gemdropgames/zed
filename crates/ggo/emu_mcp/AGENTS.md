@@ -54,6 +54,21 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `fetch_ggo_report { run }` | paste-ready summary of one perf run (+ its ggo-diag log path) |
 | `open_ggo_report { run }` | open the Reports tab in Zed on that run (`{requested: true}` — the panel lands on the runs list if its db lacks the run) |
 | `close_ggo_report { run? }` | close the Reports tab (only if it shows `run`, when given) |
+| `world_list` | every world in the project: `[{ stem, rel_path }]` |
+| `world_open { world }` | open a world in the World panel |
+| `world_read { world? }` | the authored world: entities/components/pos, instances, backgrounds, selection, dirty |
+
+## Worlds
+
+`world_list` / `world_open` / `world_read` read the WORLD panel — the
+level as the designer authored it (entity components, `[[instance]]`
+placements, background slots, the current selection, and whether the
+document has unsaved edits) — not the running game; that is
+`emu_next_frame`'s `world`. Paths are worktree-relative (what the
+explorer shows); `world_open` also accepts the stem `emd`, `cart_pack`
+and `hw_flash` take. `world_open` is a click minus the modal: the world
+already open is left exactly as it is, and a swap away from a world with
+unsaved edits is refused rather than discarding them.
 
 ## Hardware
 

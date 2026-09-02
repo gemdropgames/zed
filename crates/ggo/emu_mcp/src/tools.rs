@@ -134,6 +134,15 @@ pub fn tool_list() -> Value {
         { "name": "close_ggo_report",
           "description": "Close the Reports tab in the user's Zed. With `run`, only if that is the run it shows. Returns {closed: false} when no tab is open.",
           "inputSchema": with(json!({ "run": { "type": "number", "description": "Only close if the tab shows this run (optional)" } })) },
+        { "name": "world_list",
+          "description": "Every world file in the open project: [{stem, rel_path}]. Stems are what emd, cart_pack and hw_flash take (worlds/arena).",
+          "inputSchema": with(json!({})) },
+        { "name": "world_open",
+          "description": "Open a world in Zed's World panel, as clicking its file would. Returns {opened: rel_path}. The already-open world is left alone (no reload, no prompt); a world with unsaved edits is never swapped out from under the user — save it first.",
+          "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem (worlds/arena) or rel path" } })) },
+        { "name": "world_read",
+          "description": "The world as the designer authored it, from the World panel: {stem, rel_path, dirty, entities[{index, pos, components}], instances[{index, world, pos, background_priority, error}], backgrounds[{layer, map}], selected[]}. Pass `world` to open one first. This is the level layout — what world_screenshot draws and what the cart boots — not the running game (that is emu_next_frame's world JSON).",
+          "inputSchema": with(json!({ "world": { "type": "string", "description": "Open this world first (stem or rel path); omit to read the one already open" } })) },
     ] })
 }
 
@@ -406,6 +415,22 @@ fn call_tool_inner(
                 PERF_ID_GRACE,
                 connect,
             )
+        }
+        "world_list" => {
+            let data = send(&session.socket, Cmd::WorldList { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "world_open" => {
+            let world = arg_str(args, "world").ok_or("missing required argument: world")?;
+            let data =
+                send(&session.socket, Cmd::WorldOpen { workspace, world }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "world_read" => {
+            let world = arg_str(args, "world");
+            let data =
+                send(&session.socket, Cmd::WorldRead { workspace, world }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         other => Err(format!("unknown tool {other:?}")),
     }
@@ -789,6 +814,24 @@ mod tests {
     }
 
     #[test]
+    fn world_tools_forward_their_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            if line.contains(r#""cmd":"world_list""#) {
+                Ok(r#"{"id":1,"ok":true,"data":{"worlds":[{"stem":"worlds/arena","rel_path":"worlds/arena.toml"}]}}"#.to_string())
+            } else {
+                assert!(line.contains(r#""cmd":"world_read""#) && line.contains(r#""world":"worlds/arena""#), "{line}");
+                Ok(r#"{"id":1,"ok":true,"data":{"stem":"worlds/arena","dirty":false,"entities":[]}}"#.to_string())
+            }
+        };
+        let (content, is_err) = call_tool("world_list", &json!({}), dir.path(), &connect);
+        assert!(!is_err && content[0]["text"].as_str().unwrap().contains("worlds/arena"), "{content:?}");
+        let (content, is_err) = call_tool("world_read", &json!({"world": "worlds/arena"}), dir.path(), &connect);
+        assert!(!is_err && content[0]["text"].as_str().unwrap().contains(r#""dirty":false"#), "{content:?}");
+    }
+
+    #[test]
     fn tool_list_names_exactly_the_lockstep_surface() {
         let list = tool_list();
         let names: Vec<&str> =
@@ -817,6 +860,9 @@ mod tests {
                 "fetch_ggo_report",
                 "open_ggo_report",
                 "close_ggo_report",
+                "world_list",
+                "world_open",
+                "world_read",
             ]
         );
     }

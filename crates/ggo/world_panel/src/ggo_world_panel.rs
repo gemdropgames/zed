@@ -2639,6 +2639,156 @@ impl WorldPanel {
         }
     }
 
+    // ------------------------------------------------------------ agent socket
+
+    /// Every world in the project, `(stem, worktree-relative path)`,
+    /// refreshed now.
+    pub fn remote_list(&mut self, cx: &mut Context<Self>) -> Vec<(String, String)> {
+        self.refresh_worlds(cx);
+        self.worlds
+            .iter()
+            .map(|world| (world.stem.clone(), self.worktree_rel(&world.rel_path)))
+            .collect()
+    }
+
+    /// The worktree-relative form of an asset-root-relative world path.
+    /// The two frames differ under an asset root (`worlds/main.toml`
+    /// against `<worktree>/assets` is `assets/worlds/main.toml` to the
+    /// explorer), and every path that crosses this panel's edges -- what
+    /// a click carries, what [`Self::load_rel_path`] splits the root back
+    /// out of, what [`Self::open_rel_path_now`] reports -- is the
+    /// worktree-relative one. An asset root outside the worktree has no
+    /// worktree-relative form; the asset-root-relative path is handed
+    /// back unchanged there, which is what the panel itself would have
+    /// used before any world was opened.
+    fn worktree_rel(&self, asset_rel: &str) -> String {
+        let prefix = self
+            .project_root
+            .as_ref()
+            .zip(self.asset_root())
+            .and_then(|(project_root, asset_root)| {
+                asset_root
+                    .strip_prefix(project_root)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
+            })
+            .unwrap_or_default();
+        if prefix.is_empty() {
+            asset_rel.to_string()
+        } else {
+            format!("{prefix}/{asset_rel}")
+        }
+    }
+
+    /// The listing entry `world` names -- a stem (`worlds/arena`), its
+    /// asset-root-relative path, or its worktree-relative one -- as the
+    /// worktree-relative path to open, or the reason there is none.
+    fn remote_resolve(&mut self, world: &str, cx: &mut Context<Self>) -> Result<String, String> {
+        self.refresh_worlds(cx);
+        self.worlds
+            .iter()
+            .map(|listing| (listing, self.worktree_rel(&listing.rel_path)))
+            .find(|(listing, rel)| {
+                listing.stem == world || listing.rel_path == world || rel == world
+            })
+            .map(|(_, rel)| rel)
+            .ok_or_else(|| {
+                let stems: Vec<&str> = self.worlds.iter().map(|w| w.stem.as_str()).collect();
+                format!("no world {world}; the project has {stems:?}")
+            })
+    }
+
+    /// Open `world` -- a stem or a rel path -- and return the
+    /// worktree-relative path that is now open.
+    ///
+    /// A click's semantics minus its modal: the world that is ALREADY
+    /// open is left exactly as it is (no reload, so an edit, the undo
+    /// stack, the selection and the camera all survive), and a different
+    /// world while this one has unsaved edits is REFUSED rather than
+    /// prompted for. A prompt is the one answer an agent cannot give,
+    /// and the alternative -- [`Self::load_rel_path`]'s unconditional
+    /// re-read -- would discard the user's edits on a tool call they
+    /// never saw. Loading directly (rather than through
+    /// [`Self::open_rel_path`], whose work is deferred onto a spawned
+    /// task) also means the panel is in `Loading` by the time this
+    /// returns, so a `world_read` that follows waits for THIS world
+    /// instead of reading the previous one.
+    pub fn remote_open(&mut self, world: &str, cx: &mut Context<Self>) -> Result<String, String> {
+        let rel = self.remote_resolve(world, cx)?;
+        if self.open_rel_path_now() == Some(rel.as_str()) {
+            return Ok(rel);
+        }
+        if let Some(dirty) = self.dirty_world_name() {
+            return Err(format!(
+                "{dirty} has unsaved edits; save or revert it before opening {rel}"
+            ));
+        }
+        self.load_rel_path(&rel, cx);
+        Ok(rel)
+    }
+
+    /// The open world as authored. `Err` while nothing is open or a load
+    /// is still in flight, so the caller can wait and ask again.
+    pub fn remote_read(&self) -> Result<serde_json::Value, String> {
+        let open = match &self.state {
+            ViewerState::Ready(open) => open,
+            ViewerState::Empty => return Err("no world open — world_open first".to_string()),
+            ViewerState::Loading { stem } => return Err(format!("{stem} is still loading")),
+            ViewerState::Error(error) => {
+                return Err(format!("the open world failed to load: {error}"));
+            }
+        };
+        let state = open.store.state();
+        let entities: Vec<serde_json::Value> = state
+            .entities
+            .iter()
+            .enumerate()
+            .map(|(index, entity)| {
+                serde_json::json!({
+                    "index": index,
+                    "pos": inspector::entity_pos(&state, index),
+                    "components": serde_json::Value::Object(entity.components.clone()),
+                })
+            })
+            .collect();
+        let instances: Vec<serde_json::Value> = state
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| {
+                serde_json::json!({
+                    "index": index,
+                    "world": instance.world,
+                    "pos": instance.pos,
+                    "background_priority": instance.background_priority,
+                    "error": instance.error,
+                })
+            })
+            .collect();
+        let backgrounds: Vec<serde_json::Value> = state
+            .backgrounds
+            .iter()
+            .map(|background| serde_json::json!({ "layer": background.layer, "map": background.map }))
+            .collect();
+        let selected: Vec<serde_json::Value> = open
+            .selected
+            .iter()
+            .map(|selection| match selection {
+                Selection::Entity(index) => serde_json::json!({ "entity": index }),
+                Selection::Instance(index) => serde_json::json!({ "instance": index }),
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "stem": open.listing.stem,
+            "rel_path": open.source_rel,
+            "dirty": state.dirty,
+            "entities": entities,
+            "instances": instances,
+            "backgrounds": backgrounds,
+            "selected": selected,
+        }))
+    }
+
     /// The open world's display path when it has unsaved edits, else
     /// `None`. Drives both the close guard and (indirectly) the title's
     /// dirty dot.
@@ -5513,6 +5663,102 @@ mod tests {
             open.view.borrow_mut().pan = Some([0.0, 0.0]);
         });
         panel
+    }
+
+    #[gpui::test]
+    async fn test_remote_list_and_read_report_the_authored_world(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let listed = panel.remote_list(cx);
+            let stems: Vec<&str> = listed.iter().map(|(stem, _)| stem.as_str()).collect();
+            assert_eq!(stems, ["worlds/sub", "worlds/test"]);
+            assert_eq!(listed[1].1, "worlds/test.toml");
+
+            let read = panel.remote_read().expect("a Ready world reads");
+            assert_eq!(read["stem"], "worlds/test");
+            assert_eq!(read["rel_path"], "worlds/test.toml");
+            assert_eq!(read["dirty"], false);
+            assert_eq!(read["entities"].as_array().unwrap().len(), 3);
+            assert_eq!(read["entities"][1]["pos"], serde_json::json!([40.0, 8.0]));
+            assert_eq!(read["entities"][1]["components"]["Text"]["content"], "hello");
+            assert_eq!(read["instances"][0]["world"], "worlds/sub");
+            assert_eq!(read["selected"].as_array().unwrap().len(), 0);
+
+            assert!(
+                panel
+                    .remote_resolve("worlds/nope", cx)
+                    .unwrap_err()
+                    .contains("worlds/test")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_read_names_the_reason_when_nothing_is_open(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = WorldPanel::new(None, cx);
+                panel.root_override = Some(dir.path().to_path_buf());
+                panel
+            })
+        });
+        panel.update(cx, |panel, _cx| {
+            assert!(panel.remote_read().unwrap_err().contains("world_open first"));
+        });
+    }
+
+    /// The two halves of `remote_open`'s "a click minus the modal": the
+    /// world already open is not reloaded (a tool call must not drop the
+    /// user's edits, undo stack or camera), and a swap away from a dirty
+    /// world is refused rather than prompted for -- no agent can answer a
+    /// prompt, and loading over it would discard the edits silently.
+    #[gpui::test]
+    async fn test_remote_open_leaves_the_open_world_alone_and_refuses_a_dirty_swap(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [50.0, 60.0],
+                    gesture: None,
+                },
+                cx,
+            );
+            assert!(panel.test_is_dirty(), "the op should dirty the doc");
+            assert_eq!(panel.remote_open("worlds/test", cx).unwrap(), "worlds/test.toml");
+            assert!(
+                panel.test_is_dirty(),
+                "reopening the open world must not reload it"
+            );
+            let error = panel.remote_open("worlds/sub", cx).unwrap_err();
+            assert!(error.contains("unsaved edits"), "{error}");
+        });
+    }
+
+    /// A clean swap loads SYNCHRONOUSLY -- the panel is in `Loading` by
+    /// the time `remote_open` returns -- so a `world_read` right behind it
+    /// waits for the world that was asked for instead of answering with
+    /// the one that was open before.
+    #[gpui::test]
+    async fn test_remote_open_is_loading_before_it_returns(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.remote_open("worlds/sub", cx).unwrap(), "worlds/sub.toml");
+            let error = panel.remote_read().unwrap_err();
+            assert!(error.contains("worlds/sub is still loading"), "{error}");
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let read = panel.remote_read().expect("the swapped-in world reads");
+            assert_eq!(read["stem"], "worlds/sub");
+        });
     }
 
     /// End-to-end viewer load against a real-fs temp project: picker
