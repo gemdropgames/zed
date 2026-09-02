@@ -12,14 +12,23 @@
 //! imported from `~/.ggo/uartd/faults` into `ggo_ide.db` on every load
 //! (`faults::import` is idempotent), because the daemon writes files and
 //! nothing else ingests them.
+//!
+//! **The three sources do not agree on what a timestamp looks like.** A
+//! perf run carries ISO-UTC (`2026-09-02T17:25:37Z`, ggo-server's ingest);
+//! a device run and a fault carry a LOCAL underscore stamp
+//! (`2026-09-02_08-49-33`, from the daemons' file names). They are ordered
+//! through [`parse_when`], never as strings -- `'_' > 'T'` alone would put
+//! every device row of a day above every perf row of it, and the two are
+//! in different zones besides.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Pixels, Render, Task, WeakEntity, Window, actions, div, px, uniform_list,
+    IntoElement, Pixels, Render, Task, WeakEntity, Window, actions, div, px,
 };
 use ui::prelude::*;
 use ui::{ListItem, Tooltip};
@@ -50,6 +59,15 @@ const NO_HOME: &str = "no home directory, so ~/.ggo/ggo_ide.db cannot be resolve
 /// The daemon appends to its faults directory while the panel is open, so
 /// a visible panel re-reads on a timer rather than only on activation.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How the two halves of a load differ in cost: importing dumps and
+/// listing them is local file and query work, while reconciling the device
+/// history CLONES `diag.db`'s rows into `ggo_ide.db` -- which, during a
+/// live `ggo-diag` run, is a growing table copied every time. Every sixth
+/// poll tick (30 s) is often enough for a list of finished runs; see
+/// [`reconcile_history_this_tick`].
+const HISTORY_EVERY_TICKS: u64 = 6;
+/// How a row's time is shown, whatever shape its producer recorded it in.
+const WHEN_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -124,16 +142,58 @@ pub struct ReportRow {
     pub id: String,
     pub perf_id: Option<i64>,
     pub title: String,
+    /// Display only, one format for every producer (see [`WHEN_FORMAT`]).
+    /// Never compared -- ordering is [`ReportRow::sort_key`]'s job.
     pub when: String,
+    /// Unix seconds, so the three producers' incompatible stamps order
+    /// against each other. [`i64::MIN`] for a stamp that did not parse, so
+    /// an unreadable row sorts last instead of jumping the list.
+    pub sort_key: i64,
     pub trailer: String,
     /// The DEVICE run a fault probably happened during -- never a perf
     /// run id (see `faults::probable_run`).
     pub run_id: Option<String>,
 }
 
-/// Merge the three sources into one list, newest first. Timestamps are
-/// `YYYY-MM-DD_HH-MM-SS` from every producer, so a string compare orders
-/// them; ties fall back to [`ReportKind::rank`].
+/// Unix seconds for either stamp shape the producers write: ISO-UTC
+/// (`2026-09-02T17:25:37Z`) from ggo-server's perf ingest, and the
+/// daemons' LOCAL `2026-09-02_08-49-33`. `None` for anything else.
+///
+/// Pure, and deliberately not `chrono`'s lenient parsing: these are the
+/// two shapes that exist, and a third one appearing should sort last and
+/// be visible as raw text rather than be guessed at.
+pub fn parse_when(stamp: &str) -> Option<i64> {
+    if let Ok(utc) = NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%SZ") {
+        return Some(utc.and_utc().timestamp());
+    }
+    let local = NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d_%H-%M-%S").ok()?;
+    // A wall clock is ambiguous twice a year: the hour a DST fall-back
+    // repeats maps to two instants (take the earlier -- the daemon wrote
+    // the file the first time round more often than the second), and the
+    // hour a spring-forward skips maps to none at all, which is `None`.
+    Local
+        .from_local_datetime(&local)
+        .earliest()
+        .map(|when| when.timestamp())
+}
+
+/// `sort_key` as the reader sees it, falling back to the producer's raw
+/// text when it did not parse -- an unreadable stamp is still evidence.
+fn display_when(sort_key: i64, raw: &str) -> String {
+    match DateTime::from_timestamp(sort_key, 0) {
+        Some(when) => when.with_timezone(&Local).format(WHEN_FORMAT).to_string(),
+        None => raw.to_string(),
+    }
+}
+
+fn row_time(raw: &str) -> (i64, String) {
+    let sort_key = parse_when(raw).unwrap_or(i64::MIN);
+    (sort_key, display_when(sort_key, raw))
+}
+
+/// Merge the three sources into one list, newest first by
+/// [`parse_when`]'s normalized instant; ties fall back to
+/// [`ReportKind::rank`].
 pub fn merge_rows(
     perf: Vec<RunListing>,
     device: Vec<RunSummary>,
@@ -141,41 +201,59 @@ pub fn merge_rows(
 ) -> Vec<ReportRow> {
     let mut rows: Vec<ReportRow> = Vec::with_capacity(perf.len() + device.len() + faults.len());
     for run in faults {
+        let (sort_key, when) = row_time(&run.at);
         rows.push(ReportRow {
             kind: ReportKind::Fault,
             id: run.id,
             perf_id: None,
             title: format!("{}: {}", run.kind, run.detail),
-            when: run.at,
-            trailer: run.kind,
+            when,
+            sort_key,
+            // No trailer: the title already leads with the kind, and a
+            // second copy of it under the title says nothing.
+            trailer: String::new(),
             run_id: run.run_id,
         });
     }
     for run in device {
         let verdict = run.verdict.unwrap_or_else(|| "no verdict".to_string());
+        let (sort_key, when) = row_time(&run.started_at);
         rows.push(ReportRow {
             kind: ReportKind::Device,
             id: run.id.clone(),
             perf_id: None,
             title: run.id,
-            when: run.started_at,
+            when,
+            sort_key,
             trailer: format!("{} · {verdict}", run.state),
             run_id: None,
         });
     }
     for run in perf {
+        let (sort_key, when) = row_time(&run.started_at);
         rows.push(ReportRow {
             kind: ReportKind::Perf,
             id: run.id.to_string(),
             perf_id: Some(run.id),
             title: run.display_title(),
-            when: run.started_at.clone(),
+            when,
+            sort_key,
             trailer: String::new(),
             run_id: None,
         });
     }
-    rows.sort_by(|a, b| b.when.cmp(&a.when).then(a.kind.rank().cmp(&b.kind.rank())));
+    rows.sort_by(|a, b| {
+        b.sort_key
+            .cmp(&a.sort_key)
+            .then(a.kind.rank().cmp(&b.kind.rank()))
+    });
     rows
+}
+
+/// Whether the poll tick numbered `tick` reconciles the device history.
+/// Pure so the cadence is testable without a clock.
+fn reconcile_history_this_tick(tick: u64) -> bool {
+    tick.is_multiple_of(HISTORY_EVERY_TICKS)
 }
 
 // ------------------------------------------------------------ view state
@@ -193,12 +271,22 @@ pub struct ReportsPanel {
     focus_handle: FocusHandle,
     position: DockPosition,
     rows: Vec<ReportRow>,
+    /// The device runs the last RECONCILED load found. Kept because most
+    /// loads skip the reconcile (see [`HISTORY_EVERY_TICKS`]) and must
+    /// still merge those rows in rather than dropping them from the list.
+    device: Vec<RunSummary>,
     /// Indices into `rows` that the filter chips let through, in display
     /// order -- what a click's `ix` means.
     visible: Vec<usize>,
     state: LoadState,
     hidden: HashSet<ReportKind>,
     generation: u64,
+    /// A load is in flight. The poll fires on a wall clock, not on the
+    /// previous load finishing, so without this a slow tick stacks a
+    /// second full reconcile on top of the first.
+    loading: bool,
+    /// Poll ticks since this activation, for [`reconcile_history_this_tick`].
+    poll_tick: u64,
     db_path_override: Option<PathBuf>,
     diag_db_path_override: Option<PathBuf>,
     faults_dir_override: Option<PathBuf>,
@@ -213,10 +301,13 @@ impl ReportsPanel {
             focus_handle: cx.focus_handle(),
             position: DockPosition::Right,
             rows: Vec::new(),
+            device: Vec::new(),
             visible: Vec::new(),
             state: LoadState::Empty,
             hidden: HashSet::new(),
             generation: 0,
+            loading: false,
+            poll_tick: 0,
             db_path_override: None,
             diag_db_path_override: None,
             faults_dir_override: None,
@@ -255,20 +346,46 @@ impl ReportsPanel {
         )
     }
 
-    /// Read all three sources off-thread and replace the list. Every read
-    /// is blocking (each spins its own current-thread tokio runtime), so
-    /// none of this may touch the UI thread. A load that lands after a
-    /// newer one started is dropped on the generation guard.
+    /// Reload everything, device history included. The activation and
+    /// the Refresh button's entry point.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.load(true, cx);
+    }
+
+    /// One poll tick: always the cheap half, the device reconcile only
+    /// every [`HISTORY_EVERY_TICKS`]th tick.
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        self.poll_tick += 1;
+        self.load(reconcile_history_this_tick(self.poll_tick), cx);
+    }
+
+    /// Read the sources off-thread and replace the list. Every read is
+    /// blocking (each spins its own current-thread tokio runtime), so none
+    /// of this may touch the UI thread. A load that lands after a newer
+    /// one started is dropped on the generation guard.
+    ///
+    /// With `reconcile_history` the device runs are re-read from
+    /// `diag.db` (which CLONES them into `ggo_ide.db`); without it the
+    /// ones from the last reconcile are merged in again, so skipping the
+    /// clone never empties the list of device rows.
+    fn load(&mut self, reconcile_history: bool, cx: &mut Context<Self>) {
+        // The poll fires on a wall clock. A tick that arrives while the
+        // previous load is still running is dropped rather than queued:
+        // the next one is 5 s away and reads the same sources anyway.
+        if self.loading {
+            return;
+        }
+        self.generation += 1;
+        let generation = self.generation;
         let Some(ide_db) = self.db_path() else {
             self.state = LoadState::Error(NO_HOME.to_string());
             cx.notify();
             return;
         };
-        let diag_db = self.diag_db_path();
+        let diag_db = reconcile_history.then(|| self.diag_db_path()).flatten();
         let faults_dir = self.faults_dir();
-        self.generation += 1;
-        let generation = self.generation;
+        let known_device = self.device.clone();
+        self.loading = true;
         // A refresh over an already-painted list must not blank it: the
         // poll runs every 5 s and would flash the loading line each time.
         if self.rows.is_empty() {
@@ -291,7 +408,7 @@ impl ReportsPanel {
             };
             let device = match diag_db {
                 Some(diag_db) => history::load(&diag_db, &ide_db, HISTORY_LIMIT).runs,
-                None => Vec::new(),
+                None => known_device,
             };
             let faults = match faults::list(&ide_db, HISTORY_LIMIT) {
                 Ok(rows) => rows,
@@ -300,15 +417,19 @@ impl ReportsPanel {
                     Vec::new()
                 }
             };
-            (merge_rows(perf, device, faults), failure)
+            (merge_rows(perf, device.clone(), faults), device, failure)
         });
         self._load_task = Some(cx.spawn(async move |this, cx| {
-            let (rows, failure) = load.await;
+            let (rows, device, failure) = load.await;
             this.update(cx, |this, cx| {
+                // The flag is cleared even for a superseded load: it
+                // guards the spawn, not the store.
+                this.loading = false;
                 if this.generation != generation {
                     return;
                 }
                 this.rows = rows;
+                this.device = device;
                 this.state = match failure {
                     Some(error) => LoadState::Error(error),
                     None if this.rows.is_empty() => LoadState::Empty,
@@ -340,7 +461,7 @@ impl ReportsPanel {
     }
 
     /// Every row the last load produced, filters ignored -- test hook.
-    pub fn rows(&self) -> &[ReportRow] {
+    pub fn all_rows(&self) -> &[ReportRow] {
         &self.rows
     }
 
@@ -493,7 +614,16 @@ impl ReportsPanel {
 
 impl Render for ReportsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let row_count = self.visible.len();
+        let rows: Vec<AnyElement> = self
+            .visible
+            .clone()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ix, row_ix)| {
+                let row = self.rows.get(row_ix).cloned()?;
+                Some(self.render_row(ix, &row, cx))
+            })
+            .collect();
         v_flex()
             .key_context(KEY_CONTEXT)
             .size_full()
@@ -503,25 +633,15 @@ impl Render for ReportsPanel {
             .child(self.render_header(cx))
             .children(self.render_note())
             .child(
-                div().id("ggo-reports-list").flex_1().min_h_0().child(
-                    uniform_list(
-                        "ggo-reports-rows",
-                        row_count,
-                        cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                            range
-                                .filter_map(|ix| {
-                                    let row = this
-                                        .visible
-                                        .get(ix)
-                                        .and_then(|row_ix| this.rows.get(*row_ix))
-                                        .cloned()?;
-                                    Some(this.render_row(ix, &row, cx))
-                                })
-                                .collect()
-                        }),
-                    )
-                    .size_full(),
-                ),
+                // Not a `uniform_list`: these rows are one to three lines
+                // (a trailer, a fault's "during run" line), and a uniform
+                // list would pin every row to row 0's measured height.
+                v_flex()
+                    .id("ggo-reports-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
             )
     }
 }
@@ -591,11 +711,12 @@ impl Panel for ReportsPanel {
             self._poll_task = None;
             return;
         }
+        self.poll_tick = 0;
         self.refresh(cx);
         self._poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;
-                if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                if this.update(cx, |this, cx| this.poll(cx)).is_err() {
                     return;
                 }
             }
@@ -654,7 +775,10 @@ mod tests {
         );
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["f1", "d1", "7", "f0"]);
-        assert_eq!(rows[0].trailer, "marker");
+        assert_eq!(
+            rows[0].trailer, "",
+            "a fault's title already leads with its kind"
+        );
         assert_eq!(rows[0].run_id.as_deref(), Some("d1"));
         assert_eq!(rows[2].title, "wilds — run7");
         assert_eq!(
@@ -663,6 +787,85 @@ mod tests {
             "the click opens a perf run by number, never by re-parsing its display id"
         );
         assert_eq!(rows[1].trailer, "done · PASS");
+    }
+
+    /// The producers disagree about timestamps: a perf run's is ISO-UTC,
+    /// a fault's is a local underscore stamp. Sorted as strings, `'_'`
+    /// beats `'T'` and every fault of a day jumps every perf run of it --
+    /// so this pins the ordering to the real instants, with the expected
+    /// order DERIVED through chrono rather than an assumed UTC offset.
+    #[test]
+    fn mixed_stamp_shapes_order_by_the_instant_not_the_text() {
+        let perf_at = "2026-09-02T17:25:37Z";
+        let fault_at = "2026-09-02_08-49-33";
+        let rows = merge_rows(
+            vec![perf(7, perf_at)],
+            Vec::new(),
+            vec![fault("f1", fault_at)],
+        );
+        let perf_key = parse_when(perf_at).expect("ISO-UTC parses");
+        let fault_key = parse_when(fault_at).expect("the local stamp parses");
+        let expected = if perf_key >= fault_key {
+            ["7", "f1"]
+        } else {
+            ["f1", "7"]
+        };
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, expected, "newest first by instant");
+        assert!(
+            fault_at > perf_at,
+            "and a raw string compare would have said the opposite"
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.sort_key).max(),
+            Some(perf_key.max(fault_key))
+        );
+        for row in &rows {
+            assert_eq!(
+                row.when,
+                display_when(row.sort_key, ""),
+                "one display format for every producer"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_when_takes_both_shapes_and_refuses_anything_else() {
+        assert_eq!(
+            parse_when("2026-09-02T17:25:37Z"),
+            Some(
+                NaiveDateTime::parse_from_str("2026-09-02T17:25:37Z", "%Y-%m-%dT%H:%M:%SZ")
+                    .expect("fixture")
+                    .and_utc()
+                    .timestamp()
+            ),
+            "ISO-UTC is read as UTC"
+        );
+        assert_eq!(
+            parse_when("2026-09-02_08-49-33"),
+            Local
+                .with_ymd_and_hms(2026, 9, 2, 8, 49, 33)
+                .earliest()
+                .map(|when| when.timestamp()),
+            "the daemons' stamp is read as LOCAL wall time"
+        );
+        assert_eq!(parse_when("not a timestamp"), None);
+        assert_eq!(parse_when("2026-09-02"), None, "a date is not an instant");
+        assert_eq!(
+            merge_rows(Vec::new(), Vec::new(), vec![fault("f", "garbage")])[0].sort_key,
+            i64::MIN,
+            "an unreadable stamp sorts last, never first"
+        );
+    }
+
+    /// The cheap half of a load runs every tick; the device reconcile --
+    /// which clones `diag.db` -- runs every sixth.
+    #[test]
+    fn the_device_reconcile_runs_every_sixth_tick() {
+        let reconciling: Vec<u64> = (1..=12)
+            .filter(|t| reconcile_history_this_tick(*t))
+            .collect();
+        assert_eq!(reconciling, [6, 12]);
     }
 
     /// The filter chips decide what a click's index MEANS: hiding a kind
@@ -693,8 +896,41 @@ mod tests {
                 .map(|row| row.id.as_str())
                 .collect();
             assert_eq!(visible, ["d1", "7"], "the fault chip hides fault rows");
-            assert_eq!(panel.rows().len(), 3, "hiding is not forgetting");
+            assert_eq!(panel.all_rows().len(), 3, "hiding is not forgetting");
         });
+    }
+
+    /// The poll fires on a wall clock, so a tick can arrive while the
+    /// previous load is still running. It must be dropped, not stacked:
+    /// a full reconcile clones `diag.db` and two of them at once is the
+    /// cost doubled for the same answer.
+    #[gpui::test]
+    async fn a_refresh_while_one_is_in_flight_does_not_start_a_second(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let faults_dir = temp.path().join("faults");
+        write_dump(&faults_dir, "2026-09-02_08-49-33_marker");
+        let panel = cx.update(|cx| cx.new(|cx| ReportsPanel::new(None, cx)));
+        panel.update(cx, |panel, cx| {
+            panel.set_db_path_override(temp.path().join("ggo_ide.db"));
+            panel.set_diag_db_path_override(temp.path().join("diag.db"));
+            panel.set_faults_dir_override(faults_dir.clone());
+            panel.refresh(cx);
+            panel.refresh(cx);
+            panel.refresh(cx);
+            assert!(panel.loading, "the first load is still in flight");
+            assert_eq!(
+                panel.generation, 1,
+                "the two refreshes on top of it started nothing"
+            );
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert!(!panel.loading, "the load cleared the flag");
+            assert_eq!(panel.all_rows().len(), 1, "and it landed");
+            panel.refresh(cx);
+            assert_eq!(panel.generation, 2, "a refresh after it lands does load");
+        });
+        cx.run_until_parked();
     }
 
     /// A dump `ggo-uartd` would have written: the header line the
@@ -757,9 +993,9 @@ mod tests {
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            let ids: Vec<&str> = panel.rows().iter().map(|row| row.id.as_str()).collect();
+            let ids: Vec<&str> = panel.all_rows().iter().map(|row| row.id.as_str()).collect();
             assert_eq!(ids, [fault_id], "the imported dump is the list");
-            assert_eq!(panel.rows()[0].kind, ReportKind::Fault);
+            assert_eq!(panel.all_rows()[0].kind, ReportKind::Fault);
         });
 
         panel.update_in(cx, |panel, window, cx| panel.click_row(0, window, cx));

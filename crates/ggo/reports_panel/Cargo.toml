@@ -12,6 +12,9 @@ workspace = true
 path = "src/ggo_reports_panel.rs"
 
 [dependencies]
+# The three producers write two different timestamp shapes; ordering them
+# means parsing both, and the local one needs a zone.
+chrono.workspace = true
 ggo-worldlib.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO
 ggo_common.workspace = true # GGO

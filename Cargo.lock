@@ -7743,6 +7743,7 @@ dependencies = [
 name = "ggo_reports_panel"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ggo-worldlib",
  "ggo_charts_panel",
  "ggo_common",
