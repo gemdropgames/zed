@@ -83,6 +83,7 @@ use ui::{Checkbox, Tooltip};
 use workspace::Workspace;
 
 use chart_geom::{ChartSpec, build_chart_scene};
+use ggo_worldlib::charts::reports::faults::{self, FaultDetail, FaultRow};
 use history::RunSummary;
 use loader::RunListing;
 
@@ -117,6 +118,8 @@ const BACK_BUTTON_SELECTOR: &str = "ggo-charts-back-button";
 const DEVICE_BACK_SELECTOR: &str = "ggo-charts-device-back-button";
 const RERUN_BUTTON_SELECTOR: &str = "ggo-charts-rerun-button";
 const INSPECT_CLOSE_SELECTOR: &str = "ggo-charts-inspect-close-button";
+const FAULT_BACK_SELECTOR: &str = "ggo-charts-fault-back";
+const FAULT_TILES_SELECTOR: &str = "ggo-charts-fault-tiles";
 
 /// The picker row for perf run at list index `ix` -- one selector per row,
 /// so a test can aim a real click at a specific run.
@@ -159,7 +162,27 @@ const LOG_HEIGHT: Pixels = px(220.);
 /// line landed.
 const NO_DEVICE_LOG: &str = "no log lines recorded for this run";
 
-/// The two log surfaces this panel renders. Every string that identifies
+/// A fault dump whose ring held no decodable text. Like [`NO_DEVICE_LOG`]
+/// this names a STATE: the daemon snapshots whatever bytes were in its
+/// ring, and that can be nothing at all (a board silent since the last
+/// dump), or bytes that were entirely COBS frames with no text between
+/// them.
+const NO_FAULT_TEXT: &str = "no text decoded from this dump";
+
+/// Why the digest shows no fps figure. A dump measures cycles, not
+/// frame time: turning those into fps needs the `frame_budget_cycles`
+/// off a `run` row, and a fault's link to a run is `probable_run`'s
+/// guess. Deriving an fps from a guessed budget would print a number
+/// that reads as measured, so the surface says what is missing instead.
+const FAULT_NO_FPS: &str = "fps needs a linked perf run's frame budget";
+
+/// The dump's file is gone -- `ggo-uartd` keeps only its last
+/// `KEEP_DUMPS`, and the imported row (which holds the bytes) outlives
+/// it. A state, not a cause: the daemon may also have been pointed at a
+/// different home.
+const NO_DUMP_FILE: &str = "no dump file on disk for this fault";
+
+/// The three log surfaces this panel renders. Every string that identifies
 /// one hangs off this enum rather than being passed to [`ChartsPanel::render_log`]
 /// as a loose argument, and that is the whole point: an empty-state
 /// sentence handed over as a literal at the call site is a sentence no test
@@ -174,6 +197,8 @@ enum LogKind {
     Console,
     /// A device run's `ggo-diag` pipeline narration (`run_log`).
     DeviceLog,
+    /// The text `ggo-uartd` decoded out of a fault dump's ring window.
+    Fault,
 }
 
 impl LogKind {
@@ -185,6 +210,7 @@ impl LogKind {
         match self {
             Self::Console => "Console — guest UART",
             Self::DeviceLog => "Log — ggo-diag pipeline",
+            Self::Fault => "Dump — decoded UART",
         }
     }
 
@@ -192,6 +218,7 @@ impl LogKind {
         match self {
             Self::Console => "ggo-charts-console",
             Self::DeviceLog => "ggo-charts-device-log",
+            Self::Fault => "ggo-charts-fault-log",
         }
     }
 
@@ -206,6 +233,7 @@ impl LogKind {
         match self {
             Self::Console => report::NO_UART,
             Self::DeviceLog => NO_DEVICE_LOG,
+            Self::Fault => NO_FAULT_TEXT,
         }
     }
 }
@@ -335,6 +363,19 @@ enum DeviceLogState {
     Error(String),
 }
 
+/// An imported fault dump's detail, on the same background/generation
+/// machinery a device run's log is.
+///
+/// `Debug` so a test can name the state it did NOT expect: the three
+/// arms are all a load can be in, and a test that only knows "not Ready"
+/// says nothing about which of the other two it got.
+#[derive(Debug)]
+enum FaultState {
+    Loading,
+    Ready(Arc<FaultDetail>),
+    Error(String),
+}
+
 /// The device-run history rail's own load.
 enum HistoryState {
     /// Nothing loaded yet -- before the panel's first activation.
@@ -351,6 +392,13 @@ enum HistoryState {
 enum Selection {
     Perf(RunListing),
     Device(RunSummary),
+    /// A `fault` row imported out of `ggo-uartd`'s dump directory -- a
+    /// THIRD id space again (the dump's file stem), and like the other
+    /// two nothing here converts it into either of them. The row carries
+    /// a `run_id` only as a "probably during" guess (see
+    /// `faults::probable_run`), which is a link the user follows, never
+    /// an identity.
+    Fault(FaultRow),
 }
 
 /// Which chart the cursor is over, and where inside it (canvas-local px).
@@ -462,6 +510,13 @@ pub struct ChartsPanel {
     detail: Option<DetailState>,
     /// Set instead of `detail` when the selection is a device run.
     device_log: Option<DeviceLogState>,
+    /// Set instead of `detail` when the selection is a fault dump.
+    fault: Option<FaultState>,
+    /// The dump file the fault header's Copy button hands out, when it is
+    /// still on disk -- `ggo-uartd` keeps only its last `KEEP_DUMPS`, and
+    /// the row outlives the file. Resolved once per selection rather than
+    /// per render, because deciding it means a `stat`.
+    fault_raw_path: Option<PathBuf>,
     /// Why the last Re-run click went nowhere, if it did.
     rerun_note: Option<&'static str>,
     /// `ggo-diag`'s consolidated log for the selected perf run, the file
@@ -531,6 +586,8 @@ impl ChartsPanel {
             selected: None,
             detail: None,
             device_log: None,
+            fault: None,
+            fault_raw_path: None,
             rerun_note: None,
             run_log_path: None,
             detail_generation: 0,
@@ -605,6 +662,22 @@ impl ChartsPanel {
         self.diag_db_path_override
             .clone()
             .or_else(ggo_common::default_diag_db_path)
+    }
+
+    /// `ggo-uartd`'s dump directory, `~/.ggo/uartd/faults` -- the layout
+    /// that daemon's `control::faults_dir` writes, resolved by the same
+    /// HOME rule [`ggo_common::default_db_path`] uses so the two cannot
+    /// disagree about which directory `~/.ggo` is. Read-only from here:
+    /// the dumps belong to the daemon, and the panel only points a user
+    /// at one.
+    fn faults_dir(&self) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(
+            PathBuf::from(home)
+                .join(".ggo")
+                .join("uartd")
+                .join("faults"),
+        )
     }
 
     /// Select a perf run and kick off its load -- same off-thread shape and
@@ -702,6 +775,8 @@ impl ChartsPanel {
         self.selected = Some(next);
         self.detail = None;
         self.device_log = None;
+        self.fault = None;
+        self.fault_raw_path = None;
         self.rerun_note = None;
         self.run_log_path = None;
         self.hover = None;
@@ -801,6 +876,62 @@ impl ChartsPanel {
         .detach();
     }
 
+    /// Show the imported fault `id`: its digest and decoded text, from the
+    /// `fault` table. The dock's click and the agent's `open_ggo_report`
+    /// both land here. Generation-guarded like [`Self::open_run`].
+    pub fn open_fault(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(db_path) = self.db_path() else {
+            return;
+        };
+        self.detail_generation += 1;
+        let generation = self.detail_generation;
+        // The load owns `id`; the warn and the raw path need it after.
+        let raw_path = self
+            .faults_dir()
+            .map(|dir| faults::raw_path(&dir, &id))
+            .filter(|path| path.is_file());
+        let missing = id.clone();
+        // The state of THIS load, whatever is on screen: opening a fault
+        // while another one is showing swaps its body for the message
+        // rather than leaving the previous dump's text sitting under a
+        // header that is about to change. Invisible from the picker,
+        // where there is no fault view to put it in.
+        self.fault = Some(FaultState::Loading);
+        cx.notify();
+        let load = cx.background_spawn(async move { faults::load(&db_path, &id) });
+        cx.spawn(async move |this, cx| {
+            let loaded = load.await;
+            this.update(cx, |this, cx| {
+                if this.detail_generation != generation {
+                    return;
+                }
+                match loaded {
+                    Ok(Some(detail)) => {
+                        this.begin_selection(Selection::Fault(detail.row.clone()));
+                        this.fault = Some(FaultState::Ready(Arc::new(detail)));
+                        this.fault_raw_path = raw_path;
+                    }
+                    Ok(None) => {
+                        log::warn!("fault {missing}: not imported, nothing to open");
+                        // The selection is left where it was -- there is
+                        // no row to select -- but the state must not stay
+                        // `Loading`, or a fault already on screen keeps
+                        // the loading message under its own header for
+                        // good. Invisible from the picker, which is where
+                        // this lands most of the time.
+                        this.fault = Some(FaultState::Error(Self::fault_missing_message(&missing)));
+                    }
+                    Err(e) => {
+                        this.fault = Some(FaultState::Error(e));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Read runs from `path` instead of `~/.ggo/ggo_ide.db`.
     ///
     /// Public only so `ggo_emu_panel`'s "Re-run hops to the charts panel"
@@ -820,6 +951,8 @@ impl ChartsPanel {
         self.selected = None;
         self.detail = None;
         self.device_log = None;
+        self.fault = None;
+        self.fault_raw_path = None;
         self.rerun_note = None;
         self.run_log_path = None;
         self.hover = None;
@@ -1028,6 +1161,7 @@ impl ChartsPanel {
         match &self.selected {
             Some(Selection::Perf(_)) => self.render_detail(cx),
             Some(Selection::Device(run)) => self.render_device_detail(run, cx),
+            Some(Selection::Fault(row)) => self.render_fault_detail(row, cx),
             None => self.render_picker(cx),
         }
     }
@@ -1231,6 +1365,195 @@ impl ChartsPanel {
             .into_any_element()
     }
 
+    /// An imported fault dump's report: what `ggo-uartd` was told went
+    /// wrong, the digest of the ring window it snapshotted, and the text
+    /// it decoded out of it.
+    ///
+    /// Modelled on [`Self::render_device_detail`] rather than on
+    /// [`Self::render_detail`]: a dump is read the way a device run's log
+    /// is -- one scroll region, no charts -- because a ring window is a
+    /// few seconds of narration, not a run's worth of samples.
+    fn render_fault_detail(&self, row: &FaultRow, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let body = match &self.fault {
+            None | Some(FaultState::Loading) => self.render_message("Loading fault…", cx),
+            Some(FaultState::Error(e)) => self.render_load_error(
+                "ggo-charts-fault-error-copy",
+                Self::fault_error_message(e),
+                cx,
+            ),
+            Some(FaultState::Ready(detail)) => self.render_fault_digest(detail, cx),
+        };
+        // The window is the DETAIL's, not the row's, so it joins the
+        // identity line only once the detail is there to say it.
+        let window = match &self.fault {
+            Some(FaultState::Ready(detail)) => format!(" · last {}s", detail.window_s),
+            _ => String::new(),
+        };
+
+        v_flex()
+            .size_full()
+            .child(
+                v_flex()
+                    .id("ggo-charts-fault-header")
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .debug_selector(|| FAULT_BACK_SELECTOR.to_string())
+                                    .child(
+                                        IconButton::new(
+                                            "ggo-charts-fault-back-icon",
+                                            IconName::ArrowLeft,
+                                        )
+                                        .tooltip(Tooltip::text("Back to runs"))
+                                        .on_click(
+                                            Self::guarded_listener(
+                                                cx,
+                                                |this, _event, _window, cx| {
+                                                    this.clear_selection(cx);
+                                                },
+                                            ),
+                                        ),
+                                    ),
+                            )
+                            .child(self.render_copy_dump_button())
+                            .child(
+                                Label::new(format!("{}: {}", row.kind, row.detail))
+                                    .size(LabelSize::Small),
+                            ),
+                    )
+                    .child(
+                        Label::new(format!("{} · {}{window}", row.at, row.tty))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    // "Probably", never "during": `faults::probable_run`
+                    // matches on start time alone because ggo-diag records
+                    // no end time, so this is a link the reader follows,
+                    // not a claim the panel makes.
+                    .children(row.run_id.clone().map(|run| {
+                        Button::new("ggo-charts-fault-run", format!("probably during run {run}"))
+                            .label_size(LabelSize::XSmall)
+                            .on_click(Self::guarded_listener(
+                                cx,
+                                move |this, _event, _window, cx| {
+                                    this.open_device_run(run.clone(), cx);
+                                },
+                            ))
+                    })),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    /// The loaded dump's body: the digest tiles, the two diagnostic
+    /// tables, then the decoded text.
+    fn render_fault_digest(&self, detail: &Arc<FaultDetail>, cx: &mut Context<Self>) -> AnyElement {
+        // The tables read a `report::Diagnostics`, and a dump that decoded
+        // no text is precisely that enum's `NoUart`: they must then say
+        // "nothing was captured", never "nothing failed" -- the same
+        // distinction `report::Diagnostics`' own doc draws.
+        let diagnostics = if detail.text.is_empty() {
+            report::Diagnostics::NoUart
+        } else {
+            report::Diagnostics::Recorded {
+                failures: detail.asset_failures.clone(),
+                panics: detail.panics.clone(),
+            }
+        };
+        let text = Arc::new(Self::mark_fault_line(detail));
+        let cycles = match (detail.cyc_avg, detail.cyc_max) {
+            (Some(avg), Some(max)) => format!(
+                "cycles avg/max: {}/{}",
+                ggo_worldlib::charts::reports::fmt::with_thousands(avg),
+                ggo_worldlib::charts::reports::fmt::with_thousands(max)
+            ),
+            _ => "cycles avg/max: —".to_string(),
+        };
+
+        v_flex()
+            .id("ggo-charts-fault-body")
+            .size_full()
+            .overflow_y_scroll()
+            .p_2()
+            .gap_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_4()
+                    .debug_selector(|| FAULT_TILES_SELECTOR.to_string())
+                    .child(Label::new(format!(
+                        "boot stage: {}",
+                        detail.row.boot_stage.as_deref().unwrap_or("—")
+                    )))
+                    .child(Label::new(format!("frames: {}", detail.row.frames)))
+                    .child(Label::new(cycles)),
+            )
+            .child(
+                Label::new(FAULT_NO_FPS)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(self.render_failures_table(&diagnostics, cx))
+            .child(self.render_panics_table(&diagnostics, cx))
+            .child(Self::render_log(LogKind::Fault, &text, cx))
+            .into_any_element()
+    }
+
+    /// The decoded text with the line the dump was taken for marked.
+    ///
+    /// A `» ` PREFIX and not a style: [`Self::render_log`] paints plain
+    /// lines through a `uniform_list` whose renderer is `'static`, so a
+    /// styled highlight means teaching that renderer about a highlighted
+    /// index and moving it in. The prefix is readable today and a styled
+    /// highlight can replace it without touching anything else here.
+    fn mark_fault_line(detail: &FaultDetail) -> Vec<String> {
+        detail
+            .text
+            .iter()
+            .enumerate()
+            .map(|(ix, line)| {
+                if Some(ix) == detail.fault_line {
+                    format!("» {line}")
+                } else {
+                    line.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// Copy the dump file's path, for pasting into an agent's prompt --
+    /// [`Self::render_copy_log_button`]'s shape for the OTHER file this
+    /// panel points at. Disabled, with the reason in its tooltip, once
+    /// `ggo-uartd` has rotated the dump away: the `fault` row holds the
+    /// bytes and outlives the file it came from.
+    fn render_copy_dump_button(&self) -> gpui::AnyElement {
+        let button = IconButton::new("ggo-charts-copy-dump-path", IconName::Copy);
+        match &self.fault_raw_path {
+            Some(path) => {
+                let text = path.to_string_lossy().into_owned();
+                button
+                    .tooltip(Tooltip::text(format!("Copy dump path\n{text}")))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                    })
+                    .into_any_element()
+            }
+            None => button
+                .disabled(true)
+                .tooltip(Tooltip::text(NO_DUMP_FILE))
+                .into_any_element(),
+        }
+    }
+
     /// The selected run's view: a back row, then one titled canvas per
     /// chart in [`chart_set::build_charts`]'s order -- except for that
     /// order's first chart on a device run, which is hoisted to the top
@@ -1431,6 +1754,15 @@ impl ChartsPanel {
         }
     }
 
+    /// The imported fault (its dump's file stem) on screen, if the panel
+    /// is showing one.
+    pub fn selected_fault_id(&self) -> Option<&str> {
+        match &self.selected {
+            Some(Selection::Fault(row)) => Some(row.id.as_str()),
+            _ => None,
+        }
+    }
+
     /// Copy the run's `ggo-diag` log path, for pasting into an agent's
     /// prompt. Disabled, with the reason in its tooltip, for a run with no
     /// such log -- an emulator run, or one whose log was pruned.
@@ -1563,6 +1895,18 @@ impl ChartsPanel {
     /// What a device run's view says when its pipeline log failed.
     fn device_log_error_message(error: &str) -> String {
         format!("Failed to load log: {error}")
+    }
+
+    /// What a fault's view says when its detail failed to load.
+    fn fault_error_message(error: &str) -> String {
+        format!("Failed to load fault: {error}")
+    }
+
+    /// What a fault's view says when the id it was asked for has no row.
+    /// A state, not a cause: the dump may never have been imported, or
+    /// its row may have gone since whoever asked for it listed it.
+    fn fault_missing_message(id: &str) -> String {
+        format!("fault {id} is not in the reports database")
     }
 
     /// The KPI tile row above the plots -- ggo-ide's `kpi_row`, wrapped
@@ -2537,6 +2881,178 @@ mod tests {
             );
             assert_eq!(close_charts_item(workspace, None, window, cx), Ok(false));
         });
+    }
+
+    /// The fault route: `open_fault` finds the imported row, selects it,
+    /// and loads its detail; the tab then reports which fault it shows.
+    #[gpui::test]
+    async fn test_open_fault_lands_on_the_fault_detail(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let ide_db = dir.path().join("ggo_ide.db");
+        let faults = dir.path().join("faults");
+        std::fs::create_dir_all(&faults).unwrap();
+        std::fs::write(
+            faults.join("2026-09-02_08-49-33_marker.log"),
+            "# ggo-uartd marker trap: mcause= \u{2014} last 5s of /dev/ttyUSB1\n<<<BOOTROM alive>>>\r\ntrap: mcause=0x2\r\n",
+        ).unwrap();
+        ggo_worldlib::charts::reports::faults::import(&faults, &ide_db).unwrap();
+
+        let panel = cx.new(|cx| ChartsPanel::new(None, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_db_path_override(ide_db.clone());
+            panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.selected_fault_id(),
+                Some("2026-09-02_08-49-33_marker")
+            );
+            match &panel.fault {
+                Some(FaultState::Ready(detail)) => {
+                    assert_eq!(detail.fault_line, Some(1));
+                    assert_eq!(detail.row.boot_stage.as_deref(), Some("boot-rom alive"));
+                }
+                other => panic!("fault detail not loaded: {other:?}"),
+            }
+            assert_eq!(panel.selected_run_id(), None);
+        });
+
+        // An id with no row leaves the fault on screen where it is and
+        // says so, rather than sitting on the loading message.
+        panel.update(cx, |panel, cx| {
+            panel.open_fault("2026-01-01_00-00-00_marker".to_string(), cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.selected_fault_id(),
+                Some("2026-09-02_08-49-33_marker"),
+                "the missing fault does not replace the selection"
+            );
+            match &panel.fault {
+                Some(FaultState::Error(e)) => {
+                    assert!(e.contains("2026-01-01_00-00-00_marker"), "{e}")
+                }
+                other => panic!("expected the missing-fault state: {other:?}"),
+            }
+        });
+    }
+
+    /// The marker is a PREFIX on exactly one line, and the text is
+    /// otherwise untouched -- a log line that already contains the fault
+    /// text elsewhere must not be marked as well.
+    #[gpui::test]
+    fn fault_text_marks_only_the_fault_line(_cx: &mut gpui::App) {
+        let detail = FaultDetail {
+            row: FaultRow {
+                id: "2026-09-02_08-49-33_marker".to_string(),
+                source: "ggo-uartd".to_string(),
+                at: "2026-09-02_08-49-33".to_string(),
+                kind: "marker".to_string(),
+                detail: "trap: mcause=".to_string(),
+                tty: "/dev/ttyUSB1".to_string(),
+                boot_stage: None,
+                frames: 0,
+                run_id: None,
+            },
+            window_s: 5,
+            text: vec![
+                "before".to_string(),
+                "trap: mcause=0x2".to_string(),
+                "after".to_string(),
+            ],
+            fault_line: Some(1),
+            cyc_avg: None,
+            cyc_max: None,
+            panics: Vec::new(),
+            asset_failures: Vec::new(),
+            raw: Vec::new(),
+        };
+        assert_eq!(
+            ChartsPanel::mark_fault_line(&detail),
+            vec![
+                "before".to_string(),
+                "\u{bb} trap: mcause=0x2".to_string(),
+                "after".to_string(),
+            ]
+        );
+
+        // A dump with no fault line (a stall window is an ABSENCE, so
+        // `digest` leaves it `None`) marks nothing at all.
+        let detail = FaultDetail {
+            fault_line: None,
+            ..detail
+        };
+        assert_eq!(ChartsPanel::mark_fault_line(&detail), detail.text);
+    }
+
+    /// The fault view paints, and paints its sections in the order the
+    /// design gives them: digest tiles, then the two diagnostic tables,
+    /// then the decoded text.
+    #[gpui::test]
+    async fn test_the_fault_view_paints_its_sections_in_order(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        cx.executor().allow_parking();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ide_db = dir.path().join("ggo_ide.db");
+        let faults = dir.path().join("faults");
+        std::fs::create_dir_all(&faults).unwrap();
+        std::fs::write(
+            faults.join("2026-09-02_08-49-33_marker.log"),
+            concat!(
+                "# ggo-uartd marker trap: mcause= \u{2014} last 5s of /dev/ttyUSB1\n",
+                "<<<BOOTROM alive>>>\r\n",
+                "asset: MISS \"sprites/hero.spr\"\r\n",
+                "f=2| panicked at 'boom', src/main.rs:1:1\r\n",
+                "trap: mcause=0x2\r\n",
+            ),
+        )
+        .unwrap();
+        ggo_worldlib::charts::reports::faults::import(&faults, &ide_db).unwrap();
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(ide_db.clone());
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            let Some(FaultState::Ready(detail)) = &panel.fault else {
+                panic!("the fixture dump must load");
+            };
+            assert_eq!(detail.panics.len(), 1, "the panic line is digested");
+            assert_eq!(detail.asset_failures.len(), 1, "and the asset MISS");
+        });
+
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        let tiles = cx
+            .debug_bounds(FAULT_TILES_SELECTOR)
+            .expect("the digest tiles must be painted");
+        let failures = cx
+            .debug_bounds(FAILURES_SELECTOR)
+            .expect("the failed-asset-loads table must be painted");
+        let panics = cx
+            .debug_bounds(PANICS_SELECTOR)
+            .expect("the panics table must be painted");
+        let log = cx
+            .debug_bounds(LogKind::Fault.selector())
+            .expect("the decoded text must be painted");
+        assert!(tiles.origin.y < failures.origin.y, "tiles lead");
+        assert!(failures.origin.y < panics.origin.y, "loads above panics");
+        assert!(panics.origin.y < log.origin.y, "the text goes last");
     }
 
     /// The reports view is a SINGLETON center tab: `open_charts_item`
@@ -3753,9 +4269,39 @@ mod tests {
             "a state, not a cause: {device}"
         );
 
-        // And the two surfaces stay distinguishable in a painted frame.
-        assert_ne!(LogKind::Console.selector(), LogKind::DeviceLog.selector());
-        assert_ne!(LogKind::Console.title(), LogKind::DeviceLog.title());
+        // A fault's text is a ring SNAPSHOT, so its absence is a third
+        // fact again -- the daemon dumped whatever it had, and that can
+        // be no text at all.
+        let fault = LogKind::Fault.empty_state();
+        assert_eq!(fault, NO_FAULT_TEXT);
+        assert_ne!(fault, console);
+        assert_ne!(fault, device);
+        assert!(
+            fault.starts_with("no text decoded"),
+            "a state, not a cause: {fault}"
+        );
+
+        // And the three surfaces stay distinguishable in a painted frame.
+        let selectors = [
+            LogKind::Console.selector(),
+            LogKind::DeviceLog.selector(),
+            LogKind::Fault.selector(),
+        ];
+        let titles = [
+            LogKind::Console.title(),
+            LogKind::DeviceLog.title(),
+            LogKind::Fault.title(),
+        ];
+        for (ix, first) in selectors.iter().enumerate() {
+            for second in &selectors[ix + 1..] {
+                assert_ne!(first, second);
+            }
+        }
+        for (ix, first) in titles.iter().enumerate() {
+            for second in &titles[ix + 1..] {
+                assert_ne!(first, second);
+            }
+        }
     }
 
     // ------------------------------ R3: the load is entirely off-thread

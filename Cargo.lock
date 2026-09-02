@@ -7524,14 +7524,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo-wire"
+version = "0.1.0"
+
+[[package]]
 name = "ggo-worldlib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "flate2",
  "ggo-asset-formats",
  "ggo-db",
  "ggo-emu-core",
+ "ggo-wire",
  "image",
  "serde",
  "serde_json",
