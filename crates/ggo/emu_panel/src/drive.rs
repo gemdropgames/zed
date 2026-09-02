@@ -73,10 +73,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ggo_emu_core::apu::Apu;
 use ggo_emu_core::cart::Cart;
 use ggo_emu_core::cpu::Cpu;
-use ggo_emu_core::mmu::{CART_XIP_BASE, DEFAULT_MAIN_RAM_BYTES, DEFAULT_VRAM_BYTES, Mmu};
+use ggo_emu_core::mmu::Mmu;
 use ggo_emu_core::peripherals::{Peripherals, SCREEN_HEIGHT, SCREEN_WIDTH};
 use ggo_emu_core::ppu::PpuSnapshot;
 use ggo_emu_core::run::{FrameEvent, run_until_event};
+use ggo_emu_core::sandbox;
 use ggo_emu_core::savefile;
 
 use crate::audio::{AudioStatus, RingWriter};
@@ -276,7 +277,8 @@ impl Session {
     /// frame with a stretched delta. Audio is silenced above 1x rather
     /// than played at chipmunk pitch.
     pub fn set_speed(&self, speed: u32) {
-        self.speed.store(speed.clamp(1, MAX_SPEED), Ordering::Release);
+        self.speed
+            .store(speed.clamp(1, MAX_SPEED), Ordering::Release);
     }
 
     pub fn speed(&self) -> u32 {
@@ -492,9 +494,31 @@ fn run(
     };
 
     let title = cart.header.title.clone();
-    let mut mmu = Mmu::new(DEFAULT_MAIN_RAM_BYTES, DEFAULT_VRAM_BYTES);
-    mmu.xip = cart.body;
-    let mut cpu = Cpu::new(CART_XIP_BASE.wrapping_add(cart.header.entry_offset));
+    // Split the die above the arena base between this cart's arena and its
+    // asset pools exactly as `run_cart` and the device OS do. Only the
+    // cart's own TOC sizes the pools: `run_cart` refuses to size them by
+    // scanning a card directory it was not explicitly given, and the pane
+    // never gives one -- neighbouring files in the cart's folder must not
+    // change the arena this cart is granted.
+    let (vram_asset_bytes, ram_asset_bytes) =
+        ggo_emu_core::assets::pool_demand(cart.toc.as_deref(), None);
+    let plan = sandbox::plan(
+        sandbox::ARENA_MAX_LEN,
+        vram_asset_bytes,
+        ram_asset_bytes,
+        cart.header.ram_needed.max(sandbox::MIN_ARENA),
+    );
+    let mut mmu = Mmu::with_plan(plan);
+    // There is no XIP flash any more: the loader copies the cart body into
+    // the PSRAM code window, which is what the OS does on device.
+    if !mmu.load_cart_body(&cart.body) {
+        uart.push_line(format!(
+            "[cart] body is {} bytes, larger than the {} byte code window; truncated",
+            cart.body.len(),
+            sandbox::XIP_LEN
+        ));
+    }
+    let mut cpu = Cpu::new(sandbox::XIP_BASE.wrapping_add(cart.header.entry_offset));
 
     // Same wall-clock RNG seed `run_cart` uses, so successive runs of the
     // same cart differ but a single run stays deterministic once started.
@@ -505,8 +529,7 @@ fn run(
     let mut p = Peripherals::new(seed, cart.header.save_bytes);
     // The cache + wire perf sim, enabled exactly as `ggo-ide`'s
     // `CartStepper::new` enables it (and as the browser/native cart runs
-    // do by default). Cart mode keeps `PerfSim`'s default cache base
-    // (`CART_XIP_BASE`) -- only the full-system boot path moves it.
+    // do by default).
     p.perf.enable();
     // Attach a log sink so `log()` calls land in the pane's console (and
     // from there the ingested `uart` table) instead of vanishing into
@@ -855,7 +878,10 @@ fn find_tap(ram: &[u8], tap_addr: &mut Option<usize>) -> Option<usize> {
     match *tap_addr {
         Some(a) if ram.get(a..a + 4).is_some_and(|m| m == TAP_MAGIC) => Some(a),
         _ => {
-            let found = ram.chunks_exact(4).position(|c| c == TAP_MAGIC).map(|i| i * 4)?;
+            let found = ram
+                .chunks_exact(4)
+                .position(|c| c == TAP_MAGIC)
+                .map(|i| i * 4)?;
             *tap_addr = Some(found);
             Some(found)
         }
@@ -866,13 +892,27 @@ fn find_tap(ram: &[u8], tap_addr: &mut Option<usize>) -> Option<usize> {
 /// host-side switch that makes serialization cost nothing in ordinary
 /// runs. No-op for carts without a tap.
 fn arm_world_tap(mmu: &mut ggo_emu_core::mmu::Mmu, tap_addr: &mut Option<usize>, on: bool) {
-    let Some(addr) = find_tap(&mmu.main_ram, tap_addr) else {
+    let arena_range = arena_range(mmu);
+    let Some(arena) = mmu.psram.get_mut(arena_range) else {
+        return;
+    };
+    let Some(addr) = find_tap(arena, tap_addr) else {
         return;
     };
     let off = addr + TAP_ENABLED_OFFSET;
-    if let Some(word) = mmu.main_ram.get_mut(off..off + 4) {
+    if let Some(word) = arena.get_mut(off..off + 4) {
         word.copy_from_slice(&u32::from(on).to_le_bytes());
     }
+}
+
+/// The cart's writable arena, as a range into [`Mmu::psram`]. The SDK
+/// linker anchors `.data`/`.bss` at the arena base, so this is the window
+/// the tap static can be in -- and its length is per-cart now, not a
+/// constant: whatever the RAM plan did not hand to the asset pools.
+fn arena_range(mmu: &ggo_emu_core::mmu::Mmu) -> std::ops::Range<usize> {
+    let start = (sandbox::ARENA_BASE - sandbox::PSRAM_BASE) as usize;
+    let end = (mmu.plan.arena_end() - sandbox::PSRAM_BASE) as usize;
+    start..end
 }
 
 /// Copy the cart's world-inspection JSON (if armed and written) out of
@@ -882,7 +922,9 @@ fn publish_world_tap(
     tap_addr: &mut Option<usize>,
     slot: &Mutex<Option<(u32, Arc<String>)>>,
 ) {
-    let ram: &[u8] = &mmu.main_ram;
+    let Some(ram) = mmu.psram.get(arena_range(mmu)) else {
+        return;
+    };
     let Some(addr) = find_tap(ram, tap_addr) else {
         return; // cart built without the inspect feature
     };
@@ -1061,10 +1103,10 @@ pub mod fixture {
     /// green forever -- so a flushed `.sav` carries a payload the test can
     /// predict.
     pub fn saving_cart() -> Vec<u8> {
-        let xip_base_hi20 = super::CART_XIP_BASE >> 12;
+        let xip_base_hi20 = super::sandbox::XIP_BASE >> 12;
         let body: Vec<u32> = vec![
             addi(A0, 0),                            // off 0
-            lui(A1, xip_base_hi20),                 // buf = CART_XIP_BASE
+            lui(A1, xip_base_hi20),                 // buf = XIP_BASE
             addi(A2, SAVING_CART_WRITE_LEN as i32), // len
             addi(A7, SYS_SAVE_WRITE),               //
             ECALL,                                  // save_write
@@ -1107,7 +1149,7 @@ pub mod fixture {
     /// the paint loop:
     ///
     /// ```text
-    ///     a0 = CART_XIP_BASE + STR_OFFSET   ; lui + addi -- STR_OFFSET
+    ///     a0 = XIP_BASE + STR_OFFSET        ; lui + addi -- STR_OFFSET
     ///                                       ; points at LOG_MESSAGE's
     ///                                       ; bytes, appended as data
     ///                                       ; after this program's own
@@ -1134,10 +1176,10 @@ pub mod fixture {
         // offset 15 * 4 = 60 -- comfortably inside a 12-bit signed `addi`
         // immediate (max 2047).
         const STR_OFFSET: i32 = 15 * 4;
-        let xip_base_hi20 = super::CART_XIP_BASE >> 12;
+        let xip_base_hi20 = super::sandbox::XIP_BASE >> 12;
 
         let body: Vec<u32> = vec![
-            lui(A0, xip_base_hi20),             // a0 = CART_XIP_BASE (hi bits)
+            lui(A0, xip_base_hi20),             // a0 = XIP_BASE (hi bits)
             addi_reg(A0, A0, STR_OFFSET),       // a0 += offset of the message
             addi(A1, LOG_MESSAGE.len() as i32), // a1 = message length
             addi(A7, SYS_LOG),                  //
@@ -1210,7 +1252,11 @@ mod tests {
 
     #[test]
     fn set_speed_clamps_to_the_supported_range() {
-        let (session, _rx) = start(PathBuf::from("/nonexistent/cart.ggo"), "cart.ggo".into(), None);
+        let (session, _rx) = start(
+            PathBuf::from("/nonexistent/cart.ggo"),
+            "cart.ggo".into(),
+            None,
+        );
         assert_eq!(session.speed(), 1, "a fresh run is real time");
         session.set_speed(4);
         assert_eq!(session.speed(), 4);
