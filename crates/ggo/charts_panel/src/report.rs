@@ -39,9 +39,10 @@ impl KpiTile {
     }
 }
 
-/// `reports.rs::kpi_row`'s tiles, in its exact order plus ONE this panel
-/// adds that ggo-ide's `kpi_row` has no counterpart for -- the measured
-/// fps tile, first of the conditionals -- over frames the
+/// `reports.rs::kpi_row`'s tiles, in its exact order plus THREE this
+/// panel adds that ggo-ide's `kpi_row` has no counterpart for -- the
+/// measured-fps trio (average, worst frame, vsync histogram), first of
+/// the conditionals -- over frames the
 /// caller has ALREADY ignore-filtered (R1's concern (1): no derivation in
 /// `kpi` applies the filter itself, so passing raw frames here silently
 /// folds frame 0's cold-cache burst into every tile and the panel's
@@ -52,22 +53,25 @@ impl KpiTile {
 /// way ggo-ide reads it (the same column `FrameRow::frame_budget_cycles`
 /// carries, denormalized onto every frame by `run_frames`' join).
 ///
-/// The last six tiles are conditional and each is gated by its own
+/// The last eight tiles are conditional and each is gated by its own
 /// `kpi` derivation returning `Some` -- NOT by
 /// `ggo_worldlib::charts::reports::gates`. That is ggo-ide's behaviour:
 /// `kpi_row` never consults `chart_gates`; the gates are for the
 /// conditional CHARTS, which is where `chart_set` uses them.
 ///
-/// **What an absent tile does and does not mean.** Three of the six hide
+/// **What an absent tile does and does not mean.** Three of the eight hide
 /// at exactly zero (`peak_spr_line`, `apu_underruns`, `sc_upload`), so for
 /// those, absence does mean "this run never measured that" and a measured
-/// zero is never rendered as a `0` tile. The measured-fps tile is absent
-/// for a different reason again: `kpi::avg_fps` needs both a `cyc`
-/// counter (device captures only -- `frame.cyc` is `NOT NULL DEFAULT 0`,
-/// so every emulator row reads zero) and a `frame_budget_cycles` on the
-/// run row. Absent there means "not derivable on this run", never "0 fps"
-/// -- a run really achieving 0 fps would have produced no frames to
-/// average. The two working-set tiles are
+/// zero is never rendered as a `0` tile. The three fps tiles are absent
+/// for a different reason again: `kpi::{avg_fps, min_fps,
+/// vsync_multiples}` each need both a `cyc` counter (device captures
+/// only -- `frame.cyc` is `NOT NULL DEFAULT 0`, so every emulator row
+/// reads zero) and a `frame_budget_cycles` on the run row, so the three
+/// appear and vanish together. Absent there means "not derivable on this
+/// run", never "0 fps" -- a run really achieving 0 fps would have
+/// produced no frames to average, and an all-zero vsync histogram would
+/// claim a distribution over frames nothing measured. The two
+/// working-set tiles are
 /// different: their threshold is `> kpi::TILE_CACHE_TILES` (64), not `> 0`
 /// (`RunPage.tsx:365/373` -- a working set that fits in the cache is not a
 /// finding worth a tile). So for those two, absence means "at or below the
@@ -121,6 +125,28 @@ pub fn kpi_tiles(frames: &[FrameRow], budget: Option<i64>) -> Vec<KpiTile> {
     // (run 55: 29.5).
     if let Some(fps) = kpi::avg_fps(frames, budget) {
         tiles.push(KpiTile::new("Measured fps", format!("{fps:.1}")));
+    }
+    // The average's two companions, gated the same way and by the same
+    // signal. The mean alone hides both of the things a device run is
+    // read for: the WORST frame (a 26.7 fps average is a very different
+    // run at a 20 fps floor than at a 25 fps one), and WHICH vsync
+    // multiple the frames actually landed on -- run 55's `[0, 2971,
+    // 103, 0]` says "pinned at half rate with a third-vsync tail", a
+    // fact no average states.
+    if let Some(worst) = kpi::min_fps(frames, budget) {
+        tiles.push(KpiTile::new("Min fps", format!("{worst:.1}")));
+    }
+    if let Some([one, two, three, four_plus]) = kpi::vsync_multiples(frames, budget) {
+        tiles.push(KpiTile::new(
+            "Vsync multiples",
+            format!(
+                "1x {} · 2x {} · 3x {} · 4x+ {}",
+                with_thousands(one),
+                with_thousands(two),
+                with_thousands(three),
+                with_thousands(four_plus),
+            ),
+        ));
     }
     if let Some(peak) = kpi::peak_spr_line_tile(frames) {
         tiles.push(KpiTile::new(
@@ -501,6 +527,8 @@ mod tests {
         assert_eq!(tiles.len(), 8, "only the unconditional eight");
         for absent in [
             "Measured fps",
+            "Min fps",
+            "Vsync multiples",
             "Peak sprites / scanline",
             "Sprite working set",
             "BG working set",
@@ -543,6 +571,70 @@ mod tests {
 
         let emulator = kpi_tiles(&sample_frames(), Some(555_549));
         assert_eq!(value_of(&emulator, "Measured fps"), None);
+    }
+
+    /// The two fps tiles that sit beside the measured average: the
+    /// run's WORST frame, and the vsync-multiple histogram that says
+    /// what the device was actually locked to. Run 55's shape in
+    /// miniature -- three frames at 2x the 555,549 budget and one at 3x,
+    /// hand-computed through `kpi`'s `60 * budget / cyc`: the mean is
+    /// 60*555_549*4/4_999_950 = 26.67 fps, the worst frame is the 3x one
+    /// at exactly 20.0, and the histogram is `[0, 3, 1, 0]` -- "pinned
+    /// at half rate with a third-vsync tail", which the 26.7 average
+    /// alone never says.
+    ///
+    /// `kpi_tiles` does NOT ignore-filter (`build` does, and these
+    /// frames stand in for what it hands over), so the fixture is the
+    /// post-filter set: no frame 0.
+    #[test]
+    fn a_device_run_gets_min_fps_and_vsync_multiple_tiles() {
+        let device: Vec<FrameRow> = [
+            (1, 1_111_100),
+            (2, 1_111_100),
+            (3, 1_111_100),
+            (4, 1_666_650),
+        ]
+        .into_iter()
+        .map(|(n, cyc)| FrameRow {
+            n,
+            cyc,
+            frame_budget_cycles: Some(555_549),
+            ..FrameRow::default()
+        })
+        .collect();
+
+        let tiles = kpi_tiles(&device, Some(555_549));
+        assert_eq!(value_of(&tiles, "Measured fps"), Some("26.7"));
+        assert_eq!(value_of(&tiles, "Min fps"), Some("20.0"));
+        assert_eq!(
+            value_of(&tiles, "Vsync multiples"),
+            Some("1x 0 · 2x 3 · 3x 1 · 4x+ 0")
+        );
+
+        // The three travel together: no budget, nothing derivable, no
+        // tiles -- never a fake rate or an all-zero histogram.
+        let no_budget = kpi_tiles(&device, None);
+        for absent in ["Measured fps", "Min fps", "Vsync multiples"] {
+            assert_eq!(
+                value_of(&no_budget, absent),
+                None,
+                "{absent} needs a budget"
+            );
+        }
+    }
+
+    /// The emulator side of the same gate: every `cyc` reads 0 (the
+    /// column is `NOT NULL DEFAULT 0` and only a device capture writes
+    /// it), so all three fps tiles are absent rather than reading 0 fps
+    /// or `1x 0 · 2x 0 · 3x 0 · 4x+ 0`.
+    #[test]
+    fn an_emulator_run_has_no_fps_tiles() {
+        let emulator = sample_frames();
+        assert!(emulator.iter().all(|f| f.cyc == 0), "the emulator shape");
+        let tiles = kpi_tiles(&emulator, Some(555_549));
+        for absent in ["Measured fps", "Min fps", "Vsync multiples"] {
+            assert_eq!(value_of(&tiles, absent), None, "{absent} must be absent");
+        }
     }
 
     /// Each conditional tile appears once its own counter crosses its own

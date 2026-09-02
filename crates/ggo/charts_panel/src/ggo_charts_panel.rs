@@ -1200,7 +1200,9 @@ impl ChartsPanel {
     }
 
     /// The selected run's view: a back row, then one titled canvas per
-    /// chart in [`chart_set::build_charts`]'s order.
+    /// chart in [`chart_set::build_charts`]'s order -- except for that
+    /// order's first chart on a device run, which is hoisted to the top
+    /// of the page (see the hero split below).
     fn render_detail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let title = match &self.selected {
             Some(Selection::Perf(run)) => run.display_title(),
@@ -1218,9 +1220,37 @@ impl ChartsPanel {
                 let (charts, report) = (&detail.charts, &detail.report);
                 self.chart_bounds.borrow_mut().resize(charts.len(), None);
                 self.scenes.borrow_mut().resize_with(charts.len(), || None);
-                // ggo-ide's `detail_view` order, top to bottom: the two
-                // diagnostic tables, the stored console, then the KPI row,
-                // then the charts. The tables come FIRST there and here for
+                // The report's HERO, and the one departure from ggo-ide's
+                // `detail_view` order below: on a device run
+                // `build_charts` leads with the measured-fps chart, and
+                // that chart is the answer to the question the whole page
+                // is opened to ask, so it is painted above everything --
+                // including the tables. Matched on the title rather than
+                // on the index because only the fps chart earns the slot:
+                // a run that gets no fps chart (an emulator run, or a
+                // device run with no budget on its `run` row) leads with
+                // an ordinary chart, which belongs under the tables with
+                // the rest of them.
+                //
+                // `HERO_IX` is 0 by construction -- `hero` IS
+                // `charts[0]` -- and `rest` is therefore indexed from 1.
+                // Those are indices into the ORIGINAL `charts` vec and
+                // must stay that way: `chart_bounds` and `scenes` are
+                // sized `charts.len()` and `render_chart` uses `ix` to
+                // hit-test and cache with, so renumbering the split
+                // halves would file a chart's bounds under its
+                // neighbour's slot.
+                const HERO_IX: usize = 0;
+                let (hero, rest) = match charts.split_first() {
+                    Some((first, rest)) if first.title == chart_set::FPS_CHART_TITLE => {
+                        (Some(first), rest)
+                    }
+                    _ => (None, &charts[..]),
+                };
+                // ggo-ide's `detail_view` order for everything under the
+                // hero, top to bottom: the two diagnostic tables, the
+                // stored console, then the KPI row, then the charts. The
+                // tables come FIRST there and here for
                 // a reason worth not "tidying" away: the run most in need of
                 // them is a cart that panicked before it ever reached
                 // vsync_wait, which has no frames, no KPIs and no charts at
@@ -1234,6 +1264,7 @@ impl ChartsPanel {
                     .overflow_y_scroll()
                     .p_2()
                     .gap_3()
+                    .children(hero.map(|spec| self.render_chart(HERO_IX, spec, cx)))
                     .child(self.render_failures_table(&report.diagnostics, cx))
                     .child(self.render_panics_table(&report.diagnostics, cx))
                     .child(Self::render_log(LogKind::Console, &detail.console, cx))
@@ -1258,16 +1289,25 @@ impl ChartsPanel {
                         ]
                     } else {
                         let mut out = vec![self.render_kpi_row(&report.tiles, cx)];
-                        // Directly above the first chart -- `charts_section`
-                        // pushes `historic_toggle_row` as its own first row
-                        // for the same reason: it is a statement about every
-                        // chart below it, not about any one of them.
+                        // Directly above the first of the `rest` charts
+                        // -- `charts_section` pushes `historic_toggle_row`
+                        // as its own first row for the same reason: it is
+                        // a statement about every chart below it, not
+                        // about any one of them. The hoisted hero is the
+                        // one chart it does not sit above, and it says
+                        // nothing about that one either: the fps chart
+                        // carries no historic overlay to switch on (see
+                        // `chart_set`, which attaches overlays only to the
+                        // charts ggo-ide overlays).
                         out.push(self.render_historic_toggle(detail.prior_runs, cx));
+                        // `rest`, still under its original indices: the
+                        // hero (when there is one) took index 0, so what
+                        // is left starts at 1.
+                        let first_rest_ix = HERO_IX + usize::from(hero.is_some());
                         out.extend(
-                            charts
-                                .iter()
+                            rest.iter()
                                 .enumerate()
-                                .map(|(ix, spec)| self.render_chart(ix, spec, cx)),
+                                .map(|(ix, spec)| self.render_chart(first_rest_ix + ix, spec, cx)),
                         );
                         out
                     })
@@ -2586,6 +2626,13 @@ mod tests {
     /// so `select_run` produces the full 13-chart set. `frames` is
     /// `1..=n` PLUS a frame 0 (the default-ignored one), matching real
     /// captures.
+    /// The `frame_budget_cycles` every seeded fixture run carries: one
+    /// 60 Hz vsync period at 33.33 MHz, the same number ggo-ide's runs
+    /// record. Bound into the INSERT rather than spelled into its SQL so
+    /// [`DEVICE_FRAME_CYCLES`] cannot describe itself as a multiple of a
+    /// budget the fixture stopped using.
+    const SEEDED_FRAME_BUDGET_CYCLES: i64 = 555_549;
+
     fn seed_run_with_samples(db_path: &std::path::Path, frames: i64) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2596,8 +2643,8 @@ mod tests {
                 .unwrap();
             conn.execute(
                 "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles, label)
-                 VALUES (1, 1, '2026-08-01T00:00:00Z', ?1, 555549, 'arena')",
-                [frames + 1],
+                 VALUES (1, 1, '2026-08-01T00:00:00Z', ?1, ?2, 'arena')",
+                (frames + 1, SEEDED_FRAME_BUDGET_CYCLES),
             )
             .await
             .unwrap();
@@ -2622,6 +2669,26 @@ mod tests {
             )
             .await
             .unwrap();
+        });
+    }
+
+    /// Two vsync periods of the seeded run's budget: run 55's half-rate
+    /// shape, and a `cyc` every frame can derive an fps from.
+    const DEVICE_FRAME_CYCLES: i64 = 2 * SEEDED_FRAME_BUDGET_CYCLES;
+
+    /// Turns the seeded fixture run into a DEVICE capture. `frame.cyc`
+    /// is `NOT NULL DEFAULT 0` and only a device capture writes it, so
+    /// `seed_run_with_samples` alone leaves an emulator-shaped run with
+    /// no FPS chart at all -- which is exactly what the hero slot is
+    /// keyed on.
+    fn seed_frame_cycles(db_path: &std::path::Path) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = ggo_db::open(db_path).await.unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute("UPDATE frame SET cyc = ?1", [DEVICE_FRAME_CYCLES])
+                .await
+                .unwrap();
         });
     }
 
@@ -3400,6 +3467,92 @@ mod tests {
         assert!(
             cx.debug_bounds(KPI_ROW_SELECTOR).is_none(),
             "no KPI row for a run that measured nothing"
+        );
+    }
+
+    /// The one section that does NOT follow ggo-ide's `detail_view`
+    /// order: on a device run the measured-fps chart is the report's
+    /// HERO and is painted ABOVE the diagnostic tables, because "how
+    /// fast is it actually running" is the question the page exists to
+    /// answer and the tables are usually empty.
+    ///
+    /// Everything below it keeps the order the test above pins, and the
+    /// remaining charts stay UNDER the KPI row -- promoting the hero
+    /// must move one chart, not reshuffle the report. The bounds are
+    /// read out of `chart_bounds` by index, which is the second thing
+    /// this pins: the hero keeps its index into the ORIGINAL chart set
+    /// (0), so `chart_bounds`/`scenes` -- both sized `charts.len()` and
+    /// indexed by the same `ix` `render_chart` hit-tests and caches
+    /// with -- stay aligned with `chart_specs()`.
+    #[gpui::test]
+    async fn test_the_fps_chart_is_painted_above_the_diagnostic_tables(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ggo_ide.db");
+        seed_run_with_samples(&db_path, 4);
+        seed_frame_cycles(&db_path);
+        seed_uart(&db_path, &["asset: MISS \"grooble.til\""]);
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.db_path_override = Some(db_path.clone());
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(
+                panel.chart_specs()[0].title,
+                chart_set::FPS_CHART_TITLE,
+                "the device gate is tripped and the fps chart leads the set"
+            );
+        });
+
+        cx.simulate_resize(gpui::size(DEFAULT_WIDTH, px(6000.)));
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(6000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+
+        let (hero, second) = panel.update(cx, |panel, _cx| {
+            let bounds = panel.chart_bounds.borrow();
+            (
+                bounds[0].expect("the fps chart must have been laid out"),
+                bounds[1].expect("the chart under it must have been laid out"),
+            )
+        });
+        let failures = cx
+            .debug_bounds(FAILURES_SELECTOR)
+            .expect("the failed-asset-loads table must be painted");
+        let kpis = cx
+            .debug_bounds(KPI_ROW_SELECTOR)
+            .expect("the KPI row must be painted for a run with frames");
+
+        assert!(
+            hero.origin.y < failures.origin.y,
+            "the fps chart leads the whole report, above even the tables"
+        );
+        assert!(
+            failures.origin.y < kpis.origin.y,
+            "and nothing else moved: the tables still sit above the KPI row"
+        );
+        assert!(
+            kpis.origin.y < second.origin.y,
+            "only ONE chart is promoted -- the rest stay under the KPIs"
         );
     }
 

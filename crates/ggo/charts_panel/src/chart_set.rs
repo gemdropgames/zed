@@ -81,6 +81,15 @@ const OTHER_FUNCTION_NAME: &str = profile::OTHER_FUNCTION_NAME;
 /// constant this module had.
 const TILE_CACHE_TILES: f32 = kpi::TILE_CACHE_TILES as f32;
 
+/// The measured-fps chart's title, and with it the run report's HERO
+/// slot: `render_detail` renders the FIRST chart above the diagnostic
+/// tables when -- and only when -- its title is this one, so the number
+/// that answers "how fast is it actually running" is the first thing on
+/// the page. A literal on either side of that comparison would let the
+/// title drift here and silently demote the chart to the bottom half of
+/// the report with every test still green, so both sides read this.
+pub const FPS_CHART_TITLE: &str = "FPS";
+
 /// The one ignore set this panel has. `ignore::default_set()` is `{0}`:
 /// a cold-cache first frame (every tile a miss, every asset a fresh
 /// upload) is an outlier that flattens the rest of the run. ggo-ide lets
@@ -349,7 +358,7 @@ pub fn build_charts(samples: &RunSamples, prior: &[HistoricRunFrames]) -> Vec<Ch
             charts.insert(
                 0,
                 line(
-                    "FPS",
+                    FPS_CHART_TITLE,
                     &fps_x,
                     Some(kpi::TARGET_FPS as f32),
                     vec![SeriesSpec {
@@ -709,7 +718,7 @@ mod tests {
         assert_eq!(
             titles(&charts),
             vec![
-                "FPS",
+                FPS_CHART_TITLE,
                 "Frame cycles",
                 "Wire cycles per frame vs budget",
                 "Wire breakdown per frame",
@@ -837,7 +846,11 @@ mod tests {
         let charts = build_charts(&device_samples(), &[]);
         assert_eq!(
             titles(&charts)[..3],
-            ["FPS", "Frame cycles", "Wire cycles per frame vs budget"]
+            [
+                FPS_CHART_TITLE,
+                "Frame cycles",
+                "Wire cycles per frame vs budget"
+            ]
         );
     }
 
@@ -848,8 +861,8 @@ mod tests {
     /// wrong one.
     #[test]
     fn the_fps_chart_appears_only_for_a_run_with_a_cycle_counter() {
-        assert!(!titles(&build_charts(&plain_samples(), &[])).contains(&"FPS"));
-        assert!(titles(&build_charts(&device_samples(), &[])).contains(&"FPS"));
+        assert!(!titles(&build_charts(&plain_samples(), &[])).contains(&FPS_CHART_TITLE));
+        assert!(titles(&build_charts(&device_samples(), &[])).contains(&FPS_CHART_TITLE));
     }
 
     /// Run 55's real shape, hand-computed through `kpi::frame_fps`'s
@@ -865,7 +878,10 @@ mod tests {
         }
         samples.frames[2].cyc = 1_666_650;
         let charts = build_charts(&samples, &[]);
-        let chart = charts.iter().find(|c| c.title == "FPS").expect("gated in");
+        let chart = charts
+            .iter()
+            .find(|c| c.title == FPS_CHART_TITLE)
+            .expect("gated in");
         assert_eq!(chart.kind, ChartKind::Line { budget: Some(60.0) });
         assert_eq!(chart.series.len(), 1);
         assert_eq!(chart.series[0].name, "fps");
@@ -885,7 +901,10 @@ mod tests {
         let mut samples = device_samples();
         samples.frames[1].cyc = 0;
         let charts = build_charts(&samples, &[]);
-        let chart = charts.iter().find(|c| c.title == "FPS").expect("gated in");
+        let chart = charts
+            .iter()
+            .find(|c| c.title == FPS_CHART_TITLE)
+            .expect("gated in");
         assert_eq!(chart.x, vec![2.0], "frame 0 ignored, frame 1 unmeasured");
         // The frame-cycles chart still plots every surviving frame.
         let cyc = charts.iter().find(|c| c.title == "Frame cycles").unwrap();
@@ -903,7 +922,7 @@ mod tests {
         }
         let charts = build_charts(&samples, &[]);
         let t = titles(&charts);
-        assert!(!t.contains(&"FPS"));
+        assert!(!t.contains(&FPS_CHART_TITLE));
         // Membership is not enough: with no FPS chart to sit under, the
         // cycles chart must fall back to its original slot BELOW the
         // wire-budget chart it is the counterpart of -- not to index 0,
