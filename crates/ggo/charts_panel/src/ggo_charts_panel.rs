@@ -120,6 +120,7 @@ const RERUN_BUTTON_SELECTOR: &str = "ggo-charts-rerun-button";
 const INSPECT_CLOSE_SELECTOR: &str = "ggo-charts-inspect-close-button";
 const FAULT_BACK_SELECTOR: &str = "ggo-charts-fault-back";
 const FAULT_TILES_SELECTOR: &str = "ggo-charts-fault-tiles";
+const FAULT_RAW_TOGGLE_SELECTOR: &str = "ggo-charts-fault-raw-toggle";
 
 /// The picker row for perf run at list index `ix` -- one selector per row,
 /// so a test can aim a real click at a specific run.
@@ -182,6 +183,22 @@ const FAULT_NO_FPS: &str = "fps needs a linked perf run's frame budget";
 /// different home.
 const NO_DUMP_FILE: &str = "no dump file on disk for this fault";
 
+/// The `fault` row stored no bytes. A state, not a cause: the daemon
+/// snapshots its ring, and an empty ring is an empty dump.
+const NO_RAW_BYTES: &str = "no raw bytes stored for this dump";
+
+/// How much of a dump [`ChartsPanel::hex_rows`] renders.
+///
+/// 64 KiB is 4096 list rows. Nothing caps the BLOB `faults::import`
+/// writes (task 2's report says so explicitly), and a megabyte-scale
+/// dump would otherwise become tens of thousands of formatted `String`s
+/// built eagerly, before `uniform_list` ever gets to skip the ones off
+/// screen -- the formatting, not the layout, is what would cost. The
+/// remainder is reported as a trailing row rather than silently dropped:
+/// the hex view exists precisely for the cases where the text decode
+/// lost something, so it must never quietly lose something itself.
+const RAW_HEX_CAP: usize = 64 * 1024;
+
 /// The three log surfaces this panel renders. Every string that identifies
 /// one hangs off this enum rather than being passed to [`ChartsPanel::render_log`]
 /// as a loose argument, and that is the whole point: an empty-state
@@ -199,6 +216,9 @@ enum LogKind {
     DeviceLog,
     /// The text `ggo-uartd` decoded out of a fault dump's ring window.
     Fault,
+    /// That same dump's bytes, as a hex dump -- the view for when the
+    /// decode above lost something.
+    FaultRaw,
 }
 
 impl LogKind {
@@ -211,6 +231,7 @@ impl LogKind {
             Self::Console => "Console — guest UART",
             Self::DeviceLog => "Log — ggo-diag pipeline",
             Self::Fault => "Dump — decoded UART",
+            Self::FaultRaw => "Dump — raw bytes",
         }
     }
 
@@ -219,6 +240,7 @@ impl LogKind {
             Self::Console => "ggo-charts-console",
             Self::DeviceLog => "ggo-charts-device-log",
             Self::Fault => "ggo-charts-fault-log",
+            Self::FaultRaw => "ggo-charts-fault-raw",
         }
     }
 
@@ -234,6 +256,7 @@ impl LogKind {
             Self::Console => report::NO_UART,
             Self::DeviceLog => NO_DEVICE_LOG,
             Self::Fault => NO_FAULT_TEXT,
+            Self::FaultRaw => NO_RAW_BYTES,
         }
     }
 }
@@ -512,6 +535,10 @@ pub struct ChartsPanel {
     device_log: Option<DeviceLogState>,
     /// Set instead of `detail` when the selection is a fault dump.
     fault: Option<FaultState>,
+    /// Whether the fault view's hex dump is expanded. OFF by default:
+    /// the decoded text answers the question on almost every dump, and
+    /// the bytes are for the cases where it did not.
+    fault_raw_expanded: bool,
     /// The dump file the fault header's Copy button hands out, when it is
     /// still on disk -- `ggo-uartd` keeps only its last `KEEP_DUMPS`, and
     /// the row outlives the file. Resolved once per selection rather than
@@ -587,6 +614,7 @@ impl ChartsPanel {
             detail: None,
             device_log: None,
             fault: None,
+            fault_raw_expanded: false,
             fault_raw_path: None,
             rerun_note: None,
             run_log_path: None,
@@ -776,6 +804,7 @@ impl ChartsPanel {
         self.detail = None;
         self.device_log = None;
         self.fault = None;
+        self.fault_raw_expanded = false;
         self.fault_raw_path = None;
         self.rerun_note = None;
         self.run_log_path = None;
@@ -932,6 +961,12 @@ impl ChartsPanel {
         .detach();
     }
 
+    /// Show or hide the selected dump's bytes.
+    fn toggle_fault_raw(&mut self, cx: &mut Context<Self>) {
+        self.fault_raw_expanded = !self.fault_raw_expanded;
+        cx.notify();
+    }
+
     /// Read runs from `path` instead of `~/.ggo/ggo_ide.db`.
     ///
     /// Public only so `ggo_emu_panel`'s "Re-run hops to the charts panel"
@@ -952,6 +987,7 @@ impl ChartsPanel {
         self.detail = None;
         self.device_log = None;
         self.fault = None;
+        self.fault_raw_expanded = false;
         self.fault_raw_path = None;
         self.rerun_note = None;
         self.run_log_path = None;
@@ -1424,6 +1460,7 @@ impl ChartsPanel {
                                     ),
                             )
                             .child(self.render_copy_dump_button())
+                            .child(self.render_raw_toggle(cx))
                             .child(
                                 Label::new(format!("{}: {}", row.kind, row.detail))
                                     .size(LabelSize::Small),
@@ -1505,7 +1542,79 @@ impl ChartsPanel {
             .child(self.render_failures_table(&diagnostics, cx))
             .child(self.render_panics_table(&diagnostics, cx))
             .child(Self::render_log(LogKind::Fault, &text, cx))
+            // Under the decoded text, and only on request: the bytes are
+            // the fallback for a decode that lost something, not the
+            // reading order.
+            .children(self.fault_raw_expanded.then(|| {
+                Self::render_log(
+                    LogKind::FaultRaw,
+                    &Arc::new(Self::hex_rows(&detail.raw)),
+                    cx,
+                )
+            }))
             .into_any_element()
+    }
+
+    /// The header's Raw bytes switch. A labelled `Button` rather than an
+    /// icon: the affordance is not guessable from a glyph, and the header
+    /// already carries two icon buttons.
+    fn render_raw_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| FAULT_RAW_TOGGLE_SELECTOR.to_string())
+            .child(
+                Button::new("ggo-charts-fault-raw", "Raw bytes")
+                    .label_size(LabelSize::XSmall)
+                    .toggle_state(self.fault_raw_expanded)
+                    .tooltip(Tooltip::text(
+                        "Show the dump's bytes, for a decode that lost something",
+                    ))
+                    .on_click(Self::guarded_listener(cx, |this, _event, _window, cx| {
+                        this.toggle_fault_raw(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// `bytes` as a classic hex dump: 16 bytes per row, as
+    /// `{offset:08x}  {hex pairs}  |{ascii}|`, with every byte outside
+    /// printable ASCII shown as `.` in the gutter.
+    ///
+    /// The hex column is padded to a fixed width so a short final row
+    /// keeps its gutter in the same column as every row above it --
+    /// `render_log` paints in a buffer font, so the columns line up.
+    ///
+    /// Truncated at [`RAW_HEX_CAP`], with the remainder named in a
+    /// trailing row rather than dropped.
+    fn hex_rows(bytes: &[u8]) -> Vec<String> {
+        // 16 pairs and the 15 spaces between them.
+        const HEX_WIDTH: usize = 16 * 3 - 1;
+        let shown = bytes.len().min(RAW_HEX_CAP);
+        let mut rows: Vec<String> = bytes[..shown]
+            .chunks(16)
+            .enumerate()
+            .map(|(row, chunk)| {
+                let hex = chunk
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let gutter: String = chunk
+                    .iter()
+                    .map(|&byte| {
+                        if byte.is_ascii_graphic() || byte == b' ' {
+                            char::from(byte)
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                format!("{:08x}  {hex:<HEX_WIDTH$}  |{gutter}|", row * 16)
+            })
+            .collect();
+        if let Some(rest) = bytes.len().checked_sub(shown).filter(|rest| *rest > 0) {
+            rows.push(format!("… {rest} more bytes"));
+        }
+        rows
     }
 
     /// The decoded text with the line the dump was taken for marked.
@@ -2988,6 +3097,29 @@ mod tests {
         assert_eq!(ChartsPanel::mark_fault_line(&detail), detail.text);
     }
 
+    /// The hex dump's row format, pinned: offset, then the bytes, then
+    /// the gutter with everything unprintable as a dot.
+    #[gpui::test]
+    fn hex_rows_are_offset_bytes_and_gutter(_cx: &mut gpui::App) {
+        let rows = ChartsPanel::hex_rows(b"AB\x00\xff");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], format!("00000000  {:<47}  |AB..|", "41 42 00 ff"));
+
+        // A second row restarts the gutter and advances the offset by 16.
+        let rows = ChartsPanel::hex_rows(&[b'z'; 17]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].starts_with("00000010  7a "), "{}", rows[1]);
+        assert!(rows[1].ends_with("|z|"), "{}", rows[1]);
+
+        // Past the cap the remainder is NAMED, never dropped: this view
+        // exists for the dumps whose decode lost something.
+        let rows = ChartsPanel::hex_rows(&vec![0u8; RAW_HEX_CAP + 3]);
+        assert_eq!(rows.len(), RAW_HEX_CAP / 16 + 1);
+        assert_eq!(rows.last().map(String::as_str), Some("… 3 more bytes"));
+
+        assert!(ChartsPanel::hex_rows(&[]).is_empty(), "and an empty dump");
+    }
+
     /// The fault view paints, and paints its sections in the order the
     /// design gives them: digest tiles, then the two diagnostic tables,
     /// then the decoded text.
@@ -3053,6 +3185,38 @@ mod tests {
         assert!(tiles.origin.y < failures.origin.y, "tiles lead");
         assert!(failures.origin.y < panics.origin.y, "loads above panics");
         assert!(panics.origin.y < log.origin.y, "the text goes last");
+        assert!(
+            cx.debug_bounds(LogKind::FaultRaw.selector()).is_none(),
+            "the bytes are not painted until they are asked for"
+        );
+
+        // The toggle the header's button drives: the hex dump appears,
+        // under the decoded text.
+        panel.update(cx, |panel, cx| panel.toggle_fault_raw(cx));
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        let raw = cx
+            .debug_bounds(LogKind::FaultRaw.selector())
+            .expect("the hex dump must be painted once the toggle is on");
+        let log = cx
+            .debug_bounds(LogKind::Fault.selector())
+            .expect("and the decoded text stays");
+        assert!(log.origin.y < raw.origin.y, "the bytes sit under the text");
+
+        // And back off again -- the toggle is a toggle.
+        panel.update(cx, |panel, cx| panel.toggle_fault_raw(cx));
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(DEFAULT_WIDTH, px(2000.)),
+            |_window, _cx| panel.clone().into_any_element(),
+        );
+        assert!(
+            cx.debug_bounds(LogKind::FaultRaw.selector()).is_none(),
+            "the second click puts them away"
+        );
     }
 
     /// The reports view is a SINGLETON center tab: `open_charts_item`
@@ -4281,16 +4445,28 @@ mod tests {
             "a state, not a cause: {fault}"
         );
 
-        // And the three surfaces stay distinguishable in a painted frame.
+        // The hex view is a fourth surface over the SAME dump, so its
+        // absence is a fourth fact again: the row stored no bytes.
+        let raw = LogKind::FaultRaw.empty_state();
+        assert_eq!(raw, NO_RAW_BYTES);
+        assert_ne!(raw, fault, "an empty ring is not an undecodable one");
+        assert!(
+            raw.starts_with("no raw bytes stored"),
+            "a state, not a cause: {raw}"
+        );
+
+        // And the four surfaces stay distinguishable in a painted frame.
         let selectors = [
             LogKind::Console.selector(),
             LogKind::DeviceLog.selector(),
             LogKind::Fault.selector(),
+            LogKind::FaultRaw.selector(),
         ];
         let titles = [
             LogKind::Console.title(),
             LogKind::DeviceLog.title(),
             LogKind::Fault.title(),
+            LogKind::FaultRaw.title(),
         ];
         for (ix, first) in selectors.iter().enumerate() {
             for second in &selectors[ix + 1..] {
