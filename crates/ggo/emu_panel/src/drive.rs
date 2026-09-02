@@ -72,7 +72,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ggo_emu_core::apu::Apu;
 use ggo_emu_core::cart::Cart;
-use ggo_emu_core::cpu::Cpu;
+use ggo_emu_core::cpu::{Cpu, Trap};
 use ggo_emu_core::mmu::Mmu;
 use ggo_emu_core::peripherals::{Peripherals, SCREEN_HEIGHT, SCREEN_WIDTH};
 use ggo_emu_core::ppu::PpuSnapshot;
@@ -499,7 +499,11 @@ fn run(
     // cart's own TOC sizes the pools: `run_cart` refuses to size them by
     // scanning a card directory it was not explicitly given, and the pane
     // never gives one -- neighbouring files in the cart's folder must not
-    // change the arena this cart is granted.
+    // change the arena this cart is granted. Note the deliberate
+    // asymmetry with `set_card_dir` below: `asset_load` DOES resolve
+    // against the cart's directory at runtime. Loading from a directory
+    // and sizing a pool from it are different questions, and only the
+    // second one can silently change what the cart is granted.
     let (vram_asset_bytes, ram_asset_bytes) =
         ggo_emu_core::assets::pool_demand(cart.toc.as_deref(), None);
     let plan = sandbox::plan(
@@ -508,6 +512,14 @@ fn run(
         ram_asset_bytes,
         cart.header.ram_needed.max(sandbox::MIN_ARENA),
     );
+    // The arena is per-cart now, so its size is no longer assumable from
+    // the outside -- report it the way `run_cart`'s banner does.
+    uart.push_line(format!(
+        "[ram] arena {} KiB, vram pool {} KiB, ram pool {} KiB",
+        plan.arena_len / 1024,
+        plan.vram_pool.1 / 1024,
+        plan.ram_pool.1 / 1024,
+    ));
     let mut mmu = Mmu::with_plan(plan);
     // There is no XIP flash any more: the loader copies the cart body into
     // the PSRAM code window, which is what the OS does on device.
@@ -519,6 +531,14 @@ fn run(
         ));
     }
     let mut cpu = Cpu::new(sandbox::XIP_BASE.wrapping_add(cart.header.entry_offset));
+    // ABI mode has no OS to program the PMP, so install the sandbox the OS
+    // installs before it jumps to a cart, exactly as `run_cart` and the
+    // wasm front end do. It is load-bearing, not ceremony: the flat
+    // `psram` backing bounds nothing by itself, and `cpu`'s PMP check
+    // short-circuits outside U-mode -- so without this an arena overrun or
+    // a store into the cart's own code window corrupts guest memory
+    // silently instead of halting the run.
+    ggo_emu_core::cpu::enter_sandbox(&mut cpu, &plan);
 
     // Same wall-clock RNG seed `run_cart` uses, so successive runs of the
     // same cart differ but a single run stays deterministic once started.
@@ -732,6 +752,23 @@ fn run(
             // is the cart's verdict on its own work, and the pane already
             // shows it in the reason.
             FrameEvent::Exit(code) => break (format!("cart exited with {code}"), false),
+            // The whole die is backed and the sandbox's arena entry ends
+            // exactly at the granted arena, so a stack or heap that runs
+            // off the end arrives as a PMP fault rather than an unmapped
+            // access. `run_cart` names that case rather than reporting a
+            // generic escape, and so must the pane -- it is the commonest
+            // way a cart dies, and the arena it overran is per-cart.
+            FrameEvent::Fault(Trap::PmpFault { pc, addr, access })
+                if ggo_emu_core::mmu::is_arena_overrun(&plan, addr, access) =>
+            {
+                break (
+                    format!(
+                        "out of memory: cart accessed {addr:#010x} past its {}-byte RAM arena at pc={pc:#010x}",
+                        plan.arena_len
+                    ),
+                    true,
+                );
+            }
             // The CPU trapped (bad instruction, bad access): the run died,
             // which is an error however the cart got there.
             FrameEvent::Fault(trap) => break (format!("cpu fault: {trap:?}"), true),
@@ -892,8 +929,8 @@ fn find_tap(ram: &[u8], tap_addr: &mut Option<usize>) -> Option<usize> {
 /// host-side switch that makes serialization cost nothing in ordinary
 /// runs. No-op for carts without a tap.
 fn arm_world_tap(mmu: &mut ggo_emu_core::mmu::Mmu, tap_addr: &mut Option<usize>, on: bool) {
-    let arena_range = arena_range(mmu);
-    let Some(arena) = mmu.psram.get_mut(arena_range) else {
+    let bounds = arena_range(mmu);
+    let Some(arena) = mmu.psram.get_mut(bounds) else {
         return;
     };
     let Some(addr) = find_tap(arena, tap_addr) else {
@@ -983,7 +1020,7 @@ pub mod fixture {
     // dispatch -> PPU compose -> RGB565 -> BGRA -> channel), just of a
     // cart small enough to write by hand.
 
-    use ggo_emu_core::cart::{HEADER_LEN, MAGIC, SUPPORTED_HEADER_VERSION};
+    use ggo_emu_core::cart::{FLAG_HAS_ASSET_TOC, HEADER_LEN, MAGIC, SUPPORTED_HEADER_VERSION};
     use ggo_emu_core::crc32::crc32;
 
     /// The cart header title `green_screen_cart` stamps -- also the
@@ -1011,6 +1048,18 @@ pub mod fixture {
     /// 12-bit `addi` immediate.
     fn lui(rd: u32, imm20: u32) -> u32 {
         ((imm20 & 0xF_FFFF) << 12) | (rd << 7) | 0x37
+    }
+
+    /// `sw rs2, imm(rs1)` -- the only store any fixture needs, and only
+    /// [`overrun_cart`] needs it.
+    fn sw(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        let imm = imm as u32;
+        (((imm >> 5) & 0x7F) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (2 << 12)
+            | ((imm & 0x1F) << 7)
+            | 0x23
     }
 
     /// `jal x0, offset` (offset in bytes, relative to this instruction).
@@ -1216,6 +1265,79 @@ pub mod fixture {
         out.extend_from_slice(&body);
         out
     }
+
+    /// Asset payload [`overrun_cart`] carries in its TOC.
+    /// `sandbox::plan` carves the read-only asset pools off the TOP of
+    /// the die and leaves the rest as arena, so a cart with assets is the
+    /// only kind whose arena ends below the die top -- with no assets the
+    /// arena IS the rest of the die and "past the arena" cannot be
+    /// expressed at all.
+    const OVERRUN_ASSET_BYTES: u32 = 64 * 1024;
+
+    /// Guest address [`overrun_cart`] stores to: the first byte above its
+    /// arena, which is the base of the pool the plan carved for
+    /// [`OVERRUN_ASSET_BYTES`] (granule-aligned, and 64 KiB is already a
+    /// whole number of granules, so this is exact).
+    pub const OVERRUN_ADDR: u32 =
+        super::sandbox::PSRAM_BASE + super::sandbox::PSRAM_BYTES - OVERRUN_ASSET_BYTES;
+
+    /// A cart whose very first store runs off the end of its arena, then
+    /// -- if it somehow survives that -- paints green forever like
+    /// [`green_screen_cart`]. The green tail is the point: a run that
+    /// forgets to install the cart PMP does not fault at all, so the
+    /// missing sandbox shows up as frames arriving rather than as a
+    /// timeout.
+    pub fn overrun_cart() -> Vec<u8> {
+        const TITLE: &str = "Overrun Fix";
+        let body: Vec<u32> = vec![
+            lui(A0, OVERRUN_ADDR >> 12), // a0 = first byte above the arena
+            sw(A0, 0, 0),                // *a0 = 0 -- the pool is read-only
+            addi(A0, 0),                 // bank 0
+            addi(A1, 0),                 // entry 0
+            addi(A2, GREEN as i32),      // colour
+            addi(A7, SYS_SET_PALETTE),   //
+            ECALL,                       //
+            addi(A7, SYS_PRESENT),       // loop:
+            ECALL,                       //
+            addi(A7, SYS_VSYNC_WAIT),    //
+            ECALL,                       //
+            jal_x0(-16),                 // back to `loop`
+        ];
+        let body: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        // A one-entry GGO2 section (`ggo_asset_formats::Section`): 8-byte
+        // header, one 13-byte TOC entry, then the blob itself -- which has
+        // to really be there, since `Section::parse` validates every
+        // entry's blob range and `pool_demand` charges the pools from the
+        // bytes it finds, not from the declared length.
+        let mut toc: Vec<u8> = Vec::with_capacity(OVERRUN_ASSET_BYTES as usize + 32);
+        toc.extend_from_slice(b"GGO2");
+        toc.extend_from_slice(&1u16.to_le_bytes()); // section version
+        toc.extend_from_slice(&1u16.to_le_bytes()); // entry count
+        toc.extend_from_slice(&0u32.to_le_bytes()); // path_hash -- never looked up
+        toc.push(1); // kind Til: a RAM-pool kind
+        toc.extend_from_slice(&0u32.to_le_bytes()); // blob offset
+        toc.extend_from_slice(&OVERRUN_ASSET_BYTES.to_le_bytes());
+        toc.resize(toc.len() + OVERRUN_ASSET_BYTES as usize, 0);
+
+        let mut h = [0u8; HEADER_LEN];
+        h[0x00..0x04].copy_from_slice(&MAGIC);
+        h[0x04..0x06].copy_from_slice(&SUPPORTED_HEADER_VERSION.to_le_bytes());
+        h[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // required_abi
+        h[0x08..0x08 + TITLE.len()].copy_from_slice(TITLE.as_bytes());
+        h[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes()); // entry_offset
+        h[0x2C..0x30].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        h[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // save_bytes
+        h[0x34..0x38].copy_from_slice(&0u32.to_le_bytes()); // ram_needed
+        h[0x38..0x3C].copy_from_slice(&FLAG_HAS_ASSET_TOC.to_le_bytes());
+        let crc = crc32(&h[0x00..0x3C]);
+        h[0x3C..0x40].copy_from_slice(&crc.to_le_bytes());
+
+        let mut out = h.to_vec();
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&toc);
+        out
+    }
 }
 
 /// Helpers other modules' tests drive a real run through.
@@ -1334,6 +1456,38 @@ mod tests {
         let out = rgb565_to_bgra(&vec![0x1234u16; (WIDTH * HEIGHT) as usize]);
         assert_eq!(out.len(), (WIDTH * HEIGHT * 4) as usize);
         assert!(out.chunks_exact(4).all(|px| px[3] == 0xFF));
+    }
+
+    // ------------------------------------------------------- the sandbox
+
+    /// The cart PMP is what bounds the arena now -- the flat `psram`
+    /// backing does not -- so a cart that stores past the arena it was
+    /// granted must halt, and halt saying so. Without `enter_sandbox` the
+    /// store lands silently and the cart paints green forever, which is
+    /// exactly what the `is_err` assertion catches (a frame arriving at
+    /// all means no fault fired).
+    #[test]
+    fn a_store_past_the_arena_halts_the_run_out_of_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overrun.ggo");
+        std::fs::write(&path, fixture::overrun_cart()).unwrap();
+
+        let (session, rx) = start(path, "overrun.ggo".into(), None);
+        assert!(
+            rx.recv_blocking().is_err(),
+            "the run must die on its first store, never reaching a frame"
+        );
+        let finished = session.wait();
+
+        assert!(finished.is_error, "an arena overrun is a failed run");
+        assert!(
+            finished.reason.contains("out of memory")
+                && finished
+                    .reason
+                    .contains(&format!("{:#010x}", fixture::OVERRUN_ADDR)),
+            "the halt must name the overrun and the address: {}",
+            finished.reason
+        );
     }
 
     // ------------------------------------------------------- the audio tap
