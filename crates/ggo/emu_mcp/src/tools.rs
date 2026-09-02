@@ -93,12 +93,12 @@ pub fn tool_list() -> Value {
           "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (worlds/arena) or file (assets/worlds/arena.toml). Returns {cart, world, lines}: hand `cart` to emu_start or emu_run. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call) — and while it runs, every other tool against this Zed waits, because the host serves one request at a time. Errors carry emd's own failure line.",
           "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem, e.g. worlds/arena" } })) },
         { "name": "hw_flash",
-          "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=115200, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
+          "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=460800, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
           "inputSchema": with(json!({
               "world": { "type": "string", "description": "World stem to bake in as the boot world, e.g. worlds/chase_cam" },
               "rebuild_gateware": { "type": "boolean", "description": "Re-run place-and-route (~20 min) instead of reusing the cached bitstream; only needed after a gateware change (default false)" },
               "tty": { "type": "string", "description": "Serial device, e.g. /dev/ttyUSB0 (default: the first port the panel's scan found)" },
-              "baud": { "type": "number", "description": "UART baud (default 115200)" },
+              "baud": { "type": "number", "description": "UART baud (default 460800)" },
               "collect_seconds": { "type": "number", "description": "How long the post-boot gameplay telemetry capture runs before the flash ends on its own (default 120)" },
               "telemetry": { "type": "boolean", "description": "Force GemOS's telemetry feature on in the firmware build (default false; firmware already defaults it on)" }
           })) },
@@ -982,7 +982,7 @@ mod tests {
             assert!(line.contains(r#""rebuild_gateware":true"#), "{line}");
             assert!(line.contains(r#""collect_seconds":30"#), "{line}");
             assert!(line.contains(r#""tty":null"#), "an unset knob travels as null: {line}");
-            Ok(r#"{"id":1,"ok":true,"data":{"started":true,"config":{"world":"worlds/chase_cam","rebuild_gateware":true,"tty":"/dev/ttyUSB0","baud":115200,"collect_seconds":30,"telemetry":false}}}"#.to_string())
+            Ok(r#"{"id":1,"ok":true,"data":{"started":true,"config":{"world":"worlds/chase_cam","rebuild_gateware":true,"tty":"/dev/ttyUSB0","baud":460800,"collect_seconds":30,"telemetry":false}}}"#.to_string())
         };
         let (content, is_err) = call_tool(
             "hw_flash",

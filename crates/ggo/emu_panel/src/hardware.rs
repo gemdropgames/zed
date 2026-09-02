@@ -1579,7 +1579,7 @@ mod tests {
     fn the_effective_config_fills_the_scanned_port_and_the_diag_defaults() {
         let effective = effective_config(&ready_env(), &FlashConfig::default());
         assert_eq!(effective.tty.as_deref(), Some("/dev/ttyUSB0"));
-        assert_eq!(effective.baud, Some(115_200));
+        assert_eq!(effective.baud, Some(460_800));
         assert_eq!(effective.collect_seconds, Some(120));
         let named = FlashConfig { tty: Some("/dev/ttyUSB7".into()), baud: Some(9600), ..Default::default() };
         let effective = effective_config(&ready_env(), &named);
@@ -1659,7 +1659,7 @@ mod tests {
             flash_args(Path::new("/game"), "/dev/ttyUSB0", &effective_config(&ready_env(), &arena))
         );
         // Explicit, not left to ggo-diag: the reported set is the run set.
-        assert!(request.args.windows(2).any(|w| w == ["--baud", "115200"]), "{:?}", request.args);
+        assert!(request.args.windows(2).any(|w| w == ["--baud", "460800"]), "{:?}", request.args);
         assert!(request.args.windows(2).any(|w| w == ["--collect-seconds", "120"]), "{:?}", request.args);
     }
 
