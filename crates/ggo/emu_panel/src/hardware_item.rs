@@ -332,10 +332,13 @@ impl HardwareSetupItem {
         } else {
             (IconName::Warning, Color::Error)
         };
+        // The remedy outranks `found` on an unmet row: a stuck board fills
+        // `found` with the relay pty it cannot flash through, and the path
+        // is the one thing a reader does not need to see there.
         let detail = match (&requirement.found, &requirement.remedy) {
-            (Some(found), _) => found.clone(),
-            (None, Remedy::Install(what)) => format!("ZedGG will run: {what}"),
-            (None, Remedy::Manual(what)) => what.clone(),
+            (Some(found), Remedy::Satisfied) => found.clone(),
+            (_, Remedy::Install(what)) => format!("ZedGG will run: {what}"),
+            (_, Remedy::Manual(what)) => what.clone(),
             (None, Remedy::Satisfied) => requirement.why.to_string(),
         };
         h_flex()

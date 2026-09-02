@@ -402,8 +402,13 @@ pub struct Requirement {
 }
 
 impl Requirement {
+    /// Derived from the remedy, not from `found`: a row can have found
+    /// something and still be unmet -- a stuck board whose `ggo-uartd`
+    /// relay pty resolves fills `found` with a pty that has nothing
+    /// behind it. Every row computes its remedy already, and that is the
+    /// value the page's icon, colors and counts must agree with.
     pub fn satisfied(&self) -> bool {
-        self.found.is_some()
+        matches!(self.remedy, Remedy::Satisfied)
     }
 }
 
@@ -2011,6 +2016,10 @@ mod tests {
             .requirements()
             .pop()
             .expect("the board row is the last requirement");
+        assert!(
+            !board_row.satisfied(),
+            "the relay in `found` must not green-check the row: {board_row:?}"
+        );
         assert!(
             matches!(&board_row.remedy, Remedy::Manual(what) if what.contains("replug")),
             "{:?}",
