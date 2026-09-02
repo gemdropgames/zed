@@ -24,6 +24,13 @@ use crate::EmuPanel;
 use crate::input::{SELECT_BIT, button_bit};
 use crate::menu;
 
+/// A pack is a cargo build, and it runs ON the single foreground dispatch
+/// loop -- every other socket request queues behind it. Longer than the
+/// bridge's own pack timeout, so the bridge gives up first and this only
+/// guards against a wedged `emd` owning the socket for the rest of the
+/// process's life.
+const HOST_PACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
 /// Foreground registry of live panels (keyed by absolute project root)
 /// and of every live workspace (keyed by entity id — its root is resolved
 /// live, since worktrees attach after construction). Workspaces let a
@@ -334,7 +341,8 @@ async fn await_world_ready<T>(
         match panel.update(cx, |p, _| read(p)) {
             Ok(value) => return Ok(value),
             Err(reason)
-                if reason.contains("still loading") && std::time::Instant::now() < deadline =>
+                if reason.contains(ggo_world_panel::WORLD_STILL_LOADING)
+                    && std::time::Instant::now() < deadline =>
             {
                 cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
             }
@@ -580,7 +588,13 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
     // window at all, and a flash in flight is exactly when demanding a
     // window would deny the caller the one thing this tool is for.
     if let Cmd::FlashCancel { .. } = cmd {
-        let panel = target.panel.ok_or("no emu panel open in this workspace")?;
+        // No panel registered is the strongest possible "nothing is
+        // flashing", and the tool promises `{cancelled: false}` for that
+        // -- erroring instead would fail the one call whose whole job is
+        // to be safe to make when the caller is unsure.
+        let Some(panel) = target.panel else {
+            return Ok(serde_json::json!({ "cancelled": false }));
+        };
         let cancelled = panel
             .update(cx, |p, cx| p.remote_flash_cancel(cx))
             .map_err(|e| e.to_string())?;
@@ -746,8 +760,34 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 .update(cx, |p, cx| p.remote_pack_plan(&world, cx))
                 .map_err(|e| e.to_string())??;
             // BLOCKING child: the runner is the panel's own (a test's fake
-            // or the system one), run off the UI thread.
-            let capture = cx.background_spawn(async move { runner(request) }).await;
+            // or the system one), run off the UI thread. Detached and
+            // reported over a channel rather than awaited as a `Task`,
+            // because dropping a `Task` cancels it: on timeout the child
+            // must be left to finish its writes, not killed mid-pack.
+            let (finished, wait) = smol::channel::bounded(1);
+            cx.background_spawn(async move {
+                finished.send(runner(request)).await.ok();
+            })
+            .detach();
+            let timer = cx.background_executor().timer(HOST_PACK_TIMEOUT);
+            let outcome = smol::future::or(
+                async { Some(wait.recv().await) },
+                async move {
+                    timer.await;
+                    None
+                },
+            )
+            .await;
+            let capture = match outcome {
+                Some(Ok(capture)) => capture,
+                Some(Err(e)) => return Err(format!("pack reported nothing: {e}")),
+                None => {
+                    return Err(format!(
+                        "pack still running after {}s — it keeps going in the background; check target/ggo-emulate/ later",
+                        HOST_PACK_TIMEOUT.as_secs()
+                    ));
+                }
+            };
             if !capture.ok {
                 return Err(format!("pack failed: {}", menu::failure_reason(&capture)));
             }

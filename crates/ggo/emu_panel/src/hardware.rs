@@ -1710,7 +1710,7 @@ mod tests {
         assert!(!payload.ready);
         let codes: Vec<&str> = payload.missing.iter().map(|m| m.code.as_str()).collect();
         assert_eq!(codes, ["emd", "port_stuck"]);
-        assert!(payload.missing[1].label.contains("replug") || !payload.missing[1].label.is_empty());
+        assert!(!payload.missing[1].label.is_empty());
     }
 
     #[test]

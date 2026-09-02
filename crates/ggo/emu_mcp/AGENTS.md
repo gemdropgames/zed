@@ -1,9 +1,11 @@
 # zedgg-emu-mcp — agent contract
 
-An MCP (stdio) server for LOCK-STEP play of the GGO emulator panel inside
-a running Zed session: boot paused, then one frame per call — the caller
-(a script, an AI, any system) sends pad input and gets the cart's own
-world state back. The run is visible in Zed's panel throughout.
+An MCP (stdio) server that drives the GGO toolchain inside a running Zed
+session: emulator control in both modes (LOCK-STEP — boot paused, one
+frame per call, the cart's own world state back — and free-running), the
+PPU inspector, cart packing, hardware flash with its readiness probe,
+perf reports, and reads of the authored world. Everything it does is
+visible in the user's Zed as it happens.
 
 ## Wiring
 
@@ -54,7 +56,7 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `fetch_ggo_report { run }` | paste-ready summary of one perf run (+ its ggo-diag log path) |
 | `open_ggo_report { run }` | open the Reports tab in Zed on that run (`{requested: true}` — the panel lands on the runs list if its db lacks the run) |
 | `close_ggo_report { run? }` | close the Reports tab (only if it shows `run`, when given) |
-| `world_list` | every world in the project: `[{ stem, rel_path }]` |
+| `world_list` | every world in the project: `{ worlds: [{ stem, rel_path }] }` |
 | `world_open { world }` | open a world in the World panel |
 | `world_read { world? }` | the authored world: entities/components/pos, instances, backgrounds, selection, dirty |
 | `world_screenshot { world?, full? }` | the authored world as PNG: device screen at the camera, or the whole scene |
@@ -89,14 +91,19 @@ they need no live session; `open_ggo_report`/`close_ggo_report` drive the
 Reports tab.
 
 This bridge is single-threaded: `main` reads one stdin line, serves it,
-and only then reads the next. Every other tool is bounded by a 15s socket
-timeout, but `hw_flash_wait` blocks for as long as its `timeout_s` (default
-1800s) — and while it does, NO other call here is served, `hw_flash_status`
-included. Many MCP clients give up well before 1800s. Nothing is lost when
-that happens: the flash runs inside Zed, not here, and flash status is
-per-run and persists, so calling `hw_flash_wait` again resumes waiting on
-the same flash (likewise after a socket blip aborts one). Prefer a
-`timeout_s` you will actually sit through (~300) and re-call.
+and only then reads the next. Most tools are bounded by a 15s socket
+timeout, but two are not. `cart_pack` blocks for the whole build (up to
+10 min here, 15 min host-side), and `hw_flash_wait` blocks for as long as
+its `timeout_s` (default 1800s) — and while either does, NO other call
+here is served, `hw_flash_status` included. Zed's host is single-threaded
+too: a `cart_pack` in flight also stalls every OTHER agent's tools against
+that same Zed until the pack ends.
+
+Many MCP clients give up well before 1800s. Nothing is lost when that
+happens: the flash runs inside Zed, not here, and flash status is per-run
+and persists, so calling `hw_flash_wait` again resumes waiting on the same
+flash (likewise after a socket blip aborts one). Prefer a `timeout_s` you
+will actually sit through (~300) and re-call.
 
 ## The loop
 

@@ -79,10 +79,10 @@ pub fn tool_list() -> Value {
         { "name": "emu_run",
           "description": "Boot a cart free-running in the Zed emulator panel — the panel's own Run button, no lock-step. The game plays itself; watch it with emu_screenshot and emu_uart, pause with emu_pause. Use emu_start instead when you need to drive input frame by frame. Pack first: cart_pack (or emd pack-ggo).",
           "inputSchema": with(json!({ "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. target/ggo-emulate/worlds-arena.ggo" } })) },
-        { "name": "emu_pause", "description": "Pause the live run at the next frame boundary. Returns {paused, frame, running}.", "inputSchema": with(json!({})) },
-        { "name": "emu_resume", "description": "Resume a paused run. Returns {paused, frame, running}.", "inputSchema": with(json!({})) },
+        { "name": "emu_pause", "description": "Pause the live run at the next frame boundary. Returns {paused, frame, running} — running = a run is live (true even while paused).", "inputSchema": with(json!({})) },
+        { "name": "emu_resume", "description": "Resume a paused run. Returns {paused, frame, running} — running = a run is live (true even while paused).", "inputSchema": with(json!({})) },
         { "name": "emu_debug",
-          "description": "The PPU inspector for the run in flight — what the frame-step debugger shows a human. view=tiles: every VRAM tile at 1× as PNG, colored by bank (0 bg/fg, 1 sprites) and palette; view=map: one background layer (0–3) composed at 1× as PNG plus scroll/enable/priority; view=oam: the sprites composited on a blank 320×240 screen as PNG plus one text row per OAM entry; view=palettes: both palette banks as RGB565 hex (no image). Use it for 'why is this sprite garbage' — the answer is usually a wrong palette or tile index visible here.",
+          "description": "The PPU inspector for the run in flight — what the frame-step debugger shows a human. view=tiles: every VRAM tile at 1× as PNG, colored by bank (0 bg/fg, 1 sprites) and palette; view=map: one background layer (0–3) composed at 1× as PNG plus scroll/enabled/priority; view=oam: the sprites composited on a blank 320×240 screen as PNG plus one text row per OAM entry; view=palettes: both palette banks as RGB565 hex (no image). Use it for 'why is this sprite garbage' — the answer is usually a wrong palette or tile index visible here.",
           "inputSchema": with(json!({
               "view": { "type": "string", "enum": ["tiles", "map", "oam", "palettes"] },
               "bank": { "type": "number", "description": "tiles: 0 bg/fg, 1 sprites (default 0)" },
@@ -90,7 +90,7 @@ pub fn tool_list() -> Value {
               "layer": { "type": "number", "description": "map: layer 0–3 (default 0)" }
           })) },
         { "name": "cart_pack",
-          "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (worlds/arena) or file (assets/worlds/arena.toml). Returns {cart, world, lines}: hand `cart` to emu_start or emu_run. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call). Errors carry emd's own failure line.",
+          "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (worlds/arena) or file (assets/worlds/arena.toml). Returns {cart, world, lines}: hand `cart` to emu_start or emu_run. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call) — and while it runs, every other tool against this Zed waits, because the host serves one request at a time. Errors carry emd's own failure line.",
           "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem, e.g. worlds/arena" } })) },
         { "name": "hw_flash",
           "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=115200, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
@@ -114,7 +114,7 @@ pub fn tool_list() -> Value {
           "description": "Is this machine ready to flash? {ready, missing[{code,label}], ports, stuck_board, project, repo, diag_bin, emd_bin, version_skew:[repo_commit, emu_commit]|null, emu_commit_in_repo}. Call before hw_flash: a missing prerequisite here is what hw_flash would fail on, and version_skew means the board would render a different PPU than the in-IDE emulator. Probes fresh each call.",
           "inputSchema": with(json!({})) },
         { "name": "hw_flash_cancel",
-          "description": "Cancel the flash in flight, the same as the user's Cancel button. Returns {cancelled: bool}; false when nothing was running. The timeline keeps the phase it reached; a cancelled run is not a failed one.",
+          "description": "Cancel the flash in flight, the same as the user's Cancel button. Returns {cancelled: bool}; false when nothing was running (including when no emulator panel has ever been opened in the workspace). The timeline keeps the phase it reached; a cancelled run is not a failed one.",
           "inputSchema": with(json!({})) },
         { "name": "list_ggo_reports",
           "description": "Perf runs (emulator and board) in ~/.ggo/ggo_ide.db, newest first: run id, started_at, cart, label, and the ggo-diag log path for board runs. Reads the database directly — no Zed session needed.",
@@ -136,7 +136,7 @@ pub fn tool_list() -> Value {
           "description": "Close the Reports tab in the user's Zed. With `run`, only if that is the run it shows. Returns {closed: false} when no tab is open.",
           "inputSchema": with(json!({ "run": { "type": "number", "description": "Only close if the tab shows this run (optional)" } })) },
         { "name": "world_list",
-          "description": "Every world file in the open project: [{stem, rel_path}]. Stems are what emd, cart_pack and hw_flash take (worlds/arena).",
+          "description": "Every world file in the open project: {worlds: [{stem, rel_path}]}. Stems are what emd, cart_pack and hw_flash take (worlds/arena).",
           "inputSchema": with(json!({})) },
         { "name": "world_open",
           "description": "Open a world in Zed's World panel, as clicking its file would. Returns {opened: rel_path}. The already-open world is left alone (no reload, no prompt); a world with unsaved edits is never swapped out from under the user — save it first.",
@@ -326,15 +326,21 @@ fn call_tool_inner(
                 Some("palettes") => ggo_emu_remote::protocol::DebugView::Palettes,
                 other => return Err(format!("view must be tiles|map|oam|palettes, got {other:?}")),
             };
-            let index = |key: &str| arg_i64(args, key).filter(|n| *n >= 0).unwrap_or(0) as usize;
+            // A negative index is a caller mistake, not a request for
+            // the default -- the same rule hw_flash applies to its knobs.
+            let index = |key: &str| match arg_i64(args, key) {
+                Some(n) if n < 0 => Err(format!("{key} must be >= 0")),
+                Some(n) => Ok(n as usize),
+                None => Ok(0),
+            };
             let mut data = send(
                 &session.socket,
                 Cmd::Debug {
                     workspace,
                     view,
-                    bank: index("bank"),
-                    palette: index("palette"),
-                    layer: index("layer"),
+                    bank: index("bank")?,
+                    palette: index("palette")?,
+                    layer: index("layer")?,
                 },
                 CALL_TIMEOUT,
                 connect,
@@ -819,6 +825,22 @@ mod tests {
     }
 
     #[test]
+    fn emu_debug_rejects_a_negative_index_instead_of_defaulting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            panic!("a negative index must never reach the host")
+        };
+        let (content, is_err) =
+            call_tool("emu_debug", &json!({"view": "map", "layer": -1}), dir.path(), &connect);
+        assert!(is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains("layer must be >= 0"), "{content:?}");
+        let (content, is_err) =
+            call_tool("emu_debug", &json!({"view": "tiles", "bank": -2}), dir.path(), &connect);
+        assert!(is_err && content[0]["text"].as_str().unwrap().contains("bank must be >= 0"), "{content:?}");
+    }
+
+    #[test]
     fn host_error_becomes_tool_error() {
         let dir = tempfile::tempdir().unwrap();
         fake_session(dir.path(), std::process::id());
@@ -871,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_list_names_exactly_the_lockstep_surface() {
+    fn tool_list_names_exactly_the_agent_surface() {
         let list = tool_list();
         let names: Vec<&str> =
             list["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();

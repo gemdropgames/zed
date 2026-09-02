@@ -81,7 +81,9 @@ pub enum Cmd {
     /// Resume a paused run.
     Resume { workspace: Option<String> },
     /// The frame-step debugger's views, for the run in flight (paused or
-    /// not): `{image?, rows?, palettes?, labels}`.
+    /// not). `tiles`/`map`/`oam` reply `{view, .., image}` -- plus `rows`
+    /// (oam) or `label`/`scroll`/`enabled`/`priority` (map); `palettes`
+    /// replies `{view, bg_fg, sprites}` and carries no image.
     Debug {
         workspace: Option<String>,
         view: DebugView,

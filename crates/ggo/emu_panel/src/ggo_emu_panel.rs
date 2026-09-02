@@ -1890,8 +1890,9 @@ impl EmuPanel {
     /// [`Self::prepare_world_build`] for the agent socket: the same plan,
     /// with the reason it could not be made RETURNED rather than shown.
     /// `world` may be a stem (`worlds/arena`) or a rel path
-    /// (`assets/worlds/arena.toml`); a stem is resolved against the
-    /// project's world listing.
+    /// (`assets/worlds/arena.toml`); a stem is resolved by probing
+    /// `assets/<stem>.toml` and then `<stem>.toml` under the project
+    /// root, first hit wins.
     pub(crate) fn remote_pack_plan(
         &mut self,
         world: &str,

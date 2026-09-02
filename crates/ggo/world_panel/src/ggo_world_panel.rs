@@ -172,6 +172,12 @@ pub fn init(cx: &mut App) {
 /// worlds arrive by clicking a `**/worlds/**/*.toml` in the project panel.
 const EMPTY_MESSAGE: &str = "Open a world file from the project panel";
 
+/// The phrase [`WorldPanel::remote_read`] answers with while a load is
+/// still in flight. Public because the agent socket host retries on it
+/// (and only on it) -- a substring match across crates that would rot
+/// silently if either side reworded independently.
+pub const WORLD_STILL_LOADING: &str = "still loading";
+
 /// Screen px one arrow keypress pans the camera when nothing is selected
 /// (Shift: 4x).
 const CAMERA_PAN_STEP_PX: f64 = 32.0;
@@ -969,13 +975,13 @@ pub fn composite_scene(items: &[DrawItem], origin: [f64; 2], width: u32, height:
                 for sy in 0..i64::from(image.h) {
                     for sx in 0..i64::from(image.w) {
                         let s = ((sy * i64::from(image.w) + sx) * 4) as usize;
-                        let px = [
-                            image.rgba[s],
-                            image.rgba[s + 1],
-                            image.rgba[s + 2],
-                            image.rgba[s + 3],
-                        ];
-                        put(x0 + sx, y0 + sy, px);
+                        // A decoded image whose buffer is shorter than
+                        // `w * h * 4` draws what it has rather than
+                        // panicking the whole composite.
+                        let Some(px) = image.rgba.get(s..s + 4) else {
+                            break;
+                        };
+                        put(x0 + sx, y0 + sy, [px[0], px[1], px[2], px[3]]);
                     }
                 }
             }
@@ -2848,7 +2854,9 @@ impl WorldPanel {
         let open = match &self.state {
             ViewerState::Ready(open) => open,
             ViewerState::Empty => return Err("no world open — world_open first".to_string()),
-            ViewerState::Loading { stem } => return Err(format!("{stem} is still loading")),
+            ViewerState::Loading { stem } => {
+                return Err(format!("{stem} is {WORLD_STILL_LOADING}"));
+            }
             ViewerState::Error(error) => {
                 return Err(format!("the open world failed to load: {error}"));
             }
@@ -5845,6 +5853,28 @@ mod tests {
         // Outside the image: untouched.
         let j = (5 * 8 + 5) * 4;
         assert_eq!(&canvas[j..j + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn composite_scene_survives_an_image_shorter_than_its_declared_size() {
+        // One pixel of data for a 2x2 image: the rest must be skipped, not
+        // indexed past the end.
+        let short: Arc<[u8]> = vec![255u8, 0, 0, 255].into();
+        let items = vec![DrawItem {
+            kind: DrawKind::Image {
+                image: RgbaImage { rgba: short, w: 2, h: 2 },
+            },
+            x: 0.0,
+            y: 0.0,
+            w: 2.0,
+            h: 2.0,
+            z: 0.0,
+            order: 0,
+            sel: None,
+        }];
+        let canvas = composite_scene(&items, [0.0, 0.0], 4, 4);
+        assert_eq!(&canvas[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&canvas[4..8], &[0, 0, 0, 0]);
     }
 
     #[gpui::test]
