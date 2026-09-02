@@ -175,7 +175,7 @@ pub struct FlashConfig {
 /// ggo-diag's own default still rules.
 ///
 /// Source of truth is the firmware's `ggo-hal` `uart::BAUD`: 33.333 MHz /
-/// (460_800 × 8 samples-per-bit) = 9.04 → divider k = 9 → 462,963 baud
+/// (460_800 × 8 samples-per-bit) = 9.04 → divider k = 9 → 462,958 baud
 /// (+0.47 %, well inside a UART's tolerance). 115_200 cannot carry the
 /// per-frame telemetry packet inside one vsync.
 pub const DEFAULT_BAUD: u32 = 460_800;

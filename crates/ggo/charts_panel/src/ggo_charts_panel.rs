@@ -2622,10 +2622,6 @@ mod tests {
 
     // ------------------------------------------------------ run detail
 
-    /// A fixture db with one run whose frames exercise every chart gate,
-    /// so `select_run` produces the full 13-chart set. `frames` is
-    /// `1..=n` PLUS a frame 0 (the default-ignored one), matching real
-    /// captures.
     /// The `frame_budget_cycles` every seeded fixture run carries: one
     /// 60 Hz vsync period at 33.33 MHz, the same number ggo-ide's runs
     /// record. Bound into the INSERT rather than spelled into its SQL so
@@ -2633,6 +2629,10 @@ mod tests {
     /// budget the fixture stopped using.
     const SEEDED_FRAME_BUDGET_CYCLES: i64 = 555_549;
 
+    /// A fixture db with one run whose frames exercise every chart gate,
+    /// so `select_run` produces the full 13-chart set. `frames` is
+    /// `1..=n` PLUS a frame 0 (the default-ignored one), matching real
+    /// captures.
     fn seed_run_with_samples(db_path: &std::path::Path, frames: i64) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
