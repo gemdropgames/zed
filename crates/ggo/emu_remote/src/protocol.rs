@@ -92,6 +92,10 @@ pub enum Cmd {
         #[serde(default)]
         layer: usize,
     },
+    /// `emd pack-ggo` for `world` (a stem like `worlds/arena` or a rel
+    /// path like `assets/worlds/arena.toml`), into the project's
+    /// `target/ggo-emulate/`. The reply names the cart for `Start`/`Run`.
+    PackWorld { workspace: Option<String>, world: String },
 }
 
 /// Which PPU inspector view `Cmd::Debug` renders.
@@ -452,6 +456,14 @@ mod tests {
             Cmd::Debug { workspace: None, view: DebugView::Map, bank: 0, palette: 0, layer: 2 }
         );
         assert!(parse_request(r#"{"id":3,"cmd":"debug","view":"sprites"}"#).is_err());
+    }
+
+    #[test]
+    fn pack_world_request_round_trips() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"pack_world","world":"worlds/arena"}"#).unwrap().cmd,
+            Cmd::PackWorld { workspace: None, world: "worlds/arena".to_string() }
+        );
     }
 
     #[test]

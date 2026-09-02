@@ -38,6 +38,9 @@ pub fn socket_call(socket: &Path, line: &str, timeout: Duration) -> std::io::Res
 /// wait); a wedged Zed surfaces as an error within this.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// A pack is a cargo build; the lock-step bound would cut it off.
+const PACK_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The MCP `tools/list` payload.
 pub fn tool_list() -> Value {
     let session_props = json!({
@@ -57,7 +60,7 @@ pub fn tool_list() -> Value {
           "inputSchema": { "type": "object", "properties": {} } },
         { "name": "emu_status", "description": "What the target session's emulator panels are doing.", "inputSchema": with(json!({})) },
         { "name": "emu_start",
-          "description": "Boot a cart in the Zed emulator panel and pause at the first frame boundary (lock-step). Pack first: emd pack-ggo [--world <stem>]. Returns the initial world-state JSON — worlds that declare `InspectWorld = {}` under [resources] serialize every entity's registered components; others return null. Drive with emu_next_frame; end with emu_stop.",
+          "description": "Boot a cart in the Zed emulator panel and pause at the first frame boundary (lock-step). Pack first with cart_pack (or emd pack-ggo --world <stem>). Returns the initial world-state JSON — worlds that declare `InspectWorld = {}` under [resources] serialize every entity's registered components; others return null. Drive with emu_next_frame; end with emu_stop.",
           "inputSchema": with(json!({ "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. wilds.ggo" } })) },
         { "name": "emu_next_frame",
           "description": "Latch the held pad buttons (names: z x a s up down left right q w e r t y u i enter select; empty/omitted releases all), run exactly ONE frame, and return the new world-state JSON. Set screenshot=true to also get the presented frame as PNG. Call repeatedly to play.",
@@ -85,6 +88,9 @@ pub fn tool_list() -> Value {
               "palette": { "type": "number", "description": "tiles: palette index (default 0)" },
               "layer": { "type": "number", "description": "map: layer 0–3 (default 0)" }
           })) },
+        { "name": "cart_pack",
+          "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (worlds/arena) or file (assets/worlds/arena.toml). Returns {cart, world, lines}: hand `cart` to emu_start or emu_run. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call). Errors carry emd's own failure line.",
+          "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem, e.g. worlds/arena" } })) },
         { "name": "hw_flash",
           "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=115200, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
           "inputSchema": with(json!({
@@ -325,6 +331,12 @@ fn call_tool_inner(
                 content.push(image_content(&image)?);
             }
             Ok(content)
+        }
+        "cart_pack" => {
+            let world = arg_str(args, "world")
+                .ok_or("missing required argument: world (a stem like worlds/arena)")?;
+            let data = send(&session.socket, Cmd::PackWorld { workspace, world }, PACK_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "hw_flash" => {
             // A zero or negative knob is a caller mistake, not a request
@@ -661,6 +673,24 @@ mod tests {
     }
 
     #[test]
+    fn cart_pack_forwards_the_world_with_the_long_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, timeout: Duration| -> std::io::Result<String> {
+            assert!(
+                line.contains(r#""cmd":"pack_world""#) && line.contains(r#""world":"worlds/arena""#),
+                "{line}"
+            );
+            assert_eq!(timeout, PACK_TIMEOUT);
+            Ok(r#"{"id":1,"ok":true,"data":{"cart":"target/ggo-emulate/worlds-arena.ggo","world":"worlds/arena","lines":[]}}"#.to_string())
+        };
+        let (content, is_err) =
+            call_tool("cart_pack", &json!({"world": "worlds/arena"}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains("worlds-arena.ggo"));
+    }
+
+    #[test]
     fn next_frame_screenshot_becomes_png_image_content() {
         use base64::Engine as _;
         let dir = tempfile::tempdir().unwrap();
@@ -777,6 +807,7 @@ mod tests {
                 "emu_pause",
                 "emu_resume",
                 "emu_debug",
+                "cart_pack",
                 "hw_flash",
                 "hw_flash_status",
                 "hw_flash_wait",

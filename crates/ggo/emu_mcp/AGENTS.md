@@ -44,6 +44,7 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `emu_run { cart }` | boot a cart free-running (the Run button); watch with `emu_screenshot`/`emu_uart` |
 | `emu_pause` / `emu_resume` | pause/resume the live run; `{ paused, frame, running }` |
 | `emu_debug { view, bank?, palette?, layer? }` | PPU inspector: tiles / map / oam as PNG + data, palettes as hex |
+| `cart_pack { world }` | `emd pack-ggo` one world into `target/ggo-emulate/`; `{ cart }` feeds `emu_start`/`emu_run` |
 | `hw_flash { world?, rebuild_gateware?, tty?, baud?, collect_seconds?, telemetry? }` | flash a world to the BOARD and run it; returns once the flash STARTS, with the effective `config` (defaults: cached gateware, first serial port, 115200 baud, 120s capture) |
 | `hw_flash_status` | snapshot: `{ active, what, phase, detail, elapsed_s, phases[], diag_steps[], verdict, failure, diag_run_id, perf_run_id, transcript, console_tail[] }` — poll it for running context |
 | `hw_flash_wait { timeout_s? }` | poll until the flash reaches a verdict (default 1800s) |
@@ -76,7 +77,8 @@ the same flash (likewise after a socket blip aborts one). Prefer a
 
 ## The loop
 
-Pack a cart in the project first (`emd pack-ggo [--world <stem>]`), then:
+Pack a cart first (`cart_pack { world: "worlds/arena" }`, or `emd
+pack-ggo --world <stem>` in a shell), then:
 
 1. `emu_start { cart: "wilds.ggo" }` → `{ started, frame, world }`
 2. repeat `emu_next_frame { buttons: ["right"] }` → `{ frame, world }`

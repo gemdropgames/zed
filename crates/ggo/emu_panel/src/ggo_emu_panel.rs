@@ -1887,6 +1887,55 @@ impl EmuPanel {
         ))
     }
 
+    /// [`Self::prepare_world_build`] for the agent socket: the same plan,
+    /// with the reason it could not be made RETURNED rather than shown.
+    /// `world` may be a stem (`worlds/arena`) or a rel path
+    /// (`assets/worlds/arena.toml`); a stem is resolved against the
+    /// project's world listing.
+    pub(crate) fn remote_pack_plan(
+        &mut self,
+        world: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(ggo_common::ProcRequest, ggo_common::ProcRunner, String), String> {
+        // The panel the agent socket packs on may have been opened by the
+        // socket itself a moment ago, and a panel nobody has clicked in has
+        // no root yet -- the same refresh `build_and_run` does first.
+        self.refresh_root(cx);
+        let world_rel = if ggo_world_panel::world_stem(world).is_some() {
+            world.to_string()
+        } else {
+            // A bare stem: find the file. `assets/worlds/x.toml` first (real
+            // projects), then `worlds/x.toml` (fixtures).
+            let root = self
+                .project_root
+                .clone()
+                .ok_or("no project folder is open")?;
+            ["assets/", ""]
+                .iter()
+                .map(|prefix| format!("{prefix}{world}.toml"))
+                .find(|rel| root.join(rel).is_file())
+                .ok_or_else(|| {
+                    format!(
+                        "no world file for stem {world} (looked for assets/{world}.toml and {world}.toml)"
+                    )
+                })?
+        };
+        // `prepare_world_build` reports its refusals on the status row; the
+        // agent gets the text instead, so the row is left as it was found.
+        let before = (self.status.clone(), self.status_is_error);
+        match self.prepare_world_build(&world_rel, cx) {
+            Some(plan) => Ok(plan),
+            None => {
+                let reason = self
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "could not plan the pack".to_string());
+                (self.status, self.status_is_error) = before;
+                Err(reason)
+            }
+        }
+    }
+
     /// **"Re-run (perf)"**: select `rel` and start it, then hop to the
     /// charts panel once the run's perf ingest lands.
     ///
@@ -7696,6 +7745,38 @@ mod tests {
                 .remote_debug_view(ggo_emu_remote::protocol::DebugView::Tiles, 0, 0, 0)
                 .unwrap_err();
             assert!(err.contains("no run live"), "{err}");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_pack_plan_resolves_a_stem_and_returns_the_reason_on_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            // `unwrap_err` is unavailable: the Ok half holds a `ProcRunner`,
+            // which is not `Debug`.
+            let Err(err) = panel.remote_pack_plan("worlds/nope", cx) else {
+                panic!("a stem with no world file cannot plan");
+            };
+            assert!(err.contains("no world file for stem worlds/nope"), "{err}");
+        });
+        // A real world under an emerald project packs.
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(
+            dir.path().join("emerald.toml"),
+            "[project]\nname = \"g\"\ndefault_world = \"worlds/arena\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("assets/worlds/arena.toml"), "").unwrap();
+        panel.update(cx, |panel, cx| {
+            let (request, _runner, cart) =
+                panel.remote_pack_plan("worlds/arena", cx).expect("plans");
+            assert!(request.args.iter().any(|a| a == "pack-ggo"), "{:?}", request.args);
+            assert!(request.args.iter().any(|a| a == "worlds/arena"), "{:?}", request.args);
+            assert_eq!(cart, "target/ggo-emulate/worlds-arena.ggo");
+            assert!(panel.status.is_none(), "a planned pack leaves the row alone");
         });
     }
 

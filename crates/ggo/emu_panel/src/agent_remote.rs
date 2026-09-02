@@ -22,6 +22,7 @@ use ggo_emu_remote::registry::{self, SessionInfo};
 
 use crate::EmuPanel;
 use crate::input::{SELECT_BIT, button_bit};
+use crate::menu;
 
 /// Foreground registry of live panels (keyed by absolute project root)
 /// and of every live workspace (keyed by entity id — its root is resolved
@@ -489,7 +490,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::Run { workspace, .. }
         | Cmd::Pause { workspace }
         | Cmd::Resume { workspace }
-        | Cmd::Debug { workspace, .. } => workspace.clone(),
+        | Cmd::Debug { workspace, .. }
+        | Cmd::PackWorld { workspace, .. } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -689,6 +691,23 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 })
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "closed": closed }))
+        }
+        Cmd::PackWorld { world, .. } => {
+            // Like a remote boot: the pack needs a panel to plan on, not a
+            // panel someone clicked.
+            let panel = panel_or_open(&target_root, target.panel, target.workspace, window, cx)?;
+            let (request, runner, cart) = panel
+                .update(cx, |p, cx| p.remote_pack_plan(&world, cx))
+                .map_err(|e| e.to_string())??;
+            // BLOCKING child: the runner is the panel's own (a test's fake
+            // or the system one), run off the UI thread.
+            let capture = cx.background_spawn(async move { runner(request) }).await;
+            if !capture.ok {
+                return Err(format!("pack failed: {}", menu::failure_reason(&capture)));
+            }
+            let tail: Vec<&String> =
+                capture.lines.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect();
+            Ok(serde_json::json!({ "cart": cart, "world": world, "lines": tail }))
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;
