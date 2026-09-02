@@ -51,8 +51,16 @@ pub enum Cmd {
     },
     /// Snapshot of the current/last flash.
     FlashStatus { workspace: Option<String> },
-    /// Open the Reports tab on perf run `run` (an id in ~/.ggo/ggo_ide.db).
-    OpenReport { workspace: Option<String>, run: i64 },
+    /// Open the Reports tab on perf run `run` (an id in ~/.ggo/ggo_ide.db)
+    /// or on daemon fault `fault` (a dump stem in the same database's
+    /// `fault` table). `run` wins when both are given; neither is an error.
+    OpenReport {
+        workspace: Option<String>,
+        #[serde(default)]
+        run: Option<i64>,
+        #[serde(default)]
+        fault: Option<String>,
+    },
     /// Close the Reports tab. With `run`, only if that is the run it shows.
     CloseReport { workspace: Option<String>, run: Option<i64> },
     /// The machine's board-readiness probe: what is missing, which
@@ -409,7 +417,21 @@ mod tests {
     fn report_requests_round_trip() {
         assert_eq!(
             parse_request(r#"{"id":1,"cmd":"open_report","run":55}"#).unwrap().cmd,
-            Cmd::OpenReport { workspace: None, run: 55 }
+            Cmd::OpenReport { workspace: None, run: Some(55), fault: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":4,"cmd":"open_report","fault":"2026-09-02_08-49-33_marker"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::OpenReport {
+                workspace: None,
+                run: None,
+                fault: Some("2026-09-02_08-49-33_marker".to_string())
+            }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":5,"cmd":"open_report"}"#).unwrap().cmd,
+            Cmd::OpenReport { workspace: None, run: None, fault: None }
         );
         assert_eq!(
             parse_request(r#"{"id":2,"cmd":"close_report"}"#).unwrap().cmd,

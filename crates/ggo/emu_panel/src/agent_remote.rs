@@ -725,21 +725,33 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 .map_err(|e| e.to_string())??;
             Ok(serde_json::json!({ "started": true, "config": effective }))
         }
-        Cmd::OpenReport { run, .. } => {
+        Cmd::OpenReport { run, fault, .. } => {
+            // Refused before a tab is opened: an OpenReport naming neither
+            // would otherwise pop the Reports panel on nothing.
+            if run.is_none() && fault.is_none() {
+                return Err("open_ggo_report needs run or fault".to_string());
+            }
             let workspace = target.workspace.ok_or("workspace vanished")?;
+            let opened = fault.clone();
             window
                 .update(cx, |_, window, app| {
                     workspace.update(app, |workspace, cx| {
                         ggo_charts_panel::open_charts_item(workspace, window, cx, |charts, _, cx| {
-                            charts.open_run(run, cx)
+                            // `run` wins when both are given, matching the
+                            // bridge; the neither case returned above.
+                            if let Some(run) = run {
+                                charts.open_run(run, cx);
+                            } else if let Some(fault) = opened {
+                                charts.open_fault(fault, cx);
+                            }
                         });
                     })
                 })
                 .map_err(|e| e.to_string())?;
-            // "requested", not "shown": the panel looks the run up
+            // "requested", not "shown": the panel looks the report up
             // off-thread and lands on the runs list if its own database
-            // has no such run.
-            Ok(serde_json::json!({ "requested": true, "run": run }))
+            // has no such run or fault.
+            Ok(serde_json::json!({ "requested": true, "run": run, "fault": fault }))
         }
         Cmd::CloseReport { run, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;

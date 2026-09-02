@@ -117,21 +117,26 @@ pub fn tool_list() -> Value {
           "description": "Cancel the flash in flight, the same as the user's Cancel button. Returns {cancelled: bool}; false when nothing was running (including when no emulator panel has ever been opened in the workspace). The timeline keeps the phase it reached; a cancelled run is not a failed one.",
           "inputSchema": with(json!({})) },
         { "name": "list_ggo_reports",
-          "description": "Perf runs (emulator and board) in ~/.ggo/ggo_ide.db, newest first: run id, started_at, cart, label, and the ggo-diag log path for board runs. Reads the database directly — no Zed session needed.",
+          "description": "Every report in ~/.ggo/ggo_ide.db, as two newest-first sections. First the perf runs (emulator and board): run id, started_at, cart, label, and the ggo-diag log path for board runs. Then, after a `--- faults ---` line, the ggo-uartd fault dumps: fault id, timestamp, kind: detail, and the probable perf run. Fresh dumps are imported on the way. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
               "type": "object",
-              "properties": { "limit": { "type": "number", "description": "Newest N runs (default 20)" } },
+              "properties": { "limit": { "type": "number", "description": "Newest N of each section (default 20)" } },
           }) },
         { "name": "fetch_ggo_report",
-          "description": "Paste-ready summary of one perf run (emulator or board) from ~/.ggo/ggo_ide.db: cart, frame budget, wire/cache aggregates, over-budget frames, and the ggo-diag log path when the run has one. Takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from list_ggo_reports. Reads the database directly — no Zed session needed.",
+          "description": "Paste-ready summary of one report from ~/.ggo/ggo_ide.db. With `run` (a perf run, emulator or board): cart, frame budget, wire/cache aggregates, over-budget frames, and the ggo-diag log path when the run has one — takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from list_ggo_reports. With `fault` (a ggo-uartd dump id from list_ggo_reports): the dump digest — kind and detail, boot stage, frame telemetry, parsed panics and asset-load failures, the fault line marked » with 20 lines of context before and 5 after, and the raw dump path. One of the two is required; `run` wins when both are given. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
               "type": "object",
-              "properties": { "run": { "type": "number", "description": "Perf run id, e.g. perf_run_id from hw_flash_wait" } },
-              "required": ["run"],
+              "properties": {
+                  "run": { "type": "number", "description": "Perf run id, e.g. perf_run_id from hw_flash_wait" },
+                  "fault": { "type": "string", "description": "Fault dump id from list_ggo_reports, e.g. 2026-09-02_08-49-33_marker" },
+              },
           }) },
         { "name": "open_ggo_report",
-          "description": "Open the Reports tab in the user's Zed on one perf run (the same page a passed flash lands on).",
-          "inputSchema": with(json!({ "run": { "type": "number", "description": "Perf run id from list_ggo_reports" } })) },
+          "description": "Open the Reports tab in the user's Zed on one perf run (the same page a passed flash lands on) or on one ggo-uartd fault dump. One of `run`/`fault` is required; `run` wins when both are given. The id is checked against ~/.ggo/ggo_ide.db first, so an unknown one is an error here rather than a tab that lands on the list.",
+          "inputSchema": with(json!({
+              "run": { "type": "number", "description": "Perf run id from list_ggo_reports" },
+              "fault": { "type": "string", "description": "Fault dump id from list_ggo_reports, e.g. 2026-09-02_08-49-33_marker" },
+          })) },
         { "name": "close_ggo_report",
           "description": "Close the Reports tab in the user's Zed. With `run`, only if that is the run it shows. Returns {closed: false} when no tab is open.",
           "inputSchema": with(json!({ "run": { "type": "number", "description": "Only close if the tab shows this run (optional)" } })) },
@@ -252,8 +257,12 @@ fn call_tool_inner(
         return list_reports(&ggo_dir()?, limit);
     }
     if name == "fetch_ggo_report" {
-        let run = arg_i64(args, "run").ok_or("missing required argument: run (a perf run id)")?;
-        return fetch_report(&ggo_dir()?, run);
+        let db_dir = ggo_dir()?;
+        return match (arg_i64(args, "run"), arg_str(args, "fault")) {
+            (Some(run), _) => fetch_report(&db_dir, run),
+            (None, Some(fault)) => fetch_fault(&db_dir, &fault),
+            (None, None) => Err(NEEDS_RUN_OR_FAULT.to_string()),
+        };
     }
 
     let workspace = arg_str(args, "workspace");
@@ -397,11 +406,8 @@ fn call_tool_inner(
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "open_ggo_report" => {
-            let run = arg_i64(args, "run").ok_or("missing required argument: run (a perf run id)")?;
-            // Checked here so a bad id is an error, not a Reports tab
-            // that silently lands on the runs list.
-            run_detail_or_missing(&ggo_dir()?, run)?;
-            let data = send(&session.socket, Cmd::OpenReport { workspace, run }, CALL_TIMEOUT, connect)?;
+            let cmd = open_report_cmd(&ggo_dir()?, workspace, args)?;
+            let data = send(&session.socket, cmd, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "close_ggo_report" => {
@@ -534,9 +540,10 @@ fn ggo_dir() -> Result<std::path::PathBuf, String> {
 }
 
 /// Every perf run in `<db_dir>/ggo_ide.db`, newest first, one line each,
-/// with the ggo-diag log path beside the board runs that have one.
+/// with the ggo-diag log path beside the board runs that have one, then
+/// the daemon faults as a second newest-first section.
 fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
-    use ggo_worldlib::charts::reports::{diag_db, perf_db};
+    use ggo_worldlib::charts::reports::{diag_db, faults, perf_db};
 
     let ide_db = db_dir.join("ggo_ide.db");
     // Same best-effort clone as `fetch_report`: board runs reach this
@@ -550,6 +557,9 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
         .exists()
         .then(|| diag_db::clone_runs(&diag_db_path, &ide_db).err())
         .flatten();
+    // Before the existence check below: a machine that has only ever run
+    // the daemon has no ggo_ide.db until this import writes one.
+    import_faults(db_dir, &ide_db);
     let none = |what: String| {
         let text = match &clone_error {
             Some(e) => format!("{what} (and cloning device runs from diag.db failed: {e})"),
@@ -570,7 +580,7 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     let logs_dir = db_dir.join("diag").join("logs");
-    let lines: Vec<String> = rows
+    let mut lines: Vec<String> = rows
         .iter()
         .take(limit)
         .map(|(started_at, id, cart, label, frames)| {
@@ -583,8 +593,32 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
             )
         })
         .collect();
-    if lines.is_empty() {
+    let fault_lines: Vec<String> = faults::list(&ide_db, limit as i64)
+        .map_err(|e| format!("reading faults: {e}"))?
+        .iter()
+        .map(|f| {
+            format!(
+                "fault {}  {}  {}: {}  run={}",
+                f.id,
+                f.at,
+                f.kind,
+                f.detail,
+                f.run_id.as_deref().unwrap_or("-")
+            )
+        })
+        .collect();
+    if lines.is_empty() && fault_lines.is_empty() {
         return none("no runs yet".to_string());
+    }
+    if !fault_lines.is_empty() {
+        // Two sources, two orders: perf runs are ordered by their start
+        // stamp and faults by the daemon's, so they are listed as two
+        // newest-first sections rather than one interleaved list that
+        // would claim an ordering between them.
+        if !lines.is_empty() {
+            lines.push("--- faults ---".to_string());
+        }
+        lines.extend(fault_lines);
     }
     Ok(vec![json!({ "type": "text", "text": lines.join("\n") })])
 }
@@ -607,6 +641,141 @@ fn fetch_report(db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
     ));
     Ok(vec![json!({ "type": "text", "text": text })])
 }
+
+/// `ggo-uartd`'s dump directory under `<db_dir>`.
+fn faults_dir(db_dir: &Path) -> std::path::PathBuf {
+    db_dir.join("uartd").join("faults")
+}
+
+/// Pull every dump the reports database has not seen into it. Best
+/// effort, like the diag clone: an unreadable dump is the daemon's
+/// problem, and must not fail a tool the rows already answer. Dumps that
+/// individually fail to parse are skipped (and named) by `import` itself.
+fn import_faults(db_dir: &Path, ide_db: &Path) {
+    let dir = faults_dir(db_dir);
+    if let Err(e) = ggo_worldlib::charts::reports::faults::import(&dir, ide_db) {
+        eprintln!("faults: importing {}: {e}", dir.display());
+    }
+}
+
+/// How much of the decoded window `fetch_fault` prints around the fault
+/// line: the lead-up is what explains it, the tail only shows whether
+/// anything came after.
+const FAULT_LINES_BEFORE: usize = 20;
+const FAULT_LINES_AFTER: usize = 5;
+
+/// One daemon fault's paste-ready digest out of `<db_dir>/ggo_ide.db`:
+/// header, boot stage, telemetry, parsed panics and asset failures, the
+/// fault line in context, and the path of the raw dump.
+fn fetch_fault(db_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
+    use ggo_worldlib::charts::reports::faults;
+
+    let ide_db = db_dir.join("ggo_ide.db");
+    // A dump written seconds ago is fetchable by id straight from the
+    // list, without the panel having been opened in between.
+    import_faults(db_dir, &ide_db);
+    let detail = faults::load(&ide_db, id)
+        .map_err(|e| format!("reading fault {id}: {e}"))?
+        .ok_or_else(|| format!("no fault {id} in {}", ide_db.display()))?;
+    let row = &detail.row;
+    let number = |value: Option<i64>| match value {
+        Some(n) => n.to_string(),
+        None => "-".to_string(),
+    };
+    let mut text = format!(
+        "fault {}\n{}: {}\nat {}  last {}s of {}\nboot stage: {}\nframes {}  cyc avg/max {}/{}\nprobable run: {}\n",
+        row.id,
+        row.kind,
+        row.detail,
+        row.at,
+        detail.window_s,
+        row.tty,
+        row.boot_stage.as_deref().unwrap_or("-"),
+        row.frames,
+        number(detail.cyc_avg),
+        number(detail.cyc_max),
+        row.run_id.as_deref().unwrap_or("-"),
+    );
+    if !detail.panics.is_empty() {
+        text.push_str("\npanics:\n");
+        for panic in &detail.panics {
+            text.push_str(&format!("  frame {}  {}\n", number(panic.frame), panic.message));
+        }
+    }
+    if !detail.asset_failures.is_empty() {
+        text.push_str("\nasset failures:\n");
+        for failure in &detail.asset_failures {
+            text.push_str(&format!("  {}  {}  x{}\n", failure.kind, failure.path, failure.count));
+        }
+    }
+    let lines = &detail.text;
+    match lines.len().checked_sub(1) {
+        None => text.push_str("\n(the window decoded to no text lines)\n"),
+        Some(end) => {
+            let (first, last, what) = match detail.fault_line {
+                Some(index) => (
+                    index.saturating_sub(FAULT_LINES_BEFORE),
+                    end.min(index + FAULT_LINES_AFTER),
+                    "» marks the fault line",
+                ),
+                // A stall or re-enumeration dump is a window around an
+                // absence: there is no line to centre on, so the tail --
+                // where the window ended -- is what a reader wants.
+                None => (
+                    lines.len().saturating_sub(FAULT_LINES_BEFORE + FAULT_LINES_AFTER + 1),
+                    end,
+                    "no marker line in this dump; the tail of the window",
+                ),
+            };
+            text.push_str(&format!(
+                "\nlog lines {}-{} of {} ({what}):\n",
+                first + 1,
+                last + 1,
+                lines.len()
+            ));
+            for (index, line) in lines.iter().enumerate().take(last + 1).skip(first) {
+                let mark = if detail.fault_line == Some(index) { "» " } else { "  " };
+                text.push_str(&format!("{mark}{line}\n"));
+            }
+        }
+    }
+    let raw = faults::raw_path(&faults_dir(db_dir), id);
+    // The daemon prunes its dumps and the row outlives the file, so the
+    // path alone would be a broken promise.
+    let pruned = if raw.is_file() { "" } else { " (pruned; the bytes are in the report db)" };
+    text.push_str(&format!("\nraw: {}{pruned}\n", raw.display()));
+    Ok(vec![json!({ "type": "text", "text": text })])
+}
+
+/// What `open_ggo_report` sends, with the report checked to exist first:
+/// a bad id has to be an error here, not a Reports tab that silently
+/// lands on the runs list.
+fn open_report_cmd(db_dir: &Path, workspace: Option<String>, args: &Value) -> Result<Cmd, String> {
+    use ggo_worldlib::charts::reports::faults;
+
+    match (arg_i64(args, "run"), arg_str(args, "fault")) {
+        (Some(run), _) => {
+            run_detail_or_missing(db_dir, run)?;
+            Ok(Cmd::OpenReport { workspace, run: Some(run), fault: None })
+        }
+        (None, Some(fault)) => {
+            let ide_db = db_dir.join("ggo_ide.db");
+            import_faults(db_dir, &ide_db);
+            if faults::load(&ide_db, &fault)
+                .map_err(|e| format!("reading fault {fault}: {e}"))?
+                .is_none()
+            {
+                return Err(format!("no fault {fault} in {}", ide_db.display()));
+            }
+            Ok(Cmd::OpenReport { workspace, run: None, fault: Some(fault) })
+        }
+        (None, None) => Err(NEEDS_RUN_OR_FAULT.to_string()),
+    }
+}
+
+/// Said by both report tools, which take either id.
+const NEEDS_RUN_OR_FAULT: &str =
+    "missing required argument: run (a perf run id) or fault (a fault id from list_ggo_reports)";
 
 /// The run's row, or the "no run" error naming both databases.
 fn run_detail_or_missing(
@@ -1376,5 +1545,114 @@ mod tests {
         let err = fetch_report(dir.path(), 999).unwrap_err();
         assert!(err.contains("no run 999"), "{err}");
         assert!(err.contains("no such column"), "{err}");
+    }
+
+    /// The dump `ggo-uartd` would leave in `<db_dir>/uartd/faults`: a
+    /// marker fault whose window carries a boot marker, an asset failure,
+    /// a panic and the marker line itself. Returns the file's path.
+    const FAULT_ID: &str = "2026-09-02_08-49-33_marker";
+
+    fn seed_fault_dump(db_dir: &Path) -> PathBuf {
+        let faults = db_dir.join("uartd").join("faults");
+        std::fs::create_dir_all(&faults).unwrap();
+        let path = faults.join(format!("{FAULT_ID}.log"));
+        std::fs::write(
+            &path,
+            concat!(
+                "# ggo-uartd marker <<<PANIC>>> — last 30s of /dev/ttyUSB0\n",
+                "<<<BOOTROM alive>>>\n",
+                "asset: MISS \"sprites/hero.spr\"\n",
+                "f=2| panicked at 'index out of range', src/main.rs:1:1\n",
+                "<<<PANIC>>> trap: mcause=0x2\n",
+                "still draining\n",
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn list_reports_lists_faults_after_the_runs() {
+        let dir = seeded_db_dir();
+        seed_fault_dump(dir.path());
+        let content = list_reports(dir.path(), 20).unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("run 7  2026-08-31T00:00:00Z  wilds"), "{text}");
+        assert_eq!(lines[1], "--- faults ---", "{text}");
+        assert_eq!(
+            lines[2],
+            "fault 2026-09-02_08-49-33_marker  2026-09-02_08-49-33  marker: <<<PANIC>>>  run=-",
+            "{text}"
+        );
+    }
+
+    /// A machine that has only ever run the daemon still gets its faults:
+    /// an empty perf list is not an empty report list.
+    #[test]
+    fn list_reports_lists_a_fault_with_no_perf_runs_and_no_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_fault_dump(dir.path());
+        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("fault 2026-09-02_08-49-33_marker  "), "{text}");
+        assert!(!text.contains("--- faults ---"), "{text}");
+    }
+
+    #[test]
+    fn fetch_fault_renders_the_digest_the_marked_line_and_the_raw_path() {
+        let dir = seeded_db_dir();
+        let raw = seed_fault_dump(dir.path());
+        let content = fetch_fault(dir.path(), FAULT_ID).unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("fault 2026-09-02_08-49-33_marker"), "{text}");
+        assert!(text.contains("marker: <<<PANIC>>>"), "{text}");
+        assert!(text.contains("last 30s of /dev/ttyUSB0"), "{text}");
+        assert!(text.contains("boot stage: boot-rom alive"), "{text}");
+        assert!(text.contains("panicked at"), "{text}");
+        assert!(text.contains("sprites/hero.spr"), "{text}");
+        assert!(text.contains("\n» <<<PANIC>>> trap: mcause=0x2\n"), "{text}");
+        assert!(text.contains("  still draining"), "{text}");
+        assert!(text.contains(&format!("raw: {}", raw.display())), "{text}");
+    }
+
+    #[test]
+    fn fetch_fault_unknown_id_is_a_tool_error() {
+        let dir = seeded_db_dir();
+        let err = fetch_fault(dir.path(), "nope").unwrap_err();
+        assert!(err.contains("no fault nope"), "{err}");
+        assert!(err.contains("ggo_ide.db"), "{err}");
+    }
+
+    #[test]
+    fn open_report_cmd_takes_a_run_or_a_fault_and_needs_one_of_them() {
+        let dir = seeded_db_dir();
+        seed_fault_dump(dir.path());
+        let cmd = open_report_cmd(dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap();
+        let line = serde_json::to_string(&Request { id: 1, cmd }).unwrap();
+        assert!(line.contains(r#""cmd":"open_report""#), "{line}");
+        assert!(line.contains(&format!(r#""fault":"{FAULT_ID}""#)), "{line}");
+
+        assert_eq!(
+            open_report_cmd(dir.path(), None, &json!({ "run": 7 })).unwrap(),
+            Cmd::OpenReport { workspace: None, run: Some(7), fault: None }
+        );
+
+        let err = open_report_cmd(dir.path(), None, &json!({ "fault": "nope" })).unwrap_err();
+        assert!(err.contains("no fault nope"), "{err}");
+        let err = open_report_cmd(dir.path(), None, &json!({})).unwrap_err();
+        assert!(err.contains("run") && err.contains("fault"), "{err}");
+    }
+
+    #[test]
+    fn open_report_without_a_run_or_a_fault_never_touches_zed() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            panic!("no socket call without a report to open")
+        };
+        let (content, is_err) = call_tool("open_ggo_report", &json!({}), dir.path(), &connect);
+        assert!(is_err, "{content:?}");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("run") && text.contains("fault"), "{text}");
     }
 }
