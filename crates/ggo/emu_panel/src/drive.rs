@@ -87,6 +87,11 @@ use crate::uart::UartLog;
 /// SQLite engines) rather than in `ggo-emu-core`.
 pub const FRAME_TIME: Duration = Duration::from_micros(16_667);
 
+/// The fastest the pane will drive a cart: ten frames per real frame
+/// period. Past this the UI thread cannot keep up with presenting, and
+/// the point -- reaching a late-game fault sooner -- is long since made.
+pub const MAX_SPEED: u32 = 10;
+
 /// Instructions interpreted per driver turn before the loop comes up for
 /// air. `ggo_emu::PER_TURN_BUDGET` verbatim: big enough to clear a
 /// frame's work, small enough that a cart spinning without `vsync_wait`
@@ -191,6 +196,9 @@ pub struct Session {
     /// the thread keeps the guest's `enabled` word set (lock-step runs);
     /// ordinary runs leave it 0 and the cart never serializes.
     inspect: Arc<AtomicBool>,
+    /// Frames per real frame period, `1..=MAX_SPEED`. Read at every
+    /// frame boundary, so a change takes effect within a frame.
+    speed: Arc<AtomicU32>,
     /// The cart's own world-inspection dump as of the last presented
     /// frame, once armed: `(tap seq, JSON bytes)`. Written by the thread
     /// every vsync from the guest's magic-tagged tap buffer.
@@ -259,6 +267,18 @@ impl Session {
     /// frame. Only lock-step (remote) runs turn this on.
     pub fn set_inspect(&self, on: bool) {
         self.inspect.store(on, Ordering::Release);
+    }
+
+    /// Run `speed` frames per real frame period (clamped to
+    /// `1..=MAX_SPEED`). The cart's clock advances `speed` times as fast
+    /// too, so a fault that takes ten minutes of play arrives in one;
+    /// audio is silenced above 1x rather than played at chipmunk pitch.
+    pub fn set_speed(&self, speed: u32) {
+        self.speed.store(speed.clamp(1, MAX_SPEED), Ordering::Release);
+    }
+
+    pub fn speed(&self) -> u32 {
+        self.speed.load(Ordering::Acquire)
     }
 
     /// The cart's world-inspection JSON as of the last presented frame
@@ -349,6 +369,7 @@ pub fn start(
     let snapshot: Arc<Mutex<Option<Arc<PpuSnapshot>>>> = Arc::new(Mutex::new(None));
     let world_json: Arc<Mutex<Option<(u32, Arc<String>)>>> = Arc::new(Mutex::new(None));
     let inspect = Arc::new(AtomicBool::new(false));
+    let speed = Arc::new(AtomicU32::new(1));
     let uart = UartLog::new();
     let outcome: Arc<Mutex<Option<RunOutcome>>> = Arc::new(Mutex::new(None));
 
@@ -362,6 +383,7 @@ pub fn start(
             step: step.clone(),
             snapshot: snapshot.clone(),
             inspect: inspect.clone(),
+            speed: speed.clone(),
             world_json: world_json.clone(),
         };
         let (uart, outcome) = (uart.clone(), outcome.clone());
@@ -383,6 +405,7 @@ pub fn start(
         step,
         snapshot,
         inspect,
+        speed,
         world_json,
         uart,
         outcome,
@@ -401,6 +424,7 @@ struct Controls {
     step: Arc<AtomicU32>,
     snapshot: Arc<Mutex<Option<Arc<PpuSnapshot>>>>,
     inspect: Arc<AtomicBool>,
+    speed: Arc<AtomicU32>,
     world_json: Arc<Mutex<Option<(u32, Arc<String>)>>>,
 }
 
@@ -431,6 +455,7 @@ fn run(
         step,
         snapshot,
         inspect,
+        speed,
         world_json,
     } = controls;
     // Cached guest address of the world-inspection tap (see
@@ -545,6 +570,11 @@ fn run(
 
     let start = Instant::now();
     let mut last_present = Instant::now();
+    // The cart's clock, accumulated per frame as real time times the
+    // speed in force for that frame -- so a speed change mid-run bends
+    // the clock forward rather than jumping it.
+    let mut emulated = Duration::ZERO;
+    let mut last_real = Duration::ZERO;
 
     // Every arm below breaks with `(reason, is_error)`, so each way out of
     // the run states its own verdict rather than leaving the caller to
@@ -596,8 +626,17 @@ fn run(
                 // the period as it can be. `handle_vsync_wait` advanced
                 // the APU exactly one frame on the way to this event, so
                 // there is precisely one frame of samples waiting.
+                let speed = speed.load(Ordering::Acquire).clamp(1, MAX_SPEED);
                 if let Some(writer) = &audio_writer {
-                    audio_cursor = pump_audio(&p.apu, audio_cursor, &mut audio_scratch, writer);
+                    audio_cursor = if speed == 1 {
+                        pump_audio(&p.apu, audio_cursor, &mut audio_scratch, writer)
+                    } else {
+                        // Silence at speed: the ring would drop most of
+                        // it anyway, and what got through would be noise.
+                        // The cursor still advances so 1x resumes clean.
+                        audio_scratch.clear();
+                        p.apu.copy_since(audio_cursor, &mut audio_scratch)
+                    };
                 }
                 frames_presented = frames_presented.wrapping_add(1);
                 if p.save_dirty
@@ -608,7 +647,7 @@ fn run(
                     flush_save(&save_file, &title, &mut p, uart);
                     last_save_flush = Some(frames_presented);
                 }
-                if let Some(hold) = pace_sleep(last_present.elapsed(), FRAME_TIME) {
+                if let Some(hold) = pace_sleep(last_present.elapsed(), FRAME_TIME / speed) {
                     std::thread::sleep(hold);
                 }
                 // The debugger's park: hold here, frame complete and
@@ -635,8 +674,10 @@ fn run(
                 // (present -> refresh_input -> set_ticks_ms), so the
                 // clock the cart reads next turn accounts for the pacing
                 // sleep it just went through.
-                let elapsed = start.elapsed().saturating_sub(paused_total);
-                p.set_ticks_ms(elapsed.as_millis().min(u32::MAX as u128) as u32);
+                let real = start.elapsed().saturating_sub(paused_total);
+                emulated += real.saturating_sub(last_real) * speed;
+                last_real = real;
+                p.set_ticks_ms(emulated.as_millis().min(u32::MAX as u128) as u32);
             }
             // Budget exhausted mid-frame: the framebuffer is half-drawn,
             // so do NOT publish it (`run_cart` likewise refuses to
@@ -1158,6 +1199,29 @@ mod tests {
     use super::*;
 
     // ------------------------------------------------------- pacing math
+
+    #[test]
+    fn set_speed_clamps_to_the_supported_range() {
+        let (session, _rx) = start(PathBuf::from("/nonexistent/cart.ggo"), "cart.ggo".into(), None);
+        assert_eq!(session.speed(), 1, "a fresh run is real time");
+        session.set_speed(4);
+        assert_eq!(session.speed(), 4);
+        session.set_speed(0);
+        assert_eq!(session.speed(), 1, "0x is not a speed");
+        session.set_speed(99);
+        assert_eq!(session.speed(), MAX_SPEED);
+    }
+
+    /// At speed the frame hold shrinks by the same factor; a late frame
+    /// still holds nothing.
+    #[test]
+    fn a_faster_speed_shortens_the_frame_hold() {
+        assert_eq!(
+            pace_sleep(Duration::from_millis(1), FRAME_TIME / 4),
+            Some(FRAME_TIME / 4 - Duration::from_millis(1))
+        );
+        assert_eq!(pace_sleep(Duration::from_millis(5), FRAME_TIME / 4), None);
+    }
 
     #[test]
     fn pace_sleep_holds_the_remainder_of_the_frame() {

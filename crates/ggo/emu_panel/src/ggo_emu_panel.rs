@@ -454,6 +454,10 @@ pub struct EmuPanel {
     /// way out, so blanking the console at that moment would hide exactly
     /// what the user wants to read.
     console: Option<UartLog>,
+    /// Frames per real frame period for the next and current run,
+    /// `1..=drive::MAX_SPEED`. A setting, not run state: it survives
+    /// Stop/Run so a fault hunt does not reset to 1x every restart.
+    speed: u32,
     console_expanded: bool,
     ingest_status: IngestStatus,
 
@@ -658,6 +662,7 @@ impl EmuPanel {
             audio: audio::AudioStatus::new(),
             fps_window_started: Instant::now(),
             console: None,
+            speed: 1,
             console_expanded: false,
             ingest_status: IngestStatus::Idle,
             latest_frame: None,
@@ -1562,6 +1567,7 @@ impl EmuPanel {
         // "no output device" against this one. Mute is deliberately kept.
         self.audio.reset_for_run();
         let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()));
+        session.set_speed(self.speed);
         self.console = Some(session.uart().clone());
         self.session = Some(session);
         // A watch restart keeps the pad as the player holds it.
@@ -2962,6 +2968,7 @@ impl EmuPanel {
                 }),
             )
             .child(self.render_mute_button(cx))
+            .child(self.render_speed_slider(cx))
             .child(
                 Button::new("ggo-emu-debug", "Debug")
                     .toggle_state(self.debug.open)
@@ -3024,6 +3031,45 @@ impl EmuPanel {
         .tooltip(Tooltip::text(tooltip))
         .on_click(cx.listener(|this, _event, _window, cx| this.toggle_mute(cx)))
         .into_any_element()
+    }
+
+    /// Set the emulation speed for the current run and the ones after it.
+    pub(crate) fn set_speed(&mut self, speed: u32, cx: &mut Context<Self>) {
+        self.speed = speed.clamp(1, drive::MAX_SPEED);
+        if let Some(session) = &self.session {
+            session.set_speed(self.speed);
+        }
+        cx.notify();
+    }
+
+    /// 1x..=MAX_SPEED, next to the transport: faster is how a fault that
+    /// only shows up late in play is reached without playing that long.
+    fn render_speed_slider(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let max = drive::MAX_SPEED as usize;
+        // The live session is the truth while one runs; the setting is
+        // what the next run will get.
+        let speed = self.session.as_ref().map(|s| s.speed()).unwrap_or(self.speed);
+        let weak = cx.weak_entity();
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                ui::Slider::new(
+                    "ggo-emu-speed",
+                    ui::slider_fraction(speed as usize, 1, max),
+                )
+                .width(px(72.))
+                .on_change(move |fraction, _window, cx| {
+                    let speed = ui::slider_step(fraction, 1, max) as u32;
+                    weak.update(cx, |this, cx| this.set_speed(speed, cx)).ok();
+                }),
+            )
+            .child(
+                Label::new(format!("{speed}×"))
+                    .size(LabelSize::XSmall)
+                    .color(if speed == 1 { Color::Muted } else { Color::Accent }),
+            )
+            .into_any_element()
     }
 
     /// The pane itself: the framebuffer integer-scaled to the dock's
@@ -7078,6 +7124,23 @@ mod tests {
             )
             .await
             .unwrap();
+        });
+    }
+
+    /// The speed setting outlives a run (a fault hunt restarts often) and
+    /// never leaves the range the drive loop honours.
+    #[gpui::test]
+    async fn test_speed_is_a_setting_clamped_to_the_drive_range(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.speed, 1);
+            panel.set_speed(7, cx);
+            assert_eq!(panel.speed, 7);
+            panel.set_speed(50, cx);
+            assert_eq!(panel.speed, drive::MAX_SPEED);
+            panel.set_speed(0, cx);
+            assert_eq!(panel.speed, 1);
         });
     }
 
