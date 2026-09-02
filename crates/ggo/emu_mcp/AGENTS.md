@@ -78,13 +78,15 @@ flat boxes, and the editor's selection outline is left out.
 
 ## Hardware
 
-Flashing occupies the board (~20 min with `rebuild_gateware`) — CONFIRM
-WITH THE USER before `hw_flash`, and pass an explicit `world` stem: with
-none, the panel flashes whichever world it last remembered. Then
-`hw_flash_wait` → `verdict` (true=PASS) and, for a passed run,
-`perf_run_id` → `fetch_ggo_report { run }`. `list_ggo_reports` and
-`fetch_ggo_report` read the database directly, so they need no live
-session; `open_ggo_report`/`close_ggo_report` drive the Reports tab.
+Call `hw_env` first: a missing prerequisite there is what `hw_flash`
+would fail on. Flashing occupies the board (~20 min with
+`rebuild_gateware`) — CONFIRM WITH THE USER before `hw_flash`, and pass
+an explicit `world` stem: with none, the panel flashes whichever world
+it last remembered. Then `hw_flash_wait` → `verdict` (true=PASS) and,
+for a passed run, `perf_run_id` → `fetch_ggo_report { run }`.
+`list_ggo_reports` and `fetch_ggo_report` read the database directly, so
+they need no live session; `open_ggo_report`/`close_ggo_report` drive the
+Reports tab.
 
 This bridge is single-threaded: `main` reads one stdin line, serves it,
 and only then reads the next. Every other tool is bounded by a 15s socket

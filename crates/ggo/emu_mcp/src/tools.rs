@@ -2,11 +2,12 @@
 //! session from the registry, sends one protocol line over its socket,
 //! and shapes the answer into MCP content.
 //!
-//! Emulation is LOCK-STEP: `emu_start` boots a cart paused and returns
-//! the cart's own world-state JSON; each `emu_next_frame` latches pad
-//! input, runs exactly one frame, and returns the new world state (plus
-//! an optional screenshot); `emu_stop` ends the run with the uart log.
-//! A script, an AI, or any other caller can play the emulator.
+//! The surface covers emulator control in both modes — LOCK-STEP, where
+//! `emu_start` boots a cart paused and each `emu_next_frame` latches pad
+//! input and runs exactly one frame, and free-running, where `emu_run`
+//! plays the cart under `emu_pause`/`emu_resume` — alongside the PPU
+//! inspector, cart packing, hardware flash with its readiness probe,
+//! perf reports, and reads of the authored world.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
