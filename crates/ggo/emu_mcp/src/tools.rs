@@ -143,6 +143,12 @@ pub fn tool_list() -> Value {
         { "name": "world_read",
           "description": "The world as the designer authored it, from the World panel: {stem, rel_path, dirty, entities[{index, pos, components}], instances[{index, world, pos, background_priority, error}], backgrounds[{layer, map}], selected[]}. Pass `world` to open one first. This is the level layout — what world_screenshot draws and what the cart boots — not the running game (that is emu_next_frame's world JSON).",
           "inputSchema": with(json!({ "world": { "type": "string", "description": "Open this world first (stem or rel path); omit to read the one already open" } })) },
+        { "name": "world_screenshot",
+          "description": "The authored world drawn to a PNG from the World panel — the level layout as designed, not a running frame. Default: the 320×240 device screen at the world's active camera (what the board shows on boot). full=true: the whole scene's bounding box (capped 4096²). Sprites, tilemaps and backgrounds render with real pixels; text and placeholder entities draw as flat boxes. Pass `world` to open one first.",
+          "inputSchema": with(json!({
+              "world": { "type": "string", "description": "Open this world first (stem or rel path); omit for the open one" },
+              "full": { "type": "boolean", "description": "Frame the whole scene instead of the device screen" }
+          })) },
     ] })
 }
 
@@ -431,6 +437,17 @@ fn call_tool_inner(
             let data =
                 send(&session.socket, Cmd::WorldRead { workspace, world }, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "world_screenshot" => {
+            let world = arg_str(args, "world");
+            let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
+            let data = send(
+                &session.socket,
+                Cmd::WorldScreenshot { workspace, world, full },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            Ok(vec![image_content(&data)?])
         }
         other => Err(format!("unknown tool {other:?}")),
     }
@@ -832,6 +849,27 @@ mod tests {
     }
 
     #[test]
+    fn world_screenshot_is_png_content() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let bgra = base64::engine::general_purpose::STANDARD.encode([0u8, 0, 255, 255]);
+        let connect = move |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(
+                line.contains(r#""cmd":"world_screenshot""#) && line.contains(r#""full":true"#),
+                "{line}"
+            );
+            Ok(format!(
+                r#"{{"id":1,"ok":true,"data":{{"width":1,"height":1,"bgra_base64":"{bgra}"}}}}"#
+            ))
+        };
+        let (content, is_err) =
+            call_tool("world_screenshot", &json!({"full": true}), dir.path(), &connect);
+        assert!(!is_err, "{content:?}");
+        assert_eq!(content[0]["type"], "image");
+    }
+
+    #[test]
     fn tool_list_names_exactly_the_lockstep_surface() {
         let list = tool_list();
         let names: Vec<&str> =
@@ -863,6 +901,7 @@ mod tests {
                 "world_list",
                 "world_open",
                 "world_read",
+                "world_screenshot",
             ]
         );
     }

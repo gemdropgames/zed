@@ -109,6 +109,16 @@ pub enum Cmd {
         #[serde(default)]
         world: Option<String>,
     },
+    /// The authored world drawn to pixels: the 320x240 device screen at
+    /// the active camera by default, the whole scene's bounding box with
+    /// `full`. `{width, height, bgra_base64}`.
+    WorldScreenshot {
+        workspace: Option<String>,
+        #[serde(default)]
+        world: Option<String>,
+        #[serde(default)]
+        full: bool,
+    },
 }
 
 /// Which PPU inspector view `Cmd::Debug` renders.
@@ -532,6 +542,24 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"id":3,"cmd":"world_read"}"#).unwrap().cmd,
             Cmd::WorldRead { workspace: None, world: None }
+        );
+    }
+
+    #[test]
+    fn world_screenshot_defaults_to_the_device_screen() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"world_screenshot"}"#).unwrap().cmd,
+            Cmd::WorldScreenshot { workspace: None, world: None, full: false }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"world_screenshot","world":"worlds/a","full":true}"#)
+                .unwrap()
+                .cmd,
+            Cmd::WorldScreenshot {
+                workspace: None,
+                world: Some("worlds/a".to_string()),
+                full: true
+            }
         );
     }
 

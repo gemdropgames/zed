@@ -56,8 +56,8 @@ use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::merge_candidates::merge_candidates;
 use ggo_worldlib::render::{
-    AssetLoads, DrawItem, Loadable, RgbaImage, Selection, active_camera_origin,
-    build_draw_list_multi, hit_test, items_in_rect, world_label,
+    AssetLoads, DEVICE_SCREEN_H, DEVICE_SCREEN_W, DrawItem, DrawKind, Loadable, RgbaImage,
+    Selection, active_camera_origin, build_draw_list_multi, hit_test, items_in_rect, world_label,
 };
 use ggo_worldlib::schemas::{ComponentSchema, FieldKind, defaults_for};
 use ggo_worldlib::sprites::map_doc::{MapDocStore, Stamp};
@@ -938,6 +938,66 @@ fn draw_items(open: &OpenWorld) -> Vec<DrawItem> {
         &open.map_loads,
         &open.meta_sprite_loads,
     )
+}
+
+/// Software-composite a draw list into a BGRA canvas whose top-left is
+/// world point `origin`. Images blit with source alpha; the gizmo kinds
+/// (`Marker`, `Placeholder`, `InstanceOrigin`, `Text`) draw as flat
+/// boxes -- the agent's picture is of the LAYOUT, not the editor's
+/// chrome, so `SelectionOutline` is skipped. Items paint in draw-list
+/// order, which `build_draw_list_multi` has already sorted by z.
+pub fn composite_scene(items: &[DrawItem], origin: [f64; 2], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (i64::from(width), i64::from(height));
+    let mut canvas = vec![0u8; (w * h * 4) as usize];
+    let mut put = |x: i64, y: i64, rgba: [u8; 4]| {
+        if x < 0 || y < 0 || x >= w || y >= h || rgba[3] == 0 {
+            return;
+        }
+        let i = ((y * w + x) * 4) as usize;
+        let a = u32::from(rgba[3]);
+        for (channel, src) in [(2usize, rgba[0]), (1, rgba[1]), (0, rgba[2])] {
+            let dst = u32::from(canvas[i + channel]);
+            canvas[i + channel] = ((u32::from(src) * a + dst * (255 - a)) / 255) as u8;
+        }
+        canvas[i + 3] = 255;
+    };
+    for item in items {
+        let x0 = (item.x - origin[0]).round() as i64;
+        let y0 = (item.y - origin[1]).round() as i64;
+        match &item.kind {
+            DrawKind::Image { image } => {
+                for sy in 0..i64::from(image.h) {
+                    for sx in 0..i64::from(image.w) {
+                        let s = ((sy * i64::from(image.w) + sx) * 4) as usize;
+                        let px = [
+                            image.rgba[s],
+                            image.rgba[s + 1],
+                            image.rgba[s + 2],
+                            image.rgba[s + 3],
+                        ];
+                        put(x0 + sx, y0 + sy, px);
+                    }
+                }
+            }
+            DrawKind::SelectionOutline => {}
+            DrawKind::Text { .. }
+            | DrawKind::Marker
+            | DrawKind::Placeholder { .. }
+            | DrawKind::InstanceOrigin => {
+                let color = match &item.kind {
+                    DrawKind::Text { .. } => [255, 255, 255, 160],
+                    DrawKind::Placeholder { .. } => [255, 64, 64, 200],
+                    _ => [96, 200, 255, 160],
+                };
+                for dy in 0..item.h.round() as i64 {
+                    for dx in 0..item.w.round() as i64 {
+                        put(x0 + dx, y0 + dy, color);
+                    }
+                }
+            }
+        }
+    }
+    canvas
 }
 
 /// The world point at the canvas center -- ggo-ide's `view_center_world`,
@@ -2740,6 +2800,46 @@ impl WorldPanel {
         }
         self.load_rel_path(&rel, cx);
         Ok(rel)
+    }
+
+    /// The open world drawn to pixels. Default framing is the device
+    /// screen (320x240) at the active camera -- what the board shows on
+    /// boot; `full` frames the whole scene's bounding box instead.
+    /// `(width, height, BGRA)`.
+    pub fn remote_screenshot(&self, full: bool) -> Result<(u32, u32, Vec<u8>), String> {
+        let ViewerState::Ready(open) = &self.state else {
+            // Not Ready: `remote_read` already words every such state
+            // (nothing open, still loading, load failed) for the caller.
+            return Err(self
+                .remote_read()
+                .err()
+                .unwrap_or_else(|| "no world open".to_string()));
+        };
+        let items = draw_items(open);
+        let (origin, width, height) = if full {
+            let mut min = [f64::INFINITY; 2];
+            let mut max = [f64::NEG_INFINITY; 2];
+            for item in items
+                .iter()
+                .filter(|item| !matches!(item.kind, DrawKind::SelectionOutline))
+            {
+                min = [min[0].min(item.x), min[1].min(item.y)];
+                max = [max[0].max(item.x + item.w), max[1].max(item.y + item.h)];
+            }
+            if !min[0].is_finite() {
+                return Err("the world draws nothing".to_string());
+            }
+            let width = ((max[0] - min[0]).ceil() as u32).clamp(1, 4096);
+            let height = ((max[1] - min[1]).ceil() as u32).clamp(1, 4096);
+            (min, width, height)
+        } else {
+            (
+                active_camera_origin(&open.store.state()),
+                DEVICE_SCREEN_W as u32,
+                DEVICE_SCREEN_H as u32,
+            )
+        };
+        Ok((width, height, composite_scene(&items, origin, width, height)))
     }
 
     /// The open world as authored. `Err` while nothing is open or a load
@@ -5539,7 +5639,6 @@ impl Panel for WorldPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggo_worldlib::render::DrawKind;
     use ggo_worldlib::world_file::{
         WorldEntity, WorldFile, WorldInstance, read_world, write_world,
     };
@@ -5705,6 +5804,82 @@ mod tests {
                     .remote_resolve("worlds/nope", cx)
                     .unwrap_err()
                     .contains("worlds/test")
+            );
+        });
+    }
+
+    #[test]
+    fn composite_scene_blits_images_and_boxes_relative_to_the_origin() {
+        let red: Arc<[u8]> =
+            vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255].into();
+        let items = vec![
+            DrawItem {
+                kind: DrawKind::Image {
+                    image: RgbaImage { rgba: red, w: 2, h: 2 },
+                },
+                x: 10.0,
+                y: 10.0,
+                w: 2.0,
+                h: 2.0,
+                z: 0.0,
+                order: 0,
+                sel: None,
+            },
+            DrawItem {
+                kind: DrawKind::SelectionOutline,
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+                z: 1.0,
+                order: 1,
+                sel: None,
+            },
+        ];
+        let canvas = composite_scene(&items, [8.0, 8.0], 8, 8);
+        // Image landed at canvas (2,2): BGRA red, opaque.
+        let i = (2 * 8 + 2) * 4;
+        assert_eq!(&canvas[i..i + 4], &[0, 0, 255, 255]);
+        // Outline drew nothing: (0,0) stays transparent black.
+        assert_eq!(&canvas[0..4], &[0, 0, 0, 0]);
+        // Outside the image: untouched.
+        let j = (5 * 8 + 5) * 4;
+        assert_eq!(&canvas[j..j + 4], &[0, 0, 0, 0]);
+    }
+
+    #[gpui::test]
+    async fn test_remote_screenshot_frames_the_device_screen_or_the_whole_scene(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, _cx| {
+            // `active_camera_origin` CENTERS the screen on the active
+            // camera, so the fixture's Camera at (0,0) puts world point
+            // (x, y) at canvas (x - origin.x, y - origin.y).
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready state after load");
+            };
+            let origin = active_camera_origin(&open.store.state());
+            assert_eq!(origin, [-DEVICE_SCREEN_W / 2.0, -DEVICE_SCREEN_H / 2.0]);
+            let canvas_index = |x: f64, y: f64| {
+                (((y - origin[1]) as usize) * 320 + (x - origin[0]) as usize) * 4
+            };
+
+            let (w, h, bgra) = panel.remote_screenshot(false).expect("Ready draws");
+            assert_eq!((w, h), (320, 240));
+            assert_eq!(bgra.len(), 320 * 240 * 4);
+            // The fixture's Text at (40,8) 40x12 paints a box: a pixel
+            // inside it is opaque, one far outside the scene is not.
+            let inside = canvas_index(45.0, 10.0);
+            assert_eq!(bgra[inside + 3], 255, "text box painted");
+            let outside = canvas_index(140.0, 110.0);
+            assert_eq!(bgra[outside + 3], 0, "empty world pixel");
+
+            let (w, h, _) = panel.remote_screenshot(true).expect("full frames the bbox");
+            assert!(
+                w > 0 && h > 0 && w <= 320,
+                "the fixture scene is smaller than a screen: {w}x{h}"
             );
         });
     }

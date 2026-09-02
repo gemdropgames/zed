@@ -57,18 +57,24 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `world_list` | every world in the project: `[{ stem, rel_path }]` |
 | `world_open { world }` | open a world in the World panel |
 | `world_read { world? }` | the authored world: entities/components/pos, instances, backgrounds, selection, dirty |
+| `world_screenshot { world?, full? }` | the authored world as PNG: device screen at the camera, or the whole scene |
 
 ## Worlds
 
-`world_list` / `world_open` / `world_read` read the WORLD panel — the
-level as the designer authored it (entity components, `[[instance]]`
-placements, background slots, the current selection, and whether the
-document has unsaved edits) — not the running game; that is
+`world_list` / `world_open` / `world_read` / `world_screenshot` read the
+WORLD panel — the level as the designer authored it (entity components,
+`[[instance]]` placements, background slots, the current selection, and
+whether the document has unsaved edits) — not the running game; that is
 `emu_next_frame`'s `world`. Paths are worktree-relative (what the
 explorer shows); `world_open` also accepts the stem `emd`, `cart_pack`
 and `hw_flash` take. `world_open` is a click minus the modal: the world
 already open is left exactly as it is, and a swap away from a world with
-unsaved edits is refused rather than discarding them.
+unsaved edits is refused rather than discarding them. `world_screenshot`
+draws that same authored layout: by default the 320x240 device screen
+framed on the world's active camera (the engine's own centring rule), or
+the whole scene's bounding box with `full`. Sprites, tilemaps and
+backgrounds composite as real pixels; text and placeholder entities are
+flat boxes, and the editor's selection outline is left out.
 
 ## Hardware
 

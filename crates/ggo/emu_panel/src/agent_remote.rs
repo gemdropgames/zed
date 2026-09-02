@@ -318,6 +318,31 @@ fn world_panel_for(
         .map_err(|e| e.to_string())?
 }
 
+/// Run `read` against the World panel once the world it is loading has
+/// landed. `remote_open` leaves the panel `Loading` with the file read
+/// still off-thread, so the first ask can legitimately answer "still
+/// loading"; every other failure is final and returns straight away.
+/// Bounded at 5s so a load that never completes answers the agent
+/// instead of hanging its tool call.
+async fn await_world_ready<T>(
+    panel: &Entity<ggo_world_panel::WorldPanel>,
+    cx: &mut AsyncApp,
+    read: impl Fn(&ggo_world_panel::WorldPanel) -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match panel.update(cx, |p, _| read(p)) {
+            Ok(value) => return Ok(value),
+            Err(reason)
+                if reason.contains("still loading") && std::time::Instant::now() < deadline =>
+            {
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+            }
+            Err(reason) => return Err(reason),
+        }
+    }
+}
+
 /// The workspace's emu panel, opening one if none is up.
 ///
 /// Two steps on purpose: the panel is opened INSIDE a `workspace.update`
@@ -511,7 +536,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::PackWorld { workspace, .. }
         | Cmd::WorldList { workspace }
         | Cmd::WorldOpen { workspace, .. }
-        | Cmd::WorldRead { workspace, .. } => workspace.clone(),
+        | Cmd::WorldRead { workspace, .. }
+        | Cmd::WorldScreenshot { workspace, .. } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -751,20 +777,17 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             if let Some(world) = world {
                 panel.update(cx, |p, cx| p.remote_open(&world, cx))?;
             }
-            // The load is off-thread; give it a bounded moment to land.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match panel.update(cx, |p, _| p.remote_read()) {
-                    Ok(value) => return Ok(value),
-                    Err(reason)
-                        if reason.contains("still loading")
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
-                    }
-                    Err(reason) => return Err(reason),
-                }
+            await_world_ready(&panel, cx, |p| p.remote_read()).await
+        }
+        Cmd::WorldScreenshot { world, full, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = world_panel_for(&workspace, window, cx)?;
+            if let Some(world) = world {
+                panel.update(cx, |p, cx| p.remote_open(&world, cx))?;
             }
+            let (width, height, bgra) =
+                await_world_ready(&panel, cx, |p| p.remote_screenshot(full)).await?;
+            Ok(bgra_reply(width, height, &bgra))
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;
