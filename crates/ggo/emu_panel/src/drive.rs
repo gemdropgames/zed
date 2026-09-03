@@ -27,7 +27,7 @@
 //! [`PerfSnapshot`], stores it in the shared [`Session`] slot, and
 //! returns. [`Session::wait`] joins the thread and hands the panel the
 //! snapshot plus the run's diagnostic lines, which is what
-//! [`crate::ingest`] writes to `ggo_ide.db`.
+//! [`crate::ingest`] writes to the database.
 //!
 //! This is deliberately NOT ggo-ide's `EmuCmd::Snapshot` request/reply
 //! round trip. That shape exists because its emu thread is persistent and
@@ -84,8 +84,8 @@ use crate::audio::{AudioStatus, RingWriter};
 use crate::uart::UartLog;
 
 /// One 60 Hz vsync period -- `ggo_emu::FRAME_TIME`, redeclared because it
-/// lives in the `ggo-emu` binary crate (which drags in winit, cpal and two
-/// SQLite engines) rather than in `ggo-emu-core`.
+/// lives in the `ggo-emu` binary crate (which drags in winit and cpal)
+/// rather than in `ggo-emu-core`.
 pub const FRAME_TIME: Duration = Duration::from_micros(16_667);
 
 /// The fastest the pane will drive a cart: ten frames per real frame
@@ -1948,14 +1948,20 @@ mod tests {
             last_number
         };
 
-        let before_step = session.snapshot().map(|s| Arc::as_ptr(&s) as usize);
+        // The Arc itself is HELD, never just its address: dropping it
+        // frees the allocation, and the allocator is free to hand the very
+        // same address back to the next snapshot -- which reads as "the
+        // slot was never refilled" even when it was.
+        let before_step = session.snapshot();
         session.step();
         let stepped =
             recv_within(&rx, Duration::from_secs(2)).expect("step releases exactly one frame");
         assert_eq!(stepped.number, last_number + 1, "one frame, the next one");
-        assert_ne!(
-            session.snapshot().map(|s| Arc::as_ptr(&s) as usize),
-            before_step,
+        let after_step = session.snapshot().expect("the stepped frame presented");
+        assert!(
+            !before_step
+                .as_ref()
+                .is_some_and(|before| Arc::ptr_eq(before, &after_step)),
             "the stepped frame refilled the snapshot slot"
         );
         last_number = stepped.number;

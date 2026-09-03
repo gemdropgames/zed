@@ -1024,7 +1024,7 @@ mod tests {
     #[gpui::test]
     async fn test_the_hardware_page_is_a_singleton_tab(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, _panel, _worktree_id, cx) =
+        let (_db, workspace, _panel, _worktree_id, cx) =
             crate::tests::run_menu_workspace(cx, dir.path()).await;
 
         workspace.update_in(cx, |workspace, window, cx| {

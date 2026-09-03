@@ -4,7 +4,8 @@
 //! pipeline: it packs the project with `emd pack-ggo`, writes the
 //! flash-backed sd-emu card image (GemOS + assets + the game), flashes the
 //! cached bitstream with `fujprog`, boot-verifies over UART and records
-//! the run in `~/.ggo/diag.db` -- the rows `ggo_charts_panel` reads. This
+//! the run in the GemdropGo database -- the rows `ggo_charts_panel`
+//! reads. This
 //! module owns the rules around that call and nothing else: what the
 //! machine is missing, the argv, how to read the CLI's progress, and how
 //! to install what is absent. Every function here is pure and unit-tested
@@ -690,11 +691,10 @@ pub fn parse_stage(line: &str) -> Option<Stage> {
 
 /// The diag run id from `ggo-diag`'s `[db] run <id>: …` persistence line --
 /// the TEXT key everything about the finished hardware run is looked up by,
-/// including its perf data once `diag_db::clone_runs` has copied that into
-/// `~/.ggo/ggo_ide.db` under `run.label`.
+/// including the perf run `runs.perf_run_id` links it to.
 ///
 /// NOT the `[db] device run <n> (…)` line printed beside it: that `<n>` is
-/// an INTEGER id in `diag.db`'s own perf tables, a different id space from
+/// an INTEGER id in ggo-diag's own log line, a different id space from
 /// both this one and the local `run.id` the charts panel opens. The
 /// `"[db] run "` prefix is what keeps the two apart, so it is matched
 /// whole rather than by a looser "starts with `[db]`" test.

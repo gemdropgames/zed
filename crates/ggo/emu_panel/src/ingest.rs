@@ -1,11 +1,11 @@
-//! Write a finished run's perf snapshot into `~/.ggo/ggo_ide.db`.
+//! Write a finished run's perf snapshot into the GemdropGo database.
 //!
 //! Ported field-for-field from `ggo-ide`'s `src/backend/ingest.rs`
 //! (`parse_output`/`ingest_run`/`write_run_rows` and its `iso8601_utc`
 //! helper) -- same required fields, same optional fields, same validation,
-//! same caps, same tables, same column order, same `BEGIN`/`COMMIT`
-//! transaction. Nothing about the schema is invented here: the input is
-//! whatever `ggo_emu_core::perfsim::perf_json` produced for the run
+//! same caps, same tables, same column order, same single transaction.
+//! Nothing about the schema is invented here: the input is whatever
+//! `ggo_emu_core::perfsim::perf_json` produced for the run
 //! ([`crate::drive`] calls it exactly the way ggo-ide's `CartStepper::
 //! perf_json` does), and the output is the `cart`/`run`/`frame`/`uart`
 //! (/`profile`/`dprofile`) row set that `ggo_charts_panel::loader`'s
@@ -18,15 +18,22 @@
 //! (see [`crate::drive::Session::wait`]), so there is no round trip and no
 //! "snapshot answered by the wrong stepper" race to guard against.
 //!
+//! The writer's SHAPE is `ggo-emu`'s `report.rs`: one `pool.begin()`
+//! transaction, `RETURNING id` for the run row, and batched multi-row
+//! `INSERT`s for the per-frame tables. The two are deliberately separate
+//! copies rather than shared code -- they write the same tables from
+//! different in-memory representations (a `FrameRecord` slice there,
+//! column-oriented `Vec`s here).
+//!
 //! [`parse_output`] is pure (`&str -> Result<RunBody, String>`, no db, no
 //! panics on malformed input); [`ingest_run`] is the blocking db half on
 //! top of it and MUST be called from a background thread -- the panel runs
 //! it inside `cx.background_spawn`, the same rule
 //! `ggo_charts_panel::loader` follows for its reads.
 
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ggo_db::sqlx::{self, PgConnection, QueryBuilder, Row};
 use serde_json::Value as Json;
 
 /// Hard cap on frames per run ("sane size": ~28 min at 60 fps).
@@ -37,27 +44,52 @@ const MAX_PROFILE_ROWS: usize = 500_000;
 /// Cart names come from a 32-byte header slot; anything longer is junk.
 const MAX_CART_NAME: usize = 64;
 
-const INSERT_CART: &str = "INSERT OR IGNORE INTO cart(name) VALUES (?1)";
-const SELECT_CART: &str = "SELECT id FROM cart WHERE name = ?1";
+/// Rows per multi-row `INSERT`. Mirrors `ggo-emu`'s `report::INSERT_BATCH`
+/// and exists for the same reason: a long run writes 100k frame rows, and
+/// PostgreSQL caps one statement at 65535 bind parameters -- the widest
+/// table here (`frame`, [`FRAME_COL_COUNT`] columns) stays well under that
+/// at this batch size.
+const INSERT_BATCH: usize = 1_000;
+
+const INSERT_CART: &str = "INSERT INTO cart(name) VALUES ($1) ON CONFLICT DO NOTHING";
+const SELECT_CART: &str = "SELECT id FROM cart WHERE name = $1";
 const INSERT_RUN: &str = "INSERT INTO run(cart_id, started_at, frames, frame_budget_cycles,
                                           scanout_wire_cycles, refill_cycles, writeback_cycles,
                                           wire_wait_cycles, label)
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
-const INSERT_UART: &str = "INSERT INTO uart(run_id, seq, text) VALUES (?1, ?2, ?3)";
-const INSERT_PROFILE: &str = "INSERT INTO profile(run_id, frame, caller, func, misses, evicted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
-const INSERT_DPROFILE: &str = "INSERT INTO dprofile(run_id, frame, caller, func, misses, evicted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
-const INSERT_FRAME: &str = "INSERT INTO frame(run_id, n, instrs, i_hits, i_misses, d_hits,
-                                              d_misses, d_writebacks, evictions, blit_wire,
-                                              miss_wire, scanout_wire, wire_total, over_budget,
-                                              bg_hits, bg_misses, bg_evictions, bg_loads,
-                                              fg_hits, fg_misses, fg_evictions, fg_loads,
-                                              spr_hits, spr_misses, spr_evictions, spr_loads,
-                                              tile_load_wire, apu_fetch_wire, apu_underruns,
-                                              sc_upload, sc_oam, sc_layer, sc_audio, sc_other,
-                                              peak_spr_line, bg_tiles_distinct, spr_tiles_distinct)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
-                                    ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)";
+                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                          RETURNING id";
+/// `uart` carries TWO nullable keys -- `run_id` (ggo-diag's TEXT run id)
+/// and `perf_run_id` (a perf `run.id`). This writer owns a perf run, so it
+/// fills the latter; `perf_db::run_uart` reads both.
+const INSERT_UART: &str = "INSERT INTO uart(perf_run_id, seq, text) VALUES ($1, $2, $3)";
+/// Column lists for the batched writers; the `VALUES` tuples are appended
+/// by [`QueryBuilder::push_values`].
+const PROFILE_INSERT_HEAD: &str =
+    "INSERT INTO profile(run_id, frame, caller, func, misses, evicted) ";
+const DPROFILE_INSERT_HEAD: &str =
+    "INSERT INTO dprofile(run_id, frame, caller, func, misses, evicted) ";
+/// `run_id` + [`FRAME_COLS`] + [`EXTRA_COLS`], in that order. The `frame`
+/// table has three more columns (`aok`/`afail`/`cyc`, written only by
+/// ggo-diag's device ingest); they keep their defaults here.
+const FRAME_INSERT_HEAD: &str = "INSERT INTO frame(run_id, n, instrs, i_hits, i_misses, d_hits,
+                                                   d_misses, d_writebacks, evictions, blit_wire,
+                                                   miss_wire, scanout_wire, wire_total, over_budget,
+                                                   bg_hits, bg_misses, bg_evictions, bg_loads,
+                                                   fg_hits, fg_misses, fg_evictions, fg_loads,
+                                                   spr_hits, spr_misses, spr_evictions, spr_loads,
+                                                   tile_load_wire, apu_fetch_wire, apu_underruns,
+                                                   sc_upload, sc_oam, sc_layer, sc_audio, sc_other,
+                                                   peak_spr_line, bg_tiles_distinct,
+                                                   spr_tiles_distinct) ";
+/// `run_id` + the 13 + 23 frame counters -- pinned by
+/// `frame_columns_match_the_insert_head`.
+const FRAME_COL_COUNT: usize = 37;
+/// PostgreSQL's hard cap on bind parameters in one statement.
+const MAX_BIND_PARAMS: usize = 65_535;
+/// The batch size is only safe against that cap for the WIDEST table here,
+/// so the widest table is what checks it -- at compile time, because a
+/// batch that overflowed would fail at runtime on a long run only.
+const _: () = assert!(INSERT_BATCH * FRAME_COL_COUNT <= MAX_BIND_PARAMS);
 
 /// The 13 REQUIRED frame arrays, in `INSERT_FRAME` column order after
 /// `run_id`. A body missing any of these is rejected.
@@ -377,88 +409,76 @@ pub struct RunId {
     pub truncated_frames: Option<usize>,
 }
 
-/// Parse `output` and write it into `db_path` as a `cart`/`run`/`frame`
-/// (/`uart`/`profile`/`dprofile`) row set -- the same shape the native
-/// `ggo-emu`/`ggo-server` writers, `ggo-ide` and `ggo_fixture` all use,
-/// and the shape `ggo_charts_panel::loader` reads.
+/// Parse `output` and write it into the database at `db_url` as a
+/// `cart`/`run`/`frame` (/`uart`/`profile`/`dprofile`) row set -- the same
+/// shape the native `ggo-emu`/`ggo-server` writers and `ggo-diag`'s device
+/// ingest use, and the shape `ggo_charts_panel::loader` reads.
 ///
-/// A missing db file is created and migrated by `ggo_db::open` (the same
-/// call ggo-ide makes), so the very first run a fresh checkout ingests
-/// brings the database into existence.
+/// The database is migrated on first connection by `ggo_db::pool_for_async`
+/// (the same call every other tool makes), so a fresh checkout's very first
+/// ingest brings the schema into existence.
 ///
 /// `started_at` is stamped here, from the host clock. `uart` is the run's
 /// diagnostic lines (zero rows written when empty, not an error) and
 /// `label` an optional free-text run identity for the `run.label` column.
 ///
-/// BLOCKING: opens a short-lived connection and returns once the write
-/// commits. Callers on the UI thread must go through
-/// `cx.background_spawn`.
+/// BLOCKING: drives ggo-db's runtime to completion and returns once the
+/// write commits. Callers on the UI thread must go through
+/// `cx.background_spawn`; callers already inside a tokio runtime must not
+/// call this at all (`ggo_db::block_on` panics there, by design).
 pub fn ingest_run(
-    db_path: &Path,
+    db_url: &str,
     output: &str,
     uart: &[String],
     label: Option<&str>,
 ) -> Result<RunId, String> {
     let body = parse_output(output)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(write_run(db_path, &body, uart, label))
+    ggo_db::block_on(write_run(db_url, &body, uart, label))
 }
 
+/// The whole run in ONE transaction: a partially written run (frames
+/// without their `run` row, or half a profile) is never observable, and a
+/// failure part-way through leaves the database exactly as it was.
 async fn write_run(
-    db_path: &Path,
+    db_url: &str,
     run: &RunBody,
     uart: &[String],
     label: Option<&str>,
 ) -> Result<RunId, String> {
-    let db = ggo_db::open(db_path).await?;
-    let conn = db.conn()?;
+    let pool = ggo_db::pool_for_async(db_url).await?;
+    let err = |e: sqlx::Error| e.to_string();
     let n_frames = run.cols[0].len();
-
-    conn.execute(INSERT_CART, [run.cart.as_str()])
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut rows = conn
-        .query(SELECT_CART, [run.cart.as_str()])
-        .await
-        .map_err(|e| e.to_string())?;
-    let row = rows
-        .next()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("cart row vanished after insert")?;
-    let cart_id = *row
-        .get_value(0)
-        .map_err(|e| e.to_string())?
-        .as_integer()
-        .ok_or("cart.id not an integer")?;
-
     let started_at = iso8601_utc_now();
-    conn.execute("BEGIN", ()).await.map_err(|e| e.to_string())?;
-    let result = write_run_rows(&conn, run, cart_id, &started_at, n_frames, uart, label).await;
-    match result {
-        Ok(run_id) => {
-            conn.execute("COMMIT", ())
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(RunId {
-                run_id,
-                cart_id,
-                truncated_frames: run.truncated_frames,
-            })
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+
+    let mut tx = pool.begin().await.map_err(err)?;
+    sqlx::query(INSERT_CART)
+        .bind(run.cart.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+    let cart_id: i64 = sqlx::query(SELECT_CART)
+        .bind(run.cart.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(err)?
+        .try_get(0)
+        .map_err(err)?;
+    let run_id = write_run_rows(&mut tx, run, cart_id, &started_at, n_frames, uart, label).await?;
+    tx.commit().await.map_err(err)?;
+    Ok(RunId {
+        run_id,
+        cart_id,
+        truncated_frames: run.truncated_frames,
+    })
 }
 
+/// Every row of one run, on an open transaction: the `run` row (whose id
+/// the rest hang off), its frames, its UART lines and its two profile
+/// sections. Split out from [`write_run`] so the transaction's commit and
+/// rollback live in one place.
 #[allow(clippy::too_many_arguments)]
 async fn write_run_rows(
-    conn: &turso::Connection,
+    conn: &mut PgConnection,
     run: &RunBody,
     cart_id: i64,
     started_at: &str,
@@ -466,80 +486,100 @@ async fn write_run_rows(
     uart: &[String],
     label: Option<&str>,
 ) -> Result<i64, String> {
-    conn.execute(
-        INSERT_RUN,
-        (
-            cart_id,
-            started_at,
-            n_frames as i64,
-            run.frame_budget_cycles,
-            run.scanout_wire_cycles,
-            run.refill_cycles,
-            run.writeback_cycles,
-            run.wire_wait_cycles,
-            label,
-        ),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let run_id = conn.last_insert_rowid();
+    let err = |e: sqlx::Error| e.to_string();
+    let run_id: i64 = sqlx::query(INSERT_RUN)
+        .bind(cart_id)
+        .bind(started_at)
+        .bind(n_frames as i64)
+        .bind(run.frame_budget_cycles)
+        .bind(run.scanout_wire_cycles)
+        .bind(run.refill_cycles)
+        .bind(run.writeback_cycles)
+        .bind(run.wire_wait_cycles)
+        .bind(label)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(err)?
+        .try_get(0)
+        .map_err(err)?;
 
-    for i in 0..n_frames {
-        // run_id + 13 required + 23 PPU/APU columns = 37 params (past the
-        // tuple `IntoParams` limit, so bind via `params_from_iter`).
-        let mut vals: Vec<i64> = Vec::with_capacity(1 + FRAME_COLS.len() + EXTRA_COLS.len());
-        vals.push(run_id);
-        for c in &run.cols {
-            vals.push(c[i]);
-        }
-        for c in &run.extra_cols {
-            vals.push(c[i]);
-        }
-        conn.execute(INSERT_FRAME, turso::params_from_iter(vals))
-            .await
-            .map_err(|e| e.to_string())?;
+    // Column-oriented input, row-oriented output: each batch walks a
+    // window of frame indices and reads the i-th entry out of every
+    // column, in `FRAME_INSERT_HEAD` order.
+    let mut from = 0;
+    while from < n_frames {
+        let to = (from + INSERT_BATCH).min(n_frames);
+        let mut qb = QueryBuilder::new(FRAME_INSERT_HEAD);
+        qb.push_values(from..to, |mut b, i| {
+            b.push_bind(run_id);
+            for c in &run.cols {
+                b.push_bind(c[i]);
+            }
+            for c in &run.extra_cols {
+                b.push_bind(c[i]);
+            }
+        });
+        qb.build().execute(&mut *conn).await.map_err(err)?;
+        from = to;
     }
+
     for (seq, line) in uart.iter().enumerate() {
-        conn.execute(INSERT_UART, (run_id, seq as i64, line.as_str()))
+        sqlx::query(INSERT_UART)
+            .bind(run_id)
+            .bind(seq as i64)
+            .bind(line.as_str())
+            .execute(&mut *conn)
+            .await
+            .map_err(err)?;
+    }
+    write_profile(conn, PROFILE_INSERT_HEAD, run_id, &run.profile).await?;
+    write_profile(conn, DPROFILE_INSERT_HEAD, run_id, &run.dprofile).await?;
+    Ok(run_id)
+}
+
+/// Batched writer shared by the `profile` and `dprofile` tables (same
+/// shape, different table): `head` carries the table + column list.
+async fn write_profile(
+    conn: &mut PgConnection,
+    head: &str,
+    run_id: i64,
+    rows: &[ProfileRow],
+) -> Result<(), String> {
+    for chunk in rows.chunks(INSERT_BATCH) {
+        let mut qb = QueryBuilder::new(head);
+        qb.push_values(chunk, |mut b, r| {
+            b.push_bind(run_id)
+                .push_bind(r.frame)
+                .push_bind(r.caller.as_str())
+                .push_bind(r.func.as_str())
+                .push_bind(r.misses)
+                .push_bind(r.evicted);
+        });
+        qb.build()
+            .execute(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
     }
-    for r in &run.profile {
-        conn.execute(
-            INSERT_PROFILE,
-            (
-                run_id,
-                r.frame,
-                r.caller.as_str(),
-                r.func.as_str(),
-                r.misses,
-                r.evicted,
-            ),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    for r in &run.dprofile {
-        conn.execute(
-            INSERT_DPROFILE,
-            (
-                run_id,
-                r.frame,
-                r.caller.as_str(),
-                r.func.as_str(),
-                r.misses,
-                r.evicted,
-            ),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(run_id)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One scalar off the test database, for the row-count assertions
+    /// below. `ggo_db::block_on` for the same reason the ingest uses it:
+    /// these are plain `#[test]`s, not `#[tokio::test]`s.
+    fn scalar_i64(db_url: &str, sql: &str, bind: Option<i64>) -> i64 {
+        ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
+            let mut q = sqlx::query_scalar::<_, i64>(sql);
+            if let Some(b) = bind {
+                q = q.bind(b);
+            }
+            q.fetch_one(&pool).await.unwrap()
+        })
+    }
 
     /// A minimal, valid perf-JSON body with `n` frames. Hand-built rather
     /// than cribbed from `ggo_fixture` (ggo-ide's own test fixture crate,
@@ -714,85 +754,85 @@ mod tests {
     // ------------------------------------------------------- ingest_run
 
     #[test]
-    fn ingest_run_creates_the_db_and_its_cart_and_run_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("nested").join("ggo_ide.db");
-        let out = ingest_run(&db_path, &output_for("demo", 3), &[], None).unwrap();
+    fn frame_columns_match_the_insert_head() {
+        assert_eq!(
+            1 + FRAME_COLS.len() + EXTRA_COLS.len(),
+            FRAME_COL_COUNT,
+            "run_id plus every frame counter, one bind each"
+        );
+        assert_eq!(
+            FRAME_INSERT_HEAD.matches(',').count() + 1,
+            FRAME_COL_COUNT,
+            "and the column list names exactly those"
+        );
+    }
+
+    #[test]
+    fn ingest_run_writes_its_cart_and_run_rows() {
+        let db = ggo_db::TestDb::new();
+        let out = ingest_run(db.url(), &output_for("demo", 3), &[], None).unwrap();
         assert_eq!(out.run_id, 1);
         assert_eq!(out.cart_id, 1);
-        assert!(
-            db_path.exists(),
-            "a missing db (and its parent dir) is created + migrated"
+        assert_eq!(
+            scalar_i64(
+                db.url(),
+                "SELECT COUNT(*) FROM frame WHERE run_id = $1",
+                Some(out.run_id)
+            ),
+            3,
+            "one frame row per frame in the body"
         );
     }
 
     #[test]
     fn ingest_run_reuses_the_cart_row_across_two_runs() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        ingest_run(&db_path, &output_for("demo", 3), &[], None).unwrap();
-        let out = ingest_run(&db_path, &output_for("demo", 3), &[], None).unwrap();
+        let db = ggo_db::TestDb::new();
+        ingest_run(db.url(), &output_for("demo", 3), &[], None).unwrap();
+        let out = ingest_run(db.url(), &output_for("demo", 3), &[], None).unwrap();
         assert_eq!(out.run_id, 2, "a second run gets a new run row");
         assert_eq!(out.cart_id, 1, "the same cart name reuses the cart row");
     }
 
     #[test]
     fn ingest_run_rejects_malformed_output_before_touching_the_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        assert!(ingest_run(&db_path, "not json at all", &[], None).is_err());
-        assert!(
-            !db_path.exists(),
-            "a parse failure must never create the db file"
+        let db = ggo_db::TestDb::new();
+        assert!(ingest_run(db.url(), "not json at all", &[], None).is_err());
+        assert_eq!(
+            scalar_i64(db.url(), "SELECT COUNT(*) FROM run", None),
+            0,
+            "a parse failure must never write a run row"
         );
     }
 
     #[test]
     fn ingest_run_persists_uart_lines_in_seq_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
+        let db = ggo_db::TestDb::new();
         let lines = vec!["[run] green.cart".to_string(), "[run ended] stopped".into()];
-        let out = ingest_run(&db_path, &output_for("uart-check", 1), &lines, None).unwrap();
+        let out = ingest_run(db.url(), &output_for("uart-check", 1), &lines, None).unwrap();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(&db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            let mut rows = conn
-                .query(
-                    "SELECT seq, text FROM uart WHERE run_id = ?1 ORDER BY seq",
-                    [out.run_id],
-                )
+        let got: Vec<(i64, String)> = ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db.url()).await.unwrap();
+            sqlx::query_as("SELECT seq, text FROM uart WHERE perf_run_id = $1 ORDER BY seq")
+                .bind(out.run_id)
+                .fetch_all(&pool)
                 .await
-                .unwrap();
-            let mut got = Vec::new();
-            while let Some(row) = rows.next().await.unwrap() {
-                got.push((
-                    *row.get_value(0).unwrap().as_integer().unwrap(),
-                    row.get_value(1).unwrap().as_text().unwrap().to_string(),
-                ));
-            }
-            assert_eq!(got, vec![(0, lines[0].clone()), (1, lines[1].clone())]);
+                .unwrap()
         });
+        assert_eq!(got, vec![(0, lines[0].clone()), (1, lines[1].clone())]);
     }
 
     #[test]
     fn ingest_run_with_no_uart_lines_writes_zero_uart_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let out = ingest_run(&db_path, &output_for("no-uart", 1), &[], None).unwrap();
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(&db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            let mut rows = conn
-                .query("SELECT COUNT(*) FROM uart WHERE run_id = ?1", [out.run_id])
-                .await
-                .unwrap();
-            let row = rows.next().await.unwrap().unwrap();
-            assert_eq!(row.get_value(0).unwrap(), turso::Value::Integer(0));
-        });
+        let db = ggo_db::TestDb::new();
+        let out = ingest_run(db.url(), &output_for("no-uart", 1), &[], None).unwrap();
+        assert_eq!(
+            scalar_i64(
+                db.url(),
+                "SELECT COUNT(*) FROM uart WHERE perf_run_id = $1",
+                Some(out.run_id)
+            ),
+            0
+        );
     }
 
     // ---------------------------------------------- cross-panel round trip
@@ -807,8 +847,7 @@ mod tests {
     fn a_run_ingested_here_reads_back_through_the_charts_panels_queries() {
         use ggo_charts_panel::loader;
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
+        let db = ggo_db::TestDb::new();
 
         let mut v: Json = serde_json::from_str(&output_for("Green Fix", 3)).unwrap();
         // A couple of the optional columns the charts read, so the
@@ -818,21 +857,21 @@ mod tests {
         v["frames"]["apu_underruns"] = serde_json::json!([0, 0, 4]);
         v["frames"]["spr_tiles_distinct"] = serde_json::json!([7, 8, 9]);
         let out = ingest_run(
-            &db_path,
+            db.url(),
             &v.to_string(),
             &["[run] green.cart".to_string()],
             Some("carts/green.cart"),
         )
         .unwrap();
 
-        let runs = loader::list_runs(&db_path).unwrap();
+        let runs = loader::list_runs(db.url()).unwrap();
         assert_eq!(runs.len(), 1, "the charts panel's picker sees the run");
         assert_eq!(runs[0].id, out.run_id);
         assert_eq!(runs[0].cart_name, "Green Fix");
         assert_eq!(runs[0].label.as_deref(), Some("carts/green.cart"));
         assert!(!runs[0].started_at.is_empty());
 
-        let samples = loader::load_run_samples(&db_path, out.run_id).unwrap();
+        let samples = loader::load_run_samples(db.url(), out.run_id).unwrap();
         assert_eq!(samples.frames.len(), 3);
         // FRAME_COLS order: n, instrs, i_hits, i_misses, ... -- so frame 0
         // has n = 0, instrs = 1, i_hits = 1, i_misses = 1.
@@ -867,24 +906,17 @@ mod tests {
         let perf = finished.perf.expect("a cart that ran has a perf snapshot");
         assert!(perf.frames >= 5, "{} frames recorded", perf.frames);
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let out = ingest_run(
-            &db_path,
-            &perf.perf_json,
-            &finished.uart,
-            Some("green.cart"),
-        )
-        .unwrap();
+        let db = ggo_db::TestDb::new();
+        let out = ingest_run(db.url(), &perf.perf_json, &finished.uart, Some("green.cart")).unwrap();
 
-        let runs = loader::list_runs(&db_path).unwrap();
+        let runs = loader::list_runs(db.url()).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(
             runs[0].cart_name, "Green Fix",
             "the perf-JSON cart identity is the cart header's own title, \
              exactly as ggo-ide's CartStepper reports it"
         );
-        let samples = loader::load_run_samples(&db_path, out.run_id).unwrap();
+        let samples = loader::load_run_samples(db.url(), out.run_id).unwrap();
         assert_eq!(samples.frames.len() as u64, perf.frames);
         assert!(
             samples

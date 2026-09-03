@@ -28,15 +28,14 @@ chrono.workspace = true
 # `emu/audio.rs` and the standalone `ggo-emu` binary use, so the pane's
 # stream is the one this project already knows how to reason about.
 cpal.workspace = true
-ggo-db.workspace = true # GGO -- the ggo_ide.db schema/migrations, shared with ggo-ide + the charts panel
+ggo-db.workspace = true # GGO -- the one PostgreSQL database: url, pool, schema/migrations, and the TestDb fixture
 ggo-emu-core.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO -- S4's Re-run entry hands the run it just ingested to that panel
-ggo_common.workspace = true # GGO -- shared `default_db_path` + the child-process runner, also with the charts/emerald panels
+ggo_common.workspace = true # GGO -- the shared child-process runner, also with the charts/emerald panels
 ggo_world_panel.workspace = true # GGO -- S4's "Emulate this world" saves that panel's doc and reuses its world-path rule
-# GGO -- `diag_db::{clone_runs, device_perf_run_id}`: after a PASS, the flash
-# pulls its own run's telemetry out of ggo-diag's `~/.ggo/diag.db` and looks
-# up the local perf run to open. Same crate (and same two functions) the
-# charts panel's device-run rail clones through.
+# GGO -- `diag_db::device_perf_run_id`: after a PASS, the flash looks up the
+# perf run ggo-diag linked to the diag run it just recorded, so the reports
+# tab can open on it. Same crate the charts panel's device-run rail reads.
 ggo-worldlib.workspace = true
 gpui.workspace = true
 image.workspace = true
@@ -46,12 +45,6 @@ serde_json.workspace = true
 smol.workspace = true # GGO -- `yield_now` between pumped frames, see `EmuPanel::run`
 base64.workspace = true # GGO -- remote screenshot payloads, see `remote`
 ggo_emu_remote.workspace = true # GGO -- agent remote-control protocol/registry
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-# Same pure-Rust SQLite engine ggo-db's migrate() takes a connection from.
-# Mirrors ggo_charts_panel's Cargo.toml (and ggo-ide's own): the ingest
-# binds 37 parameters via `turso::params_from_iter`, which needs the type
-# directly rather than a bespoke ggo-db method.
-turso = "0.7"
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true

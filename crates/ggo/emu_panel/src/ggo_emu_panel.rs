@@ -1,7 +1,7 @@
 //! GGO Emulator panel (F3 tasks E1/E2, F4 X4): an embedded `ggo-emu` --
 //! Run/Stop, live 320x240 video, keyboard -> pad input, a live stats row,
-//! a diagnostic console, and an end-of-run perf ingest into
-//! `~/.ggo/ggo_ide.db`. The emulation itself is `ggo-emu-core` verbatim;
+//! a diagnostic console, and an end-of-run perf ingest into the
+//! GemdropGo database. The emulation itself is `ggo-emu-core` verbatim;
 //! [`drive`] ports the standalone binary's drive loop
 //! (`ggo-emu/src/lib.rs::run_cart` + `src/native.rs`) onto a background
 //! thread, and this module is the gpui shell around it.
@@ -25,7 +25,7 @@
 //! collects its perf snapshot plus the run's console lines, and
 //! [`ingest`] writes them into the SAME `cart`/`run`/`frame`/`uart` tables
 //! `ggo_charts_panel` reads back. That replaces ggo-ide's CLI-chained
-//! `ggo-emu --perf` -> `ggo_ide.db` step with a native one; run a cart
+//! `ggo-emu --perf` -> database step with a native one; run a cart
 //! here, and it is in the charts panel's picker the moment it stops.
 //!
 //! Structural mirror of `ggo_world_panel`/`ggo_sprite_panel`/
@@ -324,13 +324,13 @@ impl IngestStatus {
 }
 
 /// The ingest half of [`EmuPanel::finish_run`]'s background task: what a
-/// finished run becomes on the panel's ingest row. BLOCKING (it writes a
-/// SQLite database), so callers stay off the UI thread. Named rather than
+/// finished run becomes on the panel's ingest row. BLOCKING (it writes to
+/// the database), so callers stay off the UI thread. Named rather than
 /// inline in the spawn so the failure paths -- malformed perf JSON, an
-/// unopenable database -- are testable without a real session to end.
+/// unreachable database -- are testable without a real session to end.
 fn ingest_finished_run(
     finished: &drive::FinishedRun,
-    db_path_override: Option<PathBuf>,
+    db_url_override: Option<String>,
     label: &str,
 ) -> IngestStatus {
     match &finished.perf {
@@ -340,10 +340,13 @@ fn ingest_finished_run(
         // picker.
         None => IngestStatus::NoFrames,
         Some(perf) if perf.frames == 0 => IngestStatus::NoFrames,
-        Some(perf) => match db_path_override.or_else(ggo_common::default_db_path) {
-            None => IngestStatus::Failed("no HOME to resolve ~/.ggo".into()),
-            Some(db_path) => {
-                match ingest::ingest_run(&db_path, &perf.perf_json, &finished.uart, Some(label)) {
+        Some(perf) => match db_url_override.or_else(|| ggo_db::url().ok()) {
+            None => IngestStatus::Failed(format!(
+                "no database url; {}",
+                ggo_db::INSTALL_HINT
+            )),
+            Some(db_url) => {
+                match ingest::ingest_run(&db_url, &perf.perf_json, &finished.uart, Some(label)) {
                     Ok(run) => IngestStatus::Done(run.run_id, run.truncated_frames),
                     Err(e) => IngestStatus::Failed(e),
                 }
@@ -358,20 +361,14 @@ pub struct EmuPanel {
     /// Test hook: bypass workspace worktree discovery
     /// (`ggo_world_panel::root_override`'s analog).
     root_override: Option<PathBuf>,
-    /// Test hook: ingest into this database instead of `~/.ggo/ggo_ide.db`
-    /// -- `ggo_charts_panel`'s `db_path_override`, same name, same reason.
+    /// Test hook: read and write THIS database instead of `ggo_db::url()`
+    /// -- `ggo_charts_panel`'s `db_url_override`, same name, same reason.
     /// Load-bearing here rather than merely convenient: without it, any
     /// test that ran a real cart to completion would write a `run` row
-    /// into the developer's actual database.
-    db_path_override: Option<PathBuf>,
-    /// Test hook: pull a flashed run's rows out of THIS `diag.db` rather
-    /// than `~/.ggo/diag.db`. `ggo_charts_panel`'s `diag_db_path_override`,
-    /// same name and same reason; separate from `db_path_override` because
-    /// the two are files owned by two different tools (see
-    /// `ggo_common::default_diag_db_path`). Load-bearing for the same
-    /// reason as its neighbour: without it the post-flash hop would read
-    /// the developer's real database in a test.
-    diag_db_path_override: Option<PathBuf>,
+    /// into the developer's actual database. One field covers both the
+    /// perf ingest and the flashed-run lookup, because ggo-diag's rows and
+    /// ours now live in one database.
+    db_url_override: Option<String>,
     project_root: Option<PathBuf>,
     /// The cart the file explorer last routed here, as a project-relative
     /// `/`-separated path. `None` until something is clicked.
@@ -642,8 +639,7 @@ impl EmuPanel {
             focus_handle,
             workspace,
             root_override: None,
-            db_path_override: None,
-            diag_db_path_override: None,
+            db_url_override: None,
             project_root: None,
             selected: None,
             run_generation: 0,
@@ -983,6 +979,15 @@ impl EmuPanel {
         );
     }
 
+    /// The database this panel writes its runs to and reads a flashed
+    /// run's report out of: the test override, else `ggo_db::url()`.
+    /// `None` only when no url resolves at all (no `$HOME`), which every
+    /// caller reports rather than papers over. `ggo_charts_panel`'s
+    /// `db_url` is the same two lines for the same reason.
+    fn db_url(&self) -> Option<String> {
+        self.db_url_override.clone().or_else(|| ggo_db::url().ok())
+    }
+
     /// Run `requests` in order through the streaming runner, feeding every
     /// line to the console and every recognised line to the status row.
     /// Stops at the first failure.
@@ -1002,19 +1007,12 @@ impl EmuPanel {
         // run to fire on. A run started without a window (setup, `git
         // pull`, a test) simply has none, which is the hop's off switch.
         let charts_window = self.flash_charts_window.take();
-        // Resolved here, on the thread the overrides live on: ggo-diag's
-        // own file to clone the flashed run out of, and ours to clone it
-        // into. `None` only when no home directory resolves at all, which
-        // is the one case with no report to open and nothing to say.
-        let report_dbs = self
-            .diag_db_path_override
-            .clone()
-            .or_else(ggo_common::default_diag_db_path)
-            .zip(
-                self.db_path_override
-                    .clone()
-                    .or_else(ggo_common::default_db_path),
-            );
+        // Resolved here, on the thread the override lives on: the
+        // database holding both ggo-diag's `runs` row for this flash and
+        // the perf run it links to. `None` only when no database url
+        // resolves at all, which is the one case with no report to open
+        // and nothing to say.
+        let report_db_url = self.db_url();
         self.status = None;
         self.status_is_error = false;
         self.console_expanded = true;
@@ -1152,7 +1150,7 @@ impl EmuPanel {
                             cx,
                             diag_run_id,
                             charts_window,
-                            report_dbs,
+                            report_db_url,
                         )
                         .await;
                     })
@@ -1191,13 +1189,12 @@ impl EmuPanel {
     /// recorded -- the board's half of the emulator's "every stopped run
     /// routes to its generated report" (see [`Self::charts_for_run`]).
     ///
-    /// The rows have to be CLONED first: `~/.ggo/diag.db` is another
-    /// tool's file and nothing here may read it as a peer
-    /// (`ggo_charts_panel::history`'s module doc has the whole rule), so
-    /// `clone_runs` copies this run into our own `ggo_ide.db` and
-    /// `device_perf_run_id` then translates ggo-diag's TEXT run id into the
-    /// INTEGER `run.id` the charts panel opens by -- two different id
-    /// spaces, which is why the translation is a db lookup and not a cast.
+    /// One lookup, not a copy: ggo-diag writes its `runs` row and the perf
+    /// run behind it into the SAME database this panel reads, so
+    /// `device_perf_run_id` only has to translate ggo-diag's TEXT run id
+    /// into the INTEGER `run.id` the charts panel opens by -- two
+    /// different id spaces, which is why the translation is a db lookup
+    /// and not a cast.
     ///
     /// A PASS whose run has no perf report -- a boot that captured no
     /// telemetry, a `ggo-diag` too old to parse the packets -- still has
@@ -1207,53 +1204,28 @@ impl EmuPanel {
     /// not read is the one case that opens nothing. The
     /// unexpected ones are logged rather than shown, because the run the
     /// user asked for did succeed.
-    ///
-    /// A clone that reports a failure is one of those logged cases and
-    /// **not** a reason to stop: the failure may belong to some OTHER,
-    /// older run in ggo-diag's file (see the call site), while this run's
-    /// rows landed fine. `device_perf_run_id` is the question that
-    /// actually decides, so it is always asked.
     async fn open_flashed_run_report(
         this: WeakEntity<Self>,
         cx: &mut AsyncApp,
         diag_run_id: String,
         window: Option<AnyWindowHandle>,
-        report_dbs: Option<(PathBuf, PathBuf)>,
+        report_db_url: Option<String>,
     ) {
         // No window means this run was not a flash (a setup run, a pull, a
         // test) -- and focusing a dock needs one either way.
-        let (Some(window), Some((diag_db_path, ide_db_path))) = (window, report_dbs) else {
+        let (Some(window), Some(db_url)) = (window, report_db_url) else {
             return;
         };
         // Which run this hop is FOR, kept back from the closure that
         // consumes it: by the time the lookup returns, "the last flash"
         // may be somebody else's (see [`Self::remember_flash_perf_run`]).
         let flashed_run = diag_run_id.clone();
-        // BLOCKING: both calls spin their own current-thread tokio runtime,
-        // the rule `ggo_charts_panel::history::load` carries too -- so they
-        // run on the background executor and never on the UI thread.
+        // BLOCKING: the lookup drives ggo-db's runtime to completion, the
+        // rule `ggo_charts_panel::history::load` carries too -- so it runs
+        // on the background executor and never on the UI thread.
         let local_id = cx
             .background_spawn(async move {
-                // Never created, only read: `clone_runs` opens it through
-                // `ggo_db::open_existing`, and a machine whose ggo-diag has
-                // recorded nothing has no file at all.
-                if !diag_db_path.exists() {
-                    return None;
-                }
-                // Logged, never fatal. `clone_runs` reconciles EVERY run in
-                // ggo-diag's file and reports a failure in any of them --
-                // including historical runs this build cannot read (a
-                // `diag.db` behind on migrations, whose `frame` table has
-                // no `cyc`), which fail identically on every call forever.
-                // Each run is its own committed transaction, so an `Err`
-                // says nothing about whether THIS run made it across. Ask
-                // the database that instead of guessing from the error, the
-                // same correction `ggo_emu_mcp::tools`' `fetch_ggo_report`
-                // makes.
-                if let Err(e) = diag_db::clone_runs(&diag_db_path, &ide_db_path) {
-                    log::warn!("flashed run {diag_run_id}: could not clone every device run: {e}");
-                }
-                match diag_db::device_perf_run_id(&ide_db_path, &diag_run_id) {
+                match diag_db::device_perf_run_id(&db_url, &diag_run_id) {
                     Ok(local_id) => local_id,
                     Err(e) => {
                         log::warn!("flashed run {diag_run_id}: could not resolve its report: {e}");
@@ -1509,7 +1481,7 @@ impl EmuPanel {
     /// one first**, through the ordinary [`Self::stop`] path rather than
     /// by dropping the session on the floor. That matters because
     /// `stop` -> [`Self::finish_run`] is what collects the run's perf
-    /// snapshot and writes it into `~/.ggo/ggo_ide.db`: silently losing a
+    /// snapshot and writes it into the database: silently losing a
     /// run's diagnostics because the user clicked the next cart would be a
     /// data loss, small but real. There is no unsaved *document* here, so
     /// no [`ggo_common::prepare_to_close_dirty`] prompt -- a running
@@ -1630,7 +1602,7 @@ impl EmuPanel {
     /// Takes the session (so the transport flips back to Run immediately)
     /// and hands it to a background task, because both halves of the work
     /// block: [`Session::wait`] joins the emulator thread, and
-    /// [`ingest::ingest_run`] opens and writes a SQLite database. Neither
+    /// [`ingest::ingest_run`] writes a whole run to the database. Neither
     /// may touch the UI thread.
     ///
     /// No idempotence guard is needed here -- unlike ggo-ide, whose Stop
@@ -1672,10 +1644,10 @@ impl EmuPanel {
         // sources has an identity to attach; this pane always knows which
         // file it ran.
         let label = session.cart.clone();
-        let db_path_override = self.db_path_override.clone();
+        let db_url_override = self.db_url_override.clone();
         let finish = cx.background_spawn(async move {
             let finished = session.wait();
-            let status = ingest_finished_run(&finished, db_path_override, &label);
+            let status = ingest_finished_run(&finished, db_url_override, &label);
             (finished.reason, finished.is_error, status)
         });
         cx.spawn(async move |this, cx| {
@@ -3711,17 +3683,17 @@ impl EmuPanel {
         self.status_is_error
     }
 
-    /// Point the perf ingest at `path` instead of `~/.ggo/ggo_ide.db`.
+    /// Point the perf ingest at `url` instead of `ggo_db::url()`.
     ///
     /// The one WRITE hook here, and load-bearing rather than convenient:
     /// a journey that runs a real cart to completion would otherwise
     /// write a `run` row into the developer's actual database -- exactly
-    /// what `db_path_override` exists to prevent for this crate's own
+    /// what `db_url_override` exists to prevent for this crate's own
     /// tests, which set the same field directly. It redirects a
     /// destination; it changes no emulator state. `test-support` only.
     #[cfg(feature = "test-support")]
-    pub fn test_set_db_path(&mut self, path: PathBuf) {
-        self.db_path_override = Some(path);
+    pub fn test_set_db_url(&mut self, url: String) {
+        self.db_url_override = Some(url);
     }
 }
 
@@ -3758,6 +3730,7 @@ fn scaled_frame_bounds(panel: gpui::Bounds<Pixels>) -> gpui::Bounds<Pixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_db::sqlx;
     use gpui::{Entity, TestAppContext};
 
     // ------------------------------------------------- viewport scaling
@@ -4241,6 +4214,7 @@ mod tests {
     async fn test_a_run_reports_an_audio_verdict_without_failing(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
+        let db = ggo_db::TestDb::new();
         std::fs::write(
             dir.path().join("green.cart"),
             drive::fixture::green_screen_cart(),
@@ -4250,7 +4224,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update_in(cx, |panel, window, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+            panel.db_url_override = Some(db.url().to_string());
             panel.refresh_root(cx);
             panel.open_rel_path("green.cart", window, cx);
         });
@@ -4292,6 +4266,7 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
+        let db = ggo_db::TestDb::new();
         std::fs::write(
             dir.path().join("green.cart"),
             drive::fixture::green_screen_cart(),
@@ -4301,7 +4276,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update_in(cx, |panel, window, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+            panel.db_url_override = Some(db.url().to_string());
             panel.refresh_root(cx);
             panel.open_rel_path("green.cart", window, cx);
         });
@@ -4483,6 +4458,7 @@ mod tests {
         cx.executor().allow_parking();
 
         let dir = tempfile::tempdir().unwrap();
+        let db = ggo_db::TestDb::new();
         std::fs::write(
             dir.path().join("green.cart"),
             drive::fixture::green_screen_cart(),
@@ -4492,7 +4468,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+            panel.db_url_override = Some(db.url().to_string());
         });
         // Exactly how the file explorer gets a cart in here.
         panel.update_in(cx, |panel, window, cx| {
@@ -4565,12 +4541,11 @@ mod tests {
 
         // The run really is in the database the charts panel reads --
         // through that panel's own query function.
-        let db_path = dir.path().join("ggo_ide.db");
-        let runs = ggo_charts_panel::loader::list_runs(&db_path).unwrap();
+        let runs = ggo_charts_panel::loader::list_runs(db.url()).unwrap();
         assert_eq!(runs.len(), 1, "one run row for one run");
         assert_eq!(runs[0].cart_name, drive::fixture::GREEN_CART_TITLE);
         assert_eq!(runs[0].label.as_deref(), Some("green.cart"));
-        let samples = ggo_charts_panel::loader::load_run_samples(&db_path, runs[0].id).unwrap();
+        let samples = ggo_charts_panel::loader::load_run_samples(db.url(), runs[0].id).unwrap();
         assert!(
             !samples.frames.is_empty(),
             "the run's perf frames must be readable by the charts panel"
@@ -4689,6 +4664,7 @@ mod tests {
     async fn test_re_clicking_the_selected_cart_does_not_disturb_a_run(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
+        let db = ggo_db::TestDb::new();
         std::fs::write(
             dir.path().join("green.cart"),
             drive::fixture::green_screen_cart(),
@@ -4698,7 +4674,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_path_override = Some(dir.path().join("ggo_ide.db"));
+            panel.db_url_override = Some(db.url().to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
@@ -4745,12 +4721,12 @@ mod tests {
             drive::fixture::green_screen_cart(),
         )
         .unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
+        let db = ggo_db::TestDb::new();
 
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_path_override = Some(db_path.clone());
+            panel.db_url_override = Some(db.url().to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
@@ -4777,7 +4753,7 @@ mod tests {
         });
 
         // ...and it really is in the database, readable by the charts panel.
-        let runs = ggo_charts_panel::loader::list_runs(&db_path).unwrap();
+        let runs = ggo_charts_panel::loader::list_runs(db.url()).unwrap();
         assert_eq!(runs.len(), 1, "one run row for the interrupted run");
         assert_eq!(runs[0].label.as_deref(), Some("green.cart"));
     }
@@ -5416,11 +5392,13 @@ mod tests {
     /// and this panel pointed at the REAL `root` -- the same split every
     /// other GGO menu test makes: the fake tree exists so a `ProjectPath`
     /// resolves, `root_override` is what the panel actually reads and
-    /// writes through.
+    /// writes through. The throwaway database comes back with it, because
+    /// a dropped `TestDb` takes its tables with it.
     pub(crate) async fn run_menu_workspace<'a>(
         cx: &'a mut TestAppContext,
         root: &std::path::Path,
     ) -> (
+        ggo_db::TestDb,
         Entity<Workspace>,
         Entity<EmuPanel>,
         WorktreeId,
@@ -5451,13 +5429,15 @@ mod tests {
         let worktree_id = worktree_id(&project, cx);
         let panel = emu_panel_via_item(&workspace, cx);
         let root = root.to_path_buf();
+        // Never the developer's real database: every path below can reach
+        // the end-of-run ingest. Handed back so the caller keeps it alive
+        // -- dropping a `TestDb` DROPs the database.
+        let db = ggo_db::TestDb::new();
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(root.clone());
-            // Never the developer's real `~/.ggo/ggo_ide.db`: every path
-            // below can reach the end-of-run ingest.
-            panel.db_path_override = Some(root.join("ggo_ide.db"));
+            panel.db_url_override = Some(db.url().to_string());
         });
-        (workspace, panel, worktree_id, cx)
+        (db, workspace, panel, worktree_id, cx)
     }
 
     /// A `ProcRunner` that spawns nothing, plus the log of every request it
@@ -5497,7 +5477,7 @@ mod tests {
     #[gpui::test]
     async fn test_the_run_menu_offers_each_entry_only_on_its_own_paths(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, _panel, worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, _panel, worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
 
         let contributed = |rel: &str, is_dir: bool, cx: &mut gpui::VisualTestContext| {
             workspace.update_in(cx, |workspace, window, cx| {
@@ -5553,7 +5533,7 @@ mod tests {
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
         std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
 
@@ -5615,7 +5595,7 @@ mod tests {
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
         std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
 
@@ -5653,7 +5633,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, _calls) = fake_proc_runner(|_| ggo_common::ProcCapture {
             ok: false,
             lines: vec!["error: no world named worlds/main".to_string()],
@@ -5686,7 +5666,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
 
@@ -5724,7 +5704,7 @@ mod tests {
         )
         .unwrap();
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let charts = workspace.update_in(cx, |workspace, window, cx| {
             ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
             workspace
@@ -5735,11 +5715,10 @@ mod tests {
                 .panel()
                 .clone()
         });
-        // Both panels on ONE temp database, so the run this test ingests is
-        // the run the charts panel then reads back.
-        let db_path = dir.path().join("ggo_ide.db");
+        // Both panels on ONE throwaway database, so the run this test
+        // ingests is the run the charts panel then reads back.
         charts.update(cx, |charts, _cx| {
-            charts.set_db_path_override(db_path.clone());
+            charts.set_db_url_override(db.url().to_string());
         });
 
         let handler = menu::rerun_handler(workspace.downgrade(), "green.cart".to_string());
@@ -5792,7 +5771,7 @@ mod tests {
         )
         .unwrap();
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, _cx| {
             assert!(panel.selected.is_none(), "nothing is selected yet");
         });
@@ -5834,7 +5813,7 @@ mod tests {
             drive::fixture::green_screen_cart(),
         )
         .unwrap();
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let charts = workspace.update_in(cx, |workspace, window, cx| {
             ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
             workspace
@@ -5845,12 +5824,8 @@ mod tests {
                 .panel()
                 .clone()
         });
-        let db_path = dir.path().join("ggo_ide.db");
         charts.update(cx, |charts, _cx| {
-            charts.set_db_path_override(db_path.clone());
-        });
-        panel.update(cx, |panel, _cx| {
-            panel.db_path_override = Some(db_path.clone());
+            charts.set_db_url_override(db.url().to_string());
         });
 
         panel.update_in(cx, |panel, window, cx| {
@@ -5950,7 +5925,7 @@ mod tests {
             drive::fixture::green_screen_cart(),
         )
         .unwrap();
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| {
             panel.proc_runner = runner;
@@ -6013,7 +5988,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         write_world_fixture(dir.path());
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
         let _world_panel = dirty_world_panel(&workspace, cx, dir.path());
@@ -6065,7 +6040,7 @@ mod tests {
             "the fixture must not already contain the edit"
         );
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let recorder = seen.clone();
         let world_path_for_runner = world_path.clone();
@@ -6105,7 +6080,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| {
             panel.proc_runner = runner;
@@ -6144,7 +6119,7 @@ mod tests {
     #[gpui::test]
     async fn test_hardware_diagnostics_launches_the_builtin_cart(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ggo_common::ProcCapture {
             ok: true,
             lines: vec!["<<<GEMOS launched>>>".to_string()],
@@ -6199,21 +6174,26 @@ mod tests {
     }
 
     /// Select the green fixture cart the way the explorer does, off a real
-    /// temp `root`, with the ingest pointed at a temp database.
+    /// temp `root`, with the ingest pointed at a throwaway database. That
+    /// database comes back with it and must be held for the whole test:
+    /// dropping a `TestDb` DROPs it.
+    #[must_use]
     fn select_green_cart(
         panel: &Entity<EmuPanel>,
         cx: &mut gpui::VisualTestContext,
         root: &std::path::Path,
-    ) {
+    ) -> ggo_db::TestDb {
         std::fs::write(root.join("green.cart"), drive::fixture::green_screen_cart()).unwrap();
+        let db = ggo_db::TestDb::new();
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(root.to_path_buf());
-            panel.db_path_override = Some(root.join("ggo_ide.db"));
+            panel.db_url_override = Some(db.url().to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
         });
         cx.run_until_parked();
+        db
     }
 
     /// Click the element `debug_selector` names in the rendered window.
@@ -6246,7 +6226,7 @@ mod tests {
             window.focus(&panel.focus_handle, cx);
         });
         cx.run_until_parked();
-        select_green_cart(&panel, cx, dir.path());
+        let _db = select_green_cart(&panel, cx, dir.path());
 
         // Mute before running -- the pane must be mutable while idle, and
         // during a run the device may (on a headless CI box) be
@@ -6301,7 +6281,7 @@ mod tests {
             window.focus(&panel.focus_handle, cx);
         });
         cx.run_until_parked();
-        select_green_cart(&panel, cx, dir.path());
+        let _db = select_green_cart(&panel, cx, dir.path());
 
         cx.simulate_keystrokes("ctrl-alt-p");
         panel.read_with(cx, |panel, _| {
@@ -6454,7 +6434,7 @@ mod tests {
             window.focus(&panel.focus_handle, cx);
         });
         cx.run_until_parked();
-        select_green_cart(&panel, cx, dir.path());
+        let _db = select_green_cart(&panel, cx, dir.path());
         cx.simulate_keystrokes("ctrl-alt-d");
         cx.simulate_keystrokes("ctrl-alt-r");
         await_first_frame(&panel, cx);
@@ -6508,7 +6488,7 @@ mod tests {
             drive::fixture::green_screen_cart(),
         )
         .unwrap();
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
         });
@@ -6617,7 +6597,7 @@ mod tests {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = focused_panel(cx);
-        select_green_cart(&panel, cx, dir.path());
+        let _db = select_green_cart(&panel, cx, dir.path());
         panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
         await_first_frame(&panel, cx);
 
@@ -6685,7 +6665,7 @@ mod tests {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = focused_panel(cx);
-        select_green_cart(&panel, cx, dir.path());
+        let _db = select_green_cart(&panel, cx, dir.path());
 
         // Mute first (see the keybinding test for why: while idle the
         // toggle is guaranteed live), and the icon must flip to the
@@ -6733,8 +6713,7 @@ mod tests {
     /// this seam is the only way to reach the parse failure).
     #[test]
     fn a_malformed_perf_json_fails_the_ingest_before_touching_the_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
+        let db = ggo_db::TestDb::new();
         let finished = drive::FinishedRun {
             reason: "cart exited".to_string(),
             is_error: false,
@@ -6746,7 +6725,7 @@ mod tests {
             uart: vec!["[run] green.cart".to_string()],
         };
 
-        let status = ingest_finished_run(&finished, Some(db_path.clone()), "green.cart");
+        let status = ingest_finished_run(&finished, Some(db.url().to_string()), "green.cart");
 
         let IngestStatus::Failed(reason) = &status else {
             panic!("malformed perf output must fail the ingest: {status:?}");
@@ -6757,16 +6736,33 @@ mod tests {
             label.starts_with("perf ingest failed:"),
             "the row must read as a failure: {label}"
         );
-        assert!(
-            !db_path.exists(),
-            "a run that cannot be parsed must not create (or dirty) the db"
+        assert_eq!(
+            run_row_count(db.url()),
+            0,
+            "a run that cannot be parsed must not write a run row"
         );
     }
 
+    /// `run` rows in `db_url`, for the "the ingest wrote nothing"
+    /// assertions. `ggo_db::block_on` because these are gpui/plain tests,
+    /// never `#[tokio::test]`s.
+    fn run_row_count(db_url: &str) -> i64 {
+        ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        })
+    }
+
+    /// A database url nothing can be reached at: its socket directory does
+    /// not exist, so the connection fails at once -- no network, no wait.
+    const UNREACHABLE_DB_URL: &str = "postgres://ggo@localhost/ggo?host=/nonexistent-ggo-socket";
+
     /// A run whose ingest fails must SAY so on the pane: the whole
-    /// end-of-run path, with the database made unopenable (a directory
-    /// where the file must go), ends in `IngestStatus::Failed` and the
-    /// error row `render` shows for it.
+    /// end-of-run path, with the database unreachable, ends in
+    /// `IngestStatus::Failed` and the error row `render` shows for it.
     #[gpui::test]
     async fn test_a_failed_ingest_surfaces_on_the_panel(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -6776,13 +6772,11 @@ mod tests {
             drive::fixture::green_screen_cart(),
         )
         .unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        std::fs::create_dir(&db_path).unwrap();
 
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_path_override = Some(db_path);
+            panel.db_url_override = Some(UNREACHABLE_DB_URL.to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
@@ -6796,7 +6790,7 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             let IngestStatus::Failed(reason) = &panel.ingest_status else {
                 panic!(
-                    "an unopenable db must surface a failed ingest: {:?}",
+                    "an unreachable db must surface a failed ingest: {:?}",
                     panel.ingest_status
                 );
             };
@@ -6860,7 +6854,7 @@ mod tests {
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
         std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
         let fs = workspace.read_with(cx, |workspace, cx| {
@@ -7074,56 +7068,58 @@ mod tests {
     }
 
     /// The run id the scripted transcript announces, and the one the
-    /// seeded `diag.db` records that flash under.
+    /// seeded `runs` row records that flash under.
     const FLASHED_RUN: &str = "20260831T120000Z-abc123def0";
 
-    /// A `diag.db` holding one finished device run WITH telemetry: the
-    /// `runs` row `ggo-diag` writes, plus the `cart`/`run`/`frame` rows its
-    /// `perf_run_id` points at -- exactly what `diag_db::clone_runs` pulls
-    /// across into our own database.
-    fn seed_flashed_run(diag_db: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(diag_db).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute(
+    /// The frame budget the seeded device run was measured against, and
+    /// the two frames' cycle counts -- one inside it, one over.
+    const SEEDED_BUDGET_CYCLES: i64 = 555_549;
+    const SEEDED_FRAME_CYCLES: [i64; 2] = [111_000, 999_999];
+
+    /// One finished device run WITH telemetry, exactly as `ggo-diag`
+    /// records it: the `runs` row, the `cart`/`run`/`frame` rows behind it,
+    /// and the `perf_run_id` that links the two. One database now, so this
+    /// is the same database the panel reads it back out of.
+    fn seed_flashed_run(db_url: &str) {
+        ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
+            sqlx::query(
                 "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
-                 hostname, state, verdict) VALUES (?1, '2026-08-31T12:00:00Z', 'main', \
+                 hostname, state, verdict) VALUES ($1, '2026-08-31T12:00:00Z', 'main', \
                  'abc123', 'v1.2.3', 'test-host', 'done', 'PASS')",
-                [FLASHED_RUN],
             )
+            .bind(FLASHED_RUN)
+            .execute(&pool)
             .await
             .unwrap();
-            conn.execute(
-                "INSERT OR IGNORE INTO cart(name) VALUES ('device:slop_battle')",
-                (),
+            let perf_id: i64 = sqlx::query_scalar(
+                "WITH c AS (INSERT INTO cart(name) VALUES ('device:slop_battle') RETURNING id) \
+                 INSERT INTO run (cart_id, started_at, frames, frame_budget_cycles) \
+                 SELECT id, '2026-08-31T12:00:02Z', 2, $1 FROM c RETURNING id",
             )
+            .bind(SEEDED_BUDGET_CYCLES)
+            .fetch_one(&pool)
             .await
             .unwrap();
-            conn.execute(
-                "INSERT INTO run (cart_id, started_at, frames, frame_budget_cycles) \
-                 SELECT id, '2026-08-31T12:00:02Z', 2, 555549 FROM cart \
-                 WHERE name = 'device:slop_battle'",
-                (),
-            )
-            .await
-            .unwrap();
-            let perf_id = conn.last_insert_rowid();
-            for (n, cyc) in [(0i64, 111_000i64), (1, 999_999)] {
-                conn.execute(
+            for (n, cyc) in SEEDED_FRAME_CYCLES.iter().enumerate() {
+                sqlx::query(
                     "INSERT INTO frame (run_id, n, cyc, wire_total, over_budget) \
-                     VALUES (?1, ?2, ?3, 0, ?4)",
-                    (perf_id, n, cyc, i64::from(cyc > 555_549)),
+                     VALUES ($1, $2, $3, 0, $4)",
                 )
+                .bind(perf_id)
+                .bind(n as i64)
+                .bind(cyc)
+                .bind(i64::from(*cyc > SEEDED_BUDGET_CYCLES))
+                .execute(&pool)
                 .await
                 .unwrap();
             }
-            conn.execute(
-                "UPDATE runs SET perf_run_id = ?2 WHERE id = ?1",
-                (FLASHED_RUN, perf_id),
-            )
-            .await
-            .unwrap();
+            sqlx::query("UPDATE runs SET perf_run_id = $2 WHERE id = $1")
+                .bind(FLASHED_RUN)
+                .bind(perf_id)
+                .execute(&pool)
+                .await
+                .unwrap();
         });
     }
 
@@ -7132,7 +7128,7 @@ mod tests {
     #[gpui::test]
     async fn test_speed_is_a_setting_clamped_to_the_drive_range(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             assert_eq!(panel.speed, 1);
             panel.set_speed(7, cx);
@@ -7148,17 +7144,16 @@ mod tests {
     /// verdict, no perf run behind it -- what a boot whose `<<<FRAME…>>>`
     /// packets went unparsed leaves behind (`[db] run …: N uart lines, 0
     /// frames`).
-    fn seed_flashed_run_without_telemetry(diag_db: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(diag_db).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute(
+    fn seed_flashed_run_without_telemetry(db_url: &str) {
+        ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
+            sqlx::query(
                 "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
-                 hostname, state, verdict) VALUES (?1, '2026-08-31T12:00:00Z', 'main', \
+                 hostname, state, verdict) VALUES ($1, '2026-08-31T12:00:00Z', 'main', \
                  'abc123', 'v1.2.3', 'test-host', 'done', 'PASS')",
-                [FLASHED_RUN],
             )
+            .bind(FLASHED_RUN)
+            .execute(&pool)
             .await
             .unwrap();
         });
@@ -7172,11 +7167,8 @@ mod tests {
     async fn test_a_passing_flash_without_telemetry_opens_its_uart_log(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        let diag_db = dir.path().join("diag.db");
-        let ide_db = dir.path().join("ggo_ide.db");
-        seed_flashed_run_without_telemetry(&diag_db);
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let charts = workspace.update_in(cx, |workspace, window, cx| {
             ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
             workspace
@@ -7187,8 +7179,9 @@ mod tests {
                 .panel()
                 .clone()
         });
+        seed_flashed_run_without_telemetry(db.url());
         charts.update(cx, |charts, _cx| {
-            charts.set_db_path_override(ide_db.clone());
+            charts.set_db_url_override(db.url().to_string());
         });
 
         let (streamer, _calls) = fake_streamer(
@@ -7203,8 +7196,6 @@ mod tests {
             hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
-            panel.db_path_override = Some(ide_db.clone());
-            panel.diag_db_path_override = Some(diag_db.clone());
             panel.flash_charts_window = Some(window.window_handle());
             panel.start_board_run(
                 vec![request],
@@ -7216,8 +7207,8 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
-                .expect("our own database reads")
+            diag_db::device_perf_run_id(db.url(), FLASHED_RUN)
+                .expect("the database reads")
                 .is_none(),
             "no telemetry means no perf run to resolve"
         );
@@ -7243,14 +7234,11 @@ mod tests {
     async fn test_a_passing_flash_opens_the_report_for_the_run_it_recorded(
         cx: &mut TestAppContext,
     ) {
-        // The clone and the lookup each block on their own tokio runtime.
+        // The lookup blocks on ggo-db's runtime.
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        let diag_db = dir.path().join("diag.db");
-        let ide_db = dir.path().join("ggo_ide.db");
-        seed_flashed_run(&diag_db);
 
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let charts = workspace.update_in(cx, |workspace, window, cx| {
             ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
             workspace
@@ -7261,10 +7249,11 @@ mod tests {
                 .panel()
                 .clone()
         });
-        // Both panels on the SAME temp database, so the run this flash
-        // clones is the run the charts panel then reads back.
+        seed_flashed_run(db.url());
+        // Both panels on the SAME throwaway database -- which is also the
+        // one ggo-diag recorded the flashed run into.
         charts.update(cx, |charts, _cx| {
-            charts.set_db_path_override(ide_db.clone());
+            charts.set_db_url_override(db.url().to_string());
         });
 
         let (streamer, _calls) = fake_streamer(
@@ -7279,8 +7268,6 @@ mod tests {
             hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
-            panel.db_path_override = Some(ide_db.clone());
-            panel.diag_db_path_override = Some(diag_db.clone());
             // What `flash_to_board_with` arms. `start_board_run` is entered
             // directly because that entry re-probes this machine for a
             // board first, and a test has none.
@@ -7310,136 +7297,14 @@ mod tests {
             );
         });
         assert!(
-            diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
-                .expect("our own database reads")
+            diag_db::device_perf_run_id(db.url(), FLASHED_RUN)
+                .expect("the database reads")
                 .is_some(),
-            "the flash cloned its own telemetry into the db the page reads"
+            "the run's telemetry is in the db the page reads"
         );
         assert!(
             cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
             "a passing flash must hand focus to the report it just produced"
-        );
-    }
-
-    /// Add an OLDER device run that this build can never clone, the way a
-    /// real `~/.ggo/diag.db` a migration behind cannot have its device runs
-    /// cloned (its `frame` table has no `cyc`). The cause here is a cart
-    /// with no name -- a per-run failure like that one, and one that can be
-    /// induced for a single run without disturbing the flashed run's rows.
-    /// Its id sorts FIRST, so it is attempted before the flashed run.
-    fn seed_unclonable_legacy_run(diag_db: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(diag_db).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute(
-                "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
-                 hostname, state, verdict) VALUES ('20260101T000000Z-0000000000', \
-                 '2026-01-01T00:00:00Z', 'main', 'old123', 'v1.0.0', 'test-host', \
-                 'done', 'PASS')",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.execute("INSERT INTO cart(name) VALUES (NULL)", ())
-                .await
-                .unwrap();
-            let cart_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO run (cart_id, started_at, frames, frame_budget_cycles) \
-                 VALUES (?1, '2026-01-01T00:00:02Z', 1, 555549)",
-                [cart_id],
-            )
-            .await
-            .unwrap();
-            let perf_id = conn.last_insert_rowid();
-            conn.execute(
-                "UPDATE runs SET perf_run_id = ?1 WHERE id = '20260101T000000Z-0000000000'",
-                [perf_id],
-            )
-            .await
-            .unwrap();
-        });
-    }
-
-    /// **The hop may not be held hostage by somebody else's run.**
-    /// `clone_runs` reconciles every run in ggo-diag's file, so one
-    /// permanently-unclonable historical run makes it return `Err` on
-    /// EVERY call -- and on a real machine with a `diag.db` a migration
-    /// behind, that is every call forever. The just-flashed run still
-    /// cloned and committed (each run is its own transaction), so its
-    /// report must still open.
-    #[gpui::test]
-    async fn test_a_passing_flash_opens_its_report_despite_an_unclonable_older_run(
-        cx: &mut TestAppContext,
-    ) {
-        cx.executor().allow_parking();
-        let dir = tempfile::tempdir().unwrap();
-        let diag_db = dir.path().join("diag.db");
-        let ide_db = dir.path().join("ggo_ide.db");
-        seed_unclonable_legacy_run(&diag_db);
-        seed_flashed_run(&diag_db);
-        // The premise, asserted rather than assumed: the clone really does
-        // fail, for the older run and not for this one.
-        let err = diag_db::clone_runs(&diag_db, &ide_db).expect_err("the older run cannot clone");
-        assert!(err.contains("20260101T000000Z-0000000000"), "{err}");
-        assert!(!err.contains(FLASHED_RUN), "{err}");
-
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
-        let charts = workspace.update_in(cx, |workspace, window, cx| {
-            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
-            workspace
-                .items_of_type::<ggo_charts_panel::ChartsItem>(cx)
-                .next()
-                .expect("open_charts_item adds the reports tab")
-                .read(cx)
-                .panel()
-                .clone()
-        });
-        charts.update(cx, |charts, _cx| {
-            charts.set_db_path_override(ide_db.clone());
-        });
-
-        let (streamer, _calls) = fake_streamer(
-            vec![
-                "==> Report",
-                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
-                "RESULT: PASS",
-            ],
-            true,
-        );
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
-        panel.update_in(cx, |panel, window, cx| {
-            panel.proc_streamer = streamer;
-            panel.db_path_override = Some(ide_db.clone());
-            panel.diag_db_path_override = Some(diag_db.clone());
-            panel.flash_charts_window = Some(window.window_handle());
-            panel.start_board_run(
-                vec![request],
-                "flashing".to_string(),
-                hardware::FlashProgress::flash(),
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        assert!(
-            diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
-                .expect("our own database reads")
-                .is_some(),
-            "the flashed run's own telemetry cloned regardless of the older run"
-        );
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                panel.last_flash_perf_run.as_ref().map(|(id, _)| id.as_str()),
-                Some(FLASHED_RUN),
-                "the hop resolved the report id rather than bailing on the Err"
-            );
-        });
-        assert!(
-            cx.update(|window, cx| charts.read(cx).focus_handle(cx).is_focused(window)),
-            "and the report still opens"
         );
     }
 
@@ -7450,20 +7315,16 @@ mod tests {
     async fn test_a_run_that_recorded_nothing_opens_no_report(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        let diag_db = dir.path().join("diag.db");
-        let ide_db = dir.path().join("ggo_ide.db");
+
+        let (db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         // Telemetry IS sitting there to be found: what is missing is the
         // transcript line saying which run this flash was.
-        seed_flashed_run(&diag_db);
-
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        seed_flashed_run(db.url());
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
         let request =
             hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
-            panel.db_path_override = Some(ide_db.clone());
-            panel.diag_db_path_override = Some(diag_db.clone());
             panel.flash_charts_window = Some(window.window_handle());
             panel.start_board_run(
                 vec![request],
@@ -7486,10 +7347,12 @@ mod tests {
                 "the transcript named no run"
             );
         });
-        assert!(
-            !ide_db.exists(),
-            "with no run to look up, nothing is cloned and no report opens"
-        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.last_flash_perf_run.is_none(),
+                "with no run to look up, nothing is resolved and no report opens"
+            );
+        });
     }
 
     /// The run's shape, not just its last line: every announced phase
@@ -7868,7 +7731,7 @@ mod tests {
     #[gpui::test]
     async fn test_remote_env_reports_the_probe(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, _cx| {
             let env = panel.remote_env();
             // Asserted against the payload's own internal consistency,
@@ -7897,7 +7760,7 @@ mod tests {
     #[gpui::test]
     async fn test_remote_resume_only_resumes_a_paused_run(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, _cx| {
             assert!(panel.remote_resume().is_err(), "no run live");
         });
@@ -7906,7 +7769,7 @@ mod tests {
     #[gpui::test]
     async fn test_remote_debug_view_needs_a_run(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, _cx| {
             let err = panel
                 .remote_debug_view(ggo_emu_remote::protocol::DebugView::Tiles, 0, 0, 0)
@@ -7920,7 +7783,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             // `unwrap_err` is unavailable: the Ok half holds a `ProcRunner`,
             // which is not `Debug`.
@@ -8046,14 +7909,12 @@ mod tests {
     /// the UI thread.
     #[gpui::test]
     async fn test_remote_flash_status_reports_the_finished_run(cx: &mut TestAppContext) {
-        // The clone and the lookup each block on their own tokio runtime.
+        // The lookup blocks on ggo-db's runtime.
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        let diag_db = dir.path().join("diag.db");
-        let ide_db = dir.path().join("ggo_ide.db");
-        seed_flashed_run(&diag_db);
 
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        seed_flashed_run(db.url());
         let (streamer, _calls) = fake_streamer(
             vec![
                 "==> Boot verify (UART)",
@@ -8067,8 +7928,6 @@ mod tests {
             hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
-            panel.db_path_override = Some(ide_db.clone());
-            panel.diag_db_path_override = Some(diag_db.clone());
             panel.flash_charts_window = Some(window.window_handle());
             panel.start_board_run(
                 vec![request],
@@ -8079,9 +7938,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let local_id = diag_db::device_perf_run_id(&ide_db, FLASHED_RUN)
-            .expect("our own database reads")
-            .expect("the flash cloned its telemetry across");
+        let local_id = diag_db::device_perf_run_id(db.url(), FLASHED_RUN)
+            .expect("the database reads")
+            .expect("the flashed run has telemetry behind it");
         panel.read_with(cx, |panel, _| {
             let status = panel.remote_flash_status();
             assert!(!status.active, "the run ended");
@@ -8106,7 +7965,7 @@ mod tests {
     #[gpui::test]
     async fn test_remote_flash_status_carries_the_runs_context(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (_workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (streamer, _calls) = fake_streamer(
             vec![
                 "==> Flash board",
@@ -8252,7 +8111,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             ggo_common::flash_to_board(workspace, None, false, window, cx)
@@ -8296,7 +8155,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
 
         workspace.update_in(cx, |workspace, window, cx| {
             ggo_common::flash_to_board(workspace, Some("worlds/arena"), false, window, cx)
@@ -8366,7 +8225,7 @@ mod tests {
     async fn test_the_flash_falls_back_to_the_world_panels_open_world(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         write_world_fixture(dir.path());
-        let (workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
+        let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
             assert_eq!(panel.flash_world(cx), None, "nothing open, nothing to boot");

@@ -1,5 +1,5 @@
 //! The run's diagnostic/UART line log -- what the pane's console shows and
-//! what [`crate::ingest`] writes into `ggo_ide.db`'s `uart` table.
+//! what [`crate::ingest`] writes into the database's `uart` table.
 //!
 //! Ported from `ggo-ide`'s `emu/thread.rs::UartAccumulator`/`UartHandle`:
 //! same byte-oriented `push`, same line splitting, same trailing-`\r` trim,
