@@ -556,10 +556,11 @@ const DB_NAME: &str = "the ggo database";
 /// producers disagree about it and the stamps do not say so themselves: a
 /// perf run's `started_at` is ISO-UTC (ggo-server's ingest writes it that
 /// way), a device run's is the LOCAL underscore stamp ggo-diag names its
-/// run by (history's reconcile copies it as-is), and a dump's id and `at`
-/// are `ggo-uartd`'s LOCAL wall clock off the file name. Listed together and unlabelled, one afternoon reads
-/// as two, and a reader lining a fault up against the run it happened
-/// during is out by the machine's UTC offset.
+/// run by (ggo-diag writes that row into this same database, stamp and
+/// all), and a dump's id and `at` are `ggo-uartd`'s LOCAL wall clock off
+/// the file name. Listed together and unlabelled, one afternoon reads as
+/// two, and a reader lining a fault up against the run it happened during
+/// is out by the machine's UTC offset.
 ///
 /// Each header is printed whenever its section has rows, a lone section
 /// included -- that is the case where there is nothing else on screen to
@@ -588,8 +589,9 @@ fn list_reports(db_url: &str, ggo_dir: &Path, limit: usize) -> Result<Vec<Value>
     // every cart for averages this list never prints.
     let rows: Vec<_> = perf_db::run_index(db_url)
         // The import note rides along: a failing read plus a failing fault
-        // import usually share one cause, and `none` above is the only
-        // other place that note is ever printed.
+        // import usually share one cause, and this is the only exit from
+        // THIS function that would otherwise drop it (`none` above carries
+        // it on the success paths).
         .map_err(|e| {
             format!("reading runs: {e:#}{}", import_failure_note(ggo_dir, import_error.as_ref()))
         })?

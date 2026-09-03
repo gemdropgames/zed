@@ -1783,13 +1783,13 @@ mod tests {
     fn parse_db_run_id_reads_ggo_diags_db_line() {
         assert_eq!(
             parse_db_run_id(
-                "[db] run 20260831T120000Z-abc123def0: 450 uart lines, 180 frames -> /home/x/.ggo/diag.db"
+                "[db] run 20260831T120000Z-abc123def0: 450 uart lines, 180 frames -> postgres://ggo@localhost/ggo"
             ),
             Some("20260831T120000Z-abc123def0".to_string())
         );
         assert_eq!(
             parse_db_run_id(
-                "[db] device run 7 (device:slop_battle): 180/180 FRAME packets -> diag.db"
+                "[db] device run 7 (device:slop_battle): 180/180 FRAME packets -> postgres"
             ),
             None
         );
@@ -1806,7 +1806,7 @@ mod tests {
         progress.apply("==> Report", Duration::from_secs(1));
         assert_eq!(progress.diag_run_id, None, "a phase names no run");
         progress.apply(
-            "[db] run 20260831T120000Z-abc123def0: 450 uart lines, 180 frames -> /x/diag.db",
+            "[db] run 20260831T120000Z-abc123def0: 450 uart lines, 180 frames -> postgres://ggo@localhost/ggo",
             Duration::from_secs(2),
         );
         assert_eq!(
@@ -1814,7 +1814,7 @@ mod tests {
             Some("20260831T120000Z-abc123def0")
         );
         progress.apply(
-            "[db] run 20260901T000000Z-later00000: 1 uart lines, 0 frames -> /x/diag.db",
+            "[db] run 20260901T000000Z-later00000: 1 uart lines, 0 frames -> postgres://ggo@localhost/ggo",
             Duration::from_secs(3),
         );
         assert_eq!(

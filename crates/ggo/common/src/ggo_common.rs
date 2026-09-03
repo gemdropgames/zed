@@ -146,7 +146,7 @@ const LOGS_DIR: &str = "logs";
 /// would never have failed a test.
 ///
 /// `ggo_emu_mcp` deliberately keeps its own copy: it resolves the directory
-/// under a caller-supplied `db_dir` rather than under `HOME`, and depends
+/// under a caller-supplied `ggo_dir` rather than under `HOME`, and depends
 /// on nothing gpui-shaped.
 pub fn default_faults_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;

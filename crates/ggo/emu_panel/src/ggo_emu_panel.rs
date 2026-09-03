@@ -7187,7 +7187,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(
             vec![
                 "==> Report",
-                "[db] run 20260831T120000Z-abc123def0: 6528 uart lines, 0 frames -> diag.db",
+                "[db] run 20260831T120000Z-abc123def0: 6528 uart lines, 0 frames -> postgres://ggo@localhost/ggo",
                 "RESULT: PASS",
             ],
             true,
@@ -7260,7 +7260,7 @@ mod tests {
         let (streamer, _calls) = fake_streamer(
             vec![
                 "==> Report",
-                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
+                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> postgres://ggo@localhost/ggo",
                 "RESULT: PASS",
             ],
             true,
@@ -7828,7 +7828,7 @@ mod tests {
         let (first, _calls) = fake_streamer(
             vec![
                 "==> Report",
-                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
+                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> postgres://ggo@localhost/ggo",
                 "RESULT: PASS",
             ],
             true,
@@ -7852,7 +7852,7 @@ mod tests {
         let (second, _calls) = fake_streamer(
             vec![
                 "==> Report",
-                "[db] run 20260901T090000Z-9999999999: 1 uart lines, 1 frames -> diag.db",
+                "[db] run 20260901T090000Z-9999999999: 1 uart lines, 1 frames -> postgres://ggo@localhost/ggo",
                 "RESULT: PASS",
             ],
             true,
@@ -7920,7 +7920,7 @@ mod tests {
             vec![
                 "==> Boot verify (UART)",
                 "==> Report",
-                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> diag.db",
+                "[db] run 20260831T120000Z-abc123def0: 2 uart lines, 2 frames -> postgres://ggo@localhost/ggo",
                 "RESULT: PASS",
             ],
             true,
