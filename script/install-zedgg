@@ -13,6 +13,10 @@ cd "$(dirname "$0")/.."
 
 # The ggo panels talk to the shared postgres database; this installs/starts it
 # (idempotent) and brings the schema up to date.
+[ -x ../ggo/scripts/pg-install.sh ] || {
+    echo "install-zedgg: expected the ggo checkout at $PWD/../ggo" >&2
+    exit 1
+}
 ../ggo/scripts/pg-install.sh
 
 cargo build --release --package zed --package cli
