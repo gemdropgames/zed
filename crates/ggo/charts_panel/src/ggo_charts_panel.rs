@@ -1,6 +1,7 @@
 //! GGO Charts panel: right-dock replacement for the Tauri IDE's Reports
-//! page, reading perf runs straight out of `~/.ggo/ggo_ide.db` -- the SAME
-//! database file, not a copy (see `loader`'s doc).
+//! page, reading perf runs straight out of the shared PostgreSQL database
+//! `ggo-db` hands out -- the SAME database every other ggo tool writes,
+//! not a copy (see `loader`'s doc).
 //!
 //! Two views. The picker (C1) lists every run (cart/label/date), loaded
 //! off-thread with a load-generation guard against a stale result -- the
@@ -9,12 +10,12 @@
 //! renders the same chart set ggo-ide's run-detail page shows for it, with
 //! a hover readout over the nearest sample.
 //!
-//! The picker also carries the DEVICE-run history rail (R3): `ggo-diag`'s
-//! `~/.ggo/diag.db` cloned into our own database and listed newest first,
-//! with a per-run log viewer. Those are a different table in a different id
-//! space from the perf runs above them and nothing converts between the two
-//! -- see [`history`]'s module doc for that, and for why the rail clones
-//! rather than reading `diag.db` live. The run detail gained the stored
+//! The picker also carries the DEVICE-run history rail (R3): the `runs`
+//! rows `ggo-diag` writes, listed newest first, with a per-run log viewer.
+//! Those are a different table in a different id space from the perf runs
+//! above them and nothing converts between the two -- see [`history`]'s
+//! module doc for that, and for why the rail may be refreshed at any
+//! instant. The run detail gained the stored
 //! guest-UART console (R3) and a Re-run entry that hands the run's cart back
 //! to the emulator pane through `ggo_common`'s cart-runner registry.
 //!
@@ -64,7 +65,7 @@ pub mod history;
 mod inspect;
 // `pub`: `ggo_emu_panel`'s ingest round-trip test reads its own writes back
 // through THESE query functions (as a dev-dependency), which is what proves
-// the two panels agree on `ggo_ide.db`'s schema rather than each having its
+// the two panels agree on the shared schema rather than each having its
 // own idea of it.
 pub mod loader;
 mod report;
@@ -159,11 +160,11 @@ const SELF_LEAF_LABEL: &str = "<self>";
 /// which is also what its history log viewer uses.
 const LOG_HEIGHT: Pixels = px(220.);
 
-/// A device run that cloned no `run_log` rows. Like `report::NO_UART` this
-/// names a STATE, not a cause: a run can reach `runs` with no narration
-/// because it died before its first log write, because only its `uart`
-/// rows were populated, or because the clone caught it before its first
-/// line landed.
+/// A device run with no `run_log` rows. Like `report::NO_UART` this names
+/// a STATE, not a cause: a run can reach `runs` with no narration because
+/// it died before its first log write, because only its `uart` rows were
+/// populated, or because it is being read while still in flight, before
+/// its first line landed.
 const NO_DEVICE_LOG: &str = "no log lines recorded for this run";
 
 /// A fault dump whose ring held no decodable text. Like [`NO_DEVICE_LOG`]
@@ -420,7 +421,7 @@ enum HistoryState {
 /// What the panel is showing, when it is showing a run rather than the
 /// picker. The two kinds come from two DIFFERENT tables in two different
 /// id spaces -- `run` (INTEGER `id`, this app's own perf captures) and
-/// `runs` (TEXT `id`, device runs cloned out of `ggo-diag`'s `diag.db`) --
+/// `runs` (TEXT `id`, the device runs `ggo-diag` records) --
 /// and nothing here ever converts one into the other (R1/R2's trap (3)).
 enum Selection {
     Perf(RunListing),
@@ -527,14 +528,11 @@ pub struct ChartsPanel {
     /// `None` in the unit tests that build a bare panel with no workspace
     /// at all, which is exactly when Re-run has nowhere to go anyway.
     workspace: Option<WeakEntity<Workspace>>,
-    /// Test hook: bypass `~/.ggo` resolution and point straight at a
-    /// fixture db (`ggo_world_panel::root_override`'s analog).
-    db_path_override: Option<PathBuf>,
-    /// Test hook for the OTHER file the panel reads -- `ggo-diag`'s own
-    /// `~/.ggo/diag.db`, which the history rail clones out of. Separate
-    /// from `db_path_override` because they are separate files owned by
-    /// separate tools; see `history`'s module doc.
-    diag_db_path_override: Option<PathBuf>,
+    /// Test hook: bypass `ggo_db::url()` and point straight at a fixture
+    /// database (`ggo_world_panel::root_override`'s analog). One url, not
+    /// two: the perf runs the picker lists and the device runs the history
+    /// rail lists are tables in the SAME database now.
+    db_url_override: Option<String>,
     /// Test hook for `ggo-uartd`'s dump directory. Without it a test that
     /// opens a fault `stat`s the developer's real `~/.ggo/uartd/faults`,
     /// so whether the Copy-dump button came out enabled depended on what
@@ -631,8 +629,7 @@ impl ChartsPanel {
         Self {
             focus_handle: cx.focus_handle(),
             workspace,
-            db_path_override: None,
-            diag_db_path_override: None,
+            db_url_override: None,
             faults_dir_override: None,
             state: LoadState::Empty,
             load_generation: 0,
@@ -707,18 +704,12 @@ impl ChartsPanel {
         }))
     }
 
-    fn db_path(&self) -> Option<PathBuf> {
-        self.db_path_override
-            .clone()
-            .or_else(ggo_common::default_db_path)
-    }
-
-    /// `ggo-diag`'s `~/.ggo/diag.db` -- a DIFFERENT file, owned by a
-    /// different tool, which this panel only ever clones out of.
-    fn diag_db_path(&self) -> Option<PathBuf> {
-        self.diag_db_path_override
-            .clone()
-            .or_else(ggo_common::default_diag_db_path)
+    /// The database every load here reads: the test override, else
+    /// `ggo-db`'s configured url. `None` only when that url cannot be
+    /// resolved at all (no `HOME`), which every caller renders as its own
+    /// empty/error state rather than treating as a failed query.
+    fn db_url(&self) -> Option<String> {
+        self.db_url_override.clone().or_else(|| ggo_db::url().ok())
     }
 
     /// `ggo-uartd`'s dump directory -- [`ggo_common::default_faults_dir`],
@@ -745,7 +736,7 @@ impl ChartsPanel {
     /// R3's console rides it too. `detail::no_build_here` is the tripwire
     /// that keeps it that way -- see that fn's doc.
     fn select_run(&mut self, run: RunListing, cx: &mut Context<Self>) {
-        let Some(db_path) = self.db_path() else {
+        let Some(db_url) = self.db_url() else {
             self.detail = Some(DetailState::Error(
                 "could not resolve a home directory".to_string(),
             ));
@@ -758,15 +749,13 @@ impl ChartsPanel {
         // ponytail: one read_dir of ~/.ggo/diag/logs on the UI thread per
         // selection; move it into the detail load if the directory grows
         // past a few thousand files.
-        self.run_log_path = self
-            .diag_db_path()
-            .and_then(|db| Some(db.parent()?.join("diag").join("logs")))
+        self.run_log_path = ggo_common::default_diag_logs_dir()
             .and_then(|logs_dir| ggo_emu_remote::diag_log_path(&logs_dir, &started_at));
         let generation = self.detail_generation;
         self.detail = Some(DetailState::Loading);
         cx.notify();
 
-        let load = cx.background_spawn(async move { detail::load(&db_path, run_id) });
+        let load = cx.background_spawn(async move { detail::load(&db_url, run_id) });
         self._detail_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -784,12 +773,12 @@ impl ChartsPanel {
         }));
     }
 
-    /// Select a DEVICE run (a `runs` row cloned out of `diag.db`) and load
+    /// Select a DEVICE run (a `runs` row `ggo-diag` wrote) and load
     /// its pipeline log. Same background spawn, same generation counter as
     /// [`Self::select_run`] -- sharing the counter is what makes switching
     /// between the two kinds discard the load being left behind.
     fn select_device_run(&mut self, run: RunSummary, cx: &mut Context<Self>) {
-        let Some(db_path) = self.db_path() else {
+        let Some(db_url) = self.db_url() else {
             self.device_log = Some(DeviceLogState::Error(
                 "could not resolve a home directory".to_string(),
             ));
@@ -802,7 +791,7 @@ impl ChartsPanel {
         self.device_log = Some(DeviceLogState::Loading);
         cx.notify();
 
-        let load = cx.background_spawn(async move { history::log(&db_path, &run_id) });
+        let load = cx.background_spawn(async move { history::log(&db_url, &run_id) });
         self._detail_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -873,13 +862,13 @@ impl ChartsPanel {
     /// [`Self::begin_selection`].
     pub fn open_run(&mut self, run_id: i64, cx: &mut Context<Self>) {
         self.refresh_runs(cx);
-        let Some(db_path) = self.db_path() else {
+        let Some(db_url) = self.db_url() else {
             return;
         };
         // Claimed NOW, on the UI thread, not when the lookup lands.
         self.detail_generation += 1;
         let generation = self.detail_generation;
-        let load = cx.background_spawn(async move { loader::list_runs(&db_path) });
+        let load = cx.background_spawn(async move { loader::list_runs(&db_url) });
         cx.spawn(async move |this, cx| {
             let listing = load
                 .await
@@ -905,18 +894,17 @@ impl ChartsPanel {
     /// reconciling load the history rail uses, so a run that landed a
     /// moment ago is there. Generation-guarded like [`Self::open_run`].
     pub fn open_device_run(&mut self, diag_run_id: String, cx: &mut Context<Self>) {
-        let (Some(db_path), Some(diag_db_path)) = (self.db_path(), self.diag_db_path()) else {
+        let Some(db_url) = self.db_url() else {
             return;
         };
         self.detail_generation += 1;
         let generation = self.detail_generation;
-        let load = cx.background_spawn(async move {
-            history::load(&diag_db_path, &db_path, history::HISTORY_LIMIT)
-        });
+        let load =
+            cx.background_spawn(async move { history::load(&db_url, history::HISTORY_LIMIT) });
         cx.spawn(async move |this, cx| {
             let history = load.await;
             let Some(run) = history.runs.into_iter().find(|run| run.id == diag_run_id) else {
-                log::warn!("device run {diag_run_id}: not in the cloned history, nothing to open");
+                log::warn!("device run {diag_run_id}: not in the run history, nothing to open");
                 return;
             };
             this.update(cx, |this, cx| {
@@ -934,7 +922,7 @@ impl ChartsPanel {
     /// `fault` table. The dock's click and the agent's `open_ggo_report`
     /// both land here. Generation-guarded like [`Self::open_run`].
     pub fn open_fault(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(db_path) = self.db_path() else {
+        let Some(db_url) = self.db_url() else {
             return;
         };
         self.detail_generation += 1;
@@ -954,7 +942,7 @@ impl ChartsPanel {
         // lines) and whether the dump file is still on disk -- that last
         // one a `stat`, which has no business on the UI thread.
         let load = cx.background_spawn(async move {
-            let loaded = faults::load(&db_path, &id)?.map(|detail| {
+            let loaded = faults::load(&db_url, &id)?.map(|detail| {
                 let text = Arc::new(Self::mark_fault_line(&detail));
                 (Arc::new(detail), text)
             });
@@ -1020,29 +1008,20 @@ impl ChartsPanel {
         cx.notify();
     }
 
-    /// Read runs from `path` instead of `~/.ggo/ggo_ide.db`.
+    /// Read every table from `url` instead of `ggo-db`'s configured
+    /// database.
     ///
     /// Public only so `ggo_emu_panel`'s "Re-run hops to the charts panel"
-    /// test can aim BOTH panels at one temporary database -- without it
-    /// that test would either read the developer's real database or not be
-    /// writable at all. Production code never calls it; the panel resolves
-    /// its own path through [`ggo_common::default_db_path`].
-    pub fn set_db_path_override(&mut self, path: PathBuf) {
-        self.db_path_override = Some(path);
-    }
-
-    /// Read the device-run history from `path` instead of
-    /// `~/.ggo/diag.db`. Public for the same reason as
-    /// [`Self::set_db_path_override`], and for a sharper one: the history
-    /// load CLONES `diag.db`'s runs into `ggo_ide.db`, so a cross-crate
-    /// test that leaves this at its default writes the developer's real
-    /// device runs into whatever database it is pointed at.
-    pub fn set_diag_db_path_override(&mut self, path: PathBuf) {
-        self.diag_db_path_override = Some(path);
+    /// test can aim BOTH panels at one throwaway `ggo_db::TestDb` --
+    /// without it that test would read (and write) the developer's real
+    /// database. Production code never calls it; the panel resolves its
+    /// own url through [`ggo_db::url`].
+    pub fn set_db_url_override(&mut self, url: String) {
+        self.db_url_override = Some(url);
     }
 
     /// Resolve dump paths under `path` instead of `~/.ggo/uartd/faults`.
-    /// Public for [`Self::set_db_path_override`]'s reason: the reports
+    /// Public for [`Self::set_db_url_override`]'s reason: the reports
     /// dock's end-to-end test imports a fixture dump directory and the
     /// tab it opens has to resolve the raw path in that same directory,
     /// not in the developer's real one.
@@ -1188,7 +1167,7 @@ impl ChartsPanel {
     /// a run ingested by `ggo-emu`/`ggo-server` while the panel sits open
     /// shows up the next time it's focused.
     fn refresh_runs(&mut self, cx: &mut Context<Self>) {
-        let Some(db_path) = self.db_path() else {
+        let Some(db_url) = self.db_url() else {
             self.state = LoadState::Error("could not resolve a home directory".to_string());
             cx.notify();
             return;
@@ -1199,7 +1178,7 @@ impl ChartsPanel {
         self.state = LoadState::Loading;
         cx.notify();
 
-        let load = cx.background_spawn(async move { loader::list_runs(&db_path) });
+        let load = cx.background_spawn(async move { loader::list_runs(&db_url) });
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -1219,27 +1198,25 @@ impl ChartsPanel {
         }));
     }
 
-    /// Clone whatever `~/.ggo/diag.db` has that we do not, then list the
-    /// device runs. Its own generation counter, for the same reason
-    /// [`Self::select_run`] has one: this refresh and the perf-run listing
-    /// are independent loads on independent tables.
+    /// List the device runs `ggo-diag` recorded. Its own generation
+    /// counter, for the same reason [`Self::select_run`] has one: this
+    /// refresh and the perf-run listing are independent loads on
+    /// independent tables.
     ///
-    /// Runs on every panel activation alongside [`Self::refresh_runs`]. The
-    /// clone is idempotent (`diag_db::clone_runs` skips a run whose `runs`
-    /// row it already holds unchanged AND whose linked device perf run it
-    /// has already cloned), so re-running it is a handful of `SELECT`s
-    /// against a small local file, and a diag run that finished -- or that
-    /// this build learned to copy more of -- while the panel sat open shows
-    /// up the next time it is focused.
+    /// Runs on every panel activation alongside [`Self::refresh_runs`]. It
+    /// is one `SELECT` and nothing else -- nothing is copied any more (see
+    /// `history`'s module doc) -- so a diag run that finished while the
+    /// panel sat open shows up the next time it is focused, and a run
+    /// still in flight simply reads as running.
     ///
-    /// A panel with no resolvable home directory shows an EMPTY rail rather
-    /// than an error: with no `~/.ggo` there is no `diag.db` either, which
-    /// is the state `history::NO_DIAG_DB` already describes.
+    /// A panel with no resolvable database url shows an EMPTY rail rather
+    /// than an error, which is the state `history::NO_DATABASE_URL`
+    /// describes.
     fn refresh_history(&mut self, cx: &mut Context<Self>) {
-        let (Some(db_path), Some(diag_db_path)) = (self.db_path(), self.diag_db_path()) else {
+        let Some(db_url) = self.db_url() else {
             self.history = HistoryState::Ready(history::History {
                 runs: Vec::new(),
-                note: Some(history::NO_DIAG_DB.to_string()),
+                note: Some(history::NO_DATABASE_URL.to_string()),
             });
             cx.notify();
             return;
@@ -1250,9 +1227,8 @@ impl ChartsPanel {
         self.history = HistoryState::Loading;
         cx.notify();
 
-        let load = cx.background_spawn(async move {
-            history::load(&diag_db_path, &db_path, history::HISTORY_LIMIT)
-        });
+        let load =
+            cx.background_spawn(async move { history::load(&db_url, history::HISTORY_LIMIT) });
         self._history_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -1337,8 +1313,8 @@ impl ChartsPanel {
             .into_any_element()
     }
 
-    /// The device-run history rail: every run cloned out of `~/.ggo/diag.db`,
-    /// newest first, capped at `history::HISTORY_LIMIT`.
+    /// The device-run history rail: every run `ggo-diag` recorded, newest
+    /// first, capped at `history::HISTORY_LIMIT`.
     ///
     /// **Undifferentiated by run kind, deliberately.** The `runs` table has
     /// no run-kind column and cart vs full-system is a path convention at
@@ -1385,9 +1361,8 @@ impl ChartsPanel {
                             .into_any_element()
                     })
                     .collect();
-                // The reason goes UNDER the rows, not instead of them: a
-                // clone that failed against rows cloned earlier means "these
-                // may be stale, here is why", which is worth both halves.
+                // The reason goes UNDER the rows, not instead of them,
+                // for the case where a listing came back with both.
                 if let Some(note) = &history.note {
                     rows.push(Self::note(note.clone()).into_any_element());
                 }
@@ -3040,6 +3015,7 @@ impl Focusable for ChartsPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_db::sqlx;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use workspace::{AppState, MultiWorkspace};
@@ -3096,19 +3072,19 @@ mod tests {
     #[gpui::test]
     async fn test_open_fault_lands_on_the_fault_detail(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
-        let ide_db = dir.path().join("ggo_ide.db");
         let faults = dir.path().join("faults");
         std::fs::create_dir_all(&faults).unwrap();
         std::fs::write(
             faults.join("2026-09-02_08-49-33_marker.log"),
             "# ggo-uartd marker trap: mcause= \u{2014} last 5s of /dev/ttyUSB1\n<<<BOOTROM alive>>>\r\ntrap: mcause=0x2\r\n",
         ).unwrap();
-        ggo_worldlib::charts::reports::faults::import(&faults, &ide_db).unwrap();
+        ggo_worldlib::charts::reports::faults::import(&faults, db.url()).unwrap();
 
         let panel = cx.new(|cx| ChartsPanel::new(None, cx));
         panel.update(cx, |panel, cx| {
-            panel.set_db_path_override(ide_db.clone());
+            panel.set_db_url_override(db.url().to_string());
             panel.set_faults_dir_override(faults.clone());
             panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
         });
@@ -3229,8 +3205,8 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
-        let ide_db = dir.path().join("ggo_ide.db");
         let faults = dir.path().join("faults");
         std::fs::create_dir_all(&faults).unwrap();
         // The fault line at the TAIL of a long window: the whole point of
@@ -3244,11 +3220,11 @@ mod tests {
         }
         dump.push_str("trap: mcause=0x2\r\n");
         std::fs::write(faults.join("2026-09-02_08-49-33_marker.log"), &dump).unwrap();
-        ggo_worldlib::charts::reports::faults::import(&faults, &ide_db).unwrap();
+        ggo_worldlib::charts::reports::faults::import(&faults, db.url()).unwrap();
 
         let panel = cx.new(|cx| ChartsPanel::new(None, cx));
         panel.update(cx, |panel, cx| {
-            panel.set_db_path_override(ide_db.clone());
+            panel.set_db_url_override(db.url().to_string());
             panel.set_faults_dir_override(faults.clone());
             panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
         });
@@ -3318,7 +3294,7 @@ mod tests {
         });
         let (panel, cx) = cx.add_window_view(|_window, cx| ChartsPanel::new(None, cx));
         panel.update(cx, |panel, cx| {
-            panel.set_db_path_override(ide_db.clone());
+            panel.set_db_url_override(db.url().to_string());
             panel.set_faults_dir_override(faults.clone());
             panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
         });
@@ -3351,8 +3327,8 @@ mod tests {
         });
         cx.executor().allow_parking();
 
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
-        let ide_db = dir.path().join("ggo_ide.db");
         let faults = dir.path().join("faults");
         std::fs::create_dir_all(&faults).unwrap();
         std::fs::write(
@@ -3366,11 +3342,11 @@ mod tests {
             ),
         )
         .unwrap();
-        ggo_worldlib::charts::reports::faults::import(&faults, &ide_db).unwrap();
+        ggo_worldlib::charts::reports::faults::import(&faults, db.url()).unwrap();
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(ide_db.clone());
+            panel.db_url_override = Some(db.url().to_string());
             panel.set_faults_dir_override(faults.clone());
             panel
         });
@@ -3510,10 +3486,10 @@ mod tests {
         });
     }
 
-    /// A fixture db authored through `ggo_db::migrate` plus one inserted
-    /// run (same pattern `ggo-ide`'s `backend/perf.rs` tests and
+    /// A throwaway migrated database plus one inserted run (the same
+    /// `ggo_db::TestDb` pattern `ggo-worldlib`'s `perf_db` tests and
     /// `loader::tests::list_runs_reads_seeded_rows_newest_first` use),
-    /// pointed at via `db_path_override` -- proves the panel reaches
+    /// pointed at via `db_url_override` -- proves the panel reaches
     /// `Ready` off-thread with the fixture run listed, end to end through
     /// `refresh_runs`/the background load, not just through
     /// `loader::list_runs` directly. Calls `refresh_runs` directly rather
@@ -3522,28 +3498,20 @@ mod tests {
     /// with `refresh_worlds`/`load_rel_path`.
     #[gpui::test]
     async fn test_refresh_runs_loads_fixture_runs_into_ready(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(&db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'demo')", ())
-                .await
-                .unwrap();
-            conn.execute(
+        let db = ggo_db::TestDb::new();
+        exec(
+            db.url(),
+            &[
+                "INSERT INTO cart (id, name) VALUES (1, 'demo')",
                 "INSERT INTO run (id, cart_id, started_at, frames, label)
                  VALUES (1, 1, '2026-08-01T00:00:00Z', 3, 'arena')",
-                (),
-            )
-            .await
-            .unwrap();
-        });
+            ],
+        );
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(db_path.clone());
+                panel.db_url_override = Some(db.url().to_string());
                 panel
             })
         });
@@ -3572,47 +3540,53 @@ mod tests {
     /// budget the fixture stopped using.
     const SEEDED_FRAME_BUDGET_CYCLES: i64 = 555_549;
 
-    /// A fixture db with one run whose frames exercise every chart gate,
-    /// so `select_run` produces the full 13-chart set. `frames` is
+    /// Run every statement in order against `db_url`. Parents before
+    /// children throughout: postgres enforces the `cart` -> `run` ->
+    /// `frame`/`profile`/`uart` foreign keys the SQLite fixtures never
+    /// did.
+    fn exec<S: AsRef<str>>(db_url: &str, statements: &[S]) {
+        ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
+            for sql in statements {
+                sqlx::query(sql.as_ref()).execute(&pool).await.unwrap();
+            }
+        });
+    }
+
+    /// A fixture database with one run whose frames exercise every chart
+    /// gate, so `select_run` produces the full 13-chart set. `frames` is
     /// `1..=n` PLUS a frame 0 (the default-ignored one), matching real
     /// captures.
-    fn seed_run_with_samples(db_path: &std::path::Path, frames: i64) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'demo')", ())
-                .await
-                .unwrap();
-            conn.execute(
+    fn seed_run_with_samples(db_url: &str, frames: i64) {
+        let mut statements = vec![
+            "INSERT INTO cart (id, name) VALUES (1, 'demo')".to_string(),
+            format!(
                 "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles, label)
-                 VALUES (1, 1, '2026-08-01T00:00:00Z', ?1, ?2, 'arena')",
-                (frames + 1, SEEDED_FRAME_BUDGET_CYCLES),
-            )
-            .await
-            .unwrap();
-            for n in 0..=frames {
-                conn.execute(
-                    "INSERT INTO frame
-                       (run_id, n, instrs, i_hits, i_misses, d_hits, d_misses,
-                        scanout_wire, blit_wire, miss_wire, wire_total, over_budget,
-                        sc_upload, sc_oam, bg_evictions, tile_load_wire,
-                        apu_fetch_wire, bg_tiles_distinct, spr_tiles_distinct)
-                     VALUES (1, ?1, ?2, 0, ?3, 0, ?4, 164400, 30, 40, ?5, 0,
-                             5, 2, 1, 60, 8, 20, 12)",
-                    (n, 1_000 + n * 10, 10 + n, 4 + n, 164_470 + n * 100),
-                )
-                .await
-                .unwrap();
-            }
-            conn.execute(
-                "INSERT INTO profile (run_id, frame, caller, func, misses, evicted)
-                 VALUES (1, 2, '', 'update_entities', 12, 4)",
-                (),
-            )
-            .await
-            .unwrap();
-        });
+                 VALUES (1, 1, '2026-08-01T00:00:00Z', {}, {SEEDED_FRAME_BUDGET_CYCLES}, 'arena')",
+                frames + 1
+            ),
+        ];
+        for n in 0..=frames {
+            statements.push(format!(
+                "INSERT INTO frame
+                   (run_id, n, instrs, i_hits, i_misses, d_hits, d_misses,
+                    scanout_wire, blit_wire, miss_wire, wire_total, over_budget,
+                    sc_upload, sc_oam, bg_evictions, tile_load_wire,
+                    apu_fetch_wire, bg_tiles_distinct, spr_tiles_distinct)
+                 VALUES (1, {n}, {}, 0, {}, 0, {}, 164400, 30, 40, {}, 0,
+                         5, 2, 1, 60, 8, 20, 12)",
+                1_000 + n * 10,
+                10 + n,
+                4 + n,
+                164_470 + n * 100
+            ));
+        }
+        statements.push(
+            "INSERT INTO profile (run_id, frame, caller, func, misses, evicted)
+             VALUES (1, 2, '', 'update_entities', 12, 4)"
+                .to_string(),
+        );
+        exec(db_url, &statements);
     }
 
     /// Two vsync periods of the seeded run's budget: run 55's half-rate
@@ -3624,31 +3598,29 @@ mod tests {
     /// `seed_run_with_samples` alone leaves an emulator-shaped run with
     /// no FPS chart at all -- which is exactly what the hero slot is
     /// keyed on.
-    fn seed_frame_cycles(db_path: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("UPDATE frame SET cyc = ?1", [DEVICE_FRAME_CYCLES])
-                .await
-                .unwrap();
-        });
+    fn seed_frame_cycles(db_url: &str) {
+        exec(
+            db_url,
+            &[format!("UPDATE frame SET cyc = {DEVICE_FRAME_CYCLES}")],
+        );
     }
 
     /// Drives a panel to `DetailState::Ready` for the seeded fixture run,
     /// going through `select_run`'s real off-thread load.
+    /// The fixture database comes back with the panel: dropping a
+    /// `TestDb` DROPs the database, so a test that let it go would pull
+    /// the tables out from under any load still in flight.
     async fn ready_detail_panel(
         cx: &mut TestAppContext,
         frames: i64,
-    ) -> (tempfile::TempDir, gpui::Entity<ChartsPanel>) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, frames);
+    ) -> (ggo_db::TestDb, gpui::Entity<ChartsPanel>) {
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), frames);
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(db_path.clone());
+                panel.db_url_override = Some(db.url().to_string());
                 panel
             })
         });
@@ -3664,14 +3636,14 @@ mod tests {
             );
         });
         cx.executor().run_until_parked();
-        (dir, panel)
+        (db, panel)
     }
 
     /// Selecting a run loads its samples off-thread and assembles the
     /// full reports-page chart set for it.
     #[gpui::test]
     async fn test_select_run_loads_samples_into_the_full_chart_set(cx: &mut TestAppContext) {
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, _cx| {
             let titles: Vec<&str> = panel
                 .chart_specs()
@@ -3709,7 +3681,7 @@ mod tests {
     async fn test_every_chart_kind_builds_a_non_empty_scene(cx: &mut TestAppContext) {
         use chart_geom::{ChartKind, Primitive};
 
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, _cx| {
             let mut seen_line = false;
             let mut seen_stacked = false;
@@ -3772,7 +3744,7 @@ mod tests {
         use chart_geom::{LEGEND_ROW_HEIGHT, LINE_MARGINS, full_x_domain, plot_rect, x_scale};
         use gpui::{point, size};
 
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
 
         let canvas = (344.0f32, 240.0f32);
         // The chart canvas sits at a nonzero window offset, like a real
@@ -3816,7 +3788,7 @@ mod tests {
     async fn test_hover_outside_the_canvas_clears_the_readout(cx: &mut TestAppContext) {
         use gpui::{point, size};
 
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         let origin = point(px(600.), px(120.));
         panel.update(cx, |panel, cx| {
             let len = panel.chart_specs().len();
@@ -3843,7 +3815,7 @@ mod tests {
     async fn test_hover_end_clears_only_the_chart_that_owned_the_hover(cx: &mut TestAppContext) {
         use gpui::{point, size};
 
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         let origin = point(px(600.), px(120.));
         panel.update(cx, |panel, cx| {
             let len = panel.chart_specs().len();
@@ -3872,7 +3844,7 @@ mod tests {
     /// The header caption that explains why the x-axis starts at 1.
     #[gpui::test]
     async fn test_the_ignored_frame_count_is_captioned(cx: &mut TestAppContext) {
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, _cx| {
             assert!(
                 matches!(&panel.detail, Some(DetailState::Ready(detail)) if detail.ignored == 1),
@@ -3890,7 +3862,7 @@ mod tests {
     /// "no frames recorded" message, never a blank canvas.
     #[gpui::test]
     async fn test_a_run_with_no_plottable_frames_is_ready_but_empty(cx: &mut TestAppContext) {
-        let (_dir, panel) = ready_detail_panel(cx, 0).await;
+        let (_db, panel) = ready_detail_panel(cx, 0).await;
         panel.update(cx, |panel, _cx| {
             assert!(
                 matches!(&panel.detail, Some(DetailState::Ready(detail)) if detail.charts.is_empty()),
@@ -3905,87 +3877,71 @@ mod tests {
     /// [`seed_run_with_samples`] so a test can choose between the three
     /// states the failure tables distinguish: no UART at all, UART with
     /// nothing wrong in it, and UART with failures.
-    fn seed_uart(db_path: &std::path::Path, lines: &[&str]) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
+    /// `perf_run_id` (not `run_id`): `uart` carries both keys now, and a
+    /// perf run's own guest log is the `perf_run_id` half -- `run_id` is
+    /// the TEXT diag-run id `ggo-diag` writes. `perf_db::run_uart` reads
+    /// both, so seeding the wrong one would still be found by the join
+    /// through `run.label` and prove nothing.
+    fn seed_uart(db_url: &str, lines: &[&str]) {
+        ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
             for (seq, text) in lines.iter().enumerate() {
-                conn.execute(
-                    "INSERT INTO uart (run_id, seq, text) VALUES (1, ?1, ?2)",
-                    (seq as i64, *text),
-                )
-                .await
-                .unwrap();
+                sqlx::query("INSERT INTO uart (perf_run_id, seq, text) VALUES (1, $1, $2)")
+                    .bind(seq as i64)
+                    .bind(*text)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
         });
     }
 
     /// A `run` row with no `frame` rows at all -- the cart that never
     /// reached vsync_wait.
-    fn seed_run_without_frames(db_path: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'demo')", ())
-                .await
-                .unwrap();
-            conn.execute(
+    fn seed_run_without_frames(db_url: &str) {
+        exec(
+            db_url,
+            &[
+                "INSERT INTO cart (id, name) VALUES (1, 'demo')",
                 "INSERT INTO run (id, cart_id, started_at, frames, label)
                  VALUES (1, 1, '2026-08-01T00:00:00Z', 0, 'arena')",
-                (),
-            )
-            .await
-            .unwrap();
-        });
+            ],
+        );
     }
 
     /// A run with only the always-on counters -- no PPU evictions, no
     /// tile working set, no sprite scanline peak, no VRAM uploads, no APU
     /// traffic. The fixture behind "a run that never measured those must
     /// render no tile for them".
-    fn seed_run_without_ppu_counters(db_path: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'demo')", ())
-                .await
-                .unwrap();
-            conn.execute(
+    fn seed_run_without_ppu_counters(db_url: &str) {
+        let mut statements = vec![
+            "INSERT INTO cart (id, name) VALUES (1, 'demo')".to_string(),
+            format!(
                 "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles,
                                   scanout_wire_cycles, refill_cycles, writeback_cycles,
                                   wire_wait_cycles, label)
-                 VALUES (1, 1, '2026-08-01T00:00:00Z', 3, 555549, 164400, 100, 65, 10, 'arena')",
-                (),
-            )
-            .await
-            .unwrap();
-            for n in 0..=2i64 {
-                conn.execute(
-                    "INSERT INTO frame
-                       (run_id, n, instrs, i_hits, i_misses, d_hits, d_misses,
-                        scanout_wire, blit_wire, miss_wire, wire_total, over_budget)
-                     VALUES (1, ?1, 1000, 990, 10, 495, 5, 164400, 30, 40, 164470, 0)",
-                    [n],
-                )
-                .await
-                .unwrap();
-            }
-        });
+                 VALUES (1, 1, '2026-08-01T00:00:00Z', 3, {SEEDED_FRAME_BUDGET_CYCLES},
+                         164400, 100, 65, 10, 'arena')"
+            ),
+        ];
+        for n in 0..=2i64 {
+            statements.push(format!(
+                "INSERT INTO frame
+                   (run_id, n, instrs, i_hits, i_misses, d_hits, d_misses,
+                    scanout_wire, blit_wire, miss_wire, wire_total, over_budget)
+                 VALUES (1, {n}, 1000, 990, 10, 495, 5, 164400, 30, 40, 164470, 0)"
+            ));
+        }
+        exec(db_url, &statements);
     }
 
-    /// Drives a panel to `Ready` for whatever the caller seeded at
-    /// `db_path`, through `select_run`'s real off-thread load.
-    async fn ready_panel_for(
-        cx: &mut TestAppContext,
-        db_path: PathBuf,
-    ) -> gpui::Entity<ChartsPanel> {
+    /// Drives a panel to `Ready` for whatever the caller seeded into the
+    /// database at `db_url`, through `select_run`'s real off-thread load.
+    async fn ready_panel_for(cx: &mut TestAppContext, db_url: String) -> gpui::Entity<ChartsPanel> {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(db_path);
+                panel.db_url_override = Some(db_url);
                 panel
             })
         });
@@ -4023,7 +3979,7 @@ mod tests {
     async fn test_the_kpi_tiles_are_derived_from_the_ignore_filtered_frames(
         cx: &mut TestAppContext,
     ) {
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, _cx| {
             let report = panel.report().expect("a loaded run has a report");
             assert_eq!(
@@ -4052,7 +4008,7 @@ mod tests {
     /// those three do not.
     #[gpui::test]
     async fn test_only_the_measured_conditional_tiles_appear(cx: &mut TestAppContext) {
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, _cx| {
             let report = panel.report().unwrap();
             assert_eq!(tile_value(report, "VRAM uploads / frame"), Some("5.0"));
@@ -4071,10 +4027,9 @@ mod tests {
     /// five conditional tiles -- not five tiles reading zero.
     #[gpui::test]
     async fn test_a_run_without_ppu_counters_renders_no_conditional_tiles(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_without_ppu_counters(&db_path);
-        let panel = ready_panel_for(cx, db_path).await;
+        let db = ggo_db::TestDb::new();
+        seed_run_without_ppu_counters(db.url());
+        let panel = ready_panel_for(cx, db.url().to_string()).await;
 
         panel.update(cx, |panel, _cx| {
             let report = panel.report().unwrap();
@@ -4107,10 +4062,9 @@ mod tests {
     /// The run-config line, off the `run` row's own wire-model columns.
     #[gpui::test]
     async fn test_the_header_carries_the_run_config_line(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_without_ppu_counters(&db_path);
-        let panel = ready_panel_for(cx, db_path).await;
+        let db = ggo_db::TestDb::new();
+        seed_run_without_ppu_counters(db.url());
+        let panel = ready_panel_for(cx, db.url().to_string()).await;
 
         panel.update(cx, |panel, _cx| {
             assert_eq!(
@@ -4126,11 +4080,10 @@ mod tests {
     /// Both tables, rendering rows out of a seeded fixture db's UART.
     #[gpui::test]
     async fn test_the_failure_tables_render_rows_from_the_seeded_uart(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
         seed_uart(
-            &db_path,
+            db.url(),
             &[
                 "== GGO OS booted ==",
                 "asset: MISS \"grooble.til\"",
@@ -4139,7 +4092,7 @@ mod tests {
                 "f=3| panicked at 'boom', src/main.rs:1:1",
             ],
         );
-        let panel = ready_panel_for(cx, db_path).await;
+        let panel = ready_panel_for(cx, db.url().to_string()).await;
 
         panel.update(cx, |panel, _cx| {
             let diagnostics = &panel.report().unwrap().diagnostics;
@@ -4176,11 +4129,10 @@ mod tests {
     /// left as a comment.
     #[gpui::test]
     async fn test_the_two_empty_states_are_distinct(cx: &mut TestAppContext) {
-        let clean_dir = tempfile::tempdir().unwrap();
-        let clean_path = clean_dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&clean_path, 4);
-        seed_uart(&clean_path, &["== GGO OS booted ==", "wave 1 start"]);
-        let clean = ready_panel_for(cx, clean_path).await;
+        let clean_db = ggo_db::TestDb::new();
+        seed_run_with_samples(clean_db.url(), 4);
+        seed_uart(clean_db.url(), &["== GGO OS booted ==", "wave 1 start"]);
+        let clean = ready_panel_for(cx, clean_db.url().to_string()).await;
         clean.update(cx, |panel, _cx| {
             let diagnostics = &panel.report().unwrap().diagnostics;
             assert!(diagnostics.failures().is_empty());
@@ -4189,7 +4141,7 @@ mod tests {
         });
 
         // `seed_run_with_samples` writes a present-day run and no UART.
-        let (_dir, silent) = ready_detail_panel(cx, 4).await;
+        let (_db, silent) = ready_detail_panel(cx, 4).await;
         silent.update(cx, |panel, _cx| {
             let diagnostics = &panel.report().unwrap().diagnostics;
             assert_eq!(*diagnostics, report::Diagnostics::NoUart);
@@ -4212,10 +4164,9 @@ mod tests {
     async fn test_the_two_chartless_reasons_are_distinct(cx: &mut TestAppContext) {
         // `seed_run_with_samples(.., 0)` writes frame 0 and nothing else,
         // so the run HAS a frame and the ignore filter removes it.
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 0);
-        let only_frame_zero = ready_panel_for(cx, db_path).await;
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 0);
+        let only_frame_zero = ready_panel_for(cx, db.url().to_string()).await;
         only_frame_zero.update(cx, |panel, _cx| {
             assert!(panel.chart_specs().is_empty());
             assert_eq!(
@@ -4226,10 +4177,9 @@ mod tests {
         });
 
         // A run row with no `frame` rows at all is the other case.
-        let bare_dir = tempfile::tempdir().unwrap();
-        let bare_path = bare_dir.path().join("ggo_ide.db");
-        seed_run_without_frames(&bare_path);
-        let never_sampled = ready_panel_for(cx, bare_path).await;
+        let bare_db = ggo_db::TestDb::new();
+        seed_run_without_frames(bare_db.url());
+        let never_sampled = ready_panel_for(cx, bare_db.url().to_string()).await;
         never_sampled.update(cx, |panel, _cx| {
             assert_eq!(
                 panel.report().unwrap().no_frames,
@@ -4245,11 +4195,10 @@ mod tests {
     /// exactly what a user opened the panel for, so it must still render.
     #[gpui::test]
     async fn test_a_run_with_no_frames_still_shows_its_panics(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 0);
-        seed_uart(&db_path, &["panicked at 'early boom', src/main.rs:1:1"]);
-        let panel = ready_panel_for(cx, db_path).await;
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 0);
+        seed_uart(db.url(), &["panicked at 'early boom', src/main.rs:1:1"]);
+        let panel = ready_panel_for(cx, db.url().to_string()).await;
 
         panel.update(cx, |panel, _cx| {
             assert!(panel.chart_specs().is_empty(), "no plottable frames");
@@ -4289,11 +4238,10 @@ mod tests {
 
         // A run with the full chart set, plus UART so both tables have
         // rows rather than an empty state.
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
         seed_uart(
-            &db_path,
+            db.url(),
             &[
                 "asset: MISS \"grooble.til\"",
                 "f=3| panicked at 'boom', src/main.rs:1:1",
@@ -4302,7 +4250,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path.clone());
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -4361,14 +4309,16 @@ mod tests {
 
         // And the other branch: a frameless run still paints both tables
         // (the whole point of hoisting them) but no KPI row.
-        let bare_dir = tempfile::tempdir().unwrap();
-        let bare_path = bare_dir.path().join("ggo_ide.db");
-        seed_run_without_frames(&bare_path);
-        seed_uart(&bare_path, &["panicked at 'early boom', src/main.rs:1:1"]);
+        let bare_db = ggo_db::TestDb::new();
+        seed_run_without_frames(bare_db.url());
+        seed_uart(
+            bare_db.url(),
+            &["panicked at 'early boom', src/main.rs:1:1"],
+        );
 
         let (bare, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(bare_path);
+            panel.db_url_override = Some(bare_db.url().to_string());
             panel
         });
         bare.update(cx, |panel, cx| {
@@ -4433,15 +4383,14 @@ mod tests {
             AppState::test(cx);
         });
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
-        seed_frame_cycles(&db_path);
-        seed_uart(&db_path, &["asset: MISS \"grooble.til\""]);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_frame_cycles(db.url());
+        seed_uart(db.url(), &["asset: MISS \"grooble.til\""]);
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path.clone());
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -4499,8 +4448,8 @@ mod tests {
         );
     }
 
-    /// R1's concern (5): every `perf_db` call blocks and spins its own
-    /// tokio runtime, so the load must go through the panel's background
+    /// R1's concern (5): every `perf_db` call blocks on `ggo-db`'s
+    /// runtime, so the load must go through the panel's background
     /// spawn. Asserted by observing that `select_run` RETURNS with the
     /// panel still `Loading` -- if the query ran inline on the UI thread,
     /// the state would already be `Ready` by the time the update closure
@@ -4509,14 +4458,13 @@ mod tests {
     /// `refresh_runs` uses; this task added no second one.
     #[gpui::test]
     async fn test_a_run_load_does_not_block_the_ui_thread(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(db_path.clone());
+                panel.db_url_override = Some(db.url().to_string());
                 panel
             })
         });
@@ -4552,7 +4500,7 @@ mod tests {
     /// the dismissed run's charts.
     #[gpui::test]
     async fn test_clear_selection_returns_to_the_picker(cx: &mut TestAppContext) {
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, cx| {
             let before = panel.detail_generation;
             panel.clear_selection(cx);
@@ -4570,18 +4518,17 @@ mod tests {
     /// the fork rendered back until now.
     #[gpui::test]
     async fn test_the_stored_console_renders_the_runs_uart(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
         seed_uart(
-            &db_path,
+            db.url(),
             &[
                 "== GGO OS booted ==",
                 "[audio] output opened",
                 "wave 1 start",
             ],
         );
-        let panel = ready_panel_for(cx, db_path).await;
+        let panel = ready_panel_for(cx, db.url().to_string()).await;
 
         panel.update(cx, |panel, _cx| {
             assert_eq!(
@@ -4606,7 +4553,7 @@ mod tests {
     /// it into a cause.
     #[gpui::test]
     async fn test_a_run_with_no_stored_uart_gets_the_hedged_empty_state(cx: &mut TestAppContext) {
-        let (_dir, panel) = ready_detail_panel(cx, 4).await;
+        let (_db, panel) = ready_detail_panel(cx, 4).await;
         panel.update(cx, |panel, _cx| {
             assert!(panel.console().is_empty(), "the fixture seeds no UART");
             assert_eq!(
@@ -4706,28 +4653,23 @@ mod tests {
 
     /// Seed `n` UART lines for run 1, in batched multi-row inserts (one
     /// `execute` per line is minutes, not seconds, at these counts).
-    fn seed_many_uart_lines(db_path: &std::path::Path, n: usize) {
+    fn seed_many_uart_lines(db_url: &str, n: usize) {
         const BATCH: usize = 250;
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            for chunk in (0..n).collect::<Vec<_>>().chunks(BATCH) {
+        let statements: Vec<String> = (0..n)
+            .collect::<Vec<_>>()
+            .chunks(BATCH)
+            .map(|chunk| {
                 let values: Vec<String> = chunk
                     .iter()
                     .map(|seq| format!("(1, {seq}, 'line {seq}')"))
                     .collect();
-                conn.execute(
-                    &format!(
-                        "INSERT INTO uart (run_id, seq, text) VALUES {}",
-                        values.join(", ")
-                    ),
-                    (),
+                format!(
+                    "INSERT INTO uart (perf_run_id, seq, text) VALUES {}",
+                    values.join(", ")
                 )
-                .await
-                .unwrap();
-            }
-        });
+            })
+            .collect();
+        exec(db_url, &statements);
     }
 
     /// **The inherited defect (R2's carried concern (1)), fixed and
@@ -4756,14 +4698,13 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
         });
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
-        seed_many_uart_lines(&db_path, 6_000);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_many_uart_lines(db.url(), 6_000);
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -4820,41 +4761,38 @@ mod tests {
     /// Seed `ggo-diag`'s OWN database (a separate file, per the
     /// no-shared-dbs rule `history`'s module doc explains) with one run and
     /// a couple of `run_log` lines.
-    fn seed_device_run(diag_path: &std::path::Path, id: &str, started_at: &str, verdict: &str) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(diag_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute(
+    fn seed_device_run(db_url: &str, id: &str, started_at: &str, verdict: &str) {
+        ggo_db::block_on(async {
+            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
+            sqlx::query(
                 "INSERT INTO runs (id, started_at, branch, commit_hash, git_describe, \
                  hostname, state, verdict) \
-                 VALUES (?1, ?2, 'main', 'abc123', 'v1.2.3', 'test-host', 'done', ?3)",
-                (id, started_at, verdict),
+                 VALUES ($1, $2, 'main', 'abc123', 'v1.2.3', 'test-host', 'done', $3)",
             )
+            .bind(id)
+            .bind(started_at)
+            .bind(verdict)
+            .execute(&pool)
             .await
             .unwrap();
             for (seq, text) in ["==> compile", "RESULT: PASS"].iter().enumerate() {
-                conn.execute(
-                    "INSERT INTO run_log (run_id, seq, text) VALUES (?1, ?2, ?3)",
-                    (id, seq as i64, *text),
-                )
-                .await
-                .unwrap();
+                sqlx::query("INSERT INTO run_log (run_id, seq, text) VALUES ($1, $2, $3)")
+                    .bind(id)
+                    .bind(seq as i64)
+                    .bind(*text)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
         });
     }
 
-    /// A panel pointed at both files, with its history rail loaded.
-    async fn history_panel(
-        cx: &mut TestAppContext,
-        db_path: PathBuf,
-        diag_path: PathBuf,
-    ) -> gpui::Entity<ChartsPanel> {
+    /// A panel pointed at `db_url`, with its history rail loaded.
+    async fn history_panel(cx: &mut TestAppContext, db_url: String) -> gpui::Entity<ChartsPanel> {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(db_path);
-                panel.diag_db_path_override = Some(diag_path);
+                panel.db_url_override = Some(db_url);
                 panel
             })
         });
@@ -4871,16 +4809,14 @@ mod tests {
         }
     }
 
-    /// The rail lists the cloned device runs, newest first, off-thread.
+    /// The rail lists the device runs, newest first, off-thread.
     #[gpui::test]
     async fn test_the_history_rail_lists_seeded_runs_newest_first(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let diag_path = dir.path().join("diag.db");
-        seed_device_run(&diag_path, "run-older", "2026-08-01T00:00:00Z", "PASS");
-        seed_device_run(&diag_path, "run-newer", "2026-08-02T00:00:00Z", "FAIL");
+        let db = ggo_db::TestDb::new();
+        seed_device_run(db.url(), "run-older", "2026-08-01T00:00:00Z", "PASS");
+        seed_device_run(db.url(), "run-newer", "2026-08-02T00:00:00Z", "FAIL");
 
-        let panel = history_panel(cx, db_path, diag_path).await;
+        let panel = history_panel(cx, db.url().to_string()).await;
         panel.update(cx, |panel, _cx| {
             let history = history_of(panel);
             let ids: Vec<&str> = history.runs.iter().map(|r| r.id.as_str()).collect();
@@ -4896,13 +4832,11 @@ mod tests {
     /// the other: the perf detail is dropped, not reinterpreted.
     #[gpui::test]
     async fn test_selecting_a_device_run_swaps_the_panels_run(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let diag_path = dir.path().join("diag.db");
-        seed_run_with_samples(&db_path, 4);
-        seed_device_run(&diag_path, "run-1", "2026-08-02T00:00:00Z", "PASS");
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_device_run(db.url(), "run-1", "2026-08-02T00:00:00Z", "PASS");
 
-        let panel = history_panel(cx, db_path, diag_path).await;
+        let panel = history_panel(cx, db.url().to_string()).await;
 
         // Start on a PERF run, so the swap has something to displace.
         panel.update(cx, |panel, cx| {
@@ -4956,13 +4890,11 @@ mod tests {
     /// replacing their choice with a run from the other id space.
     #[gpui::test]
     async fn test_a_device_selection_survives_an_in_flight_open_run(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let diag_path = dir.path().join("diag.db");
-        seed_run_with_samples(&db_path, 4);
-        seed_device_run(&diag_path, "run-1", "2026-08-02T00:00:00Z", "PASS");
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_device_run(db.url(), "run-1", "2026-08-02T00:00:00Z", "PASS");
 
-        let panel = history_panel(cx, db_path, diag_path).await;
+        let panel = history_panel(cx, db.url().to_string()).await;
         let summary = panel.update(cx, |panel, _cx| history_of(panel).runs[0].clone());
 
         panel.update(cx, |panel, cx| {
@@ -4986,13 +4918,12 @@ mod tests {
     /// works. (A guard that dropped every hop would pass the test above.)
     #[gpui::test]
     async fn test_open_run_still_selects_the_run_it_was_given(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(db_path);
+                panel.db_url_override = Some(db.url().to_string());
                 panel
             })
         });
@@ -5007,31 +4938,19 @@ mod tests {
         });
     }
 
-    /// **The fresh-machine case.** No `~/.ggo/diag.db` is the norm, and it
-    /// must produce an empty rail with a legible reason -- never a panic,
-    /// never a silent blank, and never a database file created as a side
-    /// effect of a read (`turso::Builder::new_local` creates an empty,
-    /// tableless file on open, which is why the `exists()` guards are in
-    /// front of everything).
+    /// **The fresh-machine case.** A database `ggo-diag` has never
+    /// written to is the norm, and it must produce an empty rail with a
+    /// legible reason -- never a panic and never a silent blank.
     #[gpui::test]
-    async fn test_an_absent_diag_db_yields_the_reason_state_and_creates_no_file(
-        cx: &mut TestAppContext,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let diag_path = dir.path().join("diag.db");
+    async fn test_a_database_with_no_device_runs_yields_the_reason_state(cx: &mut TestAppContext) {
+        let db = ggo_db::TestDb::new();
 
-        let panel = history_panel(cx, db_path.clone(), diag_path.clone()).await;
+        let panel = history_panel(cx, db.url().to_string()).await;
         panel.update(cx, |panel, _cx| {
             let history = history_of(panel);
             assert!(history.runs.is_empty());
-            assert_eq!(history.note.as_deref(), Some(history::NO_DIAG_DB));
+            assert_eq!(history.note.as_deref(), Some(history::NO_RUNS));
         });
-        assert!(
-            !diag_path.exists(),
-            "a read must not create ggo-diag's file"
-        );
-        assert!(!db_path.exists(), "nor ours");
     }
 
     // ----------------------------------------------- R3: the Re-run hop
@@ -5062,13 +4981,12 @@ mod tests {
         cx: &'a mut TestAppContext,
         label: Option<&str>,
     ) -> (
-        tempfile::TempDir,
+        ggo_db::TestDb,
         gpui::Entity<ChartsPanel>,
         &'a mut gpui::VisualTestContext,
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
 
         cx.update(|cx| {
             AppState::test(cx);
@@ -5090,7 +5008,7 @@ mod tests {
                 .clone()
         });
         panel.update(cx, |panel, cx| {
-            panel.db_path_override = Some(db_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel.select_run(
                 RunListing {
                     id: 1,
@@ -5102,7 +5020,7 @@ mod tests {
             );
         });
         cx.run_until_parked();
-        (dir, panel, cx)
+        (db, panel, cx)
     }
 
     /// **Re-run routes to the emulator.** The run's `label` is the rel path
@@ -5111,7 +5029,7 @@ mod tests {
     /// path.
     #[gpui::test]
     async fn test_rerun_hands_the_runs_cart_path_to_the_cart_runner(cx: &mut TestAppContext) {
-        let (_dir, panel, cx) = rerun_panel(cx, Some("carts/green.cart")).await;
+        let (_db, panel, cx) = rerun_panel(cx, Some("carts/green.cart")).await;
         cx.update(|_window, cx| ggo_common::register_cart_runner(cx, recording_cart_runner));
 
         panel.update_in(cx, |panel, window, cx| panel.rerun_selected(window, cx));
@@ -5131,7 +5049,7 @@ mod tests {
     /// carry one.)
     #[gpui::test]
     async fn test_rerun_is_refused_for_a_run_with_no_cart_path(cx: &mut TestAppContext) {
-        let (_dir, panel, cx) = rerun_panel(cx, None).await;
+        let (_db, panel, cx) = rerun_panel(cx, None).await;
         cx.update(|_window, cx| ggo_common::register_cart_runner(cx, recording_cart_runner));
 
         panel.update_in(cx, |panel, window, cx| panel.rerun_selected(window, cx));
@@ -5150,7 +5068,7 @@ mod tests {
     /// Re-run says so instead of silently doing nothing.
     #[gpui::test]
     async fn test_rerun_with_no_registered_runner_says_so(cx: &mut TestAppContext) {
-        let (_dir, panel, cx) = rerun_panel(cx, Some("carts/green.cart")).await;
+        let (_db, panel, cx) = rerun_panel(cx, Some("carts/green.cart")).await;
         panel.update_in(cx, |panel, window, cx| panel.rerun_selected(window, cx));
         panel.update(cx, |panel, _cx| {
             assert_eq!(panel.rerun_note, Some(NO_CART_RUNNER));
@@ -5164,57 +5082,43 @@ mod tests {
     /// cold-cache burst on the ignored frame 0, two functions under one
     /// caller on frame 1, two callers on frame 3 -- and nothing at all on
     /// frame 4, which is the "no per-function data" case.
-    fn seed_profile_rows(db_path: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            for (frame, caller, func, misses, evicted) in [
-                (0i64, "boot", "boot", 9_000i64, 4_000i64),
-                (1, "main", "update", 30, 2),
-                (1, "main", "render", 10, 8),
-                (3, "main", "update", 5, 1),
-                (3, "draw", "blit", 40, 0),
-            ] {
-                conn.execute(
-                    "INSERT INTO profile (run_id, frame, caller, func, misses, evicted)
-                     VALUES (1, ?1, ?2, ?3, ?4, ?5)",
-                    (frame, caller, func, misses, evicted),
-                )
-                .await
-                .unwrap();
-            }
-        });
+    fn seed_profile_rows(db_url: &str) {
+        let statements: Vec<String> = [
+            (0i64, "boot", "boot", 9_000i64, 4_000i64),
+            (1, "main", "update", 30, 2),
+            (1, "main", "render", 10, 8),
+            (3, "main", "update", 5, 1),
+            (3, "draw", "blit", 40, 0),
+        ]
+        .iter()
+        .map(|(frame, caller, func, misses, evicted)| {
+            format!(
+                "INSERT INTO profile (run_id, frame, caller, func, misses, evicted)
+                 VALUES (1, {frame}, '{caller}', '{func}', {misses}, {evicted})"
+            )
+        })
+        .collect();
+        exec(db_url, &statements);
     }
 
     /// A second run in the same fixture db, so the run -> run selection
     /// path can be exercised for real. Deliberately a DIFFERENT frame
     /// range (10..=12) from run 1: a frame number that survived the
     /// switch would then name a frame this run does not even have.
-    fn seed_second_run(db_path: &std::path::Path) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(db_path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute(
-                "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles, label)
-                 VALUES (2, 1, '2026-08-03T00:00:00Z', 3, 555549, 'arena-2')",
-                (),
-            )
-            .await
-            .unwrap();
-            for n in 10..=12 {
-                conn.execute(
-                    "INSERT INTO frame
-                       (run_id, n, instrs, i_hits, i_misses, d_hits, d_misses,
-                        scanout_wire, blit_wire, miss_wire, wire_total, over_budget)
-                     VALUES (2, ?1, 1000, 0, 7, 0, 3, 164400, 30, 40, 164470, 0)",
-                    [n],
-                )
-                .await
-                .unwrap();
-            }
-        });
+    fn seed_second_run(db_url: &str) {
+        let mut statements = vec![format!(
+            "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles, label)
+             VALUES (2, 1, '2026-08-03T00:00:00Z', 3, {SEEDED_FRAME_BUDGET_CYCLES}, 'arena-2')"
+        )];
+        for n in 10..=12i64 {
+            statements.push(format!(
+                "INSERT INTO frame
+                   (run_id, n, instrs, i_hits, i_misses, d_hits, d_misses,
+                    scanout_wire, blit_wire, miss_wire, wire_total, over_budget)
+                 VALUES (2, {n}, 1000, 0, 7, 0, 3, 164400, 30, 40, 164470, 0)"
+            ));
+        }
+        exec(db_url, &statements);
     }
 
     /// Window-space centre of the point chart `ix` drew for `frame`,
@@ -5279,22 +5183,20 @@ mod tests {
     async fn drawn_detail_window(
         cx: &mut TestAppContext,
     ) -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
+        ggo_db::TestDb,
         gpui::Entity<ChartsPanel>,
         &mut gpui::VisualTestContext,
     ) {
         cx.update(|cx| {
             AppState::test(cx);
         });
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
-        seed_profile_rows(&db_path);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_profile_rows(db.url());
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path.clone());
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -5318,7 +5220,7 @@ mod tests {
             gpui::size(DEFAULT_WIDTH, px(6000.)),
             |_window, _cx| panel.clone().into_any_element(),
         );
-        (dir, db_path, panel, cx)
+        (db, panel, cx)
     }
 
     /// The whole click path, through a real mouse event on a real
@@ -5326,7 +5228,7 @@ mod tests {
     /// are grouped, and the pane is painted beneath the chart clicked.
     #[gpui::test]
     async fn test_clicking_a_plot_opens_the_inspect_pane_for_that_frame(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, at) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 3.0))
@@ -5368,7 +5270,7 @@ mod tests {
     /// `RunPage.tsx`'s `pickFrame` toggle.
     #[gpui::test]
     async fn test_clicking_the_selected_frame_again_clears_it(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let at = panel.update(cx, |panel, _cx| {
             point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
         });
@@ -5389,7 +5291,7 @@ mod tests {
     /// read as "dismiss".
     #[gpui::test]
     async fn test_the_same_frame_on_another_chart_moves_the_pane(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (first, at_first) = panel.update(cx, |panel, _cx| {
             let first = chart_index(panel, "Cache misses per frame");
             (first, point_of(panel, first, 3.0))
@@ -5428,7 +5330,7 @@ mod tests {
     /// compares two constants proves nothing about what was painted).
     #[gpui::test]
     async fn test_a_frame_with_no_per_function_data_shows_the_empty_state(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let at = panel.update(cx, |panel, _cx| {
             point_of(panel, chart_index(panel, "Cache misses per frame"), 4.0)
         });
@@ -5459,7 +5361,7 @@ mod tests {
     /// inspector about a frame the user was reading wire cycles on.
     #[gpui::test]
     async fn test_a_click_on_an_unselectable_chart_selects_nothing(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let at = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Wire cycles per frame vs budget");
             assert!(!panel.chart_specs()[ix].selectable);
@@ -5479,8 +5381,8 @@ mod tests {
     /// not have.
     #[gpui::test]
     async fn test_leaving_a_run_drops_the_frame_selection(cx: &mut TestAppContext) {
-        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
-        seed_second_run(&db_path);
+        let (db, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(db.url());
         let at = panel.update(cx, |panel, _cx| {
             point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
         });
@@ -5535,7 +5437,7 @@ mod tests {
     /// not because anything here reversed a vector.
     #[gpui::test]
     async fn test_the_profile_sort_header_toggles_the_tables_order(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let order = |panel: &ChartsPanel| -> Vec<String> {
             let Some(DetailState::Ready(detail)) = &panel.detail else {
                 panic!("ready");
@@ -5589,7 +5491,7 @@ mod tests {
     /// The profile table is painted for a run that HAS profile rows...
     #[gpui::test]
     async fn test_the_profile_table_is_painted_below_the_charts(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let table = cx
             .debug_bounds(PROFILE_TABLE_SELECTOR)
             .expect("the I$ profile table must be painted");
@@ -5614,13 +5516,12 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
         });
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_without_frames(&db_path);
+        let db = ggo_db::TestDb::new();
+        seed_run_without_frames(db.url());
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -5661,7 +5562,7 @@ mod tests {
     }
 
     /// Inspect is perf-only. A device run comes out of the OTHER id space
-    /// (`runs`, TEXT ids, cloned from `diag.db`), has no frames, no
+    /// (`runs`, TEXT ids, written by `ggo-diag`), has no frames, no
     /// charts and no profile, and sets `device_log` instead of `detail` --
     /// so the click path has nothing to reach even if something called
     /// it. Asserted both ways: the entry point refuses, and neither
@@ -5671,17 +5572,14 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
         });
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let diag_path = dir.path().join("diag.db");
-        seed_run_with_samples(&db_path, 4);
-        seed_profile_rows(&db_path);
-        seed_device_run(&diag_path, "dev-1", "2026-08-02T00:00:00Z", "pass");
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_profile_rows(db.url());
+        seed_device_run(db.url(), "dev-1", "2026-08-02T00:00:00Z", "pass");
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path);
-            panel.diag_db_path_override = Some(diag_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         // Show a perf run first, so the failure mode this guards against
@@ -5753,7 +5651,7 @@ mod tests {
     /// release lands on one and this chart is frame-selectable.
     #[gpui::test]
     async fn test_a_drag_zooms_the_chart_to_the_dragged_window(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, from, to) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 2.0), point_of(panel, ix, 4.0))
@@ -5800,7 +5698,7 @@ mod tests {
     /// frame selected behind it.
     #[gpui::test]
     async fn test_a_double_click_restores_the_full_domain(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, from, to) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
@@ -5828,7 +5726,7 @@ mod tests {
     /// `zoom_domain` would widen it to.
     #[gpui::test]
     async fn test_a_sub_threshold_drag_selects_a_frame_instead_of_zooming(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let from = panel.update(cx, |panel, _cx| {
             point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
         });
@@ -5858,7 +5756,7 @@ mod tests {
     /// select the wrong one rather than merely a coincidentally right one.
     #[gpui::test]
     async fn test_a_click_on_a_zoomed_chart_selects_what_is_under_it(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, from, to) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
@@ -5905,7 +5803,7 @@ mod tests {
     /// exactly as the frame selection does (R4's concern (4)).
     #[gpui::test]
     async fn test_leaving_a_run_drops_the_zoom_and_the_overlay_switch(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, from, to) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
@@ -5928,8 +5826,8 @@ mod tests {
     /// the ramp's brightest step, with the prior run's OWN values.
     #[gpui::test]
     async fn test_the_overlay_draws_the_prior_run_of_the_same_cart(cx: &mut TestAppContext) {
-        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
-        seed_second_run(&db_path);
+        let (db, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(db.url());
         panel.update(cx, |panel, cx| {
             panel.select_run(
                 RunListing {
@@ -5975,8 +5873,8 @@ mod tests {
     /// fails this test with the tripwire's message.
     #[gpui::test]
     async fn test_the_historic_toggle_paints_the_overlays_it_was_given(cx: &mut TestAppContext) {
-        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
-        seed_second_run(&db_path);
+        let (db, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(db.url());
         panel.update(cx, |panel, cx| {
             panel.select_run(
                 RunListing {
@@ -6028,7 +5926,7 @@ mod tests {
     async fn test_a_run_with_no_earlier_runs_names_that_state_and_no_cause(
         cx: &mut TestAppContext,
     ) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         panel.update(cx, |panel, _cx| {
             let Some(DetailState::Ready(detail)) = &panel.detail else {
                 panic!("the fixture run must be loaded");
@@ -6085,7 +5983,7 @@ mod tests {
     /// `clear_hover`.
     #[gpui::test]
     async fn test_an_in_flight_drag_paints_its_band(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, from, to) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
@@ -6127,7 +6025,7 @@ mod tests {
     /// gesture that has already ended.
     #[gpui::test]
     async fn test_a_release_outside_the_chart_abandons_the_drag(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, from, to) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 1.0), point_of(panel, ix, 3.0))
@@ -6155,8 +6053,8 @@ mod tests {
     /// the painted toggle row switches the overlay on.
     #[gpui::test]
     async fn test_clicking_the_historic_checkbox_switches_the_overlay_on(cx: &mut TestAppContext) {
-        let (_dir, db_path, panel, cx) = drawn_detail_window(cx).await;
-        seed_second_run(&db_path);
+        let (db, panel, cx) = drawn_detail_window(cx).await;
+        seed_second_run(db.url());
         panel.update(cx, |panel, cx| {
             panel.select_run(
                 RunListing {
@@ -6198,7 +6096,7 @@ mod tests {
     /// nothing` is the other half.)
     #[gpui::test]
     async fn test_an_unselectable_line_chart_still_zooms(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, from, to) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Wire cycles per frame vs budget");
             assert!(!panel.chart_specs()[ix].selectable);
@@ -6221,7 +6119,7 @@ mod tests {
     /// doc carries the measurement that motivated it).
     #[gpui::test]
     async fn test_a_hover_move_rebuilds_only_the_chart_under_the_cursor(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let charts = panel.update(cx, |panel, _cx| panel.chart_specs().len());
         assert!(charts > 1, "the fixture must have several charts");
 
@@ -6266,27 +6164,24 @@ mod tests {
     // the painted element it is wired to, with a real click.
 
     /// A device run selected and painted, the way [`drawn_detail_window`]
-    /// does for a perf run: through `refresh_history`'s real clone and
+    /// does for a perf run: through `refresh_history`'s real listing and
     /// `select_device_run`'s real off-thread load.
     async fn drawn_device_detail_window(
         cx: &mut TestAppContext,
     ) -> (
-        tempfile::TempDir,
+        ggo_db::TestDb,
         gpui::Entity<ChartsPanel>,
         &mut gpui::VisualTestContext,
     ) {
         cx.update(|cx| {
             AppState::test(cx);
         });
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let diag_path = dir.path().join("diag.db");
-        seed_device_run(&diag_path, "dev-1", "2026-08-02T00:00:00Z", "PASS");
+        let db = ggo_db::TestDb::new();
+        seed_device_run(db.url(), "dev-1", "2026-08-02T00:00:00Z", "PASS");
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path);
-            panel.diag_db_path_override = Some(diag_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| panel.refresh_history(cx));
@@ -6299,7 +6194,7 @@ mod tests {
             gpui::size(DEFAULT_WIDTH, px(800.)),
             |_window, _cx| panel.clone().into_any_element(),
         );
-        (dir, panel, cx)
+        (db, panel, cx)
     }
 
     /// A real click on a picker row reaches `select_run` for THAT row's
@@ -6310,14 +6205,13 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
         });
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
-        seed_second_run(&db_path);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_second_run(db.url());
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| panel.refresh_runs(cx));
@@ -6360,16 +6254,13 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
         });
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        let diag_path = dir.path().join("diag.db");
-        seed_device_run(&diag_path, "run-older", "2026-08-01T00:00:00Z", "PASS");
-        seed_device_run(&diag_path, "run-newer", "2026-08-02T00:00:00Z", "FAIL");
+        let db = ggo_db::TestDb::new();
+        seed_device_run(db.url(), "run-older", "2026-08-01T00:00:00Z", "PASS");
+        seed_device_run(db.url(), "run-newer", "2026-08-02T00:00:00Z", "FAIL");
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_path_override = Some(db_path);
-            panel.diag_db_path_override = Some(diag_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| panel.refresh_history(cx));
@@ -6408,7 +6299,7 @@ mod tests {
     /// drive directly.
     #[gpui::test]
     async fn test_clicking_back_returns_to_the_picker(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let back = cx
             .debug_bounds(BACK_BUTTON_SELECTOR)
             .expect("the detail header paints its Back button");
@@ -6438,7 +6329,7 @@ mod tests {
     /// `clear_selection`.
     #[gpui::test]
     async fn test_clicking_back_on_a_device_run_returns_to_the_picker(cx: &mut TestAppContext) {
-        let (_dir, panel, cx) = drawn_device_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_device_detail_window(cx).await;
         let back = cx
             .debug_bounds(DEVICE_BACK_SELECTOR)
             .expect("the device header paints its Back button");
@@ -6465,7 +6356,7 @@ mod tests {
     /// clicked for real.
     #[gpui::test]
     async fn test_clicking_the_inspect_close_button_dismisses_the_pane(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let at = panel.update(cx, |panel, _cx| {
             point_of(panel, chart_index(panel, "Cache misses per frame"), 3.0)
         });
@@ -6508,9 +6399,8 @@ mod tests {
     /// handed to the panel as the same `WeakEntity` `init` hands over.
     #[gpui::test]
     async fn test_clicking_rerun_routes_to_the_cart_runner(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        seed_run_with_samples(&db_path, 4);
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
 
         cx.update(|cx| {
             AppState::test(cx);
@@ -6524,7 +6414,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(Some(workspace.downgrade()), cx);
-            panel.db_path_override = Some(db_path);
+            panel.db_url_override = Some(db.url().to_string());
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -6566,7 +6456,7 @@ mod tests {
     /// the perf-side refusal notes.
     #[gpui::test]
     async fn test_rerun_is_absent_from_a_device_run(cx: &mut TestAppContext) {
-        let (_dir, panel, cx) = drawn_device_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_device_detail_window(cx).await;
         assert!(
             cx.debug_bounds(RERUN_BUTTON_SELECTOR).is_none(),
             "the device header paints no Re-run entry"
@@ -6595,7 +6485,7 @@ mod tests {
     /// -- an untouched panel is only reachable by refusing the event.
     #[gpui::test]
     async fn test_a_keyboard_click_selects_nothing(cx: &mut TestAppContext) {
-        let (_dir, _db_path, panel, cx) = drawn_detail_window(cx).await;
+        let (_db, panel, cx) = drawn_detail_window(cx).await;
         let (ix, at) = panel.update(cx, |panel, _cx| {
             let ix = chart_index(panel, "Cache misses per frame");
             (ix, point_of(panel, ix, 3.0))
@@ -6616,20 +6506,16 @@ mod tests {
         });
     }
 
-    /// The three error states, reached through a db that exists but is
-    /// not a database, and read via the same named methods the renderer
+    /// The three error states, reached through a database url nothing is
+    /// listening on, and read via the same named methods the renderer
     /// prints -- `runs_error_message` and friends exist so these
     /// sentences are readable at all (`LogKind::empty_state`'s lesson).
     #[gpui::test]
-    async fn test_a_corrupt_db_lands_every_load_in_its_error_state(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ggo_ide.db");
-        std::fs::write(&db_path, b"this is not a database").unwrap();
-
+    async fn test_an_unreachable_db_lands_every_load_in_its_error_state(cx: &mut TestAppContext) {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(db_path);
+                panel.db_url_override = Some(loader::UNREACHABLE_DB_URL.to_string());
                 panel
             })
         });
@@ -6638,7 +6524,7 @@ mod tests {
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
             let LoadState::Error(e) = &panel.state else {
-                panic!("a corrupt db must land the runs list in Error");
+                panic!("an unreachable db must land the runs list in Error");
             };
             let message = ChartsPanel::runs_error_message(e);
             assert!(message.contains("Failed to load runs"), "{message}");
@@ -6662,7 +6548,7 @@ mod tests {
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
             let Some(DetailState::Error(e)) = &panel.detail else {
-                panic!("a corrupt db must land the run detail in Error");
+                panic!("an unreachable db must land the run detail in Error");
             };
             let message = ChartsPanel::samples_error_message(e);
             assert!(message.contains("Failed to load samples"), "{message}");
@@ -6682,7 +6568,7 @@ mod tests {
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
             let Some(DeviceLogState::Error(e)) = &panel.device_log else {
-                panic!("a corrupt db must land the device log in Error");
+                panic!("an unreachable db must land the device log in Error");
             };
             let message = ChartsPanel::device_log_error_message(e);
             assert!(message.contains("Failed to load log"), "{message}");
@@ -6696,17 +6582,16 @@ mod tests {
     /// iterations run the executor's schedules over both.
     #[gpui::test(iterations = 10)]
     async fn test_a_stale_runs_refresh_does_not_stomp_the_fresh_one(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let first_db = dir.path().join("first.db");
-        let second_db = dir.path().join("second.db");
-        seed_run_with_samples(&first_db, 4);
-        seed_run_with_samples(&second_db, 4);
-        seed_second_run(&second_db);
+        let first_db = ggo_db::TestDb::new();
+        let second_db = ggo_db::TestDb::new();
+        seed_run_with_samples(first_db.url(), 4);
+        seed_run_with_samples(second_db.url(), 4);
+        seed_second_run(second_db.url());
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(first_db);
+                panel.db_url_override = Some(first_db.url().to_string());
                 panel
             })
         });
@@ -6714,7 +6599,7 @@ mod tests {
             panel.refresh_runs(cx);
             // Repointed and refreshed again with the first load still in
             // flight -- the rapid double-activation case.
-            panel.db_path_override = Some(second_db);
+            panel.db_url_override = Some(second_db.url().to_string());
             panel.refresh_runs(cx);
         });
         cx.executor().run_until_parked();
@@ -6732,32 +6617,26 @@ mod tests {
         });
     }
 
-    /// The same race on the history rail's own generation counter.
-    /// Separate (ide, diag) pairs per refresh, because `history::load`
-    /// clones diag rows INTO the ide db -- a shared target would let the
-    /// stale clone's rows leak into the fresh listing and mask a stomp.
+    /// The same race on the history rail's own generation counter. A
+    /// separate database per refresh, so the stale listing's rows cannot
+    /// be mistaken for the fresh one's.
     #[gpui::test(iterations = 10)]
     async fn test_a_stale_history_refresh_does_not_stomp_the_fresh_one(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let first_ide = dir.path().join("first_ide.db");
-        let first_diag = dir.path().join("first_diag.db");
-        let second_ide = dir.path().join("second_ide.db");
-        let second_diag = dir.path().join("second_diag.db");
-        seed_device_run(&first_diag, "run-a", "2026-08-01T00:00:00Z", "PASS");
-        seed_device_run(&second_diag, "run-b", "2026-08-02T00:00:00Z", "FAIL");
+        let first_db = ggo_db::TestDb::new();
+        let second_db = ggo_db::TestDb::new();
+        seed_device_run(first_db.url(), "run-a", "2026-08-01T00:00:00Z", "PASS");
+        seed_device_run(second_db.url(), "run-b", "2026-08-02T00:00:00Z", "FAIL");
 
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_path_override = Some(first_ide);
-                panel.diag_db_path_override = Some(first_diag);
+                panel.db_url_override = Some(first_db.url().to_string());
                 panel
             })
         });
         panel.update(cx, |panel, cx| {
             panel.refresh_history(cx);
-            panel.db_path_override = Some(second_ide);
-            panel.diag_db_path_override = Some(second_diag);
+            panel.db_url_override = Some(second_db.url().to_string());
             panel.refresh_history(cx);
         });
         cx.executor().run_until_parked();
@@ -6768,7 +6647,7 @@ mod tests {
             assert_eq!(
                 ids,
                 vec!["run-b"],
-                "the second pair's run, not the stale first's"
+                "the second database's run, not the stale first's"
             );
         });
     }

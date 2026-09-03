@@ -18,12 +18,6 @@ ggo_common.workspace = true
 ggo_emu_remote.workspace = true
 log.workspace = true
 gpui.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-# Same pure-Rust SQLite engine ggo-db's migrate() takes a connection from
-# (mirrors ggo-ide's tools/ggo-ide/Cargo.toml: it depends on turso
-# directly too, alongside ggo-db, for the exact same reason -- `loader`
-# opens its own connection rather than adding a bespoke method to ggo-db).
-turso = "0.7"
 ui.workspace = true
 workspace.workspace = true
 

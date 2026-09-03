@@ -7512,7 +7512,8 @@ dependencies = [
 name = "ggo-db"
 version = "0.1.0"
 dependencies = [
- "turso",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
@@ -7541,9 +7542,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
- "tokio",
  "toml 1.1.4+spec-1.1.0",
- "turso",
 ]
 
 [[package]]
@@ -7580,8 +7579,6 @@ dependencies = [
  "log",
  "project",
  "tempfile",
- "tokio",
- "turso",
  "ui",
  "workspace",
 ]

@@ -121,65 +121,29 @@ pub const GGO_KEY_CONTEXTS: &[&str] = &[
     "GgoEmeraldPanel > Editor",
 ];
 
-// --------------------------------------------------------- shared db path
+// ------------------------------------------------------ shared ~/.ggo paths
 
-/// Database filename under `~/.ggo/`, matching `ggo-ide`'s
-/// `backend/db.rs::DB_FILE`.
-const DB_FILE: &str = "ggo_ide.db";
 const DOT_GGO: &str = ".ggo";
-/// `ggo-diag`'s own file under the same directory -- see
-/// [`default_diag_db_path`]. Matches ggo-ide's
-/// `pages/device.rs::DIAG_DB_FILE` and `ggo-diag`'s own `diag::db::DB_FILE`.
-const DIAG_DB_FILE: &str = "diag.db";
 /// `ggo-uartd`'s dump directory under `~/.ggo/`, as that daemon's
 /// `control::faults_dir` lays it out -- see [`default_faults_dir`].
 const UARTD_DIR: &str = "uartd";
 const FAULTS_DIR: &str = "faults";
-
-/// `~/.ggo/ggo_ide.db`, matching `ggo-ide`'s `backend/db.rs::default_db_path`.
-/// `None` only if neither `HOME` nor `USERPROFILE` resolves (mirrors that
-/// function's `anyhow` error, downgraded to `Option` here since neither
-/// caller treats an unresolvable home directory as a hard error).
-///
-/// Shared by `ggo_charts_panel::loader` (reads runs for the picker) and
-/// `ggo_emu_panel::ingest` (writes a finished run) -- both touch the SAME
-/// file, not copies, so a run the emu pane ingests shows up in the charts
-/// panel's picker with no configuration. Kept in one place because the two
-/// crates diverging here would be a silent split-brain: the round-trip test
-/// that exercises both sides passes a `db_path_override`, so it would never
-/// catch drift in this default.
-pub fn default_db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(DOT_GGO).join(DB_FILE))
-}
-
-/// `ggo-diag`'s OWN database file, `~/.ggo/diag.db` -- mirrors ggo-ide's
-/// `pages::device::default_diag_db_path`, and deliberately resolved from the
-/// same `DOT_GGO` constant [`default_db_path`] uses so the two can never
-/// disagree about which directory `~/.ggo` is.
-///
-/// This is a DIFFERENT file from [`default_db_path`]'s, owned by a
-/// DIFFERENT tool, and the distinction is the whole no-shared-dbs rule (see
-/// `ggo-db`'s `open_existing`): a reader may open this file read-only and
-/// copy rows out of it into its own database
-/// (`ggo_worldlib::charts::reports::diag_db::clone_runs` is the only thing
-/// in the fork that touches it), and may never migrate or write it.
-pub fn default_diag_db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(DOT_GGO).join(DIAG_DB_FILE))
-}
+/// `ggo-diag`'s consolidated per-run logs under `~/.ggo/` -- see
+/// [`default_diag_logs_dir`].
+const DIAG_DIR: &str = "diag";
+const LOGS_DIR: &str = "logs";
 
 /// `ggo-uartd`'s dump directory, `~/.ggo/uartd/faults` -- the layout that
 /// daemon's `control::faults_dir` writes, resolved from the same `DOT_GGO`
-/// constant [`default_db_path`] uses so nothing here can disagree about
-/// which directory `~/.ggo` is.
+/// constant [`default_diag_logs_dir`] uses so nothing here can disagree
+/// about which directory `~/.ggo` is.
 ///
 /// Read-only from the fork's side: the dumps belong to the daemon, and the
 /// panels only import them and point a user at one. Shared by
 /// `ggo_charts_panel` (resolves a dump's raw path) and `ggo_reports_panel`
-/// (imports the directory on every load) for [`default_db_path`]'s reason
-/// -- both had their own copy of this join, and both take a test override,
-/// so a drift between them would never have failed a test.
+/// (imports the directory on every load) -- both had their own copy of
+/// this join, and both take a test override, so a drift between them
+/// would never have failed a test.
 ///
 /// `ggo_emu_mcp` deliberately keeps its own copy: it resolves the directory
 /// under a caller-supplied `db_dir` rather than under `HOME`, and depends
@@ -191,6 +155,25 @@ pub fn default_faults_dir() -> Option<PathBuf> {
             .join(DOT_GGO)
             .join(UARTD_DIR)
             .join(FAULTS_DIR),
+    )
+}
+
+/// `ggo-diag`'s consolidated run logs, `~/.ggo/diag/logs` -- the directory
+/// that tool writes one text log per run into, and the file
+/// `ggo_charts_panel`'s header hands out for a selected run (see
+/// `ggo_emu_remote::diag_log_path`).
+///
+/// Resolved from the same `DOT_GGO` constant [`default_faults_dir`] uses.
+/// Before the PostgreSQL migration the panel derived this from the parent
+/// of `~/.ggo/diag.db`; that file is gone, and the directory is not, so it
+/// is named here directly rather than inferred from a database path.
+pub fn default_diag_logs_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(DOT_GGO)
+            .join(DIAG_DIR)
+            .join(LOGS_DIR),
     )
 }
 
@@ -1582,15 +1565,6 @@ mod tests {
         assert!(cascade_detail(&["a".to_string()], true).ends_with(&destructive_detail(true)));
     }
 
-    /// `default_db_path` must land on `~/.ggo/ggo_ide.db` -- the file both
-    /// `ggo_charts_panel` and `ggo_emu_panel` read/write. HOME reliably
-    /// resolves in the test environment.
-    #[test]
-    fn default_db_path_is_dot_ggo_ggo_ide_db() {
-        let path = default_db_path().expect("HOME resolves in the test env");
-        assert!(path.ends_with(".ggo/ggo_ide.db"));
-    }
-
     /// `default_faults_dir` must land on `~/.ggo/uartd/faults` -- the
     /// directory `ggo-uartd` writes and the two panels import from. Both
     /// resolve it through this one function, so a test that pins the
@@ -1599,10 +1573,24 @@ mod tests {
     fn default_faults_dir_is_dot_ggo_uartd_faults() {
         let path = default_faults_dir().expect("HOME resolves in the test env");
         assert!(path.ends_with(".ggo/uartd/faults"), "{}", path.display());
+    }
+
+    /// `default_diag_logs_dir` must land on `~/.ggo/diag/logs` -- the
+    /// directory `ggo-diag` writes its per-run logs into, and the one the
+    /// charts panel's Copy-log-path button reads.
+    #[test]
+    fn default_diag_logs_dir_is_dot_ggo_diag_logs() {
+        let path = default_diag_logs_dir().expect("HOME resolves in the test env");
+        assert!(path.ends_with(".ggo/diag/logs"), "{}", path.display());
+        // Both live under the SAME `~/.ggo`, which is the whole reason
+        // `DOT_GGO` is a single constant.
         assert_eq!(
             path.parent().and_then(|p| p.parent()),
-            default_db_path().expect("HOME resolves").parent(),
-            "the dumps live under the SAME ~/.ggo the databases do"
+            default_faults_dir()
+                .expect("HOME resolves")
+                .parent()
+                .and_then(|p| p.parent()),
+            "the logs and the dumps live under one ~/.ggo"
         );
     }
 

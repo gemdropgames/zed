@@ -59,7 +59,6 @@
 //!   edit that reached for THIS module from a prepaint closure would still
 //!   slip past the counter, and that is the standing gap.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use ggo_worldlib::charts::reports::historic::HistoricRunFrames;
@@ -115,11 +114,12 @@ pub struct Detail {
     pub prior_runs: usize,
 }
 
-/// Query `run_id` out of `db_path` and derive everything from it.
+/// Query `run_id` out of the database at `db_url` and derive everything
+/// from it.
 ///
 /// **BLOCKING, and never on the UI thread.** [`loader::load_run_samples`]
-/// spins four short-lived tokio runtimes (R1's concern (5)) and the build
-/// half is the cost this module's doc opens with. `select_run`'s
+/// blocks on `ggo-db`'s runtime four times over (R1's concern (5)) and the
+/// build half is the cost this module's doc opens with. `select_run`'s
 /// `cx.background_spawn` is the only caller.
 ///
 /// R5's historic overlay loads HERE, in this same pass, rather than behind
@@ -133,9 +133,9 @@ pub struct Detail {
 /// **The samples' failures are fatal; the overlay's are not** -- see
 /// [`prior_or_none`]. That asymmetry is the whole reason the two loads are
 /// separate statements rather than one `?`-chained expression.
-pub fn load(db_path: &Path, run_id: i64) -> Result<Detail, String> {
-    let samples = loader::load_run_samples(db_path, run_id)?;
-    let prior = prior_or_none(db_path, run_id, samples.detail.as_ref().map(|d| d.cart_id));
+pub fn load(db_url: &str, run_id: i64) -> Result<Detail, String> {
+    let samples = loader::load_run_samples(db_url, run_id)?;
+    let prior = prior_or_none(db_url, run_id, samples.detail.as_ref().map(|d| d.cart_id));
     Ok(build(&samples, &prior))
 }
 
@@ -159,10 +159,10 @@ pub fn load(db_path: &Path, run_id: i64) -> Result<Detail, String> {
 /// overlay set already has a surface that says so (`NO_PRIOR_RUNS`), and
 /// the alternative -- a second error channel plumbed through `Detail` for
 /// a decoration -- would cost more than it explains. It does mean a
-/// transient lock failure reads as "no prior runs of this cart", which is
-/// noted as a residual in this task's report.
-fn prior_or_none(db_path: &Path, run_id: i64, cart_id: Option<i64>) -> Vec<HistoricRunFrames> {
-    loader::load_prior_runs(db_path, run_id, cart_id).unwrap_or_default()
+/// transient connection failure reads as "no prior runs of this cart",
+/// which is noted as a residual in this task's report.
+fn prior_or_none(db_url: &str, run_id: i64, cart_id: Option<i64>) -> Vec<HistoricRunFrames> {
+    loader::load_prior_runs(db_url, run_id, cart_id).unwrap_or_default()
 }
 
 /// The pure half of [`load`] -- every derivation, no I/O.
@@ -250,7 +250,7 @@ impl Drop for NoBuildHere {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::FrameRow;
+    use crate::loader::{FrameRow, UNREACHABLE_DB_URL};
 
     fn samples() -> RunSamples {
         RunSamples {
@@ -291,10 +291,9 @@ mod tests {
     /// **A prior-run query failure must not take the run detail with it.**
     ///
     /// Two halves, because a test of the degrade alone would pass over a
-    /// query that cannot fail. First: an unreadable database really does
-    /// make `load_prior_runs` return `Err` -- a file that exists (so the
-    /// `!exists()` guard lets it through) but is not a database. Second:
-    /// [`prior_or_none`] turns exactly that into an empty overlay set.
+    /// query that cannot fail. First: an unreachable database really does
+    /// make `load_prior_runs` return `Err`. Second: [`prior_or_none`]
+    /// turns exactly that into an empty overlay set.
     ///
     /// What the `?` this replaced would have done, from the reviewer's
     /// drill: 30 run-detail tests fail, because `select_run` has ONE error
@@ -303,16 +302,12 @@ mod tests {
     /// charts, no inspect pane, just "Failed to load samples".
     #[test]
     fn a_prior_run_query_failure_degrades_to_no_overlay() {
-        let dir = tempfile::tempdir().unwrap();
-        let junk = dir.path().join("not_a_database.db");
-        std::fs::write(&junk, b"this is not a SQLite file, not even close").unwrap();
-
         assert!(
-            loader::load_prior_runs(&junk, 5, Some(1)).is_err(),
+            loader::load_prior_runs(UNREACHABLE_DB_URL, 5, Some(1)).is_err(),
             "the fixture has to actually fail, or the degrade below proves nothing"
         );
         assert!(
-            prior_or_none(&junk, 5, Some(1)).is_empty(),
+            prior_or_none(UNREACHABLE_DB_URL, 5, Some(1)).is_empty(),
             "a failed overlay load is no overlay, not a failed run detail"
         );
     }
@@ -335,34 +330,30 @@ mod tests {
 
     /// The other half of the fatal/degrade asymmetry
     /// [`a_prior_run_query_failure_degrades_to_no_overlay`] pins: the
-    /// SAMPLES' failure is fatal. A corrupt db makes
+    /// SAMPLES' failure is fatal. An unreachable database makes
     /// `loader::load_run_samples` fail, and [`load`] must carry that
     /// `Err` out of the off-thread pass verbatim -- not degrade it into
     /// an empty `Detail` the way it does for the overlay -- so
     /// `select_run`'s error state shows the loader's message.
     #[test]
     fn load_propagates_a_samples_failure_out_of_the_off_thread_pass() {
-        let dir = tempfile::tempdir().unwrap();
-        let junk = dir.path().join("not_a_database.db");
-        std::fs::write(&junk, b"this is not a SQLite file, not even close").unwrap();
-
-        let expected = loader::load_run_samples(&junk, 1)
+        let expected = loader::load_run_samples(UNREACHABLE_DB_URL, 1)
             .expect_err("the fixture has to actually fail, or this proves nothing");
         assert_eq!(
-            load(&junk, 1),
+            load(UNREACHABLE_DB_URL, 1),
             Err(expected),
             "the loader's error reaches the caller unchanged"
         );
     }
 
+    /// A run id nothing was ever ingested under is an empty detail, not an
+    /// error -- the panel's own no-samples message, not its error banner.
     #[test]
-    fn load_of_a_missing_db_file_is_an_empty_detail_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does_not_exist.db");
-        let detail = load(&missing, 1).unwrap();
+    fn load_of_a_run_that_was_never_ingested_is_an_empty_detail_not_an_error() {
+        let db = ggo_db::TestDb::new();
+        let detail = load(db.url(), 1).unwrap();
         assert!(detail.charts.is_empty());
         assert!(detail.console.is_empty());
-        assert!(!missing.exists(), "a missing-file read creates no db file");
     }
 
     /// The tripwire catches the regression it names. Without this, the
