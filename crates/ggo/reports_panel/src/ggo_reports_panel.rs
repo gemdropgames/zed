@@ -8,10 +8,11 @@
 //! dock is a spine of entry points, the tab is the reader.
 //!
 //! The three sources are read on the background executor and merged by
-//! [`merge_rows`], which is pure and separately tested. Faults are
-//! imported from `~/.ggo/uartd/faults` into `ggo_ide.db` on every load
-//! (`faults::import` is idempotent), because the daemon writes files and
-//! nothing else ingests them.
+//! [`merge_rows`], which is pure and separately tested. All three live in
+//! the one shared PostgreSQL database; only the daemon's dumps are still
+//! files, so they are imported from `~/.ggo/uartd/faults` into the `fault`
+//! table on every load (`faults::import` is idempotent), because nothing
+//! else ingests them.
 //!
 //! **The three sources do not agree on what a timestamp looks like.** A
 //! perf run carries ISO-UTC (`2026-09-02T17:25:37Z`, ggo-server's ingest);
@@ -35,7 +36,7 @@ use ui::{ListItem, Tooltip};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
-use ggo_charts_panel::history::{self, HISTORY_LIMIT};
+use ggo_charts_panel::history::{self, HISTORY_LIMIT, NO_DATABASE_URL};
 use ggo_charts_panel::loader::{self, RunListing};
 use ggo_charts_panel::{RunSummary, open_charts_item};
 use ggo_worldlib::charts::reports::faults::{self, FaultRow};
@@ -55,14 +56,13 @@ const KEY_CONTEXT: &str = "GgoReportsPanel";
 const DEFAULT_WIDTH: Pixels = px(300.);
 const EMPTY_MESSAGE: &str = "no reports yet";
 const LOADING_MESSAGE: &str = "reading reports…";
-const NO_HOME: &str = "no home directory, so ~/.ggo/ggo_ide.db cannot be resolved";
 /// The daemon appends to its faults directory while the panel is open, so
 /// a visible panel re-reads on a timer rather than only on activation.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How the two halves of a load differ in cost: importing dumps and
-/// listing them is local file and query work, while reconciling the device
-/// history CLONES `diag.db`'s rows into `ggo_ide.db` -- which, during a
-/// live `ggo-diag` run, is a growing table copied every time. Every sixth
+/// listing them is local file work plus one query, while reconciling the
+/// device history is a second full scan of `ggo-diag`'s run table -- which,
+/// during a live run, is a growing table re-read every time. Every sixth
 /// poll tick (30 s) is often enough for a list of finished runs; see
 /// [`reconcile_history_this_tick`].
 const HISTORY_EVERY_TICKS: u64 = 6;
@@ -298,8 +298,7 @@ pub struct ReportsPanel {
     loading: bool,
     /// Poll ticks since this activation, for [`reconcile_history_this_tick`].
     poll_tick: u64,
-    db_path_override: Option<PathBuf>,
-    diag_db_path_override: Option<PathBuf>,
+    db_url_override: Option<String>,
     faults_dir_override: Option<PathBuf>,
     _load_task: Option<Task<()>>,
     _poll_task: Option<Task<()>>,
@@ -321,26 +320,17 @@ impl ReportsPanel {
             generation: 0,
             loading: false,
             poll_tick: 0,
-            db_path_override: None,
-            diag_db_path_override: None,
+            db_url_override: None,
             faults_dir_override: None,
             _load_task: None,
             _poll_task: None,
         }
     }
 
-    /// This app's own database, `~/.ggo/ggo_ide.db`.
-    fn db_path(&self) -> Option<PathBuf> {
-        self.db_path_override
-            .clone()
-            .or_else(ggo_common::default_db_path)
-    }
-
-    /// `ggo-diag`'s database, a different file owned by a different tool.
-    fn diag_db_path(&self) -> Option<PathBuf> {
-        self.diag_db_path_override
-            .clone()
-            .or_else(ggo_common::default_diag_db_path)
+    /// The one database every source lives in -- perf runs, `ggo-diag`'s
+    /// device runs and the imported faults alike.
+    fn db_url(&self) -> Option<String> {
+        self.db_url_override.clone().or_else(|| ggo_db::url().ok())
     }
 
     /// Where `ggo-uartd` drops its dumps --
@@ -366,14 +356,15 @@ impl ReportsPanel {
     }
 
     /// Read the sources off-thread and replace the list. Every read is
-    /// blocking (each spins its own current-thread tokio runtime), so none
-    /// of this may touch the UI thread. A load that lands after a newer
-    /// one started is dropped on the generation guard.
+    /// blocking (each drives `ggo-db`'s shared runtime through
+    /// `block_on`, which PANICS inside a tokio one), so none of this may
+    /// touch the UI thread. A load that lands after a newer one started is
+    /// dropped on the generation guard.
     ///
-    /// With `reconcile_history` the device runs are re-read from
-    /// `diag.db` (which CLONES them into `ggo_ide.db`); without it the
-    /// ones from the last reconcile are merged in again, so skipping the
-    /// clone never empties the list of device rows.
+    /// With `reconcile_history` the device runs are re-read from the
+    /// `runs` table; without it the ones from the last reconcile are
+    /// merged in again, so skipping that read never empties the list of
+    /// device rows.
     fn load(&mut self, reconcile_history: bool, cx: &mut Context<Self>) {
         // The poll fires on a wall clock. A tick that arrives while the
         // previous load is still running is dropped rather than queued:
@@ -383,12 +374,11 @@ impl ReportsPanel {
         }
         self.generation += 1;
         let generation = self.generation;
-        let Some(ide_db) = self.db_path() else {
-            self.state = LoadState::Error(NO_HOME.to_string());
+        let Some(db_url) = self.db_url() else {
+            self.state = LoadState::Error(NO_DATABASE_URL.to_string());
             cx.notify();
             return;
         };
-        let diag_db = reconcile_history.then(|| self.diag_db_path()).flatten();
         let faults_dir = self.faults_dir();
         let known_device = self.device.clone();
         let known_device_note = self.device_note.clone();
@@ -408,14 +398,14 @@ impl ReportsPanel {
             // describe one failure one way.
             let mut notes = Vec::new();
             if let Some(dir) = faults_dir.as_ref()
-                && let Err(error) = faults::import(dir, &ide_db)
+                && let Err(error) = faults::import(dir, &db_url)
             {
                 let note = format!("importing faults from {} failed: {error}", dir.display());
                 log::warn!("reports: {note}");
                 notes.push(note);
             }
             let mut failure = None;
-            let perf = match loader::list_runs(&ide_db) {
+            let perf = match loader::list_runs(&db_url) {
                 Ok(runs) => runs,
                 Err(error) => {
                     failure = Some(error);
@@ -429,17 +419,19 @@ impl ReportsPanel {
             // and sorting a full run table to throw most of it away is
             // work the panel can decline.
             let perf = perf.into_iter().take(HISTORY_LIMIT as usize).collect();
-            let (device, device_note) = match diag_db {
-                Some(diag_db) => {
-                    let history = history::load(&diag_db, &ide_db, HISTORY_LIMIT);
-                    (history.runs, history.note)
-                }
-                None => (known_device, known_device_note),
+            let (device, device_note) = if reconcile_history {
+                let history = history::load(&db_url, HISTORY_LIMIT);
+                (history.runs, history.note)
+            } else {
+                (known_device, known_device_note)
             };
             if let Some(note) = device_note.as_ref() {
                 notes.push(note.clone());
             }
-            let faults = match faults::list(&ide_db, HISTORY_LIMIT) {
+            // An unreachable database is an ERROR here, not an empty
+            // list: a fault section that silently reads as "no dumps"
+            // when the server is down hides the one signal the user has.
+            let faults = match faults::list(&db_url, HISTORY_LIMIT) {
                 Ok(rows) => rows,
                 Err(error) => {
                     failure = failure.or(Some(error));
@@ -534,15 +526,10 @@ impl ReportsPanel {
         });
     }
 
-    /// Read reports from `path` instead of `~/.ggo/ggo_ide.db`. Test hook:
-    /// production resolves its own path.
-    pub fn set_db_path_override(&mut self, path: PathBuf) {
-        self.db_path_override = Some(path);
-    }
-
-    /// Read device runs from `path` instead of `~/.ggo/diag.db`.
-    pub fn set_diag_db_path_override(&mut self, path: PathBuf) {
-        self.diag_db_path_override = Some(path);
+    /// Read reports from `url` instead of the database `ggo_db::url`
+    /// resolves. Test hook: production resolves its own.
+    pub fn set_db_url_override(&mut self, url: String) {
+        self.db_url_override = Some(url);
     }
 
     /// Import dumps from `path` instead of `~/.ggo/uartd/faults`.
@@ -779,9 +766,16 @@ impl Panel for ReportsPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_db::TestDb;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use workspace::{AppState, MultiWorkspace};
+
+    /// A url whose socket directory does not exist, so no read through it
+    /// can reach a server -- what a stopped `ggo-pg` looks like to the
+    /// panel. The postgres analog of the old "a path nothing can be
+    /// created at" fixture.
+    const UNREACHABLE_DB_URL: &str = "postgres://ggo@localhost/ggo?host=/nonexistent/ggo-pg-socket";
 
     fn perf(id: i64, at: &str) -> RunListing {
         RunListing {
@@ -911,7 +905,7 @@ mod tests {
     }
 
     /// The cheap half of a load runs every tick; the device reconcile --
-    /// which clones `diag.db` -- runs every sixth.
+    /// a second full read of the `runs` table -- runs every sixth.
     #[test]
     fn the_device_reconcile_runs_every_sixth_tick() {
         let reconciling: Vec<u64> = (1..=12)
@@ -954,17 +948,17 @@ mod tests {
 
     /// The poll fires on a wall clock, so a tick can arrive while the
     /// previous load is still running. It must be dropped, not stacked:
-    /// a full reconcile clones `diag.db` and two of them at once is the
-    /// cost doubled for the same answer.
+    /// a full reconcile re-reads the whole device history and two of them
+    /// at once is the cost doubled for the same answer.
     #[gpui::test]
     async fn a_refresh_while_one_is_in_flight_does_not_start_a_second(cx: &mut TestAppContext) {
+        let db = TestDb::new();
         let temp = tempfile::tempdir().expect("tempdir");
         let faults_dir = temp.path().join("faults");
         write_dump(&faults_dir, "2026-09-02_08-49-33_marker");
         let panel = cx.update(|cx| cx.new(|cx| ReportsPanel::new(None, cx)));
         panel.update(cx, |panel, cx| {
-            panel.set_db_path_override(temp.path().join("ggo_ide.db"));
-            panel.set_diag_db_path_override(temp.path().join("diag.db"));
+            panel.set_db_url_override(db.url().to_string());
             panel.set_faults_dir_override(faults_dir.clone());
             panel.refresh(cx);
             panel.refresh(cx);
@@ -999,22 +993,18 @@ mod tests {
 
     /// An empty list is a claim ("nothing was recorded"), and it must not
     /// be made when the truth is "the sources could not be read". The
-    /// fixture is a database path the importer cannot create -- its
-    /// parent is a FILE, so no directory can be made there -- while both
-    /// list reads still return empty for the ordinary "no such file"
-    /// reason, which is the shape an unwritable home has.
+    /// fixture points every read at a url no server answers on, which is
+    /// what a stopped `ggo-pg` looks like -- so the import fails, the two
+    /// list reads fail, and the panel owes the reader all of it: the
+    /// failure's own hint, and never a bare "no reports yet".
     #[gpui::test]
     async fn an_empty_list_says_why_rather_than_claiming_there_is_nothing(cx: &mut TestAppContext) {
         let temp = tempfile::tempdir().expect("tempdir");
         let faults_dir = temp.path().join("faults");
         write_dump(&faults_dir, "2026-09-02_08-49-33_marker");
-        let blocker = temp.path().join("not-a-directory");
-        std::fs::write(&blocker, "").expect("blocker");
-        let unwritable = blocker.join("ggo_ide.db");
         let panel = cx.update(|cx| cx.new(|cx| ReportsPanel::new(None, cx)));
         panel.update(cx, |panel, cx| {
-            panel.set_db_path_override(unwritable);
-            panel.set_diag_db_path_override(temp.path().join("diag.db"));
+            panel.set_db_url_override(UNREACHABLE_DB_URL.to_string());
             panel.set_faults_dir_override(faults_dir.clone());
             panel.refresh(cx);
         });
@@ -1022,19 +1012,38 @@ mod tests {
 
         panel.update(cx, |panel, _| {
             assert!(panel.all_rows().is_empty(), "nothing could be listed");
-            assert_eq!(panel.state, LoadState::Empty, "and no read failed outright");
+            // Unlike a missing FILE, an unreachable server is a read that
+            // FAILED -- the panel says so outright rather than showing an
+            // empty list with a footnote.
+            let LoadState::Error(error) = &panel.state else {
+                panic!("an unreachable database must land the list in Error, not Empty");
+            };
+            assert!(
+                error.contains(ggo_db::INSTALL_HINT),
+                "the failure tells the user how to fix it: {error}"
+            );
             let note = panel
                 .note()
                 .expect("an empty list owes the reader a reason");
             assert_ne!(note, EMPTY_MESSAGE, "'no reports yet' would be a lie here");
-            assert!(note.contains("importing faults from"), "{note}");
+            assert_eq!(note, *error, "and the reason shown IS that failure");
+            // The two best-effort halves recorded their own reasons on the
+            // way past. They are one root cause with the failure above --
+            // the server is down -- so the note the reader sees is that
+            // one line, but neither reason was swallowed.
             assert!(
-                note.contains(&faults_dir.display().to_string()),
-                "the directory that could not be imported is named: {note}"
+                panel
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("importing faults from")
+                        && n.contains(&faults_dir.display().to_string())),
+                "the directory that could not be imported is named: {:?}",
+                panel.notes
             );
             assert!(
-                note.contains("diag.db"),
-                "and the device history's own reason comes through too: {note}"
+                panel.notes.iter().any(|n| n.contains("device runs")),
+                "and the device history's own reason comes through too: {:?}",
+                panel.notes
             );
 
             // A populated list is never blanked by a reason: the note is
@@ -1064,24 +1073,22 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
+        let db = TestDb::new();
         let temp = tempfile::tempdir().expect("tempdir");
-        let ide_db = temp.path().join("ggo_ide.db");
         let faults_dir = temp.path().join("faults");
         let fault_id = "2026-09-02_08-49-33_marker";
         write_dump(&faults_dir, fault_id);
 
-        // The center tab reads the same fixture files the dock does; in
-        // production both resolve `~/.ggo` themselves. The tab is built
-        // and aimed BEFORE it is added, because `open_charts_item`
-        // refreshes on the way in -- and that refresh CLONES `diag.db`'s
-        // runs into `ggo_ide.db`, i.e. an unaimed tab would drag the
-        // developer's real device runs into this fixture database.
+        // The center tab reads the same fixture database the dock does; in
+        // production both resolve `ggo_db::url` themselves. The tab is
+        // built and aimed BEFORE it is added, because `open_charts_item`
+        // refreshes on the way in -- an unaimed tab would read (and its
+        // fault import would WRITE) the developer's real database.
         workspace.update_in(cx, |workspace, window, cx| {
             let item = cx.new(|cx| ggo_charts_panel::ChartsItem::new(workspace.weak_handle(), cx));
             let charts = item.read(cx).panel().clone();
             charts.update(cx, |charts, _| {
-                charts.set_db_path_override(ide_db.clone());
-                charts.set_diag_db_path_override(temp.path().join("diag.db"));
+                charts.set_db_url_override(db.url().to_string());
                 // The tab resolves the clicked dump's raw path itself; left
                 // at its default it would `stat` the developer's real
                 // ~/.ggo/uartd/faults instead of this fixture's.
@@ -1094,8 +1101,7 @@ mod tests {
             .read_with(cx, |workspace, cx| workspace.panel::<ReportsPanel>(cx))
             .expect("init adds the panel to every workspace");
         panel.update(cx, |panel, cx| {
-            panel.set_db_path_override(ide_db.clone());
-            panel.set_diag_db_path_override(temp.path().join("diag.db"));
+            panel.set_db_url_override(db.url().to_string());
             panel.set_faults_dir_override(faults_dir.clone());
             panel.refresh(cx);
         });

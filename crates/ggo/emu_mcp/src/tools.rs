@@ -117,13 +117,13 @@ pub fn tool_list() -> Value {
           "description": "Cancel the flash in flight, the same as the user's Cancel button. Returns {cancelled: bool}; false when nothing was running (including when no emulator panel has ever been opened in the workspace). The timeline keeps the phase it reached; a cancelled run is not a failed one.",
           "inputSchema": with(json!({})) },
         { "name": "list_ggo_reports",
-          "description": "Every report in ~/.ggo/ggo_ide.db, as two newest-first sections, each under a header naming its time zone. Under `--- runs (perf stamps UTC, device stamps local time) ---`, the runs: run id, started_at (ISO-UTC for emulator perf runs, the local underscore stamp for ggo-diag device runs), cart, label, and the ggo-diag log path for board runs. Under `--- faults (local time) ---`, the ggo-uartd fault dumps: fault id, timestamp (the daemon's local wall clock), kind: detail, and the probable perf run. The two zones are not comparable as text — line a fault up against a run only after converting. Fresh dumps are imported on the way. Reads the database directly — no Zed session needed.",
+          "description": "Every report in the ggo database, as two newest-first sections, each under a header naming its time zone. Under `--- runs (perf stamps UTC, device stamps local time) ---`, the runs: run id, started_at (ISO-UTC for emulator perf runs, the local underscore stamp for ggo-diag device runs), cart, label, and the ggo-diag log path for board runs. Under `--- faults (local time) ---`, the ggo-uartd fault dumps: fault id, timestamp (the daemon's local wall clock), kind: detail, and the probable perf run. The two zones are not comparable as text — line a fault up against a run only after converting. Fresh dumps are imported on the way. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
               "type": "object",
               "properties": { "limit": { "type": "number", "description": "Newest N of each section (default 20)" } },
           }) },
         { "name": "fetch_ggo_report",
-          "description": "Paste-ready summary of one report from ~/.ggo/ggo_ide.db. With `run` (a perf run, emulator or board): cart, frame budget, wire/cache aggregates, over-budget frames, and the ggo-diag log path when the run has one — takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from list_ggo_reports. With `fault` (a ggo-uartd dump id from list_ggo_reports): the dump digest — kind and detail, boot stage, frame telemetry, parsed panics and asset-load failures, the fault line marked » with 20 lines of context before and 5 after, and the raw dump path. One of the two is required; `run` wins when both are given. Reads the database directly — no Zed session needed.",
+          "description": "Paste-ready summary of one report from the ggo database. With `run` (a perf run, emulator or board): cart, frame budget, wire/cache aggregates, over-budget frames, and the ggo-diag log path when the run has one — takes the run number hw_flash_wait/hw_flash_status report as perf_run_id, or one from list_ggo_reports. With `fault` (a ggo-uartd dump id from list_ggo_reports): the dump digest — kind and detail, boot stage, frame telemetry, parsed panics and asset-load failures, the fault line marked » with 20 lines of context before and 5 after, and the raw dump path. One of the two is required; `run` wins when both are given. Reads the database directly — no Zed session needed.",
           "inputSchema": json!({
               "type": "object",
               "properties": {
@@ -132,7 +132,7 @@ pub fn tool_list() -> Value {
               },
           }) },
         { "name": "open_ggo_report",
-          "description": "Open the Reports tab in the user's Zed on one perf run (the same page a passed flash lands on) or on one ggo-uartd fault dump. One of `run`/`fault` is required; `run` wins when both are given. The id is checked against ~/.ggo/ggo_ide.db first, so an unknown one is an error here rather than a tab that lands on the list.",
+          "description": "Open the Reports tab in the user's Zed on one perf run (the same page a passed flash lands on) or on one ggo-uartd fault dump. One of `run`/`fault` is required; `run` wins when both are given. The id is checked against the ggo database first, so an unknown one is an error here rather than a tab that lands on the list.",
           "inputSchema": with(json!({
               "run": { "type": "number", "description": "Perf run id from list_ggo_reports" },
               "fault": { "type": "string", "description": "Fault dump id from list_ggo_reports, e.g. 2026-09-02_08-49-33_marker" },
@@ -254,13 +254,13 @@ fn call_tool_inner(
 
     if name == "list_ggo_reports" {
         let limit = arg_i64(args, "limit").filter(|n| *n > 0).unwrap_or(20) as usize;
-        return list_reports(&ggo_dir()?, limit);
+        return list_reports(&db_url()?, &ggo_dir()?, limit);
     }
     if name == "fetch_ggo_report" {
-        let db_dir = ggo_dir()?;
+        let (db_url, db_dir) = (db_url()?, ggo_dir()?);
         return match (arg_i64(args, "run"), arg_str(args, "fault")) {
-            (Some(run), _) => fetch_report(&db_dir, run),
-            (None, Some(fault)) => fetch_fault(&db_dir, &fault),
+            (Some(run), _) => fetch_report(&db_url, &db_dir, run),
+            (None, Some(fault)) => fetch_fault(&db_url, &db_dir, &fault),
             (None, None) => Err(NEEDS_RUN_OR_FAULT.to_string()),
         };
     }
@@ -406,7 +406,7 @@ fn call_tool_inner(
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "open_ggo_report" => {
-            let cmd = open_report_cmd(&ggo_dir()?, workspace, args)?;
+            let cmd = open_report_cmd(&db_url()?, &ggo_dir()?, workspace, args)?;
             let data = send(&session.socket, cmd, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
@@ -475,7 +475,7 @@ const DEFAULT_FLASH_TIMEOUT_S: u64 = 1800;
 /// of cheap questions, never one long blocking read.
 const FLASH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Once a run PASSES, the Zed panel still has a database hop to make
-/// before it can name the cloned perf run. Waiting this long for it (in
+/// before it can name the run's perf row. Waiting this long for it (in
 /// `poll` steps) is what lets `hw_flash_wait`'s answer carry the id the
 /// caller then hands to `fetch_ggo_report`, instead of a null the agent has to
 /// go poll for itself.
@@ -529,15 +529,28 @@ fn flash_wait(
     }
 }
 
-/// `~/.ggo` -- the same directory `ggo_common::default_db_path` resolves
-/// (duplicated as two lines rather than pulling a gpui-shaped crate into
-/// this bridge binary).
+/// `~/.ggo` -- the FILE tree beside the database: `ggo-diag`'s run logs
+/// and `ggo-uartd`'s dump directory. Resolved here rather than through
+/// `ggo_common` so this bridge binary need not pull in a gpui-shaped
+/// crate for two lines.
 fn ggo_dir() -> Result<std::path::PathBuf, String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .ok_or("cannot find your home directory (neither HOME nor USERPROFILE is set)")?;
     Ok(std::path::PathBuf::from(home).join(".ggo"))
 }
+
+/// The one PostgreSQL database every ggo tool shares -- `$GGO_DATABASE_URL`
+/// when set, else the local `ggo-pg` service. Every report row this module
+/// prints comes from here; `ggo_dir` only supplies the files beside them.
+fn db_url() -> Result<String, String> {
+    ggo_db::url()
+}
+
+/// How the report tools name the database in their errors. There is no
+/// path to print any more -- one server, one url, and the url may carry a
+/// password -- so the messages say what it IS.
+const DB_NAME: &str = "the ggo database";
 
 /// The two report sections' headers. They carry the ZONE because the
 /// producers disagree about it and the stamps do not say so themselves: a
@@ -554,48 +567,30 @@ fn ggo_dir() -> Result<std::path::PathBuf, String> {
 const RUNS_HEADER: &str = "--- runs (perf stamps UTC, device stamps local time) ---";
 const FAULTS_HEADER: &str = "--- faults (local time) ---";
 
-/// Every perf run in `<db_dir>/ggo_ide.db`, newest first, one line each,
-/// with the ggo-diag log path beside the board runs that have one, then
-/// the daemon faults as a second newest-first section. Both sections are
+/// Every perf run in the ggo database, newest first, one line each, with
+/// the ggo-diag log path beside the board runs that have one, then the
+/// daemon faults as a second newest-first section. Both sections are
 /// headed with their zone -- see [`RUNS_HEADER`].
-fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
-    use ggo_worldlib::charts::reports::{diag_db, faults, perf_db};
+///
+/// Device runs need no copying across any more: `ggo-diag` writes its
+/// rows into this same database, so the list reads one source.
+fn list_reports(db_url: &str, db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
+    use ggo_worldlib::charts::reports::{faults, perf_db};
 
-    let ide_db = db_dir.join("ggo_ide.db");
-    // Same best-effort clone as `fetch_report`: board runs reach this
-    // database only by being copied across, and a clone failure must not
-    // hide the emulator runs already here -- but an EMPTY list with a
-    // failed clone is told why, since the failure may be the reason.
-    // No diag.db is nothing to clone (a machine that never ran the
-    // device tooling), not a failure to report.
-    let diag_db_path = db_dir.join("diag.db");
-    let clone_error = diag_db_path
-        .exists()
-        .then(|| diag_db::clone_runs(&diag_db_path, &ide_db).err())
-        .flatten();
-    // Before the existence check below: a machine that has only ever run
-    // the daemon has no ggo_ide.db until this import writes one.
-    let import_error = import_faults(db_dir);
+    // Before the reads below: a machine that has only ever run the daemon
+    // has no fault rows at all until this import writes them.
+    let import_error = import_faults(db_url, db_dir);
     let none = |what: String| {
-        let text = match &clone_error {
-            Some(e) => format!("{what} (and cloning device runs from diag.db failed: {e})"),
-            None => what,
-        };
-        let text = format!("{text}{}", import_failure_note(db_dir, import_error.as_ref()));
+        let text = format!("{what}{}", import_failure_note(db_dir, import_error.as_ref()));
         Ok(vec![json!({ "type": "text", "text": text })])
     };
-    if !ide_db.exists() {
-        return none(format!("no runs yet ({} does not exist)", ide_db.display()));
-    }
-    let mut rows = Vec::new();
-    for cart in perf_db::carts(&ide_db).map_err(|e| format!("reading carts: {e:#}"))? {
-        for run in perf_db::cart_runs(&ide_db, cart.id)
-            .map_err(|e| format!("reading runs of cart {}: {e:#}", cart.name))?
-        {
-            rows.push((run.started_at, run.id, cart.name.clone(), run.label, run.frames));
-        }
-    }
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    // The aggregate-free index: `cart_runs` would scan every frame row of
+    // every cart for averages this list never prints.
+    let rows: Vec<_> = perf_db::run_index(db_url)
+        .map_err(|e| format!("reading runs: {e:#}"))?
+        .into_iter()
+        .map(|r| (r.started_at, r.id, r.cart_name, r.label, r.frames))
+        .collect();
     let logs_dir = db_dir.join("diag").join("logs");
     let run_lines: Vec<String> = rows
         .iter()
@@ -610,7 +605,7 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
             )
         })
         .collect();
-    let fault_lines: Vec<String> = faults::list(&ide_db, limit as i64)
+    let fault_lines: Vec<String> = faults::list(db_url, limit as i64)
         .map_err(|e| format!("reading faults: {e}"))?
         .iter()
         .map(|f| {
@@ -647,16 +642,16 @@ fn list_reports(db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
     Ok(vec![json!({ "type": "text", "text": lines.join("\n") })])
 }
 
-/// One perf run's paste-ready summary out of `<db_dir>/ggo_ide.db`.
-/// `db_dir` is a parameter so tests can point at a temp directory;
-/// production passes `~/.ggo`.
-fn fetch_report(db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
+/// One perf run's paste-ready summary out of the ggo database, with the
+/// ggo-diag log beside it from `db_dir`. Both are parameters so tests can
+/// point at a fixture database and a temp directory; production passes
+/// [`db_url`] and `~/.ggo`.
+fn fetch_report(db_url: &str, db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
     use ggo_worldlib::charts::reports::perf_db;
 
-    let ide_db = db_dir.join("ggo_ide.db");
-    let detail = run_detail_or_missing(db_dir, run)?;
+    let detail = run_detail_or_missing(db_url, run)?;
     let frames =
-        perf_db::run_frames(&ide_db, run).map_err(|e| format!("reading run {run} frames: {e:#}"))?;
+        perf_db::run_frames(db_url, run).map_err(|e| format!("reading run {run} frames: {e:#}"))?;
     let mut text = perf_db::run_handoff_text(&detail, &frames);
     let log = ggo_emu_remote::diag_log_path(&db_dir.join("diag").join("logs"), &detail.started_at);
     text.push_str(&format!(
@@ -672,15 +667,14 @@ fn faults_dir(db_dir: &Path) -> std::path::PathBuf {
 }
 
 /// Pull every dump the reports database has not seen into it, returning
-/// why it could not when it could not. Best effort, like the diag clone:
-/// an unreadable dump is the daemon's problem and must not fail a tool
-/// the rows already answer -- but a caller looking at an empty faults
-/// section is TOLD, since the failure may be exactly why it is empty.
-/// Dumps that individually fail to parse are skipped (and named on
-/// stderr) by `import` itself.
-fn import_faults(db_dir: &Path) -> Option<String> {
+/// why it could not when it could not. Best effort: an unreadable dump is
+/// the daemon's problem and must not fail a tool the rows already answer
+/// -- but a caller looking at an empty faults section is TOLD, since the
+/// failure may be exactly why it is empty. Dumps that individually fail to
+/// parse are skipped (and named on stderr) by `import` itself.
+fn import_faults(db_url: &str, db_dir: &Path) -> Option<String> {
     let dir = faults_dir(db_dir);
-    match ggo_worldlib::charts::reports::faults::import(&dir, &db_dir.join("ggo_ide.db")) {
+    match ggo_worldlib::charts::reports::faults::import(&dir, db_url) {
         Ok(_) => None,
         Err(e) => {
             eprintln!("faults: importing {}: {e}", dir.display());
@@ -706,22 +700,20 @@ fn import_failure_note(db_dir: &Path, error: Option<&String>) -> String {
 const FAULT_LINES_BEFORE: usize = 20;
 const FAULT_LINES_AFTER: usize = 5;
 
-/// One daemon fault's paste-ready digest out of `<db_dir>/ggo_ide.db`:
-/// header, boot stage, telemetry, parsed panics and asset failures, the
-/// fault line in context, and the path of the raw dump.
-fn fetch_fault(db_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
+/// One daemon fault's paste-ready digest out of the ggo database: header,
+/// boot stage, telemetry, parsed panics and asset failures, the fault line
+/// in context, and the path of the raw dump under `db_dir`.
+fn fetch_fault(db_url: &str, db_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
     use ggo_worldlib::charts::reports::faults;
 
-    let ide_db = db_dir.join("ggo_ide.db");
     // A dump written seconds ago is fetchable by id straight from the
     // list, without the panel having been opened in between.
-    let import_error = import_faults(db_dir);
-    let detail = faults::load(&ide_db, id)
+    let import_error = import_faults(db_url, db_dir);
+    let detail = faults::load(db_url, id)
         .map_err(|e| format!("reading fault {id}: {e}"))?
         .ok_or_else(|| {
             format!(
-                "no fault {id} in {}{}",
-                ide_db.display(),
+                "no fault {id} in {DB_NAME}{}",
                 import_failure_note(db_dir, import_error.as_ref())
             )
         })?;
@@ -798,24 +790,27 @@ fn fetch_fault(db_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
 /// What `open_ggo_report` sends, with the report checked to exist first:
 /// a bad id has to be an error here, not a Reports tab that silently
 /// lands on the runs list.
-fn open_report_cmd(db_dir: &Path, workspace: Option<String>, args: &Value) -> Result<Cmd, String> {
+fn open_report_cmd(
+    db_url: &str,
+    db_dir: &Path,
+    workspace: Option<String>,
+    args: &Value,
+) -> Result<Cmd, String> {
     use ggo_worldlib::charts::reports::faults;
 
     match (arg_i64(args, "run"), arg_str(args, "fault")) {
         (Some(run), _) => {
-            run_detail_or_missing(db_dir, run)?;
+            run_detail_or_missing(db_url, run)?;
             Ok(Cmd::OpenReport { workspace, run: Some(run), fault: None })
         }
         (None, Some(fault)) => {
-            let ide_db = db_dir.join("ggo_ide.db");
-            let import_error = import_faults(db_dir);
-            if faults::load(&ide_db, &fault)
+            let import_error = import_faults(db_url, db_dir);
+            if faults::load(db_url, &fault)
                 .map_err(|e| format!("reading fault {fault}: {e}"))?
                 .is_none()
             {
                 return Err(format!(
-                    "no fault {fault} in {}{}",
-                    ide_db.display(),
+                    "no fault {fault} in {DB_NAME}{}",
                     import_failure_note(db_dir, import_error.as_ref())
                 ));
             }
@@ -829,43 +824,19 @@ fn open_report_cmd(db_dir: &Path, workspace: Option<String>, args: &Value) -> Re
 const NEEDS_RUN_OR_FAULT: &str =
     "missing required argument: run (a perf run id) or fault (a fault id from list_ggo_reports)";
 
-/// The run's row, or the "no run" error naming both databases.
+/// The run's row, or the "no run" error naming the database it looked in.
+///
+/// Board runs need no cloning to be found here: `ggo-diag` and the
+/// emulator's ingest write into the one database this reads.
 fn run_detail_or_missing(
-    db_dir: &Path,
+    db_url: &str,
     run: i64,
 ) -> Result<ggo_worldlib::charts::reports::perf_db::RunDetail, String> {
-    use ggo_worldlib::charts::reports::{diag_db, perf_db};
+    use ggo_worldlib::charts::reports::perf_db;
 
-    let ide_db = db_dir.join("ggo_ide.db");
-    let diag_db_path = db_dir.join("diag.db");
-    // Best effort, unconditionally: a board run only reaches the reports
-    // database once ggo-diag's rows are cloned across, and the panel's own
-    // clone may not have run since -- but NO clone failure may fail this
-    // tool. Every reason it can fail (no diag.db at all, on a machine that
-    // has never run the device tooling; a diag.db a migration behind this
-    // build, which is ggo-diag's own file to repair) leaves the run the
-    // caller asked for exactly as readable as it already was -- and most
-    // runs asked about are emulator runs the clone has nothing to say
-    // about. The error is kept only as context for the "no run" case
-    // below, where it may well be WHY the run is missing.
-    let clone_error = diag_db::clone_runs(&diag_db_path, &ide_db).err();
-    // Checked rather than left to the query: opening a missing database
-    // CREATES it, and a stray empty ~/.ggo/ggo_ide.db is worse than the
-    // error the caller gets either way.
-    let missing = || match &clone_error {
-        Some(e) => format!(
-            "no run {run} in {} (and cloning device runs from {} failed: {e})",
-            ide_db.display(),
-            diag_db_path.display()
-        ),
-        None => format!("no run {run} in {}", ide_db.display()),
-    };
-    if !ide_db.exists() {
-        return Err(missing());
-    }
-    perf_db::run_detail(&ide_db, run)
+    perf_db::run_detail(db_url, run)
         .map_err(|e| format!("reading run {run}: {e:#}"))?
-        .ok_or_else(missing)
+        .ok_or_else(|| format!("no run {run} in {DB_NAME}"))
 }
 
 /// Shape a script report into MCP content: a text summary (frames + uart),
@@ -886,6 +857,7 @@ fn send(socket: &Path, cmd: Cmd, timeout: Duration, connect: &Connector) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_db::sqlx;
     use std::path::PathBuf;
 
     fn fake_session(dir: &Path, pid: u32) -> SessionInfo {
@@ -1423,44 +1395,58 @@ mod tests {
         assert!(text.contains(r#""perf_run_id":null"#), "{text}");
     }
 
-    /// A temp `ggo_ide.db` through the real schema (`ggo_db::open`
-    /// migrates), seeded with the same INSERT shape ggo-worldlib's
-    /// `perf_db` tests use: one cart, one run, two frames.
-    fn seeded_db_dir() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ggo_ide.db");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(&path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("INSERT INTO cart (id, name) VALUES (1, 'wilds')", ()).await.unwrap();
-            conn.execute(
+    /// A throwaway PostgreSQL database on the real migrated schema,
+    /// seeded with the same INSERT shape ggo-worldlib's `perf_db` tests
+    /// use (one cart, one run, two frames), plus the `~/.ggo` FILE tree
+    /// beside it -- `diag/logs` and `uartd/faults` are still files, and
+    /// the tools read both.
+    ///
+    /// The `TestDb` is returned, not dropped: dropping it destroys the
+    /// database, so every caller has to keep it alive for the whole test.
+    fn seeded_db() -> (ggo_db::TestDb, tempfile::TempDir) {
+        let db = ggo_db::TestDb::new();
+        let pool = db.pool();
+        ggo_db::block_on(async {
+            for sql in [
+                "INSERT INTO cart (id, name) VALUES (1, 'wilds')",
                 "INSERT INTO run (id, cart_id, started_at, frames, frame_budget_cycles,
                                   scanout_wire_cycles, refill_cycles, writeback_cycles,
                                   wire_wait_cycles, label)
                  VALUES (7, 1, '2026-08-31T00:00:00Z', 2, 555549, 164400, 100, 65, 0, 'board')",
-                (),
-            )
-            .await
-            .unwrap();
+            ] {
+                sqlx::query(sql).execute(&pool).await.unwrap();
+            }
             for (n, wire_total, cyc) in [(0i64, 100_000i64, 700_000i64), (1, 600_000, 812_345)] {
-                conn.execute(
+                sqlx::query(
                     "INSERT INTO frame (run_id, n, wire_total, i_misses, d_misses, over_budget,
                                         apu_underruns, cyc)
-                     VALUES (7, ?1, ?2, 5, 2, 0, 0, ?3)",
-                    (n, wire_total, cyc),
+                     VALUES (7, $1, $2, 5, 2, 0, 0, $3)",
                 )
+                .bind(n)
+                .bind(wire_total)
+                .bind(cyc)
+                .execute(&pool)
                 .await
                 .unwrap();
             }
         });
-        dir
+        (db, tempfile::tempdir().unwrap())
     }
+
+    /// A url whose socket directory does not exist, so no read through it
+    /// can reach a server. The postgres analog of the old "point at a file
+    /// that is not a database" fixture.
+    const UNREACHABLE_DB_URL: &str = "postgres://ggo@localhost/ggo?host=/nonexistent/ggo-pg-socket";
+
+    /// A run id no serial sequence will ever hand out, so the tests that
+    /// go through `call_tool` -- which resolves the REAL database, the
+    /// developer's own -- cannot collide with a run that is actually in it.
+    const UNKNOWN_RUN: i64 = i64::MAX;
 
     #[test]
     fn fetch_report_renders_the_run_handoff_text_and_its_log_path() {
-        let dir = seeded_db_dir();
-        let content = fetch_report(dir.path(), 7).unwrap();
+        let (db, dir) = seeded_db();
+        let content = fetch_report(db.url(), dir.path(), 7).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains("GemdropGo perf run #7"), "{text}");
         assert!(text.contains("wilds"), "{text}");
@@ -1471,39 +1457,58 @@ mod tests {
         std::fs::create_dir_all(&logs).unwrap();
         let log = logs.join("main_abc1234_2026-08-31T00:00:00Z.log");
         std::fs::write(&log, "").unwrap();
-        let content = fetch_report(dir.path(), 7).unwrap();
+        let content = fetch_report(db.url(), dir.path(), 7).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("ggo_diag_log: {}", log.display())), "{text}");
     }
 
     #[test]
     fn list_reports_lists_runs_newest_first_with_their_logs() {
-        let dir = seeded_db_dir();
+        let (db, dir) = seeded_db();
         let logs = dir.path().join("diag").join("logs");
         std::fs::create_dir_all(&logs).unwrap();
         let log = logs.join("main_abc1234_2026-08-31T00:00:00Z.log");
         std::fs::write(&log, "").unwrap();
-        let content = list_reports(dir.path(), 20).unwrap();
+        let content = list_reports(db.url(), dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], RUNS_HEADER, "{text}");
         assert!(lines[1].starts_with("run 7  2026-08-31T00:00:00Z  wilds  label=board  frames=2  log="), "{text}");
         assert!(text.ends_with(&log.display().to_string()), "{text}");
-        assert_eq!(list_reports(dir.path(), 0).unwrap()[0]["text"], "no runs yet");
-        assert!(
-            !dir.path().join("diag.db").exists(),
-            "a missing diag.db is nothing to clone, not a failure to report"
-        );
+        assert_eq!(list_reports(db.url(), dir.path(), 0).unwrap()[0]["text"], "no runs yet");
     }
 
+    /// A migrated database nothing has been recorded into yet is the
+    /// ordinary state of a fresh machine, not a failure.
     #[test]
-    fn list_reports_with_no_database_says_so_and_creates_nothing() {
+    fn list_reports_of_an_empty_database_says_there_are_no_runs_yet() {
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
-        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
-        assert!(text.starts_with("no runs yet"), "{text}");
-        assert!(!dir.path().join("ggo_ide.db").exists(), "must not create an empty db");
+        let text =
+            list_reports(db.url(), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        assert_eq!(text, "no runs yet", "{text}");
     }
 
+    /// A database the tool cannot REACH is a different thing from an
+    /// empty one, and must not be reported as "no runs yet": the error
+    /// carries the hint that says how to fix it.
+    #[test]
+    fn list_reports_of_an_unreachable_database_is_an_error_that_says_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = list_reports(UNREACHABLE_DB_URL, dir.path(), 20).unwrap_err();
+        assert!(err.contains(ggo_db::INSTALL_HINT), "{err}");
+    }
+
+    /// The routing test: `call_tool` checks the id through
+    /// `open_report_cmd` BEFORE it reaches for a socket, so an unknown run
+    /// is a tool error rather than a Reports tab that lands on the list.
+    ///
+    /// This entry point resolves the database itself ([`db_url`]), i.e.
+    /// the developer's own -- so the assertion is only that the error is
+    /// ABOUT the run asked for, which holds whether the run is missing
+    /// ("no run N") or the database could not be read at all ("reading run
+    /// N: ..."). The exact sentence is pinned against a fixture database
+    /// by `open_report_cmd_takes_a_run_or_a_fault_and_needs_one_of_them`.
     #[test]
     fn open_report_rejects_an_unknown_run_before_touching_zed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1511,9 +1516,13 @@ mod tests {
         let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
             panic!("no socket call for a run that does not exist")
         };
-        let (content, is_err) = call_tool("open_ggo_report", &json!({"run": 999}), dir.path(), &connect);
+        let (content, is_err) =
+            call_tool("open_ggo_report", &json!({"run": UNKNOWN_RUN}), dir.path(), &connect);
         assert!(is_err, "{content:?}");
-        assert!(content[0]["text"].as_str().unwrap().contains("no run 999"), "{content:?}");
+        assert!(
+            content[0]["text"].as_str().unwrap().contains(&UNKNOWN_RUN.to_string()),
+            "{content:?}"
+        );
     }
 
     #[test]
@@ -1531,74 +1540,31 @@ mod tests {
 
     #[test]
     fn fetch_report_unknown_run_is_a_tool_error() {
-        let dir = seeded_db_dir();
-        let err = fetch_report(dir.path(), 999).unwrap_err();
+        let (db, dir) = seeded_db();
+        let err = fetch_report(db.url(), dir.path(), 999).unwrap_err();
         assert!(err.contains("no run 999"), "{err}");
-        assert!(err.contains("ggo_ide.db"), "{err}");
+        assert!(err.contains(DB_NAME), "{err}");
     }
 
-    /// No `~/.ggo` at all: the missing diag.db is swallowed (nothing to
-    /// clone), and the missing ide db is the same "no such run" error --
-    /// never a stray empty database left behind.
+    /// An empty database answers the same way: the run is missing, and
+    /// that is the whole error -- there is no second file to blame.
     #[test]
-    fn fetch_report_with_no_databases_is_a_tool_error_and_creates_nothing() {
+    fn fetch_report_against_an_empty_database_is_a_tool_error() {
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
-        let err = fetch_report(dir.path(), 1).unwrap_err();
+        let err = fetch_report(db.url(), dir.path(), 1).unwrap_err();
         assert!(err.contains("no run 1"), "{err}");
-        assert!(!dir.path().join("ggo_ide.db").exists(), "must not create an empty db");
+        assert!(err.contains(DB_NAME), "{err}");
     }
 
-    /// A `diag.db` this build cannot read -- here one whose `runs` table
-    /// predates `007_perf_run_id.sql`, which is how a real one goes stale:
-    /// ggo-diag owns that file, and only ggo-diag migrates it.
-    fn seed_stale_diag_db(dir: &Path) {
-        let path = dir.join("diag.db");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(&path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("DROP TABLE runs", ()).await.unwrap();
-            conn.execute(
-                "CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT, branch TEXT,
-                                    commit_hash TEXT, git_describe TEXT, hostname TEXT,
-                                    verdict TEXT, boot_outcome TEXT, telem_overflows INTEGER,
-                                    state TEXT NOT NULL DEFAULT 'done', updated_at TEXT)",
-                (),
-            )
-            .await
-            .unwrap();
-        });
-    }
-
-    /// The clone is best effort for EVERY failure, not just a missing
-    /// file: a diag.db that cannot be cloned must not fail a report the
-    /// ide db can already answer -- which is every emulator run.
+    /// ...and a database that cannot be reached is NOT "no such run": the
+    /// read failed, and the caller is told how to fix it.
     #[test]
-    fn fetch_report_still_reports_when_the_diag_clone_fails() {
-        let dir = seeded_db_dir();
-        seed_stale_diag_db(dir.path());
-        // Pre-condition: this diag.db really does break the clone, with an
-        // error nothing here is allowed to special-case.
-        let clone_err = ggo_worldlib::charts::reports::diag_db::clone_runs(
-            &dir.path().join("diag.db"),
-            &dir.path().join("ggo_ide.db"),
-        )
-        .unwrap_err();
-        assert!(clone_err.contains("no such column"), "{clone_err}");
-
-        let content = fetch_report(dir.path(), 7).unwrap();
-        assert!(content[0]["text"].as_str().unwrap().contains("GemdropGo perf run #7"));
-    }
-
-    /// ...and when the run really is missing, the swallowed clone error
-    /// comes back as context, since it may be exactly why.
-    #[test]
-    fn fetch_report_unknown_run_carries_the_clone_failure_as_context() {
-        let dir = seeded_db_dir();
-        seed_stale_diag_db(dir.path());
-        let err = fetch_report(dir.path(), 999).unwrap_err();
-        assert!(err.contains("no run 999"), "{err}");
-        assert!(err.contains("no such column"), "{err}");
+    fn fetch_report_of_an_unreachable_database_says_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = fetch_report(UNREACHABLE_DB_URL, dir.path(), 7).unwrap_err();
+        assert!(err.contains("reading run 7"), "{err}");
+        assert!(err.contains(ggo_db::INSTALL_HINT), "{err}");
     }
 
     /// The dump `ggo-uartd` would leave in `<db_dir>/uartd/faults`: a
@@ -1627,9 +1593,9 @@ mod tests {
 
     #[test]
     fn list_reports_lists_faults_after_the_runs() {
-        let dir = seeded_db_dir();
+        let (db, dir) = seeded_db();
         seed_fault_dump(dir.path());
-        let content = list_reports(dir.path(), 20).unwrap();
+        let content = list_reports(db.url(), dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
         // The two sections are in DIFFERENT zones -- a run's `started_at`
@@ -1652,9 +1618,11 @@ mod tests {
     /// has nothing else to compare the stamps against.
     #[test]
     fn list_reports_lists_a_fault_with_no_perf_runs() {
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
         seed_fault_dump(dir.path());
-        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        let text =
+            list_reports(db.url(), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], FAULTS_HEADER, "{text}");
         assert!(lines[1].starts_with("fault 2026-09-02_08-49-33_marker  "), "{text}");
@@ -1663,9 +1631,9 @@ mod tests {
 
     #[test]
     fn fetch_fault_renders_the_digest_the_marked_line_and_the_raw_path() {
-        let dir = seeded_db_dir();
+        let (db, dir) = seeded_db();
         let raw = seed_fault_dump(dir.path());
-        let content = fetch_fault(dir.path(), FAULT_ID).unwrap();
+        let content = fetch_fault(db.url(), dir.path(), FAULT_ID).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.starts_with("fault 2026-09-02_08-49-33_marker"), "{text}");
         assert!(text.contains("marker: <<<PANIC>>>"), "{text}");
@@ -1678,91 +1646,48 @@ mod tests {
         assert!(text.contains(&format!("raw: {}", raw.display())), "{text}");
     }
 
-    /// The one way `faults::import` actually reports failure: it skips a
-    /// bad dump file itself (and an absent or non-directory faults dir is
-    /// `Ok(0)`), so the error has to come from the database side -- here a
-    /// `~/.ggo` the process cannot write, so `ggo_ide.db` cannot be
-    /// created. Returns the dump path so a caller can assert on the dir.
-    fn seed_unwritable_fault_dump(db_dir: &Path) -> PathBuf {
-        let path = seed_fault_dump(db_dir);
-        let mut perms = std::fs::metadata(db_dir).unwrap().permissions();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o555);
-        }
-        std::fs::set_permissions(db_dir, perms).unwrap();
-        path
-    }
-
-    fn restore_write_permission(db_dir: &Path) {
-        let mut perms = std::fs::metadata(db_dir).unwrap().permissions();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        std::fs::set_permissions(db_dir, perms).unwrap();
-    }
-
-    /// Running as root ignores the mode bits, so the fixture cannot fail
-    /// the import there.
-    fn running_as_root() -> bool {
-        std::fs::metadata("/proc/self").is_ok_and(|m| {
-            use std::os::unix::fs::MetadataExt;
-            m.uid() == 0
-        })
+    /// A `fault` table the import cannot WRITE but both reads can still
+    /// use: `imported_at` is the one column `import`'s INSERT names that
+    /// neither `list` nor `load` selects, so dropping it fails the import
+    /// on a missing column while leaving every read exactly as it was.
+    ///
+    /// This is the one way `faults::import` reports failure at all -- it
+    /// skips a bad dump file itself, and an absent faults directory is
+    /// `Ok(0)` -- so the error has to come from the database side.
+    fn break_the_fault_import(db: &ggo_db::TestDb) {
+        let pool = db.pool();
+        ggo_db::block_on(async {
+            sqlx::query("ALTER TABLE fault DROP COLUMN imported_at")
+                .execute(&pool)
+                .await
+                .unwrap();
+        });
     }
 
     /// A dump that cannot be imported must not read as "no dumps": the
     /// empty list has to say why it is empty.
     #[test]
     fn list_reports_says_why_the_faults_could_not_be_imported() {
-        if running_as_root() {
-            return;
-        }
+        let db = ggo_db::TestDb::new();
+        break_the_fault_import(&db);
         let dir = tempfile::tempdir().unwrap();
-        seed_unwritable_fault_dump(dir.path());
-        // Restored before anything can panic: `TempDir`'s cleanup cannot
-        // unlink a file out of a directory it may not write, so a failure
-        // past this point would leave the fixture on disk for good.
-        let listed = list_reports(dir.path(), 20);
-        restore_write_permission(dir.path());
-        let content = listed.unwrap();
+        seed_fault_dump(dir.path());
+        let content = list_reports(db.url(), dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.starts_with("no runs yet"), "{text}");
         assert!(text.contains("importing faults from"), "{text}");
         assert!(text.contains("uartd/faults"), "{text}");
     }
 
-    /// A `fault` table the import cannot write but the list CAN read: the
-    /// columns `list`'s SELECT names, and none of the rest, so `import`'s
-    /// INSERT fails on a missing column while every read still works.
-    /// `CREATE TABLE IF NOT EXISTS` leaves this shape alone.
-    fn seed_fault_table_the_import_cannot_write(db_dir: &Path) {
-        let path = db_dir.join("ggo_ide.db");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async {
-            let db = ggo_db::open(&path).await.unwrap();
-            let conn = db.conn().unwrap();
-            conn.execute("DROP TABLE fault", ()).await.unwrap();
-            conn.execute(
-                "CREATE TABLE fault (id TEXT PRIMARY KEY, source TEXT NOT NULL, at TEXT NOT NULL,
-                                     kind TEXT NOT NULL, detail TEXT NOT NULL, tty TEXT NOT NULL,
-                                     boot_stage TEXT, frames INTEGER NOT NULL, run_id TEXT)",
-                (),
-            )
-            .await
-            .unwrap();
-        });
-    }
-
     /// Perf runs to show and no faults: the missing section reads as "no
     /// dumps" unless the failure is stated on its own line.
     #[test]
     fn list_reports_flags_a_failed_import_beside_the_runs() {
-        let dir = seeded_db_dir();
+        let (db, dir) = seeded_db();
         seed_fault_dump(dir.path());
-        seed_fault_table_the_import_cannot_write(dir.path());
-        let text = list_reports(dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+        break_the_fault_import(&db);
+        let text =
+            list_reports(db.url(), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], RUNS_HEADER, "{text}");
         assert!(lines[1].starts_with("run 7  "), "{text}");
@@ -1772,49 +1697,46 @@ mod tests {
 
     #[test]
     fn fetch_fault_unknown_id_names_the_failed_import_too() {
-        if running_as_root() {
-            return;
-        }
+        let db = ggo_db::TestDb::new();
+        break_the_fault_import(&db);
         let dir = tempfile::tempdir().unwrap();
-        seed_unwritable_fault_dump(dir.path());
-        // Restored before the first `unwrap_err`, for the reason
-        // `list_reports_says_why_the_faults_could_not_be_imported` gives.
-        let fetched = fetch_fault(dir.path(), FAULT_ID);
-        let opened = open_report_cmd(dir.path(), None, &json!({ "fault": FAULT_ID }));
-        restore_write_permission(dir.path());
-        let err = fetched.unwrap_err();
-        let open_err = opened.unwrap_err();
+        seed_fault_dump(dir.path());
+        let err = fetch_fault(db.url(), dir.path(), FAULT_ID).unwrap_err();
+        let open_err =
+            open_report_cmd(db.url(), dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap_err();
         assert!(err.contains(&format!("no fault {FAULT_ID}")), "{err}");
-        assert!(err.contains("ggo_ide.db"), "{err}");
+        assert!(err.contains(DB_NAME), "{err}");
         assert!(err.contains("importing faults from"), "{err}");
         assert!(open_err.contains("importing faults from"), "{open_err}");
     }
 
     #[test]
     fn fetch_fault_unknown_id_is_a_tool_error() {
-        let dir = seeded_db_dir();
-        let err = fetch_fault(dir.path(), "nope").unwrap_err();
+        let (db, dir) = seeded_db();
+        let err = fetch_fault(db.url(), dir.path(), "nope").unwrap_err();
         assert!(err.contains("no fault nope"), "{err}");
-        assert!(err.contains("ggo_ide.db"), "{err}");
+        assert!(err.contains(DB_NAME), "{err}");
     }
 
     #[test]
     fn open_report_cmd_takes_a_run_or_a_fault_and_needs_one_of_them() {
-        let dir = seeded_db_dir();
+        let (db, dir) = seeded_db();
         seed_fault_dump(dir.path());
-        let cmd = open_report_cmd(dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap();
+        let cmd =
+            open_report_cmd(db.url(), dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap();
         let line = serde_json::to_string(&Request { id: 1, cmd }).unwrap();
         assert!(line.contains(r#""cmd":"open_report""#), "{line}");
         assert!(line.contains(&format!(r#""fault":"{FAULT_ID}""#)), "{line}");
 
         assert_eq!(
-            open_report_cmd(dir.path(), None, &json!({ "run": 7 })).unwrap(),
+            open_report_cmd(db.url(), dir.path(), None, &json!({ "run": 7 })).unwrap(),
             Cmd::OpenReport { workspace: None, run: Some(7), fault: None }
         );
 
-        let err = open_report_cmd(dir.path(), None, &json!({ "fault": "nope" })).unwrap_err();
+        let err =
+            open_report_cmd(db.url(), dir.path(), None, &json!({ "fault": "nope" })).unwrap_err();
         assert!(err.contains("no fault nope"), "{err}");
-        let err = open_report_cmd(dir.path(), None, &json!({})).unwrap_err();
+        let err = open_report_cmd(db.url(), dir.path(), None, &json!({})).unwrap_err();
         assert!(err.contains("run") && err.contains("fault"), "{err}");
     }
 

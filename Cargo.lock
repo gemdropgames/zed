@@ -7427,7 +7427,6 @@ dependencies = [
  "image",
  "serde_json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -7531,6 +7530,7 @@ name = "ggo_reports_panel"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "ggo-db",
  "ggo-worldlib",
  "ggo_charts_panel",
  "ggo_common",
@@ -7547,6 +7547,7 @@ name = "ggo_smoke"
 version = "0.1.0"
 dependencies = [
  "editor",
+ "ggo-db",
  "ggo-worldlib",
  "ggo_audio_panel",
  "ggo_common",

@@ -2287,14 +2287,13 @@ mod tests {
     }
 
     /// Open `rel` through the fork's interceptor and hand back its
-    /// emulator panel, with the perf ingest pointed at a database inside
-    /// `root` -- without that redirect a run that reaches the end of
-    /// `finish_run` writes a row into the developer's real
-    /// `~/.ggo/ggo_ide.db`.
+    /// emulator panel, with the perf ingest pointed at `db_url` -- without
+    /// that redirect a run that reaches the end of `finish_run` writes a
+    /// row into the developer's real ggo database.
     fn open_cart(
         workspace: &Entity<Workspace>,
         cx: &mut gpui::VisualTestContext,
-        root: &Path,
+        db_url: &str,
         rel: &str,
     ) -> Entity<ggo_emu_panel::EmuPanel> {
         assert!(
@@ -2311,7 +2310,7 @@ mod tests {
                 .test_panel()
         });
         panel.update(cx, |panel, _| {
-            panel.test_set_db_path(root.join("ggo_ide.db"));
+            panel.test_set_db_url(db_url.to_string());
         });
         cx.run_until_parked();
         panel
@@ -2333,6 +2332,9 @@ mod tests {
         // The emulator thread is real and self-paced, so the journey has
         // to be allowed to wait on wall-clock time.
         cx.executor().allow_parking();
+        // Kept alive for the whole journey: dropping it destroys the
+        // database the panel's ingest is aimed at.
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
         let (workspace, cx) = boot_all(cx, dir.path()).await;
         std::fs::write(
@@ -2341,7 +2343,7 @@ mod tests {
         )
         .unwrap();
 
-        let panel = open_cart(&workspace, cx, dir.path(), "game.cart");
+        let panel = open_cart(&workspace, cx, db.url(), "game.cart");
         panel.read_with(cx, |panel, _| {
             assert!(
                 panel.test_is_ready(),
@@ -2474,11 +2476,13 @@ mod tests {
     #[gpui::test]
     async fn smoke_bad_cart_surfaces_an_error_and_survives(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
+        // Kept alive for the whole journey, for `open_cart`'s reason.
+        let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
         let (workspace, cx) = boot_all(cx, dir.path()).await;
         std::fs::write(dir.path().join("bad.cart"), b"not a cart, just bytes").unwrap();
 
-        let panel = open_cart(&workspace, cx, dir.path(), "bad.cart");
+        let panel = open_cart(&workspace, cx, db.url(), "bad.cart");
         panel.read_with(cx, |panel, _| {
             assert!(panel.test_is_ready(), "a junk cart still opens a tab");
             assert!(!panel.test_is_running());

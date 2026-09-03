@@ -15,6 +15,9 @@ path = "src/ggo_reports_panel.rs"
 # The three producers write two different timestamp shapes; ordering them
 # means parsing both, and the local one needs a zone.
 chrono.workspace = true
+# Resolving the one shared database url (`ggo_db::url`), and -- in tests --
+# a throwaway database per journey through `ggo_db::TestDb`.
+ggo-db.workspace = true # GGO
 ggo-worldlib.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO
 ggo_common.workspace = true # GGO

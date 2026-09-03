@@ -52,7 +52,7 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `hw_flash_wait { timeout_s? }` | poll until the flash reaches a verdict (default 1800s) |
 | `hw_env` | board readiness: `{ ready, missing[{code,label}], ports, version_skew }` — call before `hw_flash` |
 | `hw_flash_cancel` | cancel the flash in flight; `{ cancelled }` |
-| `list_ggo_reports { limit? }` | reports in `~/.ggo/ggo_ide.db`, newest first: perf runs with their ggo-diag log paths, then the ggo-uartd fault dumps after a `--- faults ---` line (fresh dumps imported on the way) |
+| `list_ggo_reports { limit? }` | reports in the ggo database, newest first: perf runs with their ggo-diag log paths, then the ggo-uartd fault dumps after a `--- faults ---` line (fresh dumps imported on the way) |
 | `fetch_ggo_report { run \| fault }` | paste-ready summary of one perf run (+ its ggo-diag log path), or one fault dump's digest (boot stage, telemetry, panics, asset failures, the fault line in context, raw path) |
 | `open_ggo_report { run \| fault }` | open the Reports tab in Zed on that run or fault (`{requested: true}`; an id absent from the db is an error here, before any tab opens) |
 | `close_ggo_report { run? }` | close the Reports tab (only if it shows `run`, when given) |

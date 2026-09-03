@@ -17,6 +17,10 @@ path = "src/ggo_smoke.rs"
 editor.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 ggo_common.workspace = true
+# A throwaway database per emulator journey: a run that reaches the end of
+# `finish_run` ingests a perf row, and it must not land in the developer's
+# real one.
+ggo-db.workspace = true
 ggo_import_panel = { workspace = true, features = ["test-support"] }
 ggo_sprite_panel = { workspace = true, features = ["test-support"] }
 ggo_audio_panel = { workspace = true, features = ["test-support"] }
