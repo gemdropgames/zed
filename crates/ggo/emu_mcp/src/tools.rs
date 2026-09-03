@@ -226,8 +226,19 @@ fn image_content(shot: &Value) -> Result<Value, String> {
 }
 
 /// Execute one MCP tool call. Returns (content, is_error).
-pub fn call_tool(name: &str, args: &Value, dir: &Path, connect: &Connector) -> (Vec<Value>, bool) {
-    match call_tool_inner(name, args, dir, connect) {
+///
+/// `db_url` is the database the report tools read, resolved ONCE by the
+/// caller ([`db_url`], from `main`). It is a parameter rather than an
+/// ambient lookup so that the tests can point the report tools at a
+/// throwaway database instead of the developer's own.
+pub fn call_tool(
+    name: &str,
+    args: &Value,
+    dir: &Path,
+    db_url: &str,
+    connect: &Connector,
+) -> (Vec<Value>, bool) {
+    match call_tool_inner(name, args, dir, db_url, connect) {
         Ok(content) => (content, false),
         Err(e) => (vec![json!({ "type": "text", "text": e })], true),
     }
@@ -237,6 +248,7 @@ fn call_tool_inner(
     name: &str,
     args: &Value,
     dir: &Path,
+    db_url: &str,
     connect: &Connector,
 ) -> Result<Vec<Value>, String> {
     let sessions = registry::list(dir);
@@ -254,13 +266,13 @@ fn call_tool_inner(
 
     if name == "list_ggo_reports" {
         let limit = arg_i64(args, "limit").filter(|n| *n > 0).unwrap_or(20) as usize;
-        return list_reports(&db_url()?, &ggo_dir()?, limit);
+        return list_reports(db_url, &ggo_dir()?, limit);
     }
     if name == "fetch_ggo_report" {
-        let (db_url, ggo_dir) = (db_url()?, ggo_dir()?);
+        let ggo_dir = ggo_dir()?;
         return match (arg_i64(args, "run"), arg_str(args, "fault")) {
-            (Some(run), _) => fetch_report(&db_url, &ggo_dir, run),
-            (None, Some(fault)) => fetch_fault(&db_url, &ggo_dir, &fault),
+            (Some(run), _) => fetch_report(db_url, &ggo_dir, run),
+            (None, Some(fault)) => fetch_fault(db_url, &ggo_dir, &fault),
             (None, None) => Err(NEEDS_RUN_OR_FAULT.to_string()),
         };
     }
@@ -406,7 +418,7 @@ fn call_tool_inner(
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "open_ggo_report" => {
-            let cmd = open_report_cmd(&db_url()?, &ggo_dir()?, workspace, args)?;
+            let cmd = open_report_cmd(db_url, &ggo_dir()?, workspace, args)?;
             let data = send(&session.socket, cmd, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
@@ -543,7 +555,12 @@ fn ggo_dir() -> Result<std::path::PathBuf, String> {
 /// The one PostgreSQL database every ggo tool shares -- `$GGO_DATABASE_URL`
 /// when set, else the local `ggo-pg` service. Every report row this module
 /// prints comes from here; `ggo_dir` only supplies the files beside them.
-fn db_url() -> Result<String, String> {
+///
+/// The server resolves this ONCE, in `main`, and hands it to every
+/// [`call_tool`]: it is the only place in this crate that reaches for the
+/// ambient database, so a test can never be routed into the developer's
+/// own by accident.
+pub fn db_url() -> Result<String, String> {
     ggo_db::url()
 }
 
@@ -911,12 +928,12 @@ mod tests {
             }
         };
         let (content, is_err) =
-            call_tool("emu_start", &json!({"cart": "wilds.ggo"}), dir.path(), &connect);
+            call_tool("emu_start", &json!({"cart": "wilds.ggo"}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""frame":2"#));
 
         let (content, is_err) =
-            call_tool("emu_next_frame", &json!({"buttons": ["right"]}), dir.path(), &connect);
+            call_tool("emu_next_frame", &json!({"buttons": ["right"]}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""id":5"#));
     }
@@ -934,7 +951,7 @@ mod tests {
             Ok(r#"{"id":1,"ok":true,"data":{"cart":"target/ggo-emulate/worlds-arena.ggo","world":"worlds/arena","lines":[]}}"#.to_string())
         };
         let (content, is_err) =
-            call_tool("cart_pack", &json!({"world": "worlds/arena"}), dir.path(), &connect);
+            call_tool("cart_pack", &json!({"world": "worlds/arena"}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains("worlds-arena.ggo"));
     }
@@ -950,7 +967,7 @@ mod tests {
         );
         let connect = move |_: &Path, _: &str, _: Duration| -> std::io::Result<String> { Ok(reply.clone()) };
         let (content, is_err) =
-            call_tool("emu_next_frame", &json!({"screenshot": true}), dir.path(), &connect);
+            call_tool("emu_next_frame", &json!({"screenshot": true}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[1]["type"], "image");
         let png = base64::engine::general_purpose::STANDARD
@@ -976,10 +993,10 @@ mod tests {
                 Ok(r#"{"id":1,"ok":true,"data":{"lines":["a","panic: b"]}}"#.to_string())
             }
         };
-        let (content, is_err) = call_tool("emu_screenshot", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("emu_screenshot", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[0]["type"], "image");
-        let (content, is_err) = call_tool("emu_uart", &json!({"tail": 2}), dir.path(), &connect);
+        let (content, is_err) = call_tool("emu_uart", &json!({"tail": 2}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[0]["text"], "a\npanic: b");
     }
@@ -992,9 +1009,9 @@ mod tests {
             assert!(line.contains(r#""cmd":"run""#) && line.contains(r#""cart":"a.ggo""#), "{line}");
             Ok(r#"{"id":1,"ok":true,"data":{"started":true,"frame":1,"running":true}}"#.to_string())
         };
-        let (content, is_err) = call_tool("emu_run", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("emu_run", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(is_err && content[0]["text"].as_str().unwrap().contains("cart"), "{content:?}");
-        let (content, is_err) = call_tool("emu_run", &json!({"cart": "a.ggo"}), dir.path(), &connect);
+        let (content, is_err) = call_tool("emu_run", &json!({"cart": "a.ggo"}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""running":true"#));
     }
@@ -1012,7 +1029,7 @@ mod tests {
             ))
         };
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "map", "layer": 2}), dir.path(), &connect);
+            call_tool("emu_debug", &json!({"view": "map", "layer": 2}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(
             !content[0]["text"].as_str().unwrap().contains("bgra_base64"),
@@ -1020,7 +1037,7 @@ mod tests {
         );
         assert_eq!(content[1]["type"], "image");
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "sprites"}), dir.path(), &connect);
+            call_tool("emu_debug", &json!({"view": "sprites"}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(is_err && content[0]["text"].as_str().unwrap().contains("view must be"), "{content:?}");
     }
 
@@ -1032,11 +1049,11 @@ mod tests {
             panic!("a negative index must never reach the host")
         };
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "map", "layer": -1}), dir.path(), &connect);
+            call_tool("emu_debug", &json!({"view": "map", "layer": -1}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains("layer must be >= 0"), "{content:?}");
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "tiles", "bank": -2}), dir.path(), &connect);
+            call_tool("emu_debug", &json!({"view": "tiles", "bank": -2}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(is_err && content[0]["text"].as_str().unwrap().contains("bank must be >= 0"), "{content:?}");
     }
 
@@ -1048,7 +1065,7 @@ mod tests {
             Ok(r#"{"id":1,"ok":false,"error":"no cart at /proj/nope.ggo"}"#.to_string())
         };
         let (content, is_err) =
-            call_tool("emu_start", &json!({"cart": "nope.ggo"}), dir.path(), &connect);
+            call_tool("emu_start", &json!({"cart": "nope.ggo"}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(is_err);
         assert_eq!(content[0]["text"], "no cart at /proj/nope.ggo");
     }
@@ -1065,9 +1082,9 @@ mod tests {
                 Ok(r#"{"id":1,"ok":true,"data":{"stem":"worlds/arena","dirty":false,"entities":[]}}"#.to_string())
             }
         };
-        let (content, is_err) = call_tool("world_list", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("world_list", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err && content[0]["text"].as_str().unwrap().contains("worlds/arena"), "{content:?}");
-        let (content, is_err) = call_tool("world_read", &json!({"world": "worlds/arena"}), dir.path(), &connect);
+        let (content, is_err) = call_tool("world_read", &json!({"world": "worlds/arena"}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err && content[0]["text"].as_str().unwrap().contains(r#""dirty":false"#), "{content:?}");
     }
 
@@ -1087,7 +1104,7 @@ mod tests {
             ))
         };
         let (content, is_err) =
-            call_tool("world_screenshot", &json!({"full": true}), dir.path(), &connect);
+            call_tool("world_screenshot", &json!({"full": true}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[0]["type"], "image");
     }
@@ -1188,6 +1205,7 @@ mod tests {
             "hw_flash",
             &json!({"world": "worlds/chase_cam", "rebuild_gateware": true, "collect_seconds": 30}),
             dir.path(),
+            UNREACHABLE_DB_URL,
             &connect,
         );
         assert!(!is_err, "{content:?}");
@@ -1207,7 +1225,7 @@ mod tests {
             (json!({"world": "worlds/a", "baud": -1}), "baud"),
             (json!({"world": "worlds/a", "collect_seconds": 0}), "collect_seconds"),
         ] {
-            let (content, is_err) = call_tool("hw_flash", &args, dir.path(), &connect);
+            let (content, is_err) = call_tool("hw_flash", &args, dir.path(), UNREACHABLE_DB_URL, &connect);
             assert!(is_err, "{content:?}");
             assert!(content[0]["text"].as_str().unwrap().contains(word), "{content:?}");
         }
@@ -1221,7 +1239,7 @@ mod tests {
             assert!(line.contains(r#""cmd":"flash_status""#), "{line}");
             Ok(r#"{"id":1,"ok":true,"data":{"active":true,"phase":"Boot verify (UART)","verdict":null,"diag_run_id":"r1","perf_run_id":null}}"#.to_string())
         };
-        let (content, is_err) = call_tool("hw_flash_status", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("hw_flash_status", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains(r#""phase":"Boot verify (UART)""#), "{text}");
@@ -1239,10 +1257,10 @@ mod tests {
                 Ok(r#"{"id":1,"ok":true,"data":{"cancelled":true}}"#.to_string())
             }
         };
-        let (content, is_err) = call_tool("hw_env", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("hw_env", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""code":"port""#));
-        let (content, is_err) = call_tool("hw_flash_cancel", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("hw_flash_cancel", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""cancelled":true"#));
     }
@@ -1305,7 +1323,7 @@ mod tests {
         };
         // `60.0`, not `60`: MCP clients routinely send whole numbers as floats.
         let (content, is_err) =
-            call_tool("hw_flash_wait", &json!({"timeout_s": 60.0}), dir.path(), &connect);
+            call_tool("hw_flash_wait", &json!({"timeout_s": 60.0}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":false"#));
     }
@@ -1322,13 +1340,13 @@ mod tests {
             Ok(r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Done","verdict":true,"diag_run_id":"r1","perf_run_id":3}}"#.to_string())
         };
         for bad in [json!({"timeout_s": 0}), json!({"timeout_s": -5}), json!({"timeout_s": 0.0})] {
-            let (content, is_err) = call_tool("hw_flash_wait", &bad, dir.path(), &connect);
+            let (content, is_err) = call_tool("hw_flash_wait", &bad, dir.path(), UNREACHABLE_DB_URL, &connect);
             assert!(is_err, "{bad} must be rejected: {content:?}");
             assert_eq!(content[0]["text"], "timeout_s must be > 0", "{bad}");
         }
 
         // Omitted is what asks for the default, and still runs normally.
-        let (content, is_err) = call_tool("hw_flash_wait", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("hw_flash_wait", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":true"#));
         assert_eq!(DEFAULT_FLASH_TIMEOUT_S, 1800);
@@ -1443,11 +1461,17 @@ mod tests {
     /// A url whose socket directory does not exist, so no read through it
     /// can reach a server. The postgres analog of the old "point at a file
     /// that is not a database" fixture.
+    ///
+    /// It is also what every `call_tool` test that does NOT exercise a
+    /// report tool passes for `db_url`: those tools never open the
+    /// database, and pointing them at an unreachable url means a routing
+    /// mistake fails loudly instead of quietly reading (and migrating) the
+    /// developer's own database. The report tools get a `TestDb` instead.
     const UNREACHABLE_DB_URL: &str = "postgres://ggo@localhost/ggo?host=/nonexistent/ggo-pg-socket";
 
-    /// A run id no serial sequence will ever hand out, so the tests that
-    /// go through `call_tool` -- which resolves the REAL database, the
-    /// developer's own -- cannot collide with a run that is actually in it.
+    /// A run id no serial sequence will ever hand out, so it is missing
+    /// from the seeded fixture database however many runs are inserted
+    /// into it.
     const UNKNOWN_RUN: i64 = i64::MAX;
 
     #[test]
@@ -1523,24 +1547,25 @@ mod tests {
     /// `open_report_cmd` BEFORE it reaches for a socket, so an unknown run
     /// is a tool error rather than a Reports tab that lands on the list.
     ///
-    /// This entry point resolves the database itself ([`db_url`]), i.e.
-    /// the developer's own -- so the assertion is only that the error is
-    /// ABOUT the run asked for, which holds whether the run is missing
-    /// ("no run N") or the database could not be read at all ("reading run
-    /// N: ..."). The exact sentence is pinned against a fixture database
-    /// by `open_report_cmd_takes_a_run_or_a_fault_and_needs_one_of_them`.
+    /// `call_tool` takes the database as a parameter, so this points it at
+    /// the seeded fixture -- never the developer's own -- and the error is
+    /// pinned to its exact sentence. That sentence is also what proves the
+    /// url is really threaded through: an unreached database would answer
+    /// "reading run N: ..." instead.
     #[test]
     fn open_report_rejects_an_unknown_run_before_touching_zed() {
-        let dir = tempfile::tempdir().unwrap();
+        // `dir` doubles as the session registry here; the run branch of
+        // `open_report_cmd` reads the database only, never `~/.ggo`.
+        let (db, dir) = seeded_db();
         fake_session(dir.path(), std::process::id());
         let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
             panic!("no socket call for a run that does not exist")
         };
         let (content, is_err) =
-            call_tool("open_ggo_report", &json!({"run": UNKNOWN_RUN}), dir.path(), &connect);
+            call_tool("open_ggo_report", &json!({"run": UNKNOWN_RUN}), dir.path(), db.url(), &connect);
         assert!(is_err, "{content:?}");
         assert!(
-            content[0]["text"].as_str().unwrap().contains(&UNKNOWN_RUN.to_string()),
+            content[0]["text"].as_str().unwrap().contains(&format!("no run {UNKNOWN_RUN}")),
             "{content:?}"
         );
     }
@@ -1553,7 +1578,7 @@ mod tests {
             assert!(line.contains(r#""cmd":"close_report""#) && line.contains(r#""run":55"#), "{line}");
             Ok(r#"{"id":1,"ok":true,"data":{"closed":true}}"#.to_string())
         };
-        let (content, is_err) = call_tool("close_ggo_report", &json!({"run": 55}), dir.path(), &connect);
+        let (content, is_err) = call_tool("close_ggo_report", &json!({"run": 55}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""closed":true"#));
     }
@@ -1767,7 +1792,7 @@ mod tests {
         let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
             panic!("no socket call without a report to open")
         };
-        let (content, is_err) = call_tool("open_ggo_report", &json!({}), dir.path(), &connect);
+        let (content, is_err) = call_tool("open_ggo_report", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(is_err, "{content:?}");
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains("run") && text.contains("fault"), "{text}");

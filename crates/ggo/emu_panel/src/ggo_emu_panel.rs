@@ -94,6 +94,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ggo_charts_panel::history::NO_DATABASE_URL;
 use ggo_worldlib::charts::reports::diag_db;
 use gpui::{
     AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable,
@@ -328,9 +329,13 @@ impl IngestStatus {
 /// the database), so callers stay off the UI thread. Named rather than
 /// inline in the spawn so the failure paths -- malformed perf JSON, an
 /// unreachable database -- are testable without a real session to end.
+///
+/// `db_url` is the already-resolved database ([`EmuPanel::db_url`]),
+/// `None` only when no url could be resolved at all -- which is why the
+/// tests can reach that branch without touching the environment.
 fn ingest_finished_run(
     finished: &drive::FinishedRun,
-    db_url_override: Option<String>,
+    db_url: Option<String>,
     label: &str,
 ) -> IngestStatus {
     match &finished.perf {
@@ -340,11 +345,11 @@ fn ingest_finished_run(
         // picker.
         None => IngestStatus::NoFrames,
         Some(perf) if perf.frames == 0 => IngestStatus::NoFrames,
-        Some(perf) => match db_url_override.or_else(|| ggo_db::url().ok()) {
-            None => IngestStatus::Failed(format!(
-                "no database url; {}",
-                ggo_db::INSTALL_HINT
-            )),
+        Some(perf) => match db_url {
+            // Not a broken install -- `ggo_db::url()` only fails with no
+            // `$HOME` -- so this says what is true and nothing more, in
+            // the same words the charts and reports panels use for it.
+            None => IngestStatus::Failed(NO_DATABASE_URL.to_string()),
             Some(db_url) => {
                 match ingest::ingest_run(&db_url, &perf.perf_json, &finished.uart, Some(label)) {
                     Ok(run) => IngestStatus::Done(run.run_id, run.truncated_frames),
@@ -1644,10 +1649,11 @@ impl EmuPanel {
         // sources has an identity to attach; this pane always knows which
         // file it ran.
         let label = session.cart.clone();
-        let db_url_override = self.db_url_override.clone();
+        // Resolved here, on the thread the override lives on.
+        let db_url = self.db_url();
         let finish = cx.background_spawn(async move {
             let finished = session.wait();
-            let status = ingest_finished_run(&finished, db_url_override, &label);
+            let status = ingest_finished_run(&finished, db_url, &label);
             (finished.reason, finished.is_error, status)
         });
         cx.spawn(async move |this, cx| {
@@ -6741,6 +6747,32 @@ mod tests {
             0,
             "a run that cannot be parsed must not write a run row"
         );
+    }
+
+    /// With no database url at all, the ingest fails with the plain fact
+    /// -- the same sentence the charts and reports panels show -- and NOT
+    /// with an install hint: `ggo_db::url()` only fails when `$HOME` is
+    /// unset, which `scripts/pg-install.sh` would not fix.
+    #[test]
+    fn no_database_url_fails_the_ingest_with_the_shared_wording() {
+        let finished = drive::FinishedRun {
+            reason: "cart exited".to_string(),
+            is_error: false,
+            perf: Some(drive::PerfSnapshot {
+                cart: "Green Fix".to_string(),
+                perf_json: "{}".to_string(),
+                frames: 3,
+            }),
+            uart: Vec::new(),
+        };
+
+        let status = ingest_finished_run(&finished, None, "green.cart");
+
+        let IngestStatus::Failed(reason) = &status else {
+            panic!("no database url must fail the ingest: {status:?}");
+        };
+        assert_eq!(reason, NO_DATABASE_URL);
+        assert!(!reason.contains(ggo_db::INSTALL_HINT), "{reason}");
     }
 
     /// `run` rows in `db_url`, for the "the ingest wrote nothing"
