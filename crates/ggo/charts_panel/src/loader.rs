@@ -396,9 +396,9 @@ mod tests {
 
     // -------------------------------------------------- per-run samples
 
-    // The three tests that used to live here decoded hand-built
-    // `turso::Value` rows through this module's own `row_to_frame`, which
-    // no longer exists -- `perf_db` decodes those rows now. What each of
+    // The three tests that used to live here decoded hand-built driver
+    // rows through this module's own `row_to_frame`, which no longer
+    // exists -- `perf_db` decodes those rows now. What each of
     // them was pinning, and where that landed, exactly:
     //
     // * **Select-list order.** Pinned by worldlib

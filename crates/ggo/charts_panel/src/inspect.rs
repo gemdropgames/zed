@@ -60,7 +60,7 @@ use crate::loader::ProfileRow;
 /// it builds a run's perf JSON (function-level attribution needs the
 /// cart's companion ELF and `ggo-emu`'s DWARF tooling, neither of which
 /// `ggo-emu-core` has), so `ingest::parse_output` finds no `"profile"`
-/// section and writes no rows. Every profile row in `ggo_ide.db` was
+/// section and writes no rows. Every profile row this panel can show was
 /// therefore ingested from a native `ggo-emu --profile <elf>` capture.
 pub const NO_PROFILE_DATA: &str = "no profile data for this run — the emulator pane does not record it; \
      a native `ggo-emu --profile <elf>` capture does";

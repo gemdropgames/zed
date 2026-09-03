@@ -760,10 +760,26 @@ mod tests {
             FRAME_COL_COUNT,
             "run_id plus every frame counter, one bind each"
         );
+        // Not just the arity: the binds are pushed positionally, so a
+        // REORDER of either array silently writes every counter into the
+        // wrong column. Compare the names the statement lists, in order.
+        const HEAD_PREFIX: &str = "INSERT INTO frame(";
+        const HEAD_SUFFIX: &str = ")";
+        let named: Vec<&str> = FRAME_INSERT_HEAD
+            .trim()
+            .strip_prefix(HEAD_PREFIX)
+            .and_then(|list| list.strip_suffix(HEAD_SUFFIX))
+            .expect("the insert head is `INSERT INTO frame(<columns>)`")
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let bound: Vec<&str> = std::iter::once("run_id")
+            .chain(FRAME_COLS)
+            .chain(EXTRA_COLS)
+            .collect();
         assert_eq!(
-            FRAME_INSERT_HEAD.matches(',').count() + 1,
-            FRAME_COL_COUNT,
-            "and the column list names exactly those"
+            named, bound,
+            "the column list names exactly the bound columns, in bind order"
         );
     }
 

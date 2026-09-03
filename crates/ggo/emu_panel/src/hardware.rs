@@ -5,10 +5,9 @@
 //! flash-backed sd-emu card image (GemOS + assets + the game), flashes the
 //! cached bitstream with `fujprog`, boot-verifies over UART and records
 //! the run in the GemdropGo database -- the rows `ggo_charts_panel`
-//! reads. This
-//! module owns the rules around that call and nothing else: what the
-//! machine is missing, the argv, how to read the CLI's progress, and how
-//! to install what is absent. Every function here is pure and unit-tested
+//! reads. This module owns the rules around that call and nothing else:
+//! what the machine is missing, the argv, how to read the CLI's progress,
+//! and how to install what is absent. Every function here is pure and unit-tested
 //! without spawning anything; the panel is the part that spawns.
 //!
 //! **Not** a `.cart` write to a cartridge's QSPI NOR: `ggo-flash` is still

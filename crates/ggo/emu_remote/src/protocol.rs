@@ -51,9 +51,10 @@ pub enum Cmd {
     },
     /// Snapshot of the current/last flash.
     FlashStatus { workspace: Option<String> },
-    /// Open the Reports tab on perf run `run` (an id in ~/.ggo/ggo_ide.db)
-    /// or on daemon fault `fault` (a dump stem in the same database's
-    /// `fault` table). `run` wins when both are given; neither is an error.
+    /// Open the Reports tab on perf run `run` (a `run.id` in the shared
+    /// GemdropGo database) or on daemon fault `fault` (a dump stem in the
+    /// same database's `fault` table). `run` wins when both are given;
+    /// neither is an error.
     OpenReport {
         workspace: Option<String>,
         #[serde(default)]
@@ -239,8 +240,9 @@ pub struct FlashStatusPayload {
     pub verdict: Option<bool>,
     /// ggo-diag's TEXT run id, once its `[db] run …` line streamed by.
     pub diag_run_id: Option<String>,
-    /// The cloned perf run id in ~/.ggo/ggo_ide.db, once the run passed
-    /// and the clone resolved (same id the reports page opens).
+    /// The run's perf run id -- `runs.perf_run_id` in the shared
+    /// database -- once the run passed and that lookup resolved (same id
+    /// the reports page opens).
     pub perf_run_id: Option<i64>,
     /// What is being run, e.g. "flashing worlds/chase_cam".
     #[serde(default)]

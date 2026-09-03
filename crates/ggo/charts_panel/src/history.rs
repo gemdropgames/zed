@@ -4,13 +4,12 @@
 //! # Why there is nothing to clone any more
 //!
 //! Until the PostgreSQL migration this module CLONED rows out of
-//! `ggo-diag`'s own `~/.ggo/diag.db` into the fork's `~/.ggo/ggo_ide.db`,
-//! because the two tools owned separate SQLite files and the no-shared-dbs
-//! rule forbade a reader from opening (and therefore migrating) another
-//! tool's file. One database ends that: `runs`/`run_log` ARE the tables
-//! `ggo-diag` writes, so the rail reads them directly and
-//! `diag_db::clone_runs` -- along with every "the clone found a stale/old
-//! diag.db" state it could produce -- is deleted.
+//! `ggo-diag`'s own database into the fork's, because the two tools owned
+//! separate SQLite files and the no-shared-dbs rule forbade a reader from
+//! opening (and therefore migrating) another tool's file. One database
+//! ends that: `runs`/`run_log` ARE the tables `ggo-diag` writes, so the
+//! rail reads them directly and the clone -- along with every "the clone
+//! found a stale copy" state it could produce -- is deleted.
 //!
 //! What survives from that design is the property that made it safe: these
 //! reads are `SELECT`s and nothing else, so the rail may be refreshed at

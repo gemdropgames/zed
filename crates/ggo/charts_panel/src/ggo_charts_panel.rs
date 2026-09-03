@@ -891,8 +891,8 @@ impl ChartsPanel {
     /// UART log -- for a run that passed with no telemetry to chart. The
     /// entry `ggo_emu_panel`'s post-PASS hop takes when
     /// `device_perf_run_id` finds nothing; looked up through the same
-    /// reconciling load the history rail uses, so a run that landed a
-    /// moment ago is there. Generation-guarded like [`Self::open_run`].
+    /// load the history rail uses, so a run that landed a moment ago is
+    /// there. Generation-guarded like [`Self::open_run`].
     pub fn open_device_run(&mut self, diag_run_id: String, cx: &mut Context<Self>) {
         let Some(db_url) = self.db_url() else {
             return;
@@ -4758,8 +4758,7 @@ mod tests {
 
     // ------------------------------------------- R3: the history rail
 
-    /// Seed `ggo-diag`'s OWN database (a separate file, per the
-    /// no-shared-dbs rule `history`'s module doc explains) with one run and
+    /// Seed the shared database `ggo-diag` records into with one run and
     /// a couple of `run_log` lines.
     fn seed_device_run(db_url: &str, id: &str, started_at: &str, verdict: &str) {
         ggo_db::block_on(async {

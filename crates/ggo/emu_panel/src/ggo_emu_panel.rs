@@ -7229,7 +7229,8 @@ mod tests {
 
     /// The board's half of "every finished run routes to its report": a
     /// flash that passes AND said which run it recorded opens the reports
-    /// page on that run's telemetry, cloned out of ggo-diag's own file.
+    /// page on that run's telemetry, found by one lookup of the run id in
+    /// the shared database both ggo-diag and this fork write.
     #[gpui::test]
     async fn test_a_passing_flash_opens_the_report_for_the_run_it_recorded(
         cx: &mut TestAppContext,
@@ -7310,7 +7311,7 @@ mod tests {
 
     /// A run that never named a run id -- a `ggo-diag` too old to print the
     /// line, and every setup or `git pull` run -- passes without hopping.
-    /// Nothing is cloned and nothing is opened; the PASS stands alone.
+    /// Nothing is looked up and nothing is opened; the PASS stands alone.
     #[gpui::test]
     async fn test_a_run_that_recorded_nothing_opens_no_report(cx: &mut TestAppContext) {
         cx.executor().allow_parking();

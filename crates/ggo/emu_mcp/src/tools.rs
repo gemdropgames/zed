@@ -257,10 +257,10 @@ fn call_tool_inner(
         return list_reports(&db_url()?, &ggo_dir()?, limit);
     }
     if name == "fetch_ggo_report" {
-        let (db_url, db_dir) = (db_url()?, ggo_dir()?);
+        let (db_url, ggo_dir) = (db_url()?, ggo_dir()?);
         return match (arg_i64(args, "run"), arg_str(args, "fault")) {
-            (Some(run), _) => fetch_report(&db_url, &db_dir, run),
-            (None, Some(fault)) => fetch_fault(&db_url, &db_dir, &fault),
+            (Some(run), _) => fetch_report(&db_url, &ggo_dir, run),
+            (None, Some(fault)) => fetch_fault(&db_url, &ggo_dir, &fault),
             (None, None) => Err(NEEDS_RUN_OR_FAULT.to_string()),
         };
     }
@@ -574,24 +574,29 @@ const FAULTS_HEADER: &str = "--- faults (local time) ---";
 ///
 /// Device runs need no copying across any more: `ggo-diag` writes its
 /// rows into this same database, so the list reads one source.
-fn list_reports(db_url: &str, db_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
+fn list_reports(db_url: &str, ggo_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
     use ggo_worldlib::charts::reports::{faults, perf_db};
 
     // Before the reads below: a machine that has only ever run the daemon
     // has no fault rows at all until this import writes them.
-    let import_error = import_faults(db_url, db_dir);
+    let import_error = import_faults(db_url, ggo_dir);
     let none = |what: String| {
-        let text = format!("{what}{}", import_failure_note(db_dir, import_error.as_ref()));
+        let text = format!("{what}{}", import_failure_note(ggo_dir, import_error.as_ref()));
         Ok(vec![json!({ "type": "text", "text": text })])
     };
     // The aggregate-free index: `cart_runs` would scan every frame row of
     // every cart for averages this list never prints.
     let rows: Vec<_> = perf_db::run_index(db_url)
-        .map_err(|e| format!("reading runs: {e:#}"))?
+        // The import note rides along: a failing read plus a failing fault
+        // import usually share one cause, and `none` above is the only
+        // other place that note is ever printed.
+        .map_err(|e| {
+            format!("reading runs: {e:#}{}", import_failure_note(ggo_dir, import_error.as_ref()))
+        })?
         .into_iter()
         .map(|r| (r.started_at, r.id, r.cart_name, r.label, r.frames))
         .collect();
-    let logs_dir = db_dir.join("diag").join("logs");
+    let logs_dir = ggo_dir.join("diag").join("logs");
     let run_lines: Vec<String> = rows
         .iter()
         .take(limit)
@@ -643,17 +648,17 @@ fn list_reports(db_url: &str, db_dir: &Path, limit: usize) -> Result<Vec<Value>,
 }
 
 /// One perf run's paste-ready summary out of the ggo database, with the
-/// ggo-diag log beside it from `db_dir`. Both are parameters so tests can
+/// ggo-diag log beside it from `ggo_dir`. Both are parameters so tests can
 /// point at a fixture database and a temp directory; production passes
 /// [`db_url`] and `~/.ggo`.
-fn fetch_report(db_url: &str, db_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
+fn fetch_report(db_url: &str, ggo_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
     use ggo_worldlib::charts::reports::perf_db;
 
     let detail = run_detail_or_missing(db_url, run)?;
     let frames =
         perf_db::run_frames(db_url, run).map_err(|e| format!("reading run {run} frames: {e:#}"))?;
     let mut text = perf_db::run_handoff_text(&detail, &frames);
-    let log = ggo_emu_remote::diag_log_path(&db_dir.join("diag").join("logs"), &detail.started_at);
+    let log = ggo_emu_remote::diag_log_path(&ggo_dir.join("diag").join("logs"), &detail.started_at);
     text.push_str(&format!(
         "\nggo_diag_log: {}\n",
         log.map(|p| p.display().to_string()).unwrap_or_else(|| "- (emulator run, or log pruned)".to_string())
@@ -661,9 +666,9 @@ fn fetch_report(db_url: &str, db_dir: &Path, run: i64) -> Result<Vec<Value>, Str
     Ok(vec![json!({ "type": "text", "text": text })])
 }
 
-/// `ggo-uartd`'s dump directory under `<db_dir>`.
-fn faults_dir(db_dir: &Path) -> std::path::PathBuf {
-    db_dir.join("uartd").join("faults")
+/// `ggo-uartd`'s dump directory under `<ggo_dir>`.
+fn faults_dir(ggo_dir: &Path) -> std::path::PathBuf {
+    ggo_dir.join("uartd").join("faults")
 }
 
 /// Pull every dump the reports database has not seen into it, returning
@@ -672,8 +677,8 @@ fn faults_dir(db_dir: &Path) -> std::path::PathBuf {
 /// -- but a caller looking at an empty faults section is TOLD, since the
 /// failure may be exactly why it is empty. Dumps that individually fail to
 /// parse are skipped (and named on stderr) by `import` itself.
-fn import_faults(db_url: &str, db_dir: &Path) -> Option<String> {
-    let dir = faults_dir(db_dir);
+fn import_faults(db_url: &str, ggo_dir: &Path) -> Option<String> {
+    let dir = faults_dir(ggo_dir);
     match ggo_worldlib::charts::reports::faults::import(&dir, db_url) {
         Ok(_) => None,
         Err(e) => {
@@ -685,10 +690,10 @@ fn import_faults(db_url: &str, db_dir: &Path) -> Option<String> {
 
 /// The parenthetical both "nothing to show" messages carry when the
 /// import is why there is nothing.
-fn import_failure_note(db_dir: &Path, error: Option<&String>) -> String {
+fn import_failure_note(ggo_dir: &Path, error: Option<&String>) -> String {
     match error {
         Some(e) => {
-            format!(" (and importing faults from {} failed: {e})", faults_dir(db_dir).display())
+            format!(" (and importing faults from {} failed: {e})", faults_dir(ggo_dir).display())
         }
         None => String::new(),
     }
@@ -702,19 +707,19 @@ const FAULT_LINES_AFTER: usize = 5;
 
 /// One daemon fault's paste-ready digest out of the ggo database: header,
 /// boot stage, telemetry, parsed panics and asset failures, the fault line
-/// in context, and the path of the raw dump under `db_dir`.
-fn fetch_fault(db_url: &str, db_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
+/// in context, and the path of the raw dump under `ggo_dir`.
+fn fetch_fault(db_url: &str, ggo_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
     use ggo_worldlib::charts::reports::faults;
 
     // A dump written seconds ago is fetchable by id straight from the
     // list, without the panel having been opened in between.
-    let import_error = import_faults(db_url, db_dir);
+    let import_error = import_faults(db_url, ggo_dir);
     let detail = faults::load(db_url, id)
         .map_err(|e| format!("reading fault {id}: {e}"))?
         .ok_or_else(|| {
             format!(
                 "no fault {id} in {DB_NAME}{}",
-                import_failure_note(db_dir, import_error.as_ref())
+                import_failure_note(ggo_dir, import_error.as_ref())
             )
         })?;
     let row = &detail.row;
@@ -779,7 +784,7 @@ fn fetch_fault(db_url: &str, db_dir: &Path, id: &str) -> Result<Vec<Value>, Stri
             }
         }
     }
-    let raw = faults::raw_path(&faults_dir(db_dir), id);
+    let raw = faults::raw_path(&faults_dir(ggo_dir), id);
     // The daemon prunes its dumps and the row outlives the file, so the
     // path alone would be a broken promise.
     let pruned = if raw.is_file() { "" } else { " (pruned; the bytes are in the report db)" };
@@ -792,7 +797,7 @@ fn fetch_fault(db_url: &str, db_dir: &Path, id: &str) -> Result<Vec<Value>, Stri
 /// lands on the runs list.
 fn open_report_cmd(
     db_url: &str,
-    db_dir: &Path,
+    ggo_dir: &Path,
     workspace: Option<String>,
     args: &Value,
 ) -> Result<Cmd, String> {
@@ -804,14 +809,14 @@ fn open_report_cmd(
             Ok(Cmd::OpenReport { workspace, run: Some(run), fault: None })
         }
         (None, Some(fault)) => {
-            let import_error = import_faults(db_url, db_dir);
+            let import_error = import_faults(db_url, ggo_dir);
             if faults::load(db_url, &fault)
                 .map_err(|e| format!("reading fault {fault}: {e}"))?
                 .is_none()
             {
                 return Err(format!(
                     "no fault {fault} in {DB_NAME}{}",
-                    import_failure_note(db_dir, import_error.as_ref())
+                    import_failure_note(ggo_dir, import_error.as_ref())
                 ));
             }
             Ok(Cmd::OpenReport { workspace, run: None, fault: Some(fault) })
@@ -1499,6 +1504,19 @@ mod tests {
         assert!(err.contains(ggo_db::INSTALL_HINT), "{err}");
     }
 
+    /// The fault import runs BEFORE the run read, so an unreachable
+    /// database fails both -- and the import's reason must ride out on the
+    /// error the run read returns instead of being dropped with it.
+    #[test]
+    fn an_unreachable_database_reports_the_failed_fault_import_too() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_fault_dump(dir.path());
+        let err = list_reports(UNREACHABLE_DB_URL, dir.path(), 20).unwrap_err();
+        assert!(err.starts_with("reading runs: "), "{err}");
+        assert!(err.contains("importing faults from"), "{err}");
+        assert!(err.contains("uartd/faults"), "{err}");
+    }
+
     /// The routing test: `call_tool` checks the id through
     /// `open_report_cmd` BEFORE it reaches for a socket, so an unknown run
     /// is a tool error rather than a Reports tab that lands on the list.
@@ -1567,13 +1585,13 @@ mod tests {
         assert!(err.contains(ggo_db::INSTALL_HINT), "{err}");
     }
 
-    /// The dump `ggo-uartd` would leave in `<db_dir>/uartd/faults`: a
+    /// The dump `ggo-uartd` would leave in `<ggo_dir>/uartd/faults`: a
     /// marker fault whose window carries a boot marker, an asset failure,
     /// a panic and the marker line itself. Returns the file's path.
     const FAULT_ID: &str = "2026-09-02_08-49-33_marker";
 
-    fn seed_fault_dump(db_dir: &Path) -> PathBuf {
-        let faults = db_dir.join("uartd").join("faults");
+    fn seed_fault_dump(ggo_dir: &Path) -> PathBuf {
+        let faults = ggo_dir.join("uartd").join("faults");
         std::fs::create_dir_all(&faults).unwrap();
         let path = faults.join(format!("{FAULT_ID}.log"));
         std::fs::write(
