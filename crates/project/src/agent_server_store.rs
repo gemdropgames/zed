@@ -1395,7 +1395,9 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
                 .run_npm_subcommand(
                     Some(&install_dir),
                     "install",
-                    &[package_spec.as_str(), "--save-exact"],
+                    // npm's audit POST to the registry can hang indefinitely with no
+                    // fetch timeout, leaving the agent stuck in "loading".
+                    &[package_spec.as_str(), "--save-exact", "--no-audit"],
                 )
                 .await?;
             let executable = node_runtime::read_package_executable(
