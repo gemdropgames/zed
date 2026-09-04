@@ -182,11 +182,13 @@ Rules:
   --release`; a user-run flash + `ggo-diag` full run for TX parity and a
   host-send → `comm-echo` cart round trip for RX.
 - `ggo-emu-core` sandbox mode: `Peripherals` gains the OS-equivalent RX
-  path (injected bytes → ggo-wire decoder → APP queue of depth 4, drop
-  counters mirroring `CommStatus`) and TX (encoded frames appended to the
-  existing `log_sink` so `take_uart` returns them). `runtime.rs` gains
-  `COMM_SEND`, `COMM_RECV`, `COMM_STATUS` arms with the same pointer and
-  length validation the `LOG` arm does. Host API: `Peripherals::uart_inject(&[u8])`.
+  path by reusing `ggo_hal::comm::CommState` (injected bytes → ggo-wire
+  decoder → APP queue of depth 4, drop counters mirroring `CommStatus`)
+  and a separate TX byte buffer of encoded frames (`take_comm`), kept apart
+  from the raw-text `log_sink` the sandbox console already reads.
+  `runtime.rs` gains `COMM_SEND`, `COMM_RECV`, `COMM_STATUS` arms with the
+  same pointer and length validation the `LOG` and `SAVE_READ` arms do.
+  Host API: `Peripherals::uart_inject(&[u8])`, `Peripherals::take_comm()`.
   Test: sandbox echo cart round trip, mirroring the full-system echo test.
 - `ggo-emu-core` depends on `ggo-wire` (already a `no_std` crate in
   `firmware/`) for the decoder; `ggo-comm`'s `MessageReader` stays the host
