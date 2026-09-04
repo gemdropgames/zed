@@ -16,11 +16,13 @@ pub struct Request {
 /// than one workspace; omitted, the host picks the only one and errors if
 /// that is ambiguous.
 ///
-/// Emulation is LOCK-STEP: `Start` boots a cart and pauses at a frame
-/// boundary; each `NextFrame` latches the pad and runs exactly one frame;
-/// every reply carries the cart's own world-inspection JSON (worlds that
-/// declare `InspectWorld` — see emerald-world's `inspect`), so a script,
-/// an AI, or any other caller can play the emulator frame by frame.
+/// Emulation is LOCK-STEP by default: `Start` boots a cart and pauses at
+/// a frame boundary; each `NextFrame` latches the pad and runs the frames
+/// it was asked for; every reply carries the cart's own world-inspection
+/// JSON (worlds that declare `InspectWorld` — see emerald-world's
+/// `inspect`), so a script, an AI, or any other caller can play the
+/// emulator frame by frame. `Start { freerun: true }` opts out into the
+/// free-running behaviour of [`Cmd::Run`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Cmd {
@@ -28,17 +30,25 @@ pub enum Cmd {
     Status,
     /// Boot `cart` (worktree-relative; pack first with
     /// `emd pack-ggo [--world <stem>]`), pause at the first frame
-    /// boundary, and report the initial world state.
-    Start { workspace: Option<String>, cart: String },
-    /// Latch `buttons` as the held pad (empty releases all), run exactly
-    /// one frame, and report the new world state. `screenshot` also
-    /// returns the presented framebuffer.
+    /// boundary, and report the initial world state. `freerun` boots the
+    /// cart free-running instead — exactly what [`Cmd::Run`] does.
+    Start {
+        workspace: Option<String>,
+        cart: String,
+        #[serde(default)]
+        freerun: bool,
+    },
+    /// Latch `buttons` as the held pad (empty releases all), run `frames`
+    /// frames (default 1), and report the new world state. `screenshot`
+    /// also returns the presented framebuffer.
     NextFrame {
         workspace: Option<String>,
         #[serde(default)]
         buttons: Vec<String>,
         #[serde(default)]
         screenshot: bool,
+        #[serde(default)]
+        frames: Option<u32>,
     },
     /// End the run; the reply carries the cart's uart log.
     Stop { workspace: Option<String> },
@@ -341,26 +351,50 @@ mod tests {
         let req = parse_request(r#"{"id":7,"cmd":"start","workspace":"/w","cart":"wilds.ggo"}"#).unwrap();
         assert_eq!(
             req.cmd,
-            Cmd::Start { workspace: Some("/w".to_string()), cart: "wilds.ggo".to_string() }
+            Cmd::Start {
+                workspace: Some("/w".to_string()),
+                cart: "wilds.ggo".to_string(),
+                freerun: false,
+            }
         );
-        let req = parse_request(r#"{"id":8,"cmd":"next_frame","buttons":["right","z"],"screenshot":true}"#).unwrap();
+        let req = parse_request(
+            r#"{"id":8,"cmd":"next_frame","buttons":["right","z"],"screenshot":true,"frames":5}"#,
+        )
+        .unwrap();
         assert_eq!(
             req.cmd,
             Cmd::NextFrame {
                 workspace: None,
                 buttons: vec!["right".to_string(), "z".to_string()],
                 screenshot: true,
+                frames: Some(5),
             }
+        );
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        let req = parse_request(r#"{"id":9,"cmd":"start","cart":"wilds.ggo","freerun":true}"#).unwrap();
+        assert_eq!(
+            req.cmd,
+            Cmd::Start { workspace: None, cart: "wilds.ggo".to_string(), freerun: true }
         );
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
     }
 
+    /// The omitted halves are the lock-step ones: a caller who forgets a
+    /// field gets one frame under its own control, never a free run.
     #[test]
     fn next_frame_defaults_release_all_and_no_screenshot() {
         let req = parse_request(r#"{"id":1,"cmd":"next_frame"}"#).unwrap();
-        assert_eq!(req.cmd, Cmd::NextFrame { workspace: None, buttons: vec![], screenshot: false });
+        assert_eq!(
+            req.cmd,
+            Cmd::NextFrame { workspace: None, buttons: vec![], screenshot: false, frames: None }
+        );
         assert_eq!(parse_request(r#"{"id":2,"cmd":"status"}"#).unwrap().cmd, Cmd::Status);
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"start","cart":"a.ggo"}"#).unwrap().cmd,
+            Cmd::Start { workspace: None, cart: "a.ggo".to_string(), freerun: false }
+        );
     }
 
     #[test]

@@ -378,6 +378,10 @@ pub struct EmuPanel {
     /// The cart the file explorer last routed here, as a project-relative
     /// `/`-separated path. `None` until something is clicked.
     selected: Option<String>,
+    /// The run in flight was started over the MCP socket, so the tab says
+    /// so: a cart the user did not press Run on, stepping under an
+    /// agent's control, must not look like an ordinary run.
+    remote_controlled: bool,
 
     /// Bumped every time [`Self::run`] starts a new session. [`Self::
     /// finish_run`] captures this at call time and its background
@@ -647,6 +651,7 @@ impl EmuPanel {
             db_url_override: None,
             project_root: None,
             selected: None,
+            remote_controlled: false,
             run_generation: 0,
             proc_runner: ggo_common::system_proc_runner(),
             diag_env_override: None,
@@ -1523,6 +1528,9 @@ impl EmuPanel {
     /// so Run is idempotent-ish (restart) rather than a way to end up
     /// with two emulator threads fighting over one pane.
     pub(crate) fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Whoever pressed Run owns the run from here; `remote_boot`
+        // re-marks its own after calling this.
+        self.remote_controlled = false;
         let (Some(root), Some(cart)) = (self.project_root.clone(), self.selected.clone()) else {
             self.report_failure("no cart selected".to_string(), cx);
             return;
@@ -1618,6 +1626,7 @@ impl EmuPanel {
         let Some(session) = self.session.take() else {
             return;
         };
+        self.remote_controlled = false;
         // The run this call is finishing -- captured now, before anything
         // async, so it names THIS run regardless of whichever run
         // `run_generation` points at by the time the background task
@@ -3311,6 +3320,12 @@ impl EmuPanel {
             .map(|stem| stem.to_string_lossy().into_owned())
     }
 
+    /// The run in flight was started over the MCP socket (the tab says
+    /// ` · MCP` while it is).
+    pub(crate) fn is_remote_controlled(&self) -> bool {
+        self.remote_controlled
+    }
+
     /// A workspace-less panel in a real test window -- the shape
     /// `TestAppContext::add_window_view` wants. Tests that don't need a
     /// window call `Self::new(None, None, cx)` directly.
@@ -3375,7 +3390,13 @@ impl EmuPanel {
         self.run(window, cx);
         match (&self.status_is_error, &self.status) {
             (true, Some(status)) => Err(status.clone()),
-            _ => Ok(()),
+            _ => {
+                // After `run`, which clears the flag for the user's own
+                // Run button; `cx.notify` is what redraws the tab title.
+                self.remote_controlled = true;
+                cx.notify();
+                Ok(())
+            }
         }
     }
 
@@ -3519,9 +3540,7 @@ impl EmuPanel {
         if !session.is_paused() {
             return Err("not paused — pause first, then step".to_string());
         }
-        for _ in 0..frames {
-            session.step();
-        }
+        session.step_by(frames);
         Ok(())
     }
 
@@ -4785,6 +4804,53 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+    }
+
+    /// The tab's ` · MCP` marker tracks who owns the run: a remote boot
+    /// sets it, the user's own Run button takes the run back, and Stop
+    /// leaves nothing marked.
+    #[gpui::test]
+    async fn test_a_remote_boot_marks_the_run_until_the_user_takes_it_back(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let db = ggo_db::TestDb::new();
+        std::fs::write(
+            dir.path().join("green.cart"),
+            drive::fixture::green_screen_cart(),
+        )
+        .unwrap();
+
+        let (panel, cx) = windowed_panel(cx);
+        panel.update(cx, |panel, _| {
+            panel.db_url_override = Some(db.url().to_string());
+        });
+        let root = dir.path().to_path_buf();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .remote_boot("green.cart".to_string(), root.clone(), window, cx)
+                .expect("the fixture cart boots");
+            assert!(panel.is_remote_controlled(), "the agent started this run");
+        });
+
+        // The user's own Run button restarts the same cart -- and the run
+        // is theirs from then on.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.run(window, cx);
+            assert!(!panel.is_remote_controlled(), "the user took the run back");
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .remote_boot("green.cart".to_string(), root, window, cx)
+                .expect("the fixture cart boots");
+            assert!(panel.is_remote_controlled());
+            panel.stop(window, cx);
+            assert!(!panel.is_remote_controlled(), "no run, nothing to mark");
+        });
+        cx.executor().run_until_parked();
     }
 
     /// **The `project_panel.rs` hook itself, end to end.** Every other

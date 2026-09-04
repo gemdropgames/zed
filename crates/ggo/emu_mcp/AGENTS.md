@@ -1,8 +1,9 @@
 # zedgg-emu-mcp — agent contract
 
 An MCP (stdio) server that drives the GGO toolchain inside a running Zed
-session: emulator control in both modes (LOCK-STEP — boot paused, one
-frame per call, the cart's own world state back — and free-running), the
+session: emulator control in both modes (LOCK-STEP by default — boot
+paused, the frames you ask for per call, the cart's own world state back
+— and free-running, which `emu_start` takes `freerun: true` for), the
 PPU inspector, cart packing, hardware flash with its readiness probe,
 perf reports, and reads of the authored world. Everything it does is
 visible in the user's Zed as it happens.
@@ -38,15 +39,14 @@ candidate is live. Start with `zed_sessions` when unsure.
 |---|---|
 | `zed_sessions` | live sessions: pid, workspaces, panel status |
 | `emu_status` | what the target session's panels are doing |
-| `emu_start { cart }` | boot + pause at the first frame boundary; returns initial world JSON |
-| `emu_next_frame { buttons?, screenshot? }` | latch pad, run EXACTLY one frame; returns new world JSON (+ PNG if asked) |
+| `emu_start { cart, freerun? }` | boot + pause at the first frame boundary (lock-step); returns initial world JSON. Focuses the emulator tab and marks it ` · MCP`. `freerun: true` boots free-running instead (the Run button, no lock-step, no world JSON) -- watch it with `emu_screenshot`/`emu_uart`, `emu_pause` |
+| `emu_next_frame { buttons?, screenshot?, frames? }` | latch pad, run EXACTLY `frames` frames (default 1, max 60000); returns new world JSON (+ PNG if asked) |
 | `emu_stop` | end the run; returns the cart's uart log |
 | `emu_screenshot` | last presented frame as PNG, any run mode |
 | `emu_uart { tail? }` | the run's UART/console log, readable mid-run |
-| `emu_run { cart }` | boot a cart free-running (the Run button); watch with `emu_screenshot`/`emu_uart` |
 | `emu_pause` / `emu_resume` | pause/resume the live run; `{ paused, frame, running }` |
 | `emu_debug { view, bank?, palette?, layer? }` | PPU inspector: tiles / map / oam as PNG + data, palettes as hex |
-| `cart_pack { world }` | `emd pack-ggo` one world into `target/ggo-emulate/`; `{ cart }` feeds `emu_start`/`emu_run` |
+| `cart_pack { world }` | `emd pack-ggo` one world into `target/ggo-emulate/`; `{ cart }` feeds `emu_start` |
 | `hw_flash { world?, rebuild_gateware?, tty?, baud?, collect_seconds?, telemetry? }` | flash a world to the BOARD and run it; returns once the flash STARTS, with the effective `config` (defaults: cached gateware, first serial port, 460800 baud, 120s capture) |
 | `hw_flash_status` | snapshot: `{ active, what, phase, detail, elapsed_s, phases[], diag_steps[], verdict, failure, diag_run_id, perf_run_id, transcript, console_tail[] }` — poll it for running context |
 | `hw_flash_wait { timeout_s? }` | poll until the flash reaches a verdict (default 1800s) |

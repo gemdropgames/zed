@@ -253,8 +253,15 @@ impl Session {
     /// unless paused (the pane pauses first, so Step while running is
     /// "pause", not "skip a frame").
     pub fn step(&self) {
+        self.step_by(1);
+    }
+
+    /// [`Self::step`] for `frames` frames: ONE add, so a long lock-step
+    /// step costs the foreground thread a single atomic rather than a
+    /// loop of them.
+    pub fn step_by(&self, frames: u32) {
         if self.is_paused() {
-            self.step.fetch_add(1, Ordering::AcqRel);
+            self.step.fetch_add(frames, Ordering::AcqRel);
         }
     }
 

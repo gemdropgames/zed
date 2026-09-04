@@ -4,8 +4,9 @@
 //!
 //! The surface covers emulator control in both modes — LOCK-STEP, where
 //! `emu_start` boots a cart paused and each `emu_next_frame` latches pad
-//! input and runs exactly one frame, and free-running, where `emu_run`
-//! plays the cart under `emu_pause`/`emu_resume` — alongside the PPU
+//! input and runs the frames it was asked for, and free-running, where
+//! `emu_start { freerun: true }` plays the cart under
+//! `emu_pause`/`emu_resume` — alongside the PPU
 //! inspector, cart packing, hardware flash with its readiness probe,
 //! perf reports, and reads of the authored world.
 
@@ -42,6 +43,11 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// A pack is a cargo build; the lock-step bound would cut it off.
 const PACK_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The most frames one `emu_next_frame` will ask for — the host's own
+/// cap, mirrored so an over-large count is refused before it is sent
+/// (~16.7 minutes of cart time at 60 fps).
+const MAX_STEP_FRAMES: i64 = 60_000;
+
 /// The MCP `tools/list` payload.
 pub fn tool_list() -> Value {
     let session_props = json!({
@@ -61,24 +67,25 @@ pub fn tool_list() -> Value {
           "inputSchema": { "type": "object", "properties": {} } },
         { "name": "emu_status", "description": "What the target session's emulator panels are doing.", "inputSchema": with(json!({})) },
         { "name": "emu_start",
-          "description": "Boot a cart in the Zed emulator panel and pause at the first frame boundary (lock-step). Pack first with cart_pack (or emd pack-ggo --world <stem>). Returns the initial world-state JSON — worlds that declare `InspectWorld = {}` under [resources] serialize every entity's registered components; others return null. Drive with emu_next_frame; end with emu_stop.",
-          "inputSchema": with(json!({ "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. wilds.ggo" } })) },
+          "description": "Boot a cart in the Zed emulator panel and pause at the first frame boundary (LOCK-STEP by default) — the emulator tab comes to the front and its title says the run is MCP-controlled. Pack first with cart_pack (or emd pack-ggo --world <stem>). Returns the initial world-state JSON — worlds that declare `InspectWorld = {}` under [resources] serialize every entity's registered components; others return null. Drive with emu_next_frame; end with emu_stop. Pass freerun=true to boot the cart free-running instead (the panel's own Run button, no lock-step and no world inspection): then the game plays itself and you watch it with emu_screenshot/emu_uart and pause it with emu_pause.",
+          "inputSchema": with(json!({
+              "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. wilds.ggo" },
+              "freerun": { "type": "boolean", "description": "Boot free-running (the panel's Run button) instead of lock-step (default false)" }
+          })) },
         { "name": "emu_next_frame",
-          "description": "Latch the held pad buttons (names: z x a s up down left right q w e r t y u i enter select; empty/omitted releases all), run exactly ONE frame, and return the new world-state JSON. Set screenshot=true to also get the presented frame as PNG. Call repeatedly to play.",
+          "description": "Latch the held pad buttons (names: z x a s up down left right q w e r t y u i enter select; empty/omitted releases all), run exactly `frames` frames (default 1, max 60000) holding them, and return the new world-state JSON. Set screenshot=true to also get the presented frame as PNG. Call repeatedly to play.",
           "inputSchema": with(json!({
               "buttons": { "type": "array", "items": { "type": "string" } },
-              "screenshot": { "type": "boolean" }
+              "screenshot": { "type": "boolean" },
+              "frames": { "type": "integer", "minimum": 1, "maximum": 60000, "description": "Frames to step before replying (default 1, max 60000)" }
           })) },
-        { "name": "emu_stop", "description": "End the lock-step run; returns the cart's uart log.", "inputSchema": with(json!({})) },
+        { "name": "emu_stop", "description": "End the run; returns the cart's uart log.", "inputSchema": with(json!({})) },
         { "name": "emu_screenshot",
           "description": "The emulator's last presented frame as PNG (320×240), for a lock-step or free-running run. Errors when no frame has been presented yet.",
           "inputSchema": with(json!({})) },
         { "name": "emu_uart",
           "description": "The run's UART/console log, newest `tail` lines (default all), readable while the run is live — read a panic without stopping the run.",
           "inputSchema": with(json!({ "tail": { "type": "number", "description": "Newest N lines (omit for the whole log)" } })) },
-        { "name": "emu_run",
-          "description": "Boot a cart free-running in the Zed emulator panel — the panel's own Run button, no lock-step. The game plays itself; watch it with emu_screenshot and emu_uart, pause with emu_pause. Use emu_start instead when you need to drive input frame by frame. Pack first: cart_pack (or emd pack-ggo).",
-          "inputSchema": with(json!({ "cart": { "type": "string", "description": "Worktree-relative packed cart path, e.g. target/ggo-emulate/worlds-arena.ggo" } })) },
         { "name": "emu_pause", "description": "Pause the live run at the next frame boundary. Returns {paused, frame, running} — running = a run is live (true even while paused).", "inputSchema": with(json!({})) },
         { "name": "emu_resume", "description": "Resume a paused run. Returns {paused, frame, running} — running = a run is live (true even while paused).", "inputSchema": with(json!({})) },
         { "name": "emu_debug",
@@ -90,7 +97,7 @@ pub fn tool_list() -> Value {
               "layer": { "type": "number", "description": "map: layer 0–3 (default 0)" }
           })) },
         { "name": "cart_pack",
-          "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (worlds/arena) or file (assets/worlds/arena.toml). Returns {cart, world, lines}: hand `cart` to emu_start or emu_run. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call) — and while it runs, every other tool against this Zed waits, because the host serves one request at a time. Errors carry emd's own failure line.",
+          "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (worlds/arena) or file (assets/worlds/arena.toml). Returns {cart, world, lines}: hand `cart` to emu_start. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call) — and while it runs, every other tool against this Zed waits, because the host serves one request at a time. Errors carry emd's own failure line.",
           "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem, e.g. worlds/arena" } })) },
         { "name": "hw_flash",
           "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=460800, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
@@ -286,7 +293,13 @@ fn call_tool_inner(
         }
         "emu_start" => {
             let cart = arg_str(args, "cart").ok_or("missing required argument: cart")?;
-            let data = send(&session.socket, Cmd::Start { workspace, cart }, CALL_TIMEOUT, connect)?;
+            let freerun = args.get("freerun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let data = send(
+                &session.socket,
+                Cmd::Start { workspace, cart, freerun },
+                CALL_TIMEOUT,
+                connect,
+            )?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "emu_next_frame" => {
@@ -296,10 +309,16 @@ fn call_tool_inner(
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
             let screenshot = args.get("screenshot").and_then(|v| v.as_bool()).unwrap_or(false);
+            // `arg_i64` rather than `arg_u32`: a client that sends the
+            // count as `5.0` still means five frames.
+            let frames = arg_i64(args, "frames").unwrap_or(1).clamp(1, MAX_STEP_FRAMES) as u32;
             let mut data = send(
                 &session.socket,
-                Cmd::NextFrame { workspace, buttons, screenshot },
-                CALL_TIMEOUT,
+                Cmd::NextFrame { workspace, buttons, screenshot, frames: Some(frames) },
+                // The host paces every stepped frame at one 60 Hz period and
+                // waits 3 periods per frame itself; 60 ms keeps this bound
+                // above the host's own at every count up to the cap.
+                CALL_TIMEOUT + Duration::from_millis(60) * frames,
                 connect,
             )?;
             let shot = data.as_object_mut().and_then(|o| o.remove("screenshot"));
@@ -325,11 +344,6 @@ fn call_tool_inner(
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
             Ok(vec![json!({ "type": "text", "text": lines.join("\n") })])
-        }
-        "emu_run" => {
-            let cart = arg_str(args, "cart").ok_or("missing required argument: cart")?;
-            let data = send(&session.socket, Cmd::Run { workspace, cart }, CALL_TIMEOUT, connect)?;
-            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "emu_pause" => {
             let data = send(&session.socket, Cmd::Pause { workspace }, CALL_TIMEOUT, connect)?;
@@ -920,10 +934,12 @@ mod tests {
         let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
             if line.contains(r#""cmd":"start""#) {
                 assert!(line.contains(r#""cart":"wilds.ggo""#), "{line}");
+                assert!(line.contains(r#""freerun":false"#), "lock-step by default: {line}");
                 Ok(r#"{"id":1,"ok":true,"data":{"started":true,"frame":2,"world":{"entities":[]}}}"#.to_string())
             } else {
                 assert!(line.contains(r#""cmd":"next_frame""#), "{line}");
                 assert!(line.contains(r#""buttons":["right"]"#), "{line}");
+                assert!(line.contains(r#""frames":1"#), "one frame by default: {line}");
                 Ok(r#"{"id":1,"ok":true,"data":{"frame":3,"world":{"entities":[{"id":5,"components":{}}]}}}"#.to_string())
             }
         };
@@ -1001,19 +1017,46 @@ mod tests {
         assert_eq!(content[0]["text"], "a\npanic: b");
     }
 
+    /// Free running is what `emu_start` does only when asked for it --
+    /// the tool that used to be `emu_run`.
     #[test]
-    fn emu_run_requires_a_cart_and_forwards_it() {
+    fn emu_start_requires_a_cart_and_free_running_is_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         fake_session(dir.path(), std::process::id());
         let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
-            assert!(line.contains(r#""cmd":"run""#) && line.contains(r#""cart":"a.ggo""#), "{line}");
+            assert!(line.contains(r#""cmd":"start""#) && line.contains(r#""cart":"a.ggo""#), "{line}");
+            assert!(line.contains(r#""freerun":true"#), "{line}");
             Ok(r#"{"id":1,"ok":true,"data":{"started":true,"frame":1,"running":true}}"#.to_string())
         };
-        let (content, is_err) = call_tool("emu_run", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("emu_start", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
         assert!(is_err && content[0]["text"].as_str().unwrap().contains("cart"), "{content:?}");
-        let (content, is_err) = call_tool("emu_run", &json!({"cart": "a.ggo"}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool(
+            "emu_start",
+            &json!({"cart": "a.ggo", "freerun": true}),
+            dir.path(),
+            UNREACHABLE_DB_URL,
+            &connect,
+        );
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""running":true"#));
+    }
+
+    /// A multi-frame step must reach the host as a count -- one call, not
+    /// five -- and its socket timeout has to outlast the frames it asked
+    /// for.
+    #[test]
+    fn emu_next_frame_forwards_the_frame_count_and_widens_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, timeout: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""frames":5"#), "{line}");
+            assert!(timeout > CALL_TIMEOUT, "{timeout:?}");
+            Ok(r#"{"id":1,"ok":true,"data":{"frame":8,"world":null}}"#.to_string())
+        };
+        let (content, is_err) =
+            call_tool("emu_next_frame", &json!({"frames": 5}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""frame":8"#));
     }
 
     #[test]
@@ -1124,7 +1167,6 @@ mod tests {
                 "emu_stop",
                 "emu_screenshot",
                 "emu_uart",
-                "emu_run",
                 "emu_pause",
                 "emu_resume",
                 "emu_debug",

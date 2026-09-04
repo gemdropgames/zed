@@ -80,12 +80,35 @@ impl Item for EmulatorItem {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        // The selected cart's stem names the tab once one is chosen; a
-        // bare emulator reads as just "Emulator".
-        self.panel
-            .read(cx)
-            .selected_cart_stem()
-            .map(|stem| format!("Emulator · {stem}").into())
-            .unwrap_or_else(|| "Emulator".into())
+        let panel = self.panel.read(cx);
+        tab_text(panel.selected_cart_stem().as_deref(), panel.is_remote_controlled())
+    }
+}
+
+/// The tab's label: the selected cart's stem names the tab once one is
+/// chosen (a bare emulator reads as just "Emulator"), and a run an agent
+/// started over the MCP socket says so — the user has to be able to tell
+/// a cart they ran from one being driven for them.
+fn tab_text(stem: Option<&str>, remote_controlled: bool) -> SharedString {
+    let base = match stem {
+        Some(stem) => format!("Emulator · {stem}"),
+        None => "Emulator".to_string(),
+    };
+    match remote_controlled {
+        true => format!("{base} · MCP").into(),
+        false => base.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_text_marks_an_mcp_driven_run() {
+        assert_eq!(tab_text(None, false), "Emulator");
+        assert_eq!(tab_text(Some("chase_cam"), false), "Emulator · chase_cam");
+        assert_eq!(tab_text(Some("chase_cam"), true), "Emulator · chase_cam · MCP");
+        assert_eq!(tab_text(None, true), "Emulator · MCP");
     }
 }
