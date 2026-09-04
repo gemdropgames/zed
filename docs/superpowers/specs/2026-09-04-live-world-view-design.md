@@ -268,6 +268,23 @@ Each phase leaves every repo green on its own gates
 `cargo clippy --workspace --all-targets -- -D warnings && cargo test
 --workspace` in emerald; the three workspace test runs in ggo).
 
+## Implementation plans
+
+Execute in order; each phase merges to its repo's main before the next starts.
+
+| Phase | Repo | Plan |
+|-------|------|------|
+| 0 | ggo | `docs/superpowers/plans/2026-09-04-live-world-view-phase0-ggo.md` |
+| 1 | emerald | `docs/superpowers/plans/2026-09-04-live-world-view-phase1-emerald.md` |
+| 2 | zed (`ggo_common`, `ggo_emu_panel`) | `docs/superpowers/plans/2026-09-04-live-world-view-phase2-zed-emu.md` |
+| 3 | zed (`ggo_world_panel`) + one worldlib helper | `docs/superpowers/plans/2026-09-04-live-world-view-phase3-zed-world.md` |
+| 4 | ggo (uartd) + zed | not yet planned |
+
+Model roles (user's global rules): plans by the main session model;
+implementation tasks dispatched to opus subagents; a fresh opus reviewer
+after each phase for practices and goal fit. Do not start until the user
+says go: the three repos are under active work by others.
+
 ## Out of scope
 
 - Acked delivery for single-datagram commands.
