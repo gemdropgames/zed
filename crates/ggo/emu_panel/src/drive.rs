@@ -1172,8 +1172,11 @@ pub mod fixture {
     const SYS_SET_PALETTE: i32 = 0x05;
     const SYS_LOG: i32 = 0x4B;
     const SYS_SAVE_WRITE: i32 = 0x31;
-    const SYS_COMM_SEND: i32 = gemdrop_sdk::sys::COMM_SEND as i32;
-    const SYS_COMM_RECV: i32 = gemdrop_sdk::sys::COMM_RECV as i32;
+    // Through `ggo_emu_core::abi`, which pins to `gemdrop_sdk::sys`
+    // itself: this module is compiled into the LIB, where the SDK (a
+    // dev-dependency, for the link tests) is not in scope.
+    const SYS_COMM_SEND: i32 = ggo_emu_core::abi::Syscall::CommSend as i32;
+    const SYS_COMM_RECV: i32 = ggo_emu_core::abi::Syscall::CommRecv as i32;
 
     /// RGB565 green -- 0x07E0, which happens to fit in a 12-bit signed
     /// immediate, so the program needs no `lui`.
@@ -1390,19 +1393,19 @@ pub mod fixture {
     pub fn comm_echo_cart() -> Vec<u8> {
         const A3: u32 = 13;
         let body: Vec<u32> = vec![
-            lui(A3, ECHO_BUFFER >> 12),   // a3 = the arena buffer
-            addi_reg(A0, A3, 0),          // loop: a0 = buf
-            addi(A1, ECHO_CAPACITY),      // a1 = capacity
-            addi(A7, SYS_COMM_RECV),      //
-            ECALL,                        // a0 = length (0 = nothing queued)
-            bge(0, A0, 20),               // if a0 <= 0, skip to `wait`
-            addi_reg(A1, A0, 0),          // a1 = length
-            addi_reg(A0, A3, 0),          // a0 = buf
-            addi(A7, SYS_COMM_SEND),      //
-            ECALL,                        // comm_send(buf, length)
-            addi(A7, SYS_VSYNC_WAIT),     // wait:
-            ECALL,                        //
-            jal_x0(-44),                  // back to `loop`
+            lui(A3, ECHO_BUFFER >> 12), // a3 = the arena buffer
+            addi_reg(A0, A3, 0),        // loop: a0 = buf
+            addi(A1, ECHO_CAPACITY),    // a1 = capacity
+            addi(A7, SYS_COMM_RECV),    //
+            ECALL,                      // a0 = length (0 = nothing queued)
+            bge(0, A0, 20),             // if a0 <= 0, skip to `wait`
+            addi_reg(A1, A0, 0),        // a1 = length
+            addi_reg(A0, A3, 0),        // a0 = buf
+            addi(A7, SYS_COMM_SEND),    //
+            ECALL,                      // comm_send(buf, length)
+            addi(A7, SYS_VSYNC_WAIT),   // wait:
+            ECALL,                      //
+            jal_x0(-44),                // back to `loop`
         ];
         // `bge`'s +20 and `jal`'s -44 are byte offsets into this exact
         // sequence; an inserted instruction silently re-aims both.
@@ -1985,13 +1988,10 @@ mod tests {
         std::fs::write(&path, fixture::comm_echo_cart()).unwrap();
 
         let endpoint = LinkEndpoint::new();
-        let (session, rx) = start(
-            path,
-            "echo.cart".to_string(),
-            None,
-            Some(endpoint.clone()),
-        );
-        endpoint.send_app(b"ping").expect("a four-byte payload fits");
+        let (session, rx) = start(path, "echo.cart".to_string(), None, Some(endpoint.clone()));
+        endpoint
+            .send_app(b"ping")
+            .expect("a four-byte payload fits");
 
         // The host's frame is injected at one boundary, read by the cart
         // on the next, and its reply decoded at the one after -- so a
@@ -2015,7 +2015,9 @@ mod tests {
         // host queues nor publishes what the cart sends, and its ending
         // is no longer its to report.
         session.release_link();
-        endpoint.send_app(b"pong").expect("a four-byte payload fits");
+        endpoint
+            .send_app(b"pong")
+            .expect("a four-byte payload fits");
         for _ in 0..20 {
             rx.recv_blocking().expect("the emulator thread must run");
         }
