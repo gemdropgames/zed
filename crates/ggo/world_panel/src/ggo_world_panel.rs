@@ -706,6 +706,20 @@ struct OpenWorld {
     /// Live mode got one. Kept (with `LiveStatus::Failed`) after a
     /// fallback so the toolbar can still say what went wrong.
     live: Option<LiveView>,
+    /// How many entities each `[[instance]]` contributes once flattened,
+    /// in `[[instance]]` order -- the counts the live index map is built
+    /// from. Computed off the UI thread (the walk reads every instanced
+    /// world file): at load time by `loader::load_world`, and after that
+    /// by [`WorldPanel::refresh_instance_counts`].
+    instance_counts: Vec<usize>,
+    /// The instance stems `instance_counts` was computed for. A document
+    /// edit that leaves this list alone (moving an instance, editing an
+    /// entity) cannot change the counts, so this is what decides whether a
+    /// recount is owed.
+    counted_instances: Vec<String>,
+    /// The in-flight recount, if any. Replacing it cancels the previous
+    /// one, which is how a burst of instance edits resolves to the last.
+    _instance_counts_task: Option<Task<()>>,
     /// Why Live mode is not showing, on the toolbar next to `save_error`.
     /// Set on every fallback to Design, cleared when a session starts.
     live_error: Option<String>,
@@ -752,6 +766,14 @@ impl OpenWorld {
         loaded: loader::LoadedWorld,
         images: HashMap<usize, Arc<RenderImage>>,
     ) -> Self {
+        let loaded_instance_stems = loaded
+            .store
+            .state()
+            .instances
+            .iter()
+            .map(|instance| instance.world.clone())
+            .collect();
+        let loaded_instance_counts = loaded.instance_counts;
         OpenWorld {
             listing,
             source_rel,
@@ -796,6 +818,9 @@ impl OpenWorld {
             terrain_name: None,
             resize: None,
             live: None,
+            instance_counts: loaded_instance_counts,
+            counted_instances: loaded_instance_stems,
+            _instance_counts_task: None,
             live_error: None,
         }
     }
@@ -1037,6 +1062,15 @@ fn view_top_left_world(view: &Rc<RefCell<ViewShared>>) -> [f64; 2] {
     )
 }
 
+/// What one turn of the live session did: whether anything the panel draws
+/// moved, and the reason the session must fall back to the design view, if
+/// any.
+#[derive(Default)]
+struct LiveStep {
+    changed: bool,
+    failure: Option<String>,
+}
+
 /// A transport failure on the link: the port or the emulator is gone, not
 /// a datagram lost on the wire.
 fn link_failed(error: std::io::Error) -> String {
@@ -1108,28 +1142,48 @@ impl OpenWorld {
         });
     }
 
-    /// One turn of the live session, on the poll task's wake. Returns the
-    /// reason the session must fall back to the design view, if any.
+    /// Re-derive the cart-index -> selection map from the document and
+    /// the last instance counts. Called when either input moves: a world
+    /// blob going out, or a recount landing.
+    fn rebuild_index_map(&mut self) {
+        let entities = self.store.state().entities.len();
+        if let Some(live) = self.live.as_mut() {
+            live.index_map = live::IndexMap::new(entities, &self.instance_counts);
+        }
+    }
+
+    /// One turn of the live session, on the poll task's wake.
     ///
     /// `wall` is the executor's clock and is used for exactly one thing:
     /// the build deadline, which cannot be measured on the cart's clock
     /// because a cart that is still being built has never framed. Every
     /// other deadline here runs on `LiveView::cart_now`.
-    fn live_step(&mut self, wall: Instant) -> Option<String> {
+    fn live_step(&mut self, wall: Instant) -> LiveStep {
         // Field-precise borrow on purpose: the steps below read the
         // document (`store`, `merged`, `root`, `view`) while the session
         // is borrowed mutably.
-        let live = self.live.as_mut()?;
+        let Some(live) = self.live.as_mut() else {
+            return LiveStep::default();
+        };
         if matches!(live.status, LiveStatus::Failed(_)) {
-            return None;
+            return LiveStep::default();
         }
+        let status_before = live.status.clone();
+        let frame_before = live.frame.as_ref().map(|(number, _)| *number);
+        let failed = |reason: String| LiveStep {
+            changed: true,
+            failure: Some(reason),
+        };
         let now = live.cart_now();
         match live.endpoint.state() {
             ggo_common::ViewerState::Building => {
-                return (wall.duration_since(live.started) >= live::BUILD_DEADLINE)
-                    .then(|| "viewer cart build timed out".to_string());
+                return if wall.duration_since(live.started) >= live::BUILD_DEADLINE {
+                    failed("viewer cart build timed out".to_string())
+                } else {
+                    LiveStep::default()
+                };
             }
-            ggo_common::ViewerState::Stopped(reason) => return Some(reason),
+            ggo_common::ViewerState::Stopped(reason) => return failed(reason),
             ggo_common::ViewerState::Running => {}
         }
         if matches!(live.status, LiveStatus::Building) {
@@ -1137,14 +1191,15 @@ impl OpenWorld {
             live.connect_since = now;
             live.last_hello = now;
             if let Err(error) = live.mailbox.hello() {
-                return Some(link_failed(error));
+                return failed(link_failed(error));
             }
         }
-        if let Err(error) = live.mailbox.poll(now) {
-            return Some(link_failed(error));
-        }
+        let mut changed = match live.mailbox.poll(now) {
+            Ok(changed) => changed,
+            Err(error) => return failed(link_failed(error)),
+        };
         if let Some(version) = live.mailbox.proto_version_mismatch() {
-            return Some(format!(
+            return failed(format!(
                 "viewer cart predates the link protocol (cart v{version}); rebuild it"
             ));
         }
@@ -1157,7 +1212,6 @@ impl OpenWorld {
                 live.world_dirty = true;
                 live.layers_dirty = true;
                 live.camera_dirty = true;
-                live.layer_queue.clear();
             }
             // `is_connected` never goes false on its own; a cart that was
             // reset or unplugged is only visible as a session that stopped
@@ -1168,21 +1222,21 @@ impl OpenWorld {
                 live.connect_since = now;
                 live.last_hello = now;
                 if let Err(error) = live.mailbox.hello() {
-                    return Some(link_failed(error));
+                    return failed(link_failed(error));
                 }
             }
         } else if let Some(greeted_at) = live.stale_hello {
             if now.duration_since(greeted_at) >= live::STALE_AFTER {
-                return Some("viewer cart stopped answering".to_string());
+                return failed("viewer cart stopped answering".to_string());
             }
         } else if now.duration_since(live.connect_since) >= live::CONNECT_DEADLINE {
-            return Some("viewer cart never answered".to_string());
+            return failed("viewer cart never answered".to_string());
         }
         if !live.mailbox.is_connected() && now.duration_since(live.last_hello) >= live::HELLO_RETRY
         {
             live.last_hello = now;
             if let Err(error) = live.mailbox.hello() {
-                return Some(link_failed(error));
+                return failed(link_failed(error));
             }
         }
 
@@ -1190,34 +1244,31 @@ impl OpenWorld {
         // cart's APP receive queue is four datagrams deep and a transfer
         // already fills it.
         if live.status == LiveStatus::Connected && !live.mailbox.busy() {
+            let mut live_error = None;
             if live.world_dirty {
                 live.world_dirty = false;
-                let state = self.store.state();
-                let instances: Vec<world_file::WorldInstance> = state
-                    .instances
-                    .iter()
-                    .map(|instance| world_file::WorldInstance {
-                        world: instance.world.clone(),
-                        pos: instance.pos,
-                        background_priority: instance.background_priority,
-                    })
-                    .collect();
-                let counts = loader::instance_entity_counts(&self.root, &instances);
-                live.index_map = live::IndexMap::new(state.entities.len(), &counts);
+                live.index_map =
+                    live::IndexMap::new(self.store.state().entities.len(), &self.instance_counts);
                 match live::encode_world(&self.store, &self.root) {
                     // A world the encoder rejects is a document problem,
                     // not a link problem: say so on the status row and stay
                     // live on whatever the cart already has.
-                    Err(error) => self.live_error = Some(format!("live update: {error}")),
+                    Err(error) => live_error = Some(format!("live update: {error}")),
                     Ok(blob) => {
                         if let Err(error) = live.mailbox.load_world(&blob) {
-                            self.live_error = Some(format!("live update: {error}"));
+                            live_error = Some(format!("live update: {error}"));
                         }
                     }
                 }
-            } else if live.layers_dirty {
-                if live.layer_queue.is_empty() {
+            } else if live.layers_dirty || !live.layer_queue.is_empty() {
+                // `layers_dirty` means "the document's layers moved since
+                // this queue was built", so re-dirtying mid-cycle REPLACES
+                // the rest of a now-stale snapshot instead of being
+                // swallowed by it. The queue, not the flag, is what says a
+                // cycle is still running.
+                if live.layers_dirty {
                     live.layer_queue = live::layer_loads(&self.root, &self.merged);
+                    live.layers_dirty = false;
                 }
                 if let Some(load) = live.layer_queue.pop_front()
                     && let Err(error) = live.mailbox.load_layer(
@@ -1228,19 +1279,27 @@ impl OpenWorld {
                         &load.tileset_stem,
                     )
                 {
-                    self.live_error = Some(format!("live layer {}: {error}", load.layer));
+                    live_error = Some(format!("live layer {}: {error}", load.layer));
                 }
-                live.layers_dirty = !live.layer_queue.is_empty();
             } else if live.camera_dirty {
                 live.camera_dirty = false;
                 let [x, y] = view_top_left_world(&self.view);
                 if let Err(error) = live.mailbox.set_camera(live::to_raw(x), live::to_raw(y)) {
-                    self.live_error = Some(format!("live camera: {error}"));
+                    live_error = Some(format!("live camera: {error}"));
                 }
+            }
+            if live_error.is_some() && live_error != self.live_error {
+                self.live_error = live_error;
+                changed = true;
             }
         }
 
-        live.rows = live::rows_from(live.mailbox.entities());
+        let Some(live) = self.live.as_mut() else {
+            return LiveStep::default();
+        };
+        let rows = live::rows_from(live.mailbox.entities());
+        changed |= rows != live.rows;
+        live.rows = rows;
         // Cloning the `Arc` only -- the emu panel owns dropping the image
         // it replaces (see `LinkEndpoint::frame`).
         live.frame = live
@@ -1249,7 +1308,12 @@ impl OpenWorld {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        None
+        changed |= live.frame.as_ref().map(|(number, _)| *number) != frame_before;
+        changed |= live.status != status_before;
+        LiveStep {
+            changed,
+            failure: None,
+        }
     }
 
     /// The current position of every selected item that still exists.
@@ -1695,6 +1759,7 @@ impl WorldPanel {
             open.store.apply(op);
             cx.notify();
         }
+        self.refresh_instance_counts(cx);
     }
 
     /// Toolbar "add entity": a fresh entity with just a Transform
@@ -2340,6 +2405,7 @@ impl WorldPanel {
         open.edit_drag = None;
         open.nudge_gesture = None;
         cx.notify();
+        self.refresh_instance_counts(cx);
     }
 
     fn select_all_impl(&mut self, cx: &mut Context<Self>) {
@@ -2665,6 +2731,7 @@ impl WorldPanel {
             open.prune_selection();
             cx.notify();
         }
+        self.refresh_instance_counts(cx);
         if self.backgrounds_now() != backgrounds_before {
             self.refresh_backgrounds(cx);
         }
@@ -2703,6 +2770,7 @@ impl WorldPanel {
             Self::refresh_asset_images(open, &mut self.retired_images);
         }
         cx.notify();
+        self.refresh_instance_counts(cx);
         if self.backgrounds_now() != backgrounds_before {
             self.refresh_backgrounds(cx);
         }
@@ -3686,9 +3754,19 @@ impl WorldPanel {
     /// [`Self::emulate_impl`] defers -- the workspace is leased while a
     /// panel listener runs, and the booter opens an emulator pane.
     fn enter_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ViewerState::Ready(open) = &self.state else {
+        let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        // A `Failed` session is kept only for its message; it is not a
+        // session, so re-entering Live must be able to start a fresh one.
+        if open
+            .live
+            .as_ref()
+            .is_some_and(|live| matches!(live.status, LiveStatus::Failed(_)))
+        {
+            open.live = None;
+            open.live_error = None;
+        }
         if open.live.is_some() {
             return;
         }
@@ -3778,22 +3856,43 @@ impl WorldPanel {
         live.poll = Some(poll);
         open.live = Some(live);
         open.live_error = None;
-        self.live_tick(cx);
+        if !self.live_tick(cx)
+            && let ViewerState::Ready(open) = &mut self.state
+            && let Some(live) = &mut open.live
+        {
+            // The session failed on its very first turn (a cart that was
+            // already stopped, say): the loop just spawned has nothing to
+            // wake for. Dropped from HERE, not from inside the loop.
+            live.poll = None;
+        }
     }
 
     /// One turn of the live session. Returns whether the poll loop should
-    /// keep going -- a fallback to Design ends it.
+    /// keep going: a session that has no future -- gone, or `Failed` --
+    /// never says yes, because `live_step` has nothing left to do for it
+    /// and a loop that kept waking would notify the panel every
+    /// [`live::POLL_INTERVAL`] for the rest of the document's life.
     fn live_tick(&mut self, cx: &mut Context<Self>) -> bool {
         let wall = cx.background_executor().now();
+        // The document's instance list decides the flattened index map,
+        // and walking it reads world files -- so the walk happens off this
+        // thread, and only when the session says the document moved.
+        self.refresh_instance_counts(cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return false;
         };
-        if open.live.is_none() {
+        let live_and_running = open
+            .live
+            .as_ref()
+            .is_some_and(|live| !matches!(live.status, LiveStatus::Failed(_)));
+        if !live_and_running {
             return false;
         }
-        let failure = open.live_step(wall);
-        cx.notify();
-        match failure {
+        let step = open.live_step(wall);
+        if step.changed {
+            cx.notify();
+        }
+        match step.failure {
             Some(reason) => {
                 self.fall_back_to_design(reason, cx);
                 false
@@ -3830,6 +3929,67 @@ impl WorldPanel {
         }
         self.stop_live_endpoint();
         cx.notify();
+    }
+
+    /// Recount what each `[[instance]]` contributes to the flattened
+    /// entity order, when (and only when) the document's instance LIST has
+    /// changed since the last count -- an add, a remove, an undo or redo
+    /// of either, a paste. Every other edit leaves the counts alone.
+    ///
+    /// The walk reads every instanced world file (recursively), so it runs
+    /// on a background thread; the live index map is rebuilt when the
+    /// result lands. Called from the mutation funnels that can change the
+    /// list ([`Self::apply_op`], the batch delete, undo and redo) so the
+    /// recount starts with the edit, AND from [`Self::live_tick`] as the
+    /// backstop for any path that reaches the store another way.
+    fn refresh_instance_counts(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        // Only worth asking while a session is mirroring the document:
+        // the counts exist for the live index map and nothing else.
+        if open.live.is_none() {
+            return;
+        }
+        let state = open.store.state();
+        let stems: Vec<String> = state
+            .instances
+            .iter()
+            .map(|instance| instance.world.clone())
+            .collect();
+        if stems == open.counted_instances {
+            return;
+        }
+        // Claimed up front so a walk in flight is not re-spawned every
+        // tick; a result is only applied if the list still matches.
+        open.counted_instances = stems.clone();
+        let root = open.root.clone();
+        let instances: Vec<world_file::WorldInstance> = state
+            .instances
+            .iter()
+            .map(|instance| world_file::WorldInstance {
+                world: instance.world.clone(),
+                pos: instance.pos,
+                background_priority: instance.background_priority,
+            })
+            .collect();
+        let counts =
+            cx.background_spawn(async move { loader::instance_entity_counts(&root, &instances) });
+        open._instance_counts_task = Some(cx.spawn(async move |this, cx| {
+            let counts = counts.await;
+            this.update(cx, |this, cx| {
+                let ViewerState::Ready(open) = &mut this.state else {
+                    return;
+                };
+                if open.counted_instances != stems {
+                    return;
+                }
+                open.instance_counts = counts;
+                open.rebuild_index_map();
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// End the viewer run this panel booted, if any. Advisory: the
@@ -4916,6 +5076,21 @@ impl WorldPanel {
                     format!("popout failed: {e}"),
                 )
                 .size(LabelSize::Small)
+            }))
+            // Wrapped for the `debug_selector`, the same reason the Save
+            // button is: `CopyableText` is a `RenderOnce` and carries none
+            // of its own, so a test could not otherwise tell "the row is
+            // there" from "the row was never rendered".
+            .children(open.live_error.as_ref().map(|e| {
+                div()
+                    .debug_selector(|| "ggo-world-live-error".into())
+                    .child(
+                        ggo_common::CopyableText::new(
+                            "ggo-world-live-error-copy",
+                            format!("live view: {e}"),
+                        )
+                        .size(LabelSize::Small),
+                    )
             }))
             .children(open.clipboard_error.as_ref().map(|e| {
                 ggo_common::CopyableText::new("ggo-world-paste-error-copy", e.clone())
@@ -12339,6 +12514,205 @@ mod tests {
             host_sent(&endpoint).is_empty(),
             "and nothing more goes on the wire"
         );
+    }
+
+    /// A booter whose cart is dead on arrival -- the build failed before
+    /// the panel ever polled it.
+    fn stillborn_booter(
+        _workspace: &mut Workspace,
+        rel: &str,
+        endpoint: Arc<ggo_common::LinkEndpoint>,
+        _window: &mut Window,
+        _cx: &mut Context<Workspace>,
+    ) -> bool {
+        endpoint.set_state(ggo_common::ViewerState::Stopped("build failed".into()));
+        BOOTED.with(|booted| booted.borrow_mut().push((rel.to_string(), endpoint)));
+        true
+    }
+
+    /// A session that fails on its very FIRST tick must not leave its poll
+    /// task behind: `Failed` is terminal, `live_step` has nothing left to
+    /// do for it, and a loop that kept waking would notify the panel every
+    /// 250 ms for the rest of the document's life.
+    #[gpui::test]
+    async fn a_session_that_fails_immediately_leaves_no_poll_task(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        cx.update(|cx| ggo_common::register_viewer_booter(cx, stillborn_booter));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+        panel.update(cx, |panel, _| {
+            panel.root_override = Some(dir.path().to_path_buf())
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("worlds/test.toml", window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            let live = open_of(panel).live.as_ref().expect("the failed session");
+            assert!(matches!(live.status, LiveStatus::Failed(_)));
+            assert!(
+                live.poll.is_none(),
+                "the poll task must not outlive the session it polls"
+            );
+        });
+        // And a tick that does arrive anyway is refused: `Failed` never
+        // says "keep polling".
+        let endpoint = BOOTED
+            .with(|booted| booted.borrow().last().map(|(_, e)| e.clone()))
+            .expect("the booter ran");
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        let kept_going = panel.update(cx, |panel, cx| panel.live_tick(cx));
+        assert!(!kept_going, "a failed session never asks for another tick");
+    }
+
+    /// A fallback keeps the failed session only for its message, so asking
+    /// for Live again has to start a NEW one -- otherwise the first
+    /// failure disables Live for the life of the open world.
+    #[gpui::test]
+    async fn live_can_be_re_entered_after_a_fallback(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Stopped("gone".into()));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+        });
+        assert_eq!(BOOTED.with(|booted| booted.borrow().len()), 1);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.canvas_mode = CanvasMode::Live;
+            panel.enter_live(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            BOOTED.with(|booted| booted.borrow().len()),
+            2,
+            "the stopped cart is not reused; a fresh one is booted"
+        );
+        panel.read_with(cx, |panel, _| {
+            let live = open_of(panel).live.as_ref().expect("a new session");
+            assert!(
+                matches!(live.status, LiveStatus::Building),
+                "the new session starts over rather than inheriting the failure"
+            );
+            assert_eq!(open_of(panel).live_error, None);
+        });
+    }
+
+    /// The fallback reason is only useful if the user can see it.
+    #[gpui::test]
+    async fn the_live_error_shows_on_the_status_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-world-live-error").is_none(),
+            "no row while Live has nothing to complain about"
+        );
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.live_error = Some("viewer cart never answered".to_string());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-live-error").is_some(),
+            "the toolbar shows why the canvas fell back to the design view"
+        );
+    }
+
+    /// A wake that changed nothing must not repaint the panel: the loop
+    /// wakes at least every 250 ms for as long as the world is open, and
+    /// an unconditional `notify` would re-render the whole panel that
+    /// often while the user is doing nothing.
+    #[gpui::test]
+    async fn a_tick_that_changes_nothing_does_not_notify(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(&endpoint, hello_ack(1, &[]));
+        cx.run_until_parked();
+
+        let notifications = Rc::new(std::cell::Cell::new(0usize));
+        let subscription = cx.update(|_, cx| {
+            cx.observe(&panel, {
+                let notifications = notifications.clone();
+                move |_, _| notifications.set(notifications.get() + 1)
+            })
+        });
+        for _ in 0..3 {
+            endpoint.tick();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            notifications.get(),
+            0,
+            "an idle cart's ticks must not repaint the panel"
+        );
+
+        // ... and a tick that DOES bring something new still does.
+        cart_says(&endpoint, hello_ack(1, &["animate"]));
+        cx.run_until_parked();
+        assert!(
+            notifications.get() > 0,
+            "a re-greeting is a change and must repaint"
+        );
+        drop(subscription);
+    }
+
+    /// The flattened instance counts come off the loader thread, and a
+    /// document whose instance LIST changes gets recounted there too --
+    /// the walk reads every instanced world file.
+    #[gpui::test]
+    async fn instance_counts_are_loaded_and_recounted_off_thread(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(&endpoint, hello_ack(1, &[]));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            assert_eq!(
+                open.instance_counts,
+                vec![1],
+                "the load counted worlds/sub's one entity"
+            );
+            assert_eq!(open.counted_instances, vec!["worlds/sub".to_string()]);
+            assert_eq!(open.live.as_ref().map(|live| live.index_map.len()), Some(4));
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(WorldOp::RemoveInstance { index: 0 }, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            assert!(open.instance_counts.is_empty(), "the recount landed");
+            assert!(open.counted_instances.is_empty());
+            assert_eq!(
+                open.live.as_ref().map(|live| live.index_map.len()),
+                Some(3),
+                "and the index map was rebuilt from it"
+            );
+        });
     }
 
     /// A world switch inside one project reuses the cart that is already

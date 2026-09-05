@@ -45,6 +45,11 @@ pub struct LoadedWorld {
     /// Inspector schema set: builtins + this project's manifest
     /// components (see [`manifest_schemas`]).
     pub schemas: Vec<ComponentSchema>,
+    /// How many entities each top-level `[[instance]]` contributes once
+    /// flattened, in `[[instance]]` order -- see
+    /// [`instance_entity_counts`]. Computed here because it walks every
+    /// instanced world file, which has no business on the UI thread.
+    pub instance_counts: Vec<usize>,
 }
 
 // ------------------------------------------------------------ worlds list
@@ -95,6 +100,7 @@ fn walk_files(dir: &Path, rel: &Path, out: &mut Vec<String>) {
 /// itself fails the load.
 pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> {
     let file = read_world(project_dir, rel).map_err(|e| e.to_string())?;
+    let instance_counts = instance_entity_counts(project_dir, &file.instances);
     let mut store = WorldDocStore::new(WorldDocWire::from(file));
 
     // Instance-subtree resolution -- ggo-ide's `resolve_instance_task`
@@ -152,6 +158,7 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
         merged,
         instance_backgrounds: loaded_bgs,
         schemas: schemas_near(project_dir),
+        instance_counts,
     })
 }
 

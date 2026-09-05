@@ -328,8 +328,15 @@ pub struct LiveView {
     /// Cart clock at the re-`Hello` a stale session triggered, if one is
     /// outstanding. A second [`STALE_AFTER`] with no answer fails it.
     pub stale_hello: Option<Instant>,
-    /// The cart's latest presented frame. Cloned out of the endpoint --
-    /// the emu panel owns dropping the image.
+    /// The cart's latest presented frame, re-cloned out of the endpoint
+    /// every tick.
+    ///
+    /// Task 5 (painting): the emu panel calls `Window::drop_image` on each
+    /// frame it RETIRES, and an `Arc` clone does not keep the atlas tile
+    /// alive. So paint only the frame this field holds right now, and
+    /// never carry an `Arc<RenderImage>` from one tick into the next for
+    /// painting -- by the time it is drawn the tile behind it may already
+    /// have been handed back.
     pub frame: Option<(u32, Arc<RenderImage>)>,
     /// The cart's published rects, in world pixels.
     pub rows: Vec<CartRow>,
