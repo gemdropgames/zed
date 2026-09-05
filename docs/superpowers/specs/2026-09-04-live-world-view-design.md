@@ -101,7 +101,7 @@ Rules:
   `Ack` (timeout 100 ms, 20 retries), then the next. The cart applies
   chunks idempotently by offset, so a duplicate after a lost `Ack` is
   harmless. In the emulator the link is lossless and no retry ever fires;
-  on hardware a 32 KiB world takes about 3 s at 115200 baud, which is
+  on hardware a 32 KiB world takes under a second at 460800 baud, which is
   accepted for a world switch.
 - The cart validates every field before touching the `Mailbox` (ids below
   `MAX_ENTITIES`, offsets inside the buffer, stems ≤ the stem caps). A
