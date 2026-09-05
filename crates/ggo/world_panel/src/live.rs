@@ -3,18 +3,19 @@
 //! order: direct entities, then each instance's subtree depth-first),
 //! hit-testing over the cart's published rects, and the payload builders.
 
-// This module lands ahead of the panel code that drives it (Task 4 wires the
-// Live-mode session); its tests are the only callers so far, so the helpers
-// would otherwise read as dead. Task 4 drops this.
-#![allow(dead_code)]
-
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use emerald_editor_link::{EntityRow, LinkIo};
+use emerald_editor_link::{EntityRow, LinkIo, LinkMailbox};
+use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::render::Selection;
 use ggo_worldlib::world_doc::WorldDocStore;
 use ggo_worldlib::world_file::world_to_toml;
+use gpui::{RenderImage, Task};
+
+use crate::loader;
 
 /// [`LinkIo`] over the emu panel's endpoint: frames payloads as APP
 /// datagrams on the way out, hands back the already-decoded APP payloads
@@ -23,17 +24,12 @@ pub struct EndpointIo(pub Arc<ggo_common::LinkEndpoint>);
 
 impl LinkIo for EndpointIo {
     fn send(&mut self, payload: &[u8]) -> std::io::Result<()> {
-        // Delimiters, sentinel, channel, CRC and COBS's own overhead; a
-        // reservation, not a bound (`encode_payload` caps payload length).
-        let mut wire = Vec::with_capacity(payload.len() + 16);
-        if !ggo_wire::encode_payload(ggo_wire::channel::APP, payload, |byte| wire.push(byte)) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "link payload exceeds the ggo-wire datagram limit",
-            ));
-        }
-        self.0.send_wire(wire);
-        Ok(())
+        // `LinkEndpoint::send_app` is the one APP-framing site on this side
+        // of the link (Phase 2 review): framing here as well would be a
+        // second copy of the wire format to keep in step.
+        self.0
+            .send_app(payload)
+            .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))
     }
 
     fn recv(&mut self) -> Vec<Vec<u8>> {
@@ -58,7 +54,14 @@ impl IndexMap {
         }
         IndexMap { entries }
     }
+}
 
+/// The lookups the Live GESTURES need: turning a click on the cart's
+/// picture back into a document selection, and back again to drive the
+/// entities a drag moves. The session (Task 4) only builds the map; Task 5
+/// is what reads it.
+#[allow(dead_code)]
+impl IndexMap {
     pub fn selection_of(&self, cart_index: u32) -> Option<Selection> {
         self.entries.get(cart_index as usize).copied()
     }
@@ -106,12 +109,16 @@ pub fn rows_from(entities: &[EntityRow]) -> Vec<CartRow> {
         .collect()
 }
 
+// Hit-testing over the cart's rows is the Live canvas's half of the
+// gesture story (Task 5); the session only keeps the rows fresh.
+#[allow(dead_code)]
 fn contains(row: &CartRow, x: f64, y: f64) -> bool {
     x >= row.x && x < row.x + row.w && y >= row.y && y < row.y + row.h
 }
 
 /// Topmost (last) row under a world point, as the cart draws later rows
 /// above earlier ones.
+#[allow(dead_code)]
 pub fn hit_row(rows: &[CartRow], x: f64, y: f64) -> Option<u32> {
     rows.iter()
         .rev()
@@ -119,6 +126,7 @@ pub fn hit_row(rows: &[CartRow], x: f64, y: f64) -> Option<u32> {
         .map(|row| row.index)
 }
 
+#[allow(dead_code)]
 pub fn rows_in_rect(rows: &[CartRow], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<u32> {
     let (left, right) = (x0.min(x1), x0.max(x1));
     let (top, bottom) = (y0.min(y1), y0.max(y1));
@@ -193,6 +201,180 @@ pub fn layer_bytes(w: u16, h: u16, cells: &[u16]) -> Vec<u8> {
         out.extend_from_slice(&cell.to_le_bytes());
     }
     out
+}
+
+/// The cart's "no tile here" cell (emerald-editor-runtime's
+/// `BLANK_TILE`), and the tileset stem an unlinked slot is cleared with.
+/// Named here rather than pulled from `emerald-editor-runtime`, which
+/// this crate does not depend on -- `emerald-editor-link` is the whole
+/// host-side surface it needs.
+pub const BLANK_TILE: u16 = 1023;
+pub const BLANK_STEM: &str = "_blank";
+
+/// One background slot's `load_layer` arguments, resolved off the
+/// document: a linked slot's map bytes against its bank, or the 1x1 blank
+/// map that clears an unlinked one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerLoad {
+    pub layer: u32,
+    pub base: u16,
+    pub budget: u16,
+    pub map_bytes: Vec<u8>,
+    pub tileset_stem: String,
+}
+
+/// Every slot's load for the merged background set, slot 0 first.
+///
+/// All four slots are always covered: a slot the document does not link
+/// (or whose map failed to open, or which names no tileset) is CLEARED
+/// with a 1x1 blank map rather than left alone, because the cart keeps
+/// whatever the previous world put there otherwise.
+pub fn layer_loads(root: &Path, merged: &[MergedBackground]) -> VecDeque<LayerLoad> {
+    let payloads: Vec<loader::LayerPayload> = loader::layer_payloads(root, merged)
+        .into_iter()
+        .filter(|payload| !payload.tileset_stem.is_empty() && usize::from(payload.slot) < 4)
+        .collect();
+    let mut linked = [false; 4];
+    for payload in &payloads {
+        linked[usize::from(payload.slot)] = true;
+    }
+    let banks = banks(&linked);
+    (0..4u8)
+        .map(|slot| {
+            let bank = banks.get(usize::from(slot)).copied().flatten();
+            match (payloads.iter().find(|p| p.slot == slot), bank) {
+                (Some(payload), Some(bank)) => LayerLoad {
+                    layer: u32::from(slot),
+                    base: bank.base,
+                    budget: bank.budget,
+                    map_bytes: layer_bytes(payload.w, payload.h, &payload.cells),
+                    tileset_stem: payload.tileset_stem.clone(),
+                },
+                _ => LayerLoad {
+                    layer: u32::from(slot),
+                    base: BG_TILE_BASE,
+                    budget: 1,
+                    map_bytes: layer_bytes(1, 1, &[BLANK_TILE]),
+                    tileset_stem: BLANK_STEM.to_string(),
+                },
+            }
+        })
+        .collect()
+}
+
+// ------------------------------------------------------------- session
+
+/// Which renderer the canvas is showing. Sticky for the session: opening
+/// another world keeps the mode the user last chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasMode {
+    Design,
+    Live,
+}
+
+/// Where the live session is between "the viewer cart is being built" and
+/// "the cart is mirroring the document". `Failed` is terminal: the panel
+/// has already fallen back to [`CanvasMode::Design`] and only keeps the
+/// session around so the toolbar can say why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveStatus {
+    Building,
+    Connecting,
+    Connected,
+    Failed(String),
+}
+
+/// One cart frame of emulator time. The mailbox's timeouts are measured
+/// on the CART's clock, so the poll clock is derived from the endpoint's
+/// frame counter rather than read off the wall -- see the plan's
+/// "Contracts learned in Phase 1".
+pub const FRAME_TIME: Duration = Duration::from_micros(16_667);
+/// How often the poll loop wakes when no frame arrives -- ticks stop
+/// while the emulator is paused or between runs.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a `Hello` may go unanswered before it is re-sent (cart clock).
+pub const HELLO_RETRY: Duration = Duration::from_millis(500);
+/// How long the cart may run without answering a `Hello` before the panel
+/// gives up on it (cart clock).
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+/// How long the viewer cart may stay in `Building` before the panel gives
+/// up. The build produces no frames, so this one IS wall time.
+pub const BUILD_DEADLINE: Duration = Duration::from_secs(120);
+/// How long a connected cart may go without framing before the host
+/// re-greets it, and again before the session is failed (cart clock).
+pub const STALE_AFTER: Duration = Duration::from_secs(2);
+
+fn cart_clock(endpoint: &ggo_common::LinkEndpoint, epoch: Instant) -> Instant {
+    epoch + FRAME_TIME * endpoint.frame_number().unwrap_or(0)
+}
+
+/// One live session: the link to the viewer cart running the open world,
+/// and everything the panel mirrors off it.
+pub struct LiveView {
+    pub endpoint: Arc<ggo_common::LinkEndpoint>,
+    pub mailbox: LinkMailbox<EndpointIo>,
+    pub status: LiveStatus,
+    /// Base of the cart clock: `epoch + FRAME_TIME * frame_number` is the
+    /// `now` every [`LinkMailbox`] call is measured against.
+    pub epoch: Instant,
+    /// When the session began, on the executor's clock -- the only
+    /// deadline that is not the cart's is the build's.
+    pub started: Instant,
+    /// Cart clock at the last `Hello`.
+    pub last_hello: Instant,
+    /// Cart clock when the cart was first seen `Running`; the
+    /// [`CONNECT_DEADLINE`] runs from here, not from the build.
+    pub connect_since: Instant,
+    /// Cart clock at the re-`Hello` a stale session triggered, if one is
+    /// outstanding. A second [`STALE_AFTER`] with no answer fails it.
+    pub stale_hello: Option<Instant>,
+    /// The cart's latest presented frame. Cloned out of the endpoint --
+    /// the emu panel owns dropping the image.
+    pub frame: Option<(u32, Arc<RenderImage>)>,
+    /// The cart's published rects, in world pixels.
+    pub rows: Vec<CartRow>,
+    pub index_map: IndexMap,
+    pub world_dirty: bool,
+    pub layers_dirty: bool,
+    pub camera_dirty: bool,
+    /// Slots still to push for the current `layers_dirty` cycle. One goes
+    /// out per tick: the cart's APP receive queue is four datagrams deep,
+    /// and a blob transfer already fills it.
+    pub layer_queue: VecDeque<LayerLoad>,
+    pub poll: Option<Task<()>>,
+}
+
+impl LiveView {
+    pub fn new(endpoint: Arc<ggo_common::LinkEndpoint>, now: Instant) -> Self {
+        // The cart clock starts wherever the endpoint's frame counter
+        // already is (a reused cart has been running a while), so every
+        // baseline below has to be taken on THAT clock, not on `now`.
+        let cart = cart_clock(&endpoint, now);
+        LiveView {
+            mailbox: LinkMailbox::new(EndpointIo(endpoint.clone())),
+            endpoint,
+            status: LiveStatus::Building,
+            epoch: now,
+            started: now,
+            last_hello: cart,
+            connect_since: cart,
+            stale_hello: None,
+            frame: None,
+            rows: Vec::new(),
+            index_map: IndexMap::new(0, &[]),
+            world_dirty: false,
+            layers_dirty: false,
+            camera_dirty: false,
+            layer_queue: VecDeque::new(),
+            poll: None,
+        }
+    }
+
+    /// The cart clock: emulator-derived, monotonic, and frozen while the
+    /// emulator is paused (`frame_number` stops advancing).
+    pub fn cart_now(&self) -> Instant {
+        cart_clock(&self.endpoint, self.epoch)
+    }
 }
 
 #[cfg(test)]

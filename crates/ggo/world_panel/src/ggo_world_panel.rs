@@ -31,11 +31,14 @@ mod loader;
 mod world_canvas_item;
 pub use world_canvas_item::WorldCanvasItem;
 
+use live::{CanvasMode, LiveStatus, LiveView};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -699,6 +702,13 @@ struct OpenWorld {
     /// first paint-mode render.
     terrain_name: Option<Entity<Editor>>,
     resize: Option<paint_ui::ResizeFields>,
+    /// The live session mirroring this document into the viewer cart, if
+    /// Live mode got one. Kept (with `LiveStatus::Failed`) after a
+    /// fallback so the toolbar can still say what went wrong.
+    live: Option<LiveView>,
+    /// Why Live mode is not showing, on the toolbar next to `save_error`.
+    /// Set on every fallback to Design, cleared when a session starts.
+    live_error: Option<String>,
 }
 
 /// What an Asset field's row shows -- see [`WorldPanel::asset_field_view`].
@@ -785,6 +795,8 @@ impl OpenWorld {
             strip_bounds: Rc::new(RefCell::new(None)),
             terrain_name: None,
             resize: None,
+            live: None,
+            live_error: None,
         }
     }
 }
@@ -1007,6 +1019,30 @@ pub fn composite_scene(items: &[DrawItem], origin: [f64; 2], width: u32, height:
     canvas
 }
 
+/// The world point at the canvas's top-left corner -- what the cart's
+/// camera has to be set to for its render to line up with the design
+/// view's framing.
+fn view_top_left_world(view: &Rc<RefCell<ViewShared>>) -> [f64; 2] {
+    let v = view.borrow();
+    let pan = v.pan.unwrap_or([0.0, 0.0]);
+    drag_ops::screen_to_world(
+        0.0,
+        0.0,
+        &View {
+            zoom: v.zoom,
+            pan_x: pan[0],
+            pan_y: pan[1],
+            dpr: None,
+        },
+    )
+}
+
+/// A transport failure on the link: the port or the emulator is gone, not
+/// a datagram lost on the wire.
+fn link_failed(error: std::io::Error) -> String {
+    format!("viewer link failed: {error}")
+}
+
 /// The world point at the canvas center -- ggo-ide's `view_center_world`,
 /// where a freshly added entity/instance lands. Before the first layout
 /// (no bounds/pan yet -- possible when adding right after load, and the
@@ -1072,6 +1108,150 @@ impl OpenWorld {
         });
     }
 
+    /// One turn of the live session, on the poll task's wake. Returns the
+    /// reason the session must fall back to the design view, if any.
+    ///
+    /// `wall` is the executor's clock and is used for exactly one thing:
+    /// the build deadline, which cannot be measured on the cart's clock
+    /// because a cart that is still being built has never framed. Every
+    /// other deadline here runs on `LiveView::cart_now`.
+    fn live_step(&mut self, wall: Instant) -> Option<String> {
+        // Field-precise borrow on purpose: the steps below read the
+        // document (`store`, `merged`, `root`, `view`) while the session
+        // is borrowed mutably.
+        let live = self.live.as_mut()?;
+        if matches!(live.status, LiveStatus::Failed(_)) {
+            return None;
+        }
+        let now = live.cart_now();
+        match live.endpoint.state() {
+            ggo_common::ViewerState::Building => {
+                return (wall.duration_since(live.started) >= live::BUILD_DEADLINE)
+                    .then(|| "viewer cart build timed out".to_string());
+            }
+            ggo_common::ViewerState::Stopped(reason) => return Some(reason),
+            ggo_common::ViewerState::Running => {}
+        }
+        if matches!(live.status, LiveStatus::Building) {
+            live.status = LiveStatus::Connecting;
+            live.connect_since = now;
+            live.last_hello = now;
+            if let Err(error) = live.mailbox.hello() {
+                return Some(link_failed(error));
+            }
+        }
+        if let Err(error) = live.mailbox.poll(now) {
+            return Some(link_failed(error));
+        }
+        if let Some(version) = live.mailbox.proto_version_mismatch() {
+            return Some(format!(
+                "viewer cart predates the link protocol (cart v{version}); rebuild it"
+            ));
+        }
+        if live.mailbox.is_connected() {
+            if live.status != LiveStatus::Connected {
+                live.status = LiveStatus::Connected;
+                live.stale_hello = None;
+                // A greeting resets the cart's whole view, so everything
+                // this document owns has to go out again.
+                live.world_dirty = true;
+                live.layers_dirty = true;
+                live.camera_dirty = true;
+                live.layer_queue.clear();
+            }
+            // `is_connected` never goes false on its own; a cart that was
+            // reset or unplugged is only visible as a session that stopped
+            // framing (Phase 1 contracts).
+            if live.mailbox.is_stale(now, live::STALE_AFTER) {
+                live.status = LiveStatus::Connecting;
+                live.stale_hello = Some(now);
+                live.connect_since = now;
+                live.last_hello = now;
+                if let Err(error) = live.mailbox.hello() {
+                    return Some(link_failed(error));
+                }
+            }
+        } else if let Some(greeted_at) = live.stale_hello {
+            if now.duration_since(greeted_at) >= live::STALE_AFTER {
+                return Some("viewer cart stopped answering".to_string());
+            }
+        } else if now.duration_since(live.connect_since) >= live::CONNECT_DEADLINE {
+            return Some("viewer cart never answered".to_string());
+        }
+        if !live.mailbox.is_connected() && now.duration_since(live.last_hello) >= live::HELLO_RETRY
+        {
+            live.last_hello = now;
+            if let Err(error) = live.mailbox.hello() {
+                return Some(link_failed(error));
+            }
+        }
+
+        // One update per tick, and none while a blob is in flight: the
+        // cart's APP receive queue is four datagrams deep and a transfer
+        // already fills it.
+        if live.status == LiveStatus::Connected && !live.mailbox.busy() {
+            if live.world_dirty {
+                live.world_dirty = false;
+                let state = self.store.state();
+                let instances: Vec<world_file::WorldInstance> = state
+                    .instances
+                    .iter()
+                    .map(|instance| world_file::WorldInstance {
+                        world: instance.world.clone(),
+                        pos: instance.pos,
+                        background_priority: instance.background_priority,
+                    })
+                    .collect();
+                let counts = loader::instance_entity_counts(&self.root, &instances);
+                live.index_map = live::IndexMap::new(state.entities.len(), &counts);
+                match live::encode_world(&self.store, &self.root) {
+                    // A world the encoder rejects is a document problem,
+                    // not a link problem: say so on the status row and stay
+                    // live on whatever the cart already has.
+                    Err(error) => self.live_error = Some(format!("live update: {error}")),
+                    Ok(blob) => {
+                        if let Err(error) = live.mailbox.load_world(&blob) {
+                            self.live_error = Some(format!("live update: {error}"));
+                        }
+                    }
+                }
+            } else if live.layers_dirty {
+                if live.layer_queue.is_empty() {
+                    live.layer_queue = live::layer_loads(&self.root, &self.merged);
+                }
+                if let Some(load) = live.layer_queue.pop_front()
+                    && let Err(error) = live.mailbox.load_layer(
+                        load.layer,
+                        load.base,
+                        load.budget,
+                        &load.map_bytes,
+                        &load.tileset_stem,
+                    )
+                {
+                    self.live_error = Some(format!("live layer {}: {error}", load.layer));
+                }
+                live.layers_dirty = !live.layer_queue.is_empty();
+            } else if live.camera_dirty {
+                live.camera_dirty = false;
+                let [x, y] = view_top_left_world(&self.view);
+                if let Err(error) = live.mailbox.set_camera(live::to_raw(x), live::to_raw(y)) {
+                    self.live_error = Some(format!("live camera: {error}"));
+                }
+            }
+        }
+
+        live.rows = live::rows_from(live.mailbox.entities());
+        // Cloning the `Arc` only -- the emu panel owns dropping the image
+        // it replaces (see `LinkEndpoint::frame`).
+        live.frame = live
+            .endpoint
+            .frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        None
+    }
+
     /// The current position of every selected item that still exists.
     fn selected_positions(&self) -> Vec<(Selection, [f64; 2])> {
         let state = self.store.state();
@@ -1118,6 +1298,15 @@ pub struct WorldPanel {
     /// the system clipboard the world's entity copy uses: a `Stamp` has no
     /// text form, and pasting cells into an editor tab would be nonsense.
     cell_clipboard: Option<Stamp>,
+    /// Which renderer the canvas draws. Sticky across worlds within a
+    /// session: a fallback to Design is what turns Live off, and the user
+    /// turning it back on is what turns it on again.
+    canvas_mode: CanvasMode,
+    /// The viewer cart's link, kept at PANEL level so switching worlds
+    /// inside one emerald project reuses the running cart instead of
+    /// rebuilding it. The `PathBuf` is the emerald project root the cart
+    /// was booted for; a world outside it needs its own cart.
+    live_endpoint: Option<(PathBuf, Arc<ggo_common::LinkEndpoint>)>,
 }
 
 impl WorldPanel {
@@ -1125,6 +1314,11 @@ impl WorldPanel {
         // The last chance to hand the image cache's atlas tiles back: no
         // render follows a release. Same hook the emu pane uses.
         cx.on_release(|this, cx| {
+            // The viewer cart outlives nothing here: with the panel gone
+            // there is no one left to poll the link.
+            if let Some((_, endpoint)) = this.live_endpoint.take() {
+                endpoint.request_stop();
+            }
             this.retire_open_images();
             for image in this
                 .retired_previous
@@ -1151,6 +1345,8 @@ impl WorldPanel {
             retired_images: Vec::new(),
             retired_previous: Vec::new(),
             cell_clipboard: None,
+            canvas_mode: CanvasMode::Live,
+            live_endpoint: None,
         }
     }
 
@@ -1297,13 +1493,23 @@ impl WorldPanel {
             cx,
             Self::save_for_close,
         );
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if !proceed.await {
                 return;
             }
-            this.update(cx, |this, cx| {
-                this.refresh_worlds(cx);
-                this.load_rel_path(&rel, cx);
+            // `spawn_in` + `cx.update` (rather than `spawn` +
+            // `update_in`): entering Live mode when the load lands needs
+            // the `Window` this call came from -- the booter runs inside a
+            // `Workspace` update -- and `update_in` cannot supply it,
+            // because it resolves the window off the ENTITY, which is not
+            // always the window's own (the headless tests build a panel
+            // outside any window).
+            cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    this.refresh_worlds(cx);
+                    this.load_rel_path(&rel, Some(window), cx);
+                })
+                .ok();
             })
             .ok();
         })
@@ -1390,10 +1596,14 @@ impl WorldPanel {
     /// "Don't Save" answer to the tab's close prompt. Unlike
     /// `open_rel_path` this asks nothing: the user already answered.
     pub(crate) fn reload_from_disk(&mut self, rel: &str, cx: &mut Context<Self>) {
-        self.load_rel_path(rel, cx);
+        self.load_rel_path(rel, None, cx);
     }
 
-    fn load_rel_path(&mut self, rel: &str, cx: &mut Context<Self>) {
+    /// `window` is what a completed load needs to enter Live mode (see
+    /// [`Self::enter_live`]); the windowless callers -- the close
+    /// prompt's reload and the MCP `world_open` -- load into Design and
+    /// let the next click through the explorer bring Live back.
+    fn load_rel_path(&mut self, rel: &str, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let Some((asset_root_rel, listing)) = split_world_path(rel) else {
             return;
         };
@@ -1432,27 +1642,46 @@ impl WorldPanel {
                 (loaded, images)
             })
         });
-        self._load_task = Some(cx.spawn(async move |this, cx| {
-            let result = load.await;
-            this.update(cx, |this, cx| {
-                if this.load_generation != generation {
-                    return;
-                }
-                this.retire_open_images();
-                this.state = match result {
-                    Ok((loaded, images)) => ViewerState::Ready(Box::new(OpenWorld::new(
-                        listing,
-                        source_rel,
-                        loaded_root,
-                        loaded,
-                        images,
-                    ))),
-                    Err(e) => ViewerState::Error(e),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
+        let finish = move |this: &mut Self,
+                           window: Option<&mut Window>,
+                           cx: &mut Context<Self>,
+                           result: Result<_, String>| {
+            if this.load_generation != generation {
+                return;
+            }
+            this.retire_open_images();
+            this.state = match result {
+                Ok((loaded, images)) => ViewerState::Ready(Box::new(OpenWorld::new(
+                    listing,
+                    source_rel,
+                    loaded_root,
+                    loaded,
+                    images,
+                ))),
+                Err(e) => ViewerState::Error(e),
+            };
+            if let Some(window) = window
+                && this.canvas_mode == CanvasMode::Live
+            {
+                this.enter_live(window, cx);
+            }
+            cx.notify();
+        };
+        self._load_task = Some(match window {
+            Some(window) => cx.spawn_in(window, async move |this, cx| {
+                let result = load.await;
+                cx.update(|window, cx| {
+                    this.update(cx, |this, cx| finish(this, Some(window), cx, result))
+                        .ok();
+                })
+                .ok();
+            }),
+            None => cx.spawn(async move |this, cx| {
+                let result = load.await;
+                this.update(cx, |this, cx| finish(this, None, cx, result))
+                    .ok();
+            }),
+        });
     }
 
     // ------------------------------------------------------------ editing
@@ -2805,7 +3034,7 @@ impl WorldPanel {
                 "{dirty} has unsaved edits; save or revert it before opening {rel}"
             ));
         }
-        self.load_rel_path(&rel, cx);
+        self.load_rel_path(&rel, None, cx);
         Ok(rel)
     }
 
@@ -3445,6 +3674,170 @@ impl WorldPanel {
                 }
             });
         });
+    }
+
+    // ---------------------------------------------------------- live mode
+
+    /// Start a live session for the open world: reuse the viewer cart
+    /// already running for this emerald project, or boot one.
+    ///
+    /// The boot goes through `ggo_common`'s viewer registry from inside a
+    /// `Workspace` update, deferred out of this one exactly as
+    /// [`Self::emulate_impl`] defers -- the workspace is leased while a
+    /// panel listener runs, and the booter opens an emulator pane.
+    fn enter_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        if open.live.is_some() {
+            return;
+        }
+        let rel = open.source_rel.clone();
+        // One cart per emerald project: every world in it loads over the
+        // same link. Worlds outside an emerald project (the test fixtures,
+        // a loose `worlds/` tree) key on the asset root instead, so the
+        // reuse rule stays "one cart per document root" either way.
+        let project_key = self
+            .project_root
+            .as_ref()
+            .map(|root| root.join(&rel))
+            .and_then(|path| ggo_common::emerald_project_root(&path))
+            .unwrap_or_else(|| open.root.clone());
+        if let Some((booted_for, endpoint)) = &self.live_endpoint {
+            let reusable = *booted_for == project_key
+                && !matches!(endpoint.state(), ggo_common::ViewerState::Stopped(_));
+            if reusable {
+                let endpoint = endpoint.clone();
+                self.start_live(endpoint, cx);
+                return;
+            }
+            // A different project's cart is running: it has nothing to do
+            // with the world now open, so end that run before booting.
+            self.stop_live_endpoint();
+        }
+        let Some(workspace) = self.workspace.clone() else {
+            self.fall_back_to_design(
+                "the world panel has no workspace to boot the viewer cart in".to_string(),
+                cx,
+            );
+            return;
+        };
+        let this = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            let endpoint = workspace.upgrade().and_then(|workspace| {
+                workspace.update(cx, |workspace, cx| {
+                    ggo_common::boot_viewer(workspace, &rel, window, cx)
+                })
+            });
+            this.update(cx, |this, cx| match endpoint {
+                Some(endpoint) => {
+                    this.live_endpoint = Some((project_key, endpoint.clone()));
+                    this.start_live(endpoint, cx);
+                }
+                None => this.fall_back_to_design(
+                    "no emulator pane is available to run the viewer cart".to_string(),
+                    cx,
+                ),
+            })
+            .ok();
+        });
+    }
+
+    /// Attach a [`LiveView`] to the open world and start polling it.
+    ///
+    /// The loop races the endpoint's per-frame tick against a timer: ticks
+    /// stop while the emulator is paused or between runs, and the mailbox's
+    /// retries only happen inside a `poll` (Phase 2 review).
+    fn start_live(&mut self, endpoint: Arc<ggo_common::LinkEndpoint>, cx: &mut Context<Self>) {
+        // `background_executor().now()` rather than `Instant::now()`: it is
+        // the clock gpui's test timers move, so the build deadline is
+        // testable instead of being 120 s of real waiting.
+        let now = cx.background_executor().now();
+        let executor = cx.background_executor().clone();
+        let ticks = endpoint.ticks();
+        let poll = cx.spawn(async move |this, cx| {
+            loop {
+                let woke = smol::future::race(async { ticks.recv().await.ok() }, async {
+                    executor.timer(live::POLL_INTERVAL).await;
+                    Some(())
+                })
+                .await;
+                if woke.is_none() {
+                    break;
+                }
+                match this.update(cx, |this, cx| this.live_tick(cx)) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
+            }
+        });
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let mut live = LiveView::new(endpoint, now);
+        live.poll = Some(poll);
+        open.live = Some(live);
+        open.live_error = None;
+        self.live_tick(cx);
+    }
+
+    /// One turn of the live session. Returns whether the poll loop should
+    /// keep going -- a fallback to Design ends it.
+    fn live_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let wall = cx.background_executor().now();
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        if open.live.is_none() {
+            return false;
+        }
+        let failure = open.live_step(wall);
+        cx.notify();
+        match failure {
+            Some(reason) => {
+                self.fall_back_to_design(reason, cx);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Show the design renderer again and say why. The [`LiveView`] (if
+    /// there is one) is kept in [`LiveStatus::Failed`] so the toolbar can
+    /// name the failure; it stops being polled.
+    fn fall_back_to_design(&mut self, reason: String, cx: &mut Context<Self>) {
+        log::warn!("GGO: live world view fell back to the design view: {reason}");
+        self.canvas_mode = CanvasMode::Design;
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.live_error = Some(reason.clone());
+            if let Some(live) = &mut open.live {
+                live.status = LiveStatus::Failed(reason);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Leave Live mode deliberately: the session goes, and so does the
+    /// viewer run behind it.
+    // Task 5 wires the toolbar's Design/Live switch, which is the only
+    // thing that leaves Live on purpose.
+    #[allow(dead_code)]
+    fn leave_live(&mut self, cx: &mut Context<Self>) {
+        self.canvas_mode = CanvasMode::Design;
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.live = None;
+            open.live_error = None;
+        }
+        self.stop_live_endpoint();
+        cx.notify();
+    }
+
+    /// End the viewer run this panel booted, if any. Advisory: the
+    /// emulator acts on it at its next frame.
+    fn stop_live_endpoint(&mut self) {
+        if let Some((_, endpoint)) = self.live_endpoint.take() {
+            endpoint.request_stop();
+        }
     }
 
     /// The toolbar's popout-Emulate button: build the cartridge exactly as
@@ -5776,7 +6169,7 @@ mod tests {
         });
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", cx);
+            panel.load_rel_path("worlds/test.toml", None, cx);
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
@@ -6041,7 +6434,7 @@ mod tests {
             panel.refresh_worlds(cx);
             let stems: Vec<&str> = panel.worlds.iter().map(|w| w.stem.as_str()).collect();
             assert_eq!(stems, ["worlds/sub", "worlds/test"]);
-            panel.load_rel_path("worlds/test.toml", cx);
+            panel.load_rel_path("worlds/test.toml", None, cx);
             assert!(matches!(panel.state, ViewerState::Loading { .. }));
         });
 
@@ -6107,7 +6500,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path("assets/worlds/test.toml", cx);
+            panel.load_rel_path("assets/worlds/test.toml", None, cx);
         });
         cx.executor().run_until_parked();
 
@@ -6433,7 +6826,7 @@ mod tests {
 
         let panel = ready_panel(cx, root).await;
         panel.update(cx, |panel, cx| {
-            panel.load_rel_path("worlds/a.toml", cx);
+            panel.load_rel_path("worlds/a.toml", None, cx);
         });
         cx.executor().run_until_parked();
 
@@ -6829,7 +7222,7 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", cx);
+            panel.load_rel_path("worlds/test.toml", None, cx);
         });
         cx.run_until_parked();
         panel.update(cx, |panel, cx| {
@@ -8294,7 +8687,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
             panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", cx);
+            panel.load_rel_path("worlds/test.toml", None, cx);
         });
         cx.run_until_parked();
         dirty_the_world(&panel, cx);
@@ -9120,7 +9513,7 @@ mod tests {
     fn open_in_menu_panel(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext, rel: &str) {
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path(rel, cx);
+            panel.load_rel_path(rel, None, cx);
         });
         cx.run_until_parked();
     }
@@ -9723,7 +10116,9 @@ mod tests {
         )
         .unwrap();
 
-        panel.update(cx, |panel, cx| panel.load_rel_path("worlds/audio.toml", cx));
+        panel.update(cx, |panel, cx| {
+            panel.load_rel_path("worlds/audio.toml", None, cx)
+        });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, cx| {
             assert_eq!(
@@ -10433,7 +10828,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
             panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", cx);
+            panel.load_rel_path("worlds/test.toml", None, cx);
         });
         cx.run_until_parked();
         panel.update_in(cx, |panel, window, cx| panel.flash_impl(false, window, cx));
@@ -11367,7 +11762,9 @@ mod tests {
             },
         )
         .unwrap();
-        panel.update(cx, |panel, cx| panel.load_rel_path("worlds/deco.toml", cx));
+        panel.update(cx, |panel, cx| {
+            panel.load_rel_path("worlds/deco.toml", None, cx)
+        });
         cx.run_until_parked();
         panel.update(cx, |panel, _cx| {
             open_of(panel).view.borrow_mut().pan = Some([0.0, 0.0]);
@@ -11688,5 +12085,337 @@ mod tests {
             serde_json::json!([70, 80]),
             "the world half of the save still landed"
         );
+    }
+
+    // ---------------------------------------------------- live mode
+
+    thread_local! {
+        static BOOTED: RefCell<Vec<(String, Arc<ggo_common::LinkEndpoint>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    fn fake_booter(
+        _workspace: &mut Workspace,
+        rel: &str,
+        endpoint: Arc<ggo_common::LinkEndpoint>,
+        _window: &mut Window,
+        _cx: &mut Context<Workspace>,
+    ) -> bool {
+        BOOTED.with(|booted| booted.borrow_mut().push((rel.to_string(), endpoint)));
+        true
+    }
+
+    /// One cart -> host datagram, hand-rolled against the wire layout table
+    /// in `emerald-editor-runtime`'s `wire.rs`. Built by hand rather than
+    /// with `wire::encode_cart` so this crate does not take a dependency on
+    /// the runtime just to test the host half -- and so the bytes the
+    /// mailbox is fed are the documented ones, not the encoder's opinion of
+    /// them.
+    fn cart_says(endpoint: &ggo_common::LinkEndpoint, datagram: Vec<u8>) {
+        endpoint.push_inbound(datagram);
+        endpoint.tick();
+    }
+
+    /// `0x81 HelloAck`: `version u8, entity_cap u16, world_cap u32,
+    /// layer_cap u32, count u8`, then `count` x (`len u8`, bytes).
+    fn hello_ack(version: u8, systems: &[&str]) -> Vec<u8> {
+        let mut out = vec![0x81, version];
+        out.extend_from_slice(&256u16.to_le_bytes());
+        out.extend_from_slice(&32768u32.to_le_bytes());
+        out.extend_from_slice(&8192u32.to_le_bytes());
+        out.push(systems.len() as u8);
+        for name in systems {
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+        }
+        out
+    }
+
+    /// Every APP payload the panel has put on the link since the last call.
+    fn host_sent(endpoint: &ggo_common::LinkEndpoint) -> Vec<Vec<u8>> {
+        let mut reader = ggo_comm::MessageReader::default();
+        endpoint
+            .take_outbound()
+            .iter()
+            .flat_map(|wire| reader.feed(wire))
+            .filter_map(|item| match item {
+                ggo_comm::LinkItem::Message(message) => Some(message.payload().to_vec()),
+                ggo_comm::LinkItem::Text(_) => None,
+            })
+            .collect()
+    }
+
+    /// A panel in a real window with `worlds/test.toml` open in Live mode,
+    /// plus the endpoint the (fake) booter was handed.
+    async fn live_panel<'a>(
+        cx: &'a mut TestAppContext,
+        dir: &tempfile::TempDir,
+    ) -> (
+        Entity<WorldPanel>,
+        Arc<ggo_common::LinkEndpoint>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let project = routed_project(cx, dir.path(), true).await;
+        cx.update(|cx| ggo_common::register_viewer_booter(cx, fake_booter));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+        panel.update(cx, |panel, _| {
+            panel.root_override = Some(dir.path().to_path_buf())
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("worlds/test.toml", window, cx)
+        });
+        cx.run_until_parked();
+        let endpoint = BOOTED
+            .with(|booted| booted.borrow().last().map(|(_, e)| e.clone()))
+            .expect("Live mode asked the booter for a viewer cart");
+        (panel, endpoint, cx)
+    }
+
+    #[gpui::test]
+    async fn live_mode_boots_the_viewer_and_says_hello_once_it_runs(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        BOOTED.with(|booted| {
+            assert_eq!(
+                booted.borrow().last().map(|(rel, _)| rel.clone()),
+                Some("worlds/test.toml".to_string()),
+                "the booter is asked for the world the panel opened"
+            );
+        });
+        assert!(
+            host_sent(&endpoint).is_empty(),
+            "nothing goes on the wire while the cart is still building"
+        );
+
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+
+        let sent = host_sent(&endpoint);
+        assert_eq!(sent.first().map(|m| m[0]), Some(0x01), "Hello goes first");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
+            assert_eq!(
+                open_of(panel).live.as_ref().map(|live| live.status.clone()),
+                Some(LiveStatus::Connecting)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn live_mode_connects_on_hello_ack_and_sends_the_world(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        cart_says(&endpoint, hello_ack(1, &["animate"]));
+        cx.run_until_parked();
+
+        let sent = host_sent(&endpoint);
+        assert_eq!(
+            sent.first().map(|m| (m[0], m[1])),
+            // `0x08 BlobBegin`, then `kind u8`: 0 is the world document
+            // (1 would be a background layer).
+            Some((0x08, 0x00)),
+            "the world document goes out as soon as the session opens"
+        );
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            let live = open.live.as_ref().expect("a live session");
+            assert_eq!(live.status, LiveStatus::Connected);
+            assert_eq!(live.mailbox.system_names(), ["animate"]);
+            assert_eq!(
+                live.index_map.len(),
+                4,
+                "three direct entities plus the instance's one"
+            );
+            assert_eq!(open.live_error, None);
+        });
+    }
+
+    #[gpui::test]
+    async fn a_stopped_viewer_falls_back_to_design_with_the_reason(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Stopped(
+            "build failed: no emd".into(),
+        ));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            let open = open_of(panel);
+            assert!(
+                open.live_error.as_deref().unwrap_or("").contains("no emd"),
+                "the toolbar names the reason: {:?}",
+                open.live_error
+            );
+            assert!(
+                matches!(
+                    open.live.as_ref().map(|live| &live.status),
+                    Some(LiveStatus::Failed(_))
+                ),
+                "the failed session is kept for its message"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn no_booter_means_design_mode(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+        panel.update(cx, |panel, _| {
+            panel.root_override = Some(dir.path().to_path_buf())
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("worlds/test.toml", window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert!(open_of(panel).live.is_none());
+            assert!(open_of(panel).live_error.is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn a_version_mismatch_falls_back_and_names_the_rebuild(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(&endpoint, hello_ack(0, &[]));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert!(
+                open_of(panel)
+                    .live_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("rebuild"),
+                "the fallback tells the user to rebuild the viewer cart: {:?}",
+                open_of(panel).live_error
+            );
+        });
+    }
+
+    /// The poll loop stops with the fallback: a failed session must not
+    /// keep waking the panel every 250 ms for the rest of the run.
+    #[gpui::test]
+    async fn a_fallback_stops_the_poll_loop(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Stopped("gone".into()));
+        cx.run_until_parked();
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert!(
+                matches!(
+                    open_of(panel).live.as_ref().map(|live| &live.status),
+                    Some(LiveStatus::Failed(_))
+                ),
+                "a later Running does not resurrect a failed session"
+            );
+        });
+        assert!(
+            host_sent(&endpoint).is_empty(),
+            "and nothing more goes on the wire"
+        );
+    }
+
+    /// A world switch inside one project reuses the cart that is already
+    /// running: rebuilding it for every world would cost a build and a
+    /// boot per click.
+    #[gpui::test]
+    async fn a_world_switch_inside_one_project_reuses_the_cart(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(&endpoint, hello_ack(1, &[]));
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("worlds/sub.toml", window, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            BOOTED.with(|booted| booted.borrow().len()),
+            1,
+            "the second world reuses the running cart"
+        );
+        assert!(
+            host_sent(&endpoint).iter().any(|m| m[0] == 0x01),
+            "and greets it again, so the cart republishes for the new world"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).listing.rel_path, "worlds/sub.toml");
+            assert!(open_of(panel).live.is_some(), "still live after the switch");
+        });
+    }
+
+    /// A viewer cart that never finishes building produces no frames, so
+    /// nothing on the cart's clock can time it out -- the build deadline
+    /// is the one that runs on the executor's.
+    #[gpui::test]
+    async fn a_build_that_never_finishes_falls_back(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, _endpoint, cx) = live_panel(cx, &dir).await;
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Live, "still waiting");
+        });
+        cx.executor()
+            .advance_clock(live::BUILD_DEADLINE + std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert!(
+                open_of(panel)
+                    .live_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("build timed out"),
+                "{:?}",
+                open_of(panel).live_error
+            );
+        });
+    }
+
+    /// Leaving Live ends the viewer run rather than leaving a cart burning
+    /// emulator frames for a panel that stopped looking (Phase 2 review).
+    #[gpui::test]
+    async fn leaving_live_stops_the_viewer_run(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        assert!(!endpoint.stop_requested());
+        panel.update(cx, |panel, cx| panel.leave_live(cx));
+        cx.run_until_parked();
+        assert!(endpoint.stop_requested(), "the viewer run is asked to end");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert!(open_of(panel).live.is_none());
+        });
     }
 }

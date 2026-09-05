@@ -190,17 +190,12 @@ pub fn fill_missing_background_loads(
 }
 
 // ------------------------------------------------------- live-mode payloads
-//
-// These land ahead of the panel code that drives them (Task 4 wires the
-// Live-mode session), so their only callers so far are this module's own
-// tests -- hence the `dead_code` allows, which Task 4 removes.
 
 const TILESET_EXT: &str = ".til";
 
 /// One background slot's cells, ready for the cart's `CMD_LOAD_LAYER`
 /// (`live::layer_bytes`) plus the tileset the slot's map is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct LayerPayload {
     pub slot: u8,
     /// Asset-root-relative, extension-less -- the `.til` path the map
@@ -217,7 +212,6 @@ pub struct LayerPayload {
 /// as an empty layer: the panel already surfaces that slot's failure on
 /// the layers rail, and pushing a zero-sized layer to the cart would
 /// blank a slot the user can still see composed on the canvas.
-#[allow(dead_code)]
 pub fn layer_payloads(root: &Path, merged: &[MergedBackground]) -> Vec<LayerPayload> {
     merged
         .iter()
@@ -246,7 +240,6 @@ pub fn layer_payloads(root: &Path, merged: &[MergedBackground]) -> Vec<LayerPayl
 /// emerald's `collect_world` encoder order (each nested `[[instance]]`
 /// depth-first, in file order); a world that fails to read counts 0, the
 /// same "contributes nothing" rule the background merge uses.
-#[allow(dead_code)]
 pub fn instance_entity_counts(root: &Path, instances: &[WorldInstance]) -> Vec<usize> {
     instances
         .iter()
