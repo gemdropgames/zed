@@ -672,6 +672,15 @@ fn watch_triggers(rel: &str, change: &project::PathChange, viewer: bool) -> bool
 /// A document the world view sends to a running viewer cart itself: a
 /// world `.toml` under a `worlds/` directory, or a `.map` under a `maps/`
 /// one, at any depth.
+/// What [`EmuPanel::on_frame`] tells its pump task to do next. A bare
+/// `bool` would not say which way round it reads at the call site.
+#[derive(Debug, PartialEq)]
+enum FramePumped {
+    Continue,
+    /// The world panel has asked for this run to end.
+    StopRequested,
+}
+
 /// Take the image out of `endpoint`'s frame slot. Split out from
 /// [`EmuPanel::take_published_frame`] because one caller has already
 /// taken the endpoint off the panel and so cannot go through the field.
@@ -1798,13 +1807,27 @@ impl EmuPanel {
         self.stats = RunStats::default();
         self.fps_window_started = Instant::now();
         self.ingest_status = IngestStatus::Idle;
+        let window_handle = window.window_handle();
         self._pump_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(frame) = rx.recv().await {
-                if this
-                    .update(cx, |this, cx| this.on_frame(frame, cx))
-                    .is_err()
-                {
-                    return;
+                match this.update(cx, |this, cx| this.on_frame(frame, cx)) {
+                    Ok(FramePumped::Continue) => {}
+                    // The world view left live mode. Ending the run from
+                    // inside this task is why `stop_for_world_panel`
+                    // exists rather than `stop`: `stop` drops
+                    // `_pump_task`, and this IS that task.
+                    Ok(FramePumped::StopRequested) => {
+                        window_handle
+                            .update(cx, |_root, window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.stop_for_world_panel(window, cx)
+                                })
+                                .ok();
+                            })
+                            .ok();
+                        return;
+                    }
+                    Err(_) => return,
                 }
                 // Give the executor a turn after EVERY frame. `recv` only
                 // suspends on an empty channel, and the emulator thread
@@ -1826,7 +1849,15 @@ impl EmuPanel {
         cx.notify();
     }
 
-    fn on_frame(&mut self, frame: Frame, cx: &mut Context<Self>) {
+    fn on_frame(&mut self, frame: Frame, cx: &mut Context<Self>) -> FramePumped {
+        if let Some(link) = &self.viewer_link
+            && link.stop_requested()
+        {
+            // Before the frame is presented: the world view has left live
+            // mode, so publishing one more frame into a slot it will
+            // never read again is just another tile to retire.
+            return FramePumped::StopRequested;
+        }
         self.frame = frame.number;
         if self.stats.on_frame(
             frame.number,
@@ -1867,6 +1898,34 @@ impl EmuPanel {
             }
             self.latest_frame = Some(image);
         }
+        cx.notify();
+        FramePumped::Continue
+    }
+
+    /// End the run because the world panel asked for it
+    /// ([`ggo_common::LinkEndpoint::request_stop`]).
+    ///
+    /// [`Self::stop`]'s work minus dropping the pump task: this runs
+    /// INSIDE that task, and a task that drops its own handle is the one
+    /// thing `stop`'s comment warns against. Nothing is lost by leaving
+    /// it -- the task returns immediately afterwards, dropping the frame
+    /// receiver, which is what `stop` wanted the drop for.
+    fn stop_for_world_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // BEFORE `finish_run`, which takes the session this reads, and
+        // before the reason is written: the run's own thread would
+        // otherwise stamp its exit reason over ours.
+        if let Some(link) = self.viewer_link.clone() {
+            self.release_link_of_current_run(&link);
+            link.set_state(ggo_common::ViewerState::Stopped(
+                "stopped by the world panel".to_string(),
+            ));
+        }
+        self.finish_run(cx);
+        // While `viewer_link` is still set, so the endpoint's own frame
+        // slot is emptied along with this pane's tiles.
+        self.release_atlas_all(window);
+        self.viewer_link = None;
+        self.run_kind = RunKind::Cart;
         cx.notify();
     }
 
@@ -7115,6 +7174,52 @@ mod tests {
         fixture
             .panel
             .update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
+    }
+
+    /// **The world panel leaving live mode ends the run.** It asks
+    /// through the endpoint ([`ggo_common::LinkEndpoint::request_stop`]);
+    /// the pane notices at its next frame and tears the run down the way
+    /// Stop does -- reason on the endpoint, tiles handed back, and the
+    /// pane no longer a viewer.
+    #[gpui::test]
+    async fn a_world_panels_stop_request_ends_the_viewer_run(cx: &mut TestAppContext) {
+        let (fixture, cx) = viewer_fixture(cx, true).await;
+        let endpoint = ggo_common::LinkEndpoint::new();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        await_first_frame(&fixture.panel, cx);
+        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
+
+        endpoint.request_stop();
+        // Tick rather than `run_until_parked`: until the request is
+        // acted on the run is still refilling the frame channel, so the
+        // executor never goes idle (see `await_first_frame`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fixture.panel.read_with(cx, |panel, _| panel.is_running()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run ignored the world panel's stop request"
+            );
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Stopped("stopped by the world panel".to_string()),
+        );
+        assert_eq!(
+            endpoint.frame_number(),
+            None,
+            "and the frame it was holding is handed back"
+        );
+        fixture.panel.read_with(cx, |panel, _| {
+            assert!(panel.viewer_link.is_none(), "the link was released");
+            assert!(matches!(panel.run_kind, RunKind::Cart));
+        });
         cx.run_until_parked();
     }
 
