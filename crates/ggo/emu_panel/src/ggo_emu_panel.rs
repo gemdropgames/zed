@@ -2197,6 +2197,24 @@ impl EmuPanel {
             let capture = cx.background_spawn(async move { runner(request) }).await;
             this.update_in(cx, |this, window, cx| {
                 if this.build_generation != generation {
+                    // Superseded. Another VIEWER boot for this endpoint
+                    // (a watch rebuild) owns reporting from here, so say
+                    // nothing. Anything else -- a world pack, a
+                    // diagnostics run -- means no run will ever drive
+                    // this endpoint again, and if THAT build fails,
+                    // `run` never comes to report the ending: the world
+                    // view would wait on a `Building` that never
+                    // resolves.
+                    let superseded_by_a_viewer = matches!(this.run_kind, RunKind::Viewer(_))
+                        && this
+                            .viewer_link
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &endpoint));
+                    if !superseded_by_a_viewer {
+                        endpoint.set_state(ggo_common::ViewerState::Stopped(
+                            "replaced by another build".to_string(),
+                        ));
+                    }
                     return;
                 }
                 this.build_done(generation, cx);
@@ -6992,6 +7010,38 @@ mod tests {
                 assert!(reason.contains("closed"), "{reason}")
             }
             other => panic!("a closed pane must stop the endpoint, not leave it {other:?}"),
+        }
+    }
+
+    /// **A viewer build superseded by a NON-viewer one must not orphan
+    /// `Building` either.** `emulate_world` and `run_hardware_diagnostics`
+    /// bump `build_generation`, so the viewer boot's completion
+    /// early-returns -- and nothing downstream of it will ever run this
+    /// endpoint, because the run that eventually starts is not the world
+    /// view's. Without a word here the live view waits on a `Building`
+    /// that never resolves.
+    #[gpui::test]
+    async fn a_viewer_build_replaced_by_another_build_stops_the_endpoint(
+        cx: &mut TestAppContext,
+    ) {
+        let (fixture, cx) = viewer_fixture(cx, false).await;
+        let endpoint = ggo_common::LinkEndpoint::new();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx);
+            // What "Emulate this world" started while the viewer cart was
+            // still building leaves behind: a newer build generation, a
+            // run kind that is not this endpoint's, and no viewer link.
+            panel.build_generation += 1;
+            panel.run_kind = RunKind::World("assets/worlds/main.toml".to_string());
+            panel.viewer_link = None;
+        });
+        cx.run_until_parked();
+
+        match endpoint.state() {
+            ggo_common::ViewerState::Stopped(reason) => {
+                assert_eq!(reason, "replaced by another build")
+            }
+            other => panic!("a superseded viewer boot must stop its endpoint, not leave it {other:?}"),
         }
     }
 
