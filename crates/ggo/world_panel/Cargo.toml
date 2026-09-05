@@ -34,8 +34,7 @@ ggo-asset-formats.workspace = true # GGO
 ggo-audio.workspace = true # GGO -- the audio budget line sizes stems against the 384 KiB sample region
 ggo_common.workspace = true
 ggo-wire.workspace = true # GGO -- APP framing for the live link transport
-emerald-editor-link.workspace = true # GGO -- the host half of the editor link
-emerald-editor-runtime.workspace = true # GGO -- wire::EntityRow, the cart's published rects
+emerald-editor-link.workspace = true # GGO -- the host half of the editor link (and `EntityRow`, which it re-exports)
 emerald-world.workspace = true # GGO -- encode_toml_at for the live world blob
 # GGO -- wired ahead of its first use (the layers rail lands before the
 # painting does): world-hosted map editing paints a background layer with

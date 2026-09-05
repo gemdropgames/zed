@@ -3,15 +3,15 @@
 //! order: direct entities, then each instance's subtree depth-first),
 //! hit-testing over the cart's published rects, and the payload builders.
 
-// This module lands ahead of the panel code that drives it (the Live-mode
-// session is the next commit); its tests are the only callers so far, so the
-// helpers would otherwise read as dead. Drop this once Live mode is wired.
+// This module lands ahead of the panel code that drives it (Task 4 wires the
+// Live-mode session); its tests are the only callers so far, so the helpers
+// would otherwise read as dead. Task 4 drops this.
 #![allow(dead_code)]
 
 use std::path::Path;
 use std::sync::Arc;
 
-use emerald_editor_link::LinkIo;
+use emerald_editor_link::{EntityRow, LinkIo};
 use ggo_worldlib::render::Selection;
 use ggo_worldlib::world_doc::WorldDocStore;
 use ggo_worldlib::world_file::world_to_toml;
@@ -93,7 +93,7 @@ pub struct CartRow {
     pub h: f64,
 }
 
-pub fn rows_from(entities: &[emerald_editor_runtime::wire::EntityRow]) -> Vec<CartRow> {
+pub fn rows_from(entities: &[EntityRow]) -> Vec<CartRow> {
     entities
         .iter()
         .map(|entity| CartRow {
@@ -214,6 +214,17 @@ mod tests {
         assert_eq!(m.indices_of(Selection::Entity(1)), [1]);
     }
 
+    /// An instance whose world is empty (or failed to read -- both count
+    /// 0) must not shift the instances after it, and must own no index.
+    #[test]
+    fn index_map_handles_an_instance_that_contributes_nothing() {
+        let m = IndexMap::new(2, &[0, 3]);
+        assert_eq!(m.len(), 5);
+        assert_eq!(m.selection_of(2), Some(Selection::Instance(1)));
+        assert!(m.indices_of(Selection::Instance(0)).is_empty());
+        assert_eq!(m.indices_of(Selection::Instance(1)), [2, 3, 4]);
+    }
+
     #[test]
     fn hit_row_prefers_the_last_row_under_the_point() {
         let rows = vec![
@@ -243,6 +254,15 @@ mod tests {
         assert_eq!(to_raw(1.5), 98304);
         assert_eq!(from_raw(98304), 1.5);
         assert_eq!(to_raw(-3.0), -196608);
+    }
+
+    /// The `as` cast is the clamp: a NaN coordinate becomes 0 and a
+    /// wildly out-of-range one saturates instead of wrapping.
+    #[test]
+    fn to_raw_saturates_out_of_range_and_zeroes_nan() {
+        assert_eq!(to_raw(f64::NAN), 0);
+        assert_eq!(to_raw(1e30), i32::MAX);
+        assert_eq!(to_raw(-1e30), i32::MIN);
     }
 
     #[test]

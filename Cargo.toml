@@ -336,7 +336,6 @@ editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }
 env_var = { path = "crates/env_var" }
 emerald-editor-link = { path = "../emerald/crates/editor-link" } # GGO
-emerald-editor-runtime = { path = "../emerald/crates/editor-runtime" } # GGO
 emerald-world = { path = "../emerald/crates/world", features = ["std"] } # GGO
 etw_tracing = { path = "crates/etw_tracing" }
 eval_utils = { path = "crates/eval_utils" }
