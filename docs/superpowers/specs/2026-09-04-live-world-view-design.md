@@ -75,7 +75,7 @@ Host → cart:
 | `PreviewMetasprite` | stem (len-prefixed), anim (len-prefixed) | `CMD_PREVIEW_METASPRITE`. |
 | `PreviewClear` | | `CMD_PREVIEW_CLEAR`. |
 | `SysMask` | mask u64 | Bit i enables entry i of the cart's system table. |
-| `BlobBegin` | kind u8 (World / Layer), total len u32, layer u8, tileset stem (len-prefixed) | Resets reassembly. |
+| `BlobBegin` | kind u8 (0 World / 1 Layer), total len u32, layer u8, tile bank base u16, tile bank budget u16, tileset stem (len-prefixed) | Resets reassembly. Base/budget are the layer's tile-VRAM bank (the host computes the 496/N split). |
 | `BlobChunk` | seq u16, off u32, bytes | Written into `world_buf` / `layer_buf` at `off`. |
 | `BlobEnd` | seq u16 | Sets `world_len` / `layer_len`, fills the cmd fields, bumps `cmd_seq`. |
 
@@ -86,7 +86,7 @@ Cart → host:
 | `HelloAck` | proto version u8, entity cap u16, world buf cap u32, layer buf cap u32, system names (count u8, each len-prefixed) | Also sent unsolicited once at boot so a host already listening learns of a reboot. |
 | `Ack` | seq u16 | One per received `BlobChunk` / `BlobEnd`. |
 | `Schema` | off u16, bytes | Chunks of the existing `schema_buf` encoding. |
-| `Entities` | first index u32, rows (index u32, x i32, y i32, w u16, h u16)... | Only rows whose bytes changed since the last publish; the full table after `Hello`, after a world load, and when `entity_count` shrinks (then a final `EntityCount`). |
+| `Entities` | count u8, then rows (index u32, x i32, y i32, w u16, h u16), at most 15 per datagram | Only rows whose bytes changed since the last publish; the full table after `Hello`, after a world load, and when `entity_count` shrinks (then a final `EntityCount`). |
 | `EntityCount` | count u32 | |
 | `LayerStatus` | 4 × u8 | After each layer load. |
 | `PreviewStatus` | u8 | After each preview command. |
