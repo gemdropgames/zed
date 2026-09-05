@@ -221,6 +221,8 @@ pub struct Session {
     /// `EmuPanel::finish_run` reports the end of a run through the
     /// endpoint THAT run was driving.
     link: Option<Arc<LinkEndpoint>>,
+    /// Cleared by [`Self::release_link`]; read by the emulator thread.
+    link_owned: Arc<AtomicBool>,
     /// `None` only after [`Self::wait`] has taken it.
     join: Option<JoinHandle<()>>,
 }
@@ -316,6 +318,21 @@ impl Session {
         self.link.clone()
     }
 
+    /// Hand this run's viewer link over: from here it neither pumps the
+    /// endpoint nor reports its own ending through it.
+    ///
+    /// A world view keeps ONE endpoint across rebuilds, so the run being
+    /// stopped for a rebuild and the run being built for it share it.
+    /// Without this the old thread's terminal `Stopped` -- written
+    /// whenever it gets round to noticing the stop flag, which is after
+    /// the rebuild has already said `Building` -- would leave the world
+    /// view reading the previous run's stop reason for the length of the
+    /// build, and its dying pump would eat outbound messages meant for
+    /// the new run.
+    pub fn release_link(&self) {
+        self.link_owned.store(false, Ordering::Release);
+    }
+
     /// Signal the run to stop and BLOCK until the thread has exited,
     /// returning everything the end-of-run ingest needs.
     ///
@@ -396,6 +413,7 @@ pub fn start(
     let speed = Arc::new(AtomicU32::new(1));
     let uart = UartLog::new();
     let outcome: Arc<Mutex<Option<RunOutcome>>> = Arc::new(Mutex::new(None));
+    let link_owned = Arc::new(AtomicBool::new(true));
 
     uart.push_line(format!("[run] {cart}"));
 
@@ -410,6 +428,7 @@ pub fn start(
             speed: speed.clone(),
             world_json: world_json.clone(),
             link: link.clone(),
+            link_owned: link_owned.clone(),
         };
         let (uart, outcome) = (uart.clone(), outcome.clone());
         std::thread::Builder::new()
@@ -422,7 +441,9 @@ pub fn start(
                 // return before the loop (unreadable file, unparsable
                 // cart). A viewer whose cart never started must see
                 // `Stopped`, not a `Building` that never resolves.
-                if let Some(link) = &controls.link {
+                if let Some(link) = &controls.link
+                    && controls.link_owned.load(Ordering::Acquire)
+                {
                     link.set_state(ViewerState::Stopped(result.reason.clone()));
                 }
                 *outcome.lock().unwrap() = Some(result);
@@ -443,6 +464,7 @@ pub fn start(
         uart,
         outcome,
         link,
+        link_owned,
         join: Some(join),
     };
     (session, rx)
@@ -462,6 +484,11 @@ struct Controls {
     world_json: Arc<Mutex<Option<(u32, Arc<String>)>>>,
     /// The viewer link, when this run is a world view's viewer cart.
     link: Option<Arc<LinkEndpoint>>,
+    /// Is [`Self::link`] still THIS run's to speak through? Cleared by
+    /// [`Session::release_link`] when the panel hands the same endpoint
+    /// to a new run; the thread then neither pumps it nor reports its own
+    /// ending through it. See that method for why.
+    link_owned: Arc<AtomicBool>,
 }
 
 /// Where a run's save file lives: the standalone's rule (`<card dir>/savs/
@@ -494,6 +521,7 @@ fn run(
         speed,
         world_json,
         link,
+        link_owned,
     } = controls;
     // Holds a frame that arrived split across two frame boundaries, so it
     // must outlive the loop -- see `crate::link`.
@@ -692,7 +720,12 @@ fn run(
                     arm_world_tap(&mut mmu, &mut tap_addr, true);
                 }
                 publish_world_tap(&mmu, &mut tap_addr, world_json);
-                if let Some(link) = link {
+                // A link this run has handed over (see
+                // `Session::release_link`) is not this run's to touch:
+                // its outbound queue now belongs to the next run.
+                if let Some(link) = link
+                    && link_owned.load(Ordering::Acquire)
+                {
                     crate::link::pump_link(&mut p, link, &mut link_reader);
                 }
                 // Full channel = the UI hasn't drained the previous
