@@ -1544,10 +1544,9 @@ impl EmuPanel {
     /// out of is also what decides which rebuild this is (a world pack,
     /// or the live view's own viewer cart).
     fn schedule_watch_rebuild(&mut self, cx: &mut Context<Self>) {
-        let (Some(world), Some(window)) = (
-            self.run_kind.world().map(str::to_string),
-            self.watch_window,
-        ) else {
+        let (Some(world), Some(window)) =
+            (self.run_kind.world().map(str::to_string), self.watch_window)
+        else {
             return;
         };
         // A viewer rebuild reboots the SAME endpoint: the world view
@@ -1758,7 +1757,9 @@ impl EmuPanel {
             // Kept, like every other viewer refusal: the reason is what
             // the world view shows in place of the feed.
             if let Some(link) = &self.viewer_link {
-                link.set_state(ggo_common::ViewerState::Stopped("no cart selected".to_string()));
+                link.set_state(ggo_common::ViewerState::Stopped(
+                    "no cart selected".to_string(),
+                ));
             }
             return;
         };
@@ -2190,13 +2191,11 @@ impl EmuPanel {
         self._build_task = Some(window.spawn(cx, async move |cx| {
             this.update(cx, |this, cx| this.refresh_root(cx)).ok();
             let prepared = this
-                .update(cx, |this, cx| {
-                    match this.prepare_viewer_build(&world_rel) {
-                        Ok(prepared) => Some(prepared),
-                        Err(reason) => {
-                            this.fail_viewer(&endpoint, reason, cx);
-                            None
-                        }
+                .update(cx, |this, cx| match this.prepare_viewer_build(&world_rel) {
+                    Ok(prepared) => Some(prepared),
+                    Err(reason) => {
+                        this.fail_viewer(&endpoint, reason, cx);
+                        None
                     }
                 })
                 .ok()
@@ -2298,14 +2297,13 @@ impl EmuPanel {
             .project_root
             .clone()
             .ok_or_else(|| "no project folder is open".to_string())?;
-        let project_dir = ggo_common::emerald_project_root(&root.join(world_rel)).ok_or_else(
-            || {
+        let project_dir =
+            ggo_common::emerald_project_root(&root.join(world_rel)).ok_or_else(|| {
                 format!(
                     "no {} above {world_rel} — emd needs an emerald project",
                     ggo_common::EMERALD_MANIFEST
                 )
-            },
-        )?;
+            })?;
         Ok((
             ggo_common::ProcRequest::emd(&project_dir, menu::editor_cart_args()),
             self.proc_runner.clone(),
@@ -3364,9 +3362,9 @@ impl EmuPanel {
                     .icon_size(IconSize::Small)
                     .disabled(self.selected.is_none())
                     .tooltip(Tooltip::text("Run cart"))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.run_selected_cart(window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _event, window, cx| this.run_selected_cart(window, cx)),
+                    ),
             )
             .child(
                 IconButton::new("ggo-emu-stop", IconName::Stop)
@@ -6797,7 +6795,10 @@ mod tests {
                 "a save after Run must still re-pack the watched world"
             );
             assert!(
-                calls[calls.len() - 1].args.iter().any(|a| a == "worlds/main"),
+                calls[calls.len() - 1]
+                    .args
+                    .iter()
+                    .any(|a| a == "worlds/main"),
                 "and re-pack THAT world"
             );
         }
@@ -6945,9 +6946,11 @@ mod tests {
         });
         let published = publish_one_frame(&panel, cx, 1);
         assert_eq!(endpoint.frame_number(), Some(1));
-        cx.draw(gpui::Point::default(), gpui::size(px(320.), px(240.)), |_, _| {
-            gpui::Empty
-        });
+        cx.draw(
+            gpui::Point::default(),
+            gpui::size(px(320.), px(240.)),
+            |_, _| gpui::Empty,
+        );
         assert!(
             cx.update(|window, _| window.has_image_atlas_entry(&published)),
             "the published frame really is in the atlas to begin with"
@@ -7043,9 +7046,7 @@ mod tests {
     /// view's. Without a word here the live view waits on a `Building`
     /// that never resolves.
     #[gpui::test]
-    async fn a_viewer_build_replaced_by_another_build_stops_the_endpoint(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_viewer_build_replaced_by_another_build_stops_the_endpoint(cx: &mut TestAppContext) {
         let (fixture, cx) = viewer_fixture(cx, false).await;
         let endpoint = ggo_common::LinkEndpoint::new();
         fixture.panel.update_in(cx, |panel, window, cx| {
@@ -7063,7 +7064,9 @@ mod tests {
             ggo_common::ViewerState::Stopped(reason) => {
                 assert_eq!(reason, "replaced by another build")
             }
-            other => panic!("a superseded viewer boot must stop its endpoint, not leave it {other:?}"),
+            other => {
+                panic!("a superseded viewer boot must stop its endpoint, not leave it {other:?}")
+            }
         }
     }
 
@@ -8387,7 +8390,11 @@ mod tests {
             "a world save goes over the link"
         );
         assert!(
-            !watch_triggers("game/assets/worlds/boss/main.toml", &PathChange::Added, true),
+            !watch_triggers(
+                "game/assets/worlds/boss/main.toml",
+                &PathChange::Added,
+                true
+            ),
             "at any depth"
         );
         assert!(
