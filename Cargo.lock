@@ -5925,6 +5925,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "emerald-core"
+version = "0.2.0"
+dependencies = [
+ "gemdrop-sdk",
+ "ggo-asset-formats",
+]
+
+[[package]]
+name = "emerald-editor-link"
+version = "0.2.0"
+dependencies = [
+ "emerald-editor-runtime",
+]
+
+[[package]]
+name = "emerald-editor-runtime"
+version = "0.2.0"
+dependencies = [
+ "emerald-core",
+ "emerald-world",
+]
+
+[[package]]
+name = "emerald-world"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "emerald-core",
+ "emerald-world-derive",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "emerald-world-derive"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "emojis"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7637,8 +7679,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "editor",
+ "emerald-editor-link",
+ "emerald-editor-runtime",
+ "emerald-world",
  "ggo-asset-formats",
  "ggo-audio",
+ "ggo-wire",
  "ggo-worldlib",
  "ggo_common",
  "ggo_map_panel",

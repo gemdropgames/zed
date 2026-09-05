@@ -26,6 +26,7 @@
 mod audio_budget;
 mod canvas;
 mod inspector;
+mod live;
 mod loader;
 mod world_canvas_item;
 pub use world_canvas_item::WorldCanvasItem;
