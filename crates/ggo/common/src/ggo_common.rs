@@ -18,8 +18,9 @@
 //! `Panel::prepare_to_close`, `PathOpenInterceptor` and
 //! `ContextMenuContributor` extension points these helpers plug into.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use smol::process::Command;
 
@@ -553,6 +554,153 @@ pub fn emulate_world(
     emulators
         .iter()
         .any(|emulate| emulate(workspace, rel, window, cx))
+}
+
+// ------------------------------------------------- viewer link (world <-> emulator)
+
+/// Payloads the cart may send between two host polls before the oldest
+/// backlog is worth more than the newest: a frame's worth of entity diffs
+/// plus statuses is a handful of datagrams; 256 is generous.
+pub const LINK_INBOUND_CAPACITY: usize = 256;
+
+/// The transport-neutral rendezvous between a world view and the emulator
+/// running its viewer cart. Lives here, not in `ggo_emu_panel`, so the
+/// world panel can hold one without depending on the emulator crate --
+/// the same reason [`WorldEmulator`] is a registry.
+pub struct LinkEndpoint {
+    /// Host -> cart, already ggo-wire framed. Drained by the emulator thread.
+    outbound: Mutex<VecDeque<Vec<u8>>>,
+    /// Cart -> host CHANNEL_APP payloads, decoded on the emulator thread.
+    inbound_tx: async_channel::Sender<Vec<u8>>,
+    inbound_rx: async_channel::Receiver<Vec<u8>>,
+    /// Latest presented frame: (cart frame number, BGRA image). Written by
+    /// the emu panel on the UI thread.
+    pub frame: Mutex<Option<(u32, Arc<gpui::RenderImage>)>>,
+    tick_tx: async_channel::Sender<()>,
+    tick_rx: async_channel::Receiver<()>,
+    state: Mutex<ViewerState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ViewerState {
+    Building,
+    Running,
+    Stopped(String),
+}
+
+impl LinkEndpoint {
+    pub fn new() -> Arc<Self> {
+        let (inbound_tx, inbound_rx) = async_channel::bounded(LINK_INBOUND_CAPACITY);
+        let (tick_tx, tick_rx) = async_channel::bounded(1);
+        Arc::new(Self {
+            outbound: Mutex::new(VecDeque::new()),
+            inbound_tx,
+            inbound_rx,
+            frame: Mutex::new(None),
+            tick_tx,
+            tick_rx,
+            state: Mutex::new(ViewerState::Building),
+        })
+    }
+
+    /// Host side: queue one already-framed wire message for the cart.
+    ///
+    /// Poison is taken rather than unwrapped throughout: nothing here holds
+    /// a lock across code that can panic, so a poisoned lock means some
+    /// unrelated thread died and the queue itself is still intact --
+    /// dropping the viewer's link for it would be the worse answer.
+    pub fn send_wire(&self, bytes: Vec<u8>) {
+        self.outbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(bytes);
+    }
+
+    /// Emulator thread: take everything queued since the last drain.
+    pub fn take_outbound(&self) -> Vec<Vec<u8>> {
+        self.outbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    /// Emulator thread. Full = the host has not polled for a while; the
+    /// cart's newest datagram is dropped, exactly what the wire would do.
+    /// The cart republishes anything that still differs on its next frame.
+    pub fn push_inbound(&self, payload: Vec<u8>) {
+        if self.inbound_tx.try_send(payload).is_err() {
+            log::debug!("viewer link inbound full; dropping a datagram");
+        }
+    }
+
+    /// Host side: take every payload the cart has sent since the last poll.
+    pub fn try_recv_inbound(&self) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| self.inbound_rx.try_recv().ok()).collect()
+    }
+
+    /// Emu panel, once per presented frame. Never blocks.
+    pub fn tick(&self) {
+        // bounded(1): a pending wake already covers this frame.
+        let _ = self.tick_tx.try_send(()); // ponytail: coalescing by design, a full channel is the success case
+    }
+
+    /// Host side: the wake stream to await between polls.
+    pub fn ticks(&self) -> async_channel::Receiver<()> {
+        self.tick_rx.clone()
+    }
+
+    pub fn set_state(&self, state: ViewerState) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+        self.tick();
+    }
+
+    pub fn state(&self) -> ViewerState {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// A handler that can boot the viewer cart for a world into an emulator
+/// pane, wired to `endpoint`. Same registry pattern (and same reason) as
+/// [`WorldEmulator`].
+pub type ViewerBooter =
+    fn(&mut Workspace, &str, Arc<LinkEndpoint>, &mut Window, &mut Context<Workspace>) -> bool;
+
+#[derive(Default)]
+struct ViewerBooters(Vec<ViewerBooter>);
+
+impl gpui::Global for ViewerBooters {}
+
+/// Register a [`ViewerBooter`]. Called once by `ggo_emu_panel::init`.
+pub fn register_viewer_booter(cx: &mut App, booter: ViewerBooter) {
+    cx.default_global::<ViewerBooters>().0.push(booter);
+}
+
+/// Ask the registered booters to boot the viewer cart for the emerald
+/// project containing `world_rel`; returns the endpoint the caller keeps
+/// polling, or `None` when no booter claimed it (no emulator pane in this
+/// build -- the world view then stays in its design mode).
+pub fn boot_viewer(
+    workspace: &mut Workspace,
+    world_rel: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Arc<LinkEndpoint>> {
+    let booters = match cx.try_global::<ViewerBooters>() {
+        Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+        _ => return None,
+    };
+    let endpoint = LinkEndpoint::new();
+    booters
+        .iter()
+        .any(|boot| boot(workspace, world_rel, endpoint.clone(), window, cx))
+        .then_some(endpoint)
 }
 
 /// Wrap `action` into the `Fn(&mut Window, &mut App)` a
@@ -1884,6 +2032,64 @@ mod tests {
         // Control: the very same script, awaited, does create the marker.
         assert!(run_capture(&request).ok);
         assert!(marker.exists(), "the script itself works");
+    }
+
+    /// The host queues wire frames while the emulator thread is between
+    /// drains; order is the wire's order and a drained frame is never
+    /// handed out twice.
+    #[test]
+    fn link_endpoint_queues_outbound_in_order_and_drains_once() {
+        let ep = LinkEndpoint::new();
+        ep.send_wire(vec![1, 2]);
+        ep.send_wire(vec![3]);
+        assert_eq!(ep.take_outbound(), vec![vec![1, 2], vec![3]]);
+        assert!(ep.take_outbound().is_empty());
+    }
+
+    /// A host that stops polling must not grow the queue without bound:
+    /// the cart's newest datagrams are dropped, exactly as the wire would.
+    #[test]
+    fn link_endpoint_inbound_is_bounded_and_drops_newest_when_full() {
+        let ep = LinkEndpoint::new();
+        for i in 0..(LINK_INBOUND_CAPACITY + 5) {
+            ep.push_inbound(vec![i as u8]);
+        }
+        let got = ep.try_recv_inbound();
+        assert_eq!(got.len(), LINK_INBOUND_CAPACITY);
+        assert_eq!(got[0], vec![0u8]);
+        assert!(ep.try_recv_inbound().is_empty());
+    }
+
+    /// `tick` runs on the emu panel's per-frame path: it must never block,
+    /// and many frames' worth of wakes collapse into the one pending wake
+    /// the host has yet to observe.
+    #[test]
+    fn link_endpoint_tick_never_blocks_and_coalesces() {
+        let ep = LinkEndpoint::new();
+        for _ in 0..10 {
+            ep.tick();
+        }
+        let ticks = ep.ticks();
+        assert!(ticks.try_recv().is_ok());
+        assert!(ticks.try_recv().is_err(), "ticks coalesce into one pending wake");
+    }
+
+    /// A fresh endpoint is Building -- the cart has not been built yet, so
+    /// the world panel must not claim the viewer is live.
+    #[test]
+    fn link_endpoint_state_starts_building() {
+        let ep = LinkEndpoint::new();
+        assert_eq!(ep.state(), ViewerState::Building);
+        ep.set_state(ViewerState::Stopped("cart exited".into()));
+        assert_eq!(ep.state(), ViewerState::Stopped("cart exited".into()));
+    }
+
+    #[gpui::test]
+    fn boot_viewer_returns_none_without_a_booter(cx: &mut gpui::TestAppContext) {
+        // No registry global at all: the world panel must fall back to Design.
+        let registered =
+            cx.update(|cx| cx.try_global::<ViewerBooters>().map(|b| b.0.len()).unwrap_or(0));
+        assert_eq!(registered, 0);
     }
 }
 

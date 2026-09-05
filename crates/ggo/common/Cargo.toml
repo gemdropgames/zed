@@ -12,6 +12,7 @@ workspace = true
 path = "src/ggo_common.rs"
 
 [dependencies]
+async-channel.workspace = true # GGO -- LinkEndpoint's inbound/tick channels
 log.workspace = true
 settings.workspace = true # GGO -- `bind_default_keymap` for panel tests
 gpui.workspace = true

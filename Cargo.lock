@@ -7398,6 +7398,7 @@ dependencies = [
 name = "ggo_common"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
  "gpui",
  "image",
  "libc",
