@@ -567,6 +567,19 @@ pub const LINK_INBOUND_CAPACITY: usize = 256;
 /// running its viewer cart. Lives here, not in `ggo_emu_panel`, so the
 /// world panel can hold one without depending on the emulator crate --
 /// the same reason [`WorldEmulator`] is a registry.
+///
+/// The two queues are bounded differently on purpose: `outbound` is
+/// unbounded because a host edit is lossless -- there is no later message
+/// that re-states it -- and the emulator drains the whole queue every
+/// frame, so it cannot grow. `inbound` is capped at
+/// [`LINK_INBOUND_CAPACITY`] because cart datagrams are re-published
+/// whenever they still differ, so a dropped one costs a frame of staleness
+/// rather than a lost fact.
+///
+/// Every `Mutex` here takes the poison rather than unwrapping it: no lock
+/// is held across code that can panic, so a poisoned lock means an
+/// unrelated thread died while the queue itself stayed consistent, and
+/// tearing down the viewer's link over that would be the worse answer.
 pub struct LinkEndpoint {
     /// Host -> cart, already ggo-wire framed. Drained by the emulator thread.
     outbound: Mutex<VecDeque<Vec<u8>>>,
@@ -575,6 +588,16 @@ pub struct LinkEndpoint {
     inbound_rx: async_channel::Receiver<Vec<u8>>,
     /// Latest presented frame: (cart frame number, BGRA image). Written by
     /// the emu panel on the UI thread.
+    ///
+    /// **The writer owns dropping the image it replaces.** `RenderImage` has
+    /// no `Drop` that frees its texture-atlas entry; that only happens on an
+    /// explicit `Window::drop_image`. So a writer must take the previous
+    /// `Arc` out of this slot and `window.drop_image(previous)` before
+    /// storing the new one (the emu panel does this in its per-frame
+    /// `on_frame`) -- overwriting at 60 Hz without it leaks an atlas entry
+    /// per frame. See `livekit_client`'s `remote_video_track_view.rs` for
+    /// the same dance. Readers only clone the `Arc`; they must never drop
+    /// the image.
     pub frame: Mutex<Option<(u32, Arc<gpui::RenderImage>)>>,
     tick_tx: async_channel::Sender<()>,
     tick_rx: async_channel::Receiver<()>,
@@ -604,11 +627,6 @@ impl LinkEndpoint {
     }
 
     /// Host side: queue one already-framed wire message for the cart.
-    ///
-    /// Poison is taken rather than unwrapped throughout: nothing here holds
-    /// a lock across code that can panic, so a poisoned lock means some
-    /// unrelated thread died and the queue itself is still intact --
-    /// dropping the viewer's link for it would be the worse answer.
     pub fn send_wire(&self, bytes: Vec<u8>) {
         self.outbound
             .lock()
@@ -2071,7 +2089,10 @@ mod tests {
         }
         let ticks = ep.ticks();
         assert!(ticks.try_recv().is_ok());
-        assert!(ticks.try_recv().is_err(), "ticks coalesce into one pending wake");
+        assert!(
+            ticks.try_recv().is_err(),
+            "ticks coalesce into one pending wake"
+        );
     }
 
     /// A fresh endpoint is Building -- the cart has not been built yet, so
@@ -2082,13 +2103,21 @@ mod tests {
         assert_eq!(ep.state(), ViewerState::Building);
         ep.set_state(ViewerState::Stopped("cart exited".into()));
         assert_eq!(ep.state(), ViewerState::Stopped("cart exited".into()));
+        assert!(
+            ep.ticks().try_recv().is_ok(),
+            "a state change wakes the host, or a stopped viewer shows as running \
+             until the next frame that will never come"
+        );
     }
 
     #[gpui::test]
     fn boot_viewer_returns_none_without_a_booter(cx: &mut gpui::TestAppContext) {
         // No registry global at all: the world panel must fall back to Design.
-        let registered =
-            cx.update(|cx| cx.try_global::<ViewerBooters>().map(|b| b.0.len()).unwrap_or(0));
+        let registered = cx.update(|cx| {
+            cx.try_global::<ViewerBooters>()
+                .map(|b| b.0.len())
+                .unwrap_or(0)
+        });
         assert_eq!(registered, 0);
     }
 }
