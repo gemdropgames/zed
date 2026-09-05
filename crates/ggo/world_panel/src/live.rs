@@ -89,6 +89,29 @@ impl IndexMap {
     }
 }
 
+/// How big the open document is, in the two frames a [`Selection`]
+/// indexes. Carried rather than re-derived because `WorldDocStore::state`
+/// deep-clones the whole document: the overlay asks "does this still
+/// exist?" once per published row per render, and that is not a question
+/// worth a document clone each time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DocCounts {
+    pub entities: usize,
+    pub instances: usize,
+}
+
+impl DocCounts {
+    /// Whether `selection` still indexes something. The index map is
+    /// rebuilt from counts that can be one tick behind an instance edit,
+    /// so a cart row can name a selection the document no longer has.
+    pub fn contains(&self, selection: Selection) -> bool {
+        match selection {
+            Selection::Entity(index) => index < self.entities,
+            Selection::Instance(index) => index < self.instances,
+        }
+    }
+}
+
 /// One published rect from the cart, in world pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CartRow {
@@ -133,6 +156,76 @@ pub fn rows_in_rect(rows: &[CartRow], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec
             row.x < right && row.x + row.w > left && row.y < bottom && row.y + row.h > top
         })
         .map(|row| row.index)
+        .collect()
+}
+
+/// The Live overlay: one entry per published cart rect that still maps to
+/// something in the document -- the selection it stands for, its world
+/// rect, and whether it is selected. Empty until the cart has republished
+/// for the world blob the panel last sent, because rows from the PREVIOUS
+/// world would otherwise be outlined over a frame that no longer holds
+/// them.
+pub fn overlay_rows(
+    live: &LiveView,
+    counts: DocCounts,
+    selected: &[Selection],
+) -> Vec<(Selection, [f64; 4], bool)> {
+    if !live.loaded() {
+        return Vec::new();
+    }
+    live.rows
+        .iter()
+        .filter_map(|row| {
+            let selection = live.index_map.selection_of(row.index)?;
+            counts.contains(selection).then(|| {
+                (
+                    selection,
+                    [row.x, row.y, row.w, row.h],
+                    selected.contains(&selection),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The document selection under a world point: the topmost cart rect
+/// there, mapped back through the flattened index map.
+pub fn hit(live: &LiveView, counts: DocCounts, world: [f64; 2]) -> Option<Selection> {
+    let index = hit_row(&live.rows, world[0], world[1])?;
+    let selection = live.index_map.selection_of(index)?;
+    counts.contains(selection).then_some(selection)
+}
+
+/// Every document selection a rubber-band covers, in cart order and
+/// without repeats (an instance owns a contiguous run of cart indices).
+pub fn hits_in_rect(
+    live: &LiveView,
+    counts: DocCounts,
+    start: [f64; 2],
+    current: [f64; 2],
+) -> Vec<Selection> {
+    let mut hits = Vec::new();
+    for index in rows_in_rect(&live.rows, start[0], start[1], current[0], current[1]) {
+        if let Some(selection) = live.index_map.selection_of(index)
+            && counts.contains(selection)
+            && !hits.contains(&selection)
+        {
+            hits.push(selection);
+        }
+    }
+    hits
+}
+
+/// Where every cart index the selection owns sits right now, in the
+/// runtime's raw fixed point -- the anchors a live drag adds its delta to.
+pub fn drag_origins(live: &LiveView, selected: &[Selection]) -> Vec<(u32, i32, i32)> {
+    selected
+        .iter()
+        .flat_map(|selection| live.index_map.indices_of(*selection))
+        .filter_map(|index| {
+            let row = live.rows.iter().find(|row| row.index == index)?;
+            Some((index, to_raw(row.x), to_raw(row.y)))
+        })
         .collect()
 }
 
@@ -306,6 +399,29 @@ fn cart_clock(endpoint: &ggo_common::LinkEndpoint, epoch: Instant) -> Instant {
     epoch + FRAME_TIME * endpoint.frame_number().unwrap_or(0)
 }
 
+/// How far the world document the panel last sent has got, and therefore
+/// what the cart's published rows describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorldSync {
+    /// The cart has framed since the blob landed: its rows describe the
+    /// document the panel is showing.
+    Loaded,
+    /// A blob is queued or in flight. The rows are still the PREVIOUS
+    /// world's.
+    Sending,
+    /// The blob was acked while the cart was on this frame. `!busy()` only
+    /// says the bytes landed -- the cart rebuilds its world and
+    /// republishes over the frames that follow, so the first frame AFTER
+    /// this one is what proves the rows are the new world's.
+    ///
+    /// The cart's own [`LinkMailbox::frame_seq`] counter is the clock
+    /// here, not `last_progress`: that one is stamped with whatever `now`
+    /// the host passes `poll`, which is the cart clock -- frozen while the
+    /// emulator is paused or lock-stepped, so it cannot tell "a datagram
+    /// arrived" from "no time passed".
+    Acked(u32),
+}
+
 /// One live session: the link to the viewer cart running the open world,
 /// and everything the panel mirrors off it.
 pub struct LiveView {
@@ -339,17 +455,22 @@ pub struct LiveView {
     /// The cart's published rects, in world pixels.
     pub rows: Vec<CartRow>,
     pub index_map: IndexMap,
-    /// Whether the cart has published an entity table for the world blob
-    /// this session last sent. `!mailbox.busy()` only says the blob was
-    /// ACKED; the rows stay the previous world's until the cart
-    /// republishes, and an overlay drawn from those would sit over a frame
-    /// that no longer contains them.
-    pub loaded: bool,
+    pub world_sync: WorldSync,
     /// Where each cart index a drag is moving sat when the drag began, in
     /// the runtime's raw fixed point -- `SetTransform` is absolute, so the
     /// mirror of a drag is "origin + the delta the document just took".
     /// Cleared on release.
     pub drag_origin: Vec<(u32, i32, i32)>,
+    /// The absolute `SetTransform` payloads an in-flight drag still owes
+    /// the cart, one per moved row. REPLACED (never appended to) by each
+    /// mouse-move and flushed once per tick, which is one cart frame: the
+    /// cart's APP receive queue is four datagrams deep, so a drag that put
+    /// one datagram per row on the wire per move event would overrun it.
+    ///
+    /// Resolved to absolute positions at the move rather than kept as a
+    /// delta so the last one still flushes after the release has dropped
+    /// [`Self::drag_origin`].
+    pub pending_transforms: Vec<(u32, i32, i32)>,
     pub world_dirty: bool,
     pub layers_dirty: bool,
     pub camera_dirty: bool,
@@ -378,8 +499,9 @@ impl LiveView {
             frame: None,
             rows: Vec::new(),
             index_map: IndexMap::new(0, &[]),
-            loaded: false,
+            world_sync: WorldSync::Loaded,
             drag_origin: Vec::new(),
+            pending_transforms: Vec::new(),
             world_dirty: false,
             layers_dirty: false,
             camera_dirty: false,
@@ -392,6 +514,39 @@ impl LiveView {
     /// emulator is paused (`frame_number` stops advancing).
     pub fn cart_now(&self) -> Instant {
         cart_clock(&self.endpoint, self.epoch)
+    }
+
+    /// Whether the cart's rows describe the document the panel is showing
+    /// -- see [`WorldSync`].
+    pub fn loaded(&self) -> bool {
+        self.world_sync == WorldSync::Loaded
+    }
+
+    /// Advance the world-blob handshake on what the last poll learned: the
+    /// transfer finishing arms the wait, and the first cart frame after
+    /// that is the republish the overlay was waiting for.
+    pub fn advance_world_sync(&mut self) {
+        let frame = self.mailbox.frame_seq();
+        if self.world_sync == WorldSync::Sending && !self.mailbox.busy() {
+            self.world_sync = WorldSync::Acked(frame);
+        }
+        if let WorldSync::Acked(acked_at) = self.world_sync
+            && frame > acked_at
+        {
+            self.world_sync = WorldSync::Loaded;
+        }
+    }
+
+    /// Put the drag's outstanding moves on the wire, at most one datagram
+    /// per row per tick. Single-datagram commands are accepted mid-blob,
+    /// so this does not wait for a transfer to finish -- a drag the user
+    /// can see lagging is worse than a datagram queued behind a blob.
+    pub fn flush_pending_transforms(&mut self) {
+        for (index, x, y) in std::mem::take(&mut self.pending_transforms) {
+            if let Err(error) = self.mailbox.set_transform(index, x, y) {
+                log::warn!("GGO: live drag update for cart entity {index}: {error}");
+            }
+        }
     }
 }
 
@@ -452,6 +607,173 @@ mod tests {
         assert_eq!(hit_row(&rows, 2.0, 2.0), Some(0));
         assert_eq!(hit_row(&rows, 100.0, 100.0), None);
         assert_eq!(rows_in_rect(&rows, 0.0, 0.0, 9.0, 9.0), [0, 1]);
+    }
+
+    /// A session with no cart behind it, for the pure lookups: they read
+    /// `rows`/`index_map`/`world_sync` and nothing else.
+    fn offline_view(rows: Vec<CartRow>, direct: usize, instances: &[usize]) -> LiveView {
+        let mut live = LiveView::new(ggo_common::LinkEndpoint::new(), Instant::now());
+        live.rows = rows;
+        live.index_map = IndexMap::new(direct, instances);
+        live
+    }
+
+    fn row(index: u32, x: f64, y: f64) -> CartRow {
+        CartRow {
+            index,
+            x,
+            y,
+            w: 16.0,
+            h: 16.0,
+        }
+    }
+
+    /// Two direct entities and one instance contributing two: cart
+    /// indices 0..4.
+    fn fixture_view() -> LiveView {
+        offline_view(
+            vec![
+                row(0, 0.0, 0.0),
+                row(1, 40.0, 8.0),
+                row(2, 80.0, 0.0),
+                row(3, 96.0, 0.0),
+            ],
+            2,
+            &[2],
+        )
+    }
+
+    const FIXTURE_COUNTS: DocCounts = DocCounts {
+        entities: 2,
+        instances: 1,
+    };
+
+    #[test]
+    fn hit_maps_the_topmost_row_back_to_its_selection() {
+        let live = fixture_view();
+        assert_eq!(
+            hit(&live, FIXTURE_COUNTS, [41.0, 9.0]),
+            Some(Selection::Entity(1))
+        );
+        // Either of the instance's two rows names the instance itself.
+        assert_eq!(
+            hit(&live, FIXTURE_COUNTS, [81.0, 1.0]),
+            Some(Selection::Instance(0))
+        );
+        assert_eq!(
+            hit(&live, FIXTURE_COUNTS, [97.0, 1.0]),
+            Some(Selection::Instance(0))
+        );
+        assert_eq!(hit(&live, FIXTURE_COUNTS, [500.0, 500.0]), None);
+    }
+
+    /// The index map is rebuilt from counts that can be one tick behind an
+    /// instance edit, so a row can name something the document has since
+    /// lost. That is a miss, not a selection of nothing.
+    #[test]
+    fn a_row_the_document_no_longer_has_is_not_a_hit() {
+        let live = fixture_view();
+        let shrunk = DocCounts {
+            entities: 1,
+            instances: 0,
+        };
+        assert_eq!(hit(&live, shrunk, [41.0, 9.0]), None);
+        assert_eq!(hit(&live, shrunk, [81.0, 1.0]), None);
+        assert_eq!(
+            hit(&live, shrunk, [1.0, 1.0]),
+            Some(Selection::Entity(0)),
+            "the survivor still hits"
+        );
+    }
+
+    #[test]
+    fn hits_in_rect_names_each_selection_once_in_cart_order() {
+        let live = fixture_view();
+        assert_eq!(
+            hits_in_rect(&live, FIXTURE_COUNTS, [0.0, 0.0], [200.0, 200.0]),
+            [
+                Selection::Entity(0),
+                Selection::Entity(1),
+                Selection::Instance(0)
+            ],
+            "the instance owns two rows and is named once"
+        );
+        assert_eq!(
+            hits_in_rect(&live, FIXTURE_COUNTS, [78.0, 0.0], [90.0, 4.0]),
+            [Selection::Instance(0)]
+        );
+        assert!(hits_in_rect(&live, FIXTURE_COUNTS, [500.0, 500.0], [600.0, 600.0]).is_empty());
+    }
+
+    #[test]
+    fn drag_origins_are_every_cart_index_the_selection_owns() {
+        let live = fixture_view();
+        assert_eq!(
+            drag_origins(&live, &[Selection::Instance(0)]),
+            [(2, to_raw(80.0), 0), (3, to_raw(96.0), 0)],
+            "moving an instance moves its whole subtree"
+        );
+        assert_eq!(
+            drag_origins(&live, &[Selection::Entity(1)]),
+            [(1, to_raw(40.0), to_raw(8.0))]
+        );
+        assert!(
+            drag_origins(&live, &[Selection::Entity(9)]).is_empty(),
+            "a selection the map does not cover owns no cart index"
+        );
+    }
+
+    #[test]
+    fn overlay_rows_wait_for_the_world_blob_and_flag_the_selection() {
+        let mut live = fixture_view();
+        live.world_sync = WorldSync::Sending;
+        assert!(
+            overlay_rows(&live, FIXTURE_COUNTS, &[Selection::Entity(0)]).is_empty(),
+            "rows from the previous world are not drawn over the new one"
+        );
+
+        live.world_sync = WorldSync::Loaded;
+        let rows = overlay_rows(&live, FIXTURE_COUNTS, &[Selection::Entity(1)]);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[1],
+            (Selection::Entity(1), [40.0, 8.0, 16.0, 16.0], true)
+        );
+        assert!(!rows[0].2, "everything else draws unselected");
+
+        // A row the document has since lost is dropped rather than drawn
+        // against an index that no longer resolves.
+        let rows = overlay_rows(
+            &live,
+            DocCounts {
+                entities: 2,
+                instances: 0,
+            },
+            &[],
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// `!busy()` only says the bytes were acked. The cart rebuilds its
+    /// world and republishes over the frames that follow, so the first
+    /// frame AFTER the ack is the signal -- and it has to work when the
+    /// republished table is byte-identical to the one before it.
+    #[test]
+    fn world_sync_needs_a_cart_frame_after_the_ack_not_a_changed_table() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        live.world_sync = WorldSync::Sending;
+        live.advance_world_sync();
+        assert_eq!(
+            live.world_sync,
+            WorldSync::Acked(0),
+            "an idle mailbox is not busy, so the send is already acked here"
+        );
+        assert!(!live.loaded());
+        // No cart frame lands, so the wait does not end however many turns
+        // pass -- an unchanged row table must not be mistaken for one.
+        live.advance_world_sync();
+        live.advance_world_sync();
+        assert_eq!(live.world_sync, WorldSync::Acked(0));
     }
 
     #[test]

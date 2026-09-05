@@ -477,8 +477,10 @@ fn paint_device_screen(
 ///
 /// `zoom`/`pan` are the SAME camera the design view uses, and `rows` are in
 /// world pixels, because the cart's camera is set to the world point the
-/// canvas's top-left shows ([`live_frame_bounds`]). Overlay and frame
-/// therefore cannot drift apart: one number moves both.
+/// canvas's top-left shows ([`live_frame_bounds`]). One number therefore
+/// places both -- but they are not in lockstep: the camera reaches the
+/// cart on the next tick and takes a frame to render, so during a pan the
+/// picture lags the overlay by a frame or two before catching up.
 pub struct LiveScene {
     /// The cart's latest presented frame, cloned per render -- the emu
     /// panel retires frames with `Window::drop_image`, so an `Arc` carried

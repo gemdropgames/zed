@@ -522,6 +522,11 @@ struct ViewShared {
     /// Canvas-relative cursor position while the pointer is over the
     /// canvas -- where a paste lands. `None` once it leaves.
     hover: Option<[f64; 2]>,
+    /// The camera moved somewhere the live session could not be reached
+    /// from -- the canvas's prepaint closure. Consumed by
+    /// `OpenWorld::live_step`, which turns it into `camera_dirty`. Every
+    /// other camera move pokes the session directly.
+    camera_moved: bool,
 }
 
 /// An in-flight middle-mouse pan drag.
@@ -542,6 +547,12 @@ struct EditDrag {
     start_world: [f64; 2],
     /// Every selected item's start position, in selection order.
     starts: Vec<(Selection, [f64; 2])>,
+    /// Whether a move event has actually displaced the primary. A click
+    /// that merely SELECTS also arms a drag (so the next move can pick it
+    /// up), and treating that as an edit would re-send the whole world
+    /// blob on every selection click -- which resets the cart's runtime
+    /// state and snaps every moving entity back.
+    moved: bool,
 }
 
 /// An in-flight rubber-band selection on empty canvas, in world coords.
@@ -792,6 +803,7 @@ impl OpenWorld {
                 last_bounds: None,
                 drag: None,
                 hover: None,
+                camera_moved: false,
             })),
             selected: Vec::new(),
             marquee: None,
@@ -1081,98 +1093,14 @@ fn layout_camera(
             zoom,
             world_center,
         ));
+        // The centering IS a camera move, and it happens in a paint
+        // closure that cannot reach the session; `live_step` picks the
+        // flag up. Without it a session that connected before the first
+        // layout leaves the cart at camera (0, 0) while the overlay draws
+        // against the centered pan.
+        v.camera_moved = true;
     }
     (zoom, v.pan.unwrap_or([0.0, 0.0]))
-}
-
-/// The Live overlay: one entry per published cart rect that still maps to
-/// something in the document. Empty until the cart has republished for the
-/// world blob the panel last sent -- rows from the PREVIOUS world would
-/// otherwise be outlined over a frame that no longer holds them.
-fn live_overlay_rows(open: &OpenWorld) -> Vec<(Selection, [f64; 4], bool)> {
-    let Some(live) = open.live.as_ref() else {
-        return Vec::new();
-    };
-    if !live.loaded {
-        return Vec::new();
-    }
-    live.rows
-        .iter()
-        .filter_map(|row| {
-            let selection = live.index_map.selection_of(row.index)?;
-            open.selection_exists(selection).then(|| {
-                (
-                    selection,
-                    [row.x, row.y, row.w, row.h],
-                    open.selected.contains(&selection),
-                )
-            })
-        })
-        .collect()
-}
-
-/// The document selection under a world point in LIVE mode: the topmost
-/// cart rect there, mapped back through the flattened index map. A row
-/// that maps to something the document no longer has is no hit at all --
-/// the map can be one tick behind an instance edit.
-fn live_hit(open: &OpenWorld, world: [f64; 2]) -> Option<Selection> {
-    let live = open.live.as_ref()?;
-    let index = live::hit_row(&live.rows, world[0], world[1])?;
-    let selection = live.index_map.selection_of(index)?;
-    open.selection_exists(selection).then_some(selection)
-}
-
-/// Every document selection a rubber-band covers in LIVE mode, in cart
-/// order and without repeats (an instance owns a run of cart indices).
-fn live_hits_in_rect(open: &OpenWorld, start: [f64; 2], current: [f64; 2]) -> Vec<Selection> {
-    let Some(live) = open.live.as_ref() else {
-        return Vec::new();
-    };
-    let mut hits = Vec::new();
-    for index in live::rows_in_rect(&live.rows, start[0], start[1], current[0], current[1]) {
-        if let Some(selection) = live.index_map.selection_of(index)
-            && open.selection_exists(selection)
-            && !hits.contains(&selection)
-        {
-            hits.push(selection);
-        }
-    }
-    hits
-}
-
-/// Where every cart index the selection owns sits right now, in the
-/// runtime's raw fixed point -- the anchors a live drag adds its delta to.
-fn live_drag_origins(open: &OpenWorld) -> Vec<(u32, i32, i32)> {
-    let Some(live) = open.live.as_ref() else {
-        return Vec::new();
-    };
-    open.selected
-        .iter()
-        .flat_map(|selection| live.index_map.indices_of(*selection))
-        .filter_map(|index| {
-            let row = live.rows.iter().find(|row| row.index == index)?;
-            Some((index, live::to_raw(row.x), live::to_raw(row.y)))
-        })
-        .collect()
-}
-
-/// Mirror an in-flight drag onto the cart: `SetTransform` is absolute, so
-/// every cart index the selection owns moves to the position it had at
-/// mouse-down plus the delta the document just took. A refused datagram is
-/// logged, never fatal -- the drop re-sends the world.
-fn live_move(open: &mut OpenWorld, delta: [f64; 2]) {
-    let Some(live) = open.live.as_mut() else {
-        return;
-    };
-    let (dx, dy) = (live::to_raw(delta[0]), live::to_raw(delta[1]));
-    for &(index, x, y) in &live.drag_origin {
-        if let Err(error) =
-            live.mailbox
-                .set_transform(index, x.saturating_add(dx), y.saturating_add(dy))
-        {
-            log::warn!("GGO: live drag update for cart entity {index}: {error}");
-        }
-    }
 }
 
 /// What one turn of the live session did: whether anything the panel draws
@@ -1276,15 +1204,13 @@ impl OpenWorld {
         }
     }
 
-    /// Whether `selection` still indexes something in the document. The
-    /// live index map is rebuilt from counts that can be one tick behind
-    /// an instance edit, so a cart row can map to a selection the document
-    /// no longer has.
-    fn selection_exists(&self, selection: Selection) -> bool {
-        let state = self.store.state();
-        match selection {
-            Selection::Entity(index) => index < state.entities.len(),
-            Selection::Instance(index) => index < state.instances.len(),
+    /// How big the document is, for the Live lookups. Takes the state
+    /// the caller already has: `WorldDocStore::state` deep-clones the
+    /// document, so asking per row would clone it per row.
+    fn doc_counts(state: &ggo_worldlib::world_doc::WorldState) -> live::DocCounts {
+        live::DocCounts {
+            entities: state.entities.len(),
+            instances: state.instances.len(),
         }
     }
 
@@ -1375,6 +1301,19 @@ impl OpenWorld {
                 return failed(link_failed(error));
             }
         }
+        let sync_before = live.world_sync;
+        live.advance_world_sync();
+        changed |= live.world_sync != sync_before;
+        // One batch per tick, blob in flight or not: a drag the user can
+        // see lagging is worse than a datagram queued behind a transfer.
+        if live.status == LiveStatus::Connected {
+            live.flush_pending_transforms();
+        }
+        // A first layout centered the camera in a paint closure that could
+        // not reach the session.
+        if std::mem::take(&mut self.view.borrow_mut().camera_moved) {
+            live.camera_dirty = true;
+        }
 
         // One update per tick, and none while a blob is in flight: the
         // cart's APP receive queue is four datagrams deep and a transfer
@@ -1388,22 +1327,29 @@ impl OpenWorld {
                 || live.camera_dirty;
             let mut live_error = None;
             if live.world_dirty {
-                live.world_dirty = false;
-                // The rows the cart has published are the PREVIOUS world's
-                // until it republishes for this blob.
-                live.loaded = false;
-                live.index_map =
-                    live::IndexMap::new(self.store.state().entities.len(), &self.instance_counts);
                 match live::encode_world(&self.store, &self.root) {
                     // A world the encoder rejects is a document problem,
                     // not a link problem: say so on the status row and stay
-                    // live on whatever the cart already has.
+                    // live on whatever the cart already has. `world_dirty`
+                    // STAYS set, so the next tick retries -- clearing it
+                    // here would leave the session showing a world it
+                    // silently failed to send, with nothing to re-arm it.
+                    // The retry is once per tick, which is the poll's own
+                    // cadence, not a spin.
                     Err(error) => live_error = Some(format!("live update: {error}")),
-                    Ok(blob) => {
-                        if let Err(error) = live.mailbox.load_world(&blob) {
-                            live_error = Some(format!("live update: {error}"));
+                    Ok(blob) => match live.mailbox.load_world(&blob) {
+                        Err(error) => live_error = Some(format!("live update: {error}")),
+                        Ok(()) => {
+                            live.world_dirty = false;
+                            // The rows the cart has published are the
+                            // PREVIOUS world's until it republishes.
+                            live.world_sync = live::WorldSync::Sending;
+                            live.index_map = live::IndexMap::new(
+                                self.store.state().entities.len(),
+                                &self.instance_counts,
+                            );
                         }
-                    }
+                    },
                 }
             } else if live.layers_dirty || !live.layer_queue.is_empty() {
                 // `layers_dirty` means "the document's layers moved since
@@ -1448,12 +1394,6 @@ impl OpenWorld {
             };
         };
         let rows = live::rows_from(live.mailbox.entities());
-        // The cart republishes its whole table after a world load, so the
-        // first publish once the transfer is done is what says the rows
-        // describe the world the panel just sent.
-        if !live.loaded && !live.mailbox.busy() && rows != live.rows {
-            live.loaded = true;
-        }
         changed |= rows != live.rows;
         live.rows = rows;
         // Cloning the `Arc` only -- the emu panel owns dropping the image
@@ -3457,10 +3397,12 @@ impl WorldPanel {
         // Live hit-tests the CART's published rects, not the design draw
         // list: what the user is clicking is the picture the cart drew, and
         // a runtime that moved an entity has already moved its rect.
-        let hit = if live_active {
-            live_hit(open, world)
-        } else {
-            hit_test(&draw_items(open), world[0], world[1])
+        let hit = match open.live.as_ref().filter(|_| live_active) {
+            Some(live) => {
+                let counts = OpenWorld::doc_counts(&open.store.state());
+                live::hit(live, counts, world)
+            }
+            None => hit_test(&draw_items(open), world[0], world[1]),
         };
         // A click ends whatever nudge run was in flight, whether or not it
         // lands on the same item: the next arrow key starts a fresh undo
@@ -3499,14 +3441,15 @@ impl WorldPanel {
                     start_pos,
                     start_world: world,
                     starts,
+                    moved: false,
                 })
             }
             _ => None,
         };
         if live_active && open.edit_drag.is_some() {
-            let origins = live_drag_origins(open);
+            let selected = open.selected.clone();
             if let Some(live) = open.live.as_mut() {
-                live.drag_origin = origins;
+                live.drag_origin = live::drag_origins(live, &selected);
             }
         }
         cx.notify();
@@ -3521,6 +3464,7 @@ impl WorldPanel {
         if self.in_paint_mode() {
             return false;
         }
+        let live_active = self.live_active();
         let Some(view) = self.canvas_view() else {
             return false;
         };
@@ -3529,7 +3473,17 @@ impl WorldPanel {
                 return false;
             };
             let world = drag_ops::screen_to_world(local[0], local[1], &view);
-            match hit_test(&draw_items(open), world[0], world[1]) {
+            // Same hit test as the single click, for the same reason: in
+            // Live the entity under the cursor is the one the CART drew
+            // there, not the one the document last placed there.
+            let hit = match open.live.as_ref().filter(|_| live_active) {
+                Some(live) => {
+                    let counts = OpenWorld::doc_counts(&open.store.state());
+                    live::hit(live, counts, world)
+                }
+                None => hit_test(&draw_items(open), world[0], world[1]),
+            };
+            match hit {
                 Some(Selection::Entity(index)) => index,
                 _ => return false,
             }
@@ -3568,17 +3522,32 @@ impl WorldPanel {
             return;
         };
         let pos = canvas::dragged_pos(drag.start_pos, drag.start_world, world, open.snap);
+        if pos == drag.start_pos {
+            // The pointer moved but the primary did not (a sub-tile move
+            // with snap on, or a click that merely jittered). Nothing to
+            // apply, and nothing that makes this gesture an EDIT.
+            return;
+        }
+        if let Some(armed) = open.edit_drag.as_mut() {
+            armed.moved = true;
+        }
         open.store
             .apply(move_ops(&drag.starts, primary, pos, Some(drag.gesture_id)));
         if live_active {
             // The delta the DOCUMENT took, not the raw cursor delta, so a
-            // snapped drag mirrors where the entity actually landed. One
-            // datagram per moved row per move event: the cart's APP receive
-            // queue is four deep, and the drop re-syncs the world anyway.
-            live_move(
-                open,
-                [pos[0] - drag.start_pos[0], pos[1] - drag.start_pos[1]],
-            );
+            // snapped drag mirrors where the entity actually landed.
+            // Resolved to absolute targets and PARKED: `live_step` puts one
+            // datagram per row on the wire per tick, which is one cart
+            // frame.
+            let delta = [pos[0] - drag.start_pos[0], pos[1] - drag.start_pos[1]];
+            if let Some(live) = open.live.as_mut() {
+                let (dx, dy) = (live::to_raw(delta[0]), live::to_raw(delta[1]));
+                live.pending_transforms = live
+                    .drag_origin
+                    .iter()
+                    .map(|&(index, x, y)| (index, x.saturating_add(dx), y.saturating_add(dy)))
+                    .collect();
+            }
         }
         cx.notify();
     }
@@ -3595,11 +3564,17 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let dragged = open.edit_drag.take().is_some();
+        // Only a drag that actually MOVED something: an ordinary
+        // selection click arms `edit_drag` too, and re-sending the world
+        // blob for it would reset the cart's runtime state on every click.
+        let moved = open.edit_drag.take().is_some_and(|drag| drag.moved);
         if let Some(live) = open.live.as_mut() {
+            // `pending_transforms` deliberately survives: the last move of
+            // the drag still owes the cart a datagram, and it is resolved
+            // to absolute positions so it no longer needs the anchors.
             live.drag_origin.clear();
         }
-        if dragged {
+        if moved {
             // The drag applied its ops straight to the store, so this is
             // where the finished move re-syncs the cart -- from the
             // document, which is the only thing that knows the flattened
@@ -3609,8 +3584,9 @@ impl WorldPanel {
         let Some(marquee) = open.marquee.take() else {
             return;
         };
-        let hits = if live_active {
-            live_hits_in_rect(open, marquee.start, marquee.current)
+        let hits = if let Some(live) = open.live.as_ref().filter(|_| live_active) {
+            let counts = OpenWorld::doc_counts(&open.store.state());
+            live::hits_in_rect(live, counts, marquee.start, marquee.current)
         } else {
             items_in_rect(
                 &draw_items(open),
@@ -4166,7 +4142,7 @@ impl WorldPanel {
 
     /// Leave Live mode deliberately: the session goes, and so does the
     /// viewer run behind it.
-    // Task 5 wires the toolbar's Design/Live switch, which is the only
+    // Task 6 wires the toolbar's Design/Live switch, which is the only
     // thing that leaves Live on purpose.
     #[allow(dead_code)]
     fn leave_live(&mut self, cx: &mut Context<Self>) {
@@ -5568,7 +5544,8 @@ impl WorldPanel {
         // per-frame-of-change rebuild; images inside are `Arc` clones.
         // Selection is threaded through so `build_draw_list` emits the
         // `SelectionOutline` overlay.
-        let screen_origin = active_camera_origin(&open.store.state());
+        let state = open.store.state();
+        let screen_origin = active_camera_origin(&state);
         let world_center = canvas::camera_center(screen_origin);
         let view = open.view.clone();
         let grid = open.grid;
@@ -5591,7 +5568,9 @@ impl WorldPanel {
                 .live
                 .as_ref()
                 .and_then(|live| live.frame.as_ref().map(|(_, image)| image.clone()));
-            let rows = live_overlay_rows(open);
+            let rows = open.live.as_ref().map_or_else(Vec::new, |live| {
+                live::overlay_rows(live, OpenWorld::doc_counts(&state), &open.selected)
+            });
             let accent = cx.theme().colors().text_accent;
             gpui::canvas(
                 move |canvas_bounds, _window, _cx| {
@@ -10413,6 +10392,7 @@ mod tests {
                 start_pos: [0.0, 0.0],
                 start_world: [0.0, 0.0],
                 starts: Vec::new(),
+                moved: false,
             });
 
             let held = move_event(52.0, 30.0, Some(MouseButton::Left));
@@ -12657,18 +12637,58 @@ mod tests {
         open_of(panel).live.as_ref().expect("a live session")
     }
 
+    /// What the Live canvas would outline right now.
+    fn overlay_of(panel: &WorldPanel) -> Vec<(Selection, [f64; 4], bool)> {
+        let open = open_of(panel);
+        live::overlay_rows(
+            live_of(panel),
+            OpenWorld::doc_counts(&open.store.state()),
+            &open.selected,
+        )
+    }
+
+    /// `0x88 FrameSeq`: `seq u32` -- the per-frame heartbeat a running
+    /// cart publishes, and the only proof the host has that a datagram
+    /// arrived after a blob was acked.
+    fn cart_frame(endpoint: &ggo_common::LinkEndpoint, seq: u32) {
+        let mut out = vec![0x88];
+        out.extend_from_slice(&seq.to_le_bytes());
+        cart_says(endpoint, out);
+    }
+
+    /// Answer whatever blob window is on the wire the way the cart does,
+    /// and publish NO frame -- so a test can tell "the bytes landed" from
+    /// "the cart has drawn something since". Returns what the host had
+    /// queued and whether any of it was a blob.
+    fn ack_blobs(endpoint: &ggo_common::LinkEndpoint) -> (Vec<Vec<u8>>, bool) {
+        let drained = host_sent(endpoint);
+        let mut answered = false;
+        for message in &drained {
+            // `0x09 BlobChunk` and `0x0A BlobEnd` both lead with `seq`.
+            if matches!(message.first(), Some(0x09 | 0x0A))
+                && let Some(seq) = message.get(1..3)
+            {
+                endpoint.push_inbound(blob_ack(u16::from_le_bytes([seq[0], seq[1]])));
+                answered = true;
+            }
+        }
+        (drained, answered)
+    }
+
     /// Run the session until it has nothing left to push: every round
     /// answers the host's in-flight blob window the way the cart does
     /// (`Ack` per `BlobChunk`, one for the `BlobEnd`; acks are cumulative,
-    /// so go-back-N unblocks the next window) and then ticks the endpoint
-    /// so the poll loop takes another step. Returns everything the host
-    /// put on the wire while settling, in order.
+    /// so go-back-N unblocks the next window), publishes the next frame
+    /// (a running cart frames whether or not the host is talking to it),
+    /// and ticks the endpoint so the poll loop takes another step. Returns
+    /// everything the host put on the wire while settling, in order.
     fn settle_live(
         panel: &Entity<WorldPanel>,
         endpoint: &ggo_common::LinkEndpoint,
         cx: &mut gpui::VisualTestContext,
     ) -> Vec<Vec<u8>> {
         let mut seen = Vec::new();
+        let mut frame = panel.read_with(cx, |panel, _| live_of(panel).mailbox.frame_seq());
         for _ in 0..200 {
             let pending = panel.read_with(cx, |panel, _| {
                 let live = live_of(panel);
@@ -12677,22 +12697,15 @@ mod tests {
                     || !live.layer_queue.is_empty()
                     || live.camera_dirty
                     || live.mailbox.busy()
+                    || !live.loaded()
             });
-            let mut answered = false;
-            for message in host_sent(endpoint) {
-                // `0x09 BlobChunk` and `0x0A BlobEnd` both lead with `seq`.
-                if matches!(message.first(), Some(0x09 | 0x0A))
-                    && let Some(seq) = message.get(1..3)
-                {
-                    endpoint.push_inbound(blob_ack(u16::from_le_bytes([seq[0], seq[1]])));
-                    answered = true;
-                }
-                seen.push(message);
-            }
+            let (drained, answered) = ack_blobs(endpoint);
+            seen.extend(drained);
             if !pending && !answered {
                 return seen;
             }
-            endpoint.tick();
+            frame += 1;
+            cart_frame(endpoint, frame);
             cx.run_until_parked();
         }
         panic!("the live session never settled");
@@ -13197,6 +13210,22 @@ mod tests {
         });
     }
 
+    /// Every `SetTransform` the host has put on the wire since the last
+    /// drain, decoded to `(cart index, x, y)` in world px.
+    fn set_transforms(endpoint: &ggo_common::LinkEndpoint) -> Vec<(u32, f64, f64)> {
+        host_sent(endpoint)
+            .iter()
+            .filter_map(
+                |message| match emerald_editor_runtime::wire::decode_host(message) {
+                    Some(emerald_editor_runtime::wire::HostMsg::SetTransform { id, x, y }) => {
+                        Some((id, live::from_raw(x), live::from_raw(y)))
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
     // --------------------------------------------- live canvas gestures
 
     /// A click in Live hit-tests the CART's rects, and the index the cart
@@ -13336,19 +13365,16 @@ mod tests {
         panel.update_in(cx, |panel, _, cx| {
             panel.canvas_drag_to(live_screen_of(panel, [51.0, 19.0]), cx)
         });
+        assert!(
+            host_sent(&endpoint).is_empty(),
+            "the move parks the mirror; the tick is what puts it on the wire"
+        );
+        endpoint.tick();
         cx.run_until_parked();
 
-        let sent = host_sent(&endpoint);
-        let transform = sent
-            .iter()
-            .find(|message| message.first() == Some(&0x02))
-            .expect("SetTransform sent");
-        match emerald_editor_runtime::wire::decode_host(transform) {
-            Some(emerald_editor_runtime::wire::HostMsg::SetTransform { id: 1, x, y }) => {
-                assert_eq!((live::from_raw(x), live::from_raw(y)), (50.0, 18.0));
-            }
-            other => panic!("{other:?}"),
-        }
+        let transforms = set_transforms(&endpoint);
+        assert_eq!(transforms.len(), 1, "one datagram for the one moved row");
+        assert_eq!(transforms[0], (1, 50.0, 18.0));
 
         panel.update_in(cx, |panel, _, cx| panel.canvas_primary_up(cx));
         cx.run_until_parked();
@@ -13660,8 +13686,8 @@ mod tests {
     }
 
     /// The overlay is drawn from rows, and rows outlive the world they
-    /// were published for: until the cart republishes, the canvas shows
-    /// the frame alone.
+    /// were published for: until the cart has FRAMED past the blob's ack,
+    /// the canvas shows the frame alone.
     #[gpui::test]
     async fn the_overlay_waits_for_the_cart_to_republish_after_a_world_load(
         cx: &mut TestAppContext,
@@ -13669,9 +13695,10 @@ mod tests {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
         cart_rows(&endpoint, &[(0, 4.0, 4.0), (1, 40.0, 8.0)]);
         cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            assert!(live_of(panel).loaded);
-            assert_eq!(live_overlay_rows(open_of(panel)).len(), 2);
+        let published = panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).loaded());
+            assert_eq!(overlay_of(panel).len(), 2);
+            live_of(panel).rows.clone()
         });
 
         panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
@@ -13679,21 +13706,294 @@ mod tests {
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert!(
-                !live_of(panel).loaded,
-                "the blob went out; the rows are stale"
+                !live_of(panel).loaded(),
+                "the blob went out; the rows are the old world's"
             );
             assert!(
-                live_overlay_rows(open_of(panel)).is_empty(),
+                overlay_of(panel).is_empty(),
                 "nothing is outlined over a frame that may not hold it"
             );
         });
 
-        settle_live(&panel, &endpoint, cx);
-        cart_rows(&endpoint, &[(0, 4.0, 4.0), (1, 40.0, 8.0), (2, 9.0, 9.0)]);
+        // Every chunk acked, and NOT one frame published: the bytes have
+        // landed but the cart has not drawn since, so the rows are still
+        // unproven.
+        for _ in 0..64 {
+            if !ack_blobs(&endpoint).1 {
+                break;
+            }
+            endpoint.tick();
+            cx.run_until_parked();
+        }
+        let frame = panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert!(!live.mailbox.busy(), "the transfer finished");
+            assert!(
+                !live.loaded(),
+                "an ack is not a republish -- the cart has not framed since"
+            );
+            live.mailbox.frame_seq()
+        });
+
+        // One frame, and the cart republishes a BYTE-IDENTICAL table (the
+        // new entity has no Transform of its own to report). Nothing about
+        // the ROWS says the reload finished; the frame after the ack does.
+        cart_frame(&endpoint, frame + 1);
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert!(live_of(panel).loaded);
-            assert_eq!(live_overlay_rows(open_of(panel)).len(), 3);
+            assert_eq!(
+                live_of(panel).rows,
+                published,
+                "the table really is unchanged"
+            );
+            assert!(live_of(panel).loaded(), "and the overlay comes back anyway");
+            assert_eq!(overlay_of(panel).len(), 2);
+        });
+    }
+
+    /// An ordinary selection click arms `edit_drag` so the next move can
+    /// pick it up. Treating that as an edit would re-send the whole world
+    /// blob on every click -- which resets the cart's runtime state and
+    /// snaps every moving entity back to its authored position.
+    #[gpui::test]
+    async fn a_click_that_selects_without_moving_sends_nothing(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_rows(&endpoint, &[(0, 4.0, 4.0), (1, 40.0, 8.0)]);
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), false, cx)
+        });
+        panel.update_in(cx, |panel, _, cx| panel.canvas_primary_up(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(1)]);
+            let live = live_of(panel);
+            assert!(!live.world_dirty, "a click is not a document edit");
+            assert!(live.loaded(), "and it does not blank the overlay");
+        });
+        let sent = host_sent(&endpoint);
+        assert!(
+            sent.iter().all(|message| message.first() != Some(&0x08)),
+            "no blob for a click: {sent:?}"
+        );
+        assert!(set_transforms(&endpoint).is_empty());
+
+        // A press that does not move, then one that does: only the second
+        // is an edit.
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), false, cx);
+            panel.canvas_drag_to(live_screen_of(panel, [41.0, 9.0]), cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).world_dirty,
+                "a move that displaces nothing is not an edit either"
+            );
+        });
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_drag_to(live_screen_of(panel, [51.0, 19.0]), cx);
+            panel.canvas_primary_up(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).world_dirty, "a real move is");
+        });
+    }
+
+    /// Plan contract: at most one `SetTransform` per moved row per cart
+    /// frame. The cart's APP receive queue is four datagrams deep, so a
+    /// drag that wrote one per row per mouse-move would overrun it.
+    #[gpui::test]
+    async fn several_moves_in_one_tick_coalesce_to_one_set_transform_per_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_rows(
+            &endpoint,
+            &[
+                (0, 4.0, 4.0),
+                (1, 40.0, 8.0),
+                (2, 0.0, 0.0),
+                (3, 32.0, 16.0),
+            ],
+        );
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        panel.update_in(cx, |panel, _, cx| {
+            // [18, 18] is inside row 0 only -- row 2 sits at the origin
+            // and would win the topmost-row test nearer the corner.
+            panel.canvas_primary_down_with(live_screen_of(panel, [18.0, 18.0]), false, cx);
+            panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), true, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).selected,
+                vec![Selection::Entity(0), Selection::Entity(1)]
+            );
+        });
+        for x in [45.0, 50.0, 55.0] {
+            panel.update_in(cx, |panel, _, cx| {
+                panel.canvas_drag_to(live_screen_of(panel, [x, 9.0]), cx)
+            });
+        }
+        endpoint.tick();
+        cx.run_until_parked();
+
+        let mut transforms = set_transforms(&endpoint);
+        transforms.sort_by_key(|(index, _, _)| *index);
+        assert_eq!(
+            transforms,
+            // Three moves, +14 px on the primary by the last one; both
+            // selected rows follow, one datagram each.
+            vec![(0, 18.0, 4.0), (1, 54.0, 8.0)],
+            "one datagram per row, carrying the LAST position"
+        );
+    }
+
+    /// A world the encoder refuses is a document problem, not a link one:
+    /// the flag has to survive so the next tick retries, and the overlay
+    /// must not be blanked for a blob that never left.
+    #[gpui::test]
+    async fn a_failed_encode_keeps_the_world_dirty_and_retries(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        // The open document instances `worlds/sub`; the encoder reads it
+        // to flatten the world, so removing it makes every encode fail.
+        let sub = dir.path().join("worlds/sub.toml");
+        let saved = std::fs::read(&sub).unwrap();
+        std::fs::remove_file(&sub).unwrap();
+
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+
+        let sent = host_sent(&endpoint);
+        assert!(
+            sent.iter().all(|message| message.first() != Some(&0x08)),
+            "nothing went out: {sent:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                live_of(panel).world_dirty,
+                "the failed send re-arms itself instead of being swallowed"
+            );
+            assert!(
+                live_of(panel).loaded(),
+                "and a blob that never left must not blank the overlay"
+            );
+            assert!(
+                open_of(panel)
+                    .live_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("live update"),
+                "{:?}",
+                open_of(panel).live_error
+            );
+        });
+
+        std::fs::write(&sub, saved).unwrap();
+        endpoint.tick();
+        cx.run_until_parked();
+        assert!(
+            host_sent(&endpoint)
+                .iter()
+                .any(|message| message.first() == Some(&0x08) && message.get(1) == Some(&0)),
+            "the retry sends the world once the document reads again"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(!live_of(panel).world_dirty);
+            assert_eq!(open_of(panel).live_error, None, "and the row clears");
+        });
+    }
+
+    /// The first layout centers the camera inside a paint closure that
+    /// cannot reach the session. Without the hand-off the cart sits at
+    /// camera (0, 0) while the overlay draws against the centered pan.
+    #[gpui::test]
+    async fn the_first_layout_hands_its_centering_to_the_cart(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        // Back to "never laid out", which is the state a session that
+        // connected before the canvas drew is really in.
+        panel.update(cx, |panel, _| {
+            open_of(panel).view.borrow_mut().pan = None;
+        });
+
+        let centered = panel.update(cx, |panel, _| {
+            let open = open_of(panel);
+            let world_center = canvas::camera_center(active_camera_origin(&open.store.state()));
+            layout_camera(
+                &open.view,
+                gpui::bounds(gpui::point(px(0.), px(0.)), gpui::size(px(400.), px(300.))),
+                world_center,
+            );
+            view_top_left_world(&open.view)
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+
+        let sent = host_sent(&endpoint);
+        let camera = sent
+            .iter()
+            .find(|message| message.first() == Some(&0x03))
+            .expect("the centering reached the cart");
+        match emerald_editor_runtime::wire::decode_host(camera) {
+            Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
+                assert_eq!(
+                    (live::from_raw(x), live::from_raw(y)),
+                    (centered[0], centered[1])
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A double-click opens the `Tilemap` entity the CART drew under the
+    /// cursor, like every other Live gesture -- not the one the document
+    /// last placed there.
+    #[gpui::test]
+    async fn a_double_click_in_live_opens_the_tilemap_the_cart_drew(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        io::save_new_bound_map(dir.path(), "maps/deco.map", 16, 16, "tiles/bg.til").unwrap();
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::AddComponent {
+                    entity: 0,
+                    name: "Tilemap".to_string(),
+                    defaults: json!({ "stem": "maps/deco", "col": 0.0, "row": 0.0 })
+                        .as_object()
+                        .expect("object literal")
+                        .clone(),
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        // Entity 0 is authored at (4, 4) but the cart draws it at
+        // (100, 60).
+        cart_rows(&endpoint, &[(0, 100.0, 60.0), (1, 40.0, 8.0)]);
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            assert!(
+                !panel.canvas_double_click(live_screen_of(panel, [5.0, 5.0]), cx),
+                "where the DOCUMENT puts it is not where it is"
+            );
+            assert!(panel.canvas_double_click(live_screen_of(panel, [101.0, 61.0]), cx));
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some("maps/deco.map"),
+                "the cart's rect is what opened the map"
+            );
         });
     }
 }
