@@ -70,6 +70,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ggo_common::{LinkEndpoint, ViewerState};
 use ggo_emu_core::apu::Apu;
 use ggo_emu_core::cart::Cart;
 use ggo_emu_core::cpu::{Cpu, Trap};
@@ -214,6 +215,15 @@ pub struct Session {
     uart: UartLog,
     /// Filled in by the thread immediately before it returns.
     outcome: Arc<Mutex<Option<RunOutcome>>>,
+    /// The viewer link this run is driving, when it was started for one
+    /// (`None` for an ordinary cart run). Held so the host side can be
+    /// reached from the session the panel keeps.
+    ///
+    /// Only this module's tests read it back today -- the world view that
+    /// starts a run with a link is the next piece of this feature -- and
+    /// the fork denies dead code, hence the narrow allow.
+    #[cfg_attr(not(test), allow(dead_code))]
+    link: Option<Arc<LinkEndpoint>>,
     /// `None` only after [`Self::wait`] has taken it.
     join: Option<JoinHandle<()>>,
 }
@@ -304,6 +314,12 @@ impl Session {
         &self.uart
     }
 
+    /// The viewer link this run was started for, if any.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn link(&self) -> Option<Arc<LinkEndpoint>> {
+        self.link.clone()
+    }
+
     /// Signal the run to stop and BLOCK until the thread has exited,
     /// returning everything the end-of-run ingest needs.
     ///
@@ -371,6 +387,7 @@ pub fn start(
     cart_path: PathBuf,
     cart: String,
     audio: Option<AudioStatus>,
+    link: Option<Arc<LinkEndpoint>>,
 ) -> (Session, async_channel::Receiver<Frame>) {
     let (tx, rx) = async_channel::bounded(1);
     let input = Arc::new(AtomicU32::new(0));
@@ -396,6 +413,7 @@ pub fn start(
             inspect: inspect.clone(),
             speed: speed.clone(),
             world_json: world_json.clone(),
+            link: link.clone(),
         };
         let (uart, outcome) = (uart.clone(), outcome.clone());
         std::thread::Builder::new()
@@ -403,6 +421,14 @@ pub fn start(
             .spawn(move || {
                 let result = run(&cart_path, &tx, &controls, &uart, audio.as_ref());
                 uart.push_line(format!("[run ended] {}", result.reason));
+                // Here rather than inside `run`, so it covers every way
+                // out: the loop's own breaks AND the setup failures that
+                // return before the loop (unreadable file, unparsable
+                // cart). A viewer whose cart never started must see
+                // `Stopped`, not a `Building` that never resolves.
+                if let Some(link) = &controls.link {
+                    link.set_state(ViewerState::Stopped(result.reason.clone()));
+                }
                 *outcome.lock().unwrap() = Some(result);
             })
             .expect("spawning the ggo emulator thread")
@@ -420,6 +446,7 @@ pub fn start(
         world_json,
         uart,
         outcome,
+        link,
         join: Some(join),
     };
     (session, rx)
@@ -437,6 +464,8 @@ struct Controls {
     inspect: Arc<AtomicBool>,
     speed: Arc<AtomicU32>,
     world_json: Arc<Mutex<Option<(u32, Arc<String>)>>>,
+    /// The viewer link, when this run is a world view's viewer cart.
+    link: Option<Arc<LinkEndpoint>>,
 }
 
 /// Where a run's save file lives: the standalone's rule (`<card dir>/savs/
@@ -468,7 +497,11 @@ fn run(
         inspect,
         speed,
         world_json,
+        link,
     } = controls;
+    // Holds a frame that arrived split across two frame boundaries, so it
+    // must outlive the loop -- see `crate::link`.
+    let mut link_reader = ggo_comm::MessageReader::default();
     // Cached guest address of the world-inspection tap (see
     // emerald-world's `inspect` module); scanned for lazily since a world
     // that never opts in never writes one.
@@ -663,6 +696,9 @@ fn run(
                     arm_world_tap(&mut mmu, &mut tap_addr, true);
                 }
                 publish_world_tap(&mmu, &mut tap_addr, world_json);
+                if let Some(link) = link {
+                    crate::link::pump_link(&mut p, link, &mut link_reader);
+                }
                 // Full channel = the UI hasn't drained the previous
                 // frame yet; drop this one. Closed = the panel dropped
                 // the receiver (Stop, or the panel itself went away).
@@ -1361,7 +1397,7 @@ pub mod tests_support {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, fixture::green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None);
+        let (session, rx) = start(path, "green.cart".to_string(), None, None);
         for _ in 0..frames {
             rx.recv_blocking().expect("the emulator thread must run");
         }
@@ -1384,6 +1420,7 @@ mod tests {
         let (session, _rx) = start(
             PathBuf::from("/nonexistent/cart.ggo"),
             "cart.ggo".into(),
+            None,
             None,
         );
         assert_eq!(session.speed(), 1, "a fresh run is real time");
@@ -1479,7 +1516,7 @@ mod tests {
         let path = dir.path().join("overrun.ggo");
         std::fs::write(&path, fixture::overrun_cart()).unwrap();
 
-        let (session, rx) = start(path, "overrun.ggo".into(), None);
+        let (session, rx) = start(path, "overrun.ggo".into(), None, None);
         assert!(
             rx.recv_blocking().is_err(),
             "the run must die on its first store, never reaching a frame"
@@ -1621,7 +1658,7 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None);
+        let (session, rx) = start(path, "green.cart".to_string(), None, None);
 
         let mut frames = Vec::new();
         // Five frames at 60 Hz is ~83 ms of pacing; the recv itself
@@ -1683,7 +1720,7 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None);
+        let (session, rx) = start(path, "green.cart".to_string(), None, None);
         // Prove the run is genuinely live before dropping the handle.
         rx.recv_blocking().expect("the emulator thread must run");
 
@@ -1756,7 +1793,7 @@ mod tests {
         let path = dir.path().join("junk.cart");
         std::fs::write(&path, b"not a cart at all").unwrap();
 
-        let (session, rx) = start(path, "junk.cart".to_string(), None);
+        let (session, rx) = start(path, "junk.cart".to_string(), None, None);
         assert!(
             rx.recv_blocking().is_err(),
             "junk must not produce a frame; the channel just closes"
@@ -1787,12 +1824,34 @@ mod tests {
             "/definitely/not/here.cart".into(),
             "here.cart".to_string(),
             None,
+            None,
         );
         assert!(rx.recv_blocking().is_err());
         let finished = session.wait();
         assert!(finished.reason.contains("here.cart"), "{}", finished.reason);
         assert!(finished.is_error, "an unreadable cart file is a FAILED run");
         assert!(finished.perf.is_none());
+    }
+
+    /// A viewer whose run ends must not be left waiting on a `Building`
+    /// that never resolves -- including when the run died in setup, before
+    /// the frame loop the link is pumped from ever turned over.
+    #[test]
+    fn a_run_started_for_a_link_leaves_it_stopped_with_the_runs_reason() {
+        let endpoint = LinkEndpoint::new();
+        let (session, rx) = start(
+            "/definitely/not/here.cart".into(),
+            "here.cart".to_string(),
+            None,
+            Some(endpoint.clone()),
+        );
+        assert!(
+            session.link().is_some_and(|l| Arc::ptr_eq(&l, &endpoint)),
+            "the session hands back the link it was started for"
+        );
+        assert!(rx.recv_blocking().is_err());
+        let finished = session.wait();
+        assert_eq!(endpoint.state(), ViewerState::Stopped(finished.reason));
     }
 
     /// A cart that exits reports the exit code -- and still hands back
@@ -1818,7 +1877,7 @@ mod tests {
         let path = dir.path().join("quit.cart");
         std::fs::write(&path, image).unwrap();
 
-        let (session, rx) = start(path, "quit.cart".to_string(), None);
+        let (session, rx) = start(path, "quit.cart".to_string(), None, None);
         // Let the run reach its own terminus first. `wait` sets the stop
         // flag before it joins (it is the "finish this run" call, not a
         // passive read), so racing it against the cart would report
@@ -1857,7 +1916,7 @@ mod tests {
         let path = dir.path().join("logging.cart");
         std::fs::write(&path, logging_cart()).unwrap();
 
-        let (session, rx) = start(path, "logging.cart".to_string(), None);
+        let (session, rx) = start(path, "logging.cart".to_string(), None, None);
         // The cart's single `log()` call runs on the very first turn,
         // before its first `vsync_wait` -- so by the time the first frame
         // arrives, that turn's drain has already moved it into the
@@ -1882,7 +1941,7 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None);
+        let (session, rx) = start(path, "green.cart".to_string(), None, None);
         // Wait for the run to be genuinely under way before publishing,
         // so the store can't race the thread's construction.
         rx.recv_blocking().unwrap();
@@ -1919,7 +1978,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
-        let (session, rx) = start(path, "green.cart".to_string(), None);
+        let (session, rx) = start(path, "green.cart".to_string(), None, None);
 
         let first = rx.recv_blocking().expect("frames flow before pause");
         assert!(
@@ -1994,7 +2053,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
-        let (session, rx) = start(path, "green.cart".to_string(), None);
+        let (session, rx) = start(path, "green.cart".to_string(), None, None);
         rx.recv_blocking().expect("running");
         session.step();
         assert_eq!(session.step.load(Ordering::Acquire), 0);
@@ -2012,7 +2071,7 @@ mod tests {
         let cart_bytes = fixture::saving_cart();
         let path = card_dir.join("save.cart");
         std::fs::write(&path, &cart_bytes).unwrap();
-        let (session, rx) = start(path, "save.cart".to_string(), None);
+        let (session, rx) = start(path, "save.cart".to_string(), None, None);
         rx.recv_blocking().expect("the cart runs");
         rx.recv_blocking().expect("and keeps running");
         let finished = session.wait();

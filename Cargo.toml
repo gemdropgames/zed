@@ -348,10 +348,13 @@ file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
+gemdrop-sdk = { path = "../ggo/sdk/gemdrop-sdk" } # GGO
 ggo-asset-formats = { path = "../ggo/sdk/ggo-asset-formats" } # GGO
 ggo-audio = { path = "../ggo/tools/ggo-audio" } # GGO
+ggo-comm = { path = "../ggo/tools/ggo-comm" } # GGO
 ggo-db = { path = "../ggo/tools/ggo-db" } # GGO
 ggo-emu-core = { path = "../ggo/tools/ggo-emu-core" } # GGO
+ggo-wire = { path = "../ggo/firmware/ggo-wire" } # GGO
 ggo-worldlib = { path = "../ggo/tools/ggo-worldlib" } # GGO
 ggo_audio_panel = { path = "crates/ggo/audio_panel" } # GGO
 ggo_charts_panel = { path = "crates/ggo/charts_panel" } # GGO

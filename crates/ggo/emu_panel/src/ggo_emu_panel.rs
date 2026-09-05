@@ -84,6 +84,7 @@ mod hardware;
 mod hardware_item;
 mod ingest;
 mod input;
+mod link;
 mod menu;
 mod stats;
 mod uart;
@@ -1551,7 +1552,7 @@ impl EmuPanel {
         // BEFORE the thread starts, so the pane never shows the last run's
         // "no output device" against this one. Mute is deliberately kept.
         self.audio.reset_for_run();
-        let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()));
+        let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()), None);
         session.set_speed(self.speed);
         self.console = Some(session.uart().clone());
         self.session = Some(session);
@@ -3964,8 +3965,12 @@ mod tests {
     async fn test_an_ended_run_reports_and_clears_the_session(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let (panel, cx) = windowed_panel(cx);
-        let (session, rx) =
-            drive::start("/definitely/not/here.cart".into(), "gone.cart".into(), None);
+        let (session, rx) = drive::start(
+            "/definitely/not/here.cart".into(),
+            "gone.cart".into(),
+            None,
+            None,
+        );
         drop(rx);
         panel.update(cx, |panel, cx| {
             panel.session = Some(session);
@@ -4008,6 +4013,7 @@ mod tests {
             "/definitely/not/here.cart".into(),
             "run-a.cart".into(),
             None,
+            None,
         );
         drop(rx_a);
 
@@ -4024,8 +4030,15 @@ mod tests {
             // Run B starts before A's completion has landed: a new
             // generation, a live session, and a status of its own.
             panel.run_generation = 2;
-            panel.session =
-                Some(drive::start("/also/not/here.cart".into(), "run-b.cart".into(), None).0);
+            panel.session = Some(
+                drive::start(
+                    "/also/not/here.cart".into(),
+                    "run-b.cart".into(),
+                    None,
+                    None,
+                )
+                .0,
+            );
             panel.status = Some("run B is live".to_string());
             panel.ingest_status = IngestStatus::Idle;
         });

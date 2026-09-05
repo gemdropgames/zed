@@ -28,8 +28,10 @@ chrono.workspace = true
 # `emu/audio.rs` and the standalone `ggo-emu` binary use, so the pane's
 # stream is the one this project already knows how to reason about.
 cpal.workspace = true
+ggo-comm.workspace = true # GGO -- MessageReader over the cart's comm TX
 ggo-db.workspace = true # GGO -- the one PostgreSQL database: url, pool, schema/migrations, and the TestDb fixture
 ggo-emu-core.workspace = true # GGO
+ggo-wire.workspace = true # GGO -- channel consts; tests frame payloads
 ggo_charts_panel.workspace = true # GGO -- S4's Re-run entry hands the run it just ingested to that panel
 ggo_common.workspace = true # GGO -- the shared child-process runner, also with the charts/emerald panels
 ggo_world_panel.workspace = true # GGO -- S4's "Emulate this world" saves that panel's doc and reuses its world-path rule
@@ -55,6 +57,10 @@ workspace.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# The link tests stage cart -> host bytes the way `ggo-emu-core`'s own
+# runtime tests do -- a real `COMM_SEND` ecall -- so they need the
+# syscall number. Dev-only: nothing in the panel itself names the SDK.
+gemdrop-sdk.workspace = true # GGO
 # The save-first half of "Emulate this world" can only be exercised with a
 # genuinely dirty world document in a real directory -- see that feature's
 # comment in ggo_world_panel/Cargo.toml.
