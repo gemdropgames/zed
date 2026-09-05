@@ -1803,7 +1803,7 @@
       "cmd-c": "ggo_world::Copy",
       "cmd-v": "ggo_world::Paste",
       "cmd-d": "ggo_world::Duplicate",
-      "ctrl-alt-l": "ggo_world::ToggleCanvasMode",
+      "cmd-alt-l": "ggo_world::ToggleCanvasMode",
     },
   },
   {

@@ -387,14 +387,15 @@ pub fn system_bit(index: usize) -> Option<u64> {
 
 /// The systems rail's rows: each of the cart's systems and whether `mask`
 /// has it on. Names with no mask bit are dropped rather than shown
-/// unusable.
-pub fn system_rows(names: &[String], mask: u64) -> Vec<(String, bool)> {
+/// unusable. Borrowed from the mailbox's own list -- this runs once per
+/// render of a connected session, which is once per cart frame.
+pub fn system_rows(names: &[String], mask: u64) -> Vec<(&str, bool)> {
     names
         .iter()
         .enumerate()
         .filter_map(|(index, name)| {
             let bit = system_bit(index)?;
-            Some((name.clone(), mask & bit != 0))
+            Some((name.as_str(), mask & bit != 0))
         })
         .collect()
 }
@@ -914,19 +915,11 @@ mod tests {
         let names = vec!["animate".to_string(), "ai".to_string(), "audio".to_string()];
         assert_eq!(
             system_rows(&names, 0),
-            vec![
-                ("animate".to_string(), false),
-                ("ai".to_string(), false),
-                ("audio".to_string(), false),
-            ]
+            [("animate", false), ("ai", false), ("audio", false)]
         );
         assert_eq!(
             system_rows(&names, 0b101),
-            vec![
-                ("animate".to_string(), true),
-                ("ai".to_string(), false),
-                ("audio".to_string(), true),
-            ]
+            [("animate", true), ("ai", false), ("audio", true)]
         );
         assert!(system_rows(&[], u64::MAX).is_empty());
     }
