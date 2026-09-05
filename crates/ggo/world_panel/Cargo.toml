@@ -45,6 +45,11 @@ ggo_map_panel.workspace = true # GGO
 # Test-only: decodes what the panel put on the viewer link back into APP
 # payloads, the same reader the emu panel runs over the cart's TX.
 ggo-comm.workspace = true # GGO
+# Test-only: the wire codec both halves of the link share, so the gesture
+# tests assert on DECODED host messages instead of on byte offsets. A
+# dev-dep, so the crate's own build still depends on nothing but
+# `emerald-editor-link` for the host side.
+emerald-editor-runtime.workspace = true # GGO
 # The map panel's own read-back hooks are `test-support`-gated over there,
 # exactly as this crate gates its own; the world panel's painting tests
 # will read cells back through them.

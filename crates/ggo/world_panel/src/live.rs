@@ -56,11 +56,9 @@ impl IndexMap {
     }
 }
 
-/// The lookups the Live GESTURES need: turning a click on the cart's
+/// The lookups the Live gestures need: turning a click on the cart's
 /// picture back into a document selection, and back again to drive the
-/// entities a drag moves. The session (Task 4) only builds the map; Task 5
-/// is what reads it.
-#[allow(dead_code)]
+/// entities a drag moves.
 impl IndexMap {
     pub fn selection_of(&self, cart_index: u32) -> Option<Selection> {
         self.entries.get(cart_index as usize).copied()
@@ -77,10 +75,15 @@ impl IndexMap {
             .collect()
     }
 
+    /// Read only by the tests: the map's production users address it by
+    /// index, never by size. Kept because "how many cart indices does this
+    /// document flatten to" is exactly what an index-map test asserts.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -109,16 +112,12 @@ pub fn rows_from(entities: &[EntityRow]) -> Vec<CartRow> {
         .collect()
 }
 
-// Hit-testing over the cart's rows is the Live canvas's half of the
-// gesture story (Task 5); the session only keeps the rows fresh.
-#[allow(dead_code)]
 fn contains(row: &CartRow, x: f64, y: f64) -> bool {
     x >= row.x && x < row.x + row.w && y >= row.y && y < row.y + row.h
 }
 
 /// Topmost (last) row under a world point, as the cart draws later rows
 /// above earlier ones.
-#[allow(dead_code)]
 pub fn hit_row(rows: &[CartRow], x: f64, y: f64) -> Option<u32> {
     rows.iter()
         .rev()
@@ -126,7 +125,6 @@ pub fn hit_row(rows: &[CartRow], x: f64, y: f64) -> Option<u32> {
         .map(|row| row.index)
 }
 
-#[allow(dead_code)]
 pub fn rows_in_rect(rows: &[CartRow], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<u32> {
     let (left, right) = (x0.min(x1), x0.max(x1));
     let (top, bottom) = (y0.min(y1), y0.max(y1));
@@ -331,16 +329,27 @@ pub struct LiveView {
     /// The cart's latest presented frame, re-cloned out of the endpoint
     /// every tick.
     ///
-    /// Task 5 (painting): the emu panel calls `Window::drop_image` on each
-    /// frame it RETIRES, and an `Arc` clone does not keep the atlas tile
-    /// alive. So paint only the frame this field holds right now, and
-    /// never carry an `Arc<RenderImage>` from one tick into the next for
-    /// painting -- by the time it is drawn the tile behind it may already
-    /// have been handed back.
+    /// The emu panel calls `Window::drop_image` on each frame it RETIRES,
+    /// and an `Arc` clone does not keep the atlas tile alive. So paint
+    /// only the frame this field holds right now, and never carry an
+    /// `Arc<RenderImage>` from one tick into the next for painting -- by
+    /// the time it is drawn the tile behind it may already have been
+    /// handed back.
     pub frame: Option<(u32, Arc<RenderImage>)>,
     /// The cart's published rects, in world pixels.
     pub rows: Vec<CartRow>,
     pub index_map: IndexMap,
+    /// Whether the cart has published an entity table for the world blob
+    /// this session last sent. `!mailbox.busy()` only says the blob was
+    /// ACKED; the rows stay the previous world's until the cart
+    /// republishes, and an overlay drawn from those would sit over a frame
+    /// that no longer contains them.
+    pub loaded: bool,
+    /// Where each cart index a drag is moving sat when the drag began, in
+    /// the runtime's raw fixed point -- `SetTransform` is absolute, so the
+    /// mirror of a drag is "origin + the delta the document just took".
+    /// Cleared on release.
+    pub drag_origin: Vec<(u32, i32, i32)>,
     pub world_dirty: bool,
     pub layers_dirty: bool,
     pub camera_dirty: bool,
@@ -369,6 +378,8 @@ impl LiveView {
             frame: None,
             rows: Vec::new(),
             index_map: IndexMap::new(0, &[]),
+            loaded: false,
+            drag_origin: Vec::new(),
             world_dirty: false,
             layers_dirty: false,
             camera_dirty: false,
@@ -393,6 +404,11 @@ mod tests {
     fn index_map_puts_direct_entities_first_then_instances_depth_first() {
         let m = IndexMap::new(2, &[3, 1]);
         assert_eq!(m.len(), 6);
+        assert!(!m.is_empty());
+        assert!(
+            IndexMap::new(0, &[]).is_empty(),
+            "a world with nothing in it flattens to no cart indices"
+        );
         assert_eq!(m.selection_of(0), Some(Selection::Entity(0)));
         assert_eq!(m.selection_of(1), Some(Selection::Entity(1)));
         assert_eq!(m.selection_of(2), Some(Selection::Instance(0)));

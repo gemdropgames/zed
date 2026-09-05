@@ -16,6 +16,7 @@ use ggo_common::to_render_image;
 use ggo_worldlib::drag_ops::{self, View};
 use ggo_worldlib::render::{
     AssetLoads, DEVICE_SCREEN_H, DEVICE_SCREEN_W, DrawItem, DrawKind, Loadable, RgbaImage,
+    Selection,
 };
 use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 
@@ -469,6 +470,93 @@ fn paint_device_screen(
     );
 }
 
+// ------------------------------------------------------------- live view
+
+/// Everything the LIVE paint closure needs: the picture the viewer cart
+/// presented, plus the editor overlay drawn over it.
+///
+/// `zoom`/`pan` are the SAME camera the design view uses, and `rows` are in
+/// world pixels, because the cart's camera is set to the world point the
+/// canvas's top-left shows ([`live_frame_bounds`]). Overlay and frame
+/// therefore cannot drift apart: one number moves both.
+pub struct LiveScene {
+    /// The cart's latest presented frame, cloned per render -- the emu
+    /// panel retires frames with `Window::drop_image`, so an `Arc` carried
+    /// from one tick to the next can name an atlas tile that is gone.
+    pub frame: Option<Arc<RenderImage>>,
+    pub zoom: f64,
+    pub pan: [f64; 2],
+    /// One entry per published cart rect: what it selects in the document,
+    /// its world rect, and whether it is in the selection.
+    pub rows: Vec<(Selection, [f64; 4], bool)>,
+    /// An in-flight rubber-band, `[x, y, w, h]` in world px -- the same
+    /// band [`Scene`] draws, because the gesture behind it is the same one.
+    pub marquee: Option<[f64; 4]>,
+    pub grid: bool,
+    pub background: Hsla,
+    pub accent: Hsla,
+}
+
+/// Where the 320x240 device frame lands on the canvas: the camera's world
+/// origin is what the canvas's top-left shows, so the frame starts at the
+/// canvas origin and zoom only scales it.
+pub fn live_frame_bounds(canvas_bounds: Bounds<Pixels>, zoom: f64) -> Bounds<Pixels> {
+    bounds(
+        canvas_bounds.origin,
+        size(
+            px((DEVICE_SCREEN_W * zoom) as f32),
+            px((DEVICE_SCREEN_H * zoom) as f32),
+        ),
+    )
+}
+
+/// How far an unselected row's outline is faded: the cart's own picture is
+/// what the user is reading, so the overlay stays a hint until something
+/// is selected.
+const LIVE_ROW_DIM_ALPHA: f32 = 0.35;
+
+pub fn paint_live(scene: &LiveScene, canvas_bounds: Bounds<Pixels>, window: &mut Window) {
+    window.with_content_mask(
+        Some(ContentMask {
+            bounds: canvas_bounds,
+        }),
+        |window| {
+            window.paint_quad(fill(canvas_bounds, scene.background));
+            if let Some(frame) = &scene.frame {
+                let b = live_frame_bounds(canvas_bounds, scene.zoom);
+                // Nearest, like every other device-resolution image here: a
+                // zoomed device pixel has to stay a square.
+                if let Err(error) =
+                    window.paint_image(b, b, Corners::default(), frame.clone(), 0, false, true)
+                {
+                    log::warn!("GGO: live frame paint failed: {error}");
+                }
+            }
+            let view = View {
+                zoom: scene.zoom,
+                pan_x: scene.pan[0],
+                pan_y: scene.pan[1],
+                dpr: None,
+            };
+            if scene.grid {
+                paint_grid(&view, canvas_bounds, window);
+            }
+            for (_, [x, y, w, h], selected) in &scene.rows {
+                let b = item_bounds(&view, canvas_bounds.origin, *x, *y, *w, *h);
+                let mut color = scene.accent;
+                if !*selected {
+                    color.a *= LIVE_ROW_DIM_ALPHA;
+                }
+                window.paint_quad(outline(b, color, BorderStyle::default()));
+            }
+            if let Some([x, y, w, h]) = scene.marquee {
+                let b = item_bounds(&view, canvas_bounds.origin, x, y, w, h);
+                window.paint_quad(outline(b, color(MARQUEE_COLOR), BorderStyle::default()));
+            }
+        },
+    );
+}
+
 /// Glyph cell of the engine's fixed 8x8 bitmap font, world px -- must
 /// match worldlib's `TEXT_GLYPH_PX`, which sizes the Text item's
 /// (hit-tested) bounding box.
@@ -731,6 +819,21 @@ mod tests {
         // edit of its first row.
         assert_eq!(paint_cell_at([-0.1, 0.0], [0.0, 0.0]), (-1, 0));
         assert_eq!(paint_cell_at([40.0, 40.0], [32.0, 32.0]), (0, 0));
+    }
+
+    #[test]
+    fn live_frame_bounds_scale_the_device_screen_by_zoom() {
+        let b = live_frame_bounds(
+            bounds(point(px(10.), px(20.)), size(px(800.), px(600.))),
+            2.0,
+        );
+        assert_eq!(b.origin, point(px(10.), px(20.)));
+        assert_eq!(b.size, size(px(640.), px(480.)));
+        // The frame is pinned to the canvas origin whatever the pan: the
+        // CART's camera is what moves, so a panned view re-renders rather
+        // than sliding the picture.
+        let b = live_frame_bounds(bounds(point(px(0.), px(0.)), size(px(80.), px(60.))), 0.25);
+        assert_eq!(b.size, size(px(80.), px(60.)));
     }
 
     #[test]
