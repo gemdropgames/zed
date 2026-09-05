@@ -189,8 +189,15 @@ pub fn overlay_rows(
 }
 
 /// The document selection under a world point: the topmost cart rect
-/// there, mapped back through the flattened index map.
+/// there, mapped back through the flattened index map. Nothing until the
+/// cart has republished for the world the panel last sent, for the reason
+/// [`overlay_rows`] draws nothing then: the rows are the PREVIOUS world's
+/// while the index map is already the new one's, so a hit would name the
+/// wrong document item -- and the user cannot even see what they hit.
 pub fn hit(live: &LiveView, counts: DocCounts, world: [f64; 2]) -> Option<Selection> {
+    if !live.loaded() {
+        return None;
+    }
     let index = hit_row(&live.rows, world[0], world[1])?;
     let selection = live.index_map.selection_of(index)?;
     counts.contains(selection).then_some(selection)
@@ -204,6 +211,9 @@ pub fn hits_in_rect(
     start: [f64; 2],
     current: [f64; 2],
 ) -> Vec<Selection> {
+    if !live.loaded() {
+        return Vec::new();
+    }
     let mut hits = Vec::new();
     for index in rows_in_rect(&live.rows, start[0], start[1], current[0], current[1]) {
         if let Some(selection) = live.index_map.selection_of(index)
@@ -219,6 +229,9 @@ pub fn hits_in_rect(
 /// Where every cart index the selection owns sits right now, in the
 /// runtime's raw fixed point -- the anchors a live drag adds its delta to.
 pub fn drag_origins(live: &LiveView, selected: &[Selection]) -> Vec<(u32, i32, i32)> {
+    if !live.loaded() {
+        return Vec::new();
+    }
     selected
         .iter()
         .flat_map(|selection| live.index_map.indices_of(*selection))
@@ -312,6 +325,44 @@ pub struct LayerLoad {
     pub budget: u16,
     pub map_bytes: Vec<u8>,
     pub tileset_stem: String,
+}
+
+/// Which background slots the cart's copy is stale for.
+///
+/// Per slot rather than one flag for the set: a continuous stroke
+/// re-dirties its own slot on every tick, and a single flag rebuilt the
+/// whole four-slot queue each time -- so the queue never got past its
+/// front and only slot 0 ever reached the cart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayerDirty([bool; 4]);
+
+impl LayerDirty {
+    pub fn mark(&mut self, slot: u8) {
+        if let Some(dirty) = self.0.get_mut(usize::from(slot)) {
+            *dirty = true;
+        }
+    }
+
+    /// Every slot: a greeting, a connect, or any change to the merged
+    /// background set, none of which say WHICH slots moved.
+    pub fn mark_all(&mut self) {
+        self.0 = [true; 4];
+    }
+
+    pub fn any(&self) -> bool {
+        self.0.iter().any(|dirty| *dirty)
+    }
+
+    /// The dirty slots in ascending order, clearing them.
+    pub fn take(&mut self) -> Vec<u32> {
+        let taken = std::mem::take(&mut self.0);
+        taken
+            .iter()
+            .enumerate()
+            .filter(|(_, dirty)| **dirty)
+            .filter_map(|(slot, _)| u32::try_from(slot).ok())
+            .collect()
+    }
 }
 
 /// Every slot's load for the merged background set, slot 0 first.
@@ -431,6 +482,11 @@ pub const BUILD_DEADLINE: Duration = Duration::from_secs(120);
 /// How long a connected cart may go without framing before the host
 /// re-greets it, and again before the session is failed (cart clock).
 pub const STALE_AFTER: Duration = Duration::from_secs(2);
+/// How long a world the encoder refused waits before the SAME document is
+/// tried again (cart clock). A changed document retries at once; this is
+/// only the backstop for a failure that came from outside the document (an
+/// instanced world file being rewritten under the panel).
+pub const ENCODE_RETRY: Duration = Duration::from_secs(1);
 
 fn cart_clock(endpoint: &ggo_common::LinkEndpoint, epoch: Instant) -> Instant {
     epoch + FRAME_TIME * endpoint.frame_number().unwrap_or(0)
@@ -509,11 +565,18 @@ pub struct LiveView {
     /// [`Self::drag_origin`].
     pub pending_transforms: Vec<(u32, i32, i32)>,
     pub world_dirty: bool,
-    pub layers_dirty: bool,
+    /// The document generation whose encode last failed, and the cart-clock
+    /// instant that generation may be tried again at. Encoding walks every
+    /// instanced world file on the UI thread, and the poll wakes on every
+    /// cart frame, so a document the encoder keeps refusing must not be
+    /// re-encoded per tick. Cleared by a successful send and by a greeting.
+    pub world_retry_at: Option<(u64, Instant)>,
+    pub layers_dirty: LayerDirty,
     pub camera_dirty: bool,
-    /// Slots still to push for the current `layers_dirty` cycle. One goes
-    /// out per tick: the cart's APP receive queue is four datagrams deep,
-    /// and a blob transfer already fills it.
+    /// Slots still to push, ascending, one per tick: the cart's APP
+    /// receive queue is four datagrams deep, and a blob transfer already
+    /// fills it. A slot re-dirtied while this queue is draining is re-read
+    /// and moved to the BACK rather than restarting the cycle.
     pub layer_queue: VecDeque<LayerLoad>,
     /// Which of the cart's own systems are enabled, one bit per entry of
     /// [`LinkMailbox::system_names`]. The mailbox re-applies this after
@@ -544,7 +607,8 @@ impl LiveView {
             drag_origin: Vec::new(),
             pending_transforms: Vec::new(),
             world_dirty: false,
-            layers_dirty: false,
+            world_retry_at: None,
+            layers_dirty: LayerDirty::default(),
             camera_dirty: false,
             layer_queue: VecDeque::new(),
             // Editor systems only: a viewer that ran the cart's gameplay
@@ -860,6 +924,29 @@ mod tests {
         assert!(b[1].is_none());
         assert_eq!(b[2].map(|b| (b.base, b.budget)), Some((759, 248)));
         assert!(banks(&[false; 4]).iter().all(|b| b.is_none()));
+    }
+
+    #[test]
+    fn layer_dirty_marks_one_slot_and_hands_the_set_back_ascending() {
+        let mut dirty = LayerDirty::default();
+        assert!(!dirty.any());
+        assert!(dirty.take().is_empty());
+
+        dirty.mark(2);
+        dirty.mark(0);
+        assert!(dirty.any());
+        assert_eq!(
+            dirty.take(),
+            [0, 2],
+            "ascending, whatever order they came in"
+        );
+        assert!(!dirty.any(), "taking them clears them");
+
+        dirty.mark(9);
+        assert!(!dirty.any(), "there are four slots, and nothing past them");
+
+        dirty.mark_all();
+        assert_eq!(dirty.take(), [0, 1, 2, 3]);
     }
 
     #[test]

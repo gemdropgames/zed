@@ -755,6 +755,10 @@ struct OpenWorld {
     /// Why Live mode is not showing, on the toolbar next to `save_error`.
     /// Set on every fallback to Design, cleared when a session starts.
     live_error: Option<String>,
+    /// Bumped by every [`Self::note_doc_changed`]. Read only by the live
+    /// session's failed-encode backoff, which has to tell "the same world
+    /// the encoder already refused" from "a world that has moved since".
+    doc_generation: u64,
 }
 
 /// What an Asset field's row shows -- see [`WorldPanel::asset_field_view`].
@@ -855,6 +859,7 @@ impl OpenWorld {
             counted_instances: loaded_instance_stems,
             _instance_counts_task: None,
             live_error: None,
+            doc_generation: 0,
         }
     }
 }
@@ -1130,7 +1135,17 @@ fn layout_camera(
 #[derive(Default)]
 struct LiveStep {
     changed: bool,
-    failure: Option<String>,
+    failure: Option<LiveFailure>,
+}
+
+/// Why a session must fall back to the design view.
+struct LiveFailure {
+    reason: String,
+    /// The cart itself reported [`ggo_common::ViewerState::Stopped`]: the
+    /// run is already over, so there is nothing left to ask to end.
+    /// Everything else leaves a cart RUNNING that this fallback has to
+    /// stop, because nothing will be polling it.
+    cart_stopped: bool,
 }
 
 /// A transport failure on the link: the port or the emulator is gone, not
@@ -1220,6 +1235,7 @@ impl OpenWorld {
     /// trying to describe the edit: the encoder is the only thing that
     /// knows the flattened order the cart indexes in.
     fn note_doc_changed(&mut self) {
+        self.doc_generation = self.doc_generation.wrapping_add(1);
         if let Some(live) = self.live.as_mut() {
             live.world_dirty = true;
         }
@@ -1255,7 +1271,10 @@ impl OpenWorld {
         let frame_before = live.frame.as_ref().map(|(number, _)| *number);
         let failed = |reason: String| LiveStep {
             changed: true,
-            failure: Some(reason),
+            failure: Some(LiveFailure {
+                reason,
+                cart_stopped: false,
+            }),
         };
         let now = live.cart_now();
         match live.endpoint.state() {
@@ -1266,7 +1285,15 @@ impl OpenWorld {
                     LiveStep::default()
                 };
             }
-            ggo_common::ViewerState::Stopped(reason) => return failed(reason),
+            ggo_common::ViewerState::Stopped(reason) => {
+                return LiveStep {
+                    changed: true,
+                    failure: Some(LiveFailure {
+                        reason,
+                        cart_stopped: true,
+                    }),
+                };
+            }
             ggo_common::ViewerState::Running => {}
         }
         if matches!(live.status, LiveStatus::Building) {
@@ -1298,8 +1325,9 @@ impl OpenWorld {
                 // though the re-send has not landed, or never left because
                 // the same tick's encode failed.
                 live.world_dirty = true;
+                live.world_retry_at = None;
                 live.world_sync = live::WorldSync::Sending;
-                live.layers_dirty = true;
+                live.layers_dirty.mark_all();
                 live.camera_dirty = true;
             }
             // `is_connected` never goes false on its own; a cart that was
@@ -1346,47 +1374,78 @@ impl OpenWorld {
         // cart's APP receive queue is four datagrams deep and a transfer
         // already fills it.
         if live.status == LiveStatus::Connected && !live.mailbox.busy() {
+            // A world the panel already failed to push is not re-attempted
+            // until the document moves or [`live::ENCODE_RETRY`] of cart
+            // time passes: `world_dirty` alone re-encodes -- which walks
+            // every instanced world file -- on every frame the cart draws.
+            // The layer and camera pushes are not held up by it; they do
+            // not go through the encoder.
+            let world_ready = live.world_dirty
+                && match live.world_retry_at {
+                    None => true,
+                    Some((generation, retry_at)) => {
+                        generation != self.doc_generation || now >= retry_at
+                    }
+                };
             // Whether this tick had something to push at all: a tick that
             // sends nothing must neither set nor clear the status row.
-            let acted = live.world_dirty
-                || live.layers_dirty
+            let acted = world_ready
+                || live.layers_dirty.any()
                 || !live.layer_queue.is_empty()
                 || live.camera_dirty;
+            // A layer or camera push that worked must not take a world
+            // failure off the status row while that world is still unsent.
+            let world_held_back = live.world_dirty && !world_ready;
             let mut live_error = None;
-            if live.world_dirty {
-                match live::encode_world(&self.store, &self.root) {
+            if world_ready {
+                // follow-up: this encode is on the UI thread; it belongs on
+                // a background task with the blob applied on a later tick.
+                let pushed = live::encode_world(&self.store, &self.root).and_then(|blob| {
+                    live.mailbox.load_world(&blob)?;
+                    Ok(())
+                });
+                match pushed {
                     // A world the encoder rejects is a document problem,
                     // not a link problem: say so on the status row and stay
                     // live on whatever the cart already has. `world_dirty`
-                    // STAYS set, so the next tick retries -- clearing it
-                    // here would leave the session showing a world it
-                    // silently failed to send, with nothing to re-arm it.
-                    // The retry is once per tick, which is the poll's own
-                    // cadence, not a spin.
-                    Err(error) => live_error = Some(format!("live update: {error}")),
-                    Ok(blob) => match live.mailbox.load_world(&blob) {
-                        Err(error) => live_error = Some(format!("live update: {error}")),
-                        Ok(()) => {
-                            live.world_dirty = false;
-                            // The rows the cart has published are the
-                            // PREVIOUS world's until it republishes.
-                            live.world_sync = live::WorldSync::Sending;
-                            live.index_map = live::IndexMap::new(
-                                self.store.state().entities.len(),
-                                &self.instance_counts,
-                            );
-                        }
-                    },
+                    // STAYS set, so the edit that fixes the document sends
+                    // it -- clearing it here would leave the session
+                    // showing a world it silently failed to send, with
+                    // nothing to re-arm it.
+                    Err(error) => {
+                        live_error = Some(format!("live update: {error}"));
+                        live.world_retry_at = Some((
+                            self.doc_generation,
+                            now.checked_add(live::ENCODE_RETRY).unwrap_or(now),
+                        ));
+                    }
+                    Ok(()) => {
+                        live.world_dirty = false;
+                        live.world_retry_at = None;
+                        // The rows the cart has published are the PREVIOUS
+                        // world's until it republishes.
+                        live.world_sync = live::WorldSync::Sending;
+                        live.index_map = live::IndexMap::new(
+                            self.store.state().entities.len(),
+                            &self.instance_counts,
+                        );
+                    }
                 }
-            } else if live.layers_dirty || !live.layer_queue.is_empty() {
-                // `layers_dirty` means "the document's layers moved since
-                // this queue was built", so re-dirtying mid-cycle REPLACES
-                // the rest of a now-stale snapshot instead of being
-                // swallowed by it. The queue, not the flag, is what says a
-                // cycle is still running.
-                if live.layers_dirty {
-                    live.layer_queue = live::layer_loads(&self.root, &self.merged);
-                    live.layers_dirty = false;
+            } else if live.layers_dirty.any() || !live.layer_queue.is_empty() {
+                // A dirty slot's payload is re-read and moved to the BACK
+                // of whatever is still queued. Re-queueing only the dirty
+                // slots is what lets a continuous stroke -- which
+                // re-dirties its own slot every tick -- get past the front
+                // of the queue at all; dropping the slot's stale copy
+                // first is what keeps the bytes that do go out the ones on
+                // disk now.
+                if live.layers_dirty.any() {
+                    let dirty = live.layers_dirty.take();
+                    let loads = live::layer_loads(&self.root, &self.merged);
+                    live.layer_queue
+                        .retain(|queued| !dirty.contains(&queued.layer));
+                    live.layer_queue
+                        .extend(loads.into_iter().filter(|load| dirty.contains(&load.layer)));
                 }
                 if let Some(load) = live.layer_queue.pop_front()
                     && let Err(error) = live.mailbox.load_layer(
@@ -1408,7 +1467,8 @@ impl OpenWorld {
             }
             // Assigned even when it is `None`: a push that succeeded after
             // an earlier failure has to take the message off the toolbar.
-            if acted && live_error != self.live_error {
+            let keep_error = world_held_back && live_error.is_none();
+            if acted && !keep_error && live_error != self.live_error {
                 self.live_error = live_error;
                 changed = true;
             }
@@ -2069,7 +2129,7 @@ impl WorldPanel {
         open.merged = loader::merged_backgrounds(&open.store.state(), &open.instance_backgrounds);
         loader::fill_missing_background_loads(&open.root, &open.merged, &mut open.map_loads);
         if let Some(live) = open.live.as_mut() {
-            live.layers_dirty = true;
+            live.layers_dirty.mark_all();
         }
         Self::replace_images(open, &mut self.retired_images);
         cx.notify();
@@ -2327,10 +2387,10 @@ impl WorldPanel {
         // Only a BACKGROUND slot is something the cart holds as a layer; a
         // `Tilemap` entity's map rides along with the world blob.
         if painted
-            && matches!(open.mode, EditMode::Paint(PaintTarget::BgSlot(_)))
+            && let EditMode::Paint(PaintTarget::BgSlot(slot)) = open.mode
             && let Some(live) = open.live.as_mut()
         {
-            live.layers_dirty = true;
+            live.layers_dirty.mark(slot);
         }
         if painted {
             self.refresh_paint_image(&rel, cx);
@@ -2957,6 +3017,7 @@ impl WorldPanel {
             }
             Err(e) => Some(e.to_string()),
         };
+        let mut written: Vec<String> = Vec::new();
         for session in open.sessions.values_mut() {
             // Clean sessions are skipped rather than rewritten: an
             // untouched `.map` has nothing to write, and touching it would
@@ -2964,11 +3025,38 @@ impl WorldPanel {
             if !session.dirty() {
                 continue;
             }
-            if let Err(e) = session.save()
-                && error.is_none()
-            {
-                error = Some(e);
+            match session.save() {
+                Ok(()) => written.push(session.rel_path.clone()),
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e);
+                    }
+                }
             }
+        }
+        // A live session reads its layer payloads from DISK, and a paint
+        // session holds its cells in memory until it is saved -- so the
+        // write is the first moment a stroke can reach the cart, and
+        // nothing else re-arms the slots it touched.
+        if !written.is_empty() {
+            let slots: Vec<u8> = open
+                .merged
+                .iter()
+                .filter(|background| {
+                    written
+                        .iter()
+                        .any(|rel| *rel == format!("{}.map", background.stem))
+                })
+                .map(|background| background.layer)
+                .collect();
+            if let Some(live) = open.live.as_mut() {
+                for slot in slots {
+                    live.layers_dirty.mark(slot);
+                }
+            }
+            // A `Tilemap` ENTITY's map is not a cart layer: it rides the
+            // world blob, so its save is a document change.
+            open.note_doc_changed();
         }
         open.save_error = error;
         cx.notify();
@@ -4166,8 +4254,8 @@ impl WorldPanel {
             cx.notify();
         }
         match step.failure {
-            Some(reason) => {
-                self.fall_back_to_design(reason, cx);
+            Some(failure) => {
+                self.fall_back_to_design_from(failure, cx);
                 false
             }
             None => true,
@@ -4178,12 +4266,36 @@ impl WorldPanel {
     /// there is one) is kept in [`LiveStatus::Failed`] so the toolbar can
     /// name the failure; it stops being polled.
     fn fall_back_to_design(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.fall_back_to_design_from(
+            LiveFailure {
+                reason,
+                cart_stopped: false,
+            },
+            cx,
+        );
+    }
+
+    fn fall_back_to_design_from(&mut self, failure: LiveFailure, cx: &mut Context<Self>) {
+        let LiveFailure {
+            reason,
+            cart_stopped,
+        } = failure;
         log::warn!("GGO: live world view fell back to the design view: {reason}");
         self.canvas_mode = CanvasMode::Design;
+        // `Failed` is terminal, so nothing polls this cart again -- and
+        // `enter_live`'s Retry would hand the session straight back to the
+        // one that just failed. Ending the run is what makes Retry boot a
+        // fresh cart. A cart that reported `Stopped` is already over.
+        if !cart_stopped {
+            self.stop_live_endpoint();
+        }
         if let ViewerState::Ready(open) = &mut self.state {
             open.live_error = Some(reason.clone());
             if let Some(live) = &mut open.live {
                 live.status = LiveStatus::Failed(reason);
+                // The emu panel calls `drop_image` on every frame it
+                // retires, and a run that is ending retires its last one.
+                live.frame = None;
             }
         }
         cx.notify();
@@ -4226,8 +4338,13 @@ impl WorldPanel {
             live.sys_mask & !bit
         };
         live.sys_mask = mask;
-        if let Err(error) = live.mailbox.set_sys_mask(mask) {
+        let sent = live.mailbox.set_sys_mask(mask);
+        if let Err(error) = sent {
+            // The rail's own toggle draws from `sys_mask`, so a push that
+            // never left would otherwise show the system as switched with
+            // the cart still running it.
             log::warn!("GGO: live system mask: {error}");
+            open.live_error = Some(format!("live update: {error}"));
         }
         self.live_sys_mask = mask;
         cx.notify();
@@ -12914,6 +13031,41 @@ mod tests {
         (panel, endpoint, cx)
     }
 
+    /// The bytes of the LAST layer-`layer` blob in `sent`, reassembled
+    /// from its chunks. Placed by `off` rather than appended, so a
+    /// go-back-N retransmission overwrites its own range instead of
+    /// lengthening the payload.
+    fn layer_blob(sent: &[Vec<u8>], layer: u8) -> Option<Vec<u8>> {
+        use emerald_editor_runtime::wire::{self, BlobKind, HostMsg};
+
+        let begin = sent.iter().rposition(|message| {
+            matches!(
+                wire::decode_host(message),
+                Some(HostMsg::BlobBegin {
+                    kind: BlobKind::Layer,
+                    layer: sent_layer,
+                    ..
+                }) if sent_layer == layer
+            )
+        })?;
+        let HostMsg::BlobBegin { len, .. } = wire::decode_host(&sent[begin])? else {
+            return None;
+        };
+        let mut out = vec![0u8; usize::try_from(len).ok()?];
+        for message in &sent[begin + 1..] {
+            match wire::decode_host(message) {
+                Some(HostMsg::BlobChunk { off, data, .. }) => {
+                    let off = usize::try_from(off).ok()?;
+                    out.get_mut(off..off.checked_add(data.len())?)?
+                        .copy_from_slice(data);
+                }
+                Some(HostMsg::BlobEnd { .. }) => break,
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+
     /// `0x82 Ack`: `seq u16`.
     fn blob_ack(seq: u16) -> Vec<u8> {
         let mut out = vec![0x82];
@@ -12942,6 +13094,13 @@ mod tests {
 
     fn live_of(panel: &WorldPanel) -> &LiveView {
         open_of(panel).live.as_ref().expect("a live session")
+    }
+
+    fn live_mut_of(panel: &mut WorldPanel) -> &mut LiveView {
+        let ViewerState::Ready(open) = &mut panel.state else {
+            panic!("expected Ready");
+        };
+        open.live.as_mut().expect("a live session")
     }
 
     /// What the Live canvas would outline right now.
@@ -13000,7 +13159,7 @@ mod tests {
             let pending = panel.read_with(cx, |panel, _| {
                 let live = live_of(panel);
                 live.world_dirty
-                    || live.layers_dirty
+                    || live.layers_dirty.any()
                     || !live.layer_queue.is_empty()
                     || live.camera_dirty
                     || live.mailbox.busy()
@@ -13226,6 +13385,50 @@ mod tests {
                 open_of(panel).live_error
             );
         });
+    }
+
+    /// A fallback for anything but "the cart stopped" leaves a cart
+    /// RUNNING with nothing polling it -- and Retry would boot nothing,
+    /// because the panel would still be holding that doomed endpoint as
+    /// reusable. So a non-`Stopped` failure ends the run.
+    #[gpui::test]
+    async fn a_non_stopped_fallback_ends_the_viewer_run(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(&endpoint, hello_ack(0, &[]));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert!(
+                panel.live_endpoint.is_none(),
+                "the panel let go of the cart it booted"
+            );
+            assert!(
+                live_of(panel).frame.is_none(),
+                "and dropped the frame, whose tile the emu panel may have retired"
+            );
+        });
+        assert!(endpoint.stop_requested(), "and asked the run to end");
+    }
+
+    /// The cart reporting `Stopped` IS the run ending: there is nothing
+    /// left to ask, and the endpoint stays put for `enter_live` to judge
+    /// un-reusable and replace.
+    #[gpui::test]
+    async fn a_stopped_cart_is_not_asked_to_stop_again(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Stopped("gone".into()));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+        });
+        assert!(
+            !endpoint.stop_requested(),
+            "a run that is already over is not asked to end"
+        );
     }
 
     /// The poll loop stops with the fallback: a failed session must not
@@ -13609,6 +13812,84 @@ mod tests {
         });
     }
 
+    /// The overlay already refuses to draw rows from the PREVIOUS world
+    /// while a blob is in flight, but the hit tests read the same rows.
+    /// The index map is rebuilt with the blob, so a click on invisible
+    /// geometry would map an old row through the new map and select --
+    /// or drag -- the wrong document item. A click there has to fall
+    /// through to Design's own empty-space behaviour instead.
+    #[gpui::test]
+    async fn live_hit_tests_are_dead_until_the_cart_has_the_world(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_rows(
+            &endpoint,
+            &[
+                (0, 4.0, 4.0),
+                (1, 40.0, 8.0),
+                (2, 0.0, 0.0),
+                (3, 32.0, 16.0),
+            ],
+        );
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), false, cx)
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(1)]);
+        });
+        panel.update_in(cx, |panel, _, cx| panel.canvas_primary_up(cx));
+
+        // A structural edit puts a blob on the wire: the rows still on
+        // screen belong to the world the cart is about to drop.
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!live_of(panel).loaded(), "a blob is in flight");
+        });
+
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), false, cx)
+        });
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            assert!(
+                open.selected.is_empty(),
+                "the click hit nothing: {:?}",
+                open.selected
+            );
+            assert!(open.edit_drag.is_none(), "and armed no drag");
+            assert!(
+                live_of(panel).drag_origin.is_empty(),
+                "so the cart has no rows to move either"
+            );
+            assert!(open.marquee.is_some(), "it fell through to a band");
+        });
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_drag_to(live_screen_of(panel, [0.0, 0.0]), cx)
+        });
+        panel.update_in(cx, |panel, _, cx| panel.canvas_primary_up(cx));
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                open_of(panel).selected.is_empty(),
+                "and the band over those rows selects nothing either"
+            );
+        });
+
+        // The cart republishes for the world it was just given, and the
+        // rows mean something again.
+        settle_live(&panel, &endpoint, cx);
+        cart_rows(&endpoint, &[(0, 4.0, 4.0), (1, 40.0, 8.0)]);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert!(live_of(panel).loaded()));
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), false, cx)
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(1)]);
+        });
+    }
+
     /// A band in Live settles over the cart's rects, mapped back the same
     /// way a click is.
     #[gpui::test]
@@ -13948,7 +14229,10 @@ mod tests {
             panel.canvas_primary_up(cx);
         });
         panel.read_with(cx, |panel, _| {
-            assert!(live_of(panel).layers_dirty, "the stroke marked the slots");
+            assert!(
+                live_of(panel).layers_dirty.any(),
+                "the stroke marked the slot"
+            );
         });
         endpoint.tick();
         cx.run_until_parked();
@@ -13961,11 +14245,53 @@ mod tests {
         );
     }
 
-    /// The slot cycle runs one layer per tick, and a document whose layers
-    /// move again mid-cycle REPLACES the rest of the stale queue instead of
-    /// queueing a second pass behind it.
+    /// The layer payloads are read from DISK, and a `PaintSession` holds
+    /// its cells in memory until it is saved -- so the save is what makes
+    /// the stroke's bytes reachable, and it has to re-arm the slot itself.
+    /// Without that the stroke only ever reached the cart if some LATER
+    /// paint happened to re-dirty the slot.
     #[gpui::test]
-    async fn layers_re_dirtied_during_a_slot_cycle_replace_the_stale_queue(
+    async fn saving_a_painted_map_ships_the_painted_cells_to_the_cart(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        // Everything the stroke itself pushed, so what is asserted below
+        // is what the SAVE sent.
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        let sent = settle_live(&panel, &endpoint, cx);
+
+        let saved = io::open_map(dir.path(), "maps/test.bg0.map").expect("the painted map saved");
+        assert_ne!(
+            saved.cells.first().copied(),
+            Some(live::BLANK_TILE),
+            "the stroke must actually have painted a tile"
+        );
+        assert_eq!(
+            layer_blob(&sent, 0),
+            Some(live::layer_bytes(saved.w, saved.h, &saved.cells)),
+            "the save's layer blob carries the painted cells, not the pre-stroke map"
+        );
+    }
+
+    /// The slot cycle runs one layer per tick, and dirtiness is PER SLOT:
+    /// a slot re-dirtied while the queue is draining is re-read from disk
+    /// and moved to the back, while the slots ahead of it keep their
+    /// place. A single flag rebuilt the whole queue instead, so a
+    /// continuous stroke -- which re-dirties every tick -- never got past
+    /// the queue's front and only ever shipped slot 0.
+    #[gpui::test]
+    async fn a_re_dirtied_slot_moves_to_the_back_without_restarting_the_cycle(
         cx: &mut TestAppContext,
     ) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
@@ -13981,17 +14307,17 @@ mod tests {
             let live = live_of(panel);
             assert_eq!(live.layer_queue.len(), 3, "one slot went out, three wait");
             assert!(
-                !live.layers_dirty,
-                "the flag is spent on the queue it built"
+                !live.layers_dirty.any(),
+                "the flags are spent on the queue they built"
             );
         });
 
-        panel.update(cx, |panel, cx| panel.refresh_backgrounds(cx));
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).layers_dirty.mark(2);
+        });
         panel.read_with(cx, |panel, _| {
-            let live = live_of(panel);
-            assert!(live.layers_dirty);
             assert_eq!(
-                live.layer_queue.len(),
+                live_of(panel).layer_queue.len(),
                 3,
                 "the queue is only rebuilt when a slot can actually go out"
             );
@@ -14005,8 +14331,45 @@ mod tests {
             .collect();
         assert_eq!(
             layers,
-            [0, 0, 1, 2, 3],
-            "the re-dirty starts the cycle over rather than appending to it"
+            [0, 1, 3, 2],
+            "only slot 2 was re-read; 1 and 3 kept their place and 0 was not re-sent"
+        );
+    }
+
+    /// The stroke case the per-slot flags exist for: a slot that is not 0
+    /// has to reach the cart while the stroke is still in flight, which a
+    /// whole-queue rebuild per tick never let happen.
+    #[gpui::test]
+    async fn painting_slot_two_mid_stroke_ships_slot_two(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(2, "tiles/bg.til".into(), cx)
+        });
+        cx.run_until_parked();
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(2), cx);
+        });
+        cx.run_until_parked();
+        // Pressed and NOT released: the stroke is still in flight.
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+
+        let layers: Vec<u8> = host_sent(&endpoint)
+            .iter()
+            .filter(|message| message.first() == Some(&0x08) && message.get(1) == Some(&1))
+            .filter_map(|message| message.get(6).copied())
+            .collect();
+        assert_eq!(
+            layers,
+            [2],
+            "the painted slot goes out, and the three clean ones stay off the wire"
         );
     }
 
@@ -14253,6 +14616,9 @@ mod tests {
         });
 
         std::fs::write(&sub, saved).unwrap();
+        // The retry is armed by the document moving, not by the tick --
+        // see `a_failed_encode_is_not_re_attempted_every_tick`.
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
         endpoint.tick();
         cx.run_until_parked();
         assert!(
@@ -14264,6 +14630,136 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert!(!live_of(panel).world_dirty);
             assert_eq!(open_of(panel).live_error, None, "and the row clears");
+        });
+    }
+
+    /// Each attempt re-reads every instanced world file on the UI thread,
+    /// and the poll wakes on every cart frame -- so a document the encoder
+    /// keeps refusing must not be re-encoded per tick. An edit is what
+    /// re-arms it, immediately.
+    #[gpui::test]
+    async fn a_failed_encode_is_not_re_attempted_every_tick(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        // The open document instances `worlds/sub`; the encoder reads it
+        // to flatten the world, so removing it makes every encode fail.
+        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                open_of(panel)
+                    .live_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("live update"),
+                "the first attempt ran and failed"
+            );
+        });
+
+        // A push that does not go through the encoder still runs -- and
+        // must not take the unsent world's failure off the row.
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).camera_dirty = true;
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                open_of(panel)
+                    .live_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("live update"),
+                "the camera push does not clear a world that is still owed: {:?}",
+                open_of(panel).live_error
+            );
+        });
+
+        // Clearing the row is what makes a further attempt visible: one
+        // that ran would fail the same way and put the message straight
+        // back.
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.live_error = None;
+        });
+        for _ in 0..3 {
+            endpoint.tick();
+            cx.run_until_parked();
+        }
+        let sent = host_sent(&endpoint);
+        assert!(
+            sent.iter().all(|message| message.first() != Some(&0x08)),
+            "nothing went out: {sent:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).live_error,
+                None,
+                "three ticks, and the encode was not attempted again"
+            );
+            assert!(live_of(panel).world_dirty, "the re-send is still owed");
+        });
+
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                open_of(panel)
+                    .live_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("live update"),
+                "an edit retries on the very next tick"
+            );
+        });
+    }
+
+    /// The backoff's other end: a failure the DOCUMENT cannot fix (an
+    /// instanced world file being rewritten under the panel) still has to
+    /// be retried, so the same generation is tried again once
+    /// [`live::ENCODE_RETRY`] of cart time has passed.
+    #[gpui::test]
+    async fn a_failed_encode_retries_the_same_document_once_the_backoff_expires(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            let live = live_mut_of(panel);
+            let (generation, retry_at) = live.world_retry_at.expect("the failure was recorded");
+            assert!(retry_at > live.cart_now(), "and it is not due yet");
+            // The cart clock only moves when the emulator publishes a
+            // frame, which a headless test never does -- so the deadline
+            // is brought to it.
+            live.world_retry_at = Some((generation, live.cart_now()));
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.live_error = None;
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                open_of(panel)
+                    .live_error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("live update"),
+                "the expired backoff re-attempted the unchanged document: {:?}",
+                open_of(panel).live_error
+            );
         });
     }
 
@@ -14379,6 +14875,9 @@ mod tests {
             )
         });
         cx.run_until_parked();
+        // The edit put a blob on the wire, and the Live hit tests are dead
+        // until the cart has republished for it.
+        settle_live(&panel, &endpoint, cx);
         // Entity 0 is authored at (4, 4) but the cart draws it at
         // (100, 60).
         cart_rows(&endpoint, &[(0, 100.0, 60.0), (1, 40.0, 8.0)]);

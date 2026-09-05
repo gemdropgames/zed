@@ -6233,6 +6233,27 @@ mod tests {
         (runner, calls)
     }
 
+    /// Whether `request` is the EMULATE build (`emd pack-ggo`). A world
+    /// panel in Live mode boots its viewer cart (`emd editor-cart --ggo`)
+    /// through this same runner, so "was anything built?" has to name
+    /// which build it means.
+    fn is_pack_ggo(request: &ggo_common::ProcRequest) -> bool {
+        request.args.first().map(String::as_str) == Some("pack-ggo")
+    }
+
+    /// Every `emd pack-ggo` invocation recorded so far.
+    fn pack_ggo_calls(
+        calls: &Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>>,
+    ) -> Vec<ggo_common::ProcRequest> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| is_pack_ggo(request))
+            .cloned()
+            .collect()
+    }
+
     fn ok_capture() -> ggo_common::ProcCapture {
         ggo_common::ProcCapture {
             ok: true,
@@ -7831,7 +7852,7 @@ mod tests {
         std::fs::set_permissions(&worlds_dir, restore).unwrap();
 
         assert!(
-            calls.lock().unwrap().is_empty(),
+            pack_ggo_calls(&calls).is_empty(),
             "NOTHING may be built from a world whose edits are not on disk"
         );
         panel.update(cx, |panel, _cx| {
@@ -7860,8 +7881,13 @@ mod tests {
         let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let recorder = seen.clone();
         let world_path_for_runner = world_path.clone();
-        let (runner, calls) = fake_proc_runner(move |_request| {
-            *recorder.lock().unwrap() = std::fs::read_to_string(&world_path_for_runner).ok();
+        let (runner, calls) = fake_proc_runner(move |request| {
+            // Only the EMULATE build's view of the file is the ordering
+            // this test is about; the world panel's Live viewer build runs
+            // through the same runner.
+            if is_pack_ggo(request) {
+                *recorder.lock().unwrap() = std::fs::read_to_string(&world_path_for_runner).ok();
+            }
             ok_capture()
         });
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
@@ -7874,7 +7900,11 @@ mod tests {
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
-        assert_eq!(calls.lock().unwrap().len(), 1, "the build ran");
+        assert_eq!(
+            pack_ggo_calls(&calls).len(),
+            1,
+            "the build ran, exactly once"
+        );
         let on_disk = seen
             .lock()
             .unwrap()
