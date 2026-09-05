@@ -31,6 +31,15 @@
 - `proto_version_mismatch() == Some(v)` with `is_connected() == false` is the "viewer cart predates the link protocol, rebuild" state.
 - Emulator link is lossless and delivers a cart frame's whole output in one `take_comm()`; hardware splits it across reads — the host handles both (schema re-greet is time-gated).
 
+## Notes from the Phase 2 final review (binding for this phase)
+
+- `poll(now)` clock: `now = epoch + FRAME_TIME * frame_number`, with `frame_number` from `LinkEndpoint::frame_number()` (added by the Phase 2 fix wave) — monotonic, emulator-derived, frozen while paused. It can jump (the UI misses frames); fine against the 100 ms `ACK_TIMEOUT`.
+- Do not drive the poll loop from `ticks()` alone: ticks stop while paused/between runs and `set_state` also ticks. Race `ticks().recv()` against a timer (250 ms) and treat `Building` with a deadline (`CONNECT_DEADLINE`).
+- Send through `LinkEndpoint::send_app(payload)` (framing lives in `ggo_common`), not a local `encode_payload`.
+- The cart's APP RX queue holds 4 datagrams per frame and the emulator models no FIFO: coalesce single-datagram commands per tick (one `SetTransform` per drag frame, one `Camera` per tick); blobs are windowed by `LinkMailbox`.
+- Leaving Live must end the viewer run: call `LinkEndpoint::request_stop()` (Phase 2 fix wave) and expect `Stopped("stopped by the world panel")`.
+- `boot_viewer` no longer activates the emulator tab; the world panel keeps focus. `frame` may be `None` while `Stopped`.
+
 ## File structure
 
 | Path | Responsibility |
