@@ -308,7 +308,15 @@ fn open_emu_item_quietly(
             // is the only one that does not, and `Workspace::add_item`
             // hard-codes it true. So the pane is addressed directly.
             workspace.active_pane().update(cx, |pane, cx| {
-                pane.add_item_inner(Box::new(item.clone()), false, false, false, None, window, cx)
+                pane.add_item_inner(
+                    Box::new(item.clone()),
+                    false,
+                    false,
+                    false,
+                    None,
+                    window,
+                    cx,
+                )
             });
             item
         }
@@ -718,9 +726,6 @@ fn watch_triggers(rel: &str, change: &project::PathChange, viewer: bool) -> bool
     !(viewer && travels_over_the_link(rel))
 }
 
-/// A document the world view sends to a running viewer cart itself: a
-/// world `.toml` under a `worlds/` directory, or a `.map` under a `maps/`
-/// one, at any depth.
 /// What [`EmuPanel::on_frame`] tells its pump task to do next. A bare
 /// `bool` would not say which way round it reads at the call site.
 #[derive(Debug, PartialEq)]
@@ -742,6 +747,9 @@ fn take_link_frame(endpoint: &ggo_common::LinkEndpoint) -> Option<Arc<RenderImag
         .map(|(_number, image)| image)
 }
 
+/// A document the world view sends to a running viewer cart itself: a
+/// world `.toml` under a `worlds/` directory, or a `.map` under a `maps/`
+/// one, at any depth.
 fn travels_over_the_link(rel: &str) -> bool {
     let mut components = rel.split('/').rev();
     let Some(name) = components.next() else {
@@ -1868,10 +1876,8 @@ impl EmuPanel {
                     Ok(FramePumped::StopRequested) => {
                         window_handle
                             .update(cx, |_root, window, cx| {
-                                this.update(cx, |this, cx| {
-                                    this.stop_for_world_panel(window, cx)
-                                })
-                                .ok();
+                                this.update(cx, |this, cx| this.stop_for_world_panel(window, cx))
+                                    .ok();
                             })
                             .ok();
                         return;
