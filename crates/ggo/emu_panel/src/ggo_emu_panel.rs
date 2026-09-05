@@ -74,6 +74,18 @@
 //! Frame N-2 is dropped, N-1 is retained. [`EmuPanel::release_atlas_all`]
 //! covers the two teardown paths (Stop, and panel release) where no
 //! further render will come.
+//!
+//! A viewer run publishes a THIRD reference to the same images: the world
+//! view's [`ggo_common::LinkEndpoint::frame`] slot, whose contract makes
+//! the publisher (this pane) the owner. So every teardown that abandons
+//! the endpoint -- `release_atlas_all`, the panel's `on_release`, and the
+//! branch of [`EmuPanel::run`] where a plain run takes the pane back --
+//! empties that slot with [`EmuPanel::take_published_frame`] and retires
+//! what it held, alongside the one-publish lag in
+//! [`EmuPanel::previously_published`]. Leaving the slot populated would
+//! be worse than a leak: the tile it names has just been handed back to
+//! the allocator, and the world view would go on sampling it. The world
+//! view therefore has to tolerate an empty slot at any time.
 
 pub mod audio;
 mod debug;
@@ -660,6 +672,18 @@ fn watch_triggers(rel: &str, change: &project::PathChange, viewer: bool) -> bool
 /// A document the world view sends to a running viewer cart itself: a
 /// world `.toml` under a `worlds/` directory, or a `.map` under a `maps/`
 /// one, at any depth.
+/// Take the image out of `endpoint`'s frame slot. Split out from
+/// [`EmuPanel::take_published_frame`] because one caller has already
+/// taken the endpoint off the panel and so cannot go through the field.
+fn take_link_frame(endpoint: &ggo_common::LinkEndpoint) -> Option<Arc<RenderImage>> {
+    endpoint
+        .frame
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .map(|(_number, image)| image)
+}
+
 fn travels_over_the_link(rel: &str) -> bool {
     let mut components = rel.split('/').rev();
     let Some(name) = components.next() else {
@@ -718,11 +742,26 @@ impl EmuPanel {
         // (`remote_video_track_view.rs:32-44`).
         cx.on_release(|this, cx| {
             this.debug.retire_all();
+            // The world view's slot as well as this pane's own: the pane
+            // is going away, so nothing else will ever own these tiles.
+            let published = this.take_published_frame();
+            // The last chance to say so, too. A pane closed while the
+            // viewer cart was still building leaves no run to report the
+            // ending, and a `Building` that never resolves is a live view
+            // that simply never appears.
+            if let Some(link) = &this.viewer_link
+                && !matches!(link.state(), ggo_common::ViewerState::Stopped(_))
+            {
+                link.set_state(ggo_common::ViewerState::Stopped(
+                    "the emulator pane was closed".to_string(),
+                ));
+            }
             for image in [
                 this.previous_rendered_frame.take(),
                 this.current_rendered_frame.take(),
                 this.latest_frame.take(),
                 this.previously_published.take(),
+                published,
             ]
             .into_iter()
             .flatten()
@@ -1682,11 +1721,21 @@ impl EmuPanel {
                     replaced.set_state(ggo_common::ViewerState::Stopped(
                         "replaced by another run".to_string(),
                     ));
-                    // Nothing will publish over it now, so the frame the
-                    // lag was holding for the world view is retired here
-                    // instead.
-                    if let Some(stale) = self.previously_published.take() {
-                        cx.drop_image(stale, None);
+                    // Nothing will publish over them now, so the frames
+                    // the world view was left holding -- the one still in
+                    // its slot and the one the publish lag was keeping
+                    // alive for it -- are retired here instead.
+                    let published = take_link_frame(&replaced);
+                    for stale in [self.previously_published.take(), published]
+                        .into_iter()
+                        .flatten()
+                    {
+                        // Through the window, not `App::drop_image(.., None)`:
+                        // that one walks `App::windows`, and THIS window is
+                        // leased out of that map for as long as `run` holds
+                        // `&mut Window` -- so it would skip the only window
+                        // the tiles are actually in.
+                        window.drop_image(stale).log_err();
                     }
                 }
                 None
@@ -2635,17 +2684,29 @@ impl EmuPanel {
     /// three slots is harmless.
     fn release_atlas_all(&mut self, window: &mut Window) {
         self.release_debug_images(window);
+        // `latest_frame` and the endpoint's slot are the SAME image while
+        // a viewer run is publishing, so handing one back without
+        // emptying the other leaves the world view sampling a freed rect.
+        let published = self.take_published_frame();
         for image in [
             self.previous_rendered_frame.take(),
             self.current_rendered_frame.take(),
             self.latest_frame.take(),
             self.previously_published.take(),
+            published,
         ]
         .into_iter()
         .flatten()
         {
             window.drop_image(image).log_err();
         }
+    }
+
+    /// Empty the viewer endpoint's frame slot and hand back what it held,
+    /// for the caller to retire. Only the publisher may do this -- see
+    /// [`ggo_common::LinkEndpoint::frame`] -- and this pane is it.
+    fn take_published_frame(&self) -> Option<Arc<RenderImage>> {
+        self.viewer_link.as_deref().and_then(take_link_frame)
     }
 
     // ----------------------------------------------------------- debug
@@ -5241,6 +5302,31 @@ mod tests {
         }
     }
 
+    /// Publish one frame through the panel's own per-frame path and hand
+    /// back the image it produced -- what the emulator thread's pump does,
+    /// minus the thread.
+    fn publish_one_frame(
+        panel: &Entity<EmuPanel>,
+        cx: &mut gpui::VisualTestContext,
+        number: u32,
+    ) -> Arc<RenderImage> {
+        let bgra = vec![0x7Fu8; (drive::WIDTH * drive::HEIGHT * 4) as usize];
+        panel.update(cx, |panel, cx| {
+            panel.on_frame(
+                Frame {
+                    bgra,
+                    number,
+                    step_ms: 1.0,
+                },
+                cx,
+            );
+            panel
+                .latest_frame
+                .clone()
+                .expect("a frame message must produce an image")
+        })
+    }
+
     /// The tab's ` · MCP` marker tracks who owns the run: a remote boot
     /// sets it, the user's own Run button takes the run back, and Stop
     /// leaves nothing marked.
@@ -6802,6 +6888,111 @@ mod tests {
             .panel
             .update_in(cx, |panel, window, cx| panel.stop(window, cx));
         cx.run_until_parked();
+    }
+
+    /// **Teardown owns the tile it published.** The image in the
+    /// endpoint's slot is the SAME `Arc` as `latest_frame`, so a
+    /// `release_atlas_all` that hands that tile back while leaving the
+    /// slot populated points the world view at a rect the atlas is free
+    /// to reallocate -- and nothing would ever retire the slot's own
+    /// reference afterwards either. Both teardown halves are one act.
+    #[gpui::test]
+    async fn stopping_a_viewer_run_empties_the_endpoints_frame_slot(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        let endpoint = ggo_common::LinkEndpoint::new();
+        panel.update(cx, |panel, _cx| {
+            panel.viewer_link = Some(endpoint.clone());
+        });
+        let published = publish_one_frame(&panel, cx, 1);
+        assert_eq!(endpoint.frame_number(), Some(1));
+        cx.draw(gpui::Point::default(), gpui::size(px(320.), px(240.)), |_, _| {
+            gpui::Empty
+        });
+        assert!(
+            cx.update(|window, _| window.has_image_atlas_entry(&published)),
+            "the published frame really is in the atlas to begin with"
+        );
+
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        assert_eq!(
+            endpoint.frame_number(),
+            None,
+            "a stopped run leaves no frame the world view could sample"
+        );
+        assert!(
+            cx.update(|window, _| !window.has_image_atlas_entry(&published)),
+            "and the tile it was holding is handed back"
+        );
+    }
+
+    /// The same contract on the OTHER two teardowns: a plain run taking
+    /// the pane back abandons the endpoint outright (nothing will ever
+    /// publish over its slot again), and so does the panel's own release.
+    #[gpui::test]
+    async fn abandoning_a_viewer_endpoint_retires_its_published_frame(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        let endpoint = ggo_common::LinkEndpoint::new();
+        panel.update(cx, |panel, _cx| {
+            panel.viewer_link = Some(endpoint.clone());
+        });
+        // Two publishes, so the one-publish lag is holding the first
+        // frame when the endpoint is abandoned -- that one is nobody's
+        // once the branch runs, which is what makes its tile checkable.
+        // The second is still what the pane displays, so only its slot
+        // can be asserted on.
+        let lagged = publish_one_frame(&panel, cx, 1);
+        publish_one_frame(&panel, cx, 2);
+        assert!(
+            cx.update(|window, _| window.has_image_atlas_entry(&lagged)),
+            "the lagged frame really is in the atlas to begin with"
+        );
+
+        // `run` with nothing selected still takes the replacement branch
+        // -- the endpoint is released before the "no cart selected"
+        // refusal, which is the point: it is no longer this pane's.
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        assert_eq!(
+            endpoint.frame_number(),
+            None,
+            "the slot was emptied -- nothing will publish over it again"
+        );
+        assert!(
+            cx.update(|window, _| !window.has_image_atlas_entry(&lagged)),
+            "and the lagged frame's tile is handed back -- through the WINDOW, \
+             which `App::drop_image(.., None)` cannot reach while `run` holds it"
+        );
+    }
+
+    /// Panel release: the last chance to hand the published tile back,
+    /// and the last chance to tell the world view its viewer is gone.
+    #[gpui::test]
+    async fn releasing_the_panel_retires_the_published_frame_and_stops_the_endpoint(
+        cx: &mut TestAppContext,
+    ) {
+        let (_root, cx) = windowed_panel(cx);
+        let panel = cx.update(|window, cx| cx.new(|cx| EmuPanel::test_new(window, cx)));
+        let endpoint = ggo_common::LinkEndpoint::new();
+        panel.update(cx, |panel, _cx| {
+            panel.viewer_link = Some(endpoint.clone());
+        });
+        let published = publish_one_frame(&panel, cx, 1);
+
+        drop(panel);
+        // An entity is released on the next effect flush, and an idle
+        // executor never starts one -- so ask for an update first.
+        cx.update(|_window, _cx| {});
+        cx.run_until_parked();
+        assert_eq!(endpoint.frame_number(), None, "the slot was emptied");
+        assert!(
+            cx.update(|window, _| !window.has_image_atlas_entry(&published)),
+            "and its tile handed back"
+        );
+        match endpoint.state() {
+            ggo_common::ViewerState::Stopped(reason) => {
+                assert!(reason.contains("closed"), "{reason}")
+            }
+            other => panic!("a closed pane must stop the endpoint, not leave it {other:?}"),
+        }
     }
 
     /// Watch mode on a viewer run rebuilds through the SAME viewer boot
