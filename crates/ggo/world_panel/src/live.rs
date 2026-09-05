@@ -527,7 +527,12 @@ impl LiveView {
     /// that is the republish the overlay was waiting for.
     pub fn advance_world_sync(&mut self) {
         let frame = self.mailbox.frame_seq();
-        if self.world_sync == WorldSync::Sending && !self.mailbox.busy() {
+        // `!busy()` is ambiguous on its own: it is equally true before a
+        // blob has been queued and after it was acked. `world_dirty` is
+        // what separates them -- a blob the panel still OWES the cart (a
+        // greeting just re-armed it, or the encode keeps failing) has not
+        // been acked by anyone.
+        if self.world_sync == WorldSync::Sending && !self.world_dirty && !self.mailbox.busy() {
             self.world_sync = WorldSync::Acked(frame);
         }
         if let WorldSync::Acked(acked_at) = self.world_sync
@@ -537,10 +542,22 @@ impl LiveView {
         }
     }
 
-    /// Put the drag's outstanding moves on the wire, at most one datagram
-    /// per row per tick. Single-datagram commands are accepted mid-blob,
-    /// so this does not wait for a transfer to finish -- a drag the user
-    /// can see lagging is worse than a datagram queued behind a blob.
+    /// Put the drag's outstanding moves on the wire: one datagram per
+    /// moved row, once per tick, which is one cart frame. Coalescing
+    /// happens at the other end -- each mouse-move REPLACES
+    /// [`Self::pending_transforms`] -- so the count here is the size of the
+    /// selection, and there is no per-tick cap on top of that.
+    ///
+    /// A selection wider than the cart's four-deep APP receive queue
+    /// therefore sheds its tail every tick, and does so for certain while
+    /// a blob transfer is using the same queue (this deliberately does not
+    /// wait for one: a drag the user can see lagging is worse than a
+    /// datagram queued behind a blob). That is left uncapped on purpose.
+    /// The payloads are ABSOLUTE and idempotent, so a lost one costs a
+    /// frame of staleness on that row and is corrected by the next tick's
+    /// datagram; the release re-sends the whole world anyway. A cap would
+    /// have to choose which rows go stale and would still not bound the
+    /// queue, because the layer and world transfers share it.
     pub fn flush_pending_transforms(&mut self) {
         for (index, x, y) in std::mem::take(&mut self.pending_transforms) {
             if let Err(error) = self.mailbox.set_transform(index, x, y) {

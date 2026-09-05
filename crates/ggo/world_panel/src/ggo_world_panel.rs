@@ -1270,8 +1270,14 @@ impl OpenWorld {
                 live.status = LiveStatus::Connected;
                 live.stale_hello = None;
                 // A greeting resets the cart's whole view, so everything
-                // this document owns has to go out again.
+                // this document owns has to go out again -- including the
+                // world handshake. Without this an `Acked(N)` from before
+                // the greeting could flip to `Loaded` on the post-reset
+                // `frame_seq` (which restarts at 0 and climbs again) even
+                // though the re-send has not landed, or never left because
+                // the same tick's encode failed.
                 live.world_dirty = true;
+                live.world_sync = live::WorldSync::Sending;
                 live.layers_dirty = true;
                 live.camera_dirty = true;
             }
@@ -3522,23 +3528,29 @@ impl WorldPanel {
             return;
         };
         let pos = canvas::dragged_pos(drag.start_pos, drag.start_world, world, open.snap);
-        if pos == drag.start_pos {
-            // The pointer moved but the primary did not (a sub-tile move
-            // with snap on, or a click that merely jittered). Nothing to
-            // apply, and nothing that makes this gesture an EDIT.
-            return;
-        }
-        if let Some(armed) = open.edit_drag.as_mut() {
-            armed.moved = true;
-        }
+        // Applied even when `pos` is back at the start: `move_ops` writes
+        // ABSOLUTE positions from the drag's own anchors, so the move that
+        // returns to the origin is what RESTORES it. Skipping it would
+        // leave the entity wherever the last off-origin move put it.
         open.store
             .apply(move_ops(&drag.starts, primary, pos, Some(drag.gesture_id)));
-        if live_active {
+        // ...but a gesture that never displaced the primary is not an
+        // edit. Latching, not tracking: a drag that wandered and came back
+        // still moved the document through positions the cart saw, so the
+        // release still owes it a re-sync.
+        let moved = if let Some(armed) = open.edit_drag.as_mut() {
+            armed.moved |= pos != drag.start_pos;
+            armed.moved
+        } else {
+            false
+        };
+        if live_active && moved {
             // The delta the DOCUMENT took, not the raw cursor delta, so a
             // snapped drag mirrors where the entity actually landed.
             // Resolved to absolute targets and PARKED: `live_step` puts one
             // datagram per row on the wire per tick, which is one cart
-            // frame.
+            // frame. A zero delta parks the anchors themselves, which is
+            // how the cart learns a drag came home.
             let delta = [pos[0] - drag.start_pos[0], pos[1] - drag.start_pos[1]];
             if let Some(live) = open.live.as_mut() {
                 let (dx, dy) = (live::to_raw(delta[0]), live::to_raw(delta[1]));
@@ -7000,6 +7012,57 @@ mod tests {
                     .iter()
                     .any(|i| matches!(i.kind, DrawKind::SelectionOutline)),
                 "no outline without a selection"
+            );
+        });
+    }
+
+    /// A drag that wanders and comes back RESTORES the original position:
+    /// each move writes an absolute position derived from the gesture's
+    /// own anchors, so the move that returns to the start is the one that
+    /// puts the entity back. Skipping "no net displacement" moves as a
+    /// cheap no-op would strand the entity wherever the last off-origin
+    /// move left it, and the release would commit it there.
+    #[gpui::test]
+    async fn test_a_drag_that_returns_to_its_start_restores_the_position(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        // Snap stays OFF: it quantizes the RESULT, so an off-grid start
+        // like the fixture's [4, 4] cannot return to itself under it
+        // (`dragged_pos_snaps_the_result_not_the_delta`). The contract
+        // under test is the absolute restore, not the snap.
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down([10.0, 10.0], cx);
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(0)]);
+
+            // Out one tile...
+            panel.canvas_drag_to([26.0, 10.0], cx);
+            assert_eq!(entity_pos_of(panel, 0), [20.0, 4.0]);
+
+            // ...and back to where the press landed.
+            panel.canvas_drag_to([10.0, 10.0], cx);
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                [4.0, 4.0],
+                "the return move restores the authored position"
+            );
+            panel.canvas_primary_up(cx);
+            assert_eq!(entity_pos_of(panel, 0), [4.0, 4.0]);
+        });
+
+        // And the whole round trip is ONE undo entry, like any other drag.
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.store.undo(), "the gesture left one entry");
+            assert_eq!(
+                inspector::entity_pos(&open.store.state(), 0),
+                Some([4.0, 4.0])
+            );
+            assert!(
+                !open.store.undo(),
+                "and only one -- the moves coalesced under the gesture id"
             );
         });
     }
@@ -13376,6 +13439,32 @@ mod tests {
         assert_eq!(transforms.len(), 1, "one datagram for the one moved row");
         assert_eq!(transforms[0], (1, 50.0, 18.0));
 
+        // A drag that comes home has to tell the cart so: the payloads are
+        // absolute, so the return leg parks the anchors themselves.
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_drag_to(live_screen_of(panel, [41.0, 9.0]), cx)
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+        assert_eq!(
+            set_transforms(&endpoint),
+            [(1, 40.0, 8.0)],
+            "back to the row's own origin, not left at the last position"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                entity_pos_of(panel, 1),
+                [40.0, 8.0],
+                "and the document is back where it started"
+            );
+        });
+
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_drag_to(live_screen_of(panel, [51.0, 19.0]), cx)
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+        host_sent(&endpoint);
         panel.update_in(cx, |panel, _, cx| panel.canvas_primary_up(cx));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
@@ -13782,19 +13871,28 @@ mod tests {
         );
         assert!(set_transforms(&endpoint).is_empty());
 
-        // A press that does not move, then one that does: only the second
-        // is an edit.
+        // A whole gesture whose moves never displace the primary is not
+        // an edit either -- asserted after the RELEASE, which is where
+        // that decision is actually made.
         panel.update_in(cx, |panel, _, cx| {
             panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), false, cx);
             panel.canvas_drag_to(live_screen_of(panel, [41.0, 9.0]), cx);
+            panel.canvas_primary_up(cx);
         });
+        endpoint.tick();
+        cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert!(
                 !live_of(panel).world_dirty,
-                "a move that displaces nothing is not an edit either"
+                "a gesture that displaces nothing is not an edit either"
             );
         });
+        assert!(
+            set_transforms(&endpoint).is_empty(),
+            "and it owes the cart no mirror update"
+        );
         panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [41.0, 9.0]), false, cx);
             panel.canvas_drag_to(live_screen_of(panel, [51.0, 19.0]), cx);
             panel.canvas_primary_up(cx);
         });
@@ -13908,6 +14006,54 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert!(!live_of(panel).world_dirty);
             assert_eq!(open_of(panel).live_error, None, "and the row clears");
+        });
+    }
+
+    /// A greeting resets the cart's whole view, so the world handshake has
+    /// to start over with it. Otherwise an `Acked(N)` recorded before the
+    /// greeting flips to `Loaded` on the post-reset frame counter -- and
+    /// the overlay would be drawn from the OLD session's rows over a cart
+    /// that has not been given the world back.
+    #[gpui::test]
+    async fn a_greeting_re_arms_the_world_handshake(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        // Every re-send will now fail to encode, so nothing can quietly
+        // repair the handshake behind the assertion.
+        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+
+        // What a stale session leaves behind: the panel re-greeted (which
+        // resets the mailbox's mirror, frame counter included) and is
+        // waiting for the cart to answer.
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            let live = open.live.as_mut().expect("a live session");
+            live.status = LiveStatus::Connecting;
+            live.world_sync = live::WorldSync::Acked(0);
+            live.mailbox.hello().expect("the link accepts a greeting");
+        });
+        cart_says(&endpoint, hello_ack(1, &[]));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert_eq!(live.status, LiveStatus::Connected);
+            assert!(live.world_dirty, "the greeting re-armed the world");
+            assert!(!live.loaded());
+        });
+
+        // The cart frames on. Those frames say nothing about a blob it was
+        // never given.
+        cart_frame(&endpoint, 1);
+        cart_frame(&endpoint, 2);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).loaded(),
+                "frames after the GREETING are not frames after an ack"
+            );
+            assert!(live_of(panel).world_dirty, "and the re-send is still owed");
         });
     }
 
