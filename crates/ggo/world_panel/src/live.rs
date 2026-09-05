@@ -375,6 +375,42 @@ pub enum LiveStatus {
     Failed(String),
 }
 
+/// Which bit of the session's system mask a system's position in
+/// [`LinkMailbox::system_names`] owns, or `None` past bit 63: the mask is
+/// a `u64` and the cart's name list is `u8`-counted, so it can name more
+/// systems than the mask can address.
+pub fn system_bit(index: usize) -> Option<u64> {
+    u32::try_from(index)
+        .ok()
+        .and_then(|shift| 1u64.checked_shl(shift))
+}
+
+/// The systems rail's rows: each of the cart's systems and whether `mask`
+/// has it on. Names with no mask bit are dropped rather than shown
+/// unusable.
+pub fn system_rows(names: &[String], mask: u64) -> Vec<(String, bool)> {
+    names
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            let bit = system_bit(index)?;
+            Some((name.clone(), mask & bit != 0))
+        })
+        .collect()
+}
+
+/// What the live status line says, and whether it should offer a retry.
+/// `frame` is the cart's own frame counter, which is the only visible
+/// proof that a connected cart is still running.
+pub fn status_line(status: &LiveStatus, frame: u32) -> (String, bool) {
+    match status {
+        LiveStatus::Building => ("Building viewer cart…".to_string(), false),
+        LiveStatus::Connecting => ("Connecting…".to_string(), false),
+        LiveStatus::Connected => (format!("Live · frame {frame}"), false),
+        LiveStatus::Failed(reason) => (reason.clone(), true),
+    }
+}
+
 /// One cart frame of emulator time. The mailbox's timeouts are measured
 /// on the CART's clock, so the poll clock is derived from the endpoint's
 /// frame counter rather than read off the wall -- see the plan's
@@ -478,6 +514,10 @@ pub struct LiveView {
     /// out per tick: the cart's APP receive queue is four datagrams deep,
     /// and a blob transfer already fills it.
     pub layer_queue: VecDeque<LayerLoad>,
+    /// Which of the cart's own systems are enabled, one bit per entry of
+    /// [`LinkMailbox::system_names`]. The mailbox re-applies this after
+    /// every greeting on its own, so the panel only pushes changes.
+    pub sys_mask: u64,
     pub poll: Option<Task<()>>,
 }
 
@@ -506,6 +546,9 @@ impl LiveView {
             layers_dirty: false,
             camera_dirty: false,
             layer_queue: VecDeque::new(),
+            // Editor systems only: a viewer that ran the cart's gameplay
+            // systems would move the entities the user is dragging.
+            sys_mask: 0,
             poll: None,
         }
     }
@@ -855,5 +898,69 @@ mod tests {
         let blob = encode_world(&store, dir.path()).unwrap();
         assert!(blob.starts_with(b"EWLD"));
         assert_eq!(blob[4], emerald_world::VERSION);
+    }
+
+    #[test]
+    fn a_system_owns_the_mask_bit_at_its_position_and_nothing_past_63() {
+        assert_eq!(system_bit(0), Some(1));
+        assert_eq!(system_bit(1), Some(0b10));
+        assert_eq!(system_bit(63), Some(1 << 63));
+        assert_eq!(system_bit(64), None, "the mask is a u64");
+        assert_eq!(system_bit(usize::MAX), None);
+    }
+
+    #[test]
+    fn the_systems_rail_reads_each_name_off_its_own_bit() {
+        let names = vec!["animate".to_string(), "ai".to_string(), "audio".to_string()];
+        assert_eq!(
+            system_rows(&names, 0),
+            vec![
+                ("animate".to_string(), false),
+                ("ai".to_string(), false),
+                ("audio".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            system_rows(&names, 0b101),
+            vec![
+                ("animate".to_string(), true),
+                ("ai".to_string(), false),
+                ("audio".to_string(), true),
+            ]
+        );
+        assert!(system_rows(&[], u64::MAX).is_empty());
+    }
+
+    /// A cart may name more systems than a `u64` has bits; those have no
+    /// bit to toggle, so the rail must not offer a control that does
+    /// nothing.
+    #[test]
+    fn the_systems_rail_drops_names_that_have_no_mask_bit() {
+        let names: Vec<String> = (0..70).map(|index| format!("s{index}")).collect();
+        let rows = system_rows(&names, u64::MAX);
+        assert_eq!(rows.len(), 64);
+        assert_eq!(rows[63].0, "s63");
+    }
+
+    #[test]
+    fn the_status_line_names_where_the_session_is() {
+        assert_eq!(
+            status_line(&LiveStatus::Building, 9),
+            ("Building viewer cart…".to_string(), false)
+        );
+        assert_eq!(
+            status_line(&LiveStatus::Connecting, 9),
+            ("Connecting…".to_string(), false)
+        );
+        assert_eq!(
+            status_line(&LiveStatus::Connected, 9),
+            ("Live · frame 9".to_string(), false),
+            "the frame counter is what proves the cart is still running"
+        );
+        assert_eq!(
+            status_line(&LiveStatus::Failed("cart never answered".into()), 9),
+            ("cart never answered".to_string(), true),
+            "a failure reads as itself, and asks for a retry"
+        );
     }
 }

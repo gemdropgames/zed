@@ -122,7 +122,15 @@ actions!(
         /// Nudges the selection one tile up.
         NudgeUpTile,
         /// Nudges the selection one tile down.
-        NudgeDownTile
+        NudgeDownTile,
+        /// Draws the canvas with the design renderer, ending any live
+        /// session.
+        ToggleDesign,
+        /// Draws the canvas with the viewer cart running the open world.
+        ToggleLive,
+        /// Switches the canvas between the design renderer and the viewer
+        /// cart.
+        ToggleCanvasMode
     ]
 );
 
@@ -4152,11 +4160,47 @@ impl WorldPanel {
         cx.notify();
     }
 
+    /// Show `mode` on the canvas, and make it the panel's mode: it is
+    /// sticky, so the next world opened through the explorer comes up the
+    /// same way.
+    ///
+    /// Live is entered by asking the booter again rather than by reviving
+    /// whatever ran before -- the emulator pane owns "is a rebuild
+    /// needed?", and the panel is not in a position to second-guess it.
+    fn set_canvas_mode(&mut self, mode: CanvasMode, window: &mut Window, cx: &mut Context<Self>) {
+        match mode {
+            CanvasMode::Design => self.leave_live(cx),
+            CanvasMode::Live => {
+                self.canvas_mode = CanvasMode::Live;
+                self.enter_live(window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Turn one of the cart's own systems on or off for this session. The
+    /// mask is the panel's to remember: `LinkMailbox::set_sys_mask`
+    /// re-applies it after every greeting, so only changes go on the wire.
+    fn set_live_system(&mut self, index: usize, on: bool, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let (Some(live), Some(bit)) = (open.live.as_mut(), live::system_bit(index)) else {
+            return;
+        };
+        live.sys_mask = if on {
+            live.sys_mask | bit
+        } else {
+            live.sys_mask & !bit
+        };
+        if let Err(error) = live.mailbox.set_sys_mask(live.sys_mask) {
+            log::warn!("GGO: live system mask: {error}");
+        }
+        cx.notify();
+    }
+
     /// Leave Live mode deliberately: the session goes, and so does the
     /// viewer run behind it.
-    // Task 6 wires the toolbar's Design/Live switch, which is the only
-    // thing that leaves Live on purpose.
-    #[allow(dead_code)]
     fn leave_live(&mut self, cx: &mut Context<Self>) {
         self.canvas_mode = CanvasMode::Design;
         if let ViewerState::Ready(open) = &mut self.state {
@@ -5346,8 +5390,138 @@ impl WorldPanel {
             .into_any_element()
     }
 
-    /// The view-control row under the toolbar: grid + snap toggles, the
-    /// zoom bar with its `-`/`+` buttons and live readout, and "Reset".
+    /// The `Design | Live` switch: which renderer draws the canvas. Its
+    /// selected half is [`Self::canvas_mode`] and not [`Self::live_active`]
+    /// -- a Live session that failed still reads as Live here, and says so
+    /// on the status line rather than snapping the switch back silently.
+    fn render_mode_switch(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        h_flex()
+            .gap_0p5()
+            .child(self.render_mode_half(
+                "ggo-world-mode-design",
+                "Design",
+                CanvasMode::Design,
+                "Draw the world with the editor's own renderer",
+                cx,
+            ))
+            .child(self.render_mode_half(
+                "ggo-world-mode-live",
+                "Live",
+                CanvasMode::Live,
+                "Draw the world with the viewer cart running it",
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_mode_half(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        mode: CanvasMode,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // The wrapper carries the `debug_selector`: `Button` is a
+        // `RenderOnce` and records no bounds of its own.
+        div().flex_none().debug_selector(move || id.into()).child(
+            Button::new(id, label)
+                .label_size(LabelSize::XSmall)
+                .toggle_state(self.canvas_mode == mode)
+                .tooltip(ui::Tooltip::text(tooltip))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.set_canvas_mode(mode, window, cx)),
+                ),
+        )
+    }
+
+    /// Where the live session is, under the toolbar. Only while there IS
+    /// one: a windowless load leaves [`Self::canvas_mode`] on Live with
+    /// nothing started, and a line claiming to be building a cart nobody
+    /// asked for would be a lie.
+    fn render_live_status(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.canvas_mode != CanvasMode::Live {
+            return None;
+        }
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let live = open.live.as_ref()?;
+        let (text, failed) = live::status_line(&live.status, live.mailbox.frame_seq());
+        let color = if failed { Color::Error } else { Color::Muted };
+        Some(
+            h_flex()
+                .gap_1()
+                .px_1()
+                .pb_1()
+                .debug_selector(|| "ggo-world-live-status".into())
+                .child(Label::new(text).size(LabelSize::XSmall).color(color))
+                .when(failed, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .debug_selector(|| "ggo-world-live-retry".into())
+                            .child(
+                                Button::new("ggo-world-live-retry", "Retry")
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.enter_live(window, cx)
+                                    })),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The systems rail: one checkbox per system the cart named in its
+    /// greeting. Live's alone -- the names come off the `HelloAck`, and in
+    /// Design mode there is no cart whose systems could be switched.
+    fn render_systems_rail(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.live_active() {
+            return None;
+        }
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let live = open.live.as_ref()?;
+        if live.status != LiveStatus::Connected {
+            return None;
+        }
+        let rows = live::system_rows(live.mailbox.system_names(), live.sys_mask);
+        if rows.is_empty() {
+            return None;
+        }
+        let mut rail = h_flex().gap_2().px_1().pb_1().flex_wrap().child(
+            Label::new("Systems")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        );
+        for (index, (name, on)) in rows.into_iter().enumerate() {
+            let weak = cx.weak_entity();
+            rail = rail.child(
+                // Wrapped for the `debug_selector` for the same reason the
+                // Save button is: `Checkbox` is a `RenderOnce`.
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("ggo-world-system-{index}"))
+                    .child(
+                        Checkbox::new(("ggo-world-system", index), ToggleState::from(on))
+                            .label(SharedString::from(name))
+                            .on_click(move |toggle, _window, cx| {
+                                let on = matches!(toggle, ToggleState::Selected);
+                                weak.update(cx, |this, cx| this.set_live_system(index, on, cx))
+                                    .ok();
+                            }),
+                    ),
+            );
+        }
+        Some(rail.into_any_element())
+    }
+
+    /// The view-control row under the toolbar: the `Design | Live` switch,
+    /// grid + snap toggles, the zoom bar with its `-`/`+` buttons and live
+    /// readout, and "Reset".
     fn render_view_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_view_controls is only called in the Ready state");
@@ -5361,6 +5535,8 @@ impl WorldPanel {
             .gap_1()
             .px_1()
             .pb_1()
+            .child(self.render_mode_switch(cx))
+            .child(Divider::vertical())
             .child(
                 Checkbox::new("ggo-world-grid", ToggleState::from(grid))
                     .label("Grid")
@@ -6272,8 +6448,10 @@ impl WorldPanel {
         v_flex()
             .size_full()
             .child(toolbar)
+            .children(self.render_live_status(cx))
             .child(self.render_view_controls(cx))
             .child(self.render_layers_rail(cx))
+            .children(self.render_systems_rail(cx))
             .child(body.children(paint))
             .into_any_element()
     }
@@ -6358,6 +6536,19 @@ impl Render for WorldPanel {
                 this.delete_selected_impl(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ResetView, _window, cx| this.reset_view_impl(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDesign, window, cx| {
+                this.set_canvas_mode(CanvasMode::Design, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleLive, window, cx| {
+                this.set_canvas_mode(CanvasMode::Live, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCanvasMode, window, cx| {
+                let next = match this.canvas_mode {
+                    CanvasMode::Design => CanvasMode::Live,
+                    CanvasMode::Live => CanvasMode::Design,
+                };
+                this.set_canvas_mode(next, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &NudgeLeft, _window, cx| {
                 this.nudge_impl("ArrowLeft", false, cx)
             }))
@@ -12785,11 +12976,25 @@ mod tests {
         tempfile::TempDir,
         &mut gpui::VisualTestContext,
     ) {
+        connected_live_panel_with_systems(cx, &[]).await
+    }
+
+    /// [`connected_live_panel`], with the cart greeting as a build that
+    /// carries `systems` -- the names the Live systems rail lists.
+    async fn connected_live_panel_with_systems<'a>(
+        cx: &'a mut TestAppContext,
+        systems: &[&str],
+    ) -> (
+        Entity<WorldPanel>,
+        Arc<ggo_common::LinkEndpoint>,
+        tempfile::TempDir,
+        &'a mut gpui::VisualTestContext,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(1, &[]));
+        cart_says(&endpoint, hello_ack(1, systems));
         cx.run_until_parked();
         panel.update(cx, |panel, _| {
             let mut view = open_of(panel).view.borrow_mut();
@@ -14141,5 +14346,288 @@ mod tests {
                 "the cart's rect is what opened the map"
             );
         });
+    }
+
+    // ------------------------------------- mode switch, systems, status
+
+    fn assert_mode(
+        panel: &Entity<WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        expected: CanvasMode,
+    ) {
+        panel.read_with(cx, |panel, _| assert_eq!(panel.canvas_mode, expected));
+    }
+
+    /// Opens the dock so the panel actually paints: the workspace-backed
+    /// live helpers leave it closed, and `debug_bounds` only resolves
+    /// elements that were laid out.
+    fn show_panel(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| window.dispatch_action(ToggleFocus.boxed_clone(), cx));
+        cx.run_until_parked();
+    }
+
+    /// Ticking a system in the rail moves the session mask AND tells the
+    /// cart; the mailbox re-applies the mask itself after every greeting,
+    /// so the panel only has to push the changes.
+    #[gpui::test]
+    async fn toggling_a_system_sends_the_mask(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) =
+            connected_live_panel_with_systems(cx, &["animate", "ai"]).await;
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).mailbox.system_names(),
+                ["animate", "ai"],
+                "the rail lists what the cart greeted with"
+            );
+            assert_eq!(
+                live_of(panel).sys_mask,
+                0,
+                "editor systems only until the user asks otherwise"
+            );
+        });
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.set_live_system(1, true, cx));
+        cx.run_until_parked();
+
+        let sent = host_sent(&endpoint);
+        match sent
+            .iter()
+            .find(|message| message.first() == Some(&0x07))
+            .and_then(|message| emerald_editor_runtime::wire::decode_host(message))
+        {
+            Some(emerald_editor_runtime::wire::HostMsg::SysMask { mask }) => {
+                assert_eq!(mask, 0b10)
+            }
+            other => panic!("{other:?}"),
+        }
+        panel.read_with(cx, |panel, _| assert_eq!(live_of(panel).sys_mask, 0b10));
+
+        host_sent(&endpoint);
+        panel.update(cx, |panel, cx| panel.set_live_system(1, false, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert_eq!(live_of(panel).sys_mask, 0));
+        match host_sent(&endpoint)
+            .iter()
+            .find(|message| message.first() == Some(&0x07))
+            .and_then(|message| emerald_editor_runtime::wire::decode_host(message))
+        {
+            Some(emerald_editor_runtime::wire::HostMsg::SysMask { mask }) => assert_eq!(mask, 0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The switch is a real mode change on both sides: Design ends the
+    /// session and the viewer run behind it, and Live starts a new one
+    /// rather than reviving the corpse. The DOCUMENT is untouched either
+    /// way -- the mode only decides which renderer draws it.
+    #[gpui::test]
+    async fn switching_to_design_keeps_the_document_and_back_to_live_starts_a_session(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        let entities = panel.read_with(cx, |panel, _| open_of(panel).store.state().entities.len());
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Design, window, cx)
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert!(
+                open_of(panel).live.is_none(),
+                "the session goes with the mode"
+            );
+            assert_eq!(
+                open_of(panel).store.state().entities.len(),
+                entities,
+                "the document is the same document"
+            );
+        });
+        assert!(
+            endpoint.stop_requested(),
+            "and the viewer run behind it is stopped"
+        );
+
+        let before = BOOTED.with(|booted| booted.borrow().len());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Live, window, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            BOOTED.with(|booted| booted.borrow().len()),
+            before + 1,
+            "asks the booter again; the emu panel decides whether to rebuild"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
+            let live = open_of(panel).live.as_ref().expect("a new session");
+            assert!(
+                matches!(live.status, LiveStatus::Building | LiveStatus::Connecting),
+                "a fresh session rather than the old one: {:?}",
+                live.status
+            );
+            assert!(
+                !Arc::ptr_eq(&live.endpoint, &endpoint),
+                "over a fresh endpoint"
+            );
+        });
+    }
+
+    /// The rail is Live's alone, and only once the cart has greeted: the
+    /// names arrive on the `HelloAck`.
+    #[gpui::test]
+    async fn the_systems_rail_is_live_only(cx: &mut TestAppContext) {
+        let (panel, _endpoint, _dir, cx) =
+            connected_live_panel_with_systems(cx, &["animate", "ai"]).await;
+        show_panel(cx);
+        assert!(cx.debug_bounds("ggo-world-system-0").is_some());
+        assert!(cx.debug_bounds("ggo-world-system-1").is_some());
+        assert!(
+            cx.debug_bounds("ggo-world-system-2").is_none(),
+            "only the systems the cart named"
+        );
+
+        // The mode alone decides, not the session: a connected cart the
+        // design renderer is drawing over has no systems to offer.
+        panel.update(cx, |panel, cx| {
+            panel.canvas_mode = CanvasMode::Design;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-world-system-0").is_none(),
+            "Design mode never shows the rail"
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Live, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-world-system-0").is_some(),
+            "and back again with the session still up"
+        );
+    }
+
+    /// The status line only exists while a session does, and it says which
+    /// one -- a Design-mode panel is not "connecting" to anything.
+    #[gpui::test]
+    async fn the_status_line_follows_the_session(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        show_panel(cx);
+        assert!(
+            cx.debug_bounds("ggo-world-live-status").is_some(),
+            "the build is worth saying out loud -- it can take a minute"
+        );
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(&endpoint, hello_ack(1, &[]));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).status, LiveStatus::Connected)
+        });
+        assert!(cx.debug_bounds("ggo-world-live-status").is_some());
+
+        // Design mode says nothing about a session even while one is up:
+        // the toolbar's `live_error` row is Design's channel.
+        panel.update(cx, |panel, cx| {
+            panel.canvas_mode = CanvasMode::Design;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("ggo-world-live-status").is_none());
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Design, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-world-live-status").is_none(),
+            "no session, nothing to report"
+        );
+    }
+
+    /// A session that failed must not read as "Live": the status line
+    /// names the reason and offers the way back.
+    #[gpui::test]
+    async fn a_failed_session_offers_a_retry_on_the_status_line(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        show_panel(cx);
+        endpoint.set_state(ggo_common::ViewerState::Stopped("gone".into()));
+        cx.run_until_parked();
+        // The fallback already flipped the switch to Design; the retry
+        // affordance is for the user who asks for Live again anyway.
+        panel.update(cx, |panel, cx| {
+            panel.canvas_mode = CanvasMode::Live;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel.live_active(),
+                "a failed session is not a live canvas"
+            )
+        });
+
+        let retry = cx
+            .debug_bounds("ggo-world-live-retry")
+            .expect("a failed session offers a way back");
+        let before = BOOTED.with(|booted| booted.borrow().len());
+        cx.simulate_click(retry.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            BOOTED.with(|booted| booted.borrow().len()),
+            before + 1,
+            "Retry starts a new session"
+        );
+    }
+
+    /// The keymap entry is part of the feature: an action nothing binds
+    /// is a command-palette entry, not a shortcut.
+    #[gpui::test]
+    async fn the_canvas_mode_keystroke_flips_the_switch(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        focus_the_panel(&panel, cx);
+        // A windowless load never enters Live, so the panel is sitting in
+        // the sticky Live mode with no session -- which is exactly the
+        // state ctrl-alt-l has to be able to leave.
+        assert_mode(&panel, cx, CanvasMode::Live);
+
+        cx.simulate_keystrokes("ctrl-alt-l");
+        cx.run_until_parked();
+
+        assert_mode(&panel, cx, CanvasMode::Design);
+    }
+
+    /// The switch is on the view-control row in both modes, its buttons
+    /// are wired, and the actions behind them flip the same state.
+    #[gpui::test]
+    async fn the_mode_switch_and_its_actions_flip_the_canvas(cx: &mut TestAppContext) {
+        let (panel, _endpoint, _dir, cx) = connected_live_panel(cx).await;
+        show_panel(cx);
+        assert!(cx.debug_bounds("ggo-world-mode-live").is_some());
+        let design = cx
+            .debug_bounds("ggo-world-mode-design")
+            .expect("the switch renders in Live mode too");
+        cx.simulate_click(design.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_mode(&panel, cx, CanvasMode::Design);
+
+        cx.dispatch_action(ToggleCanvasMode);
+        cx.run_until_parked();
+        assert_mode(&panel, cx, CanvasMode::Live);
+        cx.dispatch_action(ToggleCanvasMode);
+        cx.run_until_parked();
+        assert_mode(&panel, cx, CanvasMode::Design);
+        cx.dispatch_action(ToggleLive);
+        cx.run_until_parked();
+        assert_mode(&panel, cx, CanvasMode::Live);
+        cx.dispatch_action(ToggleDesign);
+        cx.run_until_parked();
+        assert_mode(&panel, cx, CanvasMode::Design);
     }
 }
