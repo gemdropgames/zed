@@ -21,6 +21,16 @@
 
 ---
 
+## Contracts learned in Phase 1 (read before implementing)
+
+- `LinkMailbox::poll(now)` takes the CART's clock, not the wall's: with a paused or lock-stepped emulator, pass an emulator-derived `Instant` (advance it only while frames run) or freeze `now` while paused, else a healthy transfer times out after `MAX_RETRIES × ACK_TIMEOUT`. Poll several times per `ACK_TIMEOUT` (100 ms); a 60 Hz tick is fine.
+- The host owns `Hello` retry and reboot detection: `is_connected()` never goes false by itself. Use `last_progress()` / `is_stale(now, after)` and re-`hello()`; a fresh `HelloAck` resets the mirror (entities, schemas, statuses), so do not hold references across it.
+- `!busy()` means the blob was acked, not that the world is loaded: `process()` runs on the next cart frame and the table publishes the frame after. Wait for the entity publish (or `FrameSeq` + 2) before flipping the UI to "loaded".
+- `entities()` is sorted by cart index and indices are sparse (an entity with no `Transform` is skipped): never index the slice by entity index.
+- `load_world`/`load_layer` return `NotConnected` before a `HelloAck`; `queue()` silently replaces a pending world / same-slot layer (by design).
+- `proto_version_mismatch() == Some(v)` with `is_connected() == false` is the "viewer cart predates the link protocol, rebuild" state.
+- Emulator link is lossless and delivers a cart frame's whole output in one `take_comm()`; hardware splits it across reads — the host handles both (schema re-greet is time-gated).
+
 ## File structure
 
 | Path | Responsibility |
