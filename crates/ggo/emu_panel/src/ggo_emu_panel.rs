@@ -1711,7 +1711,19 @@ impl EmuPanel {
         // polling a run that is no longer its own would sit on a frozen
         // frame forever.
         let link = match self.run_kind {
-            RunKind::Viewer(_) => self.viewer_link.clone(),
+            RunKind::Viewer(_) => {
+                let link = self.viewer_link.clone();
+                // BEFORE `stop`, for the reason `boot_viewer` does the
+                // same: the run being replaced is driving THIS endpoint,
+                // and its thread writes its own `Stopped` whenever it
+                // gets round to noticing the flag -- which is after this
+                // run has already said `Running`. See
+                // `drive::Session::release_link`.
+                if let Some(link) = &link {
+                    self.release_link_of_current_run(link);
+                }
+                link
+            }
             RunKind::Cart | RunKind::World(_) => {
                 if let Some(replaced) = self.viewer_link.take() {
                     // Before the reason is written: the run being
@@ -2423,6 +2435,16 @@ impl EmuPanel {
     /// Unlike [`Self::open_rel_path`], re-clicking the selected cart is
     /// the whole point, so there is no already-selected early return.
     pub fn rerun(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Before `stop` takes the session: a Re-run of the viewer's own
+        // cart replaces the run driving the world view's endpoint, and
+        // `run` -- which does exactly this for its own replacements --
+        // does not get a look in until the build task below, by which
+        // time the session it would have released is already gone.
+        if matches!(self.run_kind, RunKind::Viewer(_))
+            && let Some(link) = self.viewer_link.clone()
+        {
+            self.release_link_of_current_run(&link);
+        }
         // Before arming: `stop` finishes any run already in flight, and
         // that run must not be the one that gets the hop.
         self.stop(window, cx);
@@ -7043,6 +7065,54 @@ mod tests {
             }
             other => panic!("a superseded viewer boot must stop its endpoint, not leave it {other:?}"),
         }
+    }
+
+    /// **Replacing a viewer run with another one must not leave a stale
+    /// `Stopped` behind.** The run being replaced is driving THIS
+    /// endpoint, and its thread writes its own stop reason whenever it
+    /// gets round to noticing the flag -- which is after the replacement
+    /// has already said `Running`. Only handing the endpoint over (see
+    /// `Session::release_link`), which `boot_viewer` does and `run`'s own
+    /// Viewer->Viewer arm did not, closes that window.
+    #[gpui::test]
+    async fn replacing_a_viewer_run_leaves_the_endpoint_running(cx: &mut TestAppContext) {
+        let (fixture, cx) = viewer_fixture(cx, true).await;
+        let endpoint = ggo_common::LinkEndpoint::new();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        await_first_frame(&fixture.panel, cx);
+        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
+
+        // Run again over the live viewer run: `run_kind` is still
+        // `Viewer`, so this is the arm that KEEPS the link -- what a
+        // watch restart and `boot_viewer`'s own completion both reach.
+        fixture
+            .panel
+            .update_in(cx, |panel, window, cx| panel.run(window, cx));
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Running,
+            "the replacement said so on its way up"
+        );
+        // The replaced run's thread ends a frame period later; give it
+        // every chance to stamp its own `Stopped` over that `Running`.
+        for _ in 0..50 {
+            cx.background_executor.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Running,
+            "the replaced run must not report its ending through an endpoint \
+             the replacement is already driving"
+        );
+
+        fixture
+            .panel
+            .update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
     }
 
     /// Watch mode on a viewer run rebuilds through the SAME viewer boot
