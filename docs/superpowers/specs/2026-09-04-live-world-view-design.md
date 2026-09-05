@@ -83,7 +83,7 @@ Cart → host:
 
 | Kind | Fields | Notes |
 |------|--------|-------|
-| `HelloAck` | proto version u8, entity cap u16, world buf cap u32, layer buf cap u32, system names (count u8, each len-prefixed) | Also sent unsolicited once at boot so a host already listening learns of a reboot. |
+| `HelloAck` | proto version u8, entity cap u16, world buf cap u32, layer buf cap u32, system names (count u8, each len-prefixed) | Sent only in answer to `Hello`; a host learns of a reboot when `FrameSeq` stops and its `Hello` retry gets a fresh `HelloAck`. |
 | `Ack` | seq u16 | One per received `BlobChunk` / `BlobEnd`. |
 | `Schema` | off u16, bytes | Chunks of the existing `schema_buf` encoding. |
 | `Entities` | count u8, then rows (index u32, x i32, y i32, w u16, h u16), at most 15 per datagram | Only rows whose bytes changed since the last publish; the full table after `Hello`, after a world load, and when `entity_count` shrinks (then a final `EntityCount`). |
@@ -97,8 +97,8 @@ Rules:
 - Single-datagram commands are fire-and-forget, exactly as today's
   busy-coalesced mailbox sends. A dropped `SetTransform` during a drag is
   corrected by the next one; the drop commit re-sends the final position.
-- Blob chunks use stop-and-wait: the host sends one chunk, waits for its
-  `Ack` (timeout 100 ms, 20 retries), then the next. The cart applies
+- Blob chunks use a small window: the host keeps at most 4 chunks in flight (the APP RX queue depth), sending the next as acks return and retransmitting from the oldest unacked after the
+  `Ack` timeout (100 ms, 20 retries). The cart applies
   chunks idempotently by offset, so a duplicate after a lost `Ack` is
   harmless. In the emulator the link is lossless and no retry ever fires;
   on hardware a 32 KiB world takes under a second at 460800 baud, which is
