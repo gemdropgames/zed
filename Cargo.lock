@@ -7301,6 +7301,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo-comm"
+version = "0.1.0"
+dependencies = [
+ "ggo-wire",
+ "libc",
+]
+
+[[package]]
 name = "ggo-db"
 version = "0.1.0"
 dependencies = [
@@ -7314,6 +7322,16 @@ version = "0.1.0"
 dependencies = [
  "gemdrop-sdk",
  "ggo-asset-formats",
+ "ggo-hal",
+ "ggo-wire",
+]
+
+[[package]]
+name = "ggo-hal"
+version = "0.1.0"
+dependencies = [
+ "ggo-asset-formats",
+ "ggo-wire",
 ]
 
 [[package]]
@@ -7328,6 +7346,7 @@ dependencies = [
  "chrono",
  "flate2",
  "ggo-asset-formats",
+ "ggo-comm",
  "ggo-db",
  "ggo-emu-core",
  "ggo-wire",
