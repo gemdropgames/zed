@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - All work in `~/projects/ggo`. ZedGG builds against this checkout by path (`ggo-emu-core = { path = "../ggo/tools/ggo-emu-core" }`), so a broken `main` breaks zed; keep every commit green.
-- Wire protocol is the merged branch's, unchanged: `0x00`, `0x9C` sentinel, COBS block of `channel u8 + payload (≤255) + CRC32 LE`, `0x00`. `CHANNEL_APP = 8`. Syscall numbers `COMM_SEND = 0x4D`, `COMM_RECV = 0x4E`, `COMM_STATUS = 0x4F`.
+- Wire protocol is the merged branch's, unchanged: `0x00`, `0x9C` sentinel, COBS block of `channel u8 + payload (≤255) + CRC32 LE`, `0x00`. `CHANNEL_APP = 8`. Syscall numbers `COMM_SEND = 0x4F`, `COMM_RECV = 0x50`, `COMM_STATUS = 0x51` (renumbered during the rebase: `main` had taken `0x4D`/`0x4E` for `blend_ctrl`/`set_backdrop`; code always reads `gemdrop_sdk::sys::COMM_*`).
 - Syscall return codes, identical to firmware's `firmware/system/src/cart.rs`: `COMM_SEND` → `0` ok, `-1` len > 255 or bad pointer, `-2` TX stalled (never happens in the emulator); `COMM_RECV` → payload length, `0` nothing queued, `-1` bad destination or cap too small (message dropped); `COMM_STATUS` → `rx_queued | queue_drops << 8 | frame_drops << 16 | other_drops << 24`.
 - APP RX queue depth 4 (`ggo_hal::comm::APP_RX_QUEUE_DEPTH`); newest dropped when full.
 - `Peripherals::log_sink` keeps raw text (the sandbox console reads it as lines); comm TX goes to a separate buffer.
