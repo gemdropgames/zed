@@ -1966,7 +1966,7 @@ impl EmuPanel {
         if let Some(link) = self.viewer_link.clone() {
             self.release_link_of_current_run(&link);
             link.set_state(ggo_common::ViewerState::Stopped(
-                "stopped by the world panel".to_string(),
+                drive::WORLD_PANEL_STOP.to_string(),
             ));
         }
         self.finish_run(cx);
@@ -7257,10 +7257,6 @@ mod tests {
             }
         }
         assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Stopped("stopped by the world panel".to_string()),
-        );
-        assert_eq!(
             endpoint.frame_number(),
             None,
             "and the frame it was holding is handed back"
@@ -7269,7 +7265,18 @@ mod tests {
             assert!(panel.viewer_link.is_none(), "the link was released");
             assert!(matches!(panel.run_kind, RunKind::Cart));
         });
+        // AFTER the run's own completion has landed -- `finish_run`
+        // backgrounds `Session::wait` plus the ingest, and that
+        // completion reports the ending too. It must not overwrite this
+        // reason with the thread's bare "stopped": the run was released
+        // before it was finished, so it has no endpoint to speak
+        // through. See `drive::Session::link`.
         cx.run_until_parked();
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Stopped(drive::WORLD_PANEL_STOP.to_string()),
+            "the reason survives the run's own end-of-run completion"
+        );
     }
 
     /// The other half of the registry hop: with no booter registered

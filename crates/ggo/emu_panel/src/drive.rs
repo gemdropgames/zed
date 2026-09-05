@@ -84,6 +84,13 @@ use ggo_emu_core::savefile;
 use crate::audio::{AudioStatus, RingWriter};
 use crate::uart::UartLog;
 
+/// The reason a run ends when the world panel asked it to
+/// ([`ggo_common::LinkEndpoint::request_stop`]). Shared with the pane,
+/// which writes the same words when it acts on the request at a frame
+/// boundary instead -- the world view must not read two different
+/// accounts of the one thing it asked for.
+pub const WORLD_PANEL_STOP: &str = "stopped by the world panel";
+
 /// One 60 Hz vsync period -- `ggo_emu::FRAME_TIME`, redeclared because it
 /// lives in the `ggo-emu` binary crate (which drags in winit and cpal)
 /// rather than in `ggo-emu-core`.
@@ -313,9 +320,22 @@ impl Session {
         &self.uart
     }
 
-    /// The viewer link this run was started for, if any.
+    /// The viewer link this run is STILL speaking through, if any --
+    /// `None` both for an ordinary cart run and for one whose link has
+    /// been handed over by [`Self::release_link`].
+    ///
+    /// Ownership is part of the answer rather than a separate question
+    /// the caller must remember to ask. `EmuPanel::finish_run` reports a
+    /// run's ending through whatever this returns, and a released run
+    /// reporting anything at all is precisely the bug `release_link`
+    /// exists to prevent -- its stop reason would land on top of the
+    /// reason the panel had already written for whoever owns the
+    /// endpoint now.
     pub fn link(&self) -> Option<Arc<LinkEndpoint>> {
-        self.link.clone()
+        self.link_owned
+            .load(Ordering::Acquire)
+            .then(|| self.link.clone())
+            .flatten()
     }
 
     /// Hand this run's viewer link over: from here it neither pumps the
@@ -696,6 +716,13 @@ fn run(
             // away): not an error.
             break ("stopped".to_string(), false);
         }
+        // HERE as well as at the frame boundary the pane checks: a cart
+        // that never reaches `vsync_wait` publishes no frame for the pane
+        // to notice the request on, and would otherwise run for ever.
+        // Not an error either -- the world view asked.
+        if world_panel_stop_requested(link.as_ref(), link_owned) {
+            break (WORLD_PANEL_STOP.to_string(), false);
+        }
         let turn_started = Instant::now();
         let (event, _insns) = run_until_event(&mut cpu, &mut mmu, &mut p, PER_TURN_BUDGET, false);
         // Drain every turn, regardless of what the turn ended with (Vsync,
@@ -773,12 +800,19 @@ fn run(
                 // published, until resumed, stepped, or stopped. The pause
                 // time is kept out of the cart's clock below so it doesn't
                 // see a giant tick.
-                let (parked, stop_requested) =
-                    park_while_paused(pause, step, stop, audio_writer.as_ref());
+                let (parked, parked_stop) = park_while_paused(
+                    pause,
+                    step,
+                    stop,
+                    link.as_ref(),
+                    link_owned,
+                    audio_writer.as_ref(),
+                );
                 paused_total += parked;
-                if stop_requested {
-                    // Stopped out of the debugger's park: not an error.
-                    break ("stopped".to_string(), false);
+                if let Some(reason) = parked_stop {
+                    // Stopped out of the debugger's park: not an error,
+                    // whichever of the two asked for it.
+                    break (reason.to_string(), false);
                 }
                 last_present = Instant::now();
                 // AFTER the hold, not before it. `native::refresh_input`
@@ -810,12 +844,19 @@ fn run(
             FrameEvent::Budget => {
                 // A cart that never reaches vsync_wait still honours pause
                 // (no frame to publish or snapshot, but it parks).
-                let (parked, stop_requested) =
-                    park_while_paused(pause, step, stop, audio_writer.as_ref());
+                let (parked, parked_stop) = park_while_paused(
+                    pause,
+                    step,
+                    stop,
+                    link.as_ref(),
+                    link_owned,
+                    audio_writer.as_ref(),
+                );
                 paused_total += parked;
-                if stop_requested {
-                    // Stopped out of the debugger's park: not an error.
-                    break ("stopped".to_string(), false);
+                if let Some(reason) = parked_stop {
+                    // Stopped out of the debugger's park: not an error,
+                    // whichever of the two asked for it.
+                    break (reason.to_string(), false);
                 }
                 p.input_mask = input.load(Ordering::Acquire);
             }
@@ -906,10 +947,12 @@ fn park_while_paused(
     pause: &AtomicBool,
     step: &AtomicU32,
     stop: &AtomicBool,
+    link: Option<&Arc<LinkEndpoint>>,
+    link_owned: &AtomicBool,
     audio_writer: Option<&RingWriter>,
-) -> (Duration, bool) {
+) -> (Duration, Option<&'static str>) {
     if !pause.load(Ordering::Acquire) {
-        return (Duration::ZERO, false);
+        return (Duration::ZERO, None);
     }
     let parked_at = Instant::now();
     if let Some(writer) = audio_writer {
@@ -917,17 +960,34 @@ fn park_while_paused(
     }
     loop {
         if stop.load(Ordering::Acquire) {
-            return (parked_at.elapsed(), true);
+            return (parked_at.elapsed(), Some("stopped"));
+        }
+        // A PAUSED viewer still hears the world panel. The park is where
+        // a manually paused run spends all of its time -- it has already
+        // published the frame it was on -- so a request noticed only on
+        // the frame path would never be acted on at all.
+        if world_panel_stop_requested(link, link_owned) {
+            return (parked_at.elapsed(), Some(WORLD_PANEL_STOP));
         }
         if !pause.load(Ordering::Acquire) {
-            return (parked_at.elapsed(), false);
+            return (parked_at.elapsed(), None);
         }
         if step.load(Ordering::Acquire) > 0 {
             step.fetch_sub(1, Ordering::AcqRel);
-            return (parked_at.elapsed(), false);
+            return (parked_at.elapsed(), None);
         }
         std::thread::sleep(FRAME_TIME);
     }
+}
+
+/// Has the world panel asked this run to end
+/// ([`ggo_common::LinkEndpoint::request_stop`])?
+///
+/// Only while the link is still THIS run's to answer for: a handed-over
+/// endpoint (see [`Session::release_link`]) belongs to whoever owns it
+/// next, and its request is that run's to act on, not ours.
+fn world_panel_stop_requested(link: Option<&Arc<LinkEndpoint>>, link_owned: &AtomicBool) -> bool {
+    link.is_some_and(|link| link_owned.load(Ordering::Acquire) && link.stop_requested())
 }
 
 /// Refill the debugger's snapshot slot from the PPU. Reuses the previous
@@ -2039,6 +2099,79 @@ mod tests {
             ViewerState::Building,
             "a released run does not report its own ending through the endpoint"
         );
+    }
+
+    /// **A PAUSED viewer run still hears the world panel.** The pane
+    /// notices [`ggo_common::LinkEndpoint::request_stop`] on the frame
+    /// path, and a paused run publishes no frames -- it sits in
+    /// [`park_while_paused`] indefinitely. So the thread checks too, and
+    /// ends with the same reason the pane would have written.
+    ///
+    /// No `Session::wait` before the assertion: `wait` sets the stop flag
+    /// itself, which would end the run whether or not the request was
+    /// heard. The thread dropping its frame sender IS the observation.
+    #[test]
+    fn a_paused_run_ends_on_the_world_panels_stop_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("green.cart");
+        std::fs::write(&path, green_screen_cart()).unwrap();
+
+        let endpoint = LinkEndpoint::new();
+        let (session, rx) = start(path, "green.cart".to_string(), None, Some(endpoint.clone()));
+        rx.recv_blocking().expect("the emulator thread must run");
+        session.pause();
+        // Long enough for the thread to reach the park and settle there:
+        // the pause is read at a frame boundary, so one frame period is
+        // the bound and four is slack.
+        std::thread::sleep(FRAME_TIME * 4);
+        assert!(!rx.is_closed(), "a paused run is still a live run");
+
+        endpoint.request_stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !rx.is_closed() {
+            assert!(
+                Instant::now() < deadline,
+                "a paused run ignored the world panel's stop request"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            endpoint.state(),
+            ViewerState::Stopped(WORLD_PANEL_STOP.to_string()),
+            "and says who ended it"
+        );
+        assert_eq!(session.wait().reason, WORLD_PANEL_STOP);
+    }
+
+    /// The same request on a run whose link has been handed over is not
+    /// this run's to act on: the endpoint belongs to whoever owns it next,
+    /// and their run is the one that must end.
+    #[test]
+    fn a_released_run_ignores_the_world_panels_stop_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("green.cart");
+        std::fs::write(&path, green_screen_cart()).unwrap();
+
+        let endpoint = LinkEndpoint::new();
+        let (session, rx) = start(path, "green.cart".to_string(), None, Some(endpoint.clone()));
+        rx.recv_blocking().expect("the emulator thread must run");
+        session.release_link();
+        assert!(
+            session.link().is_none(),
+            "a released run has no link to report through"
+        );
+
+        endpoint.request_stop();
+        for _ in 0..5 {
+            rx.recv_blocking().expect("the run carries on");
+        }
+        assert_eq!(
+            endpoint.state(),
+            ViewerState::Building,
+            "and it wrote nothing to an endpoint that is no longer its own"
+        );
+        drop(rx);
+        assert_eq!(session.wait().reason, "stopped");
     }
 
     /// A cart that exits reports the exit code -- and still hands back
