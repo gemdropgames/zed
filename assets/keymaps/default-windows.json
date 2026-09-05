@@ -1729,6 +1729,7 @@
       "ctrl-c": "ggo_world::Copy",
       "ctrl-v": "ggo_world::Paste",
       "ctrl-d": "ggo_world::Duplicate",
+      "ctrl-alt-l": "ggo_world::ToggleCanvasMode",
     },
   },
   {

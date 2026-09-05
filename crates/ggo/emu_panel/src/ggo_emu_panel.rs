@@ -1899,7 +1899,33 @@ impl EmuPanel {
             // its own terms (cart exit, CPU fault, or a stop flag it has
             // now acted on). There is no terminal message on the wire --
             // the close IS the message. See `drive::start`'s doc.
-            this.update(cx, |this, cx| this.finish_run(cx)).ok();
+            //
+            // "A stop flag it has now acted on" includes the WORLD
+            // PANEL's: the thread checks that one too (at its loop top
+            // and in the vsync park, where a paused viewer spends all of
+            // its time), so either it or `on_frame` above notices first.
+            // Both must leave the pane in the same state, so the race the
+            // thread won takes the same teardown the `StopRequested` arm
+            // does. `finish_run` alone reports the same reason but keeps
+            // the endpoint, the frame published into it and the `Viewer`
+            // run kind, for a view that has already left live mode.
+            let stop_requested = this
+                .read_with(cx, |this, _cx| {
+                    this.viewer_link
+                        .as_ref()
+                        .is_some_and(|link| link.stop_requested())
+                })
+                .unwrap_or(false);
+            let torn_down = stop_requested
+                && window_handle
+                    .update(cx, |_root, window, cx| {
+                        this.update(cx, |this, cx| this.stop_for_world_panel(window, cx))
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+            if !torn_down {
+                this.update(cx, |this, cx| this.finish_run(cx)).ok();
+            }
         }));
         cx.notify();
     }
@@ -7285,6 +7311,65 @@ mod tests {
         );
     }
 
+    /// **The same request, noticed by the EMULATOR THREAD.** A paused
+    /// viewer publishes no frame for `on_frame` to see the request on, so
+    /// the run ends by the thread's own check in the vsync park and the
+    /// pump reaches its tail instead of its `StopRequested` arm. The
+    /// teardown has to be the same one either way -- otherwise which of
+    /// the two won the race decides whether the pane is left holding a
+    /// dead view's endpoint and tiles.
+    #[gpui::test]
+    async fn a_stop_request_the_thread_notices_first_tears_the_viewer_down_too(
+        cx: &mut TestAppContext,
+    ) {
+        let (fixture, cx) = viewer_fixture(cx, true).await;
+        let endpoint = ggo_common::LinkEndpoint::new();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        await_first_frame(&fixture.panel, cx);
+        fixture.panel.update(cx, |panel, cx| panel.toggle_pause(cx));
+
+        // Let the thread reach its park and the pump drain the frames
+        // already in flight -- several frame periods' worth of wall clock,
+        // because both are off this thread. From here the channel stays
+        // empty, so only the thread's own check can see the request.
+        let settled = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while std::time::Instant::now() < settled {
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        endpoint.request_stop();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fixture.panel.read_with(cx, |panel, _| panel.is_running()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the paused run ignored the world panel's stop request"
+            );
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fixture.panel.read_with(cx, |panel, _| {
+            assert!(panel.viewer_link.is_none(), "the link was released");
+            assert!(matches!(panel.run_kind, RunKind::Cart));
+        });
+        assert_eq!(
+            endpoint.frame_number(),
+            None,
+            "and the frame it was holding is handed back"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Stopped(drive::WORLD_PANEL_STOP.to_string()),
+        );
+    }
+
     /// The other half of the registry hop: with no booter registered
     /// (this build has no emulator pane), `boot_viewer` hands back
     /// nothing at all -- which is what keeps the world view in its design
@@ -8643,6 +8728,27 @@ mod tests {
         assert!(
             watch_triggers("assets/worlds/notes.txt", &PathChange::Updated, true),
             "only the world DOCUMENT travels over the link"
+        );
+    }
+
+    /// The other half of that carve-out: everything the pack bakes INTO
+    /// the viewer cart still rebuilds it, and the carve-out is scoped to
+    /// the two documents' own directories rather than to their
+    /// extensions.
+    #[test]
+    fn a_viewer_run_still_rebuilds_for_what_is_packed_into_the_cart() {
+        use project::PathChange;
+        assert!(
+            watch_triggers("assets/sprites/hero.spr", &PathChange::Updated, true),
+            "a sprite is baked into the cart"
+        );
+        assert!(
+            watch_triggers("src/main.rs", &PathChange::Updated, true),
+            "and so is the cart's entry point"
+        );
+        assert!(
+            watch_triggers("assets/levels/overworld.map", &PathChange::Updated, true),
+            "a .map outside a maps/ directory is not a document the world view sends"
         );
     }
 

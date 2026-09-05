@@ -14597,8 +14597,12 @@ mod tests {
         );
     }
 
-    /// The status line only exists while a session does, and it says which
-    /// one -- a Design-mode panel is not "connecting" to anything.
+    /// The status line belongs to LIVE mode, not to the session: it
+    /// tracks the session while there is one (and says an idle "not
+    /// running" when there is not, which
+    /// `live_with_no_session_says_so_and_offers_a_start` covers), and
+    /// Design mode is silent about a session either way -- a Design panel
+    /// is not "connecting" to anything.
     #[gpui::test]
     async fn the_status_line_follows_the_session(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
