@@ -2482,7 +2482,17 @@ impl EmuPanel {
     /// Hidden-tab pause: the emulator item was deactivated. Undone by the
     /// next render (only a visible item renders). A run already paused by
     /// the user is left exactly as it is.
+    ///
+    /// **A viewer run is exempt.** Its audience is the world panel, not
+    /// this tab -- which is hardly ever the front one while a live view is
+    /// up -- and the pause takes effect inside the very `Vsync` arm the
+    /// link is pumped from, so adopting it would freeze the live feed for
+    /// as long as the user looked at anything else. [`Self::auto_resume`]
+    /// needs no matching guard: it only ever undoes what this set.
     pub(crate) fn auto_pause(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.run_kind, RunKind::Viewer(_)) {
+            return;
+        }
         let Some(session) = &self.session else {
             return;
         };
@@ -6743,6 +6753,55 @@ mod tests {
             cx.update(|window, _| !window.has_image_atlas_entry(&first)),
             "the frame from two publishes ago IS retired"
         );
+    }
+
+    /// **A viewer run is never hidden-tab paused.** The world view lives
+    /// somewhere else entirely (its own panel), so the emulator tab is
+    /// hardly ever the front one while a live view is up -- and the
+    /// deactivation pause lands inside the `Vsync` arm the link is pumped
+    /// from, so adopting it would freeze the live feed for as long as the
+    /// user looked at anything but the emulator.
+    #[gpui::test]
+    async fn a_viewer_run_is_not_paused_when_its_tab_is_hidden(cx: &mut TestAppContext) {
+        let (fixture, cx) = viewer_fixture(cx, true).await;
+        let endpoint = ggo_common::LinkEndpoint::new();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        await_first_frame(&fixture.panel, cx);
+
+        // Another centre tab takes the pane, which is what deactivates
+        // the emulator item -- and, unlike a bare `auto_pause` call, also
+        // stops it rendering, so nothing resumes it behind our back.
+        // Deliberately NOT followed by `run_until_parked`: a viewer run
+        // that correctly keeps running refills the frame channel every
+        // ~16ms, so the executor never goes idle (see `await_first_frame`).
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
+        });
+        fixture.panel.read_with(cx, |panel, _| {
+            assert!(!panel.auto_paused, "a viewer run is not hidden-tab paused");
+            assert!(!panel.is_paused(), "and the cart keeps running");
+        });
+
+        // And the feed really does keep advancing behind the hidden tab.
+        let published = endpoint.frame_number().expect("a frame has been published");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while endpoint.frame_number() == Some(published) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the live feed stopped advancing once the tab was hidden"
+            );
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fixture
+            .panel
+            .update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.run_until_parked();
     }
 
     /// Watch mode on a viewer run rebuilds through the SAME viewer boot
