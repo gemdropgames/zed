@@ -217,12 +217,9 @@ pub struct Session {
     outcome: Arc<Mutex<Option<RunOutcome>>>,
     /// The viewer link this run is driving, when it was started for one
     /// (`None` for an ordinary cart run). Held so the host side can be
-    /// reached from the session the panel keeps.
-    ///
-    /// Only this module's tests read it back today -- the world view that
-    /// starts a run with a link is the next piece of this feature -- and
-    /// the fork denies dead code, hence the narrow allow.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// reached from the session the panel keeps -- which is how
+    /// `EmuPanel::finish_run` reports the end of a run through the
+    /// endpoint THAT run was driving.
     link: Option<Arc<LinkEndpoint>>,
     /// `None` only after [`Self::wait`] has taken it.
     join: Option<JoinHandle<()>>,
@@ -315,7 +312,6 @@ impl Session {
     }
 
     /// The viewer link this run was started for, if any.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn link(&self) -> Option<Arc<LinkEndpoint>> {
         self.link.clone()
     }

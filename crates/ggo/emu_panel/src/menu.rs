@@ -107,6 +107,43 @@ pub fn cart_selection(root: &Path, abs: &Path) -> String {
     }
 }
 
+// ------------------------------------------------------- the viewer cart
+
+/// `emd editor-cart --ggo`: the viewer cart -- the game's own code plus
+/// emerald's editor systems -- packed with the project's assets folded
+/// in, so the pane boots it exactly like any other `.ggo`.
+///
+/// No `--world`: the viewer boots empty and the world panel sends it a
+/// world over the link, which is the whole point of the live view. That
+/// is also why the build does not depend on a world stem the way
+/// [`world_pack_args`] does.
+pub fn editor_cart_args() -> Vec<String> {
+    vec!["editor-cart".to_string(), "--ggo".to_string()]
+}
+
+/// The `.ggo` path `emd editor-cart --ggo` printed in its JSON trailer
+/// (`{"cart":…,"elf":…,"ggo":…}`, emerald's
+/// `commands::editor_cart::editor_cart_result_value`).
+///
+/// A BARE JSON line, deliberately not
+/// `ggo_worldlib::emerald::parse_emd_trailer`: `editor-cart` is a `Unit`
+/// outcome in `emd`'s `main`, so it prints its result itself with
+/// `println!` and never wears the `emd-json: ` prefix that the mutation
+/// commands' trailer carries. `ggo` is `null` when the build was asked
+/// for a `.cart` only, which reads here as "there is nothing to boot".
+pub fn editor_cart_ggo_path(lines: &[String]) -> Option<PathBuf> {
+    lines
+        .iter()
+        .rev()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("ggo")
+                .cloned()
+        })
+        .and_then(|ggo| ggo.as_str().map(PathBuf::from))
+}
+
 // ----------------------------------------------------- hardware diagnostics
 
 /// Stable-symlink directory scanned first -- immune to `ttyUSB`
@@ -513,6 +550,43 @@ mod tests {
         assert_eq!(
             cart_selection(Path::new("/proj"), Path::new("/elsewhere/x.ggo")),
             "/elsewhere/x.ggo"
+        );
+    }
+
+    #[test]
+    fn editor_cart_args_ask_for_the_ggo_artifact() {
+        assert_eq!(editor_cart_args(), ["editor-cart", "--ggo"]);
+        assert_eq!(
+            ProcRequest::emd("/proj", editor_cart_args()).args.last(),
+            Some(&"--json".to_string()),
+            "the request adds the machine-readable flag, as the pack path does"
+        );
+    }
+
+    /// The trailer is the LAST parseable JSON line, and a build that
+    /// packed no `.ggo` (`"ggo": null`) has nothing to boot.
+    #[test]
+    fn editor_cart_ggo_path_reads_the_json_trailer() {
+        let lines = vec![
+            "   Compiling demo_editor".to_string(),
+            r#"{"cart":"/p/demo-editor.cart","elf":"/p/.tmp/x","ggo":"/p/demo-editor.ggo"}"#
+                .to_string(),
+        ];
+        assert_eq!(
+            editor_cart_ggo_path(&lines),
+            Some(PathBuf::from("/p/demo-editor.ggo"))
+        );
+        let no_ggo =
+            vec![r#"{"cart":"/p/demo-editor.cart","elf":"/p/.tmp/x","ggo":null}"#.to_string()];
+        assert_eq!(editor_cart_ggo_path(&no_ggo), None);
+        assert_eq!(editor_cart_ggo_path(&["packed".to_string()]), None);
+        assert_eq!(
+            editor_cart_ggo_path(&[
+                r#"{"ggo":"/p/demo-editor.ggo"}"#.to_string(),
+                "42".to_string(),
+            ]),
+            Some(PathBuf::from("/p/demo-editor.ggo")),
+            "a bare number is valid JSON and must not shadow the real trailer"
         );
     }
 
