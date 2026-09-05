@@ -1134,6 +1134,22 @@ pub mod fixture {
             | 0x23
     }
 
+    /// `bge rs1, rs2, offset` (offset in bytes, relative to this
+    /// instruction). The only branch any fixture needs, and only
+    /// [`comm_echo_cart`] needs it: `bge x0, a0` is "skip unless
+    /// `comm_recv` returned something".
+    fn bge(rs1: u32, rs2: u32, offset: i32) -> u32 {
+        let imm = offset as u32;
+        (((imm >> 12) & 1) << 31)
+            | (((imm >> 5) & 0x3F) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (5 << 12)
+            | (((imm >> 1) & 0xF) << 8)
+            | (((imm >> 11) & 1) << 7)
+            | 0x63
+    }
+
     /// `jal x0, offset` (offset in bytes, relative to this instruction).
     fn jal_x0(offset: i32) -> u32 {
         let imm = offset as u32;
@@ -1156,6 +1172,8 @@ pub mod fixture {
     const SYS_SET_PALETTE: i32 = 0x05;
     const SYS_LOG: i32 = 0x4B;
     const SYS_SAVE_WRITE: i32 = 0x31;
+    const SYS_COMM_SEND: i32 = gemdrop_sdk::sys::COMM_SEND as i32;
+    const SYS_COMM_RECV: i32 = gemdrop_sdk::sys::COMM_RECV as i32;
 
     /// RGB565 green -- 0x07E0, which happens to fit in a 12-bit signed
     /// immediate, so the program needs no `lui`.
@@ -1325,6 +1343,77 @@ pub mod fixture {
         h[0x04..0x06].copy_from_slice(&SUPPORTED_HEADER_VERSION.to_le_bytes());
         h[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // required_abi
         h[0x08..0x08 + LOGGING_CART_TITLE.len()].copy_from_slice(LOGGING_CART_TITLE.as_bytes());
+        h[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes()); // entry_offset
+        h[0x2C..0x30].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        h[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // save_bytes
+        h[0x34..0x38].copy_from_slice(&0u32.to_le_bytes()); // ram_needed
+        h[0x38..0x3C].copy_from_slice(&0u32.to_le_bytes()); // flags
+        let crc = crc32(&h[0x00..0x3C]);
+        h[0x3C..0x40].copy_from_slice(&crc.to_le_bytes());
+
+        let mut out = h.to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    pub const ECHO_CART_TITLE: &str = "Echo Fix";
+
+    /// The `comm_recv` destination and `comm_send` source: the base of
+    /// the cart's own arena, which is the one region the sandbox lets a
+    /// cart both write (so `comm_recv` may fill it) and read (so
+    /// `comm_send` may frame it).
+    const ECHO_BUFFER: u32 = super::sandbox::ARENA_BASE;
+
+    /// The capacity the cart offers `comm_recv`, and the wire's own
+    /// maximum: `ggo_wire::MAX_PAYLOAD`.
+    const ECHO_CAPACITY: i32 = 255;
+
+    /// A cart that echoes the link: every frame it asks for a datagram
+    /// and, if one arrived, sends the very same bytes straight back,
+    /// then waits for vsync.
+    ///
+    /// ```text
+    ///     a3 = ARENA_BASE                   ; the buffer, kept across ecalls
+    /// loop:
+    ///     a0 = a3; a1 = 255; comm_recv()    ; a0 = payload length, 0 = nothing
+    ///     if a0 <= 0 goto wait
+    ///     a1 = a0; a0 = a3; comm_send()     ; the same bytes back
+    /// wait:
+    ///     vsync_wait()                      ; frame boundary -- where the
+    ///     j loop                            ; host's pump runs
+    /// ```
+    ///
+    /// This is what makes [`crate::link::pump_link`]'s CALL SITE
+    /// testable: the module's own tests drive the two halves directly,
+    /// but only a cart that really reads and writes its comm queues
+    /// exercises the frame boundary the driver pumps at.
+    pub fn comm_echo_cart() -> Vec<u8> {
+        const A3: u32 = 13;
+        let body: Vec<u32> = vec![
+            lui(A3, ECHO_BUFFER >> 12),   // a3 = the arena buffer
+            addi_reg(A0, A3, 0),          // loop: a0 = buf
+            addi(A1, ECHO_CAPACITY),      // a1 = capacity
+            addi(A7, SYS_COMM_RECV),      //
+            ECALL,                        // a0 = length (0 = nothing queued)
+            bge(0, A0, 20),               // if a0 <= 0, skip to `wait`
+            addi_reg(A1, A0, 0),          // a1 = length
+            addi_reg(A0, A3, 0),          // a0 = buf
+            addi(A7, SYS_COMM_SEND),      //
+            ECALL,                        // comm_send(buf, length)
+            addi(A7, SYS_VSYNC_WAIT),     // wait:
+            ECALL,                        //
+            jal_x0(-44),                  // back to `loop`
+        ];
+        // `bge`'s +20 and `jal`'s -44 are byte offsets into this exact
+        // sequence; an inserted instruction silently re-aims both.
+        debug_assert_eq!(body.len(), 13, "the branch offsets assume 13 instructions");
+        let body: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        let mut h = [0u8; HEADER_LEN];
+        h[0x00..0x04].copy_from_slice(&MAGIC);
+        h[0x04..0x06].copy_from_slice(&SUPPORTED_HEADER_VERSION.to_le_bytes());
+        h[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // required_abi
+        h[0x08..0x08 + ECHO_CART_TITLE.len()].copy_from_slice(ECHO_CART_TITLE.as_bytes());
         h[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes()); // entry_offset
         h[0x2C..0x30].copy_from_slice(&(body.len() as u32).to_le_bytes());
         h[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // save_bytes
@@ -1881,6 +1970,73 @@ mod tests {
         assert!(rx.recv_blocking().is_err());
         let finished = session.wait();
         assert_eq!(endpoint.state(), ViewerState::Stopped(finished.reason));
+    }
+
+    /// **The `Vsync` pump's call site, end to end.** A wire frame the
+    /// host queues on the endpoint reaches a REAL cart's `comm_recv`, and
+    /// what that cart sends back comes out of the endpoint as a decoded
+    /// `CHANNEL_APP` payload. `crate::link`'s own tests drive the two
+    /// halves directly; only this one runs them at the frame boundary the
+    /// driver actually pumps at.
+    #[test]
+    fn the_frame_boundary_pump_carries_the_link_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("echo.cart");
+        std::fs::write(&path, fixture::comm_echo_cart()).unwrap();
+
+        let endpoint = LinkEndpoint::new();
+        let (session, rx) = start(
+            path,
+            "echo.cart".to_string(),
+            None,
+            Some(endpoint.clone()),
+        );
+        endpoint.send_app(b"ping").expect("a four-byte payload fits");
+
+        // The host's frame is injected at one boundary, read by the cart
+        // on the next, and its reply decoded at the one after -- so a
+        // handful of frames, not one. The `recv` blocks, so this cannot
+        // spin.
+        let mut inbound = Vec::new();
+        for _ in 0..30 {
+            rx.recv_blocking().expect("the emulator thread must run");
+            inbound.extend(endpoint.try_recv_inbound());
+            if !inbound.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            inbound,
+            vec![b"ping".to_vec()],
+            "the cart echoed the host's datagram back over the link"
+        );
+
+        // Hand the link over: from here this run neither drains what the
+        // host queues nor publishes what the cart sends, and its ending
+        // is no longer its to report.
+        session.release_link();
+        endpoint.send_app(b"pong").expect("a four-byte payload fits");
+        for _ in 0..20 {
+            rx.recv_blocking().expect("the emulator thread must run");
+        }
+        assert!(
+            endpoint.try_recv_inbound().is_empty(),
+            "a released link is not pumped"
+        );
+        assert_eq!(
+            endpoint.take_outbound().len(),
+            1,
+            "and what the host queued is left for whoever owns the link next"
+        );
+
+        drop(rx);
+        let finished = session.wait();
+        assert_eq!(finished.reason, "stopped");
+        assert_eq!(
+            endpoint.state(),
+            ViewerState::Building,
+            "a released run does not report its own ending through the endpoint"
+        );
     }
 
     /// A cart that exits reports the exit code -- and still hands back
