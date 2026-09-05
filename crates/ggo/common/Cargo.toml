@@ -15,6 +15,7 @@ path = "src/ggo_common.rs"
 async-channel.workspace = true # GGO -- LinkEndpoint's inbound/tick channels
 log.workspace = true
 settings.workspace = true # GGO -- `bind_default_keymap` for panel tests
+ggo-wire.workspace = true # GGO -- LinkEndpoint::send_app frames CHANNEL_APP
 gpui.workspace = true
 schemars.workspace = true # GGO -- the `ReimportTileset` Action derive
 serde.workspace = true

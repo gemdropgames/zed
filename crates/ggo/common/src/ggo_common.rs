@@ -20,6 +20,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use smol::process::Command;
@@ -602,6 +603,11 @@ pub struct LinkEndpoint {
     tick_tx: async_channel::Sender<()>,
     tick_rx: async_channel::Receiver<()>,
     state: Mutex<ViewerState>,
+    /// Set by [`Self::request_stop`], read by whoever is running the
+    /// viewer cart. One-way: a host that has asked for the run to end has
+    /// nothing to take back, and the endpoint itself is abandoned with the
+    /// run.
+    stop_requested: AtomicBool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -623,6 +629,7 @@ impl LinkEndpoint {
             tick_tx,
             tick_rx,
             state: Mutex::new(ViewerState::Building),
+            stop_requested: AtomicBool::new(false),
         })
     }
 
@@ -632,6 +639,24 @@ impl LinkEndpoint {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(bytes);
+    }
+
+    /// Host side: queue one `CHANNEL_APP` payload for the cart, framed
+    /// here so the world panel never has to know the wire format -- the
+    /// one framing site on this side, matching the cart's own single
+    /// `COMM_SEND` framing site in `ggo-emu-core`'s ecall dispatch.
+    ///
+    /// `Err` for a payload the wire cannot carry, which is the only way
+    /// this can fail. It is a caller bug rather than a transport problem
+    /// (the world panel splits its own updates), so the message is a
+    /// `&'static str` the caller can log rather than an error type.
+    pub fn send_app(&self, payload: &[u8]) -> Result<(), &'static str> {
+        let mut frame = Vec::new();
+        if !ggo_wire::encode_payload(ggo_wire::channel::APP, payload, |byte| frame.push(byte)) {
+            return Err("payload is longer than the wire's maximum");
+        }
+        self.send_wire(frame);
+        Ok(())
     }
 
     /// Emulator thread: take everything queued since the last drain.
@@ -681,6 +706,30 @@ impl LinkEndpoint {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// The cart frame number of whatever is in [`Self::frame`], without
+    /// handing out the image: a host that only wants to know whether the
+    /// feed advanced must not end up holding an `Arc` to a tile the
+    /// publisher is about to retire.
+    pub fn frame_number(&self) -> Option<u32> {
+        self.frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(number, _image)| *number)
+    }
+
+    /// Host side: ask the emulator to end this run (the world view left
+    /// live mode). Advisory -- the emulator acts on it at its next frame
+    /// -- and idempotent.
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+    }
+
+    /// Emulator side: has the host asked for this run to end?
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
     }
 }
 
@@ -2110,15 +2159,69 @@ mod tests {
         );
     }
 
+    /// The host's one framing site: what `send_app` queues is a wire
+    /// frame a cart's decoder accepts, on `CHANNEL_APP`, carrying the
+    /// bytes verbatim.
+    #[test]
+    fn link_endpoint_send_app_frames_the_payload_on_the_app_channel() {
+        let ep = LinkEndpoint::new();
+        ep.send_app(b"hello")
+            .expect("a short payload fits the wire");
+        let queued = ep.take_outbound();
+        assert_eq!(queued.len(), 1);
+        let mut expected = Vec::new();
+        assert!(ggo_wire::encode_payload(
+            ggo_wire::channel::APP,
+            b"hello",
+            |byte| expected.push(byte)
+        ));
+        assert_eq!(queued[0], expected);
+    }
+
+    /// A payload the wire cannot carry is refused rather than truncated,
+    /// and nothing is queued -- a half-sent world edit would resync the
+    /// cart's decoder against a frame that was never framed.
+    #[test]
+    fn link_endpoint_send_app_refuses_an_oversize_payload() {
+        let ep = LinkEndpoint::new();
+        assert!(ep.send_app(&vec![0u8; 256]).is_err());
+        assert!(ep.take_outbound().is_empty(), "nothing was queued");
+        assert!(ep.send_app(&vec![0u8; 255]).is_ok(), "255 is the maximum");
+    }
+
+    /// The host can ask whether the feed advanced without taking an `Arc`
+    /// to the image: only the publisher may hold one (see
+    /// [`LinkEndpoint::frame`]).
     #[gpui::test]
-    fn boot_viewer_returns_none_without_a_booter(cx: &mut gpui::TestAppContext) {
-        // No registry global at all: the world panel must fall back to Design.
-        let registered = cx.update(|cx| {
-            cx.try_global::<ViewerBooters>()
-                .map(|b| b.0.len())
-                .unwrap_or(0)
+    fn link_endpoint_frame_number_reads_the_slot_without_the_image(cx: &mut gpui::TestAppContext) {
+        let ep = LinkEndpoint::new();
+        assert_eq!(ep.frame_number(), None, "nothing published yet");
+        let image = cx.update(|_cx| {
+            Arc::new(gpui::RenderImage::new(vec![Frame::new(
+                image::ImageBuffer::new(1, 1),
+            )]))
         });
-        assert_eq!(registered, 0);
+        *ep.frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((7, image.clone()));
+        assert_eq!(ep.frame_number(), Some(7));
+        assert_eq!(
+            Arc::strong_count(&image),
+            2,
+            "reading the number must not clone the image out of the slot"
+        );
+    }
+
+    /// Live -> Design: the host asks the run to end. One-way and
+    /// idempotent -- the emulator acts on it at its next frame.
+    #[test]
+    fn link_endpoint_stop_request_is_one_way() {
+        let ep = LinkEndpoint::new();
+        assert!(!ep.stop_requested(), "a fresh endpoint wants the run");
+        ep.request_stop();
+        assert!(ep.stop_requested());
+        ep.request_stop();
+        assert!(ep.stop_requested(), "asking twice is asking once");
     }
 }
 
