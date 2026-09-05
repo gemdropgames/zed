@@ -23,7 +23,7 @@ use ggo_worldlib::render::{self, AssetLoads, Loadable, collect_load_targets};
 use ggo_worldlib::schemas::{ComponentSchema, ManifestComponent, all_schemas, manifest_components};
 use ggo_worldlib::sprites::{io, preview};
 use ggo_worldlib::world_doc::{Background, WorldDocStore, WorldDocWire, WorldState};
-use ggo_worldlib::world_file::read_world;
+use ggo_worldlib::world_file::{WorldInstance, read_world};
 use ggo_worldlib::world_files::{self, WORLD_EXT, WorldListing};
 
 /// Everything the panel needs to enter its Ready state, assembled entirely
@@ -187,6 +187,95 @@ pub fn fill_missing_background_loads(
             settle(io::compose_map_rgba(project_dir, &bg.stem).map_err(|e| e.to_string()))
         });
     }
+}
+
+// ------------------------------------------------------- live-mode payloads
+//
+// These land ahead of the panel code that drives them (Task 4 wires the
+// Live-mode session), so their only callers so far are this module's own
+// tests -- hence the `dead_code` allows, which Task 4 removes.
+
+const TILESET_EXT: &str = ".til";
+
+/// One background slot's cells, ready for the cart's `CMD_LOAD_LAYER`
+/// (`live::layer_bytes`) plus the tileset the slot's map is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct LayerPayload {
+    pub slot: u8,
+    /// Asset-root-relative, extension-less -- the `.til` path the map
+    /// carries minus its suffix, i.e. the same shape every other stem in
+    /// this module has.
+    pub tileset_stem: String,
+    pub w: u16,
+    pub h: u16,
+    pub cells: Vec<u16>,
+}
+
+/// One payload per merged background slot whose `.map` opens. A slot
+/// whose map is missing (or fails to decode) is SKIPPED rather than sent
+/// as an empty layer: the panel already surfaces that slot's failure on
+/// the layers rail, and pushing a zero-sized layer to the cart would
+/// blank a slot the user can still see composed on the canvas.
+#[allow(dead_code)]
+pub fn layer_payloads(root: &Path, merged: &[MergedBackground]) -> Vec<LayerPayload> {
+    merged
+        .iter()
+        .filter_map(|background| {
+            let rel = format!("{}.map", background.stem);
+            let map = io::open_map(root, &rel).ok()?;
+            let tileset_stem = map
+                .til_path
+                .strip_suffix(TILESET_EXT)
+                .unwrap_or(&map.til_path)
+                .to_string();
+            Some(LayerPayload {
+                slot: background.layer,
+                tileset_stem,
+                w: map.w,
+                h: map.h,
+                cells: map.cells,
+            })
+        })
+        .collect()
+}
+
+/// How many entities each top-level instance contributes once flattened,
+/// in `[[instance]]` order -- the counts `live::IndexMap::new` needs to
+/// map a cart index back to a document selection. Recursion follows
+/// emerald's `collect_world` encoder order (each nested `[[instance]]`
+/// depth-first, in file order); a world that fails to read counts 0, the
+/// same "contributes nothing" rule the background merge uses.
+#[allow(dead_code)]
+pub fn instance_entity_counts(root: &Path, instances: &[WorldInstance]) -> Vec<usize> {
+    instances
+        .iter()
+        .map(|instance| subtree_entity_count(root, &instance.world, &mut Vec::new()))
+        .collect()
+}
+
+/// `seen` is the stem chain above this call; a repeat contributes 0
+/// instead of recursing forever, matching `resolve_world_value`'s
+/// `visited` guard (a cycle there becomes that instance's `error`, which
+/// the encoder likewise flattens to nothing).
+fn subtree_entity_count(root: &Path, stem: &str, seen: &mut Vec<String>) -> usize {
+    if seen.iter().any(|s| s == stem) {
+        return 0;
+    }
+    seen.push(stem.to_string());
+    let count = match read_world(root, &format!("{stem}{WORLD_EXT}")) {
+        Ok(world) => {
+            world.entities.len()
+                + world
+                    .instances
+                    .iter()
+                    .map(|nested| subtree_entity_count(root, &nested.world, seen))
+                    .sum::<usize>()
+        }
+        Err(_) => 0,
+    };
+    seen.pop();
+    count
 }
 
 // --------------------------------------------------- incremental (add time)
@@ -385,6 +474,122 @@ fn resolve_world_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_worldlib::sprites::map_doc::MapState;
+
+    /// A `w`x`h` `.map` at `rel`, bound to `til_rel`, carrying `cells`.
+    /// Returns the map's asset-root-relative STEM (what a
+    /// `[[background]]` slot names).
+    fn write_small_map(
+        root: &Path,
+        rel: &str,
+        til_rel: &str,
+        w: u16,
+        h: u16,
+        cells: &[u16],
+    ) -> String {
+        if let Some(parent) = root.join(rel).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let state = MapState {
+            w,
+            h,
+            cells: cells.to_vec(),
+            til_path: til_rel.to_string(),
+            pal_path: String::new(),
+            dirty: false,
+        };
+        io::save_map(root, rel, &state).unwrap();
+        rel.strip_suffix(".map").unwrap().to_string()
+    }
+
+    #[test]
+    fn instance_entity_counts_recurse_in_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("worlds")).unwrap();
+        std::fs::write(
+            dir.path().join("worlds/leaf.toml"),
+            "[[entity]]\nTransform = { pos = [0, 0] }\n[[entity]]\nTransform = { pos = [1, 1] }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("worlds/mid.toml"),
+            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"worlds/leaf\"\npos = [0, 0]\n",
+        )
+        .unwrap();
+        let instances = vec![
+            WorldInstance {
+                world: "worlds/mid".into(),
+                pos: [0.0, 0.0],
+                background_priority: false,
+            },
+            WorldInstance {
+                world: "worlds/missing".into(),
+                pos: [0.0, 0.0],
+                background_priority: false,
+            },
+            WorldInstance {
+                world: "worlds/leaf".into(),
+                pos: [0.0, 0.0],
+                background_priority: false,
+            },
+        ];
+        assert_eq!(instance_entity_counts(dir.path(), &instances), [3, 0, 2]);
+    }
+
+    /// A world that instances itself (directly or through a chain) must
+    /// terminate rather than recurse forever -- same guard as
+    /// `resolve_world_value`'s `visited` chain.
+    #[test]
+    fn instance_entity_counts_stop_at_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("worlds")).unwrap();
+        std::fs::write(
+            dir.path().join("worlds/a.toml"),
+            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"worlds/b\"\npos = [0, 0]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("worlds/b.toml"),
+            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"worlds/a\"\npos = [0, 0]\n",
+        )
+        .unwrap();
+        let instances = vec![WorldInstance {
+            world: "worlds/a".into(),
+            pos: [0.0, 0.0],
+            background_priority: false,
+        }];
+        assert_eq!(instance_entity_counts(dir.path(), &instances), [2]);
+    }
+
+    #[test]
+    fn layer_payloads_carry_cells_and_tileset_stem_per_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = write_small_map(dir.path(), "maps/m.map", "tiles/a.til", 2, 1, &[7, 1023]);
+        let merged = vec![MergedBackground { layer: 2, stem }];
+        let payloads = layer_payloads(dir.path(), &merged);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!((payloads[0].slot, payloads[0].w, payloads[0].h), (2, 2, 1));
+        assert_eq!(payloads[0].cells, [7, 1023]);
+        assert_eq!(payloads[0].tileset_stem, "tiles/a");
+    }
+
+    /// A slot whose `.map` is missing is skipped, not defaulted -- the
+    /// panel already reports that slot's failure on the layers rail.
+    #[test]
+    fn layer_payloads_skip_a_slot_whose_map_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = write_small_map(dir.path(), "maps/there.map", "tiles/a.til", 1, 1, &[0]);
+        let merged = vec![
+            MergedBackground {
+                layer: 0,
+                stem: "maps/gone".to_string(),
+            },
+            MergedBackground { layer: 3, stem },
+        ];
+        let payloads = layer_payloads(dir.path(), &merged);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].slot, 3);
+    }
 
     /// Picker filter: only `worlds/**.toml` files survive, nested dirs
     /// included, and listings come back path-sorted.
