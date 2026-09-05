@@ -533,6 +533,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 running: false,
                 paused: false,
                 frame: 0,
+                run_kind: ggo_emu_remote::protocol::RunKind::Cart,
+                world: None,
             }));
         }
         return Ok(serde_json::json!({ "pid": std::process::id(), "workspaces": rows }));

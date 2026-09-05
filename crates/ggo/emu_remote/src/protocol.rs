@@ -234,6 +234,29 @@ pub struct WorkspaceStatus {
     pub paused: bool,
     /// Last delivered frame number.
     pub frame: u32,
+    /// What the run is: a cart the user picked, a world packed for
+    /// emulation, or the live world view's viewer cart.
+    #[serde(default)]
+    pub run_kind: RunKind,
+    /// Worktree-relative path of the world this run was started for --
+    /// set for `world` and `viewer` runs, `None` for a plain cart.
+    #[serde(default)]
+    pub world: Option<String>,
+}
+
+/// Which of the panel's three run paths produced the run
+/// [`WorkspaceStatus`] describes. Defaults to [`RunKind::Cart`] so a
+/// host that predates the field still parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    /// A `.cart`/`.ggo` the user selected.
+    #[default]
+    Cart,
+    /// A cartridge packed by "Emulate this world".
+    World,
+    /// The live world view's viewer cart, driving the world panel.
+    Viewer,
 }
 
 /// `Cmd::FlashStatus`'s response payload: what the board run in flight
@@ -626,6 +649,44 @@ mod tests {
                 full: true
             }
         );
+    }
+
+    #[test]
+    fn workspace_status_reports_the_run_kind_and_its_world() {
+        let world = "assets/worlds/arena.toml";
+        let status = WorkspaceStatus {
+            workspace: "/w".to_string(),
+            cart: Some("target/ggo-emulate/worlds-arena.ggo".to_string()),
+            running: true,
+            paused: false,
+            frame: 12,
+            run_kind: RunKind::Viewer,
+            world: Some(world.to_string()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(r#""run_kind":"viewer""#), "{json}");
+        assert!(json.contains(&format!(r#""world":"{world}""#)), "{json}");
+        let back: WorkspaceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, status);
+
+        let world_run = WorkspaceStatus {
+            run_kind: RunKind::World,
+            ..status
+        };
+        let json = serde_json::to_string(&world_run).unwrap();
+        assert!(json.contains(r#""run_kind":"world""#), "{json}");
+        let back: WorkspaceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, world_run);
+    }
+
+    /// A host that predates the field still parses: the bridge and the
+    /// Zed build are installed separately.
+    #[test]
+    fn workspace_status_without_a_run_kind_is_a_cart_run() {
+        let old = r#"{"workspace":"/w","cart":null,"running":false,"paused":false,"frame":0}"#;
+        let back: WorkspaceStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(back.run_kind, RunKind::Cart);
+        assert_eq!(back.world, None);
     }
 
     #[test]

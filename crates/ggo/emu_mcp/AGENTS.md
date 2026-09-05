@@ -38,7 +38,7 @@ candidate is live. Start with `zed_sessions` when unsure.
 | tool | what |
 |---|---|
 | `zed_sessions` | live sessions: pid, workspaces, panel status |
-| `emu_status` | what the target session's panels are doing |
+| `emu_status` | what the target session's panels are doing: `{pid, workspaces[{workspace, cart, running, paused, frame, run_kind, world}]}`. `run_kind` is `cart` \| `world` \| `viewer` (the live world view's viewer cart); `world` is the world's rel path for the latter two |
 | `emu_start { cart, freerun? }` | boot + pause at the first frame boundary (lock-step); returns initial world JSON. Focuses the emulator tab and marks it ` · MCP`. `freerun: true` boots free-running instead (the Run button, no lock-step, no world JSON) -- watch it with `emu_screenshot`/`emu_uart`, `emu_pause` |
 | `emu_next_frame { buttons?, screenshot?, frames? }` | latch pad, run EXACTLY `frames` frames (default 1, max 60000); returns new world JSON (+ PNG if asked) |
 | `emu_stop` | end the run; returns the cart's uart log |

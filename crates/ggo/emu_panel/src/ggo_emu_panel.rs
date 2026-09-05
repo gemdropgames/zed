@@ -3758,12 +3758,19 @@ impl EmuPanel {
 
     /// Status row for `agent_remote`'s `status` command.
     pub(crate) fn remote_status(&self, workspace: String) -> ggo_emu_remote::protocol::WorkspaceStatus {
+        let run_kind = match self.run_kind {
+            RunKind::Cart => ggo_emu_remote::protocol::RunKind::Cart,
+            RunKind::World(_) => ggo_emu_remote::protocol::RunKind::World,
+            RunKind::Viewer(_) => ggo_emu_remote::protocol::RunKind::Viewer,
+        };
         ggo_emu_remote::protocol::WorkspaceStatus {
             workspace,
             cart: self.session.as_ref().map(|s| s.cart.clone()).or_else(|| self.selected.clone()),
             running: self.session.is_some(),
             paused: self.is_paused(),
             frame: self.frame,
+            run_kind,
+            world: self.run_kind.world().map(str::to_string),
         }
     }
 
