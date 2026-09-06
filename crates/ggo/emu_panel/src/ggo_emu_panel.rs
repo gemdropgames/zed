@@ -828,7 +828,9 @@ impl EmuPanel {
         let workspace = self.workspace.as_ref()?.upgrade()?;
         let world_panel = workspace
             .read(cx)
-            .panel::<ggo_world_panel::WorldPanel>(cx)?;
+            .panel::<ggo_world_panel::WorldDock>(cx)?
+            .read(cx)
+            .active()?;
         world_panel.read(cx).open_world_stem()
     }
 
@@ -6178,11 +6180,19 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
         root: &std::path::Path,
     ) -> Entity<ggo_world_panel::WorldPanel> {
-        let world_panel = workspace.read_with(cx, |workspace, cx| {
+        let dock = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<ggo_world_panel::WorldPanel>(cx)
-                .expect("ggo_world_panel::init adds its panel")
+                .panel::<ggo_world_panel::WorldDock>(cx)
+                .expect("ggo_world_panel::init adds its dock")
         });
+        // Through the dock, so the panel this returns is one the dock
+        // knows about: the save the tests are about goes through
+        // `open_panels`.
+        let world_panel = dock
+            .update_in(cx, |dock, window, cx| {
+                dock.open_world("assets/worlds/main.toml", window, cx)
+            })
+            .expect("the dock opened a world tab");
         let root = root.to_path_buf();
         world_panel.update(cx, |panel, _cx| panel.test_root_override(root));
         world_panel.update_in(cx, |panel, window, cx| {

@@ -313,8 +313,10 @@ pub(crate) fn bgra_reply(width: u32, height: u32, bgra: &[u8]) -> serde_json::Va
     })
 }
 
-/// The workspace's World panel (a dock panel `ggo_world_panel::init`
-/// registers on every workspace), leased through its window.
+/// The world panel behind the ACTIVE world tab, reached through the dock
+/// `ggo_world_panel::init` registers on every workspace, and leased
+/// through its window. There is one panel per open world now, so the
+/// agent's reads follow whichever tab is in front.
 fn world_panel_for(
     workspace: &Entity<Workspace>,
     window: AnyWindowHandle,
@@ -324,8 +326,9 @@ fn world_panel_for(
         .update(cx, |_, _window, app| {
             workspace
                 .read(app)
-                .panel::<ggo_world_panel::WorldPanel>(app)
-                .ok_or_else(|| "no World panel in this workspace".to_string())
+                .panel::<ggo_world_panel::WorldDock>(app)
+                .and_then(|dock| dock.read(app).active())
+                .ok_or_else(|| "no world is open".to_string())
         })
         .map_err(|e| e.to_string())?
 }

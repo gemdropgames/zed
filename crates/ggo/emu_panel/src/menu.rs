@@ -445,15 +445,22 @@ pub(crate) fn emulate_world_handler(
     });
     move |window, cx| {
         let saved = match workspace.upgrade() {
-            // No world panel docked means no unsaved copy of this world
-            // anywhere, so the file on disk IS the current one.
+            // No world dock means no unsaved copy of this world anywhere,
+            // so the file on disk IS the current one. With one, every open
+            // world tab is asked: any of them may be the one holding this
+            // world.
             Some(workspace) => workspace
                 .read(cx)
-                .panel::<ggo_world_panel::WorldPanel>(cx)
-                .is_none_or(|world_panel| {
-                    world_panel.update(cx, |world_panel, cx| {
-                        world_panel.save_if_open_and_dirty(&rel, cx)
-                    })
+                .panel::<ggo_world_panel::WorldDock>(cx)
+                .is_none_or(|dock| {
+                    dock.read(cx)
+                        .open_panels()
+                        .into_iter()
+                        .all(|world_panel| {
+                            world_panel.update(cx, |world_panel, cx| {
+                                world_panel.save_if_open_and_dirty(&rel, cx)
+                            })
+                        })
                 }),
             None => return,
         };
