@@ -202,13 +202,15 @@ impl Render for WorldDock {
 }
 
 impl Focusable for WorldDock {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        // The dock's own handle only stands in while no world is open:
-        // the panel's is what the world key bindings are scoped to.
-        match self.active() {
-            Some(panel) => panel.read(cx).focus_handle.clone(),
-            None => self.focus_handle.clone(),
-        }
+    /// The dock's OWN handle, deliberately: this is the root the
+    /// containment checks use, and the world tab shares its panel's
+    /// handle. Returning the panel's here would make `ToggleFocus` read
+    /// "the dock is already focused" whenever the canvas tab has focus,
+    /// and then refuse to open the dock (or, with
+    /// `close_panel_on_toggle`, close it). Focus still LANDS in the panel
+    /// -- see [`Panel::activation_focus_handle`] below.
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -221,6 +223,17 @@ impl Panel for WorldDock {
 
     fn panel_key() -> &'static str {
         GGO_WORLD_PANEL_KEY
+    }
+
+    /// Activating the dock focuses the open world's panel, whose render
+    /// tracks this handle inside the dock's own -- so the world key
+    /// bindings (`GgoWorldPanel`) dispatch, which focusing the dock's
+    /// bare root would not do.
+    fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        match self.active() {
+            Some(panel) => panel.read(cx).focus_handle.clone(),
+            None => self.focus_handle.clone(),
+        }
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
@@ -289,6 +302,7 @@ pub(crate) mod tests {
     use super::*;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
+    use workspace::item::Item as _;
     use workspace::{AppState, MultiWorkspace};
 
     /// A workspace with the dock registered and a real fixture root the
@@ -345,6 +359,16 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
 
+        let tabs = workspace.read_with(cx, |ws, cx| {
+            ws.items_of_type::<WorldCanvasItem>(cx)
+                .map(|item| item.read(cx).tab_content_text(0, cx).to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            tabs,
+            ["World: test", "World: other"],
+            "a center tab per world, titled by it"
+        );
         let panels = dock.read_with(cx, |dock, _| dock.open_panels());
         assert_eq!(panels.len(), 2, "one panel per tab");
         let rels: Vec<_> = panels
@@ -380,6 +404,11 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
         assert_eq!(dock.read_with(cx, |dock, _| dock.open_panels().len()), 2);
+        assert_eq!(
+            workspace.read_with(cx, |ws, cx| ws.items_of_type::<WorldCanvasItem>(cx).count()),
+            2,
+            "and no third tab"
+        );
         let active = dock.read_with(cx, |dock, _| dock.active().expect("an active world"));
         assert_eq!(
             active.read_with(cx, |p, _| p.open_rel_path_now().map(str::to_string)),
@@ -427,6 +456,102 @@ pub(crate) mod tests {
             "the panel's release stopped its viewer"
         );
         assert!(dock.read_with(cx, |dock, _| dock.active().is_none()));
+    }
+
+    /// The dock follows the ACTIVE tab, not the last one opened: switching
+    /// tabs in the pane is what the `ActiveItemChanged` subscription is
+    /// for, and nothing else in these tests exercises it (`open_world`
+    /// assigns `active` itself).
+    #[gpui::test]
+    async fn the_dock_follows_whichever_world_tab_is_active(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+            workspace.update_in(cx, |ws, window, cx| {
+                ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
+                    dock.open_world(rel, window, cx);
+                })
+            });
+            cx.run_until_parked();
+        }
+        let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+
+        for (index, rel) in ["worlds/test.toml", "worlds/other.toml"]
+            .into_iter()
+            .enumerate()
+        {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.activate_item(index, true, true, window, cx)
+            });
+            cx.run_until_parked();
+            let active = dock.read_with(cx, |dock, _| dock.active().expect("an active world"));
+            assert_eq!(
+                active.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
+                Some(rel.to_string()),
+                "activating tab {index} must move the dock to {rel}"
+            );
+        }
+    }
+
+    /// The canvas tab shares its panel's focus handle, so the dock's own
+    /// handle is what says whether the DOCK is focused. With the tab
+    /// focused and the dock closed, `ToggleFocus` must open it -- reading
+    /// the panel's handle here made that a no-op.
+    #[gpui::test]
+    async fn toggle_focus_opens_the_dock_while_a_world_tab_holds_focus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        workspace.update_in(cx, |ws, window, cx| {
+            ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world("worlds/test.toml", window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
+
+        // The tab is focused and the dock closed: what a user gets after
+        // hiding the dock to give the canvas the room.
+        workspace.update_in(cx, |ws, window, cx| ws.close_panel::<WorldDock>(window, cx));
+        cx.run_until_parked();
+        workspace.update_in(cx, |ws, window, cx| {
+            ws.active_pane()
+                .update(cx, |pane, cx| pane.focus_active_item(window, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |ws, cx| {
+            assert!(!ws.right_dock().read(cx).is_open(), "the dock is closed");
+        });
+
+        cx.update(|window, cx| {
+            assert!(
+                panel.read(cx).focus_handle.is_focused(window),
+                "the canvas tab holds the panel's focus handle"
+            );
+        });
+        // The body of the `ToggleFocus` action, called rather than
+        // dispatched: the canvas tab shares the panel's focus handle and
+        // never tracks it in its own render, so with the dock closed the
+        // focused handle has no dispatch node for an action to travel up.
+        let focused_the_dock = workspace.update_in(cx, |ws, window, cx| {
+            ws.toggle_panel_focus::<WorldDock>(window, cx)
+        });
+        assert!(
+            focused_the_dock,
+            "the dock must read as unfocused while the tab holds the panel's handle"
+        );
+        cx.run_until_parked();
+        workspace.read_with(cx, |ws, cx| {
+            assert!(
+                ws.right_dock().read(cx).is_open(),
+                "ToggleFocus must open the dock even from the canvas tab"
+            );
+        });
+        cx.update(|window, cx| {
+            assert!(
+                panel.read(cx).focus_handle.is_focused(window),
+                "and focus must land in the panel, where the world bindings live"
+            );
+        });
     }
 
     #[gpui::test]

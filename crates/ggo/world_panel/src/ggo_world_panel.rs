@@ -1710,9 +1710,14 @@ impl WorldPanel {
 
     /// Load the project-relative world path `rel`, prompting FIRST if the
     /// open world has unsaved edits -- Cancel leaves the current document
-    /// loaded and dirty and abandons the open. This is the panel's entry
-    /// point from the file explorer ([`intercept_world_open`]); there is no
-    /// in-panel picker.
+    /// loaded and dirty and abandons the open.
+    ///
+    /// Callers outside this crate open worlds through
+    /// [`WorldDock::open_world`], not through here: the dock's tab list is
+    /// keyed on the rel it opened each panel for, so a world loaded into a
+    /// panel behind the dock's back would leave that key stale and get a
+    /// second tab on the next open. The dock itself calls this once, on
+    /// the fresh panel it just made for `rel`.
     ///
     /// Everything after the guard runs on a spawned task, deliberately: the
     /// interceptor calls this from INSIDE the workspace's own update, and
@@ -1853,15 +1858,29 @@ impl WorldPanel {
         }
     }
 
+    /// A load that never started must not leave the panel in the
+    /// `Loading` state [`Self::mark_loading`] put it in: `remote_read`
+    /// waits on that state (see [`WORLD_STILL_LOADING`]) and would wait
+    /// forever. Only touches a panel that IS waiting -- an abandoned load
+    /// leaves an already-open world alone.
+    fn abandon_load(&mut self, reason: String, cx: &mut Context<Self>) {
+        if matches!(self.state, ViewerState::Loading { .. }) {
+            self.state = ViewerState::Error(reason);
+            cx.notify();
+        }
+    }
+
     /// `window` is what a completed load needs to enter Live mode (see
     /// [`Self::enter_live`]); the windowless callers -- the close
     /// prompt's reload and the MCP `world_open` -- load into Design and
     /// let the next click through the explorer bring Live back.
     fn load_rel_path(&mut self, rel: &str, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let Some((asset_root_rel, listing)) = split_world_path(rel) else {
+            self.abandon_load(format!("{rel} is not a world file"), cx);
             return;
         };
         let Some(project_root) = self.project_root.clone() else {
+            self.abandon_load(format!("no project root to load {rel} against"), cx);
             return;
         };
         let root = if asset_root_rel.is_empty() {
@@ -3332,6 +3351,11 @@ impl WorldPanel {
 
     /// Open `world` -- a stem or a rel path -- and return the
     /// worktree-relative path that is now open.
+    ///
+    /// Loads into THIS panel. The MCP host reaches worlds through
+    /// [`WorldDock::open_world`] instead, for the reason
+    /// [`Self::open_rel_path`] gives: a world loaded behind the dock's
+    /// back leaves its tab list keyed on the wrong path.
     ///
     /// A click's semantics minus its modal: the world that is ALREADY
     /// open is left exactly as it is (no reload, so an edit, the undo
@@ -6776,6 +6800,7 @@ mod tests {
     use ggo_worldlib::world_file::{
         WorldEntity, WorldFile, WorldInstance, read_world, write_world,
     };
+    use gpui::Action as _;
     use gpui::TestAppContext;
     use project::{FakeFs, Project, WorktreeId};
     use serde_json::json;
@@ -6930,6 +6955,31 @@ mod tests {
             open.view.borrow_mut().pan = Some([0.0, 0.0]);
         });
         panel
+    }
+
+    /// `mark_loading` puts a fresh panel into `Loading` before its
+    /// deferred load runs; a load that then never starts must leave a
+    /// TERMINAL state behind, or `remote_read` waits on "still loading"
+    /// forever.
+    #[gpui::test]
+    async fn test_an_abandoned_load_does_not_strand_the_panel_in_loading(cx: &mut TestAppContext) {
+        let panel = cx.update(|cx| cx.new(|cx| WorldPanel::new(None, cx)));
+        panel.update(cx, |panel, cx| {
+            // No workspace and no root override: nothing to resolve a
+            // project root from, which is what `load_rel_path` gives up on.
+            panel.mark_loading("worlds/test.toml", cx);
+            assert!(matches!(panel.state, ViewerState::Loading { .. }));
+            panel.load_rel_path("worlds/test.toml", None, cx);
+            let ViewerState::Error(reason) = &panel.state else {
+                panic!("an abandoned load must not stay Loading");
+            };
+            assert!(reason.contains("worlds/test.toml"), "{reason}");
+            let read = panel.remote_read().unwrap_err();
+            assert!(
+                !read.contains(WORLD_STILL_LOADING),
+                "the reader must get a terminal answer: {read}"
+            );
+        });
     }
 
     #[gpui::test]
@@ -14736,10 +14786,10 @@ mod tests {
         panel.read_with(cx, |panel, _| assert_eq!(panel.canvas_mode, expected));
     }
 
-    /// Lets the dock paint the panel, so `debug_bounds` can resolve its
-    /// elements: opening a world already revealed the dock, but nothing
-    /// has drawn since the test's last message.
+    /// Focuses the dock and lets it paint the panel, so `debug_bounds`
+    /// can resolve the panel's elements.
     fn show_panel(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| window.dispatch_action(ToggleFocus.boxed_clone(), cx));
         cx.run_until_parked();
     }
 
