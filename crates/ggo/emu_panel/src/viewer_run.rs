@@ -350,9 +350,9 @@ impl ViewerRun {
     /// the run, pump included.
     fn stop_with(&mut self, reason: String, cx: &mut App) {
         self.end_run(reason, cx);
-        // Not in `end_run`: that one is also called from inside this
-        // task, and a task that drops its own handle is exactly what
-        // `EmuPanel::stop_for_world_panel` exists to avoid.
+        // Not in `end_run`: that one is also called from inside the pump
+        // task, and a task that drops its own handle would be dropping
+        // the future it is running in.
         self._pump_task = None;
     }
 

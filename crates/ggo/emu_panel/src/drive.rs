@@ -222,12 +222,6 @@ pub struct Session {
     uart: UartLog,
     /// Filled in by the thread immediately before it returns.
     outcome: Arc<Mutex<Option<RunOutcome>>>,
-    /// The viewer link this run is driving, when it was started for one
-    /// (`None` for an ordinary cart run). Held so the host side can be
-    /// reached from the session the panel keeps -- which is how
-    /// `EmuPanel::finish_run` reports the end of a run through the
-    /// endpoint THAT run was driving.
-    link: Option<Arc<LinkEndpoint>>,
     /// Cleared by [`Self::release_link`]; read by the emulator thread.
     link_owned: Arc<AtomicBool>,
     /// `None` only after [`Self::wait`] has taken it.
@@ -318,24 +312,6 @@ impl Session {
     /// The live diagnostic log, for the pane's console.
     pub fn uart(&self) -> &UartLog {
         &self.uart
-    }
-
-    /// The viewer link this run is STILL speaking through, if any --
-    /// `None` both for an ordinary cart run and for one whose link has
-    /// been handed over by [`Self::release_link`].
-    ///
-    /// Ownership is part of the answer rather than a separate question
-    /// the caller must remember to ask. `EmuPanel::finish_run` reports a
-    /// run's ending through whatever this returns, and a released run
-    /// reporting anything at all is precisely the bug `release_link`
-    /// exists to prevent -- its stop reason would land on top of the
-    /// reason the panel had already written for whoever owns the
-    /// endpoint now.
-    pub fn link(&self) -> Option<Arc<LinkEndpoint>> {
-        self.link_owned
-            .load(Ordering::Acquire)
-            .then(|| self.link.clone())
-            .flatten()
     }
 
     /// Hand this run's viewer link over: from here it neither pumps the
@@ -447,7 +423,7 @@ pub fn start(
             inspect: inspect.clone(),
             speed: speed.clone(),
             world_json: world_json.clone(),
-            link: link.clone(),
+            link,
             link_owned: link_owned.clone(),
         };
         let (uart, outcome) = (uart.clone(), outcome.clone());
@@ -483,7 +459,6 @@ pub fn start(
         world_json,
         uart,
         outcome,
-        link,
         link_owned,
         join: Some(join),
     };
@@ -2026,10 +2001,6 @@ mod tests {
             None,
             Some(endpoint.clone()),
         );
-        assert!(
-            session.link().is_some_and(|l| Arc::ptr_eq(&l, &endpoint)),
-            "the session hands back the link it was started for"
-        );
         assert!(rx.recv_blocking().is_err());
         let finished = session.wait();
         assert_eq!(endpoint.state(), ViewerState::Stopped(finished.reason));
@@ -2156,10 +2127,6 @@ mod tests {
         let (session, rx) = start(path, "green.cart".to_string(), None, Some(endpoint.clone()));
         rx.recv_blocking().expect("the emulator thread must run");
         session.release_link();
-        assert!(
-            session.link().is_none(),
-            "a released run has no link to report through"
-        );
 
         endpoint.request_stop();
         for _ in 0..5 {

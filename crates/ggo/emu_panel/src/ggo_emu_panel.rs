@@ -74,18 +74,6 @@
 //! Frame N-2 is dropped, N-1 is retained. [`EmuPanel::release_atlas_all`]
 //! covers the two teardown paths (Stop, and panel release) where no
 //! further render will come.
-//!
-//! A viewer run publishes a THIRD reference to the same images: the world
-//! view's [`ggo_common::LinkEndpoint::frame`] slot, whose contract makes
-//! the publisher (this pane) the owner. So every teardown that abandons
-//! the endpoint -- `release_atlas_all`, the panel's `on_release`, and the
-//! branch of [`EmuPanel::run`] where a plain run takes the pane back --
-//! empties that slot with [`EmuPanel::take_published_frame`] and retires
-//! what it held, alongside the one-publish lag in
-//! [`EmuPanel::previously_published`]. Leaving the slot populated would
-//! be worse than a leak: the tile it names has just been handed back to
-//! the allocator, and the world view would go on sampling it. The world
-//! view therefore has to tolerate an empty slot at any time.
 
 pub mod audio;
 mod debug;
@@ -517,23 +505,8 @@ pub struct EmuPanel {
     /// so it is never auto-resumed.
     auto_paused: bool,
     /// What this pane is running -- see [`RunKind`]. `Cart` until a world
-    /// or a viewer boot says otherwise.
+    /// boot says otherwise.
     pub(crate) run_kind: RunKind,
-    /// The frame published to [`Self::viewer_link`] one publish ago, held
-    /// exactly as [`Self::previous_rendered_frame`] is and for the same
-    /// reason: the scene the world view most recently submitted still
-    /// references the tile of the frame it drew, and freeing that rect
-    /// lets the next upload reallocate it under a scene that is still
-    /// being presented. So a published frame is retired one publish LATE.
-    previously_published: Option<Arc<RenderImage>>,
-    /// The live world view's rendezvous, while a [`RunKind::Viewer`] run
-    /// is the one this pane is driving. Every presented frame is published
-    /// into it and every state change is reported through it, so the world
-    /// view can show the run without reaching into this panel.
-    ///
-    /// Kept after the run ends, deliberately: `Stopped(reason)` is what
-    /// the world view puts on screen instead of the live feed.
-    pub(crate) viewer_link: Option<Arc<ggo_common::LinkEndpoint>>,
     /// Watch mode: a save anywhere in the project re-packs and restarts
     /// `watched_world` (the world the last "Emulate this world" built).
     watch: bool,
@@ -654,11 +627,12 @@ const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// need not be the worktree root) and editor sidecars never do: the
 /// former would loop.
 ///
-/// `viewer` is "this is a live world view's run" ([`RunKind::Viewer`]),
-/// which subtracts the documents that reach the running cart over the
-/// LINK rather than by being packed into it: worlds and maps. Rebuilding
-/// for those would tear down the live view -- the very thing the edit was
-/// made in -- to show a change the cart already has.
+/// `viewer` is "this is a live world view's run" (see
+/// [`viewer_run::ViewerRun`]), which subtracts the documents that reach
+/// the running cart over the LINK rather than by being packed into it:
+/// worlds and maps. Rebuilding for those would tear down the live view --
+/// the very thing the edit was made in -- to show a change the cart
+/// already has. This pane's own runs pass `false`.
 fn watch_triggers(rel: &str, change: &project::PathChange, viewer: bool) -> bool {
     if matches!(change, project::PathChange::Loaded) {
         return false;
@@ -670,27 +644,6 @@ fn watch_triggers(rel: &str, change: &project::PathChange, viewer: bool) -> bool
         return false;
     }
     !(viewer && travels_over_the_link(rel))
-}
-
-/// What [`EmuPanel::on_frame`] tells its pump task to do next. A bare
-/// `bool` would not say which way round it reads at the call site.
-#[derive(Debug, PartialEq)]
-enum FramePumped {
-    Continue,
-    /// The world panel has asked for this run to end.
-    StopRequested,
-}
-
-/// Take the image out of `endpoint`'s frame slot. Split out from
-/// [`EmuPanel::take_published_frame`] because one caller has already
-/// taken the endpoint off the panel and so cannot go through the field.
-fn take_link_frame(endpoint: &ggo_common::LinkEndpoint) -> Option<Arc<RenderImage>> {
-    endpoint
-        .frame
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-        .map(|(_number, image)| image)
 }
 
 /// A document the world view sends to a running viewer cart itself: a
@@ -710,26 +663,22 @@ fn travels_over_the_link(rel: &str) -> bool {
 }
 
 /// What the pane is currently running, which decides how a watch-mode
-/// rebuild is routed and whether frames are published to a world view.
+/// rebuild is routed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunKind {
     /// A `.cart`/`.ggo` the user selected: the ordinary case.
     Cart,
     /// A cartridge "Emulate this world" packed for that world.
     World(String),
-    /// The live world view's viewer cart, booted for that world and
-    /// driving [`EmuPanel::viewer_link`].
-    Viewer(String),
 }
 
 impl RunKind {
     /// The world this run was started for, when it was started for one.
-    /// It is both what a watch rebuild re-targets and -- as the variant
-    /// it came out of -- what decides which rebuild path that is.
+    /// It is what a watch rebuild re-targets.
     fn world(&self) -> Option<&str> {
         match self {
             RunKind::Cart => None,
-            RunKind::World(world) | RunKind::Viewer(world) => Some(world),
+            RunKind::World(world) => Some(world),
         }
     }
 }
@@ -754,26 +703,10 @@ impl EmuPanel {
         // (`remote_video_track_view.rs:32-44`).
         cx.on_release(|this, cx| {
             this.debug.retire_all();
-            // The world view's slot as well as this pane's own: the pane
-            // is going away, so nothing else will ever own these tiles.
-            let published = this.take_published_frame();
-            // The last chance to say so, too. A pane closed while the
-            // viewer cart was still building leaves no run to report the
-            // ending, and a `Building` that never resolves is a live view
-            // that simply never appears.
-            if let Some(link) = &this.viewer_link
-                && !matches!(link.state(), ggo_common::ViewerState::Stopped(_))
-            {
-                link.set_state(ggo_common::ViewerState::Stopped(
-                    "the emulator pane was closed".to_string(),
-                ));
-            }
             for image in [
                 this.previous_rendered_frame.take(),
                 this.current_rendered_frame.take(),
                 this.latest_frame.take(),
-                this.previously_published.take(),
-                published,
             ]
             .into_iter()
             .flatten()
@@ -815,8 +748,6 @@ impl EmuPanel {
             current_rendered_frame: None,
             previous_rendered_frame: None,
             run_kind: RunKind::Cart,
-            previously_published: None,
-            viewer_link: None,
             _focus_out,
             debug: debug::DebugState::new(),
             auto_paused: false,
@@ -1469,10 +1400,7 @@ impl EmuPanel {
 
     // --------------------------------------------------------------- watch
 
-    /// A plain cart replaced the world: nothing left to re-pack, and
-    /// nothing world-shaped left to rebuild either (the endpoint of a
-    /// viewer run is released by [`Self::run`], which is what actually
-    /// takes the pane over).
+    /// A plain cart replaced the world: nothing left to re-pack.
     fn forget_watched_world(&mut self) {
         self.watch = false;
         self.run_kind = RunKind::Cart;
@@ -1531,10 +1459,9 @@ impl EmuPanel {
         if !self.watch {
             return;
         }
-        let viewer = matches!(self.run_kind, RunKind::Viewer(_));
         let relevant = changes
             .iter()
-            .any(|(path, _, change)| watch_triggers(path.as_unix_str(), change, viewer));
+            .any(|(path, _, change)| watch_triggers(path.as_unix_str(), change, false));
         if !relevant {
             return;
         }
@@ -1552,21 +1479,13 @@ impl EmuPanel {
     /// (Re)start the debounce; the rebuild runs when it lapses.
     ///
     /// The world comes off [`Self::run_kind`] rather than
-    /// `watched_world`: the two are set together, and the variant it came
-    /// out of is also what decides which rebuild this is (a world pack,
-    /// or the live view's own viewer cart).
+    /// `watched_world`: the two are set together, and only a run that is
+    /// still a world run has anything to re-pack.
     fn schedule_watch_rebuild(&mut self, cx: &mut Context<Self>) {
         let (Some(world), Some(window)) =
             (self.run_kind.world().map(str::to_string), self.watch_window)
         else {
             return;
-        };
-        // A viewer rebuild reboots the SAME endpoint: the world view
-        // keeps its handle and re-sends its world when the state comes
-        // back to `Running`.
-        let viewer_link = match self.run_kind {
-            RunKind::Viewer(_) => self.viewer_link.clone(),
-            _ => None,
         };
         let workspace = self.workspace.clone();
         self._watch_debounce = Some(cx.spawn(async move |this, cx| {
@@ -1591,14 +1510,6 @@ impl EmuPanel {
                         })
                         .unwrap_or(false);
                     if !go {
-                        return;
-                    }
-                    if let Some(link) = viewer_link {
-                        // No save-first hop: the world view's document
-                        // reaches the cart over the link, and this
-                        // rebuild is for the code and assets around it.
-                        this.update(cx, |this, cx| this.boot_viewer(&world, link, window, cx))
-                            .ok();
                         return;
                     }
                     // Through the registered emulator, so a dirty world
@@ -1694,22 +1605,6 @@ impl EmuPanel {
         .detach();
     }
 
-    /// The Run button and the Run action: start the SELECTED CART.
-    ///
-    /// A live world view's run is downgraded to a plain one, which
-    /// releases its link (see [`Self::run`]) rather than silently
-    /// rebooting a viewer the user did not ask for. A WORLD run is left
-    /// alone: pressing Run on one has always been "restart this", and
-    /// watch mode re-packs whatever [`Self::run_kind`] still names -- so
-    /// downgrading it here would quietly turn a lit Watch toggle into a
-    /// no-op on the next save.
-    fn run_selected_cart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.run_kind, RunKind::Viewer(_)) {
-            self.run_kind = RunKind::Cart;
-        }
-        self.run(window, cx);
-    }
-
     /// Start the selected cart. A run already in flight is stopped first,
     /// so Run is idempotent-ish (restart) rather than a way to end up
     /// with two emulator threads fighting over one pane.
@@ -1717,62 +1612,8 @@ impl EmuPanel {
         // Whoever pressed Run owns the run from here; `remote_boot`
         // re-marks its own after calling this.
         self.remote_controlled = false;
-        // Only a viewer run drives the world view's link. Anything else
-        // taking this pane RELEASES it, with a reason: a world view left
-        // polling a run that is no longer its own would sit on a frozen
-        // frame forever.
-        let link = match self.run_kind {
-            RunKind::Viewer(_) => {
-                let link = self.viewer_link.clone();
-                // BEFORE `stop`, for the reason `boot_viewer` does the
-                // same: the run being replaced is driving THIS endpoint,
-                // and its thread writes its own `Stopped` whenever it
-                // gets round to noticing the flag -- which is after this
-                // run has already said `Running`. See
-                // `drive::Session::release_link`.
-                if let Some(link) = &link {
-                    self.release_link_of_current_run(link);
-                }
-                link
-            }
-            RunKind::Cart | RunKind::World(_) => {
-                if let Some(replaced) = self.viewer_link.take() {
-                    // Before the reason is written: the run being
-                    // replaced would otherwise overwrite it with its own
-                    // on its way out.
-                    self.release_link_of_current_run(&replaced);
-                    replaced.set_state(ggo_common::ViewerState::Stopped(
-                        "replaced by another run".to_string(),
-                    ));
-                    // Nothing will publish over them now, so the frames
-                    // the world view was left holding -- the one still in
-                    // its slot and the one the publish lag was keeping
-                    // alive for it -- are retired here instead.
-                    let published = take_link_frame(&replaced);
-                    for stale in [self.previously_published.take(), published]
-                        .into_iter()
-                        .flatten()
-                    {
-                        // Through the window, not `App::drop_image(.., None)`:
-                        // that one walks `App::windows`, and THIS window is
-                        // leased out of that map for as long as `run` holds
-                        // `&mut Window` -- so it would skip the only window
-                        // the tiles are actually in.
-                        window.drop_image(stale).log_err();
-                    }
-                }
-                None
-            }
-        };
         let (Some(root), Some(cart)) = (self.project_root.clone(), self.selected.clone()) else {
             self.report_failure("no cart selected".to_string(), cx);
-            // Kept, like every other viewer refusal: the reason is what
-            // the world view shows in place of the feed.
-            if let Some(link) = &self.viewer_link {
-                link.set_state(ggo_common::ViewerState::Stopped(
-                    "no cart selected".to_string(),
-                ));
-            }
             return;
         };
         self.stop(window, cx);
@@ -1791,14 +1632,7 @@ impl EmuPanel {
         // BEFORE the thread starts, so the pane never shows the last run's
         // "no output device" against this one. Mute is deliberately kept.
         self.audio.reset_for_run();
-        // BEFORE `drive::start`, not after: a cart that cannot be read or
-        // parsed makes the emulator thread write `Stopped` immediately,
-        // and a `Running` stamped over that would strand the world view
-        // on a run that is already finished.
-        if let Some(link) = &link {
-            link.set_state(ggo_common::ViewerState::Running);
-        }
-        let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()), link);
+        let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()), None);
         session.set_speed(self.speed);
         self.console = Some(session.uart().clone());
         self.session = Some(session);
@@ -1810,25 +1644,10 @@ impl EmuPanel {
         self.stats = RunStats::default();
         self.fps_window_started = Instant::now();
         self.ingest_status = IngestStatus::Idle;
-        let window_handle = window.window_handle();
         self._pump_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(frame) = rx.recv().await {
-                match this.update(cx, |this, cx| this.on_frame(frame, cx)) {
-                    Ok(FramePumped::Continue) => {}
-                    // The world view left live mode. Ending the run from
-                    // inside this task is why `stop_for_world_panel`
-                    // exists rather than `stop`: `stop` drops
-                    // `_pump_task`, and this IS that task.
-                    Ok(FramePumped::StopRequested) => {
-                        window_handle
-                            .update(cx, |_root, window, cx| {
-                                this.update(cx, |this, cx| this.stop_for_world_panel(window, cx))
-                                    .ok();
-                            })
-                            .ok();
-                        return;
-                    }
-                    Err(_) => return,
+                if this.update(cx, |this, cx| this.on_frame(frame, cx)).is_err() {
+                    return;
                 }
                 // Give the executor a turn after EVERY frame. `recv` only
                 // suspends on an empty channel, and the emulator thread
@@ -1845,46 +1664,12 @@ impl EmuPanel {
             // its own terms (cart exit, CPU fault, or a stop flag it has
             // now acted on). There is no terminal message on the wire --
             // the close IS the message. See `drive::start`'s doc.
-            //
-            // "A stop flag it has now acted on" includes the WORLD
-            // PANEL's: the thread checks that one too (at its loop top
-            // and in the vsync park, where a paused viewer spends all of
-            // its time), so either it or `on_frame` above notices first.
-            // Both must leave the pane in the same state, so the race the
-            // thread won takes the same teardown the `StopRequested` arm
-            // does. `finish_run` alone reports the same reason but keeps
-            // the endpoint, the frame published into it and the `Viewer`
-            // run kind, for a view that has already left live mode.
-            let stop_requested = this
-                .read_with(cx, |this, _cx| {
-                    this.viewer_link
-                        .as_ref()
-                        .is_some_and(|link| link.stop_requested())
-                })
-                .unwrap_or(false);
-            let torn_down = stop_requested
-                && window_handle
-                    .update(cx, |_root, window, cx| {
-                        this.update(cx, |this, cx| this.stop_for_world_panel(window, cx))
-                            .is_ok()
-                    })
-                    .unwrap_or(false);
-            if !torn_down {
-                this.update(cx, |this, cx| this.finish_run(cx)).ok();
-            }
+            this.update(cx, |this, cx| this.finish_run(cx)).ok();
         }));
         cx.notify();
     }
 
-    fn on_frame(&mut self, frame: Frame, cx: &mut Context<Self>) -> FramePumped {
-        if let Some(link) = &self.viewer_link
-            && link.stop_requested()
-        {
-            // Before the frame is presented: the world view has left live
-            // mode, so publishing one more frame into a slot it will
-            // never read again is just another tile to retire.
-            return FramePumped::StopRequested;
-        }
+    fn on_frame(&mut self, frame: Frame, cx: &mut Context<Self>) {
         self.frame = frame.number;
         if self.stats.on_frame(
             frame.number,
@@ -1897,62 +1682,8 @@ impl EmuPanel {
         // already produced BGRA, so this is a move, not a copy.
         if let Some(buffer) = image::ImageBuffer::from_raw(drive::WIDTH, drive::HEIGHT, frame.bgra)
         {
-            let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-            if let Some(link) = &self.viewer_link {
-                // The publisher owns retiring what it replaces (see
-                // `LinkEndpoint::frame`): the world view only ever clones
-                // the `Arc`, so without this every published frame leaks
-                // its atlas tile.
-                //
-                // Retired one publish LATE, exactly like this pane's own
-                // double buffer (see the module doc and
-                // [`Self::retire_atlas_frames`]): the frame just replaced
-                // is the one the world view's most recently submitted
-                // scene is drawing, and handing its rect back frees it to
-                // be reallocated -- and overwritten -- under a scene that
-                // is still being presented.
-                let replaced = link
-                    .frame
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .replace((frame.number, image.clone()))
-                    .map(|(_number, image)| image);
-                link.tick();
-                if let Some(stale) = self.previously_published.take() {
-                    cx.drop_image(stale, None);
-                }
-                self.previously_published = replaced;
-            }
-            self.latest_frame = Some(image);
+            self.latest_frame = Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
         }
-        cx.notify();
-        FramePumped::Continue
-    }
-
-    /// End the run because the world panel asked for it
-    /// ([`ggo_common::LinkEndpoint::request_stop`]).
-    ///
-    /// [`Self::stop`]'s work minus dropping the pump task: this runs
-    /// INSIDE that task, and a task that drops its own handle is the one
-    /// thing `stop`'s comment warns against. Nothing is lost by leaving
-    /// it -- the task returns immediately afterwards, dropping the frame
-    /// receiver, which is what `stop` wanted the drop for.
-    fn stop_for_world_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // BEFORE `finish_run`, which takes the session this reads, and
-        // before the reason is written: the run's own thread would
-        // otherwise stamp its exit reason over ours.
-        if let Some(link) = self.viewer_link.clone() {
-            self.release_link_of_current_run(&link);
-            link.set_state(ggo_common::ViewerState::Stopped(
-                drive::WORLD_PANEL_STOP.to_string(),
-            ));
-        }
-        self.finish_run(cx);
-        // While `viewer_link` is still set, so the endpoint's own frame
-        // slot is emptied along with this pane's tiles.
-        self.release_atlas_all(window);
-        self.viewer_link = None;
-        self.run_kind = RunKind::Cart;
         cx.notify();
     }
 
@@ -2005,10 +1736,6 @@ impl EmuPanel {
         // sources has an identity to attach; this pane always knows which
         // file it ran.
         let label = session.cart.clone();
-        // The link THIS run was driving, if any -- taken from the session
-        // rather than the field, so a run that has already been replaced
-        // cannot report its end through the next run's endpoint.
-        let link = session.link();
         // Resolved here, on the thread the override lives on.
         let db_url = self.db_url();
         let finish = cx.background_spawn(async move {
@@ -2028,48 +1755,11 @@ impl EmuPanel {
                         return None;
                     }
                     if this.build_generation == owns_status {
-                        // The world view is told the run is over here as
-                        // well as from the emulator thread: a thread that
-                        // PANICKED stored no outcome and set no state,
-                        // and `wait`'s synthesized reason is the only
-                        // account of it. `viewer_link` itself is
-                        // deliberately left in place -- the reason is
-                        // what the world view shows in place of the feed.
-                        //
-                        // Gated on `owns_status` for the same reason the
-                        // status row is, and it matters MORE here: a
-                        // watch rebuild bumps `build_generation` and
-                        // reuses this very endpoint, but bumps
-                        // `run_generation` only once the build is over.
-                        // Ungated, this completion would land inside the
-                        // rebuild and replace its `Building` with the
-                        // previous run's stop reason for the whole build.
-                        if let Some(link) = &link {
-                            link.set_state(ggo_common::ViewerState::Stopped(reason.clone()));
-                        }
                         this.status = Some(reason);
                         // The run itself says whether it ended badly: a
                         // cart that never loaded or faulted is a failure,
                         // a stop or a plain exit is not.
                         this.status_is_error = is_error;
-                    } else if let Some(link) = &link
-                        && this.building
-                        && this
-                            .viewer_link
-                            .as_ref()
-                            .is_some_and(|current| Arc::ptr_eq(current, link))
-                    {
-                        // A newer BUILD owns this endpoint: a watch
-                        // rebuild reuses it and bumps only
-                        // `build_generation`. Both accounts of the run
-                        // that was stopped for that rebuild land here --
-                        // this one, and the emulator thread's own
-                        // `Stopped`, which `Session::wait` has just
-                        // joined and so strictly precedes us. Re-assert
-                        // what is actually happening, or the world view
-                        // reads the previous run's stop reason for the
-                        // whole build.
-                        link.set_state(ggo_common::ViewerState::Building);
                     }
                     this.ingest_status = status;
                     cx.notify();
@@ -2220,187 +1910,6 @@ impl EmuPanel {
         }));
     }
 
-    /// **Boot the live world view's cart.** `emd editor-cart --ggo` (the
-    /// game's own code plus emerald's editor systems, packed with the
-    /// project's assets), then the panel's ORDINARY [`Self::run`] over the
-    /// `.ggo` that build printed -- with `endpoint` attached, which is the
-    /// only thing that makes this run different from any other.
-    ///
-    /// No `--world`: the viewer boots empty and the world view sends it
-    /// the world over the link. That is also why a world save does not
-    /// rebuild anything here (see [`watch_triggers`]).
-    ///
-    /// **Every failure is reported on BOTH sides.** The world view has no
-    /// other way to learn that the run it is waiting for will never
-    /// arrive: a `Building` that never resolves is a live view that just
-    /// never appears. So each refusal sets `Stopped(reason)` on the
-    /// endpoint as well as writing the status row.
-    pub(crate) fn boot_viewer(
-        &mut self,
-        world_rel: &str,
-        endpoint: Arc<ggo_common::LinkEndpoint>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let restart = self.watch_restart_pending;
-        // BEFORE `stop`: a rebuild reuses the endpoint of the run it is
-        // replacing, and that run must stop speaking through it now --
-        // its thread writes its own `Stopped` whenever it gets round to
-        // noticing the flag, which is after this build has said
-        // `Building`. See `drive::Session::release_link`.
-        self.release_link_of_current_run(&endpoint);
-        // `stop` reads the flag (a restart keeps the pad); clear it after.
-        self.stop(window, cx);
-        // A watch rebuild reuses the endpoint of the run just stopped, so
-        // say what is happening: without this the world view would sit on
-        // the previous run's stop reason for the length of the build.
-        endpoint.set_state(ggo_common::ViewerState::Building);
-        self.watch_restart_pending = false;
-        if !restart {
-            self.watch_rebuilds = 0;
-            self._watch_debounce = None;
-        }
-        self.building = true;
-        self.build_is_explicit = !restart;
-        self.run_kind = RunKind::Viewer(world_rel.to_string());
-        self.watched_world = Some(world_rel.to_string());
-        self.viewer_link = Some(endpoint.clone());
-        self.build_generation += 1;
-        let generation = self.build_generation;
-        let world_rel = world_rel.to_string();
-        self.status = Some(format!("building the viewer for {world_rel}…"));
-        self.status_is_error = false;
-        self.ingest_status = IngestStatus::Idle;
-        cx.notify();
-
-        let this = cx.weak_entity();
-        self._build_task = Some(window.spawn(cx, async move |cx| {
-            this.update(cx, |this, cx| this.refresh_root(cx)).ok();
-            let prepared = this
-                .update(cx, |this, cx| match this.prepare_viewer_build(&world_rel) {
-                    Ok(prepared) => Some(prepared),
-                    Err(reason) => {
-                        this.fail_viewer(&endpoint, reason, cx);
-                        None
-                    }
-                })
-                .ok()
-                .flatten();
-            let Some((request, runner, root)) = prepared else {
-                this.update(cx, |this, cx| this.build_done(generation, cx))
-                    .ok();
-                return;
-            };
-            let capture = cx.background_spawn(async move { runner(request) }).await;
-            this.update_in(cx, |this, window, cx| {
-                if this.build_generation != generation {
-                    // Superseded. Another VIEWER boot for this endpoint
-                    // (a watch rebuild) owns reporting from here, so say
-                    // nothing. Anything else -- a world pack, a
-                    // diagnostics run -- means no run will ever drive
-                    // this endpoint again, and if THAT build fails,
-                    // `run` never comes to report the ending: the world
-                    // view would wait on a `Building` that never
-                    // resolves.
-                    let superseded_by_a_viewer = matches!(this.run_kind, RunKind::Viewer(_))
-                        && this
-                            .viewer_link
-                            .as_ref()
-                            .is_some_and(|current| Arc::ptr_eq(current, &endpoint));
-                    if !superseded_by_a_viewer {
-                        endpoint.set_state(ggo_common::ViewerState::Stopped(
-                            "replaced by another build".to_string(),
-                        ));
-                    }
-                    return;
-                }
-                this.build_done(generation, cx);
-                if !capture.ok {
-                    let reason = format!("build failed: {}", menu::failure_reason(&capture));
-                    this.fail_viewer(&endpoint, reason, cx);
-                    return;
-                }
-                let Some(ggo) = menu::editor_cart_ggo_path(&capture.lines) else {
-                    this.fail_viewer(
-                        &endpoint,
-                        "emd editor-cart --ggo printed no .ggo path".to_string(),
-                        cx,
-                    );
-                    return;
-                };
-                this.selected = Some(menu::cart_selection(&root, &ggo));
-                this.frame = 0;
-                this.stats = RunStats::default();
-                this.status = None;
-                this.status_is_error = false;
-                // `run` is what attaches `viewer_link` to the session and
-                // flips the endpoint to `Running`.
-                this.run(window, cx);
-            })
-            .ok();
-        }));
-    }
-
-    /// Take `endpoint` off the run that is currently driving it, if that
-    /// is the run in flight -- so its ending is reported by whoever owns
-    /// the endpoint next, not by a thread that is already being replaced.
-    fn release_link_of_current_run(&self, endpoint: &Arc<ggo_common::LinkEndpoint>) {
-        if let Some(session) = &self.session
-            && session
-                .link()
-                .is_some_and(|link| Arc::ptr_eq(&link, endpoint))
-        {
-            session.release_link();
-        }
-    }
-
-    /// A viewer boot that cannot go on: the status row AND the world
-    /// view's endpoint both get the reason.
-    fn fail_viewer(
-        &mut self,
-        endpoint: &Arc<ggo_common::LinkEndpoint>,
-        reason: String,
-        cx: &mut Context<Self>,
-    ) {
-        endpoint.set_state(ggo_common::ViewerState::Stopped(reason.clone()));
-        self.report_failure(reason, cx);
-    }
-
-    /// Assemble the `emd editor-cart --ggo` invocation for the emerald
-    /// project holding `world_rel`, or the reason there isn't one. Unlike
-    /// [`Self::prepare_world_build`] this RETURNS its refusal, because a
-    /// viewer boot has to report every one of them twice (see
-    /// [`Self::boot_viewer`]).
-    ///
-    /// The project root comes back with the request: it is what the
-    /// `.ggo` the build names is made relative to, and re-reading it
-    /// after the build would race a project switch.
-    fn prepare_viewer_build(
-        &self,
-        world_rel: &str,
-    ) -> Result<(ggo_common::ProcRequest, ggo_common::ProcRunner, PathBuf), String> {
-        let root = self
-            .project_root
-            .clone()
-            .ok_or_else(|| "no project folder is open".to_string())?;
-        let project_dir =
-            ggo_common::emerald_project_root(&root.join(world_rel)).ok_or_else(|| {
-                format!(
-                    "no {} above {world_rel} — emd needs an emerald project",
-                    ggo_common::EMERALD_MANIFEST
-                )
-            })?;
-        Ok((
-            ggo_common::ProcRequest::emd(&project_dir, menu::editor_cart_args()),
-            self.proc_runner.clone(),
-            root,
-        ))
-    }
-
-    /// Assemble the `emd pack-ggo` invocation for `world_rel`, or report
-    /// on the status row why there isn't one. Runs on the UI thread, where
-    /// a problem can still be shown, and hands the background task
-    /// everything it needs by value.
     /// The build for `generation` ended (either way): release the
     /// in-flight flag and run any rebuild that queued behind it.
     fn build_done(&mut self, generation: u64, cx: &mut Context<Self>) {
@@ -2413,6 +1922,10 @@ impl EmuPanel {
         }
     }
 
+    /// Assemble the `emd pack-ggo` invocation for `world_rel`, or report
+    /// on the status row why there isn't one. Runs on the UI thread, where
+    /// a problem can still be shown, and hands the background task
+    /// everything it needs by value.
     fn prepare_world_build(
         &mut self,
         world_rel: &str,
@@ -2519,16 +2032,6 @@ impl EmuPanel {
     /// Unlike [`Self::open_rel_path`], re-clicking the selected cart is
     /// the whole point, so there is no already-selected early return.
     pub fn rerun(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // Before `stop` takes the session: a Re-run of the viewer's own
-        // cart replaces the run driving the world view's endpoint, and
-        // `run` -- which does exactly this for its own replacements --
-        // does not get a look in until the build task below, by which
-        // time the session it would have released is already gone.
-        if matches!(self.run_kind, RunKind::Viewer(_))
-            && let Some(link) = self.viewer_link.clone()
-        {
-            self.release_link_of_current_run(&link);
-        }
         // Before arming: `stop` finishes any run already in flight, and
         // that run must not be the one that gets the hop.
         self.stop(window, cx);
@@ -2654,18 +2157,9 @@ impl EmuPanel {
 
     /// Hidden-tab pause: the emulator item was deactivated. Undone by the
     /// next render (only a visible item renders). A run already paused by
-    /// the user is left exactly as it is.
-    ///
-    /// **A viewer run is exempt.** Its audience is the world panel, not
-    /// this tab -- which is hardly ever the front one while a live view is
-    /// up -- and the pause takes effect inside the very `Vsync` arm the
-    /// link is pumped from, so adopting it would freeze the live feed for
-    /// as long as the user looked at anything else. [`Self::auto_resume`]
-    /// needs no matching guard: it only ever undoes what this set.
+    /// the user is left exactly as it is. [`Self::auto_resume`] only ever
+    /// undoes what this set.
     pub(crate) fn auto_pause(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.run_kind, RunKind::Viewer(_)) {
-            return;
-        }
         let Some(session) = &self.session else {
             return;
         };
@@ -2808,29 +2302,16 @@ impl EmuPanel {
     /// three slots is harmless.
     fn release_atlas_all(&mut self, window: &mut Window) {
         self.release_debug_images(window);
-        // `latest_frame` and the endpoint's slot are the SAME image while
-        // a viewer run is publishing, so handing one back without
-        // emptying the other leaves the world view sampling a freed rect.
-        let published = self.take_published_frame();
         for image in [
             self.previous_rendered_frame.take(),
             self.current_rendered_frame.take(),
             self.latest_frame.take(),
-            self.previously_published.take(),
-            published,
         ]
         .into_iter()
         .flatten()
         {
             window.drop_image(image).log_err();
         }
-    }
-
-    /// Empty the viewer endpoint's frame slot and hand back what it held,
-    /// for the caller to retire. Only the publisher may do this -- see
-    /// [`ggo_common::LinkEndpoint::frame`] -- and this pane is it.
-    fn take_published_frame(&self) -> Option<Arc<RenderImage>> {
-        self.viewer_link.as_deref().and_then(take_link_frame)
     }
 
     // ----------------------------------------------------------- debug
@@ -3449,7 +2930,7 @@ impl EmuPanel {
                     .disabled(self.selected.is_none())
                     .tooltip(Tooltip::text("Run cart"))
                     .on_click(
-                        cx.listener(|this, _event, window, cx| this.run_selected_cart(window, cx)),
+                        cx.listener(|this, _event, window, cx| this.run(window, cx)),
                     ),
             )
             .child(
@@ -3844,7 +3325,7 @@ impl Render for EmuPanel {
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
-            .on_action(cx.listener(|this, _: &Run, window, cx| this.run_selected_cart(window, cx)))
+            .on_action(cx.listener(|this, _: &Run, window, cx| this.run(window, cx)))
             .on_action(cx.listener(|this, _: &Stop, window, cx| this.stop(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleMute, _window, cx| this.toggle_mute(cx)))
             .on_action(cx.listener(|this, _: &TogglePause, _window, cx| this.toggle_pause(cx)))
@@ -3956,7 +3437,6 @@ impl EmuPanel {
         let run_kind = match self.run_kind {
             RunKind::Cart => ggo_emu_remote::protocol::RunKind::Cart,
             RunKind::World(_) => ggo_emu_remote::protocol::RunKind::World,
-            RunKind::Viewer(_) => ggo_emu_remote::protocol::RunKind::Viewer,
         };
         ggo_emu_remote::protocol::WorkspaceStatus {
             workspace,
@@ -5426,31 +4906,6 @@ mod tests {
         }
     }
 
-    /// Publish one frame through the panel's own per-frame path and hand
-    /// back the image it produced -- what the emulator thread's pump does,
-    /// minus the thread.
-    fn publish_one_frame(
-        panel: &Entity<EmuPanel>,
-        cx: &mut gpui::VisualTestContext,
-        number: u32,
-    ) -> Arc<RenderImage> {
-        let bgra = vec![0x7Fu8; (drive::WIDTH * drive::HEIGHT * 4) as usize];
-        panel.update(cx, |panel, cx| {
-            panel.on_frame(
-                Frame {
-                    bgra,
-                    number,
-                    step_ms: 1.0,
-                },
-                cx,
-            );
-            panel
-                .latest_frame
-                .clone()
-                .expect("a frame message must produce an image")
-        })
-    }
-
     /// The tab's ` · MCP` marker tracks who owns the run: a remote boot
     /// sets it, the user's own Run button takes the run back, and Stop
     /// leaves nothing marked.
@@ -6179,10 +5634,10 @@ mod tests {
         (runner, calls)
     }
 
-    /// Whether `request` is the EMULATE build (`emd pack-ggo`). A world
-    /// panel in Live mode boots its viewer cart (`emd editor-cart --ggo`)
-    /// through this same runner, so "was anything built?" has to name
-    /// which build it means.
+    /// Whether `request` is the EMULATE build (`emd pack-ggo`). Every
+    /// other `emd` invocation the pane makes goes through the same
+    /// runner, so "was anything built?" has to name which build it
+    /// means.
     fn is_pack_ggo(request: &ggo_common::ProcRequest) -> bool {
         request.args.first().map(String::as_str) == Some("pack-ggo")
     }
@@ -6428,394 +5883,10 @@ mod tests {
         });
     }
 
-    // ------------------------------------------- the live world view's cart
-
-    /// Everything a viewer-boot test drives: a real temp emerald project
-    /// (the panel reads and writes through `root_override`), a fake
-    /// worktree for the workspace, and a recording `proc_runner` that
-    /// answers `emd editor-cart --ggo` with the JSON trailer emerald
-    /// prints. Held together in one struct because the `TestDb` and the
-    /// `TempDir` both take their contents with them when dropped.
-    struct ViewerFixture {
-        _db: ggo_db::TestDb,
-        workspace: Entity<Workspace>,
-        panel: Entity<EmuPanel>,
-        dir: tempfile::TempDir,
-        calls: Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>>,
-    }
-
-    /// The path the fixture's fake `emd` names in its trailer.
-    const VIEWER_GGO: &str = "demo-editor.ggo";
-
-    /// A viewer fixture whose fake `emd` succeeds.
-    ///
-    /// `with_cart` decides whether the `.ggo` the trailer names is
-    /// actually written: with it, the panel boots a REAL green-screen
-    /// cart and frames flow; without it the run ends the moment the
-    /// emulator thread cannot read the file, which is what the tests that
-    /// pump the executor many times over want (a live cart refills the
-    /// frame channel every ~16ms, and `run_until_parked` can then never
-    /// go idle -- see `await_first_frame`).
-    async fn viewer_fixture(
-        cx: &mut TestAppContext,
-        with_cart: bool,
-    ) -> (ViewerFixture, &mut gpui::VisualTestContext) {
-        viewer_fixture_with(cx, move |dir: &std::path::Path| {
-            let ggo = dir.join(VIEWER_GGO);
-            if with_cart {
-                std::fs::write(&ggo, drive::fixture::green_screen_cart()).unwrap();
-            }
-            ggo_common::ProcCapture {
-                ok: true,
-                lines: vec![
-                    "   Compiling demo_editor".to_string(),
-                    serde_json::json!({
-                        "cart": dir.join("demo-editor.cart"),
-                        "elf": dir.join(".tmp/demo_editor"),
-                        "ggo": ggo,
-                    })
-                    .to_string(),
-                ],
-            }
-        })
-        .await
-    }
-
-    /// [`viewer_fixture`] with the reply spelled out -- the failing-build
-    /// half uses this directly.
-    async fn viewer_fixture_with(
-        cx: &mut TestAppContext,
-        reply: impl Fn(&std::path::Path) -> ggo_common::ProcCapture + Send + Sync + 'static,
-    ) -> (ViewerFixture, &mut gpui::VisualTestContext) {
-        cx.executor().allow_parking();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
-        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
-
-        let (db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
-        let root = dir.path().to_path_buf();
-        let (runner, calls) = fake_proc_runner(move |_request| reply(&root));
-        panel.update(cx, |panel, _cx| panel.proc_runner = runner);
-        (
-            ViewerFixture {
-                _db: db,
-                workspace,
-                panel,
-                dir,
-                calls,
-            },
-            cx,
-        )
-    }
-
-    /// **The live world view's boot.** The panel builds the viewer cart
-    /// with `emd editor-cart --ggo`, selects the `.ggo` the trailer names,
-    /// and starts it through the ORDINARY run path with the world view's
-    /// link endpoint attached -- which is what makes the run reachable
-    /// from the other side.
-    #[gpui::test]
-    async fn boot_viewer_builds_the_editor_cart_then_runs_it_with_the_link(
-        cx: &mut TestAppContext,
-    ) {
-        let (fixture, cx) = viewer_fixture(cx, true).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-
-        {
-            let calls = fixture.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1, "exactly one build");
-            assert_eq!(
-                calls[0].args,
-                ["editor-cart", "--ggo", "--json"],
-                "the viewer cart is built with no --world: worlds travel over the link"
-            );
-            assert_eq!(
-                calls[0].cwd,
-                fixture.dir.path(),
-                "emd discovers the project from its cwd"
-            );
-        }
-        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
-        fixture.panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.selected.as_deref(), Some(VIEWER_GGO));
-            assert!(
-                matches!(&panel.run_kind, RunKind::Viewer(world) if world == "assets/worlds/main.toml"),
-                "{:?}",
-                panel.run_kind
-            );
-            assert!(
-                panel
-                    .session
-                    .as_ref()
-                    .and_then(|session| session.link())
-                    .is_some(),
-                "the run drives the link the world view is holding"
-            );
-        });
-    }
-
-    /// A build that fails must not leave the world view waiting on a
-    /// `Building` that never resolves: the reason reaches the endpoint as
-    /// well as the panel's own status row.
-    #[gpui::test]
-    async fn a_failed_editor_cart_build_stops_the_endpoint_with_the_reason(
-        cx: &mut TestAppContext,
-    ) {
-        let (fixture, cx) = viewer_fixture_with(cx, |_dir| ggo_common::ProcCapture {
-            ok: false,
-            lines: vec!["error: could not compile demo_editor".to_string()],
-        })
-        .await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-
-        match endpoint.state() {
-            ggo_common::ViewerState::Stopped(reason) => {
-                assert!(reason.contains("could not compile"), "{reason}")
-            }
-            other => panic!("{other:?}"),
-        }
-        fixture.panel.read_with(cx, |panel, _| {
-            assert!(panel.status_is_error);
-            assert!(!panel.is_running(), "nothing was started");
-        });
-    }
-
-    /// A world that is not inside an emerald project has no viewer cart to
-    /// build, and says so on both sides.
-    #[gpui::test]
-    async fn a_viewer_boot_outside_a_project_stops_the_endpoint(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, false).await;
-        std::fs::remove_file(fixture.dir.path().join("emerald.toml")).unwrap();
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-
-        assert!(
-            fixture.calls.lock().unwrap().is_empty(),
-            "nothing was spawned"
-        );
-        match endpoint.state() {
-            ggo_common::ViewerState::Stopped(reason) => {
-                assert!(reason.contains(ggo_common::EMERALD_MANIFEST), "{reason}")
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// Every presented frame lands in the endpoint's slot and wakes the
-    /// world view -- the feed the live view actually draws.
-    #[gpui::test]
-    async fn viewer_frames_land_in_the_endpoint_slot_and_tick(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, true).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        await_first_frame(&fixture.panel, cx);
-
-        assert!(
-            endpoint
-                .frame
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some(),
-            "on_frame published the frame it just presented"
-        );
-        assert!(
-            endpoint.ticks().try_recv().is_ok(),
-            "and woke the world view"
-        );
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.stop(window, cx));
-    }
-
-    /// A plain cart run takes the pane back: the world view is told why
-    /// rather than left polling a run that is no longer its own.
-    #[gpui::test]
-    async fn a_plain_run_stops_the_viewer_endpoint_and_releases_it(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, false).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-
-        std::fs::write(
-            fixture.dir.path().join("green.cart"),
-            drive::fixture::green_screen_cart(),
-        )
-        .unwrap();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            // The Run button's own entry point, over the viewer's own
-            // selection: a viewer run IS downgraded (a world run is not
-            // -- see `pressing_run_leaves_a_watched_world_run_watchable`).
-            panel.run_selected_cart(window, cx);
-            assert!(panel.viewer_link.is_none(), "the link was released");
-            assert!(matches!(panel.run_kind, RunKind::Cart));
-        });
-        match endpoint.state() {
-            ggo_common::ViewerState::Stopped(_) => {}
-            other => panic!("a replaced viewer must be stopped, not {other:?}"),
-        }
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.stop(window, cx));
-        cx.run_until_parked();
-    }
-
-    /// **A rebuild must never flash the previous run's stop reason.** The
-    /// run `boot_viewer` stops finishes off-thread, in the middle of the
-    /// build, on the SAME endpoint the rebuild reuses -- and a rebuild
-    /// bumps only `build_generation`, so `finish_run`'s run-generation
-    /// guard does not cover this case at all. The world view must read
-    /// `Building` for the whole build and then `Running`, never a
-    /// `Stopped` in between.
-    ///
-    /// The state is sampled inside the fake `emd`, which is the one place
-    /// that runs WHILE the build is in flight -- the window a user of a
-    /// real (seconds-long) build would be staring at.
-    #[gpui::test]
-    async fn a_viewer_rebuild_stays_building_until_the_new_run_is_up(cx: &mut TestAppContext) {
-        let endpoint = ggo_common::LinkEndpoint::new();
-        let during_build: Arc<std::sync::Mutex<Vec<ggo_common::ViewerState>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (fixture, cx) = viewer_fixture_with(cx, {
-            let endpoint = endpoint.clone();
-            let during_build = during_build.clone();
-            move |dir: &std::path::Path| {
-                during_build.lock().unwrap().push(endpoint.state());
-                let ggo = dir.join(VIEWER_GGO);
-                std::fs::write(&ggo, drive::fixture::green_screen_cart()).unwrap();
-                ggo_common::ProcCapture {
-                    ok: true,
-                    lines: vec![serde_json::json!({ "ggo": ggo }).to_string()],
-                }
-            }
-        })
-        .await;
-
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        await_first_frame(&fixture.panel, cx);
-        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
-
-        // The rebuild a watched save schedules, on the endpoint the world
-        // view is already holding.
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Building,
-            "the rebuild says what it is doing"
-        );
-        cx.run_until_parked();
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Running,
-            "and ends in the new run"
-        );
-
-        let during_build = during_build.lock().unwrap();
-        assert_eq!(during_build.len(), 2, "two builds");
-        assert_eq!(
-            during_build[1],
-            ggo_common::ViewerState::Building,
-            "the run stopped for this rebuild must not report over it"
-        );
-        drop(during_build);
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.stop(window, cx));
-        cx.run_until_parked();
-    }
-
-    /// The other half of the same defect: `finish_run`'s OWN account of
-    /// the ending must not land on an endpoint a newer BUILD already
-    /// owns. Its only guard was `run_generation`, which a rebuild does
-    /// not bump until the build is over -- so the completion of the run
-    /// the rebuild stopped sailed through it and replaced `Building` with
-    /// that run's stop reason.
-    ///
-    /// The build is stood in for by the two fields `boot_viewer` sets
-    /// (`build_generation`, `building`) rather than by a real rebuild:
-    /// the point is to leave this completion as the LAST writer, which a
-    /// real rebuild -- racing its own `Running` against it -- cannot do
-    /// deterministically.
-    #[gpui::test]
-    async fn a_completion_from_before_a_rebuild_does_not_report_over_it(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, true).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        await_first_frame(&fixture.panel, cx);
-        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
-
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            // The run's completion is in flight from here.
-            panel.stop(window, cx);
-            panel.build_generation += 1;
-            panel.building = true;
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Building,
-            "the completion of the run a rebuild stopped must not report over the rebuild"
-        );
-    }
-
-    /// A run that ends without ever starting still tells the world view
-    /// why -- `finish_run`'s own account of an ending, which is the only
-    /// one there is when the emulator thread never got far enough (or
-    /// panicked) to write its own.
-    #[gpui::test]
-    async fn a_viewer_run_with_nothing_to_start_stops_the_endpoint(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, false).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.selected = None;
-            panel.run(window, cx);
-            assert_eq!(panel.status.as_deref(), Some("no cart selected"));
-        });
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Stopped("no cart selected".to_string())
-        );
-        fixture.panel.read_with(cx, |panel, _| {
-            assert!(
-                panel.viewer_link.is_some(),
-                "the endpoint is kept: its reason is what the world view shows"
-            );
-        });
-    }
-
     /// **Pressing Run must not silently disarm watch mode.** Watch
     /// re-packs whatever [`RunKind`] names, so downgrading a WORLD run to
     /// a plain cart here would leave the toggle lit and the next save
-    /// doing nothing. Only a viewer run is downgraded (it hands its link
-    /// back -- see the test above).
+    /// doing nothing.
     #[gpui::test]
     async fn pressing_run_leaves_a_watched_world_run_watchable(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -6841,7 +5912,7 @@ mod tests {
         assert!(panel.read_with(cx, |panel, _| panel.watch));
 
         // The user restarts the world cart with the Run button.
-        panel.update_in(cx, |panel, window, cx| panel.run_selected_cart(window, cx));
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert!(
@@ -6885,434 +5956,12 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// **The published frame's atlas tile is retired one publish LATE**,
-    /// for the reason this pane's own double buffer is (see the module
-    /// doc): the world view's most recently submitted scene is still
-    /// drawing the frame that was just replaced, and handing that rect
-    /// back frees it to be reallocated -- and overwritten -- under a
-    /// scene that is still being presented.
-    ///
-    /// No explicit `cx.draw` here, unlike the tests above: at this
-    /// cadence this pane's OWN double buffer has not retired the replaced
-    /// frame yet when the check runs (it still holds it as
-    /// `previous_rendered_frame`), so a missing tile after the second
-    /// publish can only have come from the publish path.
-    #[gpui::test]
-    async fn published_frames_are_retired_one_publish_late(cx: &mut TestAppContext) {
-        let (panel, cx) = windowed_panel(cx);
-        let endpoint = ggo_common::LinkEndpoint::new();
-        panel.update(cx, |panel, _cx| {
-            panel.viewer_link = Some(endpoint.clone());
-        });
-        let publish = |cx: &mut gpui::VisualTestContext, number: u32| {
-            let bgra = vec![0x7Fu8; (drive::WIDTH * drive::HEIGHT * 4) as usize];
-            panel.update(cx, |panel, cx| {
-                panel.on_frame(
-                    Frame {
-                        bgra,
-                        number,
-                        step_ms: 1.0,
-                    },
-                    cx,
-                );
-                panel
-                    .latest_frame
-                    .clone()
-                    .expect("a frame message must produce an image")
-            })
-        };
-
-        let first = publish(cx, 1);
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                panel.previously_published.is_none(),
-                "the first publish replaced nothing"
-            );
-        });
-
-        let second = publish(cx, 2);
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                panel
-                    .previously_published
-                    .as_ref()
-                    .is_some_and(|held| Arc::ptr_eq(held, &first)),
-                "the frame just replaced is HELD, not retired"
-            );
-        });
-        assert!(
-            cx.update(|window, _| window.has_image_atlas_entry(&first)),
-            "and its tile is still resident: the world view may be presenting it"
-        );
-
-        publish(cx, 3);
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                panel
-                    .previously_published
-                    .as_ref()
-                    .is_some_and(|held| Arc::ptr_eq(held, &second)),
-                "the lag slot moves on to the newly replaced frame"
-            );
-        });
-        assert!(
-            cx.update(|window, _| !window.has_image_atlas_entry(&first)),
-            "the frame from two publishes ago IS retired"
-        );
-    }
-
-    /// **A viewer run is never hidden-tab paused.** The world view lives
-    /// somewhere else entirely (its own panel), so the emulator tab is
-    /// hardly ever the front one while a live view is up -- and the
-    /// deactivation pause lands inside the `Vsync` arm the link is pumped
-    /// from, so adopting it would freeze the live feed for as long as the
-    /// user looked at anything but the emulator.
-    #[gpui::test]
-    async fn a_viewer_run_is_not_paused_when_its_tab_is_hidden(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, true).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        await_first_frame(&fixture.panel, cx);
-
-        // Another centre tab takes the pane, which is what deactivates
-        // the emulator item -- and, unlike a bare `auto_pause` call, also
-        // stops it rendering, so nothing resumes it behind our back.
-        // Deliberately NOT followed by `run_until_parked`: a viewer run
-        // that correctly keeps running refills the frame channel every
-        // ~16ms, so the executor never goes idle (see `await_first_frame`).
-        fixture.workspace.update_in(cx, |workspace, window, cx| {
-            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
-        });
-        fixture.panel.read_with(cx, |panel, _| {
-            assert!(!panel.auto_paused, "a viewer run is not hidden-tab paused");
-            assert!(!panel.is_paused(), "and the cart keeps running");
-        });
-
-        // And the feed really does keep advancing behind the hidden tab.
-        let published = endpoint.frame_number().expect("a frame has been published");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while endpoint.frame_number() == Some(published) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the live feed stopped advancing once the tab was hidden"
-            );
-            if !cx.background_executor.tick() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.stop(window, cx));
-        cx.run_until_parked();
-    }
-
-    /// **Teardown owns the tile it published.** The image in the
-    /// endpoint's slot is the SAME `Arc` as `latest_frame`, so a
-    /// `release_atlas_all` that hands that tile back while leaving the
-    /// slot populated points the world view at a rect the atlas is free
-    /// to reallocate -- and nothing would ever retire the slot's own
-    /// reference afterwards either. Both teardown halves are one act.
-    #[gpui::test]
-    async fn stopping_a_viewer_run_empties_the_endpoints_frame_slot(cx: &mut TestAppContext) {
-        let (panel, cx) = windowed_panel(cx);
-        let endpoint = ggo_common::LinkEndpoint::new();
-        panel.update(cx, |panel, _cx| {
-            panel.viewer_link = Some(endpoint.clone());
-        });
-        let published = publish_one_frame(&panel, cx, 1);
-        assert_eq!(endpoint.frame_number(), Some(1));
-        cx.draw(
-            gpui::Point::default(),
-            gpui::size(px(320.), px(240.)),
-            |_, _| gpui::Empty,
-        );
-        assert!(
-            cx.update(|window, _| window.has_image_atlas_entry(&published)),
-            "the published frame really is in the atlas to begin with"
-        );
-
-        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
-        assert_eq!(
-            endpoint.frame_number(),
-            None,
-            "a stopped run leaves no frame the world view could sample"
-        );
-        assert!(
-            cx.update(|window, _| !window.has_image_atlas_entry(&published)),
-            "and the tile it was holding is handed back"
-        );
-    }
-
-    /// The same contract on the OTHER two teardowns: a plain run taking
-    /// the pane back abandons the endpoint outright (nothing will ever
-    /// publish over its slot again), and so does the panel's own release.
-    #[gpui::test]
-    async fn abandoning_a_viewer_endpoint_retires_its_published_frame(cx: &mut TestAppContext) {
-        let (panel, cx) = windowed_panel(cx);
-        let endpoint = ggo_common::LinkEndpoint::new();
-        panel.update(cx, |panel, _cx| {
-            panel.viewer_link = Some(endpoint.clone());
-        });
-        // Two publishes, so the one-publish lag is holding the first
-        // frame when the endpoint is abandoned -- that one is nobody's
-        // once the branch runs, which is what makes its tile checkable.
-        // The second is still what the pane displays, so only its slot
-        // can be asserted on.
-        let lagged = publish_one_frame(&panel, cx, 1);
-        publish_one_frame(&panel, cx, 2);
-        assert!(
-            cx.update(|window, _| window.has_image_atlas_entry(&lagged)),
-            "the lagged frame really is in the atlas to begin with"
-        );
-
-        // `run` with nothing selected still takes the replacement branch
-        // -- the endpoint is released before the "no cart selected"
-        // refusal, which is the point: it is no longer this pane's.
-        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
-        assert_eq!(
-            endpoint.frame_number(),
-            None,
-            "the slot was emptied -- nothing will publish over it again"
-        );
-        assert!(
-            cx.update(|window, _| !window.has_image_atlas_entry(&lagged)),
-            "and the lagged frame's tile is handed back -- through the WINDOW, \
-             which `App::drop_image(.., None)` cannot reach while `run` holds it"
-        );
-    }
-
-    /// Panel release: the last chance to hand the published tile back,
-    /// and the last chance to tell the world view its viewer is gone.
-    #[gpui::test]
-    async fn releasing_the_panel_retires_the_published_frame_and_stops_the_endpoint(
-        cx: &mut TestAppContext,
-    ) {
-        let (_root, cx) = windowed_panel(cx);
-        let panel = cx.update(|window, cx| cx.new(|cx| EmuPanel::test_new(window, cx)));
-        let endpoint = ggo_common::LinkEndpoint::new();
-        panel.update(cx, |panel, _cx| {
-            panel.viewer_link = Some(endpoint.clone());
-        });
-        let published = publish_one_frame(&panel, cx, 1);
-
-        drop(panel);
-        // An entity is released on the next effect flush, and an idle
-        // executor never starts one -- so ask for an update first.
-        cx.update(|_window, _cx| {});
-        cx.run_until_parked();
-        assert_eq!(endpoint.frame_number(), None, "the slot was emptied");
-        assert!(
-            cx.update(|window, _| !window.has_image_atlas_entry(&published)),
-            "and its tile handed back"
-        );
-        match endpoint.state() {
-            ggo_common::ViewerState::Stopped(reason) => {
-                assert!(reason.contains("closed"), "{reason}")
-            }
-            other => panic!("a closed pane must stop the endpoint, not leave it {other:?}"),
-        }
-    }
-
-    /// **A viewer build superseded by a NON-viewer one must not orphan
-    /// `Building` either.** `emulate_world` and `run_hardware_diagnostics`
-    /// bump `build_generation`, so the viewer boot's completion
-    /// early-returns -- and nothing downstream of it will ever run this
-    /// endpoint, because the run that eventually starts is not the world
-    /// view's. Without a word here the live view waits on a `Building`
-    /// that never resolves.
-    #[gpui::test]
-    async fn a_viewer_build_replaced_by_another_build_stops_the_endpoint(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, false).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx);
-            // What "Emulate this world" started while the viewer cart was
-            // still building leaves behind: a newer build generation, a
-            // run kind that is not this endpoint's, and no viewer link.
-            panel.build_generation += 1;
-            panel.run_kind = RunKind::World("assets/worlds/main.toml".to_string());
-            panel.viewer_link = None;
-        });
-        cx.run_until_parked();
-
-        match endpoint.state() {
-            ggo_common::ViewerState::Stopped(reason) => {
-                assert_eq!(reason, "replaced by another build")
-            }
-            other => {
-                panic!("a superseded viewer boot must stop its endpoint, not leave it {other:?}")
-            }
-        }
-    }
-
-    /// **Replacing a viewer run with another one must not leave a stale
-    /// `Stopped` behind.** The run being replaced is driving THIS
-    /// endpoint, and its thread writes its own stop reason whenever it
-    /// gets round to noticing the flag -- which is after the replacement
-    /// has already said `Running`. Only handing the endpoint over (see
-    /// `Session::release_link`), which `boot_viewer` does and `run`'s own
-    /// Viewer->Viewer arm did not, closes that window.
-    #[gpui::test]
-    async fn replacing_a_viewer_run_leaves_the_endpoint_running(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, true).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        await_first_frame(&fixture.panel, cx);
-        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
-
-        // Run again over the live viewer run: `run_kind` is still
-        // `Viewer`, so this is the arm that KEEPS the link -- what a
-        // watch restart and `boot_viewer`'s own completion both reach.
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.run(window, cx));
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Running,
-            "the replacement said so on its way up"
-        );
-        // The replaced run's thread ends a frame period later; give it
-        // every chance to stamp its own `Stopped` over that `Running`.
-        for _ in 0..50 {
-            cx.background_executor.tick();
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Running,
-            "the replaced run must not report its ending through an endpoint \
-             the replacement is already driving"
-        );
-
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.stop(window, cx));
-        cx.run_until_parked();
-    }
-
-    /// **The world panel leaving live mode ends the run.** It asks
-    /// through the endpoint ([`ggo_common::LinkEndpoint::request_stop`]);
-    /// the pane notices at its next frame and tears the run down the way
-    /// Stop does -- reason on the endpoint, tiles handed back, and the
-    /// pane no longer a viewer.
-    #[gpui::test]
-    async fn a_world_panels_stop_request_ends_the_viewer_run(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, true).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        await_first_frame(&fixture.panel, cx);
-        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
-
-        endpoint.request_stop();
-        // Tick rather than `run_until_parked`: until the request is
-        // acted on the run is still refilling the frame channel, so the
-        // executor never goes idle (see `await_first_frame`).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while fixture.panel.read_with(cx, |panel, _| panel.is_running()) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the run ignored the world panel's stop request"
-            );
-            if !cx.background_executor.tick() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        assert_eq!(
-            endpoint.frame_number(),
-            None,
-            "and the frame it was holding is handed back"
-        );
-        fixture.panel.read_with(cx, |panel, _| {
-            assert!(panel.viewer_link.is_none(), "the link was released");
-            assert!(matches!(panel.run_kind, RunKind::Cart));
-        });
-        // AFTER the run's own completion has landed -- `finish_run`
-        // backgrounds `Session::wait` plus the ingest, and that
-        // completion reports the ending too. It must not overwrite this
-        // reason with the thread's bare "stopped": the run was released
-        // before it was finished, so it has no endpoint to speak
-        // through. See `drive::Session::link`.
-        cx.run_until_parked();
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Stopped(drive::WORLD_PANEL_STOP.to_string()),
-            "the reason survives the run's own end-of-run completion"
-        );
-    }
-
-    /// **The same request, noticed by the EMULATOR THREAD.** A paused
-    /// viewer publishes no frame for `on_frame` to see the request on, so
-    /// the run ends by the thread's own check in the vsync park and the
-    /// pump reaches its tail instead of its `StopRequested` arm. The
-    /// teardown has to be the same one either way -- otherwise which of
-    /// the two won the race decides whether the pane is left holding a
-    /// dead view's endpoint and tiles.
-    #[gpui::test]
-    async fn a_stop_request_the_thread_notices_first_tears_the_viewer_down_too(
-        cx: &mut TestAppContext,
-    ) {
-        let (fixture, cx) = viewer_fixture(cx, true).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        await_first_frame(&fixture.panel, cx);
-        fixture.panel.update(cx, |panel, cx| panel.toggle_pause(cx));
-
-        // Let the thread reach its park and the pump drain the frames
-        // already in flight -- several frame periods' worth of wall clock,
-        // because both are off this thread. From here the channel stays
-        // empty, so only the thread's own check can see the request.
-        let settled = std::time::Instant::now() + std::time::Duration::from_millis(250);
-        while std::time::Instant::now() < settled {
-            if !cx.background_executor.tick() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-
-        endpoint.request_stop();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while fixture.panel.read_with(cx, |panel, _| panel.is_running()) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the paused run ignored the world panel's stop request"
-            );
-            if !cx.background_executor.tick() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-
-        fixture.panel.read_with(cx, |panel, _| {
-            assert!(panel.viewer_link.is_none(), "the link was released");
-            assert!(matches!(panel.run_kind, RunKind::Cart));
-        });
-        assert_eq!(
-            endpoint.frame_number(),
-            None,
-            "and the frame it was holding is handed back"
-        );
-        cx.run_until_parked();
-        assert_eq!(
-            endpoint.state(),
-            ggo_common::ViewerState::Stopped(drive::WORLD_PANEL_STOP.to_string()),
-        );
-    }
-
-    /// The other half of the registry hop: with no booter registered
-    /// (this build has no emulator pane), `boot_viewer` hands back
-    /// nothing at all -- which is what keeps the world view in its design
-    /// mode instead of waiting on a viewer that will never boot.
+    /// The registry hop's other half (the booter this crate's `init`
+    /// registers is exercised in [`viewer_run`]'s own tests): with NO
+    /// booter registered -- a build with no emulator pane --
+    /// `ggo_common::boot_viewer` hands back nothing at all, which is what
+    /// keeps the world view in its design mode instead of waiting on a
+    /// viewer that will never boot.
     ///
     /// Here rather than in `ggo_common`, whose own tests have no
     /// `Workspace` to call it with.
@@ -7332,78 +5981,6 @@ mod tests {
             ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
         });
         assert!(endpoint.is_none(), "no booter claimed the world");
-    }
-
-    /// Watch mode on a viewer run rebuilds through the SAME viewer boot
-    /// (not `emd pack-ggo`), and keeps the endpoint the world view is
-    /// already holding.
-    #[gpui::test]
-    async fn watch_mode_rebuilds_a_viewer_run_through_the_viewer_boot(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, false).await;
-        let endpoint = ggo_common::LinkEndpoint::new();
-        fixture.panel.update_in(cx, |panel, window, cx| {
-            panel.boot_viewer("assets/worlds/main.toml", endpoint.clone(), window, cx)
-        });
-        cx.run_until_parked();
-        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
-
-        let fs = fixture.workspace.read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).fs().clone()
-        });
-        let fake_fs = fs.as_fake();
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.set_watch(true, window, cx));
-        assert!(fixture.panel.read_with(cx, |panel, _| panel.watch));
-
-        fake_fs
-            .insert_tree("/proj", serde_json::json!({ "assets": { "tiles": {} } }))
-            .await;
-        cx.run_until_parked();
-        cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
-        cx.run_until_parked();
-        let after_dirs = fixture.calls.lock().unwrap().len();
-
-        fake_fs
-            .insert_file("/proj/assets/tiles/a.til", b"til".to_vec())
-            .await;
-        cx.run_until_parked();
-        cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
-        cx.run_until_parked();
-        {
-            let calls = fixture.calls.lock().unwrap();
-            assert_eq!(calls.len(), after_dirs + 1, "the asset save rebuilt");
-            assert_eq!(
-                calls[calls.len() - 1].args,
-                ["editor-cart", "--ggo", "--json"],
-                "a viewer rebuild is another viewer build, not a world pack"
-            );
-        }
-        fixture.panel.read_with(cx, |panel, _| {
-            assert!(
-                panel
-                    .viewer_link
-                    .as_ref()
-                    .is_some_and(|link| Arc::ptr_eq(link, &endpoint)),
-                "the rebuild kept the world view's own endpoint"
-            );
-        });
-
-        // A world save travels over the link, so it must NOT rebuild.
-        fake_fs
-            .insert_file("/proj/assets/worlds/main.toml", b"[world]".to_vec())
-            .await;
-        cx.run_until_parked();
-        cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
-        cx.run_until_parked();
-        assert_eq!(
-            fixture.calls.lock().unwrap().len(),
-            after_dirs + 1,
-            "a world save is sent over the link, not rebuilt"
-        );
-        fixture
-            .panel
-            .update_in(cx, |panel, window, cx| panel.set_watch(false, window, cx));
     }
 
     /// **"Re-run (perf)", end to end.** The entry routes the cart into
@@ -7762,8 +6339,8 @@ mod tests {
         let world_path_for_runner = world_path.clone();
         let (runner, calls) = fake_proc_runner(move |request| {
             // Only the EMULATE build's view of the file is the ordering
-            // this test is about; the world panel's Live viewer build runs
-            // through the same runner.
+            // this test is about; other `emd` invocations share the
+            // runner.
             if is_pack_ggo(request) {
                 *recorder.lock().unwrap() = std::fs::read_to_string(&world_path_for_runner).ok();
             }
