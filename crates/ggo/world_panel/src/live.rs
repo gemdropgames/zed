@@ -273,16 +273,11 @@ pub fn from_raw(raw: i32) -> f64 {
     f64::from(raw) / 65536.0
 }
 
-// The Live picture geometry. `dead_code` allowed until the view and the
-// paint path call these; the unit tests below are the only caller for now.
-
 /// The largest integer scale the emulator picture is drawn at, so a huge
 /// tab doesn't blow one device pixel up past a readable block.
-#[allow(dead_code)]
 pub const LIVE_SCALE_MAX: u32 = 8;
 
 /// The largest integer scale at which the device frame fits `canvas`, min 1.
-#[allow(dead_code)]
 pub fn fit_scale(canvas_w: f64, canvas_h: f64) -> u32 {
     let by_w = (canvas_w / DEVICE_SCREEN_W).floor();
     let by_h = (canvas_h / DEVICE_SCREEN_H).floor();
@@ -292,7 +287,6 @@ pub fn fit_scale(canvas_w: f64, canvas_h: f64) -> u32 {
 
 /// Where the scaled frame sits: centered in the canvas (canvas-relative px).
 /// Floored so the frame lands on whole device pixels.
-#[allow(dead_code)]
 pub fn frame_origin(canvas_w: f64, canvas_h: f64, scale: u32) -> [f64; 2] {
     let scale = f64::from(scale);
     [
@@ -302,7 +296,6 @@ pub fn frame_origin(canvas_w: f64, canvas_h: f64, scale: u32) -> [f64; 2] {
 }
 
 /// The Live transform as a worldlib `View`: `screen = origin + (world - camera) * scale`.
-#[allow(dead_code)]
 pub fn live_view(origin: [f64; 2], scale: u32, camera: [f64; 2]) -> View {
     let zoom = f64::from(scale);
     View {
@@ -314,7 +307,6 @@ pub fn live_view(origin: [f64; 2], scale: u32, camera: [f64; 2]) -> View {
 }
 
 /// `scale` +/- 1, clamped to `1..=LIVE_SCALE_MAX`.
-#[allow(dead_code)]
 pub fn scale_step(scale: u32, dir: i32) -> u32 {
     let next = if dir > 0 {
         scale.saturating_add(1)
@@ -642,7 +634,16 @@ pub struct LiveView {
     /// re-encoded per tick. Cleared by a successful send and by a greeting.
     pub world_retry_at: Option<(u64, Instant)>,
     pub layers_dirty: LayerDirty,
-    pub camera_dirty: bool,
+    /// User-chosen integer picture scale; `None` fits the canvas.
+    pub scale: Option<u32>,
+    /// The cart's camera in world px, from its per-frame report.
+    pub camera: Option<[f64; 2]>,
+    /// A camera the host owes the cart (a pan, a look-around, the
+    /// document's own framing at the greeting), flushed once per tick.
+    pub pending_camera: Option<[f64; 2]>,
+    /// A middle-drag in progress: where the cursor went down, and the
+    /// camera that drag started from.
+    pub pan_drag: Option<([f64; 2], [f64; 2])>,
     /// Slots still to push, ascending, one per tick: the cart's APP
     /// receive queue is four datagrams deep, and a blob transfer already
     /// fills it. A slot re-dirtied while this queue is draining is re-read
@@ -679,7 +680,10 @@ impl LiveView {
             world_dirty: false,
             world_retry_at: None,
             layers_dirty: LayerDirty::default(),
-            camera_dirty: false,
+            scale: None,
+            camera: None,
+            pending_camera: None,
+            pan_drag: None,
             layer_queue: VecDeque::new(),
             // Editor systems only: a viewer that ran the cart's gameplay
             // systems would move the entities the user is dragging.

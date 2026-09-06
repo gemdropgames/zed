@@ -549,11 +549,6 @@ struct ViewShared {
     /// Canvas-relative cursor position while the pointer is over the
     /// canvas -- where a paste lands. `None` once it leaves.
     hover: Option<[f64; 2]>,
-    /// The camera moved somewhere the live session could not be reached
-    /// from -- the canvas's prepaint closure. Consumed by
-    /// `OpenWorld::live_step`, which turns it into `camera_dirty`. Every
-    /// other camera move pokes the session directly.
-    camera_moved: bool,
 }
 
 /// An in-flight middle-mouse pan drag.
@@ -834,7 +829,6 @@ impl OpenWorld {
                 last_bounds: None,
                 drag: None,
                 hover: None,
-                camera_moved: false,
             })),
             selected: Vec::new(),
             marquee: None,
@@ -1088,24 +1082,6 @@ pub fn composite_scene(items: &[DrawItem], origin: [f64; 2], width: u32, height:
     canvas
 }
 
-/// The world point at the canvas's top-left corner -- what the cart's
-/// camera has to be set to for its render to line up with the design
-/// view's framing.
-fn view_top_left_world(view: &Rc<RefCell<ViewShared>>) -> [f64; 2] {
-    let v = view.borrow();
-    let pan = v.pan.unwrap_or([0.0, 0.0]);
-    drag_ops::screen_to_world(
-        0.0,
-        0.0,
-        &View {
-            zoom: v.zoom,
-            pan_x: pan[0],
-            pan_y: pan[1],
-            dpr: None,
-        },
-    )
-}
-
 /// Stamp the canvas bounds on the shared view and, on the very first
 /// layout, center the camera. Shared by both renderers so Design and Live
 /// frame a freshly opened world identically -- and so the Live gestures,
@@ -1125,12 +1101,6 @@ fn layout_camera(
             zoom,
             world_center,
         ));
-        // The centering IS a camera move, and it happens in a paint
-        // closure that cannot reach the session; `live_step` picks the
-        // flag up. Without it a session that connected before the first
-        // layout leaves the cart at camera (0, 0) while the overlay draws
-        // against the centered pan.
-        v.camera_moved = true;
     }
     (zoom, v.pan.unwrap_or([0.0, 0.0]))
 }
@@ -1334,7 +1304,10 @@ impl OpenWorld {
                 live.world_retry_at = None;
                 live.world_sync = live::WorldSync::Sending;
                 live.layers_dirty.mark_all();
-                live.camera_dirty = true;
+                // Where the cart starts looking is the document's own
+                // framing -- the camera origin the Design renderer frames
+                // -- not wherever the design pan happens to sit.
+                live.pending_camera = Some(active_camera_origin(&self.store.state()));
             }
             // `is_connected` never goes false on its own; a cart that was
             // reset or unplugged is only visible as a session that stopped
@@ -1370,12 +1343,6 @@ impl OpenWorld {
         if live.status == LiveStatus::Connected {
             live.flush_pending_transforms();
         }
-        // A first layout centered the camera in a paint closure that could
-        // not reach the session.
-        if std::mem::take(&mut self.view.borrow_mut().camera_moved) {
-            live.camera_dirty = true;
-        }
-
         // One update per tick, and none while a blob is in flight: the
         // cart's APP receive queue is four datagrams deep and a transfer
         // already fills it.
@@ -1398,7 +1365,7 @@ impl OpenWorld {
             let acted = world_ready
                 || live.layers_dirty.any()
                 || !live.layer_queue.is_empty()
-                || live.camera_dirty;
+                || live.pending_camera.is_some();
             // A layer or camera push that worked must not take a world
             // failure off the status row while that world is still unsent.
             let world_held_back = live.world_dirty && !world_ready;
@@ -1464,9 +1431,7 @@ impl OpenWorld {
                 {
                     live_error = Some(format!("live layer {}: {error}", load.layer));
                 }
-            } else if live.camera_dirty {
-                live.camera_dirty = false;
-                let [x, y] = view_top_left_world(&self.view);
+            } else if let Some([x, y]) = live.pending_camera.take() {
                 if let Err(error) = live.mailbox.set_camera(live::to_raw(x), live::to_raw(y)) {
                     live_error = Some(format!("live camera: {error}"));
                 }
@@ -1489,6 +1454,12 @@ impl OpenWorld {
         let rows = live::rows_from(live.mailbox.entities());
         changed |= rows != live.rows;
         live.rows = rows;
+        let camera_before = live.camera;
+        live.camera = live
+            .mailbox
+            .camera()
+            .map(|(x, y)| [live::from_raw(x), live::from_raw(y)]);
+        changed |= live.camera != camera_before;
         // Cloning the `Arc` only -- the emu panel owns dropping the image
         // it replaces (see `LinkEndpoint::frame`).
         live.frame = live
@@ -2708,6 +2679,7 @@ impl WorldPanel {
         // their look-around meaning there rather than moving an entity the
         // user can't even see selected.
         let painting = self.in_paint_mode();
+        let live_active = self.live_active();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -2722,10 +2694,6 @@ impl WorldPanel {
             } else {
                 CAMERA_PAN_STEP_PX
             };
-            let mut view = open.view.borrow_mut();
-            let Some(pan) = view.pan else {
-                return;
-            };
             // Not `signum`: `0.0_f64.signum()` is 1.0, which would drag the
             // cross axis along.
             let sign = |axis: f64| {
@@ -2737,15 +2705,19 @@ impl WorldPanel {
                     0.0
                 }
             };
-            view.pan = Some([
-                pan[0] - sign(delta[0]) * step,
-                pan[1] - sign(delta[1]) * step,
-            ]);
-            drop(view);
-            // Look-around is a camera move, exactly like a middle-drag.
-            if let Some(live) = open.live.as_mut() {
-                live.camera_dirty = true;
+            let look = [sign(delta[0]) * step, sign(delta[1]) * step];
+            // In Live the look-around is a middle-drag by another name: it
+            // moves the CART's camera and leaves the design pan alone.
+            if live_active {
+                self.live_pan_by(look, cx);
+                return;
             }
+            let mut view = open.view.borrow_mut();
+            let Some(pan) = view.pan else {
+                return;
+            };
+            view.pan = Some([pan[0] - look[0], pan[1] - look[1]]);
+            drop(view);
             cx.notify();
             return;
         };
@@ -2905,10 +2877,27 @@ impl WorldPanel {
         }
     }
 
-    /// Restore the default camera framing -- `canvas::reset_camera`'s pair,
-    /// with the `None` pan letting the next prepaint re-center on the
-    /// active camera (see that function's doc).
+    /// Restore the default camera framing. In Design that is
+    /// `canvas::reset_camera`'s pair, with the `None` pan letting the next
+    /// prepaint re-center on the active camera (see that function's doc);
+    /// in Live it is the fitted scale and the document's camera origin.
     fn reset_view_impl(&mut self, cx: &mut Context<Self>) {
+        // Live has its own framing: back to the fitted scale, with the
+        // cart pointed at the document's camera origin again.
+        if self.live_active() {
+            let origin = match &self.state {
+                ViewerState::Ready(open) => active_camera_origin(&open.store.state()),
+                _ => return,
+            };
+            if let ViewerState::Ready(open) = &mut self.state
+                && let Some(live) = open.live.as_mut()
+            {
+                live.scale = None;
+                live.pending_camera = Some(origin);
+            }
+            cx.notify();
+            return;
+        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -3330,10 +3319,10 @@ impl WorldPanel {
             .as_ref()
             .zip(self.asset_root())
             .and_then(|(project_root, asset_root)| {
-                asset_root
-                    .strip_prefix(project_root)
-                    .ok()
-                    .map(|rel| rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
+                asset_root.strip_prefix(project_root).ok().map(|rel| {
+                    rel.to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                })
             })
             .unwrap_or_default();
         if prefix.is_empty() {
@@ -3352,7 +3341,11 @@ impl WorldPanel {
     /// [`WorldDock::open_world`], and any panel can answer (the listing
     /// only needs the project root), including a throwaway one when no
     /// world tab is open yet.
-    pub fn remote_resolve(&mut self, world: &str, cx: &mut Context<Self>) -> Result<String, String> {
+    pub fn remote_resolve(
+        &mut self,
+        world: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
         self.refresh_worlds(cx);
         self.worlds
             .iter()
@@ -3404,7 +3397,11 @@ impl WorldPanel {
                 DEVICE_SCREEN_H as u32,
             )
         };
-        Ok((width, height, composite_scene(&items, origin, width, height)))
+        Ok((
+            width,
+            height,
+            composite_scene(&items, origin, width, height),
+        ))
     }
 
     /// The open world as authored. `Err` while nothing is open or a load
@@ -3488,7 +3485,15 @@ impl WorldPanel {
     }
 
     /// The current camera transform, if the canvas has laid out.
+    ///
+    /// In Live this is the CART's transform, not the design pan/zoom: the
+    /// hit test, the marquee, the drag anchors and the double-click all go
+    /// through here, so branching once is what keeps every gesture in the
+    /// space the picture is drawn in.
     fn canvas_view(&self) -> Option<View> {
+        if self.live_active() {
+            return self.live_camera().map(|(view, _, _)| view);
+        }
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
@@ -3500,6 +3505,184 @@ impl WorldPanel {
             pan_y: pan[1],
             dpr: None,
         })
+    }
+
+    /// The canvas size the element last laid out at, canvas-relative px.
+    fn live_canvas_size(&self) -> Option<[f64; 2]> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let bounds = open.view.borrow().last_bounds?;
+        Some([f64::from(bounds.size.width), f64::from(bounds.size.height)])
+    }
+
+    /// [`Self::live_camera_for`] at the canvas's own size.
+    fn live_camera(&self) -> Option<(View, [f64; 4], u32)> {
+        self.live_camera_for(self.live_canvas_size()?)
+    }
+
+    /// The Live transform for a canvas of `size` (canvas-relative px): the
+    /// device frame centered at the effective scale, offset by the cart's
+    /// camera. Returns `(view, frame bounds, scale)`.
+    ///
+    /// The camera a pan still owes the cart wins over the cart's last
+    /// report, so the outlines travel with the picture the user is
+    /// dragging instead of snapping back until the report catches up.
+    fn live_camera_for(&self, size: [f64; 2]) -> Option<(View, [f64; 4], u32)> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let live = open.live.as_ref()?;
+        let scale = live
+            .scale
+            .unwrap_or_else(|| live::fit_scale(size[0], size[1]));
+        let origin = live::frame_origin(size[0], size[1], scale);
+        let camera = live.pending_camera.or(live.camera).unwrap_or([0.0, 0.0]);
+        let scaled = f64::from(scale);
+        Some((
+            live::live_view(origin, scale, camera),
+            [
+                origin[0],
+                origin[1],
+                DEVICE_SCREEN_W * scaled,
+                DEVICE_SCREEN_H * scaled,
+            ],
+            scale,
+        ))
+    }
+
+    /// The integer scale the Live picture is drawn at on a canvas of
+    /// `size`: the user's choice, else whatever fits.
+    fn live_scale(&self, size: [f64; 2]) -> u32 {
+        match &self.state {
+            ViewerState::Ready(open) => open
+                .live
+                .as_ref()
+                .and_then(|live| live.scale)
+                .unwrap_or_else(|| live::fit_scale(size[0], size[1])),
+            _ => live::fit_scale(size[0], size[1]),
+        }
+    }
+
+    /// Middle-button down in Live: anchor a camera pan at `cursor`.
+    fn live_pan_begin(&mut self, cursor: [f64; 2]) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(live) = open.live.as_mut()
+        {
+            let camera = live.pending_camera.or(live.camera).unwrap_or([0.0, 0.0]);
+            live.pan_drag = Some((cursor, camera));
+        }
+    }
+
+    /// A move during a Live camera pan. Returns whether one was in flight.
+    fn live_pan_move(&mut self, cursor: [f64; 2], size: [f64; 2], cx: &mut Context<Self>) -> bool {
+        let Some((_, _, scale)) = self.live_camera_for(size) else {
+            return false;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        let Some(live) = open.live.as_mut() else {
+            return false;
+        };
+        let Some((start, start_camera)) = live.pan_drag else {
+            return false;
+        };
+        let scaled = f64::from(scale);
+        // Dragging the picture right moves the camera left.
+        live.pending_camera = Some([
+            start_camera[0] - (cursor[0] - start[0]) / scaled,
+            start_camera[1] - (cursor[1] - start[1]) / scaled,
+        ]);
+        cx.notify();
+        true
+    }
+
+    /// End a Live camera pan. Returns whether one was in flight.
+    fn live_pan_end(&mut self) -> bool {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(live) = open.live.as_mut()
+        {
+            return live.pan_drag.take().is_some();
+        }
+        false
+    }
+
+    /// Move the cart's camera by `screen_delta` canvas px -- the Live twin
+    /// of nudging the design pan.
+    fn live_pan_by(&mut self, screen_delta: [f64; 2], cx: &mut Context<Self>) -> bool {
+        let Some(size) = self.live_canvas_size() else {
+            return false;
+        };
+        let Some((_, _, scale)) = self.live_camera_for(size) else {
+            return false;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        let Some(live) = open.live.as_mut() else {
+            return false;
+        };
+        let camera = live.pending_camera.or(live.camera).unwrap_or([0.0, 0.0]);
+        let scaled = f64::from(scale);
+        live.pending_camera = Some([
+            camera[0] + screen_delta[0] / scaled,
+            camera[1] + screen_delta[1] / scaled,
+        ]);
+        cx.notify();
+        true
+    }
+
+    /// One wheel notch in Live: the picture scale steps, and nothing goes
+    /// to the cart -- the scale is the host's own.
+    fn live_wheel(&mut self, dir: i32, size: [f64; 2], cx: &mut Context<Self>) {
+        let current = self.live_scale(size);
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(live) = open.live.as_mut() else {
+            return;
+        };
+        let next = live::scale_step(current, dir);
+        if live.scale == Some(next) {
+            return;
+        }
+        live.scale = Some(next);
+        cx.notify();
+    }
+
+    /// The screen rect the Live overlay outlines cart row `index` at, on a
+    /// canvas of `size`.
+    #[cfg(test)]
+    fn test_live_row_screen_rect(&self, index: u32, size: [f64; 2]) -> Option<[f64; 4]> {
+        let (view, _, _) = self.live_camera_for(size)?;
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let [x, y, w, h] = open
+            .live
+            .as_ref()?
+            .rows
+            .iter()
+            .find(|row| row.index == index)?
+            .drawn();
+        let top_left = drag_ops::world_to_screen(x, y, &view);
+        let bottom_right = drag_ops::world_to_screen(x + w, y + h, &view);
+        Some([
+            top_left[0],
+            top_left[1],
+            bottom_right[0] - top_left[0],
+            bottom_right[1] - top_left[1],
+        ])
+    }
+
+    /// The DESIGN view's pan, which no Live gesture may touch.
+    #[cfg(test)]
+    fn test_design_pan(&self) -> Option<[f64; 2]> {
+        match &self.state {
+            ViewerState::Ready(open) => open.view.borrow().pan,
+            _ => None,
+        }
     }
 
     /// Left-mouse down at canvas-relative `local` px: hit-test in world
@@ -3754,6 +3937,19 @@ impl WorldPanel {
     /// Middle-mouse pan handling for a move event. Returns true if the
     /// event belonged to an in-flight pan (handled or cancelled).
     fn handle_pan_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        // In Live the pan does not move the picture -- it moves the CART's
+        // camera, and the cart re-renders from there. The design pan is
+        // left exactly where the design view had it.
+        if self.live_active() {
+            if event.pressed_button != Some(MouseButton::Middle) {
+                return self.live_pan_end();
+            }
+            let cursor = [f64::from(event.position.x), f64::from(event.position.y)];
+            let Some(size) = self.live_canvas_size() else {
+                return false;
+            };
+            return self.live_pan_move(cursor, size, cx);
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return false;
         };
@@ -3769,11 +3965,6 @@ impl WorldPanel {
         let dy = f64::from(event.position.y) - drag.start_cursor[1];
         v.pan = Some([drag.start_pan[0] + dx, drag.start_pan[1] + dy]);
         drop(v);
-        // In Live the pan does not move the picture -- it moves the CART's
-        // camera, and the cart re-renders from there.
-        if let Some(live) = open.live.as_mut() {
-            live.camera_dirty = true;
-        }
         cx.notify();
         true
     }
@@ -3783,6 +3974,19 @@ impl WorldPanel {
     /// cursor stays under it ([`canvas::zoom_at`]). A zero delta, a ladder
     /// end, or a canvas that hasn't laid out yet is a no-op.
     fn wheel_zoom(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
+        if dy == 0.0 {
+            return;
+        }
+        let dir = if dy > 0.0 { 1 } else { -1 };
+        // Live has no zoom ladder: the picture is drawn at whole device
+        // pixels, so the wheel steps that integer scale instead.
+        if self.live_active() {
+            if let Some(size) = self.live_canvas_size() {
+                self.live_wheel(dir, size, cx);
+            }
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -3790,11 +3994,6 @@ impl WorldPanel {
         let (Some(pan), Some(canvas_bounds)) = (v.pan, v.last_bounds) else {
             return;
         };
-        let dy = f32::from(event.delta.pixel_delta(px(20.)).y);
-        if dy == 0.0 {
-            return;
-        }
-        let dir = if dy > 0.0 { 1 } else { -1 };
         let new_zoom = canvas::zoom_step(v.zoom, dir);
         if new_zoom == v.zoom {
             return;
@@ -3806,12 +4005,6 @@ impl WorldPanel {
         v.pan = Some(canvas::zoom_at(pan, v.zoom, cursor, new_zoom));
         v.zoom = new_zoom;
         drop(v);
-        // Zoom itself is host-side (the frame scales), but zooming about
-        // the cursor moves the world point at the canvas's top-left, which
-        // IS the cart's camera.
-        if let Some(live) = open.live.as_mut() {
-            live.camera_dirty = true;
-        }
         cx.notify();
     }
 
@@ -5427,11 +5620,17 @@ impl WorldPanel {
                             Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
                                 let flash = weak.clone();
                                 let rebuild = weak;
-                                menu.entry("Flash now (cached gateware)", None, move |window, cx| {
-                                    flash
-                                        .update(cx, |this, cx| this.flash_impl(false, window, cx))
-                                        .ok();
-                                })
+                                menu.entry(
+                                    "Flash now (cached gateware)",
+                                    None,
+                                    move |window, cx| {
+                                        flash
+                                            .update(cx, |this, cx| {
+                                                this.flash_impl(false, window, cx)
+                                            })
+                                            .ok();
+                                    },
+                                )
                                 .entry(
                                     "Flash + rebuild gateware (~20 min)",
                                     None,
@@ -6022,16 +6221,18 @@ impl WorldPanel {
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                    let cursor = [f64::from(event.position.x), f64::from(event.position.y)];
+                    if this.live_active() {
+                        this.live_pan_begin(cursor);
+                        return;
+                    }
                     let ViewerState::Ready(open) = &this.state else {
                         return;
                     };
                     let mut v = open.view.borrow_mut();
                     if let Some(pan) = v.pan {
                         v.drag = Some(Drag {
-                            start_cursor: [
-                                f64::from(event.position.x),
-                                f64::from(event.position.y),
-                            ],
+                            start_cursor: cursor,
                             start_pan: pan,
                         });
                     }
@@ -6081,6 +6282,10 @@ impl WorldPanel {
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                    if this.live_active() {
+                        this.live_pan_end();
+                        return;
+                    }
                     if let ViewerState::Ready(open) = &this.state {
                         open.view.borrow_mut().drag = None;
                     }
@@ -6965,7 +7170,10 @@ mod tests {
             assert_eq!(read["dirty"], false);
             assert_eq!(read["entities"].as_array().unwrap().len(), 3);
             assert_eq!(read["entities"][1]["pos"], serde_json::json!([40.0, 8.0]));
-            assert_eq!(read["entities"][1]["components"]["Text"]["content"], "hello");
+            assert_eq!(
+                read["entities"][1]["components"]["Text"]["content"],
+                "hello"
+            );
             assert_eq!(read["instances"][0]["world"], "worlds/sub");
             assert_eq!(read["selected"].as_array().unwrap().len(), 0);
 
@@ -6980,12 +7188,18 @@ mod tests {
 
     #[test]
     fn composite_scene_blits_images_and_boxes_relative_to_the_origin() {
-        let red: Arc<[u8]> =
-            vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255].into();
+        let red: Arc<[u8]> = vec![
+            255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+        ]
+        .into();
         let items = vec![
             DrawItem {
                 kind: DrawKind::Image {
-                    image: RgbaImage { rgba: red, w: 2, h: 2 },
+                    image: RgbaImage {
+                        rgba: red,
+                        w: 2,
+                        h: 2,
+                    },
                 },
                 x: 10.0,
                 y: 10.0,
@@ -7024,7 +7238,11 @@ mod tests {
         let short: Arc<[u8]> = vec![255u8, 0, 0, 255].into();
         let items = vec![DrawItem {
             kind: DrawKind::Image {
-                image: RgbaImage { rgba: short, w: 2, h: 2 },
+                image: RgbaImage {
+                    rgba: short,
+                    w: 2,
+                    h: 2,
+                },
             },
             x: 0.0,
             y: 0.0,
@@ -7054,9 +7272,8 @@ mod tests {
             };
             let origin = active_camera_origin(&open.store.state());
             assert_eq!(origin, [-DEVICE_SCREEN_W / 2.0, -DEVICE_SCREEN_H / 2.0]);
-            let canvas_index = |x: f64, y: f64| {
-                (((y - origin[1]) as usize) * 320 + (x - origin[0]) as usize) * 4
-            };
+            let canvas_index =
+                |x: f64, y: f64| (((y - origin[1]) as usize) * 320 + (x - origin[0]) as usize) * 4;
 
             let (w, h, bgra) = panel.remote_screenshot(false).expect("Ready draws");
             assert_eq!((w, h), (320, 240));
@@ -7097,8 +7314,14 @@ mod tests {
             assert_eq!(
                 listed,
                 vec![
-                    ("worlds/sub".to_string(), "assets/worlds/sub.toml".to_string()),
-                    ("worlds/test".to_string(), "assets/worlds/test.toml".to_string()),
+                    (
+                        "worlds/sub".to_string(),
+                        "assets/worlds/sub.toml".to_string()
+                    ),
+                    (
+                        "worlds/test".to_string(),
+                        "assets/worlds/test.toml".to_string()
+                    ),
                 ]
             );
             let rel = panel.remote_resolve("worlds/test", cx).unwrap();
@@ -7125,7 +7348,12 @@ mod tests {
             })
         });
         panel.update(cx, |panel, _cx| {
-            assert!(panel.remote_read().unwrap_err().contains("world_open first"));
+            assert!(
+                panel
+                    .remote_read()
+                    .unwrap_err()
+                    .contains("world_open first")
+            );
         });
     }
 
@@ -13034,6 +13262,15 @@ mod tests {
         cart_says(endpoint, out);
     }
 
+    /// `0x89 Camera`: `x i32, y i32` Q16.16 -- the camera the cart's render
+    /// pass drew its last frame with.
+    fn cart_camera(endpoint: &ggo_common::LinkEndpoint, x: f64, y: f64) {
+        let mut out = vec![0x89];
+        out.extend_from_slice(&live::to_raw(x).to_le_bytes());
+        out.extend_from_slice(&live::to_raw(y).to_le_bytes());
+        cart_says(endpoint, out);
+    }
+
     /// Answer whatever blob window is on the wire the way the cart does,
     /// and publish NO frame -- so a test can tell "the bytes landed" from
     /// "the cart has drawn something since". Returns what the host had
@@ -13073,7 +13310,7 @@ mod tests {
                 live.world_dirty
                     || live.layers_dirty.any()
                     || !live.layer_queue.is_empty()
-                    || live.camera_dirty
+                    || live.pending_camera.is_some()
                     || live.mailbox.busy()
                     || !live.loaded()
             });
@@ -13090,8 +13327,8 @@ mod tests {
     }
 
     /// A connected, fully synced Live panel: the cart has greeted, the
-    /// world blob and the four layer slots have been acked, and the camera
-    /// is pinned to identity so canvas-local px are world px.
+    /// world blob and the four layer slots have been acked, and the canvas
+    /// has been given bounds so the Live transform is defined.
     async fn connected_live_panel(
         cx: &mut TestAppContext,
     ) -> (
@@ -13118,7 +13355,10 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, systems));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, systems),
+        );
         cx.run_until_parked();
         panel.update(cx, |panel, _| {
             let mut view = open_of(panel).view.borrow_mut();
@@ -13153,13 +13393,11 @@ mod tests {
         (panel, endpoint, dir, cx)
     }
 
-    /// World px -> canvas-local px for the Live view: the cart's camera is
-    /// the world point the canvas's top-left shows.
+    /// World px -> canvas-local px for the Live view: the centered device
+    /// frame at the fitted scale, offset by the cart's camera.
     fn live_screen_of(panel: &WorldPanel, world: [f64; 2]) -> [f64; 2] {
-        let open = open_of(panel);
-        let camera = view_top_left_world(&open.view);
-        let zoom = open.view.borrow().zoom;
-        [(world[0] - camera[0]) * zoom, (world[1] - camera[1]) * zoom]
+        let (view, _, _) = panel.live_camera().expect("a laid-out live canvas");
+        drag_ops::world_to_screen(world[0], world[1], &view)
     }
 
     #[gpui::test]
@@ -13200,7 +13438,13 @@ mod tests {
         cx.run_until_parked();
         host_sent(&endpoint);
 
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &["animate"]));
+        cart_says(
+            &endpoint,
+            hello_ack(
+                emerald_editor_runtime::wire::LINK_PROTO_VERSION,
+                &["animate"],
+            ),
+        );
         cx.run_until_parked();
 
         let sent = host_sent(&endpoint);
@@ -13506,7 +13750,13 @@ mod tests {
         );
 
         // ... and a tick that DOES bring something new still does.
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &["animate"]));
+        cart_says(
+            &endpoint,
+            hello_ack(
+                emerald_editor_runtime::wire::LINK_PROTO_VERSION,
+                &["animate"],
+            ),
+        );
         cx.run_until_parked();
         assert!(
             notifications.get() > 0,
@@ -13564,10 +13814,7 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(
-            &endpoint,
-            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
-        );
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
         cx.run_until_parked();
 
         panel.update_in(cx, |panel, window, cx| {
@@ -14032,20 +14279,35 @@ mod tests {
         );
     }
 
-    /// Arrow keys with nothing selected look around, which is a camera
-    /// move -- the same contract a middle-drag has.
+    /// Arrow keys with nothing selected look around, which in Live is a
+    /// camera move -- the same contract a middle-drag has, and the design
+    /// pan stays where the design view left it.
     #[gpui::test]
     async fn looking_around_with_the_arrows_moves_the_live_camera(cx: &mut TestAppContext) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
         host_sent(&endpoint);
+        let design_pan_before = panel.read_with(cx, |panel, _| panel.test_design_pan());
         panel.update(cx, |panel, cx| {
             let ViewerState::Ready(open) = &mut panel.state else {
                 panic!("expected Ready");
             };
             open.selected.clear();
+            open.view.borrow_mut().last_bounds = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(800.), px(600.)),
+            ));
             panel.nudge_impl("ArrowRight", false, cx);
-            assert!(live_of(panel).camera_dirty);
+            // 800x600 fits the 320x240 frame twice over: a
+            // `CAMERA_PAN_STEP_PX` step on screen is half that in world px.
+            assert_eq!(
+                live_of(panel).pending_camera,
+                Some([CAMERA_PAN_STEP_PX / 2.0, 0.0])
+            );
         });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.test_design_pan()),
+            design_pan_before
+        );
         endpoint.tick();
         cx.run_until_parked();
         assert!(
@@ -14056,22 +14318,73 @@ mod tests {
         );
     }
 
-    /// Pan in Live moves the CART's camera, not the picture: the frame is
-    /// re-rendered from the new origin rather than slid across the canvas.
+    /// Reset view in Live is the Live framing's own reset: back to the
+    /// fitted scale, with the cart pointed at the document's camera origin
+    /// again. The design zoom and pan are not what it resets.
     #[gpui::test]
-    async fn panning_in_live_sends_camera_not_pixels(cx: &mut TestAppContext) {
-        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        host_sent(&endpoint);
-
+    async fn reset_view_in_live_refits_the_scale_and_re_aims_the_cart(cx: &mut TestAppContext) {
+        let (panel, _endpoint, _dir, cx) = connected_live_panel(cx).await;
+        let design_pan_before = panel.read_with(cx, |panel, _| panel.test_design_pan());
         panel.update(cx, |panel, cx| {
-            open_of(panel).view.borrow_mut().drag = Some(Drag {
-                start_cursor: [10.0, 10.0],
-                start_pan: [0.0, 0.0],
-            });
-            panel.handle_pan_move(&move_event(30.0, 20.0, Some(MouseButton::Middle)), cx);
+            panel.live_wheel(1, [640.0, 480.0], cx);
+            panel.reset_view_impl(cx);
         });
         panel.read_with(cx, |panel, _| {
-            assert!(live_of(panel).camera_dirty);
+            let origin = active_camera_origin(&open_of(panel).store.state());
+            let live = live_of(panel);
+            assert_eq!(live.scale, None, "back to fit");
+            assert_eq!(live.pending_camera, Some(origin));
+            assert_eq!(panel.test_design_pan(), design_pan_before);
+        });
+    }
+
+    /// The cart's camera report, not the design pan, is what Live draws
+    /// against: a report of (100, 50) puts a row at world (110, 60) ten px
+    /// right and down of the frame's origin at scale 1.
+    #[gpui::test]
+    async fn live_overlay_rows_follow_the_carts_camera_report(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_rows(&endpoint, &[(0, 110.0, 60.0)]);
+        cart_camera(&endpoint, 100.0, 50.0);
+        cart_frame(&endpoint, 3);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).camera, Some([100.0, 50.0]));
+        });
+        // 640x480 canvas -> scale 2, frame origin (0, 0): the row's screen
+        // rect is ((110 - 100) * 2, (60 - 50) * 2) = (20, 20), 32x32.
+        let rect = panel.read_with(cx, |panel, _| {
+            panel
+                .test_live_row_screen_rect(0, [640.0, 480.0])
+                .expect("a published row")
+        });
+        assert_eq!(rect, [20.0, 20.0, 32.0, 32.0]);
+    }
+
+    /// A middle-drag in Live moves the CART's camera and leaves the design
+    /// pan alone -- the two views keep their own framing.
+    #[gpui::test]
+    async fn a_middle_drag_in_live_sends_the_camera_and_never_touches_the_design_pan(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_camera(&endpoint, 100.0, 50.0);
+        cart_frame(&endpoint, 3);
+        cx.run_until_parked();
+        host_sent(&endpoint);
+        let design_pan_before = panel.read_with(cx, |panel, _| panel.test_design_pan());
+
+        panel.update(cx, |panel, cx| {
+            // A 640x480 canvas fits the 320x240 frame at scale 2, so the
+            // 30x10 px drag below is 15x5 world px.
+            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(640.), px(480.)),
+            ));
+            panel.live_pan_begin([200.0, 200.0]);
+            assert!(
+                panel.handle_pan_move(&move_event(230.0, 210.0, Some(MouseButton::Middle)), cx)
+            );
         });
         endpoint.tick();
         cx.run_until_parked();
@@ -14079,38 +14392,62 @@ mod tests {
         let sent = host_sent(&endpoint);
         let camera = sent
             .iter()
+            .rev()
             .find(|message| message.first() == Some(&0x03))
-            .expect("Camera sent");
+            .expect("a Camera went out");
         match emerald_editor_runtime::wire::decode_host(camera) {
             Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
-                // Panned 20 px right and 10 down at 1x, so the world point
-                // at the canvas's top-left moved the other way.
-                assert_eq!((live::from_raw(x), live::from_raw(y)), (-20.0, -10.0));
+                // Dragging the picture right moves the camera left.
+                assert_eq!((x, y), (live::to_raw(85.0), live::to_raw(45.0)));
             }
             other => panic!("{other:?}"),
         }
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.test_design_pan()),
+            design_pan_before
+        );
     }
 
-    /// A zoom about the cursor moves the world point at the canvas's
-    /// top-left, so it is a camera update too -- the scale itself is
-    /// host-side.
+    /// The wheel in Live steps the integer picture scale; it never touches
+    /// the design zoom ladder and sends nothing to the cart.
     #[gpui::test]
-    async fn zooming_in_live_re_sends_the_camera(cx: &mut TestAppContext) {
+    async fn wheel_in_live_steps_the_integer_scale(cx: &mut TestAppContext) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
         host_sent(&endpoint);
-
+        let design_zoom_before = panel.read_with(cx, |panel, _| open_of(panel).view.borrow().zoom);
+        // Through the real wheel handler: the design ladder stays put and
+        // the cart hears nothing -- the scale is the host's own.
         panel.update(cx, |panel, cx| {
-            panel.wheel_zoom(&wheel_event(40.0, 30.0, 20.0), cx);
-            assert_eq!(open_of(panel).view.borrow().zoom, 2.0);
-            assert!(live_of(panel).camera_dirty);
+            panel.wheel_zoom(&wheel_event(40.0, 30.0, 20.0), cx)
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).view.borrow().zoom, design_zoom_before);
+            assert_eq!(live_of(panel).pending_camera, None);
         });
         endpoint.tick();
         cx.run_until_parked();
         assert!(
             host_sent(&endpoint)
                 .iter()
-                .any(|message| message.first() == Some(&0x03)),
-            "Camera sent"
+                .all(|message| message.first() != Some(&0x03)),
+            "a wheel notch is not a camera move"
+        );
+
+        panel.update(cx, |panel, _| live_mut_of(panel).scale = None);
+        panel.update(cx, |panel, cx| panel.live_wheel(1, [640.0, 480.0], cx));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_scale([640.0, 480.0])),
+            3,
+            "fit 2 -> 3"
+        );
+        panel.update(cx, |panel, cx| {
+            for _ in 0..10 {
+                panel.live_wheel(-1, [640.0, 480.0], cx);
+            }
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_scale([640.0, 480.0])),
+            1
         );
     }
 
@@ -14285,7 +14622,7 @@ mod tests {
             };
             open.live_error = Some("live update: something was wrong".to_string());
             if let Some(live) = &mut open.live {
-                live.camera_dirty = true;
+                live.pending_camera = Some([0.0, 0.0]);
             }
             cx.notify();
         });
@@ -14563,7 +14900,7 @@ mod tests {
         // A push that does not go through the encoder still runs -- and
         // must not take the unsent world's failure off the row.
         panel.update(cx, |panel, _| {
-            live_mut_of(panel).camera_dirty = true;
+            live_mut_of(panel).pending_camera = Some([0.0, 0.0]);
         });
         endpoint.tick();
         cx.run_until_parked();
@@ -14712,42 +15049,33 @@ mod tests {
         });
     }
 
-    /// The first layout centers the camera inside a paint closure that
-    /// cannot reach the session. Without the hand-off the cart sits at
-    /// camera (0, 0) while the overlay draws against the centered pan.
+    /// The camera the cart is pointed at when the session opens is the
+    /// DOCUMENT's own framing -- the camera origin the Design renderer
+    /// frames -- not wherever the design pan happens to sit, and not
+    /// (0, 0).
     #[gpui::test]
-    async fn the_first_layout_hands_its_centering_to_the_cart(cx: &mut TestAppContext) {
-        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        host_sent(&endpoint);
-        // Back to "never laid out", which is the state a session that
-        // connected before the canvas drew is really in.
-        panel.update(cx, |panel, _| {
-            open_of(panel).view.borrow_mut().pan = None;
-        });
-
-        let centered = panel.update(cx, |panel, _| {
-            let open = open_of(panel);
-            let world_center = canvas::camera_center(active_camera_origin(&open.store.state()));
-            layout_camera(
-                &open.view,
-                gpui::bounds(gpui::point(px(0.), px(0.)), gpui::size(px(400.), px(300.))),
-                world_center,
-            );
-            view_top_left_world(&open.view)
-        });
-        endpoint.tick();
+    async fn the_greeting_hands_the_document_framing_to_the_cart(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cx.run_until_parked();
+        let origin = panel.read_with(cx, |panel, _| {
+            active_camera_origin(&open_of(panel).store.state())
+        });
+        assert_ne!(origin, [0.0, 0.0], "the fixture is framed somewhere");
 
-        let sent = host_sent(&endpoint);
+        let sent = settle_live(&panel, &endpoint, cx);
         let camera = sent
             .iter()
             .find(|message| message.first() == Some(&0x03))
-            .expect("the centering reached the cart");
+            .expect("the greeting reached the cart");
         match emerald_editor_runtime::wire::decode_host(camera) {
             Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
                 assert_eq!(
                     (live::from_raw(x), live::from_raw(y)),
-                    (centered[0], centered[1])
+                    (origin[0], origin[1])
                 );
             }
             other => panic!("{other:?}"),
