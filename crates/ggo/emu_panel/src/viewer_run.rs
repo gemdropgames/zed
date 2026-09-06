@@ -17,6 +17,12 @@ use workspace::Workspace;
 use crate::drive::{self, Frame, Session};
 use crate::menu;
 
+/// How many published frames may be waiting to be retired before the
+/// oldest is retired regardless. A consumer that is painting keeps at most
+/// the frame it last took, so anything beyond a handful means it has
+/// stopped dropping them and the queue would grow with the run.
+const RETIRE_QUEUE_CAP: usize = 8;
+
 /// Assemble the `emd editor-cart --ggo` invocation for the emerald project
 /// holding `world_rel`, or the reason there isn't one. Free-standing so a
 /// refusal can be decided -- and tested -- without starting a run.
@@ -232,10 +238,14 @@ pub struct ViewerRun {
     pending_rebuild: bool,
     _build_task: Option<Task<()>>,
     _pump_task: Option<Task<()>>,
-    /// The frame published one publish ago -- retired one late, like the
-    /// pane's own double buffer, because the world view's most recently
-    /// submitted scene still draws it.
-    previously_published: Option<Arc<RenderImage>>,
+    /// Frames this run has published and replaced, waiting to be retired.
+    /// They cannot be dropped at the publish that replaces them: the world
+    /// view is an asynchronous consumer that clones the `Arc` out of the
+    /// slot and paints it whenever it next draws, and retiring an image it
+    /// still holds makes `paint_image` re-insert the dropped image --
+    /// leaking the atlas tile this retirement exists to reclaim. So each
+    /// one waits here until this run holds the only reference.
+    retiring: Vec<Arc<RenderImage>>,
     _watch: Option<Subscription>,
     _watch_debounce: Option<Task<()>>,
 }
@@ -266,7 +276,7 @@ impl ViewerRun {
             pending_rebuild: false,
             _build_task: None,
             _pump_task: None,
-            previously_published: None,
+            retiring: Vec::new(),
             _watch,
             _watch_debounce: None,
         };
@@ -425,15 +435,43 @@ impl ViewerRun {
             .replace((frame.number, image))
             .map(|(_number, image)| image);
         self.endpoint.tick();
-        if let Some(stale) = self.previously_published.take() {
-            cx.drop_image(stale, None);
+        if let Some(replaced) = replaced {
+            self.retiring.push(replaced);
         }
-        self.previously_published = replaced;
+        self.retire_unheld(cx);
         true
+    }
+
+    /// Retire every queued frame nobody else is holding.
+    ///
+    /// `strong_count == 1` means this queue owns the last reference: the
+    /// slot has moved on and the world view has finished with it, so the
+    /// atlas tile can go. The cap is there because a consumer that stops
+    /// dropping its clones (a world view whose window is not drawing)
+    /// would otherwise queue a frame per publish forever; past it the
+    /// oldest goes anyway, which is what the single-slot retirement this
+    /// replaced did on EVERY frame.
+    fn retire_unheld(&mut self, cx: &mut App) {
+        let mut queued = std::mem::take(&mut self.retiring);
+        while queued.len() > RETIRE_QUEUE_CAP {
+            cx.drop_image(queued.remove(0), None);
+        }
+        for image in queued {
+            if Arc::strong_count(&image) == 1 {
+                cx.drop_image(image, None);
+            } else {
+                self.retiring.push(image);
+            }
+        }
     }
 
     /// The reason the emulator thread ended on its own, in the words
     /// `EmuPanel::finish_run` puts on its status row for the same outcome.
+    ///
+    /// On a normal exit the thread has ALREADY published its own
+    /// `Stopped(reason)` through the endpoint, so this is not how the
+    /// world view learns what happened; the join is kept because it is
+    /// what reaps the thread.
     fn take_run_reason(&mut self) -> String {
         // `Session::wait` joins the thread; it has already exited here
         // (the frame sender is dropped), so the join is immediate.
@@ -493,11 +531,13 @@ impl ViewerRun {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             .map(|(_number, image)| image);
-        // Nothing will publish over them now, so both the frame in the
-        // slot and the one the publish lag was keeping alive are retired.
-        for stale in [self.previously_published.take(), published]
+        // Nothing will publish over them now, so the frame in the slot and
+        // everything still queued go together -- including any the
+        // consumer has not let go of, since there will be no later publish
+        // to retire them at.
+        for stale in std::mem::take(&mut self.retiring)
             .into_iter()
-            .flatten()
+            .chain(published)
         {
             cx.drop_image(stale, None);
         }
@@ -604,7 +644,6 @@ mod tests {
         assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
 
         // Frames arrive on their own clock: wait for the first one.
-        let ticks = endpoint.ticks();
         for _ in 0..600 {
             if endpoint.frame_number().is_some() {
                 break;
@@ -612,7 +651,6 @@ mod tests {
             cx.background_executor
                 .timer(std::time::Duration::from_millis(5))
                 .await;
-            ticks.try_recv().ok();
         }
         assert!(
             endpoint.frame_number().is_some(),
@@ -983,6 +1021,79 @@ mod tests {
                 cx.try_global::<ViewerRuns>()
                     .is_none_or(|runs| runs.runs.is_empty()),
                 "nothing registered: there is no run to keep alive"
+            );
+        });
+    }
+
+    /// One synthetic presented frame, the size `drive` delivers.
+    fn test_frame(number: u32) -> Frame {
+        Frame {
+            bgra: vec![0; (drive::WIDTH * drive::HEIGHT * 4) as usize],
+            number,
+            step_ms: 0.0,
+        }
+    }
+
+    /// The world view paints a published frame LATER, out of a scene it
+    /// has already submitted, so a replaced frame is retired only once
+    /// nothing else holds it. Retiring one the consumer is still holding
+    /// has `paint_image` re-insert a dropped image, leaking exactly the
+    /// atlas tile this retirement exists to reclaim.
+    #[gpui::test]
+    async fn a_frame_the_consumer_still_holds_is_not_retired(cx: &mut TestAppContext) {
+        let dir = project_dir();
+        // A build that fails leaves the run with no session of its own, so
+        // the only frames it publishes are the ones fed in here.
+        let runner: ggo_common::ProcRunner = Arc::new(|_| ggo_common::ProcCapture {
+            ok: false,
+            lines: vec!["error: could not compile demo_editor".to_string()],
+        });
+        let endpoint = ggo_common::LinkEndpoint::new();
+        let run = cx.new(|cx| {
+            ViewerRun::new(
+                "assets/worlds/main.toml".into(),
+                dir.path().to_path_buf(),
+                runner,
+                endpoint.clone(),
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        run.update(cx, |run, cx| {
+            for number in 0..3 {
+                assert!(run.on_frame(test_frame(number), cx));
+            }
+            assert!(
+                run.retiring.is_empty(),
+                "frames nobody holds are retired as they are replaced"
+            );
+        });
+
+        // What the world view takes out of the slot to paint.
+        let held = endpoint
+            .frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_number, image)| image.clone())
+            .expect("a frame is published");
+        run.update(cx, |run, cx| {
+            assert!(run.on_frame(test_frame(3), cx));
+            assert_eq!(
+                run.retiring.len(),
+                1,
+                "the frame the consumer is still holding waits"
+            );
+        });
+
+        drop(held);
+        run.update(cx, |run, cx| {
+            assert!(run.on_frame(test_frame(4), cx));
+            assert!(
+                run.retiring.is_empty(),
+                "and is retired at the first publish after it lets go"
             );
         });
     }
