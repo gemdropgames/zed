@@ -639,11 +639,26 @@ fn watch_triggers(rel: &str, change: &project::PathChange, viewer: bool) -> bool
     }
     if rel
         .split('/')
-        .any(|component| component == "target" || component == ".ggo-ide")
+        .any(|component| component == "target" || component == ".ggo-ide" || component == ".tmp")
     {
         return false;
     }
+    // A cartridge is an OUTPUT: `emd editor-cart --ggo` drops
+    // `<name>-editor.{ggo,cart}` at the project root, and a viewer run
+    // that treated its own artifact as a source change rebuilt forever.
+    if is_cartridge(rel) {
+        return false;
+    }
     !(viewer && travels_over_the_link(rel))
+}
+
+fn is_cartridge(rel: &str) -> bool {
+    matches!(
+        std::path::Path::new(rel)
+            .extension()
+            .and_then(|ext| ext.to_str()),
+        Some("ggo") | Some("cart")
+    )
 }
 
 /// A document the world view sends to a running viewer cart itself: a
@@ -7186,6 +7201,36 @@ mod tests {
         assert!(
             !watch_triggers("assets/tiles/a.til", &PathChange::Loaded, false),
             "the initial scan"
+        );
+    }
+
+    /// `emd editor-cart --ggo` writes `<name>-editor.{ggo,cart}` at the
+    /// project ROOT and its ELF under `.tmp/`. With every viewer run
+    /// watching its project, those outputs counted as source changes and
+    /// each build queued the next one forever ("Building viewer cart..."
+    /// never ending). A cartridge is never a source.
+    #[test]
+    fn watch_triggers_skips_the_viewer_builds_own_outputs() {
+        use project::PathChange;
+        for rel in [
+            "duel-battle-thing-editor.ggo",
+            "duel-battle-thing-editor.cart",
+            "duel_battle_thing.ggo",
+            ".tmp/duel_battle_thing_editor/duel_battle_thing_editor",
+            ".tmp",
+        ] {
+            assert!(
+                !watch_triggers(rel, &PathChange::AddedOrUpdated, true),
+                "{rel} is a build output, not a source"
+            );
+            assert!(
+                !watch_triggers(rel, &PathChange::Updated, false),
+                "{rel} must not re-pack a world run either"
+            );
+        }
+        assert!(
+            watch_triggers("crates/core/src/lib.rs", &PathChange::Updated, true),
+            "a source edit still rebuilds the viewer"
         );
     }
 
