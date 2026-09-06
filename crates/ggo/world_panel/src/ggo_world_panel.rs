@@ -1269,6 +1269,13 @@ impl OpenWorld {
                 // cart, and the world is never re-sent to it.
                 let regressed = live.status != LiveStatus::Building;
                 live.status = LiveStatus::Building;
+                // The deadline times out THIS build, and a rebuild is a
+                // new one. Left on the boot's baseline, any session that
+                // has been live longer than the deadline would fail its
+                // rebuild's very first poll instead of re-greeting.
+                if regressed {
+                    live.started = wall;
+                }
                 return if wall.duration_since(live.started) >= live::BUILD_DEADLINE {
                     failed("viewer cart build timed out".to_string())
                 } else {
@@ -1639,9 +1646,8 @@ impl WorldPanel {
     }
 
     /// Hand the user's Live choices back to the dock, which is what seeds
-    /// the next world tab with them. Every path that moves either of them
-    /// calls this -- a fallback to Design included, since that is how Live
-    /// gets turned off and the next tab must not turn it back on.
+    /// the next world tab with them. Called only by the paths the USER
+    /// drives; a fallback to Design leaves the sticky choice alone.
     fn note_sticky_live(&self, cx: &mut App) {
         let (mode, sys_mask) = (self.canvas_mode, self.live_sys_mask);
         if let Some(dock) = self.dock.as_ref() {
@@ -3237,6 +3243,14 @@ impl WorldPanel {
         matches!(self.state, ViewerState::Ready(_))
     }
 
+    /// The stems of the worlds this panel last enumerated -- the set
+    /// `AddInstance` offers. Test-only, and deliberately NOT refreshing:
+    /// what it is for is proving that something else refreshed it.
+    #[cfg(test)]
+    pub(crate) fn test_world_stems(&self) -> Vec<String> {
+        self.worlds.iter().map(|world| world.stem.clone()).collect()
+    }
+
     /// Give the panel a viewer link without booting a cart, so a test can
     /// prove the panel's release stops the viewer.
     #[cfg(test)]
@@ -4596,7 +4610,9 @@ impl WorldPanel {
         log::warn!("GGO: live world view fell back to the design view: {reason}");
         self.canvas_mode = CanvasMode::Design;
         self.live_boot_pending = false;
-        self.note_sticky_live(cx);
+        // Deliberately NOT `note_sticky_live`: the dock's sticky mode is
+        // the user's choice, and a transient boot failure must not turn
+        // Live off for every tab they open afterwards.
         // `Failed` is terminal, so nothing polls this cart again -- and
         // `enter_live`'s Retry would hand the session straight back to the
         // one that just failed. Ending the run is what makes Retry boot a
@@ -15763,6 +15779,57 @@ mod tests {
             let live = live_of(panel);
             assert_eq!(live.status, LiveStatus::Connected);
             assert!(live.loaded(), "the new cart is showing this document");
+        });
+    }
+
+    /// The build deadline runs on the executor's clock from the moment
+    /// the session started, and a rebuild's first `Building` poll can
+    /// arrive on a session that has been live far longer than it. The
+    /// re-baseline in the `Building` arm is what keeps that poll from
+    /// timing the NEW build out before it has begun.
+    #[gpui::test]
+    async fn a_rebuild_of_a_long_lived_session_survives_the_build_deadline(
+        cx: &mut TestAppContext,
+    ) {
+        use emerald_editor_runtime::wire;
+
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cx.executor()
+            .advance_clock(live::BUILD_DEADLINE + std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).status,
+                LiveStatus::Connected,
+                "an idle live session outlives the build deadline"
+            )
+        });
+        host_sent(&endpoint);
+
+        endpoint.set_state(ggo_common::ViewerState::Building);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.canvas_mode, CanvasMode::Live, "still live");
+            assert_eq!(
+                open_of(panel).live_error,
+                None,
+                "the rebuild is not the boot's build timing out"
+            );
+            assert_eq!(live_of(panel).status, LiveStatus::Building);
+        });
+
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        assert!(
+            host_sent(&endpoint)
+                .iter()
+                .any(|message| message.first() == Some(&0x01)),
+            "and the replacement cart is greeted"
+        );
+        cart_says(&endpoint, hello_ack(wire::LINK_PROTO_VERSION, &[]));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).status, LiveStatus::Connected)
         });
     }
 

@@ -389,7 +389,7 @@ fn world_panel_open(
             // the workspace, and reading it while leased panics.
             let rel = world_resolver(&dock, workspace, app)
                 .update(app, |panel, cx| panel.remote_resolve(world, cx))?;
-            // The panel comes back out of `open_world` itself rather than
+            // The panel comes back out of `open_world_in` itself rather than
             // off `dock.active()` afterwards: a dock that declined to open
             // anything would otherwise hand back whatever tab was in front
             // before, which is a different world than the agent asked for.

@@ -181,7 +181,22 @@ impl WorldDock {
         // is in Live and is theirs whenever it gets there.
         let live_sys_mask = self.live_sys_mask;
         let panel = match existing {
-            Some(panel) => panel,
+            Some(panel) => {
+                // `self.active` is assigned below, so the `activate_item`
+                // this queues raises an `ActiveItemChanged` that
+                // `refresh_active` reads as "no move" and skips. Without
+                // this an existing tab re-opened from the explorer or the
+                // emerald menu keeps a world listing from whenever it was
+                // last activated. Deferred for the same reason
+                // `refresh_active` defers: the workspace is leased.
+                cx.defer({
+                    let panel = panel.clone();
+                    move |cx| {
+                        panel.update(cx, |panel, cx| panel.refresh_worlds(cx));
+                    }
+                });
+                panel
+            }
             None => {
                 let weak_workspace = self.workspace.clone();
                 let weak_dock = cx.weak_entity();
@@ -820,6 +835,94 @@ pub(crate) mod tests {
             panel.read_with(cx, |panel, _| panel.canvas_mode()),
             crate::CanvasMode::Live,
             "an agent's read must not close down the user's live view"
+        );
+    }
+
+    /// A boot that fails puts THAT panel back in Design, but the dock's
+    /// sticky mode is the user's own choice and a transient failure must
+    /// not downgrade every tab they open afterwards. (No viewer booter is
+    /// registered in these tests, so the sticky-Live open below boots
+    /// nothing and falls back -- which is the failure under test.)
+    #[gpui::test]
+    async fn a_fallback_to_design_leaves_the_sticky_mode_alone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        workspace.update_in(cx, |ws, window, cx| {
+            ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world("worlds/test.toml", window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.canvas_mode()),
+            crate::CanvasMode::Design,
+            "the boot found no emulator pane and the panel fell back"
+        );
+        assert_eq!(
+            dock.read_with(cx, |dock, _| dock.canvas_mode),
+            crate::CanvasMode::Live,
+            "but the user's sticky choice is untouched by the fallback"
+        );
+
+        // Read before parking: with no booter the second tab falls back
+        // too, and the mode it OPENS in is what the sticky choice decides.
+        let second = dock
+            .update_in(cx, |dock, window, cx| {
+                dock.open_world("worlds/other.toml", window, cx)
+            })
+            .expect("a second tab");
+        assert_eq!(
+            second.read_with(cx, |panel, _| panel.canvas_mode()),
+            crate::CanvasMode::Live,
+            "so the next world still comes up live"
+        );
+        cx.run_until_parked();
+    }
+
+    /// Re-opening a world that already has a tab must re-enumerate that
+    /// panel's worlds. `open_world_in` assigns `active` itself, so the
+    /// `ActiveItemChanged` behind its deferred `activate_item` reads as
+    /// "no move" and `refresh_active` skips the refresh -- leaving
+    /// `+ Instance` offering whatever the project held when the tab was
+    /// last activated.
+    #[gpui::test]
+    async fn re_opening_an_existing_tab_refreshes_its_world_listing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        let open = |rel: &'static str, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |ws, window, cx| {
+                ggo_common::open_in_panel(ws, window, cx, move |dock: &mut WorldDock, window, cx| {
+                    dock.open_world(rel, window, cx);
+                })
+            });
+            cx.run_until_parked();
+        };
+        open("worlds/test.toml", cx);
+        let first = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
+        open("worlds/other.toml", cx);
+
+        std::fs::copy(
+            dir.path().join("worlds/test.toml"),
+            dir.path().join("worlds/third.toml"),
+        )
+        .unwrap();
+        assert!(
+            !first
+                .read_with(cx, |panel, _| panel.test_world_stems())
+                .iter()
+                .any(|stem| stem == "worlds/third"),
+            "the world added on disk is not in the older tab's listing yet: {:?}",
+            first.read_with(cx, |panel, _| panel.test_world_stems())
+        );
+
+        open("worlds/test.toml", cx);
+        assert!(
+            first
+                .read_with(cx, |panel, _| panel.test_world_stems())
+                .iter()
+                .any(|stem| stem == "worlds/third"),
+            "re-opening the existing tab re-enumerates the project's worlds"
         );
     }
 }
