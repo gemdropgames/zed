@@ -1083,9 +1083,10 @@ pub fn composite_scene(items: &[DrawItem], origin: [f64; 2], width: u32, height:
 }
 
 /// Stamp the canvas bounds on the shared view and, on the very first
-/// layout, center the camera. Shared by both renderers so Design and Live
-/// frame a freshly opened world identically -- and so the Live gestures,
-/// which read the same `ViewShared`, agree with what was drawn.
+/// layout, center the camera. DESIGN's prepaint only: Live has its own
+/// framing (a centered integer-scaled frame at the cart's camera) and
+/// stamps the bounds itself, because centering the design pan from a Live
+/// layout would move the view the user left behind in Design.
 fn layout_camera(
     view: &Rc<RefCell<ViewShared>>,
     canvas_bounds: Bounds<Pixels>,
@@ -1255,10 +1256,18 @@ impl OpenWorld {
         let now = live.cart_now();
         match live.endpoint.state() {
             ggo_common::ViewerState::Building => {
+                // A rebuild retires whatever the previous run presented:
+                // the emu panel hands that atlas tile back, so a frame
+                // kept across the rebuild would be re-inserted by the next
+                // paint. The boot screen covers the gap.
+                let dropped = live.frame.take().is_some();
                 return if wall.duration_since(live.started) >= live::BUILD_DEADLINE {
                     failed("viewer cart build timed out".to_string())
                 } else {
-                    LiveStep::default()
+                    LiveStep {
+                        changed: dropped,
+                        failure: None,
+                    }
                 };
             }
             ggo_common::ViewerState::Stopped(reason) => {
@@ -1433,7 +1442,13 @@ impl OpenWorld {
                 }
             } else if let Some([x, y]) = live.pending_camera.take() {
                 if let Err(error) = live.mailbox.set_camera(live::to_raw(x), live::to_raw(y)) {
+                    // Owed again: a camera the cart never heard would
+                    // otherwise leave the picture where it was with
+                    // nothing left to re-send it.
+                    live.pending_camera = Some([x, y]);
                     live_error = Some(format!("live camera: {error}"));
+                } else {
+                    live.sent_camera = Some([x, y]);
                 }
             }
             // Assigned even when it is `None`: a push that succeeded after
@@ -3508,6 +3523,11 @@ impl WorldPanel {
     }
 
     /// The canvas size the element last laid out at, canvas-relative px.
+    ///
+    /// In Live this stamp comes from the Live prepaint closure alone (see
+    /// [`Self::render_canvas`]) -- Live does not run `layout_camera`,
+    /// which would also centre the DESIGN pan -- so a gesture before the
+    /// first Live layout has no transform and does nothing.
     fn live_canvas_size(&self) -> Option<[f64; 2]> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
@@ -3525,9 +3545,12 @@ impl WorldPanel {
     /// device frame centered at the effective scale, offset by the cart's
     /// camera. Returns `(view, frame bounds, scale)`.
     ///
-    /// The camera a pan still owes the cart wins over the cart's last
-    /// report, so the outlines travel with the picture the user is
-    /// dragging instead of snapping back until the report catches up.
+    /// The camera is the cart's own REPORT, falling back to the last one
+    /// the host sent and then to the origin -- never the camera a pan
+    /// still owes the cart. A cart system that moves the camera has to be
+    /// able to win, so the picture and the outlines lag together by one
+    /// report rather than the outlines running ahead of the frame. The
+    /// INPUT anchor is the other way round; see [`Self::live_pan_begin`].
     fn live_camera_for(&self, size: [f64; 2]) -> Option<(View, [f64; 4], u32)> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
@@ -3537,7 +3560,7 @@ impl WorldPanel {
             .scale
             .unwrap_or_else(|| live::fit_scale(size[0], size[1]));
         let origin = live::frame_origin(size[0], size[1], scale);
-        let camera = live.pending_camera.or(live.camera).unwrap_or([0.0, 0.0]);
+        let camera = live.camera.or(live.sent_camera).unwrap_or([0.0, 0.0]);
         let scaled = f64::from(scale);
         Some((
             live::live_view(origin, scale, camera),
@@ -3565,11 +3588,20 @@ impl WorldPanel {
     }
 
     /// Middle-button down in Live: anchor a camera pan at `cursor`.
+    ///
+    /// The anchor is what the host has already DECIDED -- a camera still
+    /// owed, else the last one sent, else the cart's report -- so
+    /// successive pans compose instead of each one restarting from a
+    /// report that has not caught up yet.
     fn live_pan_begin(&mut self, cursor: [f64; 2]) {
         if let ViewerState::Ready(open) = &mut self.state
             && let Some(live) = open.live.as_mut()
         {
-            let camera = live.pending_camera.or(live.camera).unwrap_or([0.0, 0.0]);
+            let camera = live
+                .pending_camera
+                .or(live.sent_camera)
+                .or(live.camera)
+                .unwrap_or([0.0, 0.0]);
             live.pan_drag = Some((cursor, camera));
         }
     }
@@ -3623,7 +3655,12 @@ impl WorldPanel {
         let Some(live) = open.live.as_mut() else {
             return false;
         };
-        let camera = live.pending_camera.or(live.camera).unwrap_or([0.0, 0.0]);
+        // The same anchor a middle-drag takes, and for the same reason.
+        let camera = live
+            .pending_camera
+            .or(live.sent_camera)
+            .or(live.camera)
+            .unwrap_or([0.0, 0.0]);
         let scaled = f64::from(scale);
         live.pending_camera = Some([
             camera[0] + screen_delta[0] / scaled,
@@ -4419,6 +4456,39 @@ impl WorldPanel {
                     .is_some_and(|live| !matches!(live.status, LiveStatus::Failed(_))),
                 _ => false,
             }
+    }
+
+    /// What the Live tab shows INSTEAD of the canvas while the viewer is
+    /// coming up: the cart is still being built, or it is running but has
+    /// not both greeted and presented a frame. `None` once there is
+    /// something to draw -- and always in Design, which is also where a
+    /// failed session falls back to.
+    pub(crate) fn live_loading_text(&self) -> Option<String> {
+        if !self.live_active() {
+            return None;
+        }
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let live = open.live.as_ref()?;
+        match live.endpoint.state() {
+            ggo_common::ViewerState::Building => Some("Building viewer cart…".to_string()),
+            ggo_common::ViewerState::Running => {
+                if live.status == LiveStatus::Connected && live.frame.is_some() {
+                    return None;
+                }
+                let stem = std::path::Path::new(open.source_rel.as_str())
+                    .file_stem()
+                    .map_or_else(
+                        || open.source_rel.clone(),
+                        |stem| stem.to_string_lossy().into_owned(),
+                    );
+                Some(format!("Booting viewer for {stem}…"))
+            }
+            // A stopped cart is a failure the status row reports; the
+            // fallback to Design is what the user sees.
+            ggo_common::ViewerState::Stopped(_) => None,
+        }
     }
 
     /// One turn of the live session. Returns whether the poll loop should
@@ -6129,16 +6199,37 @@ impl WorldPanel {
                 live::overlay_rows(live, OpenWorld::doc_counts(&state), &open.selected)
             });
             let accent = cx.theme().colors().text_accent;
+            // Read here, not in the closures: prepaint runs while this
+            // entity is borrowed, so the geometry inputs travel as values.
+            let scale_override = open.live.as_ref().and_then(|live| live.scale);
+            let camera = open.live.as_ref().map_or([0.0, 0.0], |live| {
+                live.camera.or(live.sent_camera).unwrap_or([0.0, 0.0])
+            });
             gpui::canvas(
                 move |canvas_bounds, _window, _cx| {
-                    let (zoom, pan) = layout_camera(&view, canvas_bounds, world_center);
+                    // Stamped directly rather than through `layout_camera`:
+                    // that one also centres the DESIGN pan, which Live must
+                    // not touch. Every Live gesture reads this stamp
+                    // (`live_canvas_size`), so it has to happen here.
+                    view.borrow_mut().last_bounds = Some(canvas_bounds);
+                    let size = [
+                        f64::from(canvas_bounds.size.width),
+                        f64::from(canvas_bounds.size.height),
+                    ];
+                    let scale = scale_override.unwrap_or_else(|| live::fit_scale(size[0], size[1]));
+                    let origin = live::frame_origin(size[0], size[1], scale);
+                    let scaled = f64::from(scale);
                     canvas::LiveScene {
                         frame,
-                        zoom,
-                        pan,
+                        frame_rect: [
+                            origin[0],
+                            origin[1],
+                            DEVICE_SCREEN_W * scaled,
+                            DEVICE_SCREEN_H * scaled,
+                        ],
+                        view: live::live_view(origin, scale, camera),
                         rows,
                         marquee,
-                        grid,
                         background,
                         accent,
                     }
@@ -14296,12 +14387,15 @@ mod tests {
                 gpui::point(px(0.), px(0.)),
                 gpui::size(px(800.), px(600.)),
             ));
+            // The anchor is what the host has already decided -- here the
+            // camera the greeting sent -- not the world origin.
+            let anchor = live_of(panel).sent_camera.expect("the greeting sent one");
             panel.nudge_impl("ArrowRight", false, cx);
             // 800x600 fits the 320x240 frame twice over: a
             // `CAMERA_PAN_STEP_PX` step on screen is half that in world px.
             assert_eq!(
                 live_of(panel).pending_camera,
-                Some([CAMERA_PAN_STEP_PX / 2.0, 0.0])
+                Some([anchor[0] + CAMERA_PAN_STEP_PX / 2.0, anchor[1]])
             );
         });
         assert_eq!(
@@ -14361,6 +14455,118 @@ mod tests {
         assert_eq!(rect, [20.0, 20.0, 32.0, 32.0]);
     }
 
+    /// The overlay follows the cart's REPORT, never the camera a pan still
+    /// owes it: a cart system that moves the camera has to be able to win,
+    /// so the picture and the outlines lag together by one report instead
+    /// of the outlines running ahead.
+    #[gpui::test]
+    async fn the_live_overlay_ignores_a_camera_the_cart_has_not_reported(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_rows(&endpoint, &[(0, 110.0, 60.0)]);
+        cart_camera(&endpoint, 100.0, 50.0);
+        cart_frame(&endpoint, 3);
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).pending_camera = Some([200.0, 150.0]);
+        });
+        let rect = panel.read_with(cx, |panel, _| {
+            panel
+                .test_live_row_screen_rect(0, [640.0, 480.0])
+                .expect("a published row")
+        });
+        assert_eq!(
+            rect,
+            [20.0, 20.0, 32.0, 32.0],
+            "the report, not the owed camera, places the outline"
+        );
+        // The INPUT anchor is the other way round: a further pan starts
+        // from what the host already decided, or it would fight itself.
+        panel.update(cx, |panel, _| panel.live_pan_begin([0.0, 0.0]));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).pan_drag.map(|(_, camera)| camera),
+                Some([200.0, 150.0])
+            );
+        });
+    }
+
+    /// Before the cart's first camera report the overlay uses the camera
+    /// the host last SENT, so the greeting's own framing places the
+    /// outlines rather than the world origin.
+    #[gpui::test]
+    async fn the_live_overlay_falls_back_to_the_camera_the_host_sent(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_rows(&endpoint, &[(0, 0.0, 0.0)]);
+        cart_frame(&endpoint, 3);
+        cx.run_until_parked();
+        let origin = panel.read_with(cx, |panel, _| {
+            let expected = active_camera_origin(&open_of(panel).store.state());
+            let live = live_of(panel);
+            assert_eq!(live.camera, None, "the cart has reported nothing");
+            assert_eq!(
+                live.sent_camera,
+                Some(expected),
+                "the greeting's camera was recorded as it went out"
+            );
+            expected
+        });
+        // 640x480 fits the frame at scale 2 with a (0, 0) frame origin.
+        let rect = panel.read_with(cx, |panel, _| {
+            panel
+                .test_live_row_screen_rect(0, [640.0, 480.0])
+                .expect("a published row")
+        });
+        assert_eq!(
+            [rect[0], rect[1]],
+            [-origin[0] * 2.0, -origin[1] * 2.0],
+            "world (0, 0) seen from the camera the host sent"
+        );
+    }
+
+    /// The Live prepaint stamps `ViewShared.last_bounds` itself -- it must
+    /// not go through `layout_camera`, which would also centre the DESIGN
+    /// pan -- and every Live gesture reads its transform from that stamp.
+    #[gpui::test]
+    async fn a_live_render_stamps_the_canvas_bounds_for_gestures(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_rows(&endpoint, &[(0, 4.0, 4.0)]);
+        cart_frame(&endpoint, 3);
+        // A frame, or the boot screen stands in for the canvas and there
+        // is no Live layout to stamp anything.
+        let image = ggo_common::to_render_image(&vec![0u8; 320 * 240 * 4], 320, 240)
+            .expect("a 320x240 RGBA buffer");
+        *endpoint
+            .frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((1, image));
+        endpoint.tick();
+        cx.run_until_parked();
+        // Forget what the helper stamped: only a real Live layout can put
+        // it back.
+        panel.update(cx, |panel, cx| {
+            open_of(panel).view.borrow_mut().last_bounds = None;
+            cx.notify();
+        });
+        show_panel(cx);
+        let size = panel
+            .read_with(cx, |panel, _| panel.live_canvas_size())
+            .expect("the live prepaint stamped the canvas bounds");
+        assert!(
+            size[0] > 0.0 && size[1] > 0.0,
+            "a laid-out canvas, not a zero one: {size:?}"
+        );
+        // The row is a 16x16 at world (4, 4); one world px inside it,
+        // through the transform the stamp defines.
+        let at = panel.read_with(cx, |panel, _| live_screen_of(panel, [5.0, 5.0]));
+        panel.update(cx, |panel, cx| {
+            panel.canvas_primary_down_with(at, false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).selected, vec![Selection::Entity(0)]);
+        });
+    }
+
     /// A middle-drag in Live moves the CART's camera and leaves the design
     /// pan alone -- the two views keep their own framing.
     #[gpui::test]
@@ -14368,11 +14574,18 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        // Reported, and deliberately not what the drag anchors on: the
+        // anchor is the camera the HOST last decided, so two drags in a
+        // row compose instead of the second restarting from a report that
+        // has not caught up.
         cart_camera(&endpoint, 100.0, 50.0);
         cart_frame(&endpoint, 3);
         cx.run_until_parked();
         host_sent(&endpoint);
         let design_pan_before = panel.read_with(cx, |panel, _| panel.test_design_pan());
+        let anchor = panel.read_with(cx, |panel, _| {
+            live_of(panel).sent_camera.expect("the greeting sent one")
+        });
 
         panel.update(cx, |panel, cx| {
             // A 640x480 canvas fits the 320x240 frame at scale 2, so the
@@ -14398,7 +14611,13 @@ mod tests {
         match emerald_editor_runtime::wire::decode_host(camera) {
             Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
                 // Dragging the picture right moves the camera left.
-                assert_eq!((x, y), (live::to_raw(85.0), live::to_raw(45.0)));
+                assert_eq!(
+                    (x, y),
+                    (
+                        live::to_raw(anchor[0] - 15.0),
+                        live::to_raw(anchor[1] - 5.0)
+                    )
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -15136,6 +15355,8 @@ mod tests {
     /// str`, so the halves cannot be built from a prefix at the call site.
     const MODE_DESIGN: (&str, &str) = ("ggo-world-mode-design-on", "ggo-world-mode-design-off");
     const MODE_LIVE: (&str, &str) = ("ggo-world-mode-live-on", "ggo-world-mode-live-off");
+    /// The Live boot screen's `debug_selector`.
+    const LIVE_LOADING: &str = "ggo-world-live-loading";
     const SYSTEM_0: (&str, &str) = ("ggo-world-system-0-on", "ggo-world-system-0-off");
     const SYSTEM_1: (&str, &str) = ("ggo-world-system-1-on", "ggo-world-system-1-off");
     const SYSTEM_2: (&str, &str) = ("ggo-world-system-2-on", "ggo-world-system-2-off");
@@ -15272,6 +15493,101 @@ mod tests {
             assert!(
                 !Arc::ptr_eq(&live.endpoint, &endpoint),
                 "over a fresh endpoint"
+            );
+        });
+    }
+
+    /// The Live tab shows a boot screen instead of the canvas until the
+    /// cart is both connected and drawing.
+    #[gpui::test]
+    async fn live_shows_a_loading_screen_until_connected_with_a_frame(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_loading_text()),
+            Some("Building viewer cart…".into())
+        );
+
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_loading_text()),
+            Some("Booting viewer for test…".into())
+        );
+
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_loading_text()),
+            Some("Booting viewer for test…".into()),
+            "connected but no frame yet"
+        );
+        assert!(
+            cx.debug_bounds(LIVE_LOADING).is_some(),
+            "the tab renders the boot screen in place of the canvas"
+        );
+
+        // A published frame: what the emu side does per presented frame.
+        let image = ggo_common::to_render_image(&vec![0u8; 320 * 240 * 4], 320, 240)
+            .expect("a 320x240 RGBA buffer");
+        *endpoint
+            .frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((1, image));
+        endpoint.tick();
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_loading_text()),
+            None
+        );
+        assert!(
+            cx.debug_bounds(LIVE_LOADING).is_none(),
+            "and gives the canvas back once the cart is drawing"
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Design, window, cx)
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_loading_text()),
+            None,
+            "Design never loads"
+        );
+    }
+
+    /// A rebuild retires the picture the viewer was drawing: the emu panel
+    /// hands that atlas tile back, so painting it again would re-insert a
+    /// dropped image. The boot screen covers the gap.
+    #[gpui::test]
+    async fn a_rebuilding_endpoint_drops_the_live_frame(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        let image = ggo_common::to_render_image(&vec![0u8; 320 * 240 * 4], 320, 240)
+            .expect("a 320x240 RGBA buffer");
+        *endpoint
+            .frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((1, image));
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).frame.is_some());
+            assert_eq!(panel.live_loading_text(), None);
+        });
+
+        endpoint.set_state(ggo_common::ViewerState::Building);
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                live_of(panel).frame.is_none(),
+                "the rebuild retired the image"
+            );
+            assert_eq!(
+                panel.live_loading_text(),
+                Some("Building viewer cart…".into())
             );
         });
     }

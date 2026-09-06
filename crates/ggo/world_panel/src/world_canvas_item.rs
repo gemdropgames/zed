@@ -13,6 +13,7 @@ use gpui::{
 };
 use project::Project;
 use ui::prelude::*;
+use ui::{CommonAnimationExt, Icon, IconName};
 use workspace::item::{Item, ItemEvent, SaveOptions};
 
 use crate::{ViewerState, WorldPanel};
@@ -63,7 +64,12 @@ impl Render for WorldCanvasItem {
             // render path that paints those images.
             panel.retire_images(window);
             match &panel.state {
-                ViewerState::Ready(_) => Some(panel.render_canvas(cx)),
+                // The boot screen stands in for the canvas, not over it:
+                // there is nothing to paint until the cart is drawing.
+                ViewerState::Ready(_) => Some(match panel.live_loading_text() {
+                    Some(text) => live_loading(text),
+                    None => panel.render_canvas(cx),
+                }),
                 _ => None,
             }
         });
@@ -78,6 +84,26 @@ impl Render for WorldCanvasItem {
                 .into_any_element(),
         }
     }
+}
+
+/// The Live boot screen: a spinner and what it is waiting for.
+fn live_loading(text: String) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .debug_selector(|| "ggo-world-live-loading".into())
+        .child(
+            Icon::new(IconName::ArrowCircle)
+                .size(IconSize::Medium)
+                .color(Color::Accent)
+                .with_rotate_animation(2),
+        )
+        .child(Label::new(text).color(Color::Muted))
+        .into_any_element()
 }
 
 impl Item for WorldCanvasItem {

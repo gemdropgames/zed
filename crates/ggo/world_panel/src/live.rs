@@ -641,6 +641,10 @@ pub struct LiveView {
     /// A camera the host owes the cart (a pan, a look-around, the
     /// document's own framing at the greeting), flushed once per tick.
     pub pending_camera: Option<[f64; 2]>,
+    /// The last camera the host actually put on the wire. Stands in for
+    /// [`Self::camera`] until the cart has reported one of its own, so the
+    /// greeting's framing places the overlay instead of the world origin.
+    pub sent_camera: Option<[f64; 2]>,
     /// A middle-drag in progress: where the cursor went down, and the
     /// camera that drag started from.
     pub pan_drag: Option<([f64; 2], [f64; 2])>,
@@ -683,6 +687,7 @@ impl LiveView {
             scale: None,
             camera: None,
             pending_camera: None,
+            sent_camera: None,
             pan_drag: None,
             layer_queue: VecDeque::new(),
             // Editor systems only: a viewer that ran the cart's gameplay
