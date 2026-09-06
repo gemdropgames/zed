@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use emerald_editor_link::{EntityRow, LinkIo, LinkMailbox};
 use ggo_worldlib::backgrounds::MergedBackground;
-use ggo_worldlib::render::Selection;
+use ggo_worldlib::drag_ops::View;
+use ggo_worldlib::render::{DEVICE_SCREEN_H, DEVICE_SCREEN_W, Selection};
 use ggo_worldlib::world_doc::WorldDocStore;
 use ggo_worldlib::world_file::world_to_toml;
 use gpui::{RenderImage, Task};
@@ -270,6 +271,57 @@ pub fn to_raw(px: f64) -> i32 {
 
 pub fn from_raw(raw: i32) -> f64 {
     f64::from(raw) / 65536.0
+}
+
+// The Live picture geometry. `dead_code` allowed until the view and the
+// paint path call these; the unit tests below are the only caller for now.
+
+/// The largest integer scale the emulator picture is drawn at, so a huge
+/// tab doesn't blow one device pixel up past a readable block.
+#[allow(dead_code)]
+pub const LIVE_SCALE_MAX: u32 = 8;
+
+/// The largest integer scale at which the device frame fits `canvas`, min 1.
+#[allow(dead_code)]
+pub fn fit_scale(canvas_w: f64, canvas_h: f64) -> u32 {
+    let by_w = (canvas_w / DEVICE_SCREEN_W).floor();
+    let by_h = (canvas_h / DEVICE_SCREEN_H).floor();
+    // `as` saturates: a NaN or negative canvas size lands on 0, then 1.
+    (by_w.min(by_h) as u32).clamp(1, LIVE_SCALE_MAX)
+}
+
+/// Where the scaled frame sits: centered in the canvas (canvas-relative px).
+/// Floored so the frame lands on whole device pixels.
+#[allow(dead_code)]
+pub fn frame_origin(canvas_w: f64, canvas_h: f64, scale: u32) -> [f64; 2] {
+    let scale = f64::from(scale);
+    [
+        ((canvas_w - DEVICE_SCREEN_W * scale) / 2.0).floor(),
+        ((canvas_h - DEVICE_SCREEN_H * scale) / 2.0).floor(),
+    ]
+}
+
+/// The Live transform as a worldlib `View`: `screen = origin + (world - camera) * scale`.
+#[allow(dead_code)]
+pub fn live_view(origin: [f64; 2], scale: u32, camera: [f64; 2]) -> View {
+    let zoom = f64::from(scale);
+    View {
+        zoom,
+        pan_x: origin[0] - camera[0] * zoom,
+        pan_y: origin[1] - camera[1] * zoom,
+        dpr: None,
+    }
+}
+
+/// `scale` +/- 1, clamped to `1..=LIVE_SCALE_MAX`.
+#[allow(dead_code)]
+pub fn scale_step(scale: u32, dir: i32) -> u32 {
+    let next = if dir > 0 {
+        scale.saturating_add(1)
+    } else {
+        scale.saturating_sub(1)
+    };
+    next.clamp(1, LIVE_SCALE_MAX)
 }
 
 /// The world blob for the open document: `world_to_toml` -> `encode_toml_at`.
@@ -697,6 +749,44 @@ impl LiveView {
 mod tests {
     use super::*;
     use ggo_worldlib::render::Selection;
+
+    #[test]
+    fn fit_scale_is_the_largest_integer_that_fits_min_one() {
+        assert_eq!(fit_scale(320.0, 240.0), 1);
+        assert_eq!(fit_scale(640.0, 480.0), 2);
+        assert_eq!(fit_scale(1000.0, 480.0), 2, "height limits");
+        assert_eq!(fit_scale(2000.0, 2000.0), 6, "width limits");
+        assert_eq!(fit_scale(4000.0, 4000.0), 8, "capped at LIVE_SCALE_MAX");
+        assert_eq!(fit_scale(100.0, 100.0), 1, "too small still 1");
+    }
+
+    #[test]
+    fn frame_origin_centers_the_scaled_frame() {
+        assert_eq!(frame_origin(640.0, 480.0, 2), [0.0, 0.0]);
+        assert_eq!(frame_origin(800.0, 600.0, 2), [80.0, 60.0]);
+        assert_eq!(
+            frame_origin(100.0, 100.0, 1),
+            [-110.0, -70.0],
+            "clipped when larger"
+        );
+    }
+
+    #[test]
+    fn live_view_maps_world_through_camera_scale_and_origin() {
+        let view = live_view([80.0, 60.0], 2, [10.0, 5.0]);
+        let [sx, sy] = ggo_worldlib::drag_ops::world_to_screen(30.0, 25.0, &view);
+        assert_eq!([sx, sy], [80.0 + 40.0, 60.0 + 40.0]);
+        let back = ggo_worldlib::drag_ops::screen_to_world(sx, sy, &view);
+        assert_eq!(back, [30.0, 25.0]);
+    }
+
+    #[test]
+    fn scale_step_clamps() {
+        assert_eq!(scale_step(1, -1), 1);
+        assert_eq!(scale_step(1, 1), 2);
+        assert_eq!(scale_step(8, 1), 8);
+        assert_eq!(scale_step(5, -1), 4);
+    }
 
     #[test]
     fn index_map_puts_direct_entities_first_then_instances_depth_first() {
