@@ -160,9 +160,9 @@ wants to be a tool checks `EditorTool` against its own index.
 
 Every frame while a host is connected, after the schedule ran:
 `Entities` rows as today (transform, size, draw offset), `Camera`,
-`FrameSeq`; `Selection { count u8, indices u32… }` (≤ 60 per datagram,
-several datagrams, a trailing `SelectionEnd` when it spans more than one)
-and `Marquee { x0 y0 x1 y1 i32 }` when they changed; `Gesture { kind u8
+`FrameSeq`; `Selection { more u8, count u8, indices u32… }` (≤ 60 per datagram;
+`more` = 1 while further datagrams of the same selection follow) and
+`Marquee { active u8, x0 y0 x1 y1 i32 }` when they changed; `Gesture { kind u8
 (0 Begin, 1 End), id u32 }` on change; `EntityRemoved { index u32 }`. `HelloAck` gains the tool names
 (`"Select"` first, then `edit_systems()` names) in place of the system
 names.
