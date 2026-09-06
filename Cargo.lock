@@ -7501,6 +7501,7 @@ dependencies = [
  "chrono",
  "cpal",
  "editor",
+ "futures 0.3.32",
  "gemdrop-sdk",
  "ggo-comm",
  "ggo-db",

@@ -28,6 +28,9 @@ chrono.workspace = true
 # `emu/audio.rs` and the standalone `ggo-emu` binary use, so the pane's
 # stream is the one this project already knows how to reason about.
 cpal.workspace = true
+# GGO -- `Shared`, so every world tab of one emerald project waits on the
+# same `emd editor-cart` build. See `viewer_run::shared_build`.
+futures.workspace = true
 ggo-comm.workspace = true # GGO -- MessageReader over the cart's comm TX
 ggo-db.workspace = true # GGO -- the one PostgreSQL database: url, pool, schema/migrations, and the TestDb fixture
 ggo-emu-core.workspace = true # GGO

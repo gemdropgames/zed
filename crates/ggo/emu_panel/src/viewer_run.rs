@@ -4,10 +4,13 @@
 //! view polls. It is not the emulator pane: it opens no tab, shows no
 //! status, and any number of them can exist at once (one per world tab).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ggo_common::{LinkEndpoint, ProcCapture, ProcRequest, ProcRunner, ViewerState};
+use futures::FutureExt as _;
+use futures::future::Shared;
+use ggo_common::{LinkEndpoint, ProcRequest, ProcRunner, ViewerState};
 use gpui::{App, AppContext as _, Context, Entity, RenderImage, Subscription, Task};
 use workspace::Workspace;
 
@@ -34,14 +37,83 @@ pub(crate) fn viewer_build_request(
     ))
 }
 
-/// Every viewer run this app has started. A `ViewerRun` stops itself
-/// when it is dropped and the world view driving it holds only the
-/// endpoint, so something has to keep the run alive for as long as that
-/// view wants frames; this is that something.
+/// One `emd editor-cart --ggo` build: the `.ggo` it produced, or the
+/// reason there isn't one. Shared because every viewer of the same
+/// emerald project waits on the same build.
+type SharedBuild = Shared<Task<Result<PathBuf, String>>>;
+
+/// Every viewer run this app has started, and the builds they share.
+///
+/// A `ViewerRun` stops itself when it is dropped and the world view
+/// driving it holds only the endpoint, so something has to keep the run
+/// alive for as long as that view wants frames; this is that something.
 #[derive(Default)]
-pub(crate) struct ViewerRuns(pub(crate) Vec<Entity<ViewerRun>>);
+pub(crate) struct ViewerRuns {
+    pub(crate) runs: Vec<Entity<ViewerRun>>,
+    /// The build in flight for each emerald project directory. N world
+    /// tabs of one project are N runs, but they are built from the same
+    /// sources into the same `.ggo`, so they get ONE `emd` per save.
+    builds: HashMap<PathBuf, SharedBuild>,
+}
 
 impl gpui::Global for ViewerRuns {}
+
+/// The build every viewer of `project_dir` is waiting on: the one already
+/// in flight, or a new one started here.
+///
+/// Sharing is not only about the minutes an `emd editor-cart` build takes
+/// and the background threads it blocks. `emd` rewrites ONE `.ggo` per
+/// project in place, and `drive::start` reads that file: two concurrent
+/// builds of the same project would have a viewer boot a half-written
+/// cart. One build per project is what makes that read safe.
+fn shared_build(
+    project_dir: &Path,
+    request: ProcRequest,
+    runner: ProcRunner,
+    cx: &mut App,
+) -> SharedBuild {
+    if let Some(build) = cx.default_global::<ViewerRuns>().builds.get(project_dir) {
+        // Only a build that is really still in flight. `strong_count == 1`
+        // means this map holds the last handle to it: every run that was
+        // waiting has been dropped (its world tab closed), and joining it
+        // would hand a viewer opened now a `.ggo` built before the edits
+        // since. `peek` is the same staleness one step later -- a result
+        // already in hand belongs to the save that asked for it.
+        let in_flight = build.strong_count().is_some_and(|handles| handles > 1)
+            && build.peek().is_none();
+        if in_flight {
+            return build.clone();
+        }
+    }
+    let build = cx
+        .background_spawn(async move {
+            let capture = runner(request);
+            if !capture.ok {
+                return Err(format!("build failed: {}", menu::failure_reason(&capture)));
+            }
+            menu::editor_cart_ggo_path(&capture.lines)
+                .ok_or_else(|| "emd editor-cart --ggo printed no .ggo path".to_string())
+        })
+        .shared();
+    cx.default_global::<ViewerRuns>()
+        .builds
+        .insert(project_dir.to_path_buf(), build.clone());
+    build
+}
+
+/// Let go of a finished build, so the next save starts a fresh one rather
+/// than handing out a stale `.ggo` path forever. Every waiter calls this;
+/// the `ptr_eq` is what keeps the second one from evicting the follow-up
+/// build a queued save has already registered in the meantime.
+fn forget_build(project_dir: &Path, finished: &SharedBuild, cx: &mut App) {
+    let builds = &mut cx.default_global::<ViewerRuns>().builds;
+    if builds
+        .get(project_dir)
+        .is_some_and(|current| current.ptr_eq(finished))
+    {
+        builds.remove(project_dir);
+    }
+}
 
 /// Test hook: the `emd` runner [`boot`] hands the run it creates, in
 /// place of spawning the real binary.
@@ -100,13 +172,13 @@ pub(crate) fn boot(
     // other world view drop it, watch subscription and all.
     // Taken out of the global first because deciding which to keep reads
     // the entities, and so borrows the `App` the global lives in.
-    let existing = std::mem::take(&mut cx.default_global::<ViewerRuns>().0);
+    let existing = std::mem::take(&mut cx.default_global::<ViewerRuns>().runs);
     let mut live: Vec<Entity<ViewerRun>> = existing
         .into_iter()
         .filter(|run| !run.read(cx).endpoint().stop_requested())
         .collect();
     live.push(run);
-    cx.default_global::<ViewerRuns>().0 = live;
+    cx.default_global::<ViewerRuns>().runs = live;
     true
 }
 
@@ -117,12 +189,12 @@ pub(crate) fn boot(
 /// is being updated. Keyed on the endpoint rather than on a handle so that
 /// nothing here keeps the run alive past the retain.
 fn forget_run(endpoint: &Arc<LinkEndpoint>, cx: &mut App) {
-    let existing = std::mem::take(&mut cx.default_global::<ViewerRuns>().0);
+    let existing = std::mem::take(&mut cx.default_global::<ViewerRuns>().runs);
     let live: Vec<Entity<ViewerRun>> = existing
         .into_iter()
         .filter(|run| !Arc::ptr_eq(run.read(cx).endpoint(), endpoint))
         .collect();
-    cx.default_global::<ViewerRuns>().0 = live;
+    cx.default_global::<ViewerRuns>().runs = live;
 }
 
 #[cfg_attr(not(test), allow(unused_variables))]
@@ -152,10 +224,10 @@ pub struct ViewerRun {
     proc_runner: ProcRunner,
     endpoint: Arc<LinkEndpoint>,
     session: Option<Session>,
-    /// A build is in flight. The `emd` spawn it is waiting on BLOCKS a
-    /// background thread and cannot be cancelled, so a save landing
-    /// mid-build queues rather than starting a second `emd` over the
-    /// first.
+    /// A build is in flight (this run's own view of the project's shared
+    /// build). The `emd` spawn it is waiting on BLOCKS a background thread
+    /// and cannot be cancelled, so a save landing mid-build queues rather
+    /// than starting a second `emd` over the first.
     building: bool,
     pending_rebuild: bool,
     _build_task: Option<Task<()>>,
@@ -221,9 +293,10 @@ impl ViewerRun {
         if self.building {
             // Every further save joins this one queued rebuild: an `emd`
             // build of the editor cart takes tens of seconds, and the
-            // blocking spawn already in flight cannot be cancelled, so
-            // starting another over it would just leave two `emd`
-            // processes writing the same target directory.
+            // blocking spawn already in flight cannot be cancelled. The
+            // follow-up rebuilds of every run of this project then join
+            // one shared build again, so N world tabs still cost one
+            // `emd` per save.
             self.pending_rebuild = true;
             return;
         }
@@ -236,32 +309,42 @@ impl ViewerRun {
         self._pump_task = None;
         self.drop_session(cx);
         self.endpoint.set_state(ViewerState::Building);
+        let (request, root) = match viewer_build_request(&self.project_root, &self.world_rel) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                self.stop_with(reason, cx);
+                return;
+            }
+        };
         self.building = true;
-        let request = viewer_build_request(&self.project_root, &self.world_rel);
-        let runner = self.proc_runner.clone();
+        // The cwd `ProcRequest::emd` was built with IS the emerald project
+        // root (`emd` discovers the project from its cwd), which is what
+        // every viewer of this project coordinates on.
+        let project_dir = request.cwd.clone();
+        // Joined here, on the UI thread, rather than inside the task: two
+        // world views booting in the same turn have to see each other's
+        // build, and the task bodies do not run until the turn is over.
+        let build = shared_build(&project_dir, request, self.proc_runner.clone(), cx);
         self._build_task = Some(cx.spawn(async move |this, cx| {
-            let (request, root) = match request {
-                Ok(prepared) => prepared,
-                Err(reason) => {
-                    this.update(cx, |this, cx| {
-                        this.stop_with(reason, cx);
-                        this.build_done(cx);
-                    })
-                    .ok();
-                    return;
-                }
-            };
-            let capture = cx.background_spawn(async move { runner(request) }).await;
+            let outcome = build.clone().await;
+            cx.update(|cx| forget_build(&project_dir, &build, cx));
             this.update(cx, |this, cx| {
-                this.build_finished(capture, root, cx);
+                this.build_finished(outcome, root, cx);
                 this.build_done(cx);
             })
             .ok();
         }));
     }
 
-    /// What `emd editor-cart --ggo` had to say, on the UI thread.
-    fn build_finished(&mut self, capture: ProcCapture, root: PathBuf, cx: &mut Context<Self>) {
+    /// What the project's shared `emd editor-cart --ggo` produced, on the
+    /// UI thread. Every run waiting on that build is told separately, and
+    /// each boots its own session from the one `.ggo`.
+    fn build_finished(
+        &mut self,
+        outcome: Result<PathBuf, String>,
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         if self.endpoint.stop_requested() {
             // Asked to stop while the build ran. Booting anyway would
             // show the world view a `Running` it has already said it does
@@ -270,16 +353,10 @@ impl ViewerRun {
             self.stop_with(drive::WORLD_PANEL_STOP.to_string(), cx);
             return;
         }
-        if !capture.ok {
-            let reason = format!("build failed: {}", menu::failure_reason(&capture));
-            self.stop_with(reason, cx);
-            return;
+        match outcome {
+            Ok(ggo) => self.boot(root, ggo, cx),
+            Err(reason) => self.stop_with(reason, cx),
         }
-        let Some(ggo) = menu::editor_cart_ggo_path(&capture.lines) else {
-            self.stop_with("emd editor-cart --ggo printed no .ggo path".to_string(), cx);
-            return;
-        };
-        self.boot(root, ggo, cx);
     }
 
     /// The build ended, whatever its outcome: clear the in-flight flag
@@ -855,7 +932,7 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 1, "one editor-cart build");
         assert_ne!(endpoint.state(), ggo_common::ViewerState::Building);
         cx.update(|_, cx| {
-            assert_eq!(cx.global::<ViewerRuns>().0.len(), 1, "one run registered");
+            assert_eq!(cx.global::<ViewerRuns>().runs.len(), 1, "one run registered");
         });
         panel.read_with(cx, |panel, _| {
             assert!(panel.session.is_none(), "the pane runs nothing");
@@ -904,10 +981,153 @@ mod tests {
         cx.update(|_, cx| {
             assert!(
                 cx.try_global::<ViewerRuns>()
-                    .is_none_or(|runs| runs.0.is_empty()),
+                    .is_none_or(|runs| runs.runs.is_empty()),
                 "nothing registered: there is no run to keep alive"
             );
         });
+    }
+
+    /// Build one `ViewerRun` for `world_rel` under `dir`, the way `boot`
+    /// does. Free-standing so the shared-build tests can create several
+    /// runs in ONE turn: what they are about is what happens before any
+    /// task has run.
+    fn spawn_run(
+        cx: &mut TestAppContext,
+        dir: &Path,
+        world_rel: &str,
+        runner: ggo_common::ProcRunner,
+    ) -> (Entity<ViewerRun>, Arc<ggo_common::LinkEndpoint>) {
+        let endpoint = ggo_common::LinkEndpoint::new();
+        let run = cx.new(|cx| {
+            ViewerRun::new(
+                world_rel.to_string(),
+                dir.to_path_buf(),
+                runner,
+                endpoint.clone(),
+                None,
+                cx,
+            )
+        });
+        (run, endpoint)
+    }
+
+    /// Two world tabs of ONE emerald project are two runs but one build:
+    /// `emd editor-cart` takes minutes and blocks a background thread, and
+    /// it rewrites the project's single `.ggo` in place -- two of them at
+    /// once would have a viewer boot a half-written cart.
+    #[gpui::test]
+    async fn two_runs_of_one_project_share_a_single_build(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        let (runner, calls) = fake_emd(dir.path(), true);
+        let (_run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
+        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "one `emd editor-cart` for both viewers"
+        );
+        assert_eq!(a.state(), ggo_common::ViewerState::Running);
+        assert_eq!(
+            b.state(),
+            ggo_common::ViewerState::Running,
+            "and both booted their own session from the one `.ggo`"
+        );
+    }
+
+    /// A save rebuilds every run of the project -- through one more build,
+    /// not one per run.
+    #[gpui::test]
+    async fn a_save_rebuilds_every_run_of_a_project_with_one_build(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        let (runner, calls) = fake_emd(dir.path(), true);
+        let (run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
+        let (run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        // Both saves land in the same turn, as the shared debounce makes
+        // them: it is the joining that is under test, not the timer.
+        run_a.update(cx, |run, cx| run.rebuild(cx));
+        run_b.update(cx, |run, cx| run.rebuild(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "the save built the project once, for both viewers"
+        );
+        assert_eq!(a.state(), ggo_common::ViewerState::Running);
+        assert_eq!(b.state(), ggo_common::ViewerState::Running);
+    }
+
+    /// Different emerald projects are different builds: sharing is keyed
+    /// on the project directory `emd` is run in, not on "a build is in
+    /// flight somewhere".
+    #[gpui::test]
+    async fn runs_of_different_projects_build_separately(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let one = project_dir();
+        let two = project_dir();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let (ggo_one, ggo_two) = (
+            one.path().join("demo-editor.ggo"),
+            two.path().join("demo-editor.ggo"),
+        );
+        for ggo in [&ggo_one, &ggo_two] {
+            std::fs::write(ggo, crate::drive::fixture::green_screen_cart()).unwrap();
+        }
+        let runner: ggo_common::ProcRunner = Arc::new(move |request: ggo_common::ProcRequest| {
+            let ggo = request.cwd.join("demo-editor.ggo");
+            recorded.lock().unwrap().push(request);
+            ggo_common::ProcCapture {
+                ok: true,
+                lines: vec![serde_json::json!({ "ggo": ggo }).to_string()],
+            }
+        });
+        let (_run_one, endpoint_one) =
+            spawn_run(cx, one.path(), "assets/worlds/main.toml", runner.clone());
+        let (_run_two, endpoint_two) =
+            spawn_run(cx, two.path(), "assets/worlds/main.toml", runner);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "each project builds its own cart"
+        );
+        assert_eq!(endpoint_one.state(), ggo_common::ViewerState::Running);
+        assert_eq!(endpoint_two.state(), ggo_common::ViewerState::Running);
+    }
+
+    /// A shared build that fails stops every run waiting on it, each with
+    /// the compiler's reason -- not just whichever one started it.
+    #[gpui::test]
+    async fn a_shared_build_failure_stops_every_waiting_run(cx: &mut TestAppContext) {
+        let dir = project_dir();
+        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let runner: ggo_common::ProcRunner = Arc::new(move |_request| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            ggo_common::ProcCapture {
+                ok: false,
+                lines: vec!["error: could not compile demo_editor".to_string()],
+            }
+        });
+        let (_run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
+        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one build for both");
+        for state in [a.state(), b.state()] {
+            assert!(
+                matches!(&state, ggo_common::ViewerState::Stopped(reason) if reason.contains("build failed")),
+                "{state:?}"
+            );
+        }
     }
 
     /// A run whose build FAILED stays registered when another world view
@@ -962,7 +1182,7 @@ mod tests {
         cx.run_until_parked();
         let run = cx
             .update(|_, cx| {
-                let runs = &cx.global::<ViewerRuns>().0;
+                let runs = &cx.global::<ViewerRuns>().runs;
                 assert_eq!(runs.len(), 2, "both runs are registered");
                 runs.iter()
                     .find(|run| Arc::ptr_eq(run.read(cx).endpoint(), &failed))
@@ -999,7 +1219,7 @@ mod tests {
             })
             .expect("the booter claimed the boot");
         cx.update(|_, cx| {
-            assert_eq!(cx.global::<ViewerRuns>().0.len(), 1, "one run registered");
+            assert_eq!(cx.global::<ViewerRuns>().runs.len(), 1, "one run registered");
         });
 
         endpoint.request_stop();
@@ -1010,7 +1230,7 @@ mod tests {
         ));
         cx.update(|_, cx| {
             assert!(
-                cx.global::<ViewerRuns>().0.is_empty(),
+                cx.global::<ViewerRuns>().runs.is_empty(),
                 "the stopped run is not kept alive for the life of the app"
             );
         });
