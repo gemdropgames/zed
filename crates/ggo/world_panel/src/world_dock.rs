@@ -317,6 +317,10 @@ pub(crate) mod tests {
     ) {
         cx.update(|cx| {
             AppState::test(cx);
+            // The second click on an open world splits its `.toml` out as
+            // a text tab; without `editor::init` there is no project-item
+            // builder for buffers and that open fails silently.
+            editor::init(cx);
             crate::init(cx);
             ggo_common::bind_default_keymap(cx);
         });

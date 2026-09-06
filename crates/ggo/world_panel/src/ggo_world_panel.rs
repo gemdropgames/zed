@@ -357,21 +357,18 @@ fn intercept_world_open(
     // A SECOND click on the world that is already open AND active splits
     // its `.toml` out to a right pane (world view left, toml text right,
     // toml focused). The first click never opens the toml.
-    let second_click_canvas = {
-        let canvas = workspace
-            .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
-            .next();
-        let showing = workspace
-            .panel::<WorldDock>(cx)
-            .and_then(|dock| dock.read(cx).active())
-            .and_then(|panel| panel.read(cx).open_rel_path_now().map(str::to_string));
-        canvas.filter(|canvas| {
-            showing.as_deref() == Some(rel.as_str())
-                && workspace
-                    .active_item(cx)
-                    .is_some_and(|item| item.item_id() == canvas.entity_id())
-        })
-    };
+    //
+    // The tab is found by what its OWN panel has open, not by asking the
+    // dock what it is showing: with a tab per world, the dock's active
+    // panel says nothing about where the clicked world lives.
+    let canvas_for_rel = workspace
+        .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+        .find(|item| item.read(cx).panel().read(cx).open_rel_path_now() == Some(rel.as_str()));
+    let second_click_canvas = canvas_for_rel.filter(|canvas| {
+        workspace
+            .active_item(cx)
+            .is_some_and(|item| item.item_id() == canvas.entity_id())
+    });
     if let Some(canvas) = second_click_canvas {
         let panes: Vec<_> = workspace.panes().to_vec();
         let canvas_pane = panes
@@ -505,17 +502,33 @@ fn delete_world_handler(
     ggo_common::panel_entry_handler(
         workspace.clone(),
         move |dock: &Entity<WorldDock>, window, cx| {
-            let rel = rel.clone();
-            // Any panel can run the prompt -- it re-derives its own root from
-            // `rel` -- so the active tab's does, and a workspace with no world
-            // open at all gets a throwaway one.
-            let panel = dock.read(cx).active().unwrap_or_else(|| {
-                let workspace = workspace.clone();
-                cx.new(|cx| WorldPanel::new(Some(workspace), cx))
-            });
-            panel
-                .update(cx, |panel, cx| panel.delete_world(rel, window, cx))
-                .detach();
+            // The tab that HAS this world open is the one that must run
+            // the delete: `delete_world` clears the document it deletes,
+            // and only that panel's document is the deleted file. Any
+            // panel can run the prompt otherwise -- it re-derives its own
+            // root from `rel` -- so the active tab's does, and a workspace
+            // with no world open at all gets a throwaway one.
+            let showing_it: Vec<_> = dock
+                .read(cx)
+                .open_panels()
+                .into_iter()
+                .filter(|panel| panel.read(cx).open_rel_path_now() == Some(rel.as_str()))
+                .collect();
+            let panels = if showing_it.is_empty() {
+                let panel = dock.read(cx).active().unwrap_or_else(|| {
+                    let workspace = workspace.clone();
+                    cx.new(|cx| WorldPanel::new(Some(workspace), cx))
+                });
+                vec![panel]
+            } else {
+                showing_it
+            };
+            for panel in panels {
+                let rel = rel.clone();
+                panel
+                    .update(cx, |panel, cx| panel.delete_world(rel, window, cx))
+                    .detach();
+            }
         },
     )
 }
@@ -1546,11 +1559,11 @@ pub struct WorldPanel {
     /// design view should not silently re-arm the systems the user turned
     /// off. Seeded into every new [`LiveView`] by [`Self::start_live`].
     live_sys_mask: u64,
-    /// The viewer cart's link, kept at PANEL level so switching worlds
-    /// inside one emerald project reuses the running cart instead of
-    /// rebuilding it. The `PathBuf` is the emerald project root the cart
-    /// was booted for; a world outside it needs its own cart.
-    live_endpoint: Option<(PathBuf, Arc<ggo_common::LinkEndpoint>)>,
+    /// The link to the viewer cart THIS panel booted. One per panel, so
+    /// each world tab drives its own viewer run: sharing one cart between
+    /// tabs would make whichever world was greeted last the only one the
+    /// cart is showing.
+    live_endpoint: Option<Arc<ggo_common::LinkEndpoint>>,
 }
 
 impl WorldPanel {
@@ -1560,7 +1573,7 @@ impl WorldPanel {
         cx.on_release(|this, cx| {
             // The viewer cart outlives nothing here: with the panel gone
             // there is no one left to poll the link.
-            if let Some((_, endpoint)) = this.live_endpoint.take() {
+            if let Some(endpoint) = this.live_endpoint.take() {
                 endpoint.request_stop();
             }
             this.retire_open_images();
@@ -3162,11 +3175,10 @@ impl WorldPanel {
     }
 
     /// Give the panel a viewer link without booting a cart, so a test can
-    /// prove the panel's release stops the viewer. The `PathBuf` half is
-    /// the emerald root the cart was booted for; nothing here has one.
+    /// prove the panel's release stops the viewer.
     #[cfg(test)]
     pub(crate) fn test_set_live_endpoint(&mut self, endpoint: Arc<ggo_common::LinkEndpoint>) {
-        self.live_endpoint = Some((PathBuf::new(), endpoint));
+        self.live_endpoint = Some(endpoint);
     }
 
     /// The open document has unsaved edits. `test-support` only.
@@ -4115,8 +4127,10 @@ impl WorldPanel {
 
     // ---------------------------------------------------------- live mode
 
-    /// Start a live session for the open world: reuse the viewer cart
-    /// already running for this emerald project, or boot one.
+    /// Start a live session for the open world by booting a viewer cart
+    /// for it. One cart per panel, i.e. per world tab: the cart is
+    /// greeted with THIS panel's document, so a shared one could only
+    /// ever show whichever tab greeted it last.
     ///
     /// The boot goes through `ggo_common`'s viewer registry from inside a
     /// `Workspace` update, deferred out of this one exactly as
@@ -4140,28 +4154,9 @@ impl WorldPanel {
             return;
         }
         let rel = open.source_rel.clone();
-        // One cart per emerald project: every world in it loads over the
-        // same link. Worlds outside an emerald project (the test fixtures,
-        // a loose `worlds/` tree) key on the asset root instead, so the
-        // reuse rule stays "one cart per document root" either way.
-        let project_key = self
-            .project_root
-            .as_ref()
-            .map(|root| root.join(&rel))
-            .and_then(|path| ggo_common::emerald_project_root(&path))
-            .unwrap_or_else(|| open.root.clone());
-        if let Some((booted_for, endpoint)) = &self.live_endpoint {
-            let reusable = *booted_for == project_key
-                && !matches!(endpoint.state(), ggo_common::ViewerState::Stopped(_));
-            if reusable {
-                let endpoint = endpoint.clone();
-                self.start_live(endpoint, cx);
-                return;
-            }
-            // A different project's cart is running: it has nothing to do
-            // with the world now open, so end that run before booting.
-            self.stop_live_endpoint();
-        }
+        // A run left over from this panel's PREVIOUS world has nothing to
+        // do with the one now open, and nothing polls it any more.
+        self.stop_live_endpoint();
         let Some(workspace) = self.workspace.clone() else {
             self.fall_back_to_design(
                 "the world panel has no workspace to boot the viewer cart in".to_string(),
@@ -4178,7 +4173,7 @@ impl WorldPanel {
             });
             this.update(cx, |this, cx| match endpoint {
                 Some(endpoint) => {
-                    this.live_endpoint = Some((project_key, endpoint.clone()));
+                    this.live_endpoint = Some(endpoint.clone());
                     this.start_live(endpoint, cx);
                 }
                 None => this.fall_back_to_design(
@@ -4459,7 +4454,7 @@ impl WorldPanel {
     /// End the viewer run this panel booted, if any. Advisory: the
     /// emulator acts on it at its next frame.
     fn stop_live_endpoint(&mut self) {
-        if let Some((_, endpoint)) = self.live_endpoint.take() {
+        if let Some(endpoint) = self.live_endpoint.take() {
             endpoint.request_stop();
         }
     }
@@ -10008,6 +10003,84 @@ mod tests {
         );
     }
 
+    /// Each world the interceptor claims gets its OWN tab and panel: the
+    /// click on the second world must not retarget the first world's
+    /// panel at it.
+    #[gpui::test]
+    async fn the_interceptor_opens_each_world_in_its_own_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = crate::world_dock::tests::dock_workspace(cx, dir.path()).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let worktree_id = worktree_id(&project, cx);
+        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+            let claimed = workspace.update_in(cx, |workspace, window, cx| {
+                intercept_world_open(workspace, &project_path(worktree_id, rel), window, cx)
+            });
+            assert!(claimed, "{rel} is a world");
+            cx.run_until_parked();
+        }
+        assert_eq!(dock.read_with(cx, |dock, _| dock.open_panels().len()), 2);
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                    .count(),
+                2,
+                "two tabs"
+            );
+        });
+    }
+
+    /// The second-click split follows the world that was CLICKED, not
+    /// whichever canvas tab comes first in the pane: with two worlds
+    /// open, re-clicking the active (second) one must still split its
+    /// toml out.
+    #[gpui::test]
+    async fn a_second_click_splits_the_toml_of_the_clicked_world(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _dock, cx) = crate::world_dock::tests::dock_workspace(cx, dir.path()).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let worktree_id = worktree_id(&project, cx);
+        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                intercept_world_open(workspace, &project_path(worktree_id, rel), window, cx)
+            });
+            cx.run_until_parked();
+        }
+
+        // `worlds/other.toml`'s tab is the active one: clicking it again
+        // is the second click on THAT world.
+        workspace.update_in(cx, |workspace, window, cx| {
+            intercept_world_open(
+                workspace,
+                &project_path(worktree_id, "worlds/other.toml"),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 2, "the toml split opened");
+            let toml_path = project_path(worktree_id, "worlds/other.toml");
+            assert!(
+                workspace.panes().iter().any(|pane| {
+                    pane.read(cx)
+                        .items()
+                        .any(|item| item.project_path(cx).as_ref() == Some(&toml_path))
+                }),
+                "the clicked world's toml is what opened"
+            );
+            assert_eq!(
+                workspace
+                    .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
+                    .count(),
+                2,
+                "and no third canvas tab"
+            );
+        });
+    }
+
     /// A clean panel switches worlds without a prompt.
     #[gpui::test]
     async fn test_open_rel_path_switches_a_clean_panel_directly(cx: &mut TestAppContext) {
@@ -10408,6 +10481,56 @@ mod tests {
                     .instance_candidates()
                     .contains(&"worlds/sub".to_string()),
                 "a deleted world must stop being an + Instance candidate"
+            );
+        });
+    }
+
+    /// Deleting a world from the explorer while ANOTHER world's tab is
+    /// active must clear the tab that had the deleted file open -- the
+    /// menu acts on the world it was invoked for, not on whatever the
+    /// dock happens to be showing.
+    #[gpui::test]
+    async fn test_delete_world_clears_the_tab_that_has_it_open(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = crate::world_dock::tests::dock_workspace(cx, dir.path()).await;
+        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                ggo_common::open_in_panel(
+                    workspace,
+                    window,
+                    cx,
+                    |dock: &mut WorldDock, window, cx| {
+                        dock.open_world(rel, window, cx);
+                    },
+                )
+            });
+            cx.run_until_parked();
+        }
+        let panels = dock.read_with(cx, |dock, _| dock.open_panels());
+        let [test_panel, other_panel] = panels.as_slice() else {
+            panic!("a panel per world");
+        };
+
+        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(
+            !dir.path().join("worlds/test.toml").exists(),
+            "Delete must unlink the file"
+        );
+        test_panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(panel.state, ViewerState::Empty),
+                "the deleted world's own tab must clear"
+            );
+        });
+        other_panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.open_rel_path_now(),
+                Some("worlds/other.toml"),
+                "and the active tab keeps its own document"
             );
         });
     }
@@ -13248,10 +13371,10 @@ mod tests {
         });
     }
 
-    /// A fallback for anything but "the cart stopped" leaves a cart
-    /// RUNNING with nothing polling it -- and Retry would boot nothing,
-    /// because the panel would still be holding that doomed endpoint as
-    /// reusable. So a non-`Stopped` failure ends the run.
+    /// A fallback for anything but "the cart stopped" would otherwise
+    /// leave a cart RUNNING with nothing polling it, and the panel
+    /// holding its link until the next boot replaced it. So a
+    /// non-`Stopped` failure ends the run there and then.
     #[gpui::test]
     async fn a_non_stopped_fallback_ends_the_viewer_run(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -13275,8 +13398,8 @@ mod tests {
     }
 
     /// The cart reporting `Stopped` IS the run ending: there is nothing
-    /// left to ask, and the endpoint stays put for `enter_live` to judge
-    /// un-reusable and replace.
+    /// left to ask, and the endpoint stays put until the next
+    /// `enter_live` drops it for the cart it boots.
     #[gpui::test]
     async fn a_stopped_cart_is_not_asked_to_stop_again(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -13510,18 +13633,21 @@ mod tests {
         });
     }
 
-    /// A world switch inside one project reuses the cart that is already
-    /// running: rebuilding it for every world would cost a build and a
-    /// boot per click.
+    /// Every world drives its OWN viewer run: a panel that switches
+    /// documents boots a fresh cart for the new world and ends the run it
+    /// was greeting, because a cart only ever shows the world it was
+    /// greeted with.
     #[gpui::test]
-    async fn a_world_switch_inside_one_project_reuses_the_cart(cx: &mut TestAppContext) {
+    async fn a_world_switch_boots_its_own_cart_and_ends_the_old_run(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
         cx.run_until_parked();
-        host_sent(&endpoint);
 
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("worlds/sub.toml", window, cx)
@@ -13530,12 +13656,12 @@ mod tests {
 
         assert_eq!(
             BOOTED.with(|booted| booted.borrow().len()),
-            1,
-            "the second world reuses the running cart"
+            2,
+            "the second world booted a cart of its own"
         );
         assert!(
-            host_sent(&endpoint).iter().any(|m| m[0] == 0x01),
-            "and greets it again, so the cart republishes for the new world"
+            endpoint.stop_requested(),
+            "and the run the first world was greeting ended"
         );
         panel.read_with(cx, |panel, _| {
             assert_eq!(open_of(panel).listing.rel_path, "worlds/sub.toml");
