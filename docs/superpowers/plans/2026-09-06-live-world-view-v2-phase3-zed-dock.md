@@ -89,13 +89,13 @@ mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         let first = workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx)
+                dock.open_world("worlds/test.toml", window, cx);
             })
         });
         cx.run_until_parked();
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/other.toml", window, cx)
+                dock.open_world("worlds/other.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -114,7 +114,7 @@ mod tests {
         // Re-opening the first world activates its tab instead of a third.
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx)
+                dock.open_world("worlds/test.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -129,7 +129,7 @@ mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx)
+                dock.open_world("worlds/test.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -593,7 +593,7 @@ fn world_panel_open(
             let rel = resolver.update(app, |p, cx| p.remote_resolve(world, cx))?;
             let panel = workspace.update(app, |ws, cx| {
                 ggo_common::open_in_panel(ws, window, cx, |dock: &mut ggo_world_panel::WorldDock, window, cx| {
-                    dock.open_world(&rel, window, cx)
+                    dock.open_world(&rel, window, cx);
                 });
                 dock.read(cx).active()
             });
