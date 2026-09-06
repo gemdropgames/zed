@@ -65,7 +65,7 @@ use ui::{ContextMenu, DropdownMenu};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
-use ggo_world_panel::WorldPanel;
+use ggo_world_panel::WorldDock;
 use ggo_worldlib::emerald::{
     EXPECTED_EMD_VERSION, ManifestKind, OrderEdit, apply_order_edit, available_systems,
     emd_error_message, emd_reverted, group_by_module, parse_cadenced_ref, schedules_using_system,
@@ -1857,10 +1857,16 @@ impl EmeraldPanel {
         };
         match kind {
             GenKind::Component => {
-                let Some(world_panel) = workspace.read(cx).panel::<WorldPanel>(cx) else {
+                let Some(dock) = workspace.read(cx).panel::<WorldDock>(cx) else {
                     return;
                 };
-                world_panel.update(cx, |panel, cx| panel.refresh_schemas(cx));
+                // Every open world's inspector reads the schema set, so
+                // each tab's panel needs the refresh, not just the active
+                // one.
+                let panels = dock.read(cx).open_panels();
+                for panel in panels {
+                    panel.update(cx, |panel, cx| panel.refresh_schemas(cx));
+                }
             }
             GenKind::World => {
                 let Some(rel) = result
@@ -1889,8 +1895,8 @@ impl EmeraldPanel {
                             workspace,
                             window,
                             cx,
-                            move |panel: &mut WorldPanel, window, cx| {
-                                panel.open_rel_path(&rel, window, cx)
+                            move |dock: &mut WorldDock, window, cx| {
+                                dock.open_world(&rel, window, cx);
                             },
                         );
                     });
@@ -4498,7 +4504,12 @@ mod tests {
         assert_eq!(recorded[0].cwd, dir.path());
         assert_eq!(run_state_message(&panel, cx), "done Created world arena");
         let world_panel = workspace.read_with(cx, |workspace, cx| {
-            workspace.panel::<WorldPanel>(cx).expect("docked")
+            workspace
+                .panel::<WorldDock>(cx)
+                .expect("docked")
+                .read(cx)
+                .active()
+                .expect("a world tab is open")
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
@@ -5197,8 +5208,11 @@ mod tests {
         cx.run_until_parked();
         let world_panel = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<WorldPanel>(cx)
+                .panel::<WorldDock>(cx)
                 .expect("ggo_world_panel::init adds it")
+                .read(cx)
+                .active()
+                .expect("a world tab is open")
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
@@ -5271,8 +5285,9 @@ mod tests {
                 .workspace
                 .as_ref()
                 .and_then(WeakEntity::upgrade)
-                .and_then(|w| w.read(cx).panel::<WorldPanel>(cx))
-                .expect("the world panel is docked")
+                .and_then(|w| w.read(cx).panel::<WorldDock>(cx))
+                .and_then(|dock| dock.read(cx).active())
+                .expect("a world tab is open")
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
@@ -5317,8 +5332,9 @@ mod tests {
                 .workspace
                 .as_ref()
                 .and_then(WeakEntity::upgrade)
-                .and_then(|w| w.read(cx).panel::<WorldPanel>(cx))
-                .expect("the world panel is docked")
+                .and_then(|w| w.read(cx).panel::<WorldDock>(cx))
+                .and_then(|dock| dock.read(cx).active())
+                .expect("a world tab is open")
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
