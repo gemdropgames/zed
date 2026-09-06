@@ -1474,6 +1474,16 @@ impl OpenWorld {
             .mailbox
             .camera()
             .map(|(x, y)| [live::from_raw(x), live::from_raw(y)]);
+        if live.camera != camera_before {
+            // The cart has moved the camera since the host last spoke, so
+            // the host's own value is stale and must stop anchoring input
+            // -- otherwise a cart system that moves the camera would be
+            // undone by the user's next drag. Only on a CHANGE: the push
+            // above ran earlier this same tick and the mailbox was polled
+            // before it, so an unconditional clear would throw away a
+            // camera the cart has not had a chance to report yet.
+            live.sent_camera = None;
+        }
         changed |= live.camera != camera_before;
         // Cloning the `Arc` only -- the emu panel owns dropping the image
         // it replaces (see `LinkEndpoint::frame`).
@@ -3556,11 +3566,7 @@ impl WorldPanel {
             return None;
         };
         let live = open.live.as_ref()?;
-        Some(live::geometry(
-            size,
-            live.scale,
-            live.camera.or(live.sent_camera).unwrap_or([0.0, 0.0]),
-        ))
+        Some(live::geometry(size, live.scale, live.overlay_camera()))
     }
 
     /// The integer scale the Live picture is drawn at on a canvas of
@@ -3576,22 +3582,13 @@ impl WorldPanel {
         }
     }
 
-    /// Middle-button down in Live: anchor a camera pan at `cursor`.
-    ///
-    /// The anchor is what the host has already DECIDED -- a camera still
-    /// owed, else the last one sent, else the cart's report -- so
-    /// successive pans compose instead of each one restarting from a
-    /// report that has not caught up yet.
+    /// Middle-button down in Live: anchor a camera pan at `cursor`
+    /// ([`live::LiveView::input_camera`] is the anchor, and says why).
     fn live_pan_begin(&mut self, cursor: [f64; 2]) {
         if let ViewerState::Ready(open) = &mut self.state
             && let Some(live) = open.live.as_mut()
         {
-            let camera = live
-                .pending_camera
-                .or(live.sent_camera)
-                .or(live.camera)
-                .unwrap_or([0.0, 0.0]);
-            live.pan_drag = Some((cursor, camera));
+            live.pan_drag = Some((cursor, live.input_camera()));
         }
     }
 
@@ -3645,11 +3642,7 @@ impl WorldPanel {
             return false;
         };
         // The same anchor a middle-drag takes, and for the same reason.
-        let camera = live
-            .pending_camera
-            .or(live.sent_camera)
-            .or(live.camera)
-            .unwrap_or([0.0, 0.0]);
+        let camera = live.input_camera();
         let scaled = f64::from(scale);
         live.pending_camera = Some([
             camera[0] + screen_delta[0] / scaled,
@@ -6191,9 +6184,10 @@ impl WorldPanel {
             // Read here, not in the closures: prepaint runs while this
             // entity is borrowed, so the geometry inputs travel as values.
             let scale_override = open.live.as_ref().and_then(|live| live.scale);
-            let camera = open.live.as_ref().map_or([0.0, 0.0], |live| {
-                live.camera.or(live.sent_camera).unwrap_or([0.0, 0.0])
-            });
+            let camera = open
+                .live
+                .as_ref()
+                .map_or([0.0, 0.0], live::LiveView::overlay_camera);
             gpui::canvas(
                 move |canvas_bounds, _window, _cx| {
                     // Stamped directly rather than through `layout_camera`:
@@ -14472,6 +14466,76 @@ mod tests {
         });
     }
 
+    /// A report that MOVES retires the camera the host last sent: a cart
+    /// system that drives the camera must not be undone by the user's
+    /// next drag anchoring on a value the cart has already left behind.
+    #[gpui::test]
+    async fn a_moved_cart_camera_retires_the_one_the_host_sent(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        // A: the cart reports where the greeting put it.
+        cart_camera(&endpoint, 10.0, 20.0);
+        cart_frame(&endpoint, 3);
+        cx.run_until_parked();
+
+        // B: the host pushes a camera of its own and it goes out.
+        panel.update(cx, |panel, cx| {
+            live_mut_of(panel).pending_camera = Some([50.0, 60.0]);
+            cx.notify();
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert_eq!(live.sent_camera, Some([50.0, 60.0]));
+            assert_eq!(
+                live.input_camera(),
+                [50.0, 60.0],
+                "the host's own push anchors input until the cart answers"
+            );
+        });
+
+        // C: the cart reports something else again -- a camera system, not
+        // the host's push, deciding where the view is.
+        cart_camera(&endpoint, 200.0, 100.0);
+        cart_frame(&endpoint, 4);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert_eq!(live.camera, Some([200.0, 100.0]));
+            assert_eq!(live.sent_camera, None, "the report retired it");
+            assert_eq!(live.input_camera(), [200.0, 100.0]);
+        });
+
+        // And a middle-drag starts from C.
+        host_sent(&endpoint);
+        panel.update(cx, |panel, cx| {
+            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(640.), px(480.)),
+            ));
+            panel.live_pan_begin([200.0, 200.0]);
+            assert!(
+                panel.handle_pan_move(&move_event(230.0, 210.0, Some(MouseButton::Middle)), cx)
+            );
+        });
+        endpoint.tick();
+        cx.run_until_parked();
+        let sent = host_sent(&endpoint);
+        let camera = sent
+            .iter()
+            .rev()
+            .find(|message| message.first() == Some(&0x03))
+            .expect("a Camera went out");
+        match emerald_editor_runtime::wire::decode_host(camera) {
+            // 640x480 fits the frame at scale 2: a 30x10 px drag is 15x5
+            // world px, and dragging right moves the camera left.
+            Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
+                assert_eq!((x, y), (live::to_raw(185.0), live::to_raw(95.0)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Before the cart's first camera report the overlay uses the camera
     /// the host last SENT, so the greeting's own framing places the
     /// outlines rather than the world origin.
@@ -14556,18 +14620,13 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        // Reported, and deliberately not what the drag anchors on: the
-        // anchor is the camera the HOST last decided, so two drags in a
-        // row compose instead of the second restarting from a report that
-        // has not caught up.
+        // A report supersedes the camera the greeting sent, so this is
+        // what the drag anchors on.
         cart_camera(&endpoint, 100.0, 50.0);
         cart_frame(&endpoint, 3);
         cx.run_until_parked();
         host_sent(&endpoint);
         let design_pan_before = panel.read_with(cx, |panel, _| panel.test_design_pan());
-        let anchor = panel.read_with(cx, |panel, _| {
-            live_of(panel).sent_camera.expect("the greeting sent one")
-        });
 
         panel.update(cx, |panel, cx| {
             // A 640x480 canvas fits the 320x240 frame at scale 2, so the
@@ -14593,13 +14652,7 @@ mod tests {
         match emerald_editor_runtime::wire::decode_host(camera) {
             Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
                 // Dragging the picture right moves the camera left.
-                assert_eq!(
-                    (x, y),
-                    (
-                        live::to_raw(anchor[0] - 15.0),
-                        live::to_raw(anchor[1] - 5.0)
-                    )
-                );
+                assert_eq!((x, y), (live::to_raw(85.0), live::to_raw(45.0)));
             }
             other => panic!("{other:?}"),
         }

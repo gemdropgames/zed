@@ -726,6 +726,30 @@ impl LiveView {
         }
     }
 
+    /// The camera the OVERLAY is placed with: the cart's own report, else
+    /// the last camera the host sent (which stands in only until the cart
+    /// has reported one), else the origin. Never a camera still owed --
+    /// a cart system that moves the camera has to be able to win, so the
+    /// picture and the outlines lag together by one report rather than
+    /// the outlines running ahead of the frame.
+    pub fn overlay_camera(&self) -> [f64; 2] {
+        self.camera.or(self.sent_camera).unwrap_or([0.0, 0.0])
+    }
+
+    /// The camera a pan or a look-around moves FROM: what the host has
+    /// already decided -- a camera still owed, else the last one sent,
+    /// else the cart's report. The opposite precedence to
+    /// [`Self::overlay_camera`], so two gestures in a row compose instead
+    /// of the second restarting from a report that has not caught up.
+    /// [`Self::sent_camera`] is dropped the moment the cart's report
+    /// moves, so a cart-driven camera still wins here in the end.
+    pub fn input_camera(&self) -> [f64; 2] {
+        self.pending_camera
+            .or(self.sent_camera)
+            .or(self.camera)
+            .unwrap_or([0.0, 0.0])
+    }
+
     /// The cart clock: emulator-derived, monotonic, and frozen while the
     /// emulator is paused (`frame_number` stops advancing).
     pub fn cart_now(&self) -> Instant {
