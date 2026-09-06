@@ -29,7 +29,9 @@ mod inspector;
 mod live;
 mod loader;
 mod world_canvas_item;
+mod world_dock;
 pub use world_canvas_item::WorldCanvasItem;
+pub use world_dock::WorldDock;
 
 use live::{CanvasMode, LiveStatus, LiveView};
 
@@ -42,15 +44,14 @@ use std::time::Instant;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, App, Bounds, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task,
-    WeakEntity, Window, actions, div, px,
+    App, Bounds, ClipboardItem, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
+    RenderImage, ScrollWheelEvent, Styled, Subscription, Task, WeakEntity, Window, actions, div,
+    px,
 };
 use serde_json::Value;
 use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, Divider, DropdownMenu, PopoverMenu, ToggleState};
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::{SplitDirection, Workspace};
 
 use ggo_map_panel::PaintSession;
@@ -140,7 +141,8 @@ const GGO_WORLD_PANEL_KEY: &str = "GGOWorldPanel";
 /// [`bind_panel_keys`] bindings are scoped to.
 const KEY_CONTEXT: &str = "GgoWorldPanel";
 
-/// Fixed default width until the panel grows real settings persistence.
+/// Fixed default width until the dock grows real settings persistence,
+/// and the canvas's fallback size before a first layout.
 const DEFAULT_WIDTH: Pixels = px(360.);
 
 /// Inspector column width inside the panel.
@@ -170,11 +172,11 @@ pub fn init(cx: &mut App) {
         };
 
         let weak_workspace = workspace.weak_handle();
-        let panel = cx.new(|cx| WorldPanel::new(Some(weak_workspace), cx));
-        workspace.add_panel(panel, window, cx);
+        let dock = cx.new(|cx| WorldDock::new(weak_workspace, cx));
+        workspace.add_panel(dock, window, cx);
 
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<WorldPanel>(window, cx);
+            workspace.toggle_panel_focus::<WorldDock>(window, cx);
         });
     })
     .detach();
@@ -360,7 +362,8 @@ fn intercept_world_open(
             .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
             .next();
         let showing = workspace
-            .panel::<WorldPanel>(cx)
+            .panel::<WorldDock>(cx)
+            .and_then(|dock| dock.read(cx).active())
             .and_then(|panel| panel.read(cx).open_rel_path_now().map(str::to_string));
         canvas.filter(|canvas| {
             showing.as_deref() == Some(rel.as_str())
@@ -436,37 +439,17 @@ fn intercept_world_open(
         return true;
     }
 
-    // FIRST click: dock first (the panel owns the document --
-    // inspector/entity editing stays there), then the center-pane canvas
-    // viewport, focused.
-    let claimed = ggo_common::open_in_panel(
+    // FIRST click: the dock reveals itself and opens the world -- a tab
+    // per world, whose panel owns that document, with the dock showing
+    // whichever tab is active (see [`WorldDock::open_world`]).
+    ggo_common::open_in_panel(
         workspace,
         window,
         cx,
-        move |panel: &mut WorldPanel, window, cx| panel.open_rel_path(&rel, window, cx),
-    );
-    if !claimed {
-        return false;
-    }
-    let canvas_item = workspace
-        .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
-        .next();
-    match canvas_item {
-        Some(item) => {
-            workspace.activate_item(&item, true, true, window, cx);
-        }
-        None => {
-            let panel = workspace.panel::<WorldPanel>(cx);
-            let item = cx.new(|cx| {
-                world_canvas_item::WorldCanvasItem::new(
-                    panel.map_or_else(WeakEntity::new_invalid, |panel| panel.downgrade()),
-                    cx,
-                )
-            });
-            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
-        }
-    }
-    true
+        move |dock: &mut WorldDock, window, cx| {
+            dock.open_world(&rel, window, cx);
+        },
+    )
 }
 
 /// `workspace::ContextMenuContributor` for `**/worlds/**/*.toml`: the world
@@ -519,12 +502,22 @@ fn delete_world_handler(
     workspace: WeakEntity<Workspace>,
     rel: String,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(workspace, move |panel: &Entity<WorldPanel>, window, cx| {
-        let rel = rel.clone();
-        panel
-            .update(cx, |panel, cx| panel.delete_world(rel, window, cx))
-            .detach();
-    })
+    ggo_common::panel_entry_handler(
+        workspace.clone(),
+        move |dock: &Entity<WorldDock>, window, cx| {
+            let rel = rel.clone();
+            // Any panel can run the prompt -- it re-derives its own root from
+            // `rel` -- so the active tab's does, and a workspace with no world
+            // open at all gets a throwaway one.
+            let panel = dock.read(cx).active().unwrap_or_else(|| {
+                let workspace = workspace.clone();
+                cx.new(|cx| WorldPanel::new(Some(workspace), cx))
+            });
+            panel
+                .update(cx, |panel, cx| panel.delete_world(rel, window, cx))
+                .detach();
+        },
+    )
 }
 
 // ------------------------------------------------------------- view state
@@ -1517,7 +1510,6 @@ impl OpenWorld {
 
 pub struct WorldPanel {
     focus_handle: FocusHandle,
-    position: DockPosition,
     workspace: Option<WeakEntity<Workspace>>,
     /// Test hook: bypass workspace worktree discovery.
     root_override: Option<PathBuf>,
@@ -1583,7 +1575,6 @@ impl WorldPanel {
         .detach();
         Self {
             focus_handle: cx.focus_handle(),
-            position: DockPosition::Right,
             workspace,
             root_override: None,
             project_root: None,
@@ -1850,6 +1841,16 @@ impl WorldPanel {
     /// `open_rel_path` this asks nothing: the user already answered.
     pub(crate) fn reload_from_disk(&mut self, rel: &str, cx: &mut Context<Self>) {
         self.load_rel_path(rel, None, cx);
+    }
+
+    /// Put a fresh panel into `Loading` for `rel` before its deferred
+    /// load runs, so a reader that arrives first (the MCP host's
+    /// `world_read`) waits instead of seeing an empty panel.
+    pub(crate) fn mark_loading(&mut self, rel: &str, cx: &mut Context<Self>) {
+        if let Some((_, listing)) = split_world_path(rel) {
+            self.state = ViewerState::Loading { stem: listing.stem };
+            cx.notify();
+        }
     }
 
     /// `window` is what a completed load needs to enter Live mode (see
@@ -3136,9 +3137,17 @@ impl WorldPanel {
     /// state machine is crate-private, and a smoke test that asserted
     /// "Ready" by poking at rendered text would pass on a panel that had
     /// silently failed to load.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_is_ready(&self) -> bool {
         matches!(self.state, ViewerState::Ready(_))
+    }
+
+    /// Give the panel a viewer link without booting a cart, so a test can
+    /// prove the panel's release stops the viewer. The `PathBuf` half is
+    /// the emerald root the cart was booted for; nothing here has one.
+    #[cfg(test)]
+    pub(crate) fn test_set_live_endpoint(&mut self, endpoint: Arc<ggo_common::LinkEndpoint>) {
+        self.live_endpoint = Some((PathBuf::new(), endpoint));
     }
 
     /// The open document has unsaved edits. `test-support` only.
@@ -6761,84 +6770,6 @@ impl Focusable for WorldPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for WorldPanel {}
-
-impl Panel for WorldPanel {
-    fn persistent_name() -> &'static str {
-        "GGO World"
-    }
-
-    fn panel_key() -> &'static str {
-        GGO_WORLD_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        // No settings persistence yet (see task-5-brief.md); Bottom isn't a
-        // sensible spot for a world/map editor sidebar, so only Left/Right.
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        DEFAULT_WIDTH
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::Public)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("GGO World")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        8
-    }
-
-    /// The open world lives in panel state, not in a workspace `Item`, so
-    /// nothing else in the close flow knows it can be dirty. Prompt with
-    /// the same Save/Don't-Save/Cancel warning a dirty buffer gets; a
-    /// failed write cancels the close rather than dropping the edits.
-    fn prepare_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
-        ggo_common::prepare_to_close_dirty(
-            self.dirty_world_name(),
-            window,
-            cx,
-            Self::save_for_close,
-        )
-    }
-
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if active {
-            // Deferred: `set_active` fires inside the workspace's own
-            // update (dock toggle), and `refresh_worlds` needs to READ the
-            // workspace to find the project root -- reading it re-entrantly
-            // panics.
-            let this = cx.weak_entity();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| this.refresh_worlds(cx)).ok();
-            });
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6848,7 +6779,7 @@ mod tests {
     use gpui::TestAppContext;
     use project::{FakeFs, Project, WorktreeId};
     use serde_json::json;
-    use workspace::dock::DockPosition;
+    use workspace::dock::{DockPosition, Panel as _};
     use workspace::{AppState, MultiWorkspace};
 
     #[gpui::test]
@@ -6857,8 +6788,8 @@ mod tests {
         ggo_common::bind_default_keymap(cx);
     }
 
-    /// Proves the panel is registered on a real workspace, and that
-    /// dispatching `ToggleFocus` opens the right dock and focuses the panel.
+    /// Proves the dock is registered on a real workspace, and that
+    /// dispatching `ToggleFocus` opens the right dock.
     /// Goes through `MultiWorkspace::test_new` rather than a bare
     /// `Workspace::test_new`, because `register_action` handlers (like
     /// `ToggleFocus`) are only mounted into the dispatch tree once something
@@ -6881,8 +6812,8 @@ mod tests {
 
         workspace.update(cx, |workspace, cx| {
             assert!(
-                workspace.panel::<WorldPanel>(cx).is_some(),
-                "WorldPanel should have been added to the workspace by init()"
+                workspace.panel::<WorldDock>(cx).is_some(),
+                "WorldDock should have been added to the workspace by init()"
             );
             assert!(
                 !workspace.right_dock().read(cx).is_open(),
@@ -6892,11 +6823,11 @@ mod tests {
 
         cx.dispatch_action(ToggleFocus);
 
-        workspace.update(cx, |workspace, cx| {
-            let panel = workspace
-                .panel::<WorldPanel>(cx)
-                .expect("WorldPanel should still be registered");
-            assert_eq!(panel.read(cx).position, DockPosition::Right);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace
+                .panel::<WorldDock>(cx)
+                .expect("WorldDock should still be registered");
+            assert_eq!(dock.read(cx).position(window, cx), DockPosition::Right);
             assert!(
                 workspace.right_dock().read(cx).is_open(),
                 "ToggleFocus should have opened the right dock"
@@ -6916,7 +6847,7 @@ mod tests {
     /// `sprites::io` save fns would dwarf the test; the brief allows this
     /// choice). Real-image composition is worldlib-tested; the BGRA bridge
     /// has its own unit test in `canvas`.
-    fn write_fixture(root: &std::path::Path) {
+    pub(crate) fn write_fixture(root: &std::path::Path) {
         let sub = WorldFile {
             entities: vec![entity(json!({
                 "Transform": { "pos": [0.0, 0.0], "z": 1.0 },
@@ -6950,6 +6881,25 @@ mod tests {
             backgrounds: vec![],
         };
         write_world(root, "worlds/test.toml", &main).unwrap();
+    }
+
+    /// A `WorldPanel` bound to `workspace` and reading from `root`: what
+    /// the dock builds behind a world tab, for the tests that only need a
+    /// panel wired to a real workspace and not the tab itself.
+    fn workspace_panel(
+        workspace: &Entity<Workspace>,
+        root: &std::path::Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<WorldPanel> {
+        let workspace = workspace.downgrade();
+        let root = root.to_path_buf();
+        cx.update(|_, cx| {
+            cx.new(|cx| {
+                let mut panel = WorldPanel::new(Some(workspace), cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        })
     }
 
     /// Load `worlds/test` into a fresh panel and return it Ready, with the
@@ -9378,170 +9328,23 @@ mod tests {
         );
     }
 
-    /// A clean panel must be invisible to the close flow: no prompt, and
-    /// the guard resolves `true` immediately.
-    #[gpui::test]
-    async fn test_close_guard_lets_a_clean_panel_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        assert!(
-            !cx.has_pending_prompt(),
-            "a clean world must not prompt on close"
-        );
-        assert!(close.await, "a clean panel must not block the close");
-    }
-
-    /// Cancel aborts the close and leaves the document dirty and unwritten
-    /// -- the data-loss guard proper.
-    #[gpui::test]
-    async fn test_close_guard_cancel_aborts_the_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-        dirty_the_world(&panel, cx);
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        assert_eq!(
-            cx.pending_prompt().map(|(msg, _)| msg),
-            Some("worlds/test.toml contains unsaved edits. Do you want to save it?".to_string()),
-        );
-        cx.simulate_prompt_answer("Cancel");
-        assert!(!close.await, "Cancel must veto the close");
-
-        panel.update(cx, |panel, _cx| {
-            assert!(
-                panel.dirty_world_name().is_some(),
-                "Cancel must leave the edits in place"
-            );
-        });
-        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
-        assert_eq!(
-            on_disk.entities[0].components["Transform"]["pos"],
-            json!([4, 4]),
-            "Cancel must not have written the file"
-        );
-    }
-
-    /// Save writes through the panel's own save path and then allows the
-    /// close.
-    #[gpui::test]
-    async fn test_close_guard_save_writes_then_allows_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-        dirty_the_world(&panel, cx);
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        cx.simulate_prompt_answer("Save");
-        assert!(close.await, "a successful save must allow the close");
-
-        panel.update(cx, |panel, _cx| {
-            assert!(panel.dirty_world_name().is_none(), "save clears dirty");
-        });
-        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
-        assert_eq!(
-            on_disk.entities[0].components["Transform"]["pos"],
-            json!([50, 60]),
-            "Save must have written the edit"
-        );
-    }
-
-    /// Answering "Save" when the write FAILS must cancel the close --
-    /// letting it proceed would discard the very edits the user just asked
-    /// to keep.
-    #[gpui::test]
-    async fn test_close_guard_save_failure_cancels_the_close(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-        dirty_the_world(&panel, cx);
-
-        let blocker = dir.path().join("blocker");
-        std::fs::write(&blocker, b"not a directory").unwrap();
-        panel.update(cx, |panel, _| {
-            let ViewerState::Ready(open) = &mut panel.state else {
-                panic!("expected Ready");
-            };
-            open.root = blocker;
-        });
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        cx.simulate_prompt_answer("Save");
-        assert!(!close.await, "a failed save must cancel the close");
-
-        panel.update(cx, |panel, _cx| {
-            let ViewerState::Ready(open) = &panel.state else {
-                panic!("expected Ready");
-            };
-            assert!(open.save_error.is_some(), "the failure must be surfaced");
-            assert!(
-                open.store.state().dirty,
-                "the edits must survive the failed save"
-            );
-        });
-    }
-
-    /// "Don't Save" closes and deliberately drops the edits -- the file on
-    /// disk keeps its loaded contents.
-    #[gpui::test]
-    async fn test_close_guard_discard_allows_close_without_writing(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        let cx = cx.add_empty_window();
-        dirty_the_world(&panel, cx);
-
-        let close = cx
-            .update(|window, cx| panel.update(cx, |panel, cx| panel.prepare_to_close(window, cx)));
-        cx.simulate_prompt_answer("Don't Save");
-        assert!(close.await, "Don't Save must allow the close");
-
-        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
-        assert_eq!(
-            on_disk.entities[0].components["Transform"]["pos"],
-            json!([4, 4]),
-            "Don't Save must not write the file"
-        );
-    }
-
-    /// The wiring test: a dirty panel docked in a REAL workspace makes
+    /// The wiring test: a dirty world TAB in a REAL workspace makes
     /// `Workspace::prepare_to_close` (the single funnel for window close,
     /// quit and restart) prompt and, on Cancel, report `false` -- which is
-    /// what `MultiWorkspace::close_window` and `zed::quit` honour.
+    /// what `MultiWorkspace::close_window` and `zed::quit` honour. The
+    /// dock itself no longer guards anything: the document lives in the
+    /// tab, and it is the tab's own dirt the close flow saves.
     #[gpui::test]
-    async fn test_dirty_panel_vetoes_workspace_prepare_to_close(cx: &mut TestAppContext) {
+    async fn test_a_dirty_world_tab_vetoes_workspace_prepare_to_close(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path());
-        cx.update(|cx| {
-            AppState::test(cx);
-            init(cx);
-            ggo_common::bind_default_keymap(cx);
-        });
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
-        });
-
-        // Point the docked panel at the real temp project and open a world.
-        panel.update(cx, |panel, cx| {
-            panel.root_override = Some(dir.path().to_path_buf());
-            panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", None, cx);
+        let (workspace, dock, cx) = world_dock::tests::dock_workspace(cx, dir.path()).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::open_in_panel(workspace, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world("worlds/test.toml", window, cx);
+            })
         });
         cx.run_until_parked();
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
         dirty_the_world(&panel, cx);
 
         let close = workspace.update_in(cx, |workspace, window, cx| {
@@ -9550,12 +9353,12 @@ mod tests {
         cx.run_until_parked();
         assert!(
             cx.has_pending_prompt(),
-            "the docked dirty panel must be polled by Workspace::prepare_to_close"
+            "the dirty world tab must be polled by Workspace::prepare_to_close"
         );
         cx.simulate_prompt_answer("Cancel");
         assert!(
             !close.await.unwrap(),
-            "Cancel in the panel guard must cancel the whole close"
+            "Cancel in the tab's save prompt must cancel the whole close"
         );
     }
 
@@ -9745,14 +9548,7 @@ mod tests {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
-        });
-        panel.update(cx, |panel, _| {
-            panel.root_override = Some(dir.path().to_path_buf())
-        });
+        let panel = workspace_panel(&workspace, dir.path(), cx);
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("worlds/test.toml", window, cx)
         });
@@ -9967,13 +9763,14 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
+        let dock = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
+                .panel::<WorldDock>(cx)
+                .expect("init() adds the dock")
         });
-        let root = dir.path().to_path_buf();
-        panel.update(cx, |panel, _| panel.root_override = Some(root));
+        dock.update(cx, |dock, _| {
+            dock.test_root_override(dir.path().to_path_buf())
+        });
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(
@@ -9988,6 +9785,7 @@ mod tests {
         );
         cx.run_until_parked();
 
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
         panel.update(cx, |panel, _cx| {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready after routing");
@@ -10351,13 +10149,20 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = worktree_id(&project, cx);
-        let panel = workspace.read_with(cx, |workspace, cx| {
+        let dock = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
+                .panel::<WorldDock>(cx)
+                .expect("init() adds the dock")
         });
-        let root = root.to_path_buf();
-        panel.update(cx, |panel, _| panel.root_override = Some(root));
+        dock.update(cx, |dock, _| dock.test_root_override(root.to_path_buf()));
+        // The menu entries act on the ACTIVE world tab, so open one.
+        workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::open_in_panel(workspace, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world("worlds/test.toml", window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
         (workspace, panel, worktree_id, cx)
     }
 
@@ -11078,11 +10883,13 @@ mod tests {
                 return false;
             }
             // What `open_in_panel::<MapPanel>` ends up doing to the dock's
-            // current panel: an update of the WorldPanel from inside the
-            // interceptor. Panics unless the jump was deferred.
+            // current panel: an update of the WorldPanel the jump came
+            // from, from inside the interceptor. Panics unless the jump
+            // was deferred.
             let world_panel = workspace
-                .panel::<WorldPanel>(cx)
-                .expect("the world panel is docked");
+                .panel::<WorldDock>(cx)
+                .and_then(|dock| dock.read(cx).active())
+                .expect("the active world tab's panel");
             world_panel.update(cx, |_, _| {});
             let rel = ggo_common::rel_in_primary_worktree(workspace, path, cx).unwrap_or_default();
             CLAIMED.with(|c| c.borrow_mut().push(rel));
@@ -11659,11 +11466,7 @@ mod tests {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
-        });
+        let panel = workspace_panel(&workspace, dir.path(), cx);
 
         // Nothing open yet: no world to name, and the project's own
         // default stands.
@@ -11679,7 +11482,6 @@ mod tests {
         // `routed_project` wrote the fixture into `dir`; the workspace's
         // worktree is a fake fs, so the load reads through the override.
         panel.update(cx, |panel, cx| {
-            panel.root_override = Some(dir.path().to_path_buf());
             panel.refresh_worlds(cx);
             panel.load_rel_path("worlds/test.toml", None, cx);
         });
@@ -13013,18 +12815,23 @@ mod tests {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
+        // Through the dock, so the panel is the one the dock RENDERS: the
+        // toolbar, status line and systems rail only paint there.
+        let dock = workspace.read_with(cx, |workspace, cx| {
             workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
+                .panel::<WorldDock>(cx)
+                .expect("init() adds the dock")
         });
-        panel.update(cx, |panel, _| {
-            panel.root_override = Some(dir.path().to_path_buf())
+        dock.update(cx, |dock, _| {
+            dock.test_root_override(dir.path().to_path_buf())
         });
-        panel.update_in(cx, |panel, window, cx| {
-            panel.open_rel_path("worlds/test.toml", window, cx)
+        workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::open_in_panel(workspace, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world("worlds/test.toml", window, cx);
+            })
         });
         cx.run_until_parked();
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
         let endpoint = BOOTED
             .with(|booted| booted.borrow().last().map(|(_, e)| e.clone()))
             .expect("Live mode asked the booter for a viewer cart");
@@ -13357,14 +13164,7 @@ mod tests {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
-        });
-        panel.update(cx, |panel, _| {
-            panel.root_override = Some(dir.path().to_path_buf())
-        });
+        let panel = workspace_panel(&workspace, dir.path(), cx);
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("worlds/test.toml", window, cx)
         });
@@ -13494,14 +13294,7 @@ mod tests {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .panel::<WorldPanel>(cx)
-                .expect("init() adds the panel")
-        });
-        panel.update(cx, |panel, _| {
-            panel.root_override = Some(dir.path().to_path_buf())
-        });
+        let panel = workspace_panel(&workspace, dir.path(), cx);
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("worlds/test.toml", window, cx)
         });
@@ -14943,11 +14736,10 @@ mod tests {
         panel.read_with(cx, |panel, _| assert_eq!(panel.canvas_mode, expected));
     }
 
-    /// Opens the dock so the panel actually paints: the workspace-backed
-    /// live helpers leave it closed, and `debug_bounds` only resolves
-    /// elements that were laid out.
+    /// Lets the dock paint the panel, so `debug_bounds` can resolve its
+    /// elements: opening a world already revealed the dock, but nothing
+    /// has drawn since the test's last message.
     fn show_panel(cx: &mut gpui::VisualTestContext) {
-        cx.update(|window, cx| window.dispatch_action(ToggleFocus.boxed_clone(), cx));
         cx.run_until_parked();
     }
 

@@ -1,13 +1,15 @@
-//! The world CANVAS as a center-pane tab: a workspace [`Item`] over the
-//! dock [`WorldPanel`]'s state (spec
-//! `docs/superpowers/specs/2026-08-20-ggo-center-editors-design.md`).
-//! The panel stays the document owner -- load/save/inspector/entity
-//! editing all live in the dock; this item only gives the viewport the
-//! center pane's space. Closing the tab closes nothing but the view.
+//! The world CANVAS as a center-pane tab: a workspace [`Item`] that OWNS
+//! the [`WorldPanel`] holding the world (spec
+//! `docs/superpowers/specs/2026-09-06-live-world-view-v2-design.md`).
+//! One world per tab, one panel per tab: load/save/inspector/entity
+//! editing all live on that panel, the tab gives its canvas the center
+//! pane's space, and `WorldDock` renders whichever panel the active tab
+//! holds. Closing the tab drops the panel -- and with it the world's
+//! viewer session.
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Task,
-    WeakEntity, Window,
+    Window,
 };
 use project::Project;
 use ui::prelude::*;
@@ -20,57 +22,50 @@ pub enum WorldCanvasEvent {
 }
 
 pub struct WorldCanvasItem {
-    panel: WeakEntity<WorldPanel>,
-    /// Fallback focus for the dead-panel case (workspace tore the dock
-    /// down); with a live panel the item shares its focus handle so the
-    /// panel's key bindings work from the canvas tab.
-    focus_handle: FocusHandle,
+    panel: Entity<WorldPanel>,
 }
 
 impl WorldCanvasItem {
-    pub fn new(panel: WeakEntity<WorldPanel>, cx: &mut Context<Self>) -> Self {
-        if let Some(panel) = panel.upgrade() {
-            cx.observe(&panel, |_, _, cx| cx.emit(WorldCanvasEvent::UpdateTab))
-                .detach();
-        }
-        Self {
-            panel,
-            focus_handle: cx.focus_handle(),
-        }
+    pub fn new(panel: Entity<WorldPanel>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&panel, |_, _, cx| cx.emit(WorldCanvasEvent::UpdateTab))
+            .detach();
+        Self { panel }
+    }
+
+    /// The panel holding this tab's world -- what `WorldDock` renders
+    /// while the tab is active.
+    pub fn panel(&self) -> &Entity<WorldPanel> {
+        &self.panel
     }
 
     /// The panel this tab views, for cross-crate journey tests
-    /// (`ggo_smoke`). Weak by construction, so a panel the workspace tore
-    /// down surfaces as `None` rather than a stale handle.
+    /// (`ggo_smoke`).
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_panel(&self) -> Option<Entity<WorldPanel>> {
-        self.panel.upgrade()
+        Some(self.panel.clone())
     }
 }
 
 impl EventEmitter<WorldCanvasEvent> for WorldCanvasItem {}
 
 impl Focusable for WorldCanvasItem {
+    /// The tab shares its panel's focus handle, so the panel's key
+    /// bindings work from the canvas tab.
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match self.panel.upgrade() {
-            Some(panel) => panel.focus_handle(cx),
-            None => self.focus_handle.clone(),
-        }
+        self.panel.focus_handle(cx)
     }
 }
 
 impl Render for WorldCanvasItem {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let canvas: Option<AnyElement> = self.panel.upgrade().and_then(|panel| {
-            panel.update(cx, |panel, cx| {
-                // The image cache's atlas release runs here, on the one
-                // render path that paints those images.
-                panel.retire_images(window);
-                match &panel.state {
-                    ViewerState::Ready(_) => Some(panel.render_canvas(cx)),
-                    _ => None,
-                }
-            })
+        let canvas: Option<AnyElement> = self.panel.update(cx, |panel, cx| {
+            // The image cache's atlas release runs here, on the one
+            // render path that paints those images.
+            panel.retire_images(window);
+            match &panel.state {
+                ViewerState::Ready(_) => Some(panel.render_canvas(cx)),
+                _ => None,
+            }
         });
         match canvas {
             Some(canvas) => div().size_full().child(canvas).into_any_element(),
@@ -95,13 +90,11 @@ impl Item for WorldCanvasItem {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        let stem = self.panel.upgrade().and_then(|panel| {
-            panel.read(cx).open_rel_path_now().map(|rel| {
-                std::path::Path::new(rel)
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| rel.to_string())
-            })
+        let stem = self.panel.read(cx).open_rel_path_now().map(|rel| {
+            std::path::Path::new(rel)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| rel.to_string())
         });
         match stem {
             Some(stem) => format!("World: {stem}").into(),
@@ -116,9 +109,7 @@ impl Item for WorldCanvasItem {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.panel
-            .upgrade()
-            .is_some_and(|panel| panel.read(cx).dirty_world_name().is_some())
+        self.panel.read(cx).dirty_world_name().is_some()
     }
 
     fn can_save(&self, cx: &App) -> bool {
@@ -136,13 +127,11 @@ impl Item for WorldCanvasItem {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        if let Some(panel) = self.panel.upgrade() {
-            panel.update(cx, |panel, cx| {
-                if let Some(rel) = panel.open_rel_path_now().map(str::to_string) {
-                    panel.reload_from_disk(&rel, cx);
-                }
-            });
-        }
+        self.panel.update(cx, |panel, cx| {
+            if let Some(rel) = panel.open_rel_path_now().map(str::to_string) {
+                panel.reload_from_disk(&rel, cx);
+            }
+        });
         Task::ready(Ok(()))
     }
 
@@ -153,14 +142,7 @@ impl Item for WorldCanvasItem {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        // An `Ok(())` here would tell the close flow the edits were
-        // written when nothing holds them anymore -- a data-loss lie.
-        let Some(panel) = self.panel.upgrade() else {
-            return Task::ready(Err(anyhow::anyhow!(
-                "cannot save the world: its panel no longer exists"
-            )));
-        };
-        let result = panel.update(cx, |panel, cx| {
+        let result = self.panel.update(cx, |panel, cx| {
             panel.save_impl(cx);
             match &panel.state {
                 ViewerState::Ready(open) => match &open.save_error {
@@ -186,7 +168,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = crate::tests::ready_panel_in_window(cx, dir.path()).await;
 
-        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.downgrade(), cx)));
+        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.clone(), cx)));
         item.read_with(cx, |item, cx| {
             assert_eq!(item.tab_content_text(0, cx).as_ref(), "World: test");
             assert!(!item.is_dirty(cx), "clean panel, clean tab");
@@ -200,7 +182,7 @@ mod tests {
         // Render the item in its own window: the canvas paints from the
         // panel's state and records its bounds (the thing the dock render
         // no longer does).
-        let (item, cx) = cx.add_window_view(|_, cx| WorldCanvasItem::new(panel.downgrade(), cx));
+        let (item, cx) = cx.add_window_view(|_, cx| WorldCanvasItem::new(panel.clone(), cx));
         cx.run_until_parked();
         let _ = item;
         panel.read_with(cx, |panel, _| {
@@ -215,19 +197,17 @@ mod tests {
     }
 
     /// `Item::save` routes through the panel's own save path: success
-    /// writes the file and clears dirty, a failed write surfaces as `Err`
-    /// and keeps the document dirty, and a DEAD panel (the workspace tore
-    /// the dock down while the tab survived) must also `Err` -- an `Ok`
-    /// there would report a save that wrote nothing, silently dropping the
-    /// edits on close.
+    /// writes the file and clears dirty, and a failed write surfaces as
+    /// `Err` and keeps the document dirty -- an `Ok` there would report a
+    /// save that wrote nothing, silently dropping the edits on close.
     #[gpui::test]
-    async fn test_item_save_success_and_failure_and_dead_panel(cx: &mut TestAppContext) {
+    async fn test_item_save_success_and_failure(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = crate::tests::ready_panel_in_window(cx, dir.path()).await;
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
 
-        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.downgrade(), cx)));
+        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.clone(), cx)));
         crate::tests::dirty_the_world(&panel, cx);
         let save = cx.update(|window, cx| {
             item.update(cx, |item, cx| {
@@ -281,21 +261,6 @@ mod tests {
         item.read_with(cx, |item, cx| {
             assert!(item.is_dirty(cx), "a failed save must keep the tab dirty");
         });
-
-        // A dead panel: drop the only strong handle and save the orphaned
-        // tab.
-        let doomed = cx.update(|_, cx| cx.new(|cx| WorldPanel::new(None, cx)));
-        let dead_item =
-            cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(doomed.downgrade(), cx)));
-        drop(doomed);
-        cx.run_until_parked();
-        let save = cx.update(|window, cx| {
-            dead_item.update(cx, |item, cx| {
-                item.save(SaveOptions::default(), project.clone(), window, cx)
-            })
-        });
-        save.await
-            .expect_err("a dead panel must not report a save that wrote nothing");
     }
 
     /// An item over a panel with NO open world still renders (the
@@ -308,7 +273,7 @@ mod tests {
             crate::init(cx);
         });
         let panel = cx.update(|cx| cx.new(|cx| WorldPanel::new(None, cx)));
-        let (item, cx) = cx.add_window_view(|_, cx| WorldCanvasItem::new(panel.downgrade(), cx));
+        let (item, cx) = cx.add_window_view(|_, cx| WorldCanvasItem::new(panel.clone(), cx));
         cx.run_until_parked();
         item.read_with(cx, |item, cx| {
             assert_eq!(item.tab_content_text(0, cx).as_ref(), "World");
@@ -324,7 +289,7 @@ mod tests {
         let (panel, cx) = crate::tests::ready_panel_in_window(cx, dir.path()).await;
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
-        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.downgrade(), cx)));
+        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.clone(), cx)));
 
         crate::tests::dirty_the_world(&panel, cx);
         item.read_with(cx, |item, cx| assert!(item.is_dirty(cx), "edited"));
