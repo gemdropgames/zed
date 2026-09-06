@@ -5927,7 +5927,7 @@ impl WorldPanel {
         if rows.is_empty() {
             return None;
         }
-        let mut rail = h_flex().gap_2().px_1().pb_1().flex_wrap().child(
+        let mut rail = v_flex().gap_1().px_1().pb_1().child(
             Label::new("Systems")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
@@ -15638,6 +15638,20 @@ mod tests {
             Some(false),
             "and back again with the session still up"
         );
+    }
+
+    /// The rail is a vertical list, not a wrapped row: one system per
+    /// line, in one column (spec: "the systems toggle is a vertical
+    /// list").
+    #[gpui::test]
+    async fn the_systems_rail_is_a_vertical_list(cx: &mut TestAppContext) {
+        let (_panel, _endpoint, _dir, cx) =
+            connected_live_panel_with_systems(cx, &["animate", "physics"]).await;
+        show_panel(cx);
+        let first = cx.debug_bounds(SYSTEM_0.1).expect("row 0");
+        let second = cx.debug_bounds(SYSTEM_1.1).expect("row 1");
+        assert_eq!(first.origin.x, second.origin.x, "same column");
+        assert!(second.origin.y > first.origin.y, "stacked");
     }
 
     /// The status line belongs to LIVE mode, not to the session: it
