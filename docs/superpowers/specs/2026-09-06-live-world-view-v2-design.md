@@ -93,10 +93,10 @@ registry (`Vec<Entity<ViewerRun>>` on a global keyed by workspace entity
 id) that prunes runs whose endpoint is `Stopped`. Many runs coexist, one
 emulator thread each.
 
-Watch mode: `EmuPanel`'s source watcher already debounces "Rust sources or
-assets changed". It additionally emits a global `ViewerSourcesChanged`
-event; every `ViewerRun` rebuilds on it (endpoint `Building` again, then
-`Running`). The world panel already re-greets after a reboot.
+Watch mode: each `ViewerRun` subscribes to the project's worktree events
+itself, with the same `watch_triggers` predicate and debounce `EmuPanel`
+uses, and rebuilds when Rust sources or assets change (endpoint `Building`
+again, then `Running`). The world panel already re-greets after a reboot.
 
 ### `ggo_world_panel`: per-tab documents, thin dock
 
