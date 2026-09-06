@@ -112,7 +112,11 @@ impl DocCounts {
     }
 }
 
-/// One published rect from the cart, in world pixels.
+/// One published row from the cart, in world pixels. `x`/`y` are the
+/// entity's TRANSFORM -- what a drag writes back through `SetTransform` --
+/// while the sprite is DRAWN at `(x + ox, y + oy)` sized `(w, h)`. The two
+/// differ for a centered sprite, so hit-testing and the overlay use
+/// [`CartRow::drawn`] and only drags use `x`/`y`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CartRow {
     pub index: u32,
@@ -120,6 +124,16 @@ pub struct CartRow {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    pub ox: f64,
+    pub oy: f64,
+}
+
+impl CartRow {
+    /// The rect the cart actually draws: `[x, y, w, h]` shifted by the
+    /// sprite's draw offset.
+    pub fn drawn(&self) -> [f64; 4] {
+        [self.x + self.ox, self.y + self.oy, self.w, self.h]
+    }
 }
 
 pub fn rows_from(entities: &[EntityRow]) -> Vec<CartRow> {
@@ -131,12 +145,15 @@ pub fn rows_from(entities: &[EntityRow]) -> Vec<CartRow> {
             y: from_raw(entity.y),
             w: f64::from(entity.w),
             h: f64::from(entity.h),
+            ox: f64::from(entity.ox),
+            oy: f64::from(entity.oy),
         })
         .collect()
 }
 
 fn contains(row: &CartRow, x: f64, y: f64) -> bool {
-    x >= row.x && x < row.x + row.w && y >= row.y && y < row.y + row.h
+    let [left, top, w, h] = row.drawn();
+    x >= left && x < left + w && y >= top && y < top + h
 }
 
 /// Topmost (last) row under a world point, as the cart draws later rows
@@ -153,7 +170,8 @@ pub fn rows_in_rect(rows: &[CartRow], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec
     let (top, bottom) = (y0.min(y1), y0.max(y1));
     rows.iter()
         .filter(|row| {
-            row.x < right && row.x + row.w > left && row.y < bottom && row.y + row.h > top
+            let [row_left, row_top, w, h] = row.drawn();
+            row_left < right && row_left + w > left && row_top < bottom && row_top + h > top
         })
         .map(|row| row.index)
         .collect()
@@ -178,11 +196,7 @@ pub fn overlay_rows(
         .filter_map(|row| {
             let selection = live.index_map.selection_of(row.index)?;
             counts.contains(selection).then(|| {
-                (
-                    selection,
-                    [row.x, row.y, row.w, row.h],
-                    selected.contains(&selection),
-                )
+                (selection, row.drawn(), selected.contains(&selection))
             })
         })
         .collect()
@@ -228,6 +242,10 @@ pub fn hits_in_rect(
 
 /// Where every cart index the selection owns sits right now, in the
 /// runtime's raw fixed point -- the anchors a live drag adds its delta to.
+/// Deliberately the TRANSFORM (`row.x`/`row.y`), not the drawn rect: the
+/// delta goes back as an absolute `SetTransform`, so folding the sprite's
+/// draw offset in here would teleport a centered sprite by that offset on
+/// the first drag.
 pub fn drag_origins(live: &LiveView, selected: &[Selection]) -> Vec<(u32, i32, i32)> {
     if !live.loaded() {
         return Vec::new();
@@ -719,6 +737,8 @@ mod tests {
                 y: 0.0,
                 w: 16.0,
                 h: 16.0,
+                ox: 0.0,
+                oy: 0.0,
             },
             CartRow {
                 index: 1,
@@ -726,6 +746,8 @@ mod tests {
                 y: 8.0,
                 w: 16.0,
                 h: 16.0,
+                ox: 0.0,
+                oy: 0.0,
             },
         ];
         assert_eq!(hit_row(&rows, 10.0, 10.0), Some(1));
@@ -750,7 +772,55 @@ mod tests {
             y,
             w: 16.0,
             h: 16.0,
+            ox: 0.0,
+            oy: 0.0,
         }
+    }
+
+    /// A 32x32 sprite drawn centered on its transform, the shape that made
+    /// the drawn rect and the transform disagree.
+    fn centered_row(index: u32, x: f64, y: f64) -> CartRow {
+        CartRow {
+            index,
+            x,
+            y,
+            w: 32.0,
+            h: 32.0,
+            ox: -16.0,
+            oy: -16.0,
+        }
+    }
+
+    #[test]
+    fn hit_testing_uses_the_drawn_rect_not_the_transform_box() {
+        let rows = vec![centered_row(0, 100.0, 100.0)];
+        // Up and left of the transform: inside the drawn rect (84..116),
+        // outside a 32x32 box anchored at the transform (100..132).
+        assert_eq!(hit_row(&rows, 88.0, 88.0), Some(0));
+        assert_eq!(rows_in_rect(&rows, 85.0, 85.0, 90.0, 90.0), [0]);
+        // Down and right of the drawn rect but inside that transform box.
+        assert_eq!(hit_row(&rows, 120.0, 120.0), None);
+        assert!(rows_in_rect(&rows, 118.0, 118.0, 130.0, 130.0).is_empty());
+    }
+
+    #[test]
+    fn a_centered_row_overlays_the_drawn_rect_but_drags_from_the_transform() {
+        let mut live = offline_view(vec![centered_row(0, 100.0, 100.0)], 1, &[]);
+        live.world_sync = WorldSync::Loaded;
+        let counts = DocCounts {
+            entities: 1,
+            instances: 0,
+        };
+
+        let overlay = overlay_rows(&live, counts, &[]);
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay[0].1, [84.0, 84.0, 32.0, 32.0]);
+
+        assert_eq!(
+            drag_origins(&live, &[Selection::Entity(0)]),
+            [(0, to_raw(100.0), to_raw(100.0))],
+            "a drag anchors on the transform the cart writes back"
+        );
     }
 
     /// Two direct entities and one instance contributing two: cart

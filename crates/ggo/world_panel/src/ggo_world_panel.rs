@@ -13073,20 +13073,31 @@ mod tests {
         out
     }
 
-    /// The cart's whole entity table: one `0x84 Entities` datagram
-    /// (`count u8`, then 16-byte rows of `index u32, x i32, y i32, w u16,
-    /// h u16`) followed by the `0x85 EntityCount` that closes it. Every
-    /// rect is 16x16, which is what the fixture's entities measure.
+    /// Most rows one `0x84 Entities` datagram carries -- the wire's own cap
+    /// (`1 + 1 + 12 * 20 = 242` bytes), which its decoder rejects a datagram
+    /// for exceeding.
+    const ROWS_PER_DATAGRAM: usize = 12;
+
+    /// The cart's whole entity table: `0x84 Entities` datagrams (`count u8`,
+    /// then 20-byte rows of `index u32, x i32, y i32, w u16, h u16, ox i16,
+    /// oy i16`) followed by the `0x85 EntityCount` that closes it. `x`/`y`
+    /// are the entity's transform and `ox`/`oy` the sprite's draw offset,
+    /// zero here: every fixture rect is an unoffset 16x16, which is what the
+    /// fixture's entities measure.
     fn cart_rows(endpoint: &ggo_common::LinkEndpoint, rows: &[(u32, f64, f64)]) {
-        let mut out = vec![0x84, rows.len() as u8];
-        for (index, x, y) in rows {
-            out.extend_from_slice(&index.to_le_bytes());
-            out.extend_from_slice(&live::to_raw(*x).to_le_bytes());
-            out.extend_from_slice(&live::to_raw(*y).to_le_bytes());
-            out.extend_from_slice(&16u16.to_le_bytes());
-            out.extend_from_slice(&16u16.to_le_bytes());
+        for batch in rows.chunks(ROWS_PER_DATAGRAM) {
+            let mut out = vec![0x84, batch.len() as u8];
+            for (index, x, y) in batch {
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(&live::to_raw(*x).to_le_bytes());
+                out.extend_from_slice(&live::to_raw(*y).to_le_bytes());
+                out.extend_from_slice(&16u16.to_le_bytes());
+                out.extend_from_slice(&16u16.to_le_bytes());
+                out.extend_from_slice(&0i16.to_le_bytes());
+                out.extend_from_slice(&0i16.to_le_bytes());
+            }
+            cart_says(endpoint, out);
         }
-        cart_says(endpoint, out);
         let mut count = vec![0x85];
         count.extend_from_slice(&(rows.len() as u32).to_le_bytes());
         cart_says(endpoint, count);

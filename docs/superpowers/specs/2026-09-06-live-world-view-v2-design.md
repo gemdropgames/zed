@@ -173,19 +173,37 @@ the Design canvas.
 ## Protocol change (emerald)
 
 - New `CartMsg::Camera { x: i32, y: i32 }`, kind `0x89`, Q16.16 world
-  offset of the cart's `Camera` resource. Emitted every frame beside
-  `FrameSeq` while a host is connected (9 bytes; unconditional so a lost
-  datagram heals next frame).
-- Entity rows publish the drawn footprint: `w, h = MetaSprite::size()`,
-  and `x, y` = transform + `offset` (minus half the size when `centered`).
-  Entities without a `MetaSprite` keep 16x16 at the transform.
+  offset the render pass draws with. Emitted every frame beside `FrameSeq`
+  while a host is connected (9 bytes; unconditional so a lost datagram
+  heals next frame).
+- The reported camera follows the render pass's own precedence, extracted
+  into `emerald_core::gfx::effective_camera`: an active `Camera` COMPONENT's
+  sibling `Transform.pos` wins, minus `(SCREEN_W/2, SCREEN_H/2)` when
+  `is_centered` (the default); else the `Camera` RESOURCE's `offset`; else
+  `(0, 0)`. Republished unconditionally, so removing the camera reports the
+  origin instead of stranding the last value in the mailbox.
+- Entity rows carry the transform, the sprite size and the sprite draw
+  offset separately: `x, y` = the entity's TRANSFORM (Q16.16), `w, h` =
+  `MetaSprite::size()`, `ox, oy` = the sprite's draw offset in whole pixels
+  (which already folds `.centered()` in). Without a `MetaSprite` that is
+  16x16 at `(0, 0)`. A host outlines and hit-tests the DRAWN rect at
+  `(x + ox, y + oy)` sized `(w, h)`, but drags anchor on `x, y` — the
+  absolute `SetTransform` writes that field back, so folding the offset in
+  would teleport a centered sprite on its first drag. Rows are 20 bytes,
+  12 to a datagram (`1 + 1 + 12 * 20 = 242`).
+- The draw offsets ride a new trailing `Mailbox::entity_offsets:
+  [[i16; 2]; MAX_ENTITIES]` rather than widening `EntityRect`, so every
+  existing `offset_of!` the RAM host reads by stays put and the mailbox
+  magic needs no bump.
 - `LinkMailbox::camera() -> Option<(i32, i32)>` on the host side, updated
   from the message.
 - `LINK_PROTO_VERSION` 1 → 2. The host's existing "viewer cart predates
   the link protocol; rebuild it" path covers older carts.
 - Tests: wire round trip for `Camera`; `link.rs` publishes it each frame
   and the in-memory `LinkIo` pair test reads it back through the mailbox;
-  a row test with a sized, offset, centered `MetaSprite`.
+  `effective_camera`'s four precedence cases plus the removal-resets case
+  through the mailbox; a golden-byte pin on the 20-byte row and an
+  offset-only row change reaching the host.
 
 ## Testing (zed)
 
