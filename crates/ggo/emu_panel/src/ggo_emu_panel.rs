@@ -100,6 +100,7 @@ mod link;
 mod menu;
 mod stats;
 mod uart;
+pub mod viewer_run;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
