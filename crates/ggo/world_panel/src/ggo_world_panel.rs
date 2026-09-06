@@ -30,10 +30,11 @@ mod live;
 mod loader;
 mod world_canvas_item;
 mod world_dock;
+pub use live::CanvasMode;
 pub use world_canvas_item::WorldCanvasItem;
-pub use world_dock::WorldDock;
+pub use world_dock::{OpenMode, WorldDock};
 
-use live::{CanvasMode, LiveStatus, LiveView};
+use live::{LiveStatus, LiveView};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1253,7 +1254,7 @@ impl OpenWorld {
                 cart_stopped: false,
             }),
         };
-        let now = live.cart_now();
+        let now = live.advance_cart_clock();
         match live.endpoint.state() {
             ggo_common::ViewerState::Building => {
                 // A rebuild retires whatever the previous run presented:
@@ -1261,11 +1262,18 @@ impl OpenWorld {
                 // kept across the rebuild would be re-inserted by the next
                 // paint. The boot screen covers the gap.
                 let dropped = live.frame.take().is_some();
+                // Back to square one, however far the session had got: the
+                // cart that greeted us is being replaced by one that never
+                // has. Without this the `Running` arm below sees a session
+                // that is already past `Building`, never greets the new
+                // cart, and the world is never re-sent to it.
+                let regressed = live.status != LiveStatus::Building;
+                live.status = LiveStatus::Building;
                 return if wall.duration_since(live.started) >= live::BUILD_DEADLINE {
                     failed("viewer cart build timed out".to_string())
                 } else {
                     LiveStep {
-                        changed: dropped,
+                        changed: dropped || regressed,
                         failure: None,
                     }
                 };
@@ -1285,6 +1293,11 @@ impl OpenWorld {
             live.status = LiveStatus::Connecting;
             live.connect_since = now;
             live.last_hello = now;
+            // Every baseline fresh, including this one: a rebuild can
+            // reach here with the PREVIOUS cart's outstanding stale
+            // re-greeting still recorded, which the deadline below would
+            // read as "the new cart has already stopped answering".
+            live.stale_hello = None;
             if let Err(error) = live.mailbox.hello() {
                 return failed(link_failed(error));
             }
@@ -1560,6 +1573,15 @@ pub struct WorldPanel {
     /// tabs would make whichever world was greeted last the only one the
     /// cart is showing.
     live_endpoint: Option<Arc<ggo_common::LinkEndpoint>>,
+    /// Set between [`Self::enter_live`] arming its deferred boot and that
+    /// boot landing. The canvas has to know: for those renders the mode
+    /// is Live and there is no session yet, and painting the design
+    /// renderer through them flashes the wrong picture at the user.
+    live_boot_pending: bool,
+    /// The dock this panel's tab was opened from, where the sticky Live
+    /// choices live. Held so the user's choices survive closing the last
+    /// world tab, which takes every panel with it.
+    dock: Option<WeakEntity<WorldDock>>,
 }
 
 impl WorldPanel {
@@ -1600,6 +1622,30 @@ impl WorldPanel {
             canvas_mode: CanvasMode::Live,
             live_sys_mask: 0,
             live_endpoint: None,
+            live_boot_pending: false,
+            dock: None,
+        }
+    }
+
+    /// Which renderer this panel's canvas is showing.
+    pub fn canvas_mode(&self) -> CanvasMode {
+        self.canvas_mode
+    }
+
+    /// Adopt the dock that opened this tab, so the sticky Live choices
+    /// this panel makes outlive it.
+    pub(crate) fn set_dock(&mut self, dock: WeakEntity<WorldDock>) {
+        self.dock = Some(dock);
+    }
+
+    /// Hand the user's Live choices back to the dock, which is what seeds
+    /// the next world tab with them. Every path that moves either of them
+    /// calls this -- a fallback to Design included, since that is how Live
+    /// gets turned off and the next tab must not turn it back on.
+    fn note_sticky_live(&self, cx: &mut App) {
+        let (mode, sys_mask) = (self.canvas_mode, self.live_sys_mask);
+        if let Some(dock) = self.dock.as_ref() {
+            dock.update(cx, |dock, _| dock.note_sticky(mode, sys_mask)).ok();
         }
     }
 
@@ -1731,7 +1777,7 @@ impl WorldPanel {
     /// Everything after the guard runs on a spawned task, deliberately: the
     /// interceptor calls this from INSIDE the workspace's own update, and
     /// [`Self::refresh_worlds`] has to read that same workspace entity.
-    pub fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_rel_path(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
         // Clicking the file that is ALREADY open is how you bring the panel
         // back into focus, and upstream's semantics for that click on a tab
         // are "activate the existing item", not "reload it". The interceptor
@@ -1880,9 +1926,11 @@ impl WorldPanel {
     }
 
     /// `window` is what a completed load needs to enter Live mode (see
-    /// [`Self::enter_live`]); the windowless callers -- the close
-    /// prompt's reload and the MCP `world_open` -- load into Design and
-    /// let the next click through the explorer bring Live back.
+    /// [`Self::enter_live`]); a windowless load stays in Design whatever
+    /// [`Self::canvas_mode`] says, because there is no window to boot a
+    /// viewer cart in. Every tab now loads WITH a window -- the dock
+    /// defers [`Self::open_rel_path`] into one -- so this is the headless
+    /// tests' path and the reload behind a close prompt.
     fn load_rel_path(&mut self, rel: &str, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let Some((asset_root_rel, listing)) = split_world_path(rel) else {
             self.abandon_load(format!("{rel} is not a world file"), cx);
@@ -3112,7 +3160,8 @@ impl WorldPanel {
     /// Save on behalf of a "Save" answer to the unsaved-edits prompt,
     /// reporting whether the write actually landed (a failed write must not
     /// let the caller discard the document). Shared by
-    /// [`Panel::prepare_to_close`] and [`Self::open_rel_path`].
+    /// [`Self::open_rel_path`]'s reload prompt and
+    /// [`Self::save_if_open_and_dirty`].
     fn save_for_close(&mut self, cx: &mut Context<Self>) -> bool {
         self.save_impl(cx);
         match &self.state {
@@ -4319,7 +4368,9 @@ impl WorldPanel {
     /// The boot goes through `ggo_common`'s viewer registry from inside a
     /// `Workspace` update, deferred out of this one exactly as
     /// [`Self::emulate_impl`] defers -- the workspace is leased while a
-    /// panel listener runs, and the booter opens an emulator pane.
+    /// panel listener runs, and the booter needs an update of its own on
+    /// it. The booter opens NO emulator pane: it registers a headless
+    /// `ViewerRun` that publishes frames into the endpoint.
     fn enter_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -4349,21 +4400,25 @@ impl WorldPanel {
             return;
         };
         let this = cx.weak_entity();
+        self.live_boot_pending = true;
         window.defer(cx, move |window, cx| {
             let endpoint = workspace.upgrade().and_then(|workspace| {
                 workspace.update(cx, |workspace, cx| {
                     ggo_common::boot_viewer(workspace, &rel, window, cx)
                 })
             });
-            this.update(cx, |this, cx| match endpoint {
-                Some(endpoint) => {
-                    this.live_endpoint = Some(endpoint.clone());
-                    this.start_live(endpoint, cx);
+            this.update(cx, |this, cx| {
+                this.live_boot_pending = false;
+                match endpoint {
+                    Some(endpoint) => {
+                        this.live_endpoint = Some(endpoint.clone());
+                        this.start_live(endpoint, cx);
+                    }
+                    None => this.fall_back_to_design(
+                        "no emulator pane is available to run the viewer cart".to_string(),
+                        cx,
+                    ),
                 }
-                None => this.fall_back_to_design(
-                    "no emulator pane is available to run the viewer cart".to_string(),
-                    cx,
-                ),
             })
             .ok();
         });
@@ -4446,26 +4501,39 @@ impl WorldPanel {
     /// something to draw -- and always in Design, which is also where a
     /// failed session falls back to.
     pub(crate) fn live_loading_text(&self) -> Option<String> {
-        if !self.live_active() {
+        if self.canvas_mode != CanvasMode::Live {
             return None;
         }
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        let live = open.live.as_ref()?;
+        let booting = || {
+            let stem = std::path::Path::new(open.source_rel.as_str())
+                .file_stem()
+                .map_or_else(
+                    || open.source_rel.clone(),
+                    |stem| stem.to_string_lossy().into_owned(),
+                );
+            format!("Booting viewer for {stem}…")
+        };
+        let Some(live) = open.live.as_ref() else {
+            // The boot is deferred out of the click that asked for it, so
+            // there is at least one render in Live with no session behind
+            // it. The boot screen covers those: falling through to the
+            // canvas would paint a frame of the DESIGN renderer in the
+            // middle of switching away from it.
+            return self.live_boot_pending.then(booting);
+        };
+        if matches!(live.status, LiveStatus::Failed(_)) {
+            return None;
+        }
         match live.endpoint.state() {
             ggo_common::ViewerState::Building => Some("Building viewer cart…".to_string()),
             ggo_common::ViewerState::Running => {
                 if live.status == LiveStatus::Connected && live.frame.is_some() {
                     return None;
                 }
-                let stem = std::path::Path::new(open.source_rel.as_str())
-                    .file_stem()
-                    .map_or_else(
-                        || open.source_rel.clone(),
-                        |stem| stem.to_string_lossy().into_owned(),
-                    );
-                Some(format!("Booting viewer for {stem}…"))
+                Some(booting())
             }
             // A stopped cart is a failure the status row reports; the
             // fallback to Design is what the user sees.
@@ -4527,6 +4595,8 @@ impl WorldPanel {
         } = failure;
         log::warn!("GGO: live world view fell back to the design view: {reason}");
         self.canvas_mode = CanvasMode::Design;
+        self.live_boot_pending = false;
+        self.note_sticky_live(cx);
         // `Failed` is terminal, so nothing polls this cart again -- and
         // `enter_live`'s Retry would hand the session straight back to the
         // one that just failed. Ending the run is what makes Retry boot a
@@ -4553,7 +4623,12 @@ impl WorldPanel {
     /// Live is entered by asking the booter again rather than by reviving
     /// whatever ran before -- the emulator pane owns "is a rebuild
     /// needed?", and the panel is not in a position to second-guess it.
-    fn set_canvas_mode(&mut self, mode: CanvasMode, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_canvas_mode(
+        &mut self,
+        mode: CanvasMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match mode {
             CanvasMode::Design => self.leave_live(cx),
             CanvasMode::Live => {
@@ -4562,6 +4637,7 @@ impl WorldPanel {
                 cx.notify();
             }
         }
+        self.note_sticky_live(cx);
     }
 
     /// Turn one of the cart's own systems on or off for this session. The
@@ -4592,6 +4668,7 @@ impl WorldPanel {
             open.live_error = Some(format!("live update: {error}"));
         }
         self.live_sys_mask = mask;
+        self.note_sticky_live(cx);
         cx.notify();
     }
 
@@ -4599,6 +4676,7 @@ impl WorldPanel {
     /// viewer run behind it.
     fn leave_live(&mut self, cx: &mut Context<Self>) {
         self.canvas_mode = CanvasMode::Design;
+        self.live_boot_pending = false;
         if let ViewerState::Ready(open) = &mut self.state {
             open.live = None;
             open.live_error = None;
@@ -15624,6 +15702,102 @@ mod tests {
                 panel.live_loading_text(),
                 Some("Building viewer cart…".into())
             );
+        });
+    }
+
+    /// A watch rebuild swaps the cart under a live session: `Building`,
+    /// then `Running` again with a cart that has never been greeted. The
+    /// session has to go back to square one and greet the new cart --
+    /// otherwise it stays "connected" to a cart that has never heard of
+    /// the document, and nothing is ever sent to it again.
+    #[gpui::test]
+    async fn a_rebuilt_viewer_is_greeted_again_and_re_sent_the_world(cx: &mut TestAppContext) {
+        use emerald_editor_runtime::wire::{self, BlobKind, HostMsg};
+
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).status, LiveStatus::Connected)
+        });
+        host_sent(&endpoint);
+
+        endpoint.set_state(ggo_common::ViewerState::Building);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).status,
+                LiveStatus::Building,
+                "the session is back where it started"
+            )
+        });
+
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        assert!(
+            host_sent(&endpoint)
+                .iter()
+                .any(|message| message.first() == Some(&0x01)),
+            "the replacement cart is greeted"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).status,
+                LiveStatus::Connecting,
+                "and the session waits for its answer"
+            )
+        });
+
+        cart_says(&endpoint, hello_ack(wire::LINK_PROTO_VERSION, &[]));
+        cx.run_until_parked();
+        let sent = settle_live(&panel, &endpoint, cx);
+        assert!(
+            sent.iter().any(|message| matches!(
+                wire::decode_host(message),
+                Some(HostMsg::BlobBegin {
+                    kind: BlobKind::World,
+                    ..
+                })
+            )),
+            "and the whole world goes out to it again"
+        );
+        panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert_eq!(live.status, LiveStatus::Connected);
+            assert!(live.loaded(), "the new cart is showing this document");
+        });
+    }
+
+    /// Entering Live defers the boot, so there is a render with the mode
+    /// already flipped and no session behind it. That render must be the
+    /// boot screen: painting the design renderer through it flashes the
+    /// picture the user just switched away from.
+    #[gpui::test]
+    async fn entering_live_paints_the_boot_screen_not_a_design_frame(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, _endpoint, cx) = live_panel(cx, &dir).await;
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Design, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.live_loading_text()),
+            None
+        );
+
+        // Asserted INSIDE the update, which is the only place the state
+        // between `enter_live` arming its deferral and the booter
+        // answering can be seen: the deferral runs on the way out.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Live, window, cx);
+            assert!(open_of(panel).live.is_none(), "the boot is deferred");
+            assert_eq!(
+                panel.live_loading_text(),
+                Some("Booting viewer for test…".into()),
+                "the boot screen stands in for the canvas"
+            );
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(open_of(panel).live.is_some(), "and the boot lands");
         });
     }
 

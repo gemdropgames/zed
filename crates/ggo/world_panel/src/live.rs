@@ -583,6 +583,19 @@ fn cart_clock(endpoint: &ggo_common::LinkEndpoint, epoch: Instant) -> Instant {
     epoch + FRAME_TIME * endpoint.frame_number().unwrap_or(0)
 }
 
+/// Where the cart clock's base has to move to so the clock does not run
+/// BACKWARDS across a rebuild: the replacement cart starts numbering its
+/// frames at zero again, and every deadline on this clock is a
+/// `duration_since` -- which saturates to zero rather than going negative,
+/// so a clock that jumped back would simply freeze the staleness and
+/// connect deadlines for as many frames as the old run had drawn.
+fn rebase_epoch(epoch: Instant, last_frame: u32, frame: u32) -> Instant {
+    match last_frame.checked_sub(frame) {
+        Some(0) | None => epoch,
+        Some(dropped) => epoch + FRAME_TIME * dropped,
+    }
+}
+
 /// How far the world document the panel last sent has got, and therefore
 /// what the cart's published rows describe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -615,6 +628,10 @@ pub struct LiveView {
     /// Base of the cart clock: `epoch + FRAME_TIME * frame_number` is the
     /// `now` every [`LinkMailbox`] call is measured against.
     pub epoch: Instant,
+    /// The endpoint frame number [`Self::advance_cart_clock`] last read.
+    /// A cart that was rebuilt under the session numbers from zero again,
+    /// which is only visible as this counter dropping.
+    pub last_frame: u32,
     /// When the session began, on the executor's clock -- the only
     /// deadline that is not the cart's is the build's.
     pub started: Instant,
@@ -695,11 +712,13 @@ impl LiveView {
         // already is (a reused cart has been running a while), so every
         // baseline below has to be taken on THAT clock, not on `now`.
         let cart = cart_clock(&endpoint, now);
+        let endpoint_frame = endpoint.frame_number().unwrap_or(0);
         LiveView {
             mailbox: LinkMailbox::new(EndpointIo(endpoint.clone())),
             endpoint,
             status: LiveStatus::Building,
             epoch: now,
+            last_frame: endpoint_frame,
             started: now,
             last_hello: cart,
             connect_since: cart,
@@ -752,8 +771,26 @@ impl LiveView {
 
     /// The cart clock: emulator-derived, monotonic, and frozen while the
     /// emulator is paused (`frame_number` stops advancing).
+    ///
+    /// Read only by the tests. Production reads the clock through
+    /// [`Self::advance_cart_clock`], which is the same value plus the
+    /// re-base a rebuilt cart needs -- and taking it without that re-base
+    /// is exactly the bug it exists to prevent.
+    #[cfg(test)]
     pub fn cart_now(&self) -> Instant {
         cart_clock(&self.endpoint, self.epoch)
+    }
+
+    /// [`Self::cart_now`] for the one caller that gets to move the clock's
+    /// base: the poll step. A viewer cart rebuilt under a live session
+    /// restarts its frame numbering, so the base is nudged forward by
+    /// whatever the counter dropped and the clock carries on from where
+    /// the outgoing run left it.
+    pub fn advance_cart_clock(&mut self) -> Instant {
+        let frame = self.endpoint.frame_number().unwrap_or(0);
+        self.epoch = rebase_epoch(self.epoch, self.last_frame, frame);
+        self.last_frame = frame;
+        self.epoch + FRAME_TIME * frame
     }
 
     /// Whether the cart's rows describe the document the panel is showing
@@ -858,6 +895,31 @@ mod tests {
         let (_, rect, scale) = geometry([800.0, 600.0], Some(1), [0.0, 0.0]);
         assert_eq!(scale, 1);
         assert_eq!(rect, [240.0, 180.0, 320.0, 240.0]);
+    }
+
+    /// A viewer cart rebuilt under a live session restarts its frame
+    /// numbering, which would run the cart clock -- and so every deadline
+    /// measured on it -- backwards. `duration_since` saturates rather than
+    /// going negative, so the visible symptom is deadlines that simply
+    /// never fire again.
+    #[test]
+    fn the_cart_clock_never_runs_backwards_across_a_rebuild() {
+        let epoch = Instant::now();
+        // 600 frames in, the replacement cart starts again at zero.
+        let before = epoch + FRAME_TIME * 600;
+        let rebased = rebase_epoch(epoch, 600, 0);
+        assert_eq!(rebased, before, "the clock carries on from where it was");
+        assert_eq!(
+            rebase_epoch(rebased, 0, 5) + FRAME_TIME * 5,
+            before + FRAME_TIME * 5,
+            "and climbs again with the new cart's frames"
+        );
+        assert_eq!(
+            rebase_epoch(epoch, 5, 9),
+            epoch,
+            "a counter that only moves forward leaves the base alone"
+        );
+        assert_eq!(rebase_epoch(epoch, 5, 5), epoch, "and so does a paused one");
     }
 
     #[test]

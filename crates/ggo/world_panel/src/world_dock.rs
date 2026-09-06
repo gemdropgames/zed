@@ -14,7 +14,25 @@ use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use crate::world_canvas_item::WorldCanvasItem;
-use crate::{DEFAULT_WIDTH, EMPTY_MESSAGE, GGO_WORLD_PANEL_KEY, ToggleFocus, WorldPanel};
+use crate::{
+    CanvasMode, DEFAULT_WIDTH, EMPTY_MESSAGE, GGO_WORLD_PANEL_KEY, ToggleFocus, WorldPanel,
+};
+
+/// The empty dock's `debug_selector`: the message a dock with no world
+/// tab shows, which is otherwise indistinguishable from a blank panel.
+const EMPTY_SELECTOR: &str = "ggo-world-dock-empty";
+
+/// Which renderer a freshly opened world tab comes up in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMode {
+    /// However the user last left a world tab -- what a click in the
+    /// explorer, the Emerald menu or the world menu means.
+    Sticky,
+    /// Design, whatever the user last chose. For opens nobody is looking
+    /// at: an agent surveying a project's worlds must not boot an
+    /// emulator per world it reads.
+    Design,
+}
 
 pub struct WorldDock {
     workspace: WeakEntity<Workspace>,
@@ -32,6 +50,12 @@ pub struct WorldDock {
     /// second click arriving mid-load would otherwise open a second tab on
     /// the same world.
     panels: Vec<(String, WeakEntity<WorldPanel>)>,
+    /// The Live choices a new [`OpenMode::Sticky`] tab inherits, pushed
+    /// here by whichever panel the user last changed them on. Held by the
+    /// DOCK (spec) rather than read back off the active panel, so closing
+    /// the last world tab does not reset them.
+    canvas_mode: CanvasMode,
+    live_sys_mask: u64,
     _active_item: Option<Subscription>,
     #[cfg(test)]
     test_root_override: Option<std::path::PathBuf>,
@@ -57,6 +81,8 @@ impl WorldDock {
             position: DockPosition::Right,
             active: None,
             panels: Vec::new(),
+            canvas_mode: CanvasMode::Live,
+            live_sys_mask: 0,
             _active_item,
             #[cfg(test)]
             test_root_override: None,
@@ -91,16 +117,52 @@ impl WorldDock {
         // tab is the exception -- its panel is gone, so `active()` is
         // already `None` and the dock has to let go of the dead handle.
         if active.is_some() || self.active().is_none() {
+            let moved = active != self.active;
             self.active = active;
+            // Only on a real move, and deferred. Only, because
+            // `refresh_worlds` notifies the panel, the canvas tab turns
+            // that into a `ChangeItemTitle`, and the workspace turns THAT
+            // back into the `ActiveItemChanged` this runs behind -- an
+            // unconditional refresh here never stops. Deferred, because
+            // `refresh_worlds` READS the workspace, which is mid-update
+            // when that event is emitted.
+            if moved && let Some(panel) = self.active() {
+                cx.defer(move |cx| {
+                    panel.update(cx, |panel, cx| panel.refresh_worlds(cx));
+                });
+            }
             cx.notify();
         }
     }
 
-    /// Activate the tab already showing `rel`, or open a new one. Returns
-    /// the tab's panel. Safe to call while the workspace is leased.
+    /// Record the Live choices a new [`OpenMode::Sticky`] tab inherits.
+    /// Called by whichever panel the user changed them on.
+    pub(crate) fn note_sticky(&mut self, canvas_mode: CanvasMode, live_sys_mask: u64) {
+        self.canvas_mode = canvas_mode;
+        self.live_sys_mask = live_sys_mask;
+    }
+
+    /// [`Self::open_world_in`] in the mode the user last chose.
     pub fn open_world(
         &mut self,
         rel: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<WorldPanel>> {
+        self.open_world_in(rel, OpenMode::Sticky, window, cx)
+    }
+
+    /// Activate the tab already showing `rel`, or open a new one in
+    /// `mode`. Returns the tab's panel. Safe to call while the workspace
+    /// is leased.
+    ///
+    /// `mode` only decides how a NEW tab comes up: a world that already
+    /// has one keeps whatever it is showing, because an agent's survey
+    /// must not close down the live view the user is working in.
+    pub fn open_world_in(
+        &mut self,
+        rel: &str,
+        mode: OpenMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<WorldPanel>> {
@@ -110,25 +172,26 @@ impl WorldDock {
             .iter()
             .find(|(open_rel, _)| open_rel == rel)
             .and_then(|(_, panel)| panel.upgrade());
-        // The mode and mask are sticky across worlds: a new tab opens the
-        // way the last one was showing.
-        let (canvas_mode, live_sys_mask) = self
-            .active()
-            .map(|panel| {
-                let panel = panel.read(cx);
-                (panel.canvas_mode, panel.live_sys_mask)
-            })
-            .unwrap_or((crate::CanvasMode::Live, 0));
+        let canvas_mode = match mode {
+            OpenMode::Sticky => self.canvas_mode,
+            OpenMode::Design => CanvasMode::Design,
+        };
+        // The mask rides along either way: it says which of the cart's
+        // systems the user wants running, which only matters once a tab
+        // is in Live and is theirs whenever it gets there.
+        let live_sys_mask = self.live_sys_mask;
         let panel = match existing {
             Some(panel) => panel,
             None => {
                 let weak_workspace = self.workspace.clone();
+                let weak_dock = cx.weak_entity();
                 #[cfg(test)]
                 let root_override = self.test_root_override.clone();
                 let panel = cx.new(|cx| {
                     let mut panel = WorldPanel::new(Some(weak_workspace), cx);
                     panel.canvas_mode = canvas_mode;
                     panel.live_sys_mask = live_sys_mask;
+                    panel.set_dock(weak_dock);
                     #[cfg(test)]
                     {
                         panel.root_override = root_override;
@@ -190,6 +253,7 @@ impl Render for WorldDock {
                 .flex()
                 .items_center()
                 .justify_center()
+                .debug_selector(|| EMPTY_SELECTOR.into())
                 .child(Label::new(EMPTY_MESSAGE).color(Color::Muted))
                 .into_any_element(),
         };
@@ -633,10 +697,129 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn the_dock_renders_the_empty_message_without_a_world(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (_workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
-        dock.update_in(cx, |dock, window, cx| {
-            let _ = dock.render(window, cx);
-            assert!(dock.active().is_none());
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_panel::<WorldDock>(window, cx)
         });
+        cx.run_until_parked();
+        assert!(dock.read_with(cx, |dock, _| dock.active().is_none()));
+        assert!(
+            cx.debug_bounds(EMPTY_SELECTOR).is_some(),
+            "the empty dock says what to do rather than rendering blank"
+        );
+    }
+
+    /// The Live choices are the DOCK's (spec), not the active panel's:
+    /// closing the last world tab takes every panel with it, and the next
+    /// world the user opens must still come up the way they left it.
+    #[gpui::test]
+    async fn the_sticky_mode_survives_closing_the_last_world_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        let open = |rel: &'static str, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |ws, window, cx| {
+                ggo_common::open_in_panel(ws, window, cx, move |dock: &mut WorldDock, window, cx| {
+                    dock.open_world(rel, window, cx);
+                })
+            });
+            cx.run_until_parked();
+        };
+        open("worlds/test.toml", cx);
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(crate::CanvasMode::Design, window, cx)
+        });
+        cx.run_until_parked();
+
+        // A second tab inherits it while the first is still open.
+        open("worlds/other.toml", cx);
+        let second = dock.read_with(cx, |dock, _| dock.active().expect("a second tab"));
+        assert_eq!(
+            second.read_with(cx, |panel, _| panel.canvas_mode()),
+            crate::CanvasMode::Design,
+            "a new tab opens the way the last one was showing"
+        );
+
+        // And it survives every panel going away -- including the strong
+        // handles this test is holding, which would otherwise keep the
+        // panels alive past their tabs.
+        drop(panel);
+        drop(second);
+        let ids = workspace.read_with(cx, |ws, cx| {
+            ws.items_of_type::<WorldCanvasItem>(cx)
+                .map(|item| item.entity_id())
+                .collect::<Vec<_>>()
+        });
+        let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
+        for id in ids {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(id, workspace::SaveIntent::Skip, window, cx)
+            })
+            .await
+            .expect("close");
+        }
+        cx.run_until_parked();
+        assert!(dock.read_with(cx, |dock, _| dock.open_panels().is_empty()));
+
+        open("worlds/test.toml", cx);
+        let reopened = dock.read_with(cx, |dock, _| dock.active().expect("a fresh tab"));
+        assert_eq!(
+            reopened.read_with(cx, |panel, _| panel.canvas_mode()),
+            crate::CanvasMode::Design,
+            "the dock kept the user's choice with no panel left to hold it"
+        );
+    }
+
+    /// The MCP tools open worlds nobody is looking at: in Live each of
+    /// those would boot a headless emulator run for a picture that is
+    /// never drawn.
+    #[gpui::test]
+    async fn an_agent_open_comes_up_in_design_and_leaves_an_open_tab_alone(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        workspace.update_in(cx, |ws, window, cx| {
+            ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world_in("worlds/test.toml", OpenMode::Design, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.canvas_mode()),
+            crate::CanvasMode::Design
+        );
+        assert_eq!(
+            dock.read_with(cx, |dock, _| dock.canvas_mode),
+            crate::CanvasMode::Live,
+            "and the user's own sticky choice is not overwritten by it"
+        );
+
+        // A world that already has a tab keeps whatever it is showing.
+        // Assigned rather than switched through `set_canvas_mode`: there
+        // is no viewer booter registered in these tests, so entering Live
+        // would fall straight back to Design.
+        panel.update(cx, |panel, cx| {
+            panel.canvas_mode = crate::CanvasMode::Live;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |ws, window, cx| {
+            ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world_in("worlds/test.toml", OpenMode::Design, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            dock.read_with(cx, |dock, _| dock.active().expect("still open")),
+            panel,
+            "the same tab"
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.canvas_mode()),
+            crate::CanvasMode::Live,
+            "an agent's read must not close down the user's live view"
+        );
     }
 }
