@@ -90,19 +90,39 @@ pub(crate) fn boot(
     let runner = proc_runner(cx);
     let world_rel = world_rel.to_string();
     let run = cx.new(|cx| ViewerRun::new(world_rel, root, runner, endpoint, Some(project), cx));
-    // The runs of world views that have since gone away: their emulator
-    // threads have stopped and nothing polls their endpoints any more, so
-    // let go of them rather than grow this list for the life of the app.
+    // The runs of world views that have since gone away: their host asked
+    // them to stop, so nothing polls their endpoints any more and letting
+    // go of them is what keeps this list from growing for the life of the
+    // app. A merely STOPPED run is not that: `on_sources_changed`
+    // deliberately keeps a run whose build failed alive so that fixing the
+    // error and saving brings it back, and this list holds the only handle
+    // to it -- pruning on `is_stopped` would have the next boot of any
+    // other world view drop it, watch subscription and all.
     // Taken out of the global first because deciding which to keep reads
     // the entities, and so borrows the `App` the global lives in.
     let existing = std::mem::take(&mut cx.default_global::<ViewerRuns>().0);
     let mut live: Vec<Entity<ViewerRun>> = existing
         .into_iter()
-        .filter(|run| !run.read(cx).is_stopped())
+        .filter(|run| !run.read(cx).endpoint().stop_requested())
         .collect();
     live.push(run);
     cx.default_global::<ViewerRuns>().0 = live;
     true
+}
+
+/// Drop the registered run driving `endpoint`, if one is still registered.
+///
+/// Deferred by [`ViewerRun::end_run`], which runs INSIDE the entity being
+/// dropped here: an entity cannot retain itself out of the global while it
+/// is being updated. Keyed on the endpoint rather than on a handle so that
+/// nothing here keeps the run alive past the retain.
+fn forget_run(endpoint: &Arc<LinkEndpoint>, cx: &mut App) {
+    let existing = std::mem::take(&mut cx.default_global::<ViewerRuns>().0);
+    let live: Vec<Entity<ViewerRun>> = existing
+        .into_iter()
+        .filter(|run| !Arc::ptr_eq(run.read(cx).endpoint(), endpoint))
+        .collect();
+    cx.default_global::<ViewerRuns>().0 = live;
 }
 
 #[cfg_attr(not(test), allow(unused_variables))]
@@ -363,9 +383,20 @@ impl ViewerRun {
     /// the outgoing thread cannot stamp its own terminal reason over the
     /// one written below.
     fn end_run(&mut self, reason: String, cx: &mut App) {
+        // Read before the state is written, since `WORLD_PANEL_STOP` is
+        // also how a dropped run reports itself.
+        let host_stop = self.endpoint.stop_requested();
         self.drop_session(cx);
         if !self.is_stopped() {
             self.endpoint.set_state(ViewerState::Stopped(reason));
+        }
+        if host_stop {
+            // The world tab left live mode: this run will never be asked
+            // for anything again, so drop it from the registry now rather
+            // than at whatever future boot happens to prune next.
+            // Deferred because this runs while the entity is updating.
+            let endpoint = self.endpoint.clone();
+            cx.defer(move |cx| forget_run(&endpoint, cx));
         }
     }
 
@@ -875,6 +906,112 @@ mod tests {
                 cx.try_global::<ViewerRuns>()
                     .is_none_or(|runs| runs.0.is_empty()),
                 "nothing registered: there is no run to keep alive"
+            );
+        });
+    }
+
+    /// A run whose build FAILED stays registered when another world view
+    /// boots. The registry holds the only handle to it -- the world view
+    /// keeps just the endpoint -- so pruning it there would drop its
+    /// project watch, and the save that fixes the compile error would
+    /// never reach it.
+    #[gpui::test]
+    async fn a_failed_run_survives_another_viewers_boot(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        let ggo = dir.path().join("demo-editor.ggo");
+        std::fs::write(&ggo, crate::drive::fixture::green_screen_cart()).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner: ggo_common::ProcRunner = Arc::new(move |_request| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ggo_common::ProcCapture {
+                    ok: false,
+                    lines: vec!["error: could not compile demo_editor".to_string()],
+                }
+            } else {
+                ggo_common::ProcCapture {
+                    ok: true,
+                    lines: vec![serde_json::json!({ "ggo": ggo }).to_string()],
+                }
+            }
+        });
+        let (_db, workspace, _panel, _worktree, cx) =
+            crate::tests::run_menu_workspace(cx, dir.path()).await;
+        cx.update(|_, cx| {
+            cx.set_global(TestViewerRunner(runner));
+            cx.set_global(TestViewerRoot(dir.path().to_path_buf()));
+        });
+        let failed = workspace
+            .update_in(cx, |workspace, window, cx| {
+                ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+            })
+            .expect("the booter claimed the boot");
+        cx.run_until_parked();
+        assert!(
+            matches!(failed.state(), ggo_common::ViewerState::Stopped(reason) if reason.contains("build failed")),
+            "{:?}",
+            failed.state()
+        );
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                ggo_common::boot_viewer(workspace, "assets/worlds/other.toml", window, cx)
+            })
+            .expect("the second world view booted too");
+        cx.run_until_parked();
+        let run = cx
+            .update(|_, cx| {
+                let runs = &cx.global::<ViewerRuns>().0;
+                assert_eq!(runs.len(), 2, "both runs are registered");
+                runs.iter()
+                    .find(|run| Arc::ptr_eq(run.read(cx).endpoint(), &failed))
+                    .cloned()
+            })
+            .expect("the failed run outlived the other view's boot");
+
+        run.update(cx, |run, cx| run.on_sources_changed(cx));
+        cx.executor().advance_clock(crate::WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            failed.state(),
+            ggo_common::ViewerState::Running,
+            "and the save that fixed the build still reaches it"
+        );
+    }
+
+    /// A world view that leaves live mode takes its run out of the
+    /// registry with it, rather than leaving it there until some other
+    /// view happens to boot.
+    #[gpui::test]
+    async fn a_run_the_host_stopped_leaves_the_registry(cx: &mut TestAppContext) {
+        let dir = project_dir();
+        let (_db, workspace, _panel, _worktree, cx) =
+            crate::tests::run_menu_workspace(cx, dir.path()).await;
+        let (runner, _calls) = fake_emd(dir.path(), false);
+        cx.update(|_, cx| {
+            cx.set_global(TestViewerRunner(runner));
+            cx.set_global(TestViewerRoot(dir.path().to_path_buf()));
+        });
+        let endpoint = workspace
+            .update_in(cx, |workspace, window, cx| {
+                ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+            })
+            .expect("the booter claimed the boot");
+        cx.update(|_, cx| {
+            assert_eq!(cx.global::<ViewerRuns>().0.len(), 1, "one run registered");
+        });
+
+        endpoint.request_stop();
+        cx.run_until_parked();
+        assert!(matches!(
+            endpoint.state(),
+            ggo_common::ViewerState::Stopped(_)
+        ));
+        cx.update(|_, cx| {
+            assert!(
+                cx.global::<ViewerRuns>().0.is_empty(),
+                "the stopped run is not kept alive for the life of the app"
             );
         });
     }
