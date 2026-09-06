@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::FutureExt as _;
 use futures::future::Shared;
@@ -48,6 +49,20 @@ pub(crate) fn viewer_build_request(
 /// emerald project waits on the same build.
 type SharedBuild = Shared<Task<Result<PathBuf, String>>>;
 
+/// A registered build and the flag its own task sets on its way out.
+///
+/// The flag, rather than "does anyone still hold a handle": every waiter
+/// can be dropped mid-build (its world tab closed), and the `emd` spawn
+/// behind the shared task keeps running regardless -- it blocks a
+/// background thread and cannot be cancelled. Reading "no waiters" as
+/// "not in flight" would start a SECOND `emd` over the same `.ggo` while
+/// the first is still rewriting it, which is the read `shared_build`
+/// exists to make safe.
+struct RegisteredBuild {
+    build: SharedBuild,
+    done: Arc<AtomicBool>,
+}
+
 /// Every viewer run this app has started, and the builds they share.
 ///
 /// A `ViewerRun` stops itself when it is dropped and the world view
@@ -59,7 +74,7 @@ pub(crate) struct ViewerRuns {
     /// The build in flight for each emerald project directory. N world
     /// tabs of one project are N runs, but they are built from the same
     /// sources into the same `.ggo`, so they get ONE `emd` per save.
-    builds: HashMap<PathBuf, SharedBuild>,
+    builds: HashMap<PathBuf, RegisteredBuild>,
 }
 
 impl gpui::Global for ViewerRuns {}
@@ -78,44 +93,69 @@ fn shared_build(
     runner: ProcRunner,
     cx: &mut App,
 ) -> SharedBuild {
-    if let Some(build) = cx.default_global::<ViewerRuns>().builds.get(project_dir) {
-        // Only a build that is really still in flight. `strong_count == 1`
-        // means this map holds the last handle to it: every run that was
-        // waiting has been dropped (its world tab closed), and joining it
-        // would hand a viewer opened now a `.ggo` built before the edits
-        // since. `peek` is the same staleness one step later -- a result
-        // already in hand belongs to the save that asked for it.
-        let in_flight = build.strong_count().is_some_and(|handles| handles > 1)
-            && build.peek().is_none();
-        if in_flight {
-            return build.clone();
+    if let Some(registered) = cx.default_global::<ViewerRuns>().builds.get(project_dir) {
+        // A build that has produced its `.ggo` belongs to the save that
+        // asked for it: joining it would hand a viewer opened now a cart
+        // built before the edits since. Anything else is still running
+        // `emd`, waiters or none.
+        if !registered.done.load(Ordering::Acquire) {
+            return registered.build.clone();
         }
     }
+    let done = Arc::new(AtomicBool::new(false));
     let build = cx
-        .background_spawn(async move {
-            let capture = runner(request);
-            if !capture.ok {
-                return Err(format!("build failed: {}", menu::failure_reason(&capture)));
+        .background_spawn({
+            let done = done.clone();
+            async move {
+                let capture = runner(request);
+                // Set LAST, and before the result is handed to any waiter:
+                // from here on `emd` is no longer touching the project's
+                // `.ggo`, which is the whole question this flag answers.
+                let outcome = if capture.ok {
+                    menu::editor_cart_ggo_path(&capture.lines)
+                        .ok_or_else(|| "emd editor-cart --ggo printed no .ggo path".to_string())
+                } else {
+                    Err(format!("build failed: {}", menu::failure_reason(&capture)))
+                };
+                done.store(true, Ordering::Release);
+                outcome
             }
-            menu::editor_cart_ggo_path(&capture.lines)
-                .ok_or_else(|| "emd editor-cart --ggo printed no .ggo path".to_string())
         })
         .shared();
-    cx.default_global::<ViewerRuns>()
-        .builds
-        .insert(project_dir.to_path_buf(), build.clone());
+    // The map entry outlives its waiters, so something that is not a
+    // waiter has to clear it -- otherwise a build every tab dropped out of
+    // stays registered as "finished" forever, and the `done` check above
+    // is all that keeps the next save from joining it.
+    let sweeper = cx.spawn({
+        let build = build.clone();
+        let project_dir = project_dir.to_path_buf();
+        async move |cx| {
+            // The outcome belongs to the runs waiting on it; this task
+            // exists only to unregister the build once `emd` is done.
+            drop(build.clone().await);
+            cx.update(|cx| forget_build(&project_dir, &build, cx));
+        }
+    });
+    cx.default_global::<ViewerRuns>().builds.insert(
+        project_dir.to_path_buf(),
+        RegisteredBuild {
+            build: build.clone(),
+            done,
+        },
+    );
+    sweeper.detach();
     build
 }
 
 /// Let go of a finished build, so the next save starts a fresh one rather
-/// than handing out a stale `.ggo` path forever. Every waiter calls this;
-/// the `ptr_eq` is what keeps the second one from evicting the follow-up
-/// build a queued save has already registered in the meantime.
+/// than handing out a stale `.ggo` path forever. The `ptr_eq` is what
+/// keeps this from evicting the follow-up build a queued save has already
+/// registered in the meantime.
 fn forget_build(project_dir: &Path, finished: &SharedBuild, cx: &mut App) {
     let builds = &mut cx.default_global::<ViewerRuns>().builds;
     if builds
         .get(project_dir)
-        .is_some_and(|current| current.ptr_eq(finished))
+        .is_some_and(|current| current.build.ptr_eq(finished))
     {
         builds.remove(project_dir);
     }
@@ -334,10 +374,13 @@ impl ViewerRun {
         // Joined here, on the UI thread, rather than inside the task: two
         // world views booting in the same turn have to see each other's
         // build, and the task bodies do not run until the turn is over.
+        // `project_dir` is not carried into the task: letting go of the
+        // finished build is the registration's own job (`shared_build`
+        // spawns that), because a build every waiter dropped out of still
+        // has to leave the map.
         let build = shared_build(&project_dir, request, self.proc_runner.clone(), cx);
         self._build_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = build.clone().await;
-            cx.update(|cx| forget_build(&project_dir, &build, cx));
+            let outcome = build.await;
             this.update(cx, |this, cx| {
                 this.build_finished(outcome, root, cx);
                 this.build_done(cx);
@@ -524,6 +567,11 @@ impl ViewerRun {
             // See `drive::Session::release_link`.
             session.release_link();
         }
+        // Whatever the host had queued was addressed to the cart that is
+        // going: a `SetTransform` or a world blob chunk left in the queue
+        // would be read by the REPLACEMENT cart as its own, out of a
+        // handshake it was never part of.
+        drop(self.endpoint.take_outbound());
         let published = self
             .endpoint
             .frame
@@ -1146,6 +1194,69 @@ mod tests {
             ggo_common::ViewerState::Running,
             "and both booted their own session from the one `.ggo`"
         );
+    }
+
+    /// The waiters can ALL be dropped mid-build -- their world tabs
+    /// closed -- and the `emd` behind the shared task keeps going: it
+    /// blocks a background thread and cannot be cancelled. A viewer that
+    /// boots while that is happening has to join it, because a second
+    /// `emd` would be rewriting the same `.ggo` the first is still
+    /// producing.
+    #[gpui::test]
+    async fn a_build_every_waiter_dropped_is_joined_not_restarted(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        let (runner, calls) = fake_emd(dir.path(), true);
+        let (run_a, endpoint_a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
+        // Nothing has been pumped, so the build `new` registered is still
+        // in flight when its only waiter goes.
+        endpoint_a.request_stop();
+        drop(run_a);
+        cx.update(|_| {});
+
+        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "one `emd` over the project's one `.ggo`"
+        );
+        assert_eq!(
+            b.state(),
+            ggo_common::ViewerState::Running,
+            "and the viewer that joined it booted from what it produced"
+        );
+    }
+
+    /// The map entry outlives every waiter, so the build's own completion
+    /// is what clears it. Left behind, a finished build would sit in the
+    /// map for the life of the app with nothing able to evict it.
+    #[gpui::test]
+    async fn a_finished_build_leaves_the_registry_with_no_waiter_left(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        let (runner, calls) = fake_emd(dir.path(), true);
+        let (run, endpoint) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
+        endpoint.request_stop();
+        drop(run);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                cx.default_global::<ViewerRuns>().builds.is_empty(),
+                "the completion unregisters the build, not the waiter that walked away"
+            );
+        });
+
+        let (_run, endpoint) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "so the next viewer gets a fresh cart rather than the stale path"
+        );
+        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
     }
 
     /// A save rebuilds every run of the project -- through one more build,

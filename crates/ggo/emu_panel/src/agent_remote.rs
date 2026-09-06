@@ -400,7 +400,17 @@ fn world_panel_open(
                     window,
                     cx,
                     |dock: &mut ggo_world_panel::WorldDock, window, cx| {
-                        opened = dock.open_world(&rel, window, cx);
+                        // Design, never the user's sticky mode: an agent
+                        // surveying a project opens a tab per world it
+                        // reads, and in Live each of those boots its own
+                        // headless emulator run for a picture nobody is
+                        // looking at.
+                        opened = dock.open_world_in(
+                            &rel,
+                            ggo_world_panel::OpenMode::Design,
+                            window,
+                            cx,
+                        );
                     },
                 );
                 opened
@@ -1067,6 +1077,62 @@ mod tests {
         assert_eq!(read["entities"].as_array().map(Vec::len), Some(1));
     }
 
+    /// An agent surveying a project opens a tab per world it reads, and
+    /// the user's sticky mode is Live: without the Design override each
+    /// of those tabs boots a headless emulator run for a picture nobody
+    /// is looking at.
+    #[gpui::test]
+    async fn world_open_comes_up_in_design_and_boots_no_viewer(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+        let (workspace, cx) = remote_workspace(cx, dir.path()).await;
+        // A fake `emd`, so a regression registers a run here instead of
+        // shelling out to the real binary.
+        cx.update(|_, cx| {
+            cx.set_global(crate::viewer_run::TestViewerRunner(std::sync::Arc::new(|_| {
+                ggo_common::ProcCapture {
+                    ok: false,
+                    lines: vec!["no build in this test".to_string()],
+                }
+            })));
+            cx.set_global(crate::viewer_run::TestViewerRoot(dir.path().to_path_buf()));
+        });
+        let mut async_cx = cx.to_async();
+
+        dispatch_inner(
+            Cmd::WorldOpen {
+                workspace: None,
+                world: "worlds/main".to_string(),
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("world_open");
+        cx.run_until_parked();
+
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<ggo_world_panel::WorldDock>(cx)
+                .expect("the dock")
+                .read(cx)
+                .active()
+                .expect("world_open opened a tab")
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.canvas_mode()),
+            ggo_world_panel::CanvasMode::Design,
+            "an agent's open is a read, not a session"
+        );
+        cx.update(|_, cx| {
+            assert!(
+                cx.try_global::<crate::viewer_run::ViewerRuns>()
+                    .is_none_or(|runs| runs.runs.is_empty()),
+                "and no viewer cart was built for it"
+            );
+        });
+    }
 
     #[test]
     fn buttons_to_mask_maps_names_and_select() {

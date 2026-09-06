@@ -6194,10 +6194,10 @@ mod tests {
             })
             .expect("the dock opened a world tab");
         let root = root.to_path_buf();
+        // Before the load: `open_world` DEFERS `open_rel_path` into the
+        // window, so the read that follows is the one this override is
+        // for.
         world_panel.update(cx, |panel, _cx| panel.test_root_override(root));
-        world_panel.update_in(cx, |panel, window, cx| {
-            panel.open_rel_path("assets/worlds/main.toml", window, cx)
-        });
         cx.run_until_parked();
         world_panel.update(cx, |panel, cx| {
             assert!(
