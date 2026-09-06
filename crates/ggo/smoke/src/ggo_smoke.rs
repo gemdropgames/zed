@@ -1360,16 +1360,7 @@ mod tests {
             "the world interceptor claimed the fixture"
         );
         cx.run_until_parked();
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .items_of_type::<ggo_world_panel::WorldCanvasItem>(cx)
-                .next()
-                .expect("the interceptor opened the world canvas tab")
-                .read(cx)
-                .test_panel()
-                .expect("the tab's panel is alive")
-        });
-        cx.run_until_parked();
+        let panel = world_tab_panel(workspace, cx, "worlds/test.toml");
         panel.read_with(cx, |panel, _| {
             assert!(panel.test_is_ready(), "the world loaded");
             assert_eq!(panel.test_entity_count(), 1, "the fixture's one entity");
@@ -1636,21 +1627,30 @@ mod tests {
             "the world interceptor claimed {rel}"
         );
         cx.run_until_parked();
-        let panel = workspace.read_with(cx, |workspace, cx| {
-            workspace
-                .items_of_type::<ggo_world_panel::WorldCanvasItem>(cx)
-                .next()
-                .expect("the interceptor opened the world canvas tab")
-                .read(cx)
-                .test_panel()
-                .expect("the tab's panel is alive")
-        });
-        cx.run_until_parked();
+        let panel = world_tab_panel(workspace, cx, rel);
         panel.read_with(cx, |panel, _| {
             assert!(panel.test_is_ready(), "the world loaded");
             assert!(!panel.test_is_dirty(), "a freshly loaded world is clean");
         });
         panel
+    }
+
+    /// The panel behind the world tab showing `rel`. By the rel and not
+    /// by tab order: every world opens in its OWN tab now, so the first
+    /// `WorldCanvasItem` in the pane is only the right one while a
+    /// journey has opened exactly one world.
+    fn world_tab_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+        rel: &str,
+    ) -> Entity<ggo_world_panel::WorldPanel> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<ggo_world_panel::WorldCanvasItem>(cx)
+                .filter_map(|item| item.read(cx).test_panel())
+                .find(|panel| panel.read(cx).open_rel_path_now() == Some(rel))
+                .unwrap_or_else(|| panic!("no world canvas tab has {rel} open"))
+        })
     }
 
     /// Enter (or leave, when it is already on) paint mode on background

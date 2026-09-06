@@ -313,28 +313,107 @@ pub(crate) fn bgra_reply(width: u32, height: u32, bgra: &[u8]) -> serde_json::Va
     })
 }
 
-/// The world panel behind the ACTIVE world tab, reached through the dock
-/// `ggo_world_panel::init` registers on every workspace, and leased
-/// through its window. There is one panel per open world now, so the
-/// agent's reads follow whichever tab is in front.
-fn world_panel_for(
+/// The world dock `ggo_world_panel::init` registers on every workspace,
+/// leased through its window. Every world the agent reaches goes through
+/// it: there is one panel per open world tab now, and a world loaded
+/// behind the dock's back would leave its tab list keyed on the wrong
+/// path.
+fn world_dock_for(
     workspace: &Entity<Workspace>,
     window: AnyWindowHandle,
     cx: &mut AsyncApp,
-) -> Result<Entity<ggo_world_panel::WorldPanel>, String> {
+) -> Result<Entity<ggo_world_panel::WorldDock>, String> {
     window
         .update(cx, |_, _window, app| {
             workspace
                 .read(app)
                 .panel::<ggo_world_panel::WorldDock>(app)
-                .and_then(|dock| dock.read(app).active())
+                .ok_or_else(|| "no world dock in this workspace".to_string())
+        })
+        .map_err(|e| e.to_string())?
+}
+
+/// The panel behind the ACTIVE world tab: what a `world_read` or
+/// `world_screenshot` with no `world` argument answers from.
+fn world_panel_for(
+    workspace: &Entity<Workspace>,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Result<Entity<ggo_world_panel::WorldPanel>, String> {
+    let dock = world_dock_for(workspace, window, cx)?;
+    window
+        .update(cx, |_, _window, app| {
+            dock.read(app)
+                .active()
                 .ok_or_else(|| "no world is open".to_string())
         })
         .map_err(|e| e.to_string())?
 }
 
+/// A panel that can answer questions about the PROJECT's worlds -- the
+/// listing, and the resolution of the name the agent typed. Any panel
+/// can: both only need the project root. The active tab's when there is
+/// one, otherwise a throwaway, because zero open world tabs is the normal
+/// state for the first call an agent makes.
+///
+/// MUST NOT be called while the workspace is leased: the listing reads
+/// the workspace to find that root.
+fn world_resolver(
+    dock: &Entity<ggo_world_panel::WorldDock>,
+    workspace: &Entity<Workspace>,
+    app: &mut App,
+) -> Entity<ggo_world_panel::WorldPanel> {
+    dock.read(app).active().unwrap_or_else(|| {
+        let workspace = workspace.downgrade();
+        app.new(|cx| ggo_world_panel::WorldPanel::new(Some(workspace), cx))
+    })
+}
+
+/// The panel showing `world` (a stem or a rel path), opening a tab for it
+/// when none does, plus the worktree-relative path it resolved to.
+///
+/// A different world's unsaved edits are no longer a reason to refuse:
+/// every world has its own tab, so nothing an agent opens can reload --
+/// let alone discard -- what the user is editing next door.
+fn world_panel_open(
+    workspace: &Entity<Workspace>,
+    window: AnyWindowHandle,
+    world: &str,
+    cx: &mut AsyncApp,
+) -> Result<(Entity<ggo_world_panel::WorldPanel>, String), String> {
+    let dock = world_dock_for(workspace, window, cx)?;
+    window
+        .update(cx, |_, window, app| {
+            // Resolved BEFORE the workspace update below, never inside it:
+            // resolving re-enumerates the project's worlds, which reads
+            // the workspace, and reading it while leased panics.
+            let rel = world_resolver(&dock, workspace, app)
+                .update(app, |panel, cx| panel.remote_resolve(world, cx))?;
+            // The panel comes back out of `open_world` itself rather than
+            // off `dock.active()` afterwards: a dock that declined to open
+            // anything would otherwise hand back whatever tab was in front
+            // before, which is a different world than the agent asked for.
+            let opened = workspace.update(app, |workspace, cx| {
+                let mut opened = None;
+                ggo_common::open_in_panel(
+                    workspace,
+                    window,
+                    cx,
+                    |dock: &mut ggo_world_panel::WorldDock, window, cx| {
+                        opened = dock.open_world(&rel, window, cx);
+                    },
+                );
+                opened
+            });
+            opened
+                .map(|panel| (panel, rel))
+                .ok_or_else(|| "the world dock could not open a tab".to_string())
+        })
+        .map_err(|e| e.to_string())?
+}
+
 /// Run `read` against the World panel once the world it is loading has
-/// landed. `remote_open` leaves the panel `Loading` with the file read
+/// landed. A tab the dock has just opened is `Loading` with the file read
 /// still off-thread, so the first ask can legitimately answer "still
 /// loading"; every other failure is final and returns straight away.
 /// Bounded at 5s so a load that never completes answers the agent
@@ -837,8 +916,12 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         }
         Cmd::WorldList { .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
-            let panel = world_panel_for(&workspace, window, cx)?;
-            let worlds = panel.update(cx, |p, cx| p.remote_list(cx));
+            let dock = world_dock_for(&workspace, window, cx)?;
+            let worlds = window
+                .update(cx, |_, _window, app| {
+                    world_resolver(&dock, &workspace, app).update(app, |p, cx| p.remote_list(cx))
+                })
+                .map_err(|e| e.to_string())?;
             let rows: Vec<serde_json::Value> = worlds
                 .into_iter()
                 .map(|(stem, rel_path)| serde_json::json!({ "stem": stem, "rel_path": rel_path }))
@@ -847,24 +930,23 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         }
         Cmd::WorldOpen { world, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
-            let panel = world_panel_for(&workspace, window, cx)?;
-            let rel = panel.update(cx, |p, cx| p.remote_open(&world, cx))?;
+            let (_panel, rel) = world_panel_open(&workspace, window, &world, cx)?;
             Ok(serde_json::json!({ "opened": rel }))
         }
         Cmd::WorldRead { world, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
-            let panel = world_panel_for(&workspace, window, cx)?;
-            if let Some(world) = world {
-                panel.update(cx, |p, cx| p.remote_open(&world, cx))?;
-            }
+            let panel = match world {
+                Some(world) => world_panel_open(&workspace, window, &world, cx)?.0,
+                None => world_panel_for(&workspace, window, cx)?,
+            };
             await_world_ready(&panel, cx, |p| p.remote_read()).await
         }
         Cmd::WorldScreenshot { world, full, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
-            let panel = world_panel_for(&workspace, window, cx)?;
-            if let Some(world) = world {
-                panel.update(cx, |p, cx| p.remote_open(&world, cx))?;
-            }
+            let panel = match world {
+                Some(world) => world_panel_open(&workspace, window, &world, cx)?.0,
+                None => world_panel_for(&workspace, window, cx)?,
+            };
             let (width, height, bgra) =
                 await_world_ready(&panel, cx, |p| p.remote_screenshot(full)).await?;
             Ok(bgra_reply(width, height, &bgra))
@@ -885,6 +967,106 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+    use project::{FakeFs, Project};
+    use workspace::{AppState, MultiWorkspace};
+
+    /// A workspace in a window, registered the way production's
+    /// `observe_new` in [`init`] does -- `init` registers nothing under
+    /// `cfg(test)`, so the dispatch path has no target without this.
+    ///
+    /// The project root is a REAL directory: the world panel's loader
+    /// reads worlds off the real filesystem, so the fake worktree is
+    /// mirrored onto the same path the fixture was written to.
+    async fn remote_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (Entity<Workspace>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            crate::init(cx);
+            ggo_world_panel::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            root,
+            serde_json::json!({
+                "emerald.toml": "",
+                "assets": { "worlds": { "main.toml": "" } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let handle = cx.update(|window, _cx| window.window_handle());
+        let id = workspace.entity_id().as_u64();
+        let weak = workspace.downgrade();
+        cx.update(|_window, cx| {
+            if cx.try_global::<RemotePanels>().is_none() {
+                cx.set_global(RemotePanels::default());
+            }
+            cx.global_mut::<RemotePanels>()
+                .workspaces
+                .insert(id, (weak, Some(handle)));
+        });
+        (workspace, cx)
+    }
+
+    /// `world_open` is the FIRST call an agent makes, with no world tab
+    /// open and nothing for `dock.active()` to answer with: it has to
+    /// resolve the name against the project anyway, open the tab, and
+    /// leave `world_read` able to answer from it.
+    #[gpui::test]
+    async fn world_open_opens_the_first_tab_and_world_read_answers_from_it(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        std::fs::write(
+            dir.path().join("assets/worlds/main.toml"),
+            "[[entity]]\nTransform = { pos = [4.0, 4.0], z = 0.0 }\n",
+        )
+        .unwrap();
+        let (workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        let opened = dispatch_inner(
+            Cmd::WorldOpen {
+                workspace: None,
+                world: "worlds/main".to_string(),
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("world_open with no tab open");
+        assert_eq!(opened["opened"], "assets/worlds/main.toml");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<ggo_world_panel::WorldCanvasItem>(cx)
+                    .count(),
+                1,
+                "the open gave the world its own center tab"
+            );
+        });
+
+        let read = dispatch_inner(
+            Cmd::WorldRead {
+                workspace: None,
+                world: None,
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("world_read answers from the tab world_open left active");
+        assert_eq!(read["rel_path"], "assets/worlds/main.toml");
+        assert_eq!(read["entities"].as_array().map(Vec::len), Some(1));
+    }
+
 
     #[test]
     fn buttons_to_mask_maps_names_and_select() {

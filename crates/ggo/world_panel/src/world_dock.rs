@@ -558,6 +558,78 @@ pub(crate) mod tests {
         });
     }
 
+    /// What `remote_open`'s "leave the open world alone" rule became: a
+    /// second open of a world that already has a tab activates that tab
+    /// and does NOT reload it, so an agent's `world_open` cannot drop the
+    /// user's unsaved edits, undo stack or camera. A world whose tab is
+    /// dirty is no longer a reason to refuse OTHER worlds either -- they
+    /// get their own tabs -- which is what the second half asserts.
+    #[gpui::test]
+    async fn re_opening_a_dirty_world_activates_its_tab_without_reloading(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        let open = |rel: &'static str, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |ws, window, cx| {
+                ggo_common::open_in_panel(ws, window, cx, move |dock: &mut WorldDock, window, cx| {
+                    dock.open_world(rel, window, cx);
+                })
+            });
+            cx.run_until_parked();
+        };
+        open("worlds/test.toml", cx);
+        let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
+        crate::tests::dirty_the_world(&panel, cx);
+
+        open("worlds/test.toml", cx);
+        assert_eq!(
+            dock.read_with(cx, |dock, _| dock.active().expect("still open")),
+            panel,
+            "the same tab, not a fresh panel"
+        );
+        assert!(
+            panel.read_with(cx, |panel, _| panel.test_is_dirty()),
+            "re-opening the open world must not reload it"
+        );
+
+        open("worlds/other.toml", cx);
+        assert!(
+            panel.read_with(cx, |panel, _| panel.test_is_dirty()),
+            "and another world opens in its own tab, leaving the dirty one be"
+        );
+        assert_eq!(dock.read_with(cx, |dock, _| dock.open_panels().len()), 2);
+    }
+
+    /// A new tab is `Loading` the moment `open_world` returns -- the load
+    /// itself is deferred -- so an agent's `world_read` right behind its
+    /// `world_open` waits for THAT world instead of answering "nothing is
+    /// open" or reading the world that was in front before.
+    #[gpui::test]
+    async fn a_new_tab_reads_as_loading_before_its_deferred_load_lands(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
+        let panel = workspace.update_in(cx, |ws, window, cx| {
+            ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world("worlds/test.toml", window, cx);
+            });
+            ws.panel::<WorldDock>(cx)
+                .and_then(|dock| dock.read(cx).active())
+                .expect("open_world assigns the active panel synchronously")
+        });
+        let error = panel
+            .read_with(cx, |panel, _| panel.remote_read())
+            .expect_err("nothing has loaded yet");
+        assert!(error.contains(crate::WORLD_STILL_LOADING), "{error}");
+
+        cx.run_until_parked();
+        let read = panel
+            .read_with(cx, |panel, _| panel.remote_read())
+            .expect("the deferred load lands");
+        assert_eq!(read["rel_path"], "worlds/test.toml");
+        assert!(dock.read_with(cx, |dock, _| dock.active().is_some()));
+    }
+
     #[gpui::test]
     async fn the_dock_renders_the_empty_message_without_a_world(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

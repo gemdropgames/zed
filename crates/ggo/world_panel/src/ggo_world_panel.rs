@@ -3346,7 +3346,13 @@ impl WorldPanel {
     /// The listing entry `world` names -- a stem (`worlds/arena`), its
     /// asset-root-relative path, or its worktree-relative one -- as the
     /// worktree-relative path to open, or the reason there is none.
-    fn remote_resolve(&mut self, world: &str, cx: &mut Context<Self>) -> Result<String, String> {
+    ///
+    /// Public for the MCP host: it resolves the name the agent typed
+    /// against the project BEFORE handing the rel path to
+    /// [`WorldDock::open_world`], and any panel can answer (the listing
+    /// only needs the project root), including a throwaway one when no
+    /// world tab is open yet.
+    pub fn remote_resolve(&mut self, world: &str, cx: &mut Context<Self>) -> Result<String, String> {
         self.refresh_worlds(cx);
         self.worlds
             .iter()
@@ -3359,40 +3365,6 @@ impl WorldPanel {
                 let stems: Vec<&str> = self.worlds.iter().map(|w| w.stem.as_str()).collect();
                 format!("no world {world}; the project has {stems:?}")
             })
-    }
-
-    /// Open `world` -- a stem or a rel path -- and return the
-    /// worktree-relative path that is now open.
-    ///
-    /// Loads into THIS panel. The MCP host reaches worlds through
-    /// [`WorldDock::open_world`] instead, for the reason
-    /// [`Self::open_rel_path`] gives: a world loaded behind the dock's
-    /// back leaves its tab list keyed on the wrong path.
-    ///
-    /// A click's semantics minus its modal: the world that is ALREADY
-    /// open is left exactly as it is (no reload, so an edit, the undo
-    /// stack, the selection and the camera all survive), and a different
-    /// world while this one has unsaved edits is REFUSED rather than
-    /// prompted for. A prompt is the one answer an agent cannot give,
-    /// and the alternative -- [`Self::load_rel_path`]'s unconditional
-    /// re-read -- would discard the user's edits on a tool call they
-    /// never saw. Loading directly (rather than through
-    /// [`Self::open_rel_path`], whose work is deferred onto a spawned
-    /// task) also means the panel is in `Loading` by the time this
-    /// returns, so a `world_read` that follows waits for THIS world
-    /// instead of reading the previous one.
-    pub fn remote_open(&mut self, world: &str, cx: &mut Context<Self>) -> Result<String, String> {
-        let rel = self.remote_resolve(world, cx)?;
-        if self.open_rel_path_now() == Some(rel.as_str()) {
-            return Ok(rel);
-        }
-        if let Some(dirty) = self.dirty_world_name() {
-            return Err(format!(
-                "{dirty} has unsaved edits; save or revert it before opening {rel}"
-            ));
-        }
-        self.load_rel_path(&rel, None, cx);
-        Ok(rel)
     }
 
     /// The open world drawn to pixels. Default framing is the device
@@ -7107,9 +7079,10 @@ mod tests {
     /// The agent surface must see the worlds of an `assets/`-rooted
     /// project (the `~/projects/wilds` layout) with nothing open yet --
     /// `world_list` is what an agent calls FIRST, before any world has
-    /// been opened by hand.
+    /// been opened by hand, and `world_open` resolves the name it typed
+    /// against that same listing before the dock opens a tab for it.
     #[gpui::test]
-    async fn test_remote_list_and_open_see_an_assets_rooted_project(cx: &mut TestAppContext) {
+    async fn test_remote_list_and_resolve_see_an_assets_rooted_project(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(&dir.path().join("assets"));
         let panel = cx.update(|cx| {
@@ -7128,10 +7101,9 @@ mod tests {
                     ("worlds/test".to_string(), "assets/worlds/test.toml".to_string()),
                 ]
             );
-            assert_eq!(
-                panel.remote_open("worlds/test", cx).unwrap(),
-                "assets/worlds/test.toml"
-            );
+            let rel = panel.remote_resolve("worlds/test", cx).unwrap();
+            assert_eq!(rel, "assets/worlds/test.toml");
+            panel.load_rel_path(&rel, None, cx);
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
@@ -7154,57 +7126,6 @@ mod tests {
         });
         panel.update(cx, |panel, _cx| {
             assert!(panel.remote_read().unwrap_err().contains("world_open first"));
-        });
-    }
-
-    /// The two halves of `remote_open`'s "a click minus the modal": the
-    /// world already open is not reloaded (a tool call must not drop the
-    /// user's edits, undo stack or camera), and a swap away from a dirty
-    /// world is refused rather than prompted for -- no agent can answer a
-    /// prompt, and loading over it would discard the edits silently.
-    #[gpui::test]
-    async fn test_remote_open_leaves_the_open_world_alone_and_refuses_a_dirty_swap(
-        cx: &mut TestAppContext,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        panel.update(cx, |panel, cx| {
-            panel.apply_op(
-                WorldOp::MoveEntity {
-                    entity: 0,
-                    pos: [50.0, 60.0],
-                    gesture: None,
-                },
-                cx,
-            );
-            assert!(panel.test_is_dirty(), "the op should dirty the doc");
-            assert_eq!(panel.remote_open("worlds/test", cx).unwrap(), "worlds/test.toml");
-            assert!(
-                panel.test_is_dirty(),
-                "reopening the open world must not reload it"
-            );
-            let error = panel.remote_open("worlds/sub", cx).unwrap_err();
-            assert!(error.contains("unsaved edits"), "{error}");
-        });
-    }
-
-    /// A clean swap loads SYNCHRONOUSLY -- the panel is in `Loading` by
-    /// the time `remote_open` returns -- so a `world_read` right behind it
-    /// waits for the world that was asked for instead of answering with
-    /// the one that was open before.
-    #[gpui::test]
-    async fn test_remote_open_is_loading_before_it_returns(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-        panel.update(cx, |panel, cx| {
-            assert_eq!(panel.remote_open("worlds/sub", cx).unwrap(), "worlds/sub.toml");
-            let error = panel.remote_read().unwrap_err();
-            assert!(error.contains("worlds/sub is still loading"), "{error}");
-        });
-        cx.executor().run_until_parked();
-        panel.update(cx, |panel, _cx| {
-            let read = panel.remote_read().expect("the swapped-in world reads");
-            assert_eq!(read["stem"], "worlds/sub");
         });
     }
 
