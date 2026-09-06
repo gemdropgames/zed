@@ -63,8 +63,14 @@ pub(crate) struct TestViewerRoot(pub(crate) PathBuf);
 impl gpui::Global for TestViewerRoot {}
 
 /// Boot a viewer for `world_rel` under the workspace's project root,
-/// driving `endpoint`. `false` when the workspace has no local root --
-/// the world view then stays in its design mode.
+/// driving `endpoint`.
+///
+/// ALWAYS claims the boot (`true`), refusals included: a `false` sends
+/// the world view down `ggo_common::boot_viewer`'s no-booter path, where
+/// it has no endpoint to read and so can only say the emulator pane is
+/// missing. Claiming and publishing `Stopped(reason)` is what puts the
+/// real reason -- "no project folder is open" -- in front of the user.
+/// Nothing here can decline on grounds another booter could satisfy.
 ///
 /// Runs while the `Workspace` is leased: it reads the project and creates
 /// an entity, and touches no pane. Opening the emulator tab from here --
@@ -78,7 +84,8 @@ pub(crate) fn boot(
     let project = workspace.project().clone();
     let Some(root) = project_root(&project, cx) else {
         endpoint.set_state(ViewerState::Stopped("no project folder is open".to_string()));
-        return false;
+        // No run to register: there is nothing for one to build.
+        return true;
     };
     let runner = proc_runner(cx);
     let world_rel = world_rel.to_string();
@@ -804,6 +811,11 @@ mod tests {
             cx.set_global(TestViewerRunner(runner));
             cx.set_global(TestViewerRoot(dir.path().to_path_buf()));
         });
+        let front = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item(cx).map(|item| item.item_id())
+            })
+            .expect("a centre tab is in front");
         let endpoint = workspace.update_in(cx, |workspace, window, cx| {
             ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
         });
@@ -823,6 +835,46 @@ mod tests {
                 workspace.items_of_type::<crate::EmulatorItem>(cx).count(),
                 1,
                 "only the tab run_menu_workspace itself opened"
+            );
+            assert_eq!(
+                workspace.active_item(cx).map(|item| item.item_id()),
+                Some(front),
+                "and the tab the user was on is still in front"
+            );
+        });
+    }
+
+    /// A refusal must reach the world view as a REASON. The booter claims
+    /// the boot even when it cannot start one, so `boot_viewer` hands
+    /// back an endpoint saying what is wrong -- rather than the `None`
+    /// that means "this build has no emulator pane at all", which is the
+    /// one thing that is NOT wrong here.
+    #[gpui::test]
+    async fn a_workspace_with_no_folder_is_refused_with_a_reason(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            workspace::AppState::test(cx);
+            crate::init(cx);
+        });
+        let project = project::Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+
+        let endpoint = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+        });
+        let endpoint = endpoint.expect("the booter claims a boot it cannot start");
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Stopped("no project folder is open".to_string()),
+            "the world view is told why, not left waiting"
+        );
+        cx.update(|_, cx| {
+            assert!(
+                cx.try_global::<ViewerRuns>()
+                    .is_none_or(|runs| runs.0.is_empty()),
+                "nothing registered: there is no run to keep alive"
             );
         });
     }
