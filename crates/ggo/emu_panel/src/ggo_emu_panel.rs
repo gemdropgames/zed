@@ -230,22 +230,12 @@ pub fn init(cx: &mut App) {
 
     // The world panel's live view asks for the viewer cart through the
     // same registry, for the same cycle -- see `ggo_common::boot_viewer`.
-    ggo_common::register_viewer_booter(cx, |workspace, world_rel, endpoint, window, cx| {
-        // Owned before the defer: the caller's world path is borrowed
-        // from ITS document.
-        let world_rel = world_rel.to_string();
-        // QUIETLY: the user is working in the world panel and asked for a
-        // live view there, not for the emulator tab to take the screen
-        // and the keyboard away from them.
-        open_emu_item_quietly(workspace, window, cx, move |_emu, window, cx| {
-            // DEFERRED, like the flasher above: this handler runs inside
-            // the world panel's own workspace update, and `boot_viewer`
-            // -> `refresh_root` reads that same leased entity. Doing it
-            // inline is the double-lease panic, not a style preference.
-            cx.defer_in(window, move |emu, window, cx| {
-                emu.boot_viewer(&world_rel, endpoint, window, cx)
-            });
-        })
+    // Unlike every entry point above it, this one opens NO tab: a live
+    // view's frames go to the world panel over the link, and the user
+    // asked for a view there rather than for the emulator pane to take
+    // the screen and the keyboard away from them.
+    ggo_common::register_viewer_booter(cx, |workspace, world_rel, endpoint, _window, cx| {
+        viewer_run::boot(workspace, world_rel, endpoint, cx)
     });
 }
 
@@ -274,51 +264,6 @@ pub fn open_emu_item(
             let weak = workspace.weak_handle();
             let item = cx.new(|cx| EmulatorItem::new(weak, window, cx));
             workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
-            item
-        }
-    };
-    run_against_emu_panel(&item, window, cx, f)
-}
-
-/// [`open_emu_item`] for a boot the USER did not ask for: the live world
-/// view's. It finds (or creates) the same singleton tab and gives the
-/// emulator its instruction, but activates nothing and focuses nothing --
-/// the world panel the user is working in keeps both. It also leaves the
-/// centre splits as they are: folding someone's layout away is a heavy
-/// action, and a background boot is not one.
-///
-/// The tab may therefore end up behind another one. That is fine for a
-/// viewer run and only for a viewer run: its frames go to the world
-/// panel over the link rather than to this pane's screen, and a viewer
-/// run is exempt from the hidden-tab pause for the same reason (see
-/// [`EmuPanel::auto_pause`]).
-fn open_emu_item_quietly(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-    f: impl FnOnce(&mut EmuPanel, &mut Window, &mut Context<EmuPanel>),
-) -> bool {
-    let existing = workspace.items_of_type::<EmulatorItem>(cx).next();
-    let item = match existing {
-        Some(item) => item,
-        None => {
-            let weak = workspace.weak_handle();
-            let item = cx.new(|cx| EmulatorItem::new(weak, window, cx));
-            // `Pane::add_item` would activate the new tab even with
-            // `focus_item = false` -- `add_item_inner`'s `activate` flag
-            // is the only one that does not, and `Workspace::add_item`
-            // hard-codes it true. So the pane is addressed directly.
-            workspace.active_pane().update(cx, |pane, cx| {
-                pane.add_item_inner(
-                    Box::new(item.clone()),
-                    false,
-                    false,
-                    false,
-                    None,
-                    window,
-                    cx,
-                )
-            });
             item
         }
     };
@@ -6696,34 +6641,6 @@ mod tests {
             .update_in(cx, |panel, window, cx| panel.stop(window, cx));
     }
 
-    /// The world panel reaches this panel through `ggo_common`'s booter
-    /// registry (the same hop the Emulate button takes), and `init` is
-    /// what registers it.
-    #[gpui::test]
-    async fn the_registered_booter_routes_to_the_panels_viewer_boot(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, false).await;
-        let endpoint = fixture.workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
-        });
-        let endpoint = endpoint.expect("init registers a viewer booter");
-        cx.run_until_parked();
-
-        assert_eq!(
-            fixture.calls.lock().unwrap().len(),
-            1,
-            "the registered booter built the viewer cart"
-        );
-        assert!(
-            fixture
-                .panel
-                .read_with(cx, |panel, _| panel.viewer_link.is_some()),
-            "the panel kept the endpoint the world view is polling"
-        );
-        // The `.ggo` was deliberately not written, so the run ends at once
-        // -- which is exactly what the world view must be told.
-        assert_ne!(endpoint.state(), ggo_common::ViewerState::Building);
-    }
-
     /// A plain cart run takes the pane back: the world view is told why
     /// rather than left polling a run that is no longer its own.
     #[gpui::test]
@@ -7415,45 +7332,6 @@ mod tests {
             ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
         });
         assert!(endpoint.is_none(), "no booter claimed the world");
-    }
-
-    /// **A viewer boot must not take the screen.** The user asked the
-    /// world panel for a live view, not for the emulator to jump in
-    /// front of whatever they were reading -- and unlike every other
-    /// entry point into this pane, nobody clicked on the emulator.
-    #[gpui::test]
-    async fn the_viewer_boot_leaves_the_users_tab_in_front(cx: &mut TestAppContext) {
-        let (fixture, cx) = viewer_fixture(cx, false).await;
-        // Something other than the emulator is what the user is looking
-        // at (the fixture's own setup left the emulator tab active).
-        fixture.workspace.update_in(cx, |workspace, window, cx| {
-            ggo_charts_panel::open_charts_item(workspace, window, cx, |_, _, _| {});
-        });
-        let front = fixture
-            .workspace
-            .read_with(cx, |workspace, cx| {
-                workspace.active_item(cx).map(|item| item.item_id())
-            })
-            .expect("a centre tab is in front");
-
-        let endpoint = fixture.workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
-        });
-        assert!(endpoint.is_some(), "the registered booter claimed it");
-        cx.run_until_parked();
-
-        assert_eq!(
-            fixture.workspace.read_with(cx, |workspace, cx| {
-                workspace.active_item(cx).map(|item| item.item_id())
-            }),
-            Some(front),
-            "the viewer boot left the user's tab in front"
-        );
-        assert_eq!(
-            fixture.calls.lock().unwrap().len(),
-            1,
-            "and still built the viewer cart"
-        );
     }
 
     /// Watch mode on a viewer run rebuilds through the SAME viewer boot

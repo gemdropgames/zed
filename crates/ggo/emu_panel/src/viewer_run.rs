@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use ggo_common::{LinkEndpoint, ProcCapture, ProcRequest, ProcRunner, ViewerState};
 use gpui::{App, AppContext as _, Context, Entity, RenderImage, Subscription, Task};
+use workspace::Workspace;
 
 use crate::drive::{self, Frame, Session};
 use crate::menu;
@@ -31,6 +32,91 @@ pub(crate) fn viewer_build_request(
         ProcRequest::emd(&project_dir, menu::editor_cart_args()),
         project_root.to_path_buf(),
     ))
+}
+
+/// Every viewer run this app has started. A `ViewerRun` stops itself
+/// when it is dropped and the world view driving it holds only the
+/// endpoint, so something has to keep the run alive for as long as that
+/// view wants frames; this is that something.
+#[derive(Default)]
+pub(crate) struct ViewerRuns(pub(crate) Vec<Entity<ViewerRun>>);
+
+impl gpui::Global for ViewerRuns {}
+
+/// Test hook: the `emd` runner [`boot`] hands the run it creates, in
+/// place of spawning the real binary.
+#[cfg(test)]
+pub(crate) struct TestViewerRunner(pub(crate) ProcRunner);
+
+#[cfg(test)]
+impl gpui::Global for TestViewerRunner {}
+
+/// Test hook: the project root [`boot`] builds under. A test workspace's
+/// worktree lives in a `FakeFs`, which neither `emd` nor
+/// [`ggo_common::emerald_project_root`] (it stats the real disk) can see,
+/// so a test that boots names a real directory here. The emulator pane's
+/// `root_override` is the same hook for the same reason.
+#[cfg(test)]
+pub(crate) struct TestViewerRoot(pub(crate) PathBuf);
+
+#[cfg(test)]
+impl gpui::Global for TestViewerRoot {}
+
+/// Boot a viewer for `world_rel` under the workspace's project root,
+/// driving `endpoint`. `false` when the workspace has no local root --
+/// the world view then stays in its design mode.
+///
+/// Runs while the `Workspace` is leased: it reads the project and creates
+/// an entity, and touches no pane. Opening the emulator tab from here --
+/// what this replaced -- is the double-lease panic.
+pub(crate) fn boot(
+    workspace: &mut Workspace,
+    world_rel: &str,
+    endpoint: Arc<LinkEndpoint>,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let project = workspace.project().clone();
+    let Some(root) = project_root(&project, cx) else {
+        endpoint.set_state(ViewerState::Stopped("no project folder is open".to_string()));
+        return false;
+    };
+    let runner = proc_runner(cx);
+    let world_rel = world_rel.to_string();
+    let run = cx.new(|cx| ViewerRun::new(world_rel, root, runner, endpoint, Some(project), cx));
+    // The runs of world views that have since gone away: their emulator
+    // threads have stopped and nothing polls their endpoints any more, so
+    // let go of them rather than grow this list for the life of the app.
+    // Taken out of the global first because deciding which to keep reads
+    // the entities, and so borrows the `App` the global lives in.
+    let existing = std::mem::take(&mut cx.default_global::<ViewerRuns>().0);
+    let mut live: Vec<Entity<ViewerRun>> = existing
+        .into_iter()
+        .filter(|run| !run.read(cx).is_stopped())
+        .collect();
+    live.push(run);
+    cx.default_global::<ViewerRuns>().0 = live;
+    true
+}
+
+#[cfg_attr(not(test), allow(unused_variables))]
+fn proc_runner(cx: &App) -> ProcRunner {
+    #[cfg(test)]
+    if let Some(runner) = cx.try_global::<TestViewerRunner>() {
+        return runner.0.clone();
+    }
+    ggo_common::system_proc_runner()
+}
+
+fn project_root(project: &Entity<project::Project>, cx: &App) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = cx.try_global::<TestViewerRoot>() {
+        return Some(root.0.clone());
+    }
+    project
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
 }
 
 pub struct ViewerRun {
@@ -701,5 +787,78 @@ mod tests {
             "the other run is untouched"
         );
         drop(run_b);
+    }
+
+    /// What the world panel's live view actually gets: the registered
+    /// booter starts a headless run and registers it, and the emulator
+    /// pane is left completely alone -- no tab of its own, no session, no
+    /// status row. The user asked for a view in the world panel.
+    #[gpui::test]
+    async fn the_booter_starts_a_run_and_opens_no_emulator_tab(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        let (_db, workspace, panel, _worktree, cx) =
+            crate::tests::run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_emd(dir.path(), false);
+        cx.update(|_, cx| {
+            cx.set_global(TestViewerRunner(runner));
+            cx.set_global(TestViewerRoot(dir.path().to_path_buf()));
+        });
+        let endpoint = workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+        });
+        cx.run_until_parked();
+        let endpoint = endpoint.expect("the booter claimed the boot");
+        assert_eq!(calls.lock().unwrap().len(), 1, "one editor-cart build");
+        assert_ne!(endpoint.state(), ggo_common::ViewerState::Building);
+        cx.update(|_, cx| {
+            assert_eq!(cx.global::<ViewerRuns>().0.len(), 1, "one run registered");
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.session.is_none(), "the pane runs nothing");
+            assert!(panel.status.is_none(), "the pane's status row is untouched");
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<crate::EmulatorItem>(cx).count(),
+                1,
+                "only the tab run_menu_workspace itself opened"
+            );
+        });
+    }
+
+    /// The run the booter started watches the project it was booted from:
+    /// a save rebuilds it, with no emulator pane in the loop at all.
+    #[gpui::test]
+    async fn a_booted_run_rebuilds_when_the_project_is_saved(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        let (_db, workspace, _panel, _worktree, cx) =
+            crate::tests::run_menu_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_emd(dir.path(), false);
+        cx.update(|_, cx| {
+            cx.set_global(TestViewerRunner(runner));
+            cx.set_global(TestViewerRoot(dir.path().to_path_buf()));
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+            })
+            .expect("the booter claimed the boot");
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let fs = workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).fs().clone());
+        fs.as_fake()
+            .insert_file("/proj/main.rs", b"fn main() {}".to_vec())
+            .await;
+        cx.run_until_parked();
+        cx.executor().advance_clock(crate::WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "the save rebuilt the viewer cart"
+        );
     }
 }
