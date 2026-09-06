@@ -306,6 +306,35 @@ pub fn live_view(origin: [f64; 2], scale: u32, camera: [f64; 2]) -> View {
     }
 }
 
+/// The whole Live geometry for a canvas of `size` (canvas-relative px):
+/// the transform world px are placed through, the frame rect
+/// `[x, y, w, h]` the picture is drawn into, and the effective scale.
+/// `scale_override` is the user's wheel choice; `None` fits the canvas.
+///
+/// One function because the paint closure -- which cannot read the panel
+/// -- and the gestures, which can, must never disagree about where the
+/// picture is: an outline placed by one and hit-tested by the other is
+/// exactly the defect this view was rebuilt to fix.
+pub fn geometry(
+    size: [f64; 2],
+    scale_override: Option<u32>,
+    camera: [f64; 2],
+) -> (View, [f64; 4], u32) {
+    let scale = scale_override.unwrap_or_else(|| fit_scale(size[0], size[1]));
+    let origin = frame_origin(size[0], size[1], scale);
+    let scaled = f64::from(scale);
+    (
+        live_view(origin, scale, camera),
+        [
+            origin[0],
+            origin[1],
+            DEVICE_SCREEN_W * scaled,
+            DEVICE_SCREEN_H * scaled,
+        ],
+        scale,
+    )
+}
+
 /// `scale` +/- 1, clamped to `1..=LIVE_SCALE_MAX`.
 pub fn scale_step(scale: u32, dir: i32) -> u32 {
     let next = if dir > 0 {
@@ -787,6 +816,24 @@ mod tests {
         assert_eq!([sx, sy], [80.0 + 40.0, 60.0 + 40.0]);
         let back = ggo_worldlib::drag_ops::screen_to_world(sx, sy, &view);
         assert_eq!(back, [30.0, 25.0]);
+    }
+
+    #[test]
+    fn geometry_composes_the_fit_the_frame_rect_and_the_transform() {
+        // 800x600 fits the 320x240 frame twice, centered at (80, 60).
+        let (view, rect, scale) = geometry([800.0, 600.0], None, [10.0, 5.0]);
+        assert_eq!(scale, 2);
+        assert_eq!(rect, [80.0, 60.0, 640.0, 480.0]);
+        assert_eq!(view.zoom, 2.0);
+        // The camera's own world point sits at the frame's origin.
+        assert_eq!(
+            [view.pan_x + 10.0 * view.zoom, view.pan_y + 5.0 * view.zoom],
+            [80.0, 60.0]
+        );
+        // The user's scale wins over the fit, and re-centers the frame.
+        let (_, rect, scale) = geometry([800.0, 600.0], Some(1), [0.0, 0.0]);
+        assert_eq!(scale, 1);
+        assert_eq!(rect, [240.0, 180.0, 320.0, 240.0]);
     }
 
     #[test]

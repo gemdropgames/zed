@@ -3556,21 +3556,10 @@ impl WorldPanel {
             return None;
         };
         let live = open.live.as_ref()?;
-        let scale = live
-            .scale
-            .unwrap_or_else(|| live::fit_scale(size[0], size[1]));
-        let origin = live::frame_origin(size[0], size[1], scale);
-        let camera = live.camera.or(live.sent_camera).unwrap_or([0.0, 0.0]);
-        let scaled = f64::from(scale);
-        Some((
-            live::live_view(origin, scale, camera),
-            [
-                origin[0],
-                origin[1],
-                DEVICE_SCREEN_W * scaled,
-                DEVICE_SCREEN_H * scaled,
-            ],
-            scale,
+        Some(live::geometry(
+            size,
+            live.scale,
+            live.camera.or(live.sent_camera).unwrap_or([0.0, 0.0]),
         ))
     }
 
@@ -6216,18 +6205,11 @@ impl WorldPanel {
                         f64::from(canvas_bounds.size.width),
                         f64::from(canvas_bounds.size.height),
                     ];
-                    let scale = scale_override.unwrap_or_else(|| live::fit_scale(size[0], size[1]));
-                    let origin = live::frame_origin(size[0], size[1], scale);
-                    let scaled = f64::from(scale);
+                    let (transform, frame_rect, _) = live::geometry(size, scale_override, camera);
                     canvas::LiveScene {
                         frame,
-                        frame_rect: [
-                            origin[0],
-                            origin[1],
-                            DEVICE_SCREEN_W * scaled,
-                            DEVICE_SCREEN_H * scaled,
-                        ],
-                        view: live::live_view(origin, scale, camera),
+                        frame_rect,
+                        view: transform,
                         rows,
                         marquee,
                         background,
