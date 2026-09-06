@@ -153,7 +153,7 @@ pub fn tool_list() -> Value {
           "description": "Every world file in the open project: {worlds: [{stem, rel_path}]}. Stems are what emd, cart_pack and hw_flash take (worlds/arena).",
           "inputSchema": with(json!({})) },
         { "name": "world_open",
-          "description": "Open a world in Zed's World panel, as clicking its file would. Returns {opened: rel_path}. The already-open world is left alone (no reload, no prompt); a world with unsaved edits is never swapped out from under the user — save it first.",
+          "description": "Open a world in Zed's World panel, as clicking its file would: it gets its own editor tab. Returns {opened: rel_path}. A world that already has a tab is brought to the front, never reloaded, so unsaved edits, undo history and camera survive — and opening one world never disturbs another.",
           "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem (worlds/arena) or rel path" } })) },
         { "name": "world_read",
           "description": "The world as the designer authored it, from the World panel: {stem, rel_path, dirty, entities[{index, pos, components}], instances[{index, world, pos, background_priority, error}], backgrounds[{layer, map}], selected[]}. Pass `world` to open one first. This is the level layout — what world_screenshot draws and what the cart boots — not the running game (that is emu_next_frame's world JSON).",

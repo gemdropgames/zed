@@ -69,9 +69,10 @@ WORLD panel — the level as the designer authored it (entity components,
 whether the document has unsaved edits) — not the running game; that is
 `emu_next_frame`'s `world`. Paths are worktree-relative (what the
 explorer shows); `world_open` also accepts the stem `emd`, `cart_pack`
-and `hw_flash` take. `world_open` is a click minus the modal: the world
-already open is left exactly as it is, and a swap away from a world with
-unsaved edits is refused rather than discarding them. `world_screenshot`
+and `hw_flash` take. `world_open` is a click: every world gets its own
+editor tab, a world that already has one is brought to the front rather
+than reloaded (unsaved edits, undo history and camera survive), and
+opening one world never disturbs another. `world_screenshot`
 draws that same authored layout: by default the 320x240 device screen
 framed on the world's active camera (the engine's own centring rule), or
 the whole scene's bounding box with `full`. Sprites, tilemaps and
