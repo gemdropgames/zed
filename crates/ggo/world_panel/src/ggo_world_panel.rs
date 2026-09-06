@@ -13206,7 +13206,7 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(1, systems));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, systems));
         cx.run_until_parked();
         panel.update(cx, |panel, _| {
             let mut view = open_of(panel).view.borrow_mut();
@@ -13288,7 +13288,7 @@ mod tests {
         cx.run_until_parked();
         host_sent(&endpoint);
 
-        cart_says(&endpoint, hello_ack(1, &["animate"]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &["animate"]));
         cx.run_until_parked();
 
         let sent = host_sent(&endpoint);
@@ -13587,7 +13587,7 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(1, &[]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
         cx.run_until_parked();
 
         let notifications = Rc::new(std::cell::Cell::new(0usize));
@@ -13608,7 +13608,7 @@ mod tests {
         );
 
         // ... and a tick that DOES bring something new still does.
-        cart_says(&endpoint, hello_ack(1, &["animate"]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &["animate"]));
         cx.run_until_parked();
         assert!(
             notifications.get() > 0,
@@ -13626,7 +13626,7 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(1, &[]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             let open = open_of(panel);
@@ -13665,7 +13665,7 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(1, &[]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
         cx.run_until_parked();
         host_sent(&endpoint);
 
@@ -14788,7 +14788,7 @@ mod tests {
             live.world_sync = live::WorldSync::Acked(0);
             live.mailbox.hello().expect("the link accepts a greeting");
         });
-        cart_says(&endpoint, hello_ack(1, &[]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             let live = live_of(panel);
@@ -15113,7 +15113,7 @@ mod tests {
         );
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(1, &[]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert_eq!(live_of(panel).status, LiveStatus::Connected)
@@ -15219,7 +15219,7 @@ mod tests {
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
         host_sent(&endpoint);
-        cart_says(&endpoint, hello_ack(1, &["animate", "ai"]));
+        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &["animate", "ai"]));
         cx.run_until_parked();
         match host_sent(&endpoint)
             .iter()
