@@ -148,8 +148,8 @@ yet, only the background.
 
 Gestures in Live use the Live transform, not `canvas_view()`: hit-test,
 marquee, drag origin and delta (delta ÷ scale = world px, then the existing
-snap + `SetTransform` mirror + `MoveEntity` on drop, untouched). Middle
-drag or left drag on empty space pans: it sends `Camera` with the cart's
+snap + `SetTransform` mirror + `MoveEntity` on drop, untouched). Left drag on empty
+space is the marquee, as in Design. Middle drag pans: it sends `Camera` with the cart's
 last reported camera minus the drag delta ÷ scale, and the overlay keeps
 using the cart's report, so a cart system that also moves the camera never
 fights the outlines. Design's `ViewShared` pan/zoom are not touched by
