@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ggo_common::{LinkEndpoint, ProcRequest, ProcRunner, ViewerState};
+use ggo_common::{LinkEndpoint, ProcCapture, ProcRequest, ProcRunner, ViewerState};
 use gpui::{App, AppContext as _, Context, Entity, RenderImage, Subscription, Task};
 
 use crate::drive::{self, Frame, Session};
@@ -39,7 +39,12 @@ pub struct ViewerRun {
     proc_runner: ProcRunner,
     endpoint: Arc<LinkEndpoint>,
     session: Option<Session>,
-    build_generation: u64,
+    /// A build is in flight. The `emd` spawn it is waiting on BLOCKS a
+    /// background thread and cannot be cancelled, so a save landing
+    /// mid-build queues rather than starting a second `emd` over the
+    /// first.
+    building: bool,
+    pending_rebuild: bool,
     _build_task: Option<Task<()>>,
     _pump_task: Option<Task<()>>,
     /// The frame published one publish ago -- retired one late, like the
@@ -72,7 +77,8 @@ impl ViewerRun {
             proc_runner,
             endpoint,
             session: None,
-            build_generation: 0,
+            building: false,
+            pending_rebuild: false,
             _build_task: None,
             _pump_task: None,
             previously_published: None,
@@ -93,6 +99,21 @@ impl ViewerRun {
 
     /// Build the viewer cart and boot it, replacing any run in flight.
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
+        if self.endpoint.stop_requested() {
+            // The world view has left live mode. Nothing -- not a save
+            // that queued behind the last build, not a caller that has
+            // not noticed yet -- may start another run for it.
+            return;
+        }
+        if self.building {
+            // Every further save joins this one queued rebuild: an `emd`
+            // build of the editor cart takes tens of seconds, and the
+            // blocking spawn already in flight cannot be cancelled, so
+            // starting another over it would just leave two `emd`
+            // processes writing the same target directory.
+            self.pending_rebuild = true;
+            return;
+        }
         // The pump too, not just the session: a pump left running would
         // keep publishing the outgoing run's last frames into the
         // endpoint mid-build, and would report that run's ending over the
@@ -102,36 +123,65 @@ impl ViewerRun {
         self._pump_task = None;
         self.drop_session(cx);
         self.endpoint.set_state(ViewerState::Building);
-        self.build_generation += 1;
-        let generation = self.build_generation;
+        self.building = true;
         let request = viewer_build_request(&self.project_root, &self.world_rel);
         let runner = self.proc_runner.clone();
         self._build_task = Some(cx.spawn(async move |this, cx| {
             let (request, root) = match request {
                 Ok(prepared) => prepared,
                 Err(reason) => {
-                    this.update(cx, |this, cx| this.stop_with(reason, cx)).ok();
+                    this.update(cx, |this, cx| {
+                        this.stop_with(reason, cx);
+                        this.build_done(cx);
+                    })
+                    .ok();
                     return;
                 }
             };
             let capture = cx.background_spawn(async move { runner(request) }).await;
             this.update(cx, |this, cx| {
-                if this.build_generation != generation {
-                    return;
-                }
-                if !capture.ok {
-                    let reason = format!("build failed: {}", menu::failure_reason(&capture));
-                    this.stop_with(reason, cx);
-                    return;
-                }
-                let Some(ggo) = menu::editor_cart_ggo_path(&capture.lines) else {
-                    this.stop_with("emd editor-cart --ggo printed no .ggo path".to_string(), cx);
-                    return;
-                };
-                this.boot(root, ggo, cx);
+                this.build_finished(capture, root, cx);
+                this.build_done(cx);
             })
             .ok();
         }));
+    }
+
+    /// What `emd editor-cart --ggo` had to say, on the UI thread.
+    fn build_finished(&mut self, capture: ProcCapture, root: PathBuf, cx: &mut Context<Self>) {
+        if self.endpoint.stop_requested() {
+            // Asked to stop while the build ran. Booting anyway would
+            // show the world view a `Running` it has already said it does
+            // not want, and leave a cart running for nobody until its
+            // first frame reached the pump.
+            self.stop_with(drive::WORLD_PANEL_STOP.to_string(), cx);
+            return;
+        }
+        if !capture.ok {
+            let reason = format!("build failed: {}", menu::failure_reason(&capture));
+            self.stop_with(reason, cx);
+            return;
+        }
+        let Some(ggo) = menu::editor_cart_ggo_path(&capture.lines) else {
+            self.stop_with("emd editor-cart --ggo printed no .ggo path".to_string(), cx);
+            return;
+        };
+        self.boot(root, ggo, cx);
+    }
+
+    /// The build ended, whatever its outcome: clear the in-flight flag
+    /// and run whatever queued behind it.
+    fn build_done(&mut self, cx: &mut Context<Self>) {
+        self.building = false;
+        if std::mem::take(&mut self.pending_rebuild) {
+            // Deferred, not called inline: this runs INSIDE the build
+            // task, and `rebuild` assigns `_build_task` -- the handle of
+            // the very task that is running.
+            let this = cx.weak_entity();
+            cx.defer(move |cx| {
+                this.update(cx, |this, cx| this.rebuild(cx)).ok();
+            });
+        }
     }
 
     fn boot(&mut self, root: PathBuf, ggo: PathBuf, cx: &mut Context<Self>) {
@@ -214,11 +264,16 @@ impl ViewerRun {
     }
 
     /// Report `reason` and let go of the emulator thread and its frames.
+    ///
+    /// The session goes FIRST, as it does in `rebuild`: `drop_session`
+    /// releases the link before setting the stop flag, so from here on
+    /// the outgoing thread cannot stamp its own terminal reason over the
+    /// one written below.
     fn end_run(&mut self, reason: String, cx: &mut App) {
+        self.drop_session(cx);
         if !self.is_stopped() {
             self.endpoint.set_state(ViewerState::Stopped(reason));
         }
-        self.drop_session(cx);
     }
 
     fn drop_session(&mut self, cx: &mut App) {
@@ -256,13 +311,25 @@ impl ViewerRun {
         let project::Event::WorktreeUpdatedEntries(_, changes) = event else {
             return;
         };
-        if self.is_stopped() {
-            return;
-        }
         let relevant = changes
             .iter()
             .any(|(path, _, change)| crate::watch_triggers(path.as_unix_str(), change, true));
         if !relevant {
+            return;
+        }
+        self.on_sources_changed(cx);
+    }
+
+    /// Something this run's cart is built from was saved: rebuild once
+    /// the saves stop landing.
+    ///
+    /// A run whose build FAILED rebuilds too -- fixing the error and
+    /// saving is the loop the live view exists for, and refusing it would
+    /// leave the view stuck on the first error until the user closed and
+    /// reopened it. The one final state is a stop the HOST asked for: it
+    /// left live mode, so no save may bring its run back.
+    pub(crate) fn on_sources_changed(&mut self, cx: &mut Context<Self>) {
+        if self.endpoint.stop_requested() {
             return;
         }
         self._watch_debounce = Some(cx.spawn(async move |this, cx| {
@@ -277,6 +344,7 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fake `emd` whose trailer names `dir/demo-editor.ggo`; `with_cart`
     /// writes the green-screen cart there so frames actually flow.
@@ -343,7 +411,7 @@ mod tests {
             cx.background_executor
                 .timer(std::time::Duration::from_millis(5))
                 .await;
-            let _ = ticks.try_recv();
+            ticks.try_recv().ok();
         }
         assert!(
             endpoint.frame_number().is_some(),
@@ -403,6 +471,138 @@ mod tests {
             "the viewer cart is built again"
         );
         assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
+    }
+
+    /// A build that FAILED is not the end of the live view: the user
+    /// fixes the error, saves, and the run comes back. Refusing to
+    /// rebuild a stopped run would strand the view on the first
+    /// compile error -- the loop this whole feature is for.
+    #[gpui::test]
+    async fn a_save_rebuilds_a_run_whose_build_failed(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        let ggo = dir.path().join("demo-editor.ggo");
+        std::fs::write(&ggo, crate::drive::fixture::green_screen_cart()).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner: ggo_common::ProcRunner = Arc::new(move |_request| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ggo_common::ProcCapture {
+                    ok: false,
+                    lines: vec!["error: could not compile demo_editor".to_string()],
+                }
+            } else {
+                ggo_common::ProcCapture {
+                    ok: true,
+                    lines: vec![serde_json::json!({ "ggo": ggo }).to_string()],
+                }
+            }
+        });
+        let endpoint = ggo_common::LinkEndpoint::new();
+        let run = cx.new(|cx| {
+            ViewerRun::new(
+                "assets/worlds/main.toml".into(),
+                dir.path().to_path_buf(),
+                runner,
+                endpoint.clone(),
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(
+            matches!(endpoint.state(), ggo_common::ViewerState::Stopped(reason) if reason.contains("build failed")),
+            "{:?}",
+            endpoint.state()
+        );
+
+        run.update(cx, |run, cx| run.on_sources_changed(cx));
+        cx.executor().advance_clock(crate::WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Running,
+            "the fixed source rebuilt and booted"
+        );
+    }
+
+    /// Saves that land while `emd` is running coalesce into ONE rebuild:
+    /// the build is a blocking spawn that cannot be cancelled, so a
+    /// rebuild per save would overlap `emd` processes over the same
+    /// target directory.
+    #[gpui::test]
+    async fn saves_during_a_build_coalesce_into_one_rebuild(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        let (runner, calls) = fake_emd(dir.path(), true);
+        let endpoint = ggo_common::LinkEndpoint::new();
+        // Nothing is pumped between here and the asserts, so the build
+        // `new` starts is still in flight for both rebuilds below.
+        let run = cx.new(|cx| {
+            ViewerRun::new(
+                "assets/worlds/main.toml".into(),
+                dir.path().to_path_buf(),
+                runner,
+                endpoint.clone(),
+                None,
+                cx,
+            )
+        });
+        run.update(cx, |run, cx| run.rebuild(cx));
+        run.update(cx, |run, cx| run.rebuild(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "the build in flight, then one rebuild for both saves"
+        );
+        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
+    }
+
+    /// A stop asked for while the build runs is honoured when it lands:
+    /// no cart is booted for a world view that has already left live
+    /// mode, and no save can bring it back.
+    #[gpui::test]
+    async fn a_stop_requested_during_a_build_is_honoured(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        let (runner, calls) = fake_emd(dir.path(), true);
+        let endpoint = ggo_common::LinkEndpoint::new();
+        let run = cx.new(|cx| {
+            ViewerRun::new(
+                "assets/worlds/main.toml".into(),
+                dir.path().to_path_buf(),
+                runner,
+                endpoint.clone(),
+                None,
+                cx,
+            )
+        });
+        endpoint.request_stop();
+        cx.run_until_parked();
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Stopped(crate::drive::WORLD_PANEL_STOP.to_string()),
+            "the build's `.ggo` is never booted"
+        );
+        assert!(
+            endpoint.frame_number().is_none(),
+            "and no frame was ever published"
+        );
+        run.read_with(cx, |run, _| assert!(run.is_stopped()));
+
+        let built = calls.lock().unwrap().len();
+        run.update(cx, |run, cx| run.on_sources_changed(cx));
+        cx.executor().advance_clock(crate::WATCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            built,
+            "a save does not resurrect a run the host asked to stop"
+        );
+        assert!(matches!(
+            endpoint.state(),
+            ggo_common::ViewerState::Stopped(_)
+        ));
     }
 
     #[gpui::test]
