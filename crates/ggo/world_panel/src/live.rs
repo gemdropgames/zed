@@ -361,6 +361,21 @@ const POINTER_QUEUE_MAX: usize = 16;
 /// by whatever the user asked for since.
 const COMMAND_QUEUE_MAX: usize = 32;
 
+/// How many of those may go out in one tick. The cart's APP receive queue
+/// is four datagrams deep and the tick's pointer sample has already taken
+/// one of those slots, so a longer burst is dropped on arrival -- and a
+/// command is a discrete request, not a sample the next one supersedes.
+pub const COMMANDS_PER_TICK: usize = 3;
+
+/// How many cell pokes may wait for the wire before the slot is given up
+/// on. A `SetCell` commits into the cart's ONE command slot, so the queue
+/// drains at one cell per cart frame -- 1024 of them is already seventeen
+/// seconds of catch-up at 60 Hz, and a fill bigger than that is past the
+/// point where trickling it out is the right answer. Past the cap the
+/// slot is simply left out of step ([`LiveView::layer_synced`]): the cells
+/// are in the DOCUMENT either way, which is what a save writes.
+const POKE_QUEUE_MAX: usize = 1024;
+
 /// How many cart commands one document step may be replayed as before
 /// the whole world is re-sent instead. The cart commits one of them into
 /// its single command slot per frame, so a big group's replay would
@@ -478,6 +493,16 @@ pub struct LayerLoad {
     pub budget: u16,
     pub map_bytes: Vec<u8>,
     pub tileset_stem: String,
+}
+
+/// One cell of one background slot the cart's layer still owes the
+/// document -- a `SetCell` that has not gone out yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellPoke {
+    pub slot: u8,
+    pub x: u16,
+    pub y: u16,
+    pub tile: u16,
 }
 
 /// Which background slots the cart's copy is stale for.
@@ -1029,6 +1054,15 @@ pub struct LiveView {
     /// would sit in a four-deep receive queue and be dropped past the
     /// fourth.
     pub pending_edits: VecDeque<CartEdit>,
+    /// Cells owed the cart's background layers, oldest first. A `SetCell`
+    /// commits into the cart's ONE command slot exactly as an entity
+    /// command does, so these drain at the same one-per-tick cadence and
+    /// share the tick with [`Self::pending_edits`]: a bucket fill sent as
+    /// one burst would put N datagrams into a four-deep receive queue and
+    /// lose every cell past the fourth -- which the panel could not even
+    /// tell, since `set_cell` returns `Ok` for a datagram the cart never
+    /// reads.
+    pending_pokes: VecDeque<CellPoke>,
     /// Spawns on the wire whose cart index is not known yet, oldest
     /// first: the cart reports `EntityAdded` in the order it took the
     /// spawns, so the oldest pending one is whose answer this is.
@@ -1116,6 +1150,7 @@ impl LiveView {
             pointer_buttons: 0,
             pending_commands: Vec::new(),
             pending_edits: VecDeque::new(),
+            pending_pokes: VecDeque::new(),
             pending_spawns: VecDeque::new(),
             spawn_echoes: 0,
             added_unknown: Vec::new(),
@@ -1159,6 +1194,56 @@ impl LiveView {
     /// Poke one cell of background slot `slot` into the cart's layer.
     pub fn set_cell(&mut self, slot: u8, x: u16, y: u16, tile: u16) -> std::io::Result<()> {
         self.mailbox.set_cell(u32::from(slot), x, y, tile)
+    }
+
+    /// Queue one cell for the cart, replacing whatever was owed for that
+    /// same cell -- a stroke that crosses its own path is only worth the
+    /// value it ended on, and the queued position is kept rather than
+    /// moved to the back because cells are independent of each other.
+    ///
+    /// `false` when [`POKE_QUEUE_MAX`] cells are already waiting: the cell
+    /// is dropped, and the caller is the one that has to say the slot is
+    /// out of step.
+    pub fn push_poke(&mut self, poke: CellPoke) -> bool {
+        if let Some(queued) = self
+            .pending_pokes
+            .iter_mut()
+            .find(|queued| (queued.slot, queued.x, queued.y) == (poke.slot, poke.x, poke.y))
+        {
+            queued.tile = poke.tile;
+            return true;
+        }
+        if self.pending_pokes.len() >= POKE_QUEUE_MAX {
+            return false;
+        }
+        self.pending_pokes.push_back(poke);
+        true
+    }
+
+    /// The oldest cell still owed the cart.
+    pub fn take_poke(&mut self) -> Option<CellPoke> {
+        self.pending_pokes.pop_front()
+    }
+
+    /// Whether any slot still owes the cart cells.
+    pub fn pokes_pending(&self) -> bool {
+        !self.pending_pokes.is_empty()
+    }
+
+    /// Whether background slot `slot` still owes the cart cells --
+    /// [`Self::layer_synced`] only says anything once this is `false`.
+    pub fn pokes_pending_for(&self, slot: u8) -> bool {
+        self.pending_pokes.iter().any(|poke| poke.slot == slot)
+    }
+
+    /// Drop every cell owed for `slot`, reporting whether there were any.
+    /// A whole-slot blob replaces the layer those cells were a difference
+    /// AGAINST, so sending them behind it would paint them onto a map they
+    /// were never computed for.
+    pub fn forget_pokes_for(&mut self, slot: u8) -> bool {
+        let before = self.pending_pokes.len();
+        self.pending_pokes.retain(|poke| poke.slot != slot);
+        self.pending_pokes.len() != before
     }
 
     /// The band the overlay paints, as an origin and a size in world px:
@@ -1577,6 +1662,10 @@ impl LiveView {
     /// the queue had not reached yet -- and the fold would then write that
     /// stale answer back over the edit.
     ///
+    /// Cell pokes count: the layer fold reads the cart's cells back over
+    /// the document's, so a readback taken while cells were still owed
+    /// would revert exactly the cells the queue had not reached.
+    ///
     /// A transform already ON the wire ([`Self::replayed_rows`]) is
     /// deliberately not waited for: datagrams are ordered, so a snapshot
     /// request sent behind one is answered from a cart that has already
@@ -1584,7 +1673,7 @@ impl LiveView {
     /// behind a row the cart may never republish -- an entity it has since
     /// dropped, or one whose replay entry aged out.
     fn edits_outstanding(&self) -> bool {
-        self.mailbox.busy() || !self.pending_edits.is_empty()
+        self.mailbox.busy() || !self.pending_edits.is_empty() || self.pokes_pending()
     }
 
     /// Send the readbacks a save is waiting on, once the cart has caught
@@ -1693,6 +1782,11 @@ impl LiveView {
             .flatten();
         self.pending_pointer.clear();
         self.pending_commands.clear();
+        // The incoming cart holds no layer of this document's at all --
+        // it is sent whole ones on the greeting -- so a cell owed the
+        // outgoing one would land as a difference against a map that was
+        // never there.
+        self.pending_pokes.clear();
         self.forget_edits();
         self.pointer_moving = false;
         self.last_pointer = None;

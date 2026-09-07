@@ -355,6 +355,7 @@ impl Journey<'_> {
                     || !live.layer_queue.is_empty()
                     || live.pending_camera.is_some()
                     || !live.pending_edits.is_empty()
+                    || live.pokes_pending()
                     || live.mailbox.busy()
                     || !live.loaded()
             });
@@ -776,6 +777,43 @@ impl Journey<'_> {
             panel.canvas_primary_up(cx);
         });
         self.frames(2);
+    }
+
+    /// Pick the brush's tool, as the paint column's tool rail does.
+    fn set_paint_tool(&mut self, tool: ggo_map_panel::MapTool) {
+        self.panel.update(self.cx, |panel, _| {
+            paint_session_mut_of(panel).set_tool(tool)
+        });
+    }
+
+    /// One brush DRAG, through the canvas's own paint path: press at
+    /// world `from`, move to world `to`, release. What lands is the tool's
+    /// -- a rect fill paints nothing until the release.
+    fn paint_drag(&mut self, from: [f64; 2], to: [f64; 2]) {
+        let start = self.pt(from);
+        let end = self.pt(to);
+        self.panel.update_in(self.cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(start, false, cx);
+            panel.canvas_drag_to(end, cx);
+            panel.canvas_primary_up(cx);
+        });
+        self.frames(2);
+    }
+
+    /// Slot 0's cells as the CART holds them.
+    fn cart_layer_cells(&mut self) -> Vec<u16> {
+        let (_, _, cells) = self.cart.layer_cells(0).expect("the cart loaded slot 0");
+        cells
+    }
+
+    /// Slot 0's cells as the SESSION under the brush holds them.
+    fn session_cells(&mut self) -> Vec<u16> {
+        self.panel.read_with(self.cx, |panel, _| {
+            panel
+                .test_paint_session("maps/journey.bg0.map")
+                .map(|session| session.store.state().cells)
+                .expect("a session with cells")
+        })
     }
 
     /// Slot 0's cells as they are ON DISK.
@@ -1708,7 +1746,9 @@ async fn add_and_delete_entities_in_live(cx: &mut TestAppContext) {
     let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     assert_eq!(journey.cart_rows(), 3);
 
-    journey.panel.update(journey.cx, |panel, cx| panel.add_entity_impl(cx));
+    journey
+        .panel
+        .update(journey.cx, |panel, cx| panel.add_entity_impl(cx));
     journey.settle();
     journey.frames(4);
     assert_eq!(journey.entity_count(), 4, "the document gained one");
@@ -1802,6 +1842,89 @@ async fn duplicate_copies_the_selection_on_the_cart_and_in_the_document(cx: &mut
     assert!(journey.undo(), "there was a duplicate to undo");
     assert_eq!(journey.entity_count(), 3);
     assert_eq!(journey.cart_rows(), 3, "the copy is gone from the cart too");
+}
+
+/// 29. A rect fill in Live reaches EVERY cell of the cart's layer, and the
+///     save keeps them.
+///
+///     The cells are paced -- one `SetCell` per cart frame -- because the
+///     cart's receive queue is four datagrams deep and drops what arrives
+///     past that ([`super::cart_harness::Inbound`]). Sent in the one burst
+///     the fill produced them in, cells 5..40 would never reach the cart
+///     while `set_cell` reported `Ok` for every one of them, the slot
+///     would still read as in step, and the save's fold would then write
+///     the cart's pre-fill cells back over the document.
+#[gpui::test]
+async fn a_bucket_fill_in_live_reaches_every_cell(cx: &mut TestAppContext) {
+    /// The filled rect, in cells: 8 x 5 is forty of them, ten times what
+    /// the cart's queue can hold at once.
+    const RECT: (usize, usize) = (8, 5);
+    /// The generated background is square and this many cells to a side.
+    const MAP_DIM: usize = 16;
+
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    journey.add_background();
+    journey.enter_paint();
+    journey.set_paint_tool(ggo_map_panel::MapTool::RectFill);
+
+    // Cell centres: cell (0, 0) through cell (7, 4), at 16 px to a tile.
+    let from = [8.0, 8.0];
+    let to = [
+        (RECT.0 - 1) as f64 * 16.0 + 8.0,
+        (RECT.1 - 1) as f64 * 16.0 + 8.0,
+    ];
+    journey.paint_drag(from, to);
+
+    let session = journey.session_cells();
+    let painted = session.first().copied().expect("a cell at the origin");
+    assert_ne!(painted, live::BLANK_TILE, "the fill painted a tile");
+    let filled: Vec<usize> = (0..RECT.1)
+        .flat_map(|y| (0..RECT.0).map(move |x| y * MAP_DIM + x))
+        .collect();
+    assert_eq!(filled.len(), RECT.0 * RECT.1);
+    assert!(
+        filled
+            .iter()
+            .all(|index| session.get(*index) == Some(&painted)),
+        "the document has all {} cells",
+        filled.len()
+    );
+
+    // The queue drains at one cell per cart frame, so this is the point of
+    // the whole journey: it takes forty of them, and none are lost.
+    journey.settle();
+    // `settle` returns on the tick the LAST cell went on the wire; the
+    // cart reads it on the frame after, as it does every input.
+    journey.frames(2);
+    let cart = journey.cart_layer_cells();
+    let missing: Vec<usize> = filled
+        .iter()
+        .copied()
+        .filter(|index| cart.get(*index) != Some(&painted))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the cart's layer is missing {} of the {} filled cells (at {missing:?})",
+        missing.len(),
+        filled.len()
+    );
+    assert_eq!(
+        journey.cart.dropped_datagrams(),
+        0,
+        "and nothing was lost to the cart's four-deep receive queue"
+    );
+
+    journey.save(400);
+    assert_eq!(journey.save_error(), None, "the save landed");
+    let disk = journey.map_cells_on_disk();
+    assert!(
+        filled
+            .iter()
+            .all(|index| disk.get(*index) == Some(&painted)),
+        "and the save kept every filled cell -- the fold read the cart's \
+         layer back, which is the very thing an unpaced burst would have \
+         left pre-fill"
+    );
 }
 
 /// 22. The accepted limitation, asserted so a change to it fails loudly:

@@ -21,10 +21,9 @@ use emerald_editor_runtime::{Mailbox, install, mailbox_ptr, set_link};
 /// rather than a shortcut around it.
 struct EndpointCartLink {
     endpoint: Arc<ggo_common::LinkEndpoint>,
-    reader: ggo_comm::MessageReader,
-    /// Payloads decoded out of one drain, handed over one per `recv` --
-    /// the cart pops datagrams one at a time.
-    pending: VecDeque<Vec<u8>>,
+    /// The wire and the cart's receive queue behind it, shared with the
+    /// harness -- see [`Inbound`].
+    inbound: Arc<Mutex<Inbound>>,
     /// While set, every cart -> host BLOB datagram is dropped on the
     /// floor. Only the blob kinds: the rows, the selection and the
     /// greeting still flow, so the session stays live and a save that
@@ -33,18 +32,77 @@ struct EndpointCartLink {
     drop_blobs: Arc<AtomicBool>,
 }
 
-impl CartLink for EndpointCartLink {
-    fn recv(&mut self, buf: &mut [u8]) -> usize {
-        if self.pending.is_empty() {
-            for wire in self.endpoint.take_outbound() {
-                for item in self.reader.feed(&wire) {
-                    if let ggo_comm::LinkItem::Message(message) = item {
-                        self.pending.push_back(message.payload().to_vec());
-                    }
+/// How many reassembled APP messages the cart holds at once, and what
+/// happens past that: the firmware's own ring
+/// (`ggo-hal/src/comm.rs`'s `APP_RX_QUEUE_DEPTH`, `CommState::enqueue`),
+/// which is four deep and drops the NEWEST arrival when it is full.
+/// Named here rather than imported: the firmware crate is not a
+/// dependency of the editor, and this is a protocol constant.
+const APP_RX_QUEUE_DEPTH: usize = 4;
+
+/// The host -> cart direction, modelled as the firmware models it.
+///
+/// A datagram the host sends is on the WIRE until the cart's receive queue
+/// takes it in, and that queue is four deep. The cart drains it from
+/// `pump_inbound`, which stops at the first datagram that COMMITS into the
+/// mailbox's one command slot -- so a burst of commands leaves the queue
+/// full with the rest of the burst still arriving, and those are the ones
+/// the firmware drops. Modelled at the frame boundary
+/// ([`Inbound::settle`]): everything still on the wire when the cart's
+/// frame ends arrived while the queue was full.
+///
+/// Shared between the link (which the runtime owns) and the harness, which
+/// is what lets the frame boundary reach it at all.
+#[derive(Default)]
+struct Inbound {
+    /// The cart side of the wire format -- the world panel frames every
+    /// payload, so this is the same `MessageReader` the emulator thread
+    /// runs.
+    reader: ggo_comm::MessageReader,
+    /// Decoded payloads the receive queue has not taken in yet.
+    wire: VecDeque<Vec<u8>>,
+    /// The cart's APP receive queue, oldest first.
+    queue: VecDeque<Vec<u8>>,
+    /// Datagrams lost because they arrived with the queue full.
+    drops: usize,
+}
+
+impl Inbound {
+    /// Decode everything the host has queued since the last look onto the
+    /// wire, then hand the receive queue as much of it as it can hold.
+    fn deliver(&mut self, endpoint: &ggo_common::LinkEndpoint) {
+        for frame in endpoint.take_outbound() {
+            for item in self.reader.feed(&frame) {
+                if let ggo_comm::LinkItem::Message(message) = item {
+                    self.wire.push_back(message.payload().to_vec());
                 }
             }
         }
-        let Some(datagram) = self.pending.pop_front() else {
+        while self.queue.len() < APP_RX_QUEUE_DEPTH {
+            let Some(next) = self.wire.pop_front() else {
+                return;
+            };
+            self.queue.push_back(next);
+        }
+    }
+
+    /// End of one cart frame: what is still on the wire is what arrived
+    /// while the queue was full, which is exactly what the firmware drops.
+    fn settle(&mut self, endpoint: &ggo_common::LinkEndpoint) {
+        self.deliver(endpoint);
+        self.drops += self.wire.len();
+        self.wire.clear();
+    }
+}
+
+impl CartLink for EndpointCartLink {
+    fn recv(&mut self, buf: &mut [u8]) -> usize {
+        let mut inbound = self
+            .inbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inbound.deliver(&self.endpoint);
+        let Some(datagram) = inbound.queue.pop_front() else {
             return 0;
         };
         // A datagram the cart's buffer cannot hold is a wire bug, not a
@@ -65,9 +123,7 @@ impl CartLink for EndpointCartLink {
         // `0x90 CartBlobBegin`, `0x91 CartBlobChunk`, `0x92 CartBlobEnd`.
         // `true` all the same: the cart handed the bytes to the wire, and
         // a wire that then lost them is not something it can tell.
-        if self.drop_blobs.load(Ordering::SeqCst)
-            && matches!(payload.first(), Some(0x90..=0x92))
-        {
+        if self.drop_blobs.load(Ordering::SeqCst) && matches!(payload.first(), Some(0x90..=0x92)) {
             return true;
         }
         self.endpoint.push_inbound(payload.to_vec());
@@ -97,6 +153,9 @@ pub(crate) struct CartHarness {
     presented: u32,
     /// Shared with the link: see [`Self::drop_cart_blobs`].
     drop_blobs: Arc<AtomicBool>,
+    /// Shared with the link: the wire and the four-deep receive queue
+    /// behind it ([`Inbound`]).
+    inbound: Arc<Mutex<Inbound>>,
     /// Held for the harness's lifetime -- see [`MAILBOX_LOCK`]. Last
     /// field, so it is dropped last: the world and schedule that run
     /// against the static mailbox must be gone before the next harness
@@ -132,13 +191,13 @@ impl CartHarness {
             edit_systems,
         );
         let drop_blobs = Arc::new(AtomicBool::new(false));
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
         assert!(
             set_link(
                 &mut world,
                 Box::new(EndpointCartLink {
                     endpoint: endpoint.clone(),
-                    reader: ggo_comm::MessageReader::default(),
-                    pending: VecDeque::new(),
+                    inbound: inbound.clone(),
                     drop_blobs: drop_blobs.clone(),
                 }),
             ),
@@ -153,8 +212,20 @@ impl CartHarness {
             picture,
             presented: 0,
             drop_blobs,
+            inbound,
             _guard: guard,
         }
+    }
+
+    /// How many host -> cart datagrams the cart's four-deep receive queue
+    /// has lost -- see [`Inbound`]. Nonzero means the host sent a burst it
+    /// did not pace, and every datagram past the fourth is one the cart
+    /// never saw and cannot ask for again.
+    pub fn dropped_datagrams(&self) -> usize {
+        self.inbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drops
     }
 
     /// Drop every cart -> host blob from here on: the world snapshot and
@@ -185,6 +256,12 @@ impl CartHarness {
     /// per gesture step, exactly as the real link does.
     pub fn frame(&mut self, cx: &mut gpui::VisualTestContext) {
         self.schedule.run(&mut self.world);
+        // The cart has stopped reading for this frame, so whatever is
+        // still on the wire arrived with its receive queue full.
+        self.inbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .settle(&self.endpoint);
         self.present(cx);
     }
 

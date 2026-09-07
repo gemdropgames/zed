@@ -1546,7 +1546,14 @@ impl OpenWorld {
             // keypress outright, where a lost pointer sample is superseded
             // by the next one.
             if !live.mailbox.busy() {
-                for command in std::mem::take(&mut live.pending_commands) {
+                // At most [`COMMANDS_PER_TICK`] of them: the cart's APP
+                // receive queue is four datagrams deep and the pointer
+                // sample above has already taken one of those slots, so a
+                // longer burst would be dropped on arrival rather than
+                // queued. The rest wait for the next tick.
+                let flushed = live.pending_commands.len().min(live::COMMANDS_PER_TICK);
+                let batch: Vec<EditCommand> = live.pending_commands.drain(..flushed).collect();
+                for command in batch {
                     if let Err(error) = live.mailbox.command(command) {
                         log::warn!("GGO: live command: {error}");
                     }
@@ -1605,6 +1612,23 @@ impl OpenWorld {
                                 }
                             }
                         }
+                    }
+                } else if let Some(poke) = live.take_poke() {
+                    // `else`, and one per tick: a `SetCell` commits into
+                    // the SAME single command slot an entity command
+                    // does, so two of them in a tick is one datagram the
+                    // cart never reads. This is what makes a bucket fill
+                    // reach the cart at all -- sending its cells in the
+                    // burst the edit produced them in put them into a
+                    // four-deep receive queue, which kept four.
+                    if let Err(error) = live.set_cell(poke.slot, poke.x, poke.y, poke.tile) {
+                        // The document has the cell and the cart does
+                        // not, so its layer is no longer the document's:
+                        // the save's fold leaves that slot to the paint
+                        // session's own write.
+                        live.set_layer_synced(poke.slot, false);
+                        self.paint_error = Some(format!("live cell: {error}"));
+                        changed = true;
                     }
                 }
             }
@@ -1703,6 +1727,12 @@ impl OpenWorld {
                         .and_then(|merged| self.sessions.get(&format!("{}.map", merged.stem)))
                         .is_some_and(PaintSession::dirty);
                     let slot = u8::try_from(load.layer).unwrap_or(u8::MAX);
+                    // The blob replaces the very layer the queued cells
+                    // were a difference against, and it carries the map
+                    // ON DISK -- so they are dropped rather than painted
+                    // over it, and the slot is out of step until the
+                    // session that holds those cells is saved.
+                    let superseded = live.forget_pokes_for(slot);
                     match live.mailbox.load_layer(
                         load.layer,
                         load.base,
@@ -1710,7 +1740,7 @@ impl OpenWorld {
                         &load.map_bytes,
                         &load.tileset_stem,
                     ) {
-                        Ok(()) => live.set_layer_synced(slot, !unsaved),
+                        Ok(()) => live.set_layer_synced(slot, !unsaved && !superseded),
                         Err(error) => {
                             live.set_layer_synced(slot, false);
                             live_error = Some(format!("live layer {}: {error}", load.layer));
@@ -2661,15 +2691,22 @@ impl OpenWorld {
             // pushed with unsaved paint behind it -- leaves the cart
             // holding an older map, and folding that in would erase the
             // user's paint.
-            let slot_synced = self
-                .live
-                .as_ref()
-                .is_some_and(|live| live.layer_is_synced(*slot) && !live.layer_push_in_flight());
+            //
+            // Tested before the session lookup, not inside it: a slot the
+            // panel knows is out of step has nothing the document wants,
+            // whether or not a session is open on it -- and a
+            // session-less one would otherwise have the cart's stale
+            // cells patched straight onto the file.
+            let slot_synced = self.live.as_ref().is_some_and(|live| {
+                live.layer_is_synced(*slot)
+                    && !live.layer_push_in_flight()
+                    && !live.pokes_pending_for(*slot)
+            });
+            if !slot_synced {
+                continue;
+            }
             let patched = match self.sessions.get_mut(&rel) {
                 Some(session) => {
-                    if !slot_synced {
-                        continue;
-                    }
                     let state = session.store.state();
                     let writes = cell_writes(&state.cells, state.w, state.h, *w, *h, cells);
                     if !writes.is_empty() {
@@ -3704,16 +3741,34 @@ impl WorldPanel {
         Some((slot, state.w, state.h, state.cells))
     }
 
-    /// Tell the cart about every cell a paint edit just changed, as one
+    /// Queue every cell a paint edit just changed for the cart, one
     /// `SetCell` each ("paint strokes send `SetCell`", spec).
+    ///
+    /// QUEUED, not sent: a `SetCell` commits into the cart's one command
+    /// slot, and the cart stops reading datagrams until the frame after
+    /// has acked it -- so a rect fill's forty cells put on the wire in the
+    /// one UI event that produced them would sit in a four-deep receive
+    /// queue and be dropped past the fourth, with `set_cell` reporting
+    /// `Ok` for every one of them. `OpenWorld::live_step` drains the queue
+    /// at one cell per cart frame.
     ///
     /// `before` is [`Self::live_layer_cells`] taken ahead of the edit. A
     /// changed SIZE is not pokeable -- the cart's shadow has the dims of
-    /// the load, not the document's -- and neither is a cell the wire
-    /// refuses, so either leaves the slot out of step and a save folds
+    /// the load, not the document's -- and neither is a cell past the
+    /// queue's cap, so either leaves the slot out of step and a save folds
     /// the cart's cells back only for a slot that is in step
     /// (`OpenWorld::write_cart_layers`).
-    fn poke_live_cells(&mut self, before: Option<(u8, u16, u16, Vec<u16>)>, cx: &mut Context<Self>) {
+    fn poke_live_cells(
+        &mut self,
+        before: Option<(u8, u16, u16, Vec<u16>)>,
+        cx: &mut Context<Self>,
+    ) {
+        // The cart's world is the game's while it plays, and the paint
+        // tools are refused there -- but an edit that reached a session
+        // some other way must not be poked into a running game either.
+        if self.live_playing() {
+            return;
+        }
         let Some((slot, width, height, before)) = before else {
             return;
         };
@@ -3736,7 +3791,7 @@ impl WorldPanel {
         // land on it. Poked anyway -- the picture the cart draws is worth
         // more than the fold, which has its own fallback.
         let synced = live.layer_is_synced(slot);
-        let mut refused: Option<String> = None;
+        let mut overflowed = false;
         for (index, (was, now)) in before.iter().zip(after.iter()).enumerate() {
             if was == now {
                 continue;
@@ -3747,16 +3802,22 @@ impl WorldPanel {
             ) else {
                 continue;
             };
-            if let Err(error) = live.set_cell(slot, x, y, *now) {
-                refused = Some(error.to_string());
+            if !live.push_poke(live::CellPoke {
+                slot,
+                x,
+                y,
+                tile: *now,
+            }) {
+                overflowed = true;
                 break;
             }
         }
-        live.set_layer_synced(slot, synced && refused.is_none());
-        // The user has to be told: the cell is in the document but not in
-        // the picture the cart is drawing.
-        if let Some(error) = refused {
-            open.paint_error = Some(format!("live cell: {error}"));
+        live.set_layer_synced(slot, synced && !overflowed);
+        // The user has to be told: the cells are in the document but not
+        // in the picture the cart is drawing.
+        if overflowed {
+            open.paint_error =
+                Some("live cell: too many cells owed the cart; its picture is behind".to_string());
             cx.notify();
         }
     }
@@ -17995,15 +18056,23 @@ mod tests {
             panel.clear_selection_impl(cx);
         });
         cx.run_until_parked();
+        // Three per tick, in the order asked for: the cart's receive queue
+        // is four datagrams deep and the tick's pointer sample owns one of
+        // those slots, so the fourth command waits rather than being
+        // dropped on arrival.
         assert_eq!(
             commands_in(&live_tick_sent(&endpoint, cx)),
             vec![
                 (command::SELECT_ALL, 0, 0),
                 (command::DUPLICATE, 0, 0),
                 (command::DELETE, 0, 0),
-                (command::CLEAR_SELECTION, 0, 0),
             ],
-            "every command of the tick goes out, in the order asked for"
+            "the tick's first three commands go out, in the order asked for"
+        );
+        assert_eq!(
+            commands_in(&live_tick_sent(&endpoint, cx)),
+            vec![(command::CLEAR_SELECTION, 0, 0)],
+            "and the fourth on the tick after -- queued, never dropped"
         );
         panel.read_with(cx, |panel, _| {
             let open = open_of(panel);
@@ -18161,8 +18230,11 @@ mod tests {
 
         let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
         assert_ne!(painted, live::BLANK_TILE, "the stroke painted a tile");
+        // On the TICK, not in the edit that produced it: a `SetCell`
+        // commits into the cart's one command slot, so the queue drains at
+        // one cell per cart frame.
         assert_eq!(
-            set_cells(&host_sent(&endpoint)),
+            set_cells(&live_tick_sent(&endpoint, cx)),
             vec![(0, 0, 0, painted)],
             "one poke, for the one cell the brush changed"
         );
@@ -18181,7 +18253,9 @@ mod tests {
             panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
             panel.canvas_primary_up(cx);
         });
-        host_sent(&endpoint);
+        // Drains the first stroke's poke, so what is asserted below is the
+        // ERASE's own.
+        live_tick_sent(&endpoint, cx);
 
         panel.update(cx, |panel, _| {
             paint_session_mut_of(panel).set_tool(ggo_map_panel::MapTool::Eraser)
@@ -18197,7 +18271,7 @@ mod tests {
             "the eraser blanked the cell it painted"
         );
         assert_eq!(
-            set_cells(&host_sent(&endpoint)),
+            set_cells(&live_tick_sent(&endpoint, cx)),
             vec![(0, 0, 0, live::BLANK_TILE)]
         );
     }
@@ -18258,7 +18332,7 @@ mod tests {
         let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
         assert_ne!(painted, live::BLANK_TILE, "the stroke painted a tile");
         assert_eq!(
-            set_cells(&host_sent(&endpoint)),
+            set_cells(&live_tick_sent(&endpoint, cx)),
             vec![(0, 0, 0, painted)],
             "and the cart was told about it a cell at a time"
         );
@@ -18276,7 +18350,12 @@ mod tests {
                 0,
                 2,
                 2,
-                vec![painted, live::BLANK_TILE, live::BLANK_TILE, live::BLANK_TILE],
+                vec![
+                    painted,
+                    live::BLANK_TILE,
+                    live::BLANK_TILE,
+                    live::BLANK_TILE,
+                ],
             )],
         );
         let sent = settle_live(&panel, &endpoint, cx);
@@ -18674,7 +18753,10 @@ mod tests {
                 open_of(panel).save_error.as_deref(),
                 Some("stop the game to save")
             );
-            assert!(panel.dirty_world_name().is_some(), "the document stays dirty");
+            assert!(
+                panel.dirty_world_name().is_some(),
+                "the document stays dirty"
+            );
         });
         // The cart answers anyway -- the request went out before Play. It
         // must reach a save that is no longer there.
@@ -18791,12 +18873,10 @@ mod tests {
             );
         });
         assert!(
-            !host_sent(&endpoint)
-                .iter()
-                .any(|message| matches!(
-                    emerald_editor_runtime::wire::decode_host(message),
-                    Some(emerald_editor_runtime::wire::HostMsg::Snapshot)
-                )),
+            !host_sent(&endpoint).iter().any(|message| matches!(
+                emerald_editor_runtime::wire::decode_host(message),
+                Some(emerald_editor_runtime::wire::HostMsg::Snapshot)
+            )),
             "and nothing was asked of the cart yet"
         );
 
@@ -18820,6 +18900,65 @@ mod tests {
             on_disk.entities[0].components["Transform"]["pos"],
             json!([4, 4]),
             "the TOML has the undone position, not the one the undo replaced"
+        );
+    }
+
+    /// The same gate, for CELLS: a save asked for while the poke queue is
+    /// still draining would read the cart's layer back over the cells the
+    /// queue had not reached, and the fold would revert exactly them.
+    #[gpui::test]
+    async fn a_save_behind_queued_cell_pokes_waits_for_them(cx: &mut TestAppContext) {
+        use emerald_editor_runtime::wire::{self, HostMsg};
+
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        // Two cells, and no tick between them: both are still owed the
+        // cart when Save is pressed.
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+            panel.canvas_primary_down_with(live_screen_of(panel, [17.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(open_of(panel).save_pending(), "the save is waiting");
+            assert!(
+                live_of(panel).pokes_pending(),
+                "behind the cells the stroke owes the cart"
+            );
+        });
+        assert!(
+            !host_sent(&endpoint)
+                .iter()
+                .any(|message| matches!(wire::decode_host(message), Some(HostMsg::Snapshot))),
+            "and nothing was asked of the cart yet"
+        );
+
+        // One cell per tick, and the readbacks on the first tick after the
+        // queue is empty.
+        cart_frames(&panel, &endpoint, cx, 3);
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).pokes_pending(),
+                "both cells went out, one per tick"
+            );
+            assert!(
+                live_of(panel).layer_is_synced(0),
+                "and the slot is still in step, so the fold may read it back"
+            );
+        });
+        assert!(
+            host_sent(&endpoint)
+                .iter()
+                .any(|message| matches!(wire::decode_host(message), Some(HostMsg::Snapshot))),
+            "the save asked once the queue had drained"
         );
     }
 
