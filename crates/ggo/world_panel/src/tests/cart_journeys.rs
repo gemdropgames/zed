@@ -333,7 +333,7 @@ impl Journey<'_> {
                     || live.layers_dirty.any()
                     || !live.layer_queue.is_empty()
                     || live.pending_camera.is_some()
-                    || !live.pending_transforms.is_empty()
+                    || !live.pending_edits.is_empty()
                     || live.mailbox.busy()
                     || !live.loaded()
             });

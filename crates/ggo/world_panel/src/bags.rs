@@ -528,6 +528,29 @@ mod tests {
         });
     }
 
+    /// A whole-valued float IS an `Int`: TOML round-trips a document's
+    /// `z = 64` back as either tag depending on how it was authored, and a
+    /// bag that encoded the two differently would re-send the component on
+    /// every commit that touched neither.
+    #[test]
+    fn a_whole_valued_float_encodes_as_the_integer_it_is() {
+        let schemas = vec![entry("Depth", vec![field("z", FieldKind::Int)])];
+        let whole = bag_from_fields(&schemas, "Depth", &fields_of(json!({"z": 64.0})));
+        let integer = bag_from_fields(&schemas, "Depth", &fields_of(json!({"z": 64})));
+        assert_eq!(whole, integer);
+        assert_eq!(whole, {
+            let mut writer = FieldWriter::new();
+            writer.int("z", 64);
+            Some(writer.finish("Depth"))
+        });
+        assert_eq!(
+            bag_from_fields(&schemas, "Depth", &fields_of(json!({"z": 64.5}))),
+            None,
+            "a fraction is not an integer, and a bag that dropped it would
+             reset the field on the cart"
+        );
+    }
+
     #[test]
     fn a_list_integer_too_wide_for_the_tag_is_refused() {
         let schemas = vec![entry("Path", vec![field("steps", FieldKind::List)])];

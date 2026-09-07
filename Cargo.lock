@@ -5937,6 +5937,7 @@ name = "emerald-editor-link"
 version = "0.2.0"
 dependencies = [
  "emerald-editor-runtime",
+ "emerald-world",
 ]
 
 [[package]]

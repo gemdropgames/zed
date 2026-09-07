@@ -24,7 +24,7 @@
 //! deselect).
 
 mod audio_budget;
-pub mod bags;
+mod bags;
 mod canvas;
 mod inspector;
 mod live;
@@ -35,7 +35,7 @@ pub use live::CanvasMode;
 pub use world_canvas_item::WorldCanvasItem;
 pub use world_dock::{OpenMode, WorldDock};
 
-use emerald_editor_link::{EditCommand, EditorMode, GestureKind};
+use emerald_editor_link::{CartBlobKind, EditCommand, EditorMode, GestureKind};
 use live::{LiveStatus, LiveView};
 
 use std::cell::RefCell;
@@ -1223,14 +1223,15 @@ impl OpenWorld {
 
     /// [`Self::note_doc_changed`] for a step whose BEFORE state is known
     /// -- undo, redo, and the ops that funnel through `apply_op`. A step
-    /// that MOVED things and changed nothing else is replayed to the cart
-    /// as one `SetTransform` per affected cart index instead of a whole
-    /// world resend: a reload takes the cart's rows away until the blob
-    /// has landed and been redrawn, which is a visible blink for an undo
-    /// that only put a sprite back where it was. Everything else -- an
-    /// added or removed item, a field, a background -- still re-sends,
-    /// because the flattened order the cart indexes in is the encoder's
-    /// to describe.
+    /// the cart can be TOLD about -- a move, a component the inspector
+    /// committed, an entity appended or dropped off the end -- is replayed
+    /// as those commands instead of a whole world resend: a reload takes
+    /// the cart's rows away until the blob has landed and been redrawn,
+    /// which is a visible blink for an undo that only put a sprite back
+    /// where it was. Everything else -- a background slot, an
+    /// `[[instance]]`, a removed component, a removal that shifts the
+    /// document's indices -- still re-sends, because the flattened order
+    /// the cart indexes in is the encoder's to describe.
     ///
     /// A step the store folded away -- an op that set a field to the value
     /// it already held -- is not a document change at all, and re-sending
@@ -1247,8 +1248,8 @@ impl OpenWorld {
         let Some(live) = self.live.as_mut() else {
             return;
         };
-        match live.transform_replay(before, &after) {
-            Some(transforms) => live.queue_transforms(transforms),
+        match live.plan_replay(before, &after) {
+            Some(edits) => live.queue_edits(edits),
             None => live.world_dirty = true,
         }
     }
@@ -1476,21 +1477,55 @@ impl OpenWorld {
                         log::warn!("GGO: live command: {error}");
                     }
                 }
-                // ONE transform per tick: the cart commits it into its
+                // ONE command per tick: the cart commits it into its
                 // single command slot and stops reading datagrams until
                 // the frame after has acked it, so the rest of a burst
-                // would only fill a four-deep queue. A transform that the
+                // would only fill a four-deep queue. A transform the
                 // mailbox refuses (an index past the cart's cap) is
                 // dropped rather than retried, and never recorded as
                 // sent: the row it would have suppressed is the cart's
-                // own after all.
-                if let Some(transform) = live.pending_transforms.pop_front() {
-                    match live
-                        .mailbox
-                        .set_transform(transform.0, transform.1, transform.2)
-                    {
-                        Ok(()) => live.note_transform_sent(transform),
-                        Err(error) => log::warn!("GGO: live set_transform: {error}"),
+                // own after all. Every other refusal falls back on the
+                // world blob, which can always say what a command could
+                // not.
+                if let Some(edit) = live.pending_edits.pop_front() {
+                    match edit {
+                        live::CartEdit::Transform { index, x, y } => {
+                            match live.mailbox.set_transform(index, x, y) {
+                                Ok(()) => live.note_transform_sent((index, x, y)),
+                                Err(error) => log::warn!("GGO: live set_transform: {error}"),
+                            }
+                        }
+                        live::CartEdit::Component { index, bag, .. } => {
+                            if let Err(error) = live.mailbox.set_component(index, &bag) {
+                                log::warn!("GGO: live set_component: {error}");
+                                live.world_dirty = true;
+                            }
+                        }
+                        live::CartEdit::Despawn { index } => {
+                            if let Err(error) = live.mailbox.despawn(index) {
+                                log::warn!("GGO: live despawn: {error}");
+                                live.world_dirty = true;
+                            }
+                        }
+                        live::CartEdit::Spawn { entity, bags } => {
+                            let bodies: Vec<&[u8]> =
+                                bags.iter().map(std::vec::Vec::as_slice).collect();
+                            match live.mailbox.spawn(&bodies) {
+                                Ok(true) => live.note_spawn_sent(entity),
+                                // The transfer queue is full and the spawn
+                                // was NOT sent: it goes back to the front
+                                // and is asked for again next tick.
+                                Ok(false) => {
+                                    drop(bodies);
+                                    live.pending_edits
+                                        .push_front(live::CartEdit::Spawn { entity, bags });
+                                }
+                                Err(error) => {
+                                    log::warn!("GGO: live spawn: {error}");
+                                    live.world_dirty = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1553,7 +1588,7 @@ impl OpenWorld {
                         // The blob places every row itself, and its
                         // flattening may not be the one these indices
                         // were computed against.
-                        live.forget_transforms();
+                        live.forget_edits();
                         live.index_map = live::IndexMap::new(
                             self.store.state().entities.len(),
                             &self.instance_counts,
@@ -1677,6 +1712,24 @@ impl OpenWorld {
         // while a world blob is in flight would be applied against the
         // NEXT world's index map, which describes a different document.
         let removed = live.mailbox.take_removed();
+        // Drained for the same reason, and because a queue nobody empties
+        // is a queue that grows: the cart publishes a component's whole
+        // new value on every change it makes, its own and the host's.
+        let component_changes = live.mailbox.take_component_changes();
+        let added = live.mailbox.take_added();
+        // The only cart -> host blob this phase asks for. A blob of
+        // another kind is dropped rather than left in the queue behind it
+        // (Task 3's save takes the layer readbacks).
+        let mut snapshot: Option<Vec<u8>> = None;
+        while let Some((kind, _, body)) = live.mailbox.take_blob() {
+            if kind == CartBlobKind::Snapshot {
+                snapshot = Some(body);
+            }
+        }
+        let mut snapshot_failed = false;
+        while let Some((kind, _)) = live.mailbox.take_failed_blob() {
+            snapshot_failed |= kind == CartBlobKind::Snapshot;
+        }
 
         let marquee = live.mailbox.marquee().map(|band| band.map(f64::from));
         if marquee != live.marquee {
@@ -1778,6 +1831,104 @@ impl OpenWorld {
                 })
                 .collect();
         }
+        // What the cart says each changed component now holds, decoded
+        // against ITS schema table -- the only one whose field hashes the
+        // bags were written with. Every entry is a whole component value,
+        // not a diff, and the ops below drop the fields that already read
+        // that way in the document (the cart echoes the host's own
+        // `set_component` back once, and a Transform lands here as well as
+        // in the rows).
+        let mut component_reports: Vec<(usize, String, serde_json::Map<String, Value>)> =
+            Vec::new();
+        if fold {
+            for (index, bag) in &component_changes {
+                // An instance member's components belong to the instanced
+                // world file, which the document does not edit through
+                // this world: only its transform mirrors, and the rows
+                // above are where that happens.
+                let Some(Selection::Entity(entity)) = live.index_map.selection_of(*index) else {
+                    continue;
+                };
+                let Some((component, fields)) = bags::fields_from_bag(live.mailbox.schemas(), bag)
+                else {
+                    continue;
+                };
+                component_reports.push((entity, component, fields));
+            }
+        }
+
+        // Every entity the cart numbered since the last tick. One answers
+        // a spawn the host asked for; anything else is a cart-side spawn
+        // whose components only a snapshot can tell the document.
+        let mut resend_after_spawn = false;
+        let mut ask_for_snapshot = false;
+        for index in added {
+            match live.claim_added(index) {
+                // The cart hands out one past its highest tracked index
+                // while the document appended at its own end. They agree
+                // in the world this replay is allowed in ([`plan_replay`]
+                // refuses an instanced one), but a cart whose own systems
+                // hold indices the document never had can still disagree
+                // -- and then only a reload puts the two flattenings back
+                // together.
+                live::AddedEntity::Spawned { doc_entity, index } => {
+                    resend_after_spawn |= index as usize != doc_entity;
+                }
+                live::AddedEntity::Echo => {}
+                live::AddedEntity::Unknown(index) => {
+                    if !live.added_unknown.contains(&index) {
+                        live.added_unknown.push(index);
+                    }
+                    ask_for_snapshot = true;
+                }
+            }
+        }
+        if resend_after_spawn {
+            live.world_dirty = true;
+        }
+        if ask_for_snapshot && !live.snapshot_pending {
+            match live.mailbox.request_snapshot() {
+                Ok(()) => live.snapshot_pending = true,
+                // Nothing else re-arms it, so the entity the cart added
+                // stays outside the document until the world is re-sent.
+                Err(error) => {
+                    log::warn!("GGO: live snapshot: {error}");
+                    live.added_unknown.clear();
+                    live.world_dirty = true;
+                }
+            }
+        }
+        // The bags of every cart-side spawn this snapshot answers for,
+        // in the order the cart numbered them.
+        let mut snapshot_adds: Vec<(u32, serde_json::Map<String, Value>)> = Vec::new();
+        if let Some(body) = snapshot {
+            live.snapshot_pending = false;
+            let wanted = std::mem::take(&mut live.added_unknown);
+            let parsed = emerald_editor_link::parse_snapshot(&body).unwrap_or_default();
+            for index in wanted {
+                let Some((_, bags)) = parsed.iter().find(|(slot, _)| *slot == index) else {
+                    continue;
+                };
+                let mut components = serde_json::Map::new();
+                for bag in bags {
+                    if let Some((name, fields)) = bags::fields_from_bag(live.mailbox.schemas(), bag)
+                    {
+                        components.insert(name, Value::Object(fields));
+                    }
+                }
+                snapshot_adds.push((index, components));
+            }
+        } else if snapshot_failed && live.snapshot_pending {
+            // The bytes are not coming. Asking again would race the same
+            // failure; the world blob describes the whole table instead.
+            live.snapshot_pending = false;
+            live.added_unknown.clear();
+            live.world_dirty = true;
+        }
+        // Spawns the cart never answered: the protocol has no refusal
+        // edge, so the budget running out IS the refusal.
+        let expired_spawns = live.expire_spawns();
+
         // Motion nobody asked for -- a user edit system animating an
         // entity -- gets a synthetic gesture for as long as it lasts, so a
         // burst is one undo entry rather than one per cart frame.
@@ -1794,7 +1945,13 @@ impl OpenWorld {
         // Nothing to fold: the document is not cloned for a tick that has
         // no report to apply, and a connected cart publishes a frame of
         // unchanged rows every 16 ms.
-        if selection.is_none() && rows.is_empty() && removed_entities.is_empty() {
+        if selection.is_none()
+            && rows.is_empty()
+            && removed_entities.is_empty()
+            && component_reports.is_empty()
+            && snapshot_adds.is_empty()
+            && expired_spawns.is_empty()
+        {
             return changed;
         }
 
@@ -1859,6 +2016,89 @@ impl OpenWorld {
             changed = true;
         }
 
+        if !component_reports.is_empty() {
+            // Against the document as the row fold just LEFT it, not the
+            // clone taken above: a `Transform` bag arrives alongside the
+            // row that already moved the entity, and re-reading is what
+            // makes that report a no-op instead of an undo entry of its
+            // own. The cart's own echo of a host `set_component` lands the
+            // same way.
+            let now = self.store.state();
+            let mut ops: Vec<WorldOp> = Vec::new();
+            for (entity, component, fields) in component_reports {
+                let Some(held) = now.entities.get(entity) else {
+                    continue;
+                };
+                let Some(held) = held.components.get(&component).and_then(Value::as_object) else {
+                    // A component the document's entity does not hold at
+                    // all: one of the cart's own edit systems inserted it.
+                    ops.push(WorldOp::AddComponent {
+                        entity,
+                        name: component,
+                        defaults: fields,
+                    });
+                    continue;
+                };
+                for (field, value) in fields {
+                    // `SetField` writes over an existing key only, so a
+                    // field the document's copy does not name is dropped
+                    // rather than silently lost inside a no-op op -- the
+                    // two sides' schemas can differ by a cart rebuild.
+                    let Some(current) = held.get(&field) else {
+                        continue;
+                    };
+                    if live::same_value(current, &value) {
+                        continue;
+                    }
+                    ops.push(WorldOp::SetField {
+                        entity,
+                        component: component.clone(),
+                        field,
+                        value,
+                    });
+                }
+            }
+            // One undo entry for the whole tick's report, the way a group
+            // move folds into one.
+            if let Some(op) = Self::one_step(ops) {
+                self.apply_mirror_op(op);
+                changed = true;
+            }
+        }
+
+        // A spawn the cart never answered. There is no refusal edge on the
+        // wire, so the budget running out IS the refusal, and the
+        // optimistic entity comes back out -- highest first, so the
+        // indices below it do not shift under the next removal.
+        if !expired_spawns.is_empty() {
+            let entities = self.store.state().entities.len();
+            let ops: Vec<WorldOp> = expired_spawns
+                .iter()
+                .filter(|entity| **entity < entities)
+                .map(|entity| WorldOp::RemoveEntity { index: *entity })
+                .collect();
+            if let Some(op) = Self::one_step(ops) {
+                self.apply_mirror_op(op);
+                self.prune_selection();
+            }
+            self.live_error = Some("add entity refused by the cart".to_string());
+            changed = true;
+        }
+
+        for (index, components) in snapshot_adds {
+            self.apply_mirror_op(WorldOp::AddEntity { components });
+            // The document appends; the cart numbered the entity itself.
+            // When those disagree the flattenings do too, and only a
+            // reload makes them describe each other again.
+            let appended = self.store.state().entities.len().saturating_sub(1);
+            if index as usize != appended
+                && let Some(live) = self.live.as_mut()
+            {
+                live.world_dirty = true;
+            }
+            changed = true;
+        }
+
         removed_entities.sort_unstable();
         removed_entities.dedup();
         let entities = state.entities.len();
@@ -1888,6 +2128,17 @@ impl OpenWorld {
             changed = true;
         }
         changed
+    }
+
+    /// One op for a list the store has to undo in a single step. A single
+    /// op is passed through as itself: `Batch` seals whatever gesture is
+    /// open, and a lone mirrored op has no reason to.
+    fn one_step(mut ops: Vec<WorldOp>) -> Option<WorldOp> {
+        match ops.len() {
+            0 => None,
+            1 => ops.pop(),
+            _ => Some(WorldOp::Batch(ops)),
+        }
     }
 
     /// Apply one op the CART reported to the document, without the world
@@ -2443,8 +2694,12 @@ impl WorldPanel {
         transform.insert("pos".to_string(), serde_json::json!([center[0], center[1]]));
         let mut components = serde_json::Map::new();
         components.insert("Transform".to_string(), Value::Object(transform));
+        // Through the step diff, not `note_doc_changed`: in Live the new
+        // entity is a `spawn` on the cart, and the document holds it
+        // optimistically until the cart answers with the index it gave it.
+        let before = open.store.state();
         open.store.apply(WorldOp::AddEntity { components });
-        open.note_doc_changed();
+        open.note_doc_stepped(&before);
         open.selected = vec![Selection::Entity(open.store.state().entities.len() - 1)];
         open.edit_drag = None;
         open.nudge_gesture = None;
@@ -4841,6 +5096,12 @@ impl WorldPanel {
         }
     }
 
+    /// The inspector's one commit point -- blur, `CommitField`, and a
+    /// picked stem, never a keystroke. That is what keeps a Live session's
+    /// `SetComponent` traffic down to one datagram per committed field:
+    /// the cart interns every distinct string a bag names, so a commit per
+    /// keystroke would leak an allocation per character typed. A future
+    /// commit-on-input has to debounce (~300 ms idle) before it lands here.
     fn commit_editor(&mut self, editor_id: EntityId, cx: &mut Context<Self>) {
         // The inspector is read-only in Play, but a read-only editor still
         // takes focus -- and a click on the canvas blurs it, which commits.
@@ -14092,6 +14353,20 @@ mod tests {
         Arc<ggo_common::LinkEndpoint>,
         &'a mut gpui::VisualTestContext,
     ) {
+        live_panel_rel(cx, dir, "worlds/test.toml").await
+    }
+
+    /// [`live_panel`] for a world other than the fixture's own.
+    async fn live_panel_rel<'a>(
+        cx: &'a mut TestAppContext,
+        dir: &tempfile::TempDir,
+        rel: &str,
+    ) -> (
+        Entity<WorldPanel>,
+        Arc<ggo_common::LinkEndpoint>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let rel = rel.to_string();
         let project = routed_project(cx, dir.path(), true).await;
         cx.update(|cx| ggo_common::register_viewer_booter(cx, fake_booter));
         let (multi_workspace, cx) =
@@ -14109,7 +14384,7 @@ mod tests {
         });
         workspace.update_in(cx, |workspace, window, cx| {
             ggo_common::open_in_panel(workspace, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world(&rel, window, cx);
             })
         });
         cx.run_until_parked();
@@ -14286,6 +14561,138 @@ mod tests {
         cart_says(endpoint, out);
     }
 
+    /// `0x8E ComponentChanged`: `index u32`, then the component's whole
+    /// new bag.
+    fn cart_component_changed(endpoint: &ggo_common::LinkEndpoint, index: u32, bag: &[u8]) {
+        let mut out = vec![0x8E];
+        out.extend_from_slice(&index.to_le_bytes());
+        out.extend_from_slice(bag);
+        cart_says(endpoint, out);
+    }
+
+    /// `0x8F EntityAdded`: `index u32`.
+    fn cart_added(endpoint: &ggo_common::LinkEndpoint, index: u32) {
+        let mut out = vec![0x8F];
+        out.extend_from_slice(&index.to_le_bytes());
+        cart_says(endpoint, out);
+    }
+
+    /// One whole cart -> host blob: `0x90 CartBlobBegin` (`kind u8, len
+    /// u32, index u32`), one `0x91 CartBlobChunk` per [`CHUNK_BYTES`]
+    /// (`seq u16, off u32, data`), then `0x92 CartBlobEnd` carrying one
+    /// past the last chunk's sequence number.
+    fn cart_blob(endpoint: &ggo_common::LinkEndpoint, kind: u8, index: u32, body: &[u8]) {
+        use emerald_editor_runtime::wire::CHUNK_BYTES;
+
+        let mut begin = vec![0x90, kind];
+        begin.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        begin.extend_from_slice(&index.to_le_bytes());
+        cart_says(endpoint, begin);
+        let mut seq: u16 = 0;
+        for (chunk, data) in body.chunks(CHUNK_BYTES).enumerate() {
+            let mut out = vec![0x91];
+            out.extend_from_slice(&seq.to_le_bytes());
+            out.extend_from_slice(&((chunk * CHUNK_BYTES) as u32).to_le_bytes());
+            out.extend_from_slice(data);
+            cart_says(endpoint, out);
+            seq += 1;
+        }
+        let mut end = vec![0x92];
+        end.extend_from_slice(&seq.to_le_bytes());
+        cart_says(endpoint, end);
+    }
+
+    /// `0x83 Schema`: `off u16`, then the packed table -- `count u16`,
+    /// then per component `name str, field_count u8`, then per field
+    /// `name str, kind u8`. The bags only mean anything against this
+    /// table, since a bag names its fields by hash alone.
+    fn cart_schemas(endpoint: &ggo_common::LinkEndpoint) {
+        const INT: u8 = 0;
+        const FIXED: u8 = 1;
+        const BOOL: u8 = 2;
+        const STR: u8 = 3;
+        const VEC2: u8 = 4;
+        let components: &[(&str, &[(&str, u8)])] = &[
+            ("Transform", &[("pos", VEC2), ("z", INT)]),
+            (
+                "Text",
+                &[
+                    ("content", STR),
+                    ("max_width", FIXED),
+                    ("max_height", FIXED),
+                ],
+            ),
+            ("Camera", &[("is_active", BOOL)]),
+        ];
+        let mut table = Vec::new();
+        table.extend_from_slice(&(components.len() as u16).to_le_bytes());
+        for (name, fields) in components {
+            table.push(name.len() as u8);
+            table.extend_from_slice(name.as_bytes());
+            table.push(fields.len() as u8);
+            for (field, kind) in *fields {
+                table.push(field.len() as u8);
+                table.extend_from_slice(field.as_bytes());
+                table.push(*kind);
+            }
+        }
+        let mut out = vec![0x83];
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&table);
+        cart_says(endpoint, out);
+    }
+
+    /// A `Transform` bag, the shape the cart publishes and takes back.
+    fn transform_bag(pos: [f64; 2], z: i32) -> Vec<u8> {
+        let mut writer = emerald_world::FieldWriter::new();
+        writer.vec2(
+            "pos",
+            emerald_core::Vec2::new(
+                emerald_core::Fixed::from_raw(live::to_raw(pos[0])),
+                emerald_core::Fixed::from_raw(live::to_raw(pos[1])),
+            ),
+        );
+        writer.int("z", z);
+        writer.finish("Transform")
+    }
+
+    /// Every `SetComponent` in `sent`, as `(entity index, bag)`.
+    fn set_components(sent: &[Vec<u8>]) -> Vec<(u32, Vec<u8>)> {
+        use emerald_editor_runtime::wire::{self, HostMsg};
+
+        sent.iter()
+            .filter_map(|message| match wire::decode_host(message) {
+                Some(HostMsg::SetComponent { index, bag }) => Some((index, bag.to_vec())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One string field of a bag, read back the way the cart would.
+    fn bag_str(bag: &[u8], field: &str) -> Option<String> {
+        let (_, reader, _) = emerald_world::FieldReader::from_bag(bag)?;
+        match reader.get(emerald_world::field_hash(field))? {
+            emerald_world::FieldValue::Str(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Drive `count` cart frames past wherever the session is, so the
+    /// deadlines measured on the cart's own frame counter can expire.
+    fn cart_frames(
+        panel: &Entity<WorldPanel>,
+        endpoint: &ggo_common::LinkEndpoint,
+        cx: &mut gpui::VisualTestContext,
+        count: u32,
+    ) {
+        let mut frame = panel.read_with(cx, |panel, _| live_of(panel).mailbox.frame_seq());
+        for _ in 0..count {
+            frame += 1;
+            cart_frame(endpoint, frame);
+            cx.run_until_parked();
+        }
+    }
+
     const GESTURE_BEGIN: u8 = 0;
     const GESTURE_END: u8 = 1;
 
@@ -14345,7 +14752,7 @@ mod tests {
                     || live.layers_dirty.any()
                     || !live.layer_queue.is_empty()
                     || live.pending_camera.is_some()
-                    || !live.pending_transforms.is_empty()
+                    || !live.pending_edits.is_empty()
                     || live.mailbox.busy()
                     || !live.loaded()
             });
@@ -14395,6 +14802,10 @@ mod tests {
             &endpoint,
             hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, tools),
         );
+        // A real cart publishes its schema table right behind the
+        // greeting, and without it no bag on either side of the link means
+        // anything: the fields are named by hash alone.
+        cart_schemas(&endpoint);
         cx.run_until_parked();
         panel.update(cx, |panel, _| {
             let mut view = open_of(panel).view.borrow_mut();
@@ -14405,6 +14816,41 @@ mod tests {
                 gpui::size(px(800.), px(600.)),
             ));
         });
+        settle_live(&panel, &endpoint, cx);
+        (panel, endpoint, dir, cx)
+    }
+
+    /// [`connected_live_panel`] on a world with no `[[instance]]` -- the
+    /// only shape whose cart flattening a spawn or a despawn keeps in step
+    /// with the document's (see `LiveView::plan_replay`).
+    async fn connected_live_panel_flat(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<WorldPanel>,
+        Arc<ggo_common::LinkEndpoint>,
+        tempfile::TempDir,
+        &mut gpui::VisualTestContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_world(
+            dir.path(),
+            "worlds/flat.toml",
+            &WorldFile {
+                entities: vec![entity(json!({ "Transform": { "pos": [4.0, 4.0], "z": 0 } }))],
+                instances: vec![],
+                backgrounds: vec![],
+            },
+        )
+        .unwrap();
+        let (panel, endpoint, cx) = live_panel_rel(cx, &dir, "worlds/flat.toml").await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
+        cart_schemas(&endpoint);
+        cx.run_until_parked();
         settle_live(&panel, &endpoint, cx);
         (panel, endpoint, dir, cx)
     }
@@ -15078,6 +15524,255 @@ mod tests {
             };
             assert!(open.store.undo(), "one entry for the move");
             assert_eq!(open.store.state().instances[0].pos, [32.0, 16.0]);
+        });
+    }
+
+    /// A component the cart changed lands in the document as `SetField`s
+    /// for the fields that actually differ -- and a report that already
+    /// reads that way changes nothing at all, which is what the cart's
+    /// echo of the host's own write looks like.
+    #[gpui::test]
+    async fn a_component_change_from_the_cart_updates_the_document(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        let pos_before = panel.read_with(cx, |panel, _| {
+            open_of(panel).store.state().entities[0].components["Transform"]["pos"].clone()
+        });
+
+        cart_component_changed(&endpoint, 0, &transform_bag([4.0, 4.0], 5));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            assert_eq!(state.entities[0].components["Transform"]["z"], json!(5));
+            assert_eq!(
+                state.entities[0].components["Transform"]["pos"],
+                pos_before,
+                "the position it was already at is not rewritten -- the bag
+                 decodes to `4.0` where the document authored `4`, and an op
+                 between the two is one the store would fold away anyway"
+            );
+            assert!(
+                !live_of(panel).world_dirty,
+                "a mirrored component is not re-sent to the cart that reported it"
+            );
+        });
+
+        // The same bag again -- what the cart publishes when the host's own
+        // `set_component` echoes back off its dirty tracking.
+        cart_component_changed(&endpoint, 0, &transform_bag([4.0, 4.0], 5));
+        cx.run_until_parked();
+        // Destructive, so it goes last: one entry for the change, and none
+        // at all for the report that said what the document already held.
+        assert_eq!(undo_depth(&panel, cx), 1);
+    }
+
+    /// An instance MEMBER's components belong to the instanced world file:
+    /// only its transform mirrors, through the rows.
+    #[gpui::test]
+    async fn an_instance_members_component_change_is_ignored(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        let before = panel.read_with(cx, |panel, _| open_of(panel).store.state());
+
+        // Index 3 is the one entity `worlds/sub` contributes.
+        cart_component_changed(&endpoint, 3, &transform_bag([99.0, 99.0], 7));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).store.state().entities, before.entities);
+            assert_eq!(open_of(panel).store.state().instances, before.instances);
+        });
+    }
+
+    /// An inspector commit in Live is a `SetComponent` carrying the
+    /// document's own component -- not a whole world blob, which would
+    /// reload the cart under the field being typed into.
+    #[gpui::test]
+    async fn an_inspector_commit_in_live_sets_the_component(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::SetField {
+                    entity: 0,
+                    component: "Text".to_string(),
+                    field: "content".to_string(),
+                    value: json!("zz"),
+                },
+                cx,
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).world_dirty,
+                "a field the cart can be told about is not a resend"
+            );
+        });
+        let sent = settle_live(&panel, &endpoint, cx);
+        let writes = set_components(&sent);
+        assert_eq!(writes.len(), 1, "one SetComponent, once");
+        assert_eq!(writes[0].0, 0, "aimed at the cart index of entity 0");
+        assert_eq!(bag_str(&writes[0].1, "content").as_deref(), Some("zz"));
+        assert!(
+            sent.iter().all(|message| message.first() != Some(&0x08)),
+            "and no blob of any kind"
+        );
+    }
+
+    /// Undo of a field edit is the same command with the value the field
+    /// used to hold.
+    #[gpui::test]
+    async fn undo_of_a_field_edit_sends_the_old_bag(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::SetField {
+                    entity: 0,
+                    component: "Text".to_string(),
+                    field: "content".to_string(),
+                    value: json!("zz"),
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.undo_impl(cx));
+        let sent = settle_live(&panel, &endpoint, cx);
+        let writes = set_components(&sent);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            bag_str(&writes[0].1, "content").as_deref(),
+            Some("ab"),
+            "the fixture's own text, back on the cart"
+        );
+        assert!(
+            sent.iter().all(|message| message.first() != Some(&0x08)),
+            "an undo the cart can be told about does not reload it"
+        );
+    }
+
+    /// `+ Entity` in Live spawns on the cart: an `Entity` blob at the
+    /// reserved spawn index, and the document keeps the entity it added
+    /// optimistically once the cart reports the index it gave it.
+    #[gpui::test]
+    async fn adding_an_entity_in_live_spawns_it_on_the_cart(cx: &mut TestAppContext) {
+        use emerald_editor_runtime::wire::{self, BlobKind, HostMsg};
+
+        let (panel, endpoint, _dir, cx) = connected_live_panel_flat(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).store.state().entities.len(), 2);
+            assert!(
+                !live_of(panel).world_dirty,
+                "the cart is told about the entity, not handed the world"
+            );
+        });
+        let sent = settle_live(&panel, &endpoint, cx);
+        let spawns: Vec<u32> = sent
+            .iter()
+            .filter_map(|message| match wire::decode_host(message) {
+                Some(HostMsg::BlobBegin {
+                    kind: BlobKind::Entity,
+                    index,
+                    ..
+                }) => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spawns,
+            vec![wire::SPAWN_INDEX],
+            "one spawn, at the reserved index"
+        );
+
+        // The cart numbers it, which is the only way the host learns the
+        // index -- and here it is the one the document appended at.
+        cart_added(&endpoint, 1);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).store.state().entities.len(), 2);
+            assert!(
+                !live_of(panel).world_dirty,
+                "the two flattenings agree, so nothing has to be re-sent"
+            );
+            assert!(live_of(panel).pending_spawns.is_empty());
+        });
+    }
+
+    /// An `EntityAdded` nobody asked for -- one of the cart's own edit
+    /// systems spawned it -- makes the host ask for a snapshot, which is
+    /// the only place the entity's components exist.
+    #[gpui::test]
+    async fn a_cart_side_spawn_is_read_out_of_a_snapshot(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        cart_added(&endpoint, 4);
+        cx.run_until_parked();
+        assert!(
+            host_sent(&endpoint)
+                .iter()
+                .any(|message| message.as_slice() == [0x12]),
+            "the host asks for a snapshot"
+        );
+
+        // `entity_count u32`, then per slot `index u32, comp_count u16,
+        // bags` -- the fixture's four tracked entities plus the new one.
+        let mut body = Vec::new();
+        body.extend_from_slice(&5u32.to_le_bytes());
+        for index in 0..5u32 {
+            body.extend_from_slice(&index.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&transform_bag([f64::from(index), 9.0], 3));
+        }
+        cart_blob(&endpoint, 0, 0, &body);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            assert_eq!(state.entities.len(), 4, "the document gained the entity");
+            assert_eq!(
+                state.entities[3].components["Transform"]["pos"],
+                json!([4.0, 9.0]),
+                "with the components the snapshot carried for index 4"
+            );
+            assert!(
+                live_of(panel).world_dirty,
+                "the document appended at 3 where the cart numbered 4, so
+                 only a reload makes the two flattenings agree"
+            );
+        });
+    }
+
+    /// A spawn the cart never answers is taken back: the protocol has no
+    /// refusal edge, so the wait running out is the only report there is.
+    #[gpui::test]
+    async fn a_spawn_the_cart_never_answers_is_taken_back(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_flat(cx).await;
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        settle_live(&panel, &endpoint, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).pending_spawns.len(), 1);
+        });
+
+        cart_frames(&panel, &endpoint, cx, 61);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).store.state().entities.len(),
+                1,
+                "the optimistic entity is gone again"
+            );
+            assert_eq!(
+                open_of(panel).live_error.as_deref(),
+                Some("add entity refused by the cart")
+            );
+            assert!(live_of(panel).pending_spawns.is_empty());
         });
     }
 
