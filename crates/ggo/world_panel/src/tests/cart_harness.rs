@@ -40,6 +40,15 @@ impl CartLink for EndpointCartLink {
         let Some(datagram) = self.pending.pop_front() else {
             return 0;
         };
+        // A datagram the cart's buffer cannot hold is a wire bug, not a
+        // short read: truncating it silently would hand the cart half a
+        // message and let the test pass on the half.
+        debug_assert!(
+            datagram.len() <= buf.len(),
+            "a {}-byte datagram does not fit the cart's {}-byte buffer",
+            datagram.len(),
+            buf.len()
+        );
         let taken = datagram.len().min(buf.len());
         buf[..taken].copy_from_slice(&datagram[..taken]);
         taken

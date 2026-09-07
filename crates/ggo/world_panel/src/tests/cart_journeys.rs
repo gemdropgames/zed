@@ -26,8 +26,11 @@ use super::*;
 
 /// The cart's own edit system for the journeys that need one: it counts
 /// the left presses it sees and claims the frame's pointer, which is how a
-/// real tool takes the gesture away from the built-in select.
+/// real tool takes the gesture away from the systems AFTER it.
 static USER_TOOL_PRESSES: AtomicU32 = AtomicU32::new(0);
+/// The same, for the edit system registered BEHIND `user_tool` -- it only
+/// counts a press nothing has claimed, which is what `consumed` is for.
+static LATE_TOOL_PRESSES: AtomicU32 = AtomicU32::new(0);
 
 fn user_tool(world: &mut emerald_core::World) {
     let Some(input) = world
@@ -45,6 +48,19 @@ fn user_tool(world: &mut emerald_core::World) {
     }
 }
 
+fn late_tool(world: &mut emerald_core::World) {
+    let Some(input) = world
+        .try_resource::<emerald_editor_runtime::EditorInput>()
+        .cloned()
+    else {
+        return;
+    };
+    if input.consumed || !input.just_pressed(emerald_editor_runtime::Button::Left) {
+        return;
+    }
+    LATE_TOOL_PRESSES.fetch_add(1, Ordering::SeqCst);
+}
+
 /// The cart's one game system: slides the entity at tracked index 0 a
 /// pixel right per frame, so a Play frame is visible in the rows.
 fn slide_first(world: &mut emerald_core::World) {
@@ -58,6 +74,10 @@ fn slide_first(world: &mut emerald_core::World) {
 
 const NO_SYSTEMS: emerald_editor_runtime::link::SystemTable = &[];
 const USER_TOOL_TABLE: emerald_editor_runtime::link::SystemTable = &[("user", user_tool)];
+/// Two tools in table order: the second sees a press only if the first
+/// left it alone.
+const TWO_TOOL_TABLE: emerald_editor_runtime::link::SystemTable =
+    &[("user", user_tool), ("late", late_tool)];
 const GAME_TABLE: emerald_editor_runtime::link::SystemTable = &[("slide", slide_first)];
 
 /// An entity table with just a `Transform` -- no sprite, so the cart
@@ -112,10 +132,7 @@ fn write_journey_fixture(root: &std::path::Path) {
         root,
         "worlds/pair.toml",
         &WorldFile {
-            entities: vec![
-                boxed_entity([0.0, 0.0]),
-                boxed_entity([0.0, PAIR_SPREAD]),
-            ],
+            entities: vec![boxed_entity([0.0, 0.0]), boxed_entity([0.0, PAIR_SPREAD])],
             instances: vec![],
             backgrounds: vec![],
         },
@@ -359,8 +376,9 @@ impl Journey<'_> {
     }
 
     fn entity_count(&mut self) -> usize {
-        self.panel
-            .read_with(self.cx, |panel, _| open_of(panel).store.state().entities.len())
+        self.panel.read_with(self.cx, |panel, _| {
+            open_of(panel).store.state().entities.len()
+        })
     }
 
     /// How many rows the CART is publishing -- its own `EntityCount`.
@@ -369,14 +387,33 @@ impl Journey<'_> {
             .read_with(self.cx, |panel, _| live_of(panel).rows.len())
     }
 
-    /// Undo one document entry and report whether there was one.
+    /// Undo one document entry the way the panel's own action does --
+    /// which also prunes the selection and re-sends the world, so the CART
+    /// moves back too -- and report whether there was an entry to undo.
+    /// Asserting on `store.undo()` alone would prove the document half and
+    /// leave the cart showing the move.
     fn undo(&mut self) -> bool {
-        self.panel.update(self.cx, |panel, _| {
-            let ViewerState::Ready(open) = &mut panel.state else {
-                panic!("expected Ready");
-            };
-            open.store.undo()
-        })
+        let before = self.doc_generation();
+        self.panel.update(self.cx, |panel, cx| panel.undo_impl(cx));
+        self.settle();
+        self.frames(2);
+        self.doc_generation() != before
+    }
+
+    /// The document's change counter, which every applied op moves.
+    fn doc_generation(&mut self) -> u64 {
+        self.panel
+            .read_with(self.cx, |panel, _| open_of(panel).doc_generation)
+    }
+
+    /// Zero the tool counters while the harness holds the runtime's
+    /// mailbox lock: the statics are shared by every journey in the
+    /// binary, and a reset taken BEFORE `journey()` (which is where the
+    /// lock is taken) could clear a count another journey is mid-way
+    /// through.
+    fn reset_tool_counters(&mut self) {
+        USER_TOOL_PRESSES.store(0, Ordering::SeqCst);
+        LATE_TOOL_PRESSES.store(0, Ordering::SeqCst);
     }
 
     /// A world point in canvas-local px, through the panel's OWN Live
@@ -471,21 +508,20 @@ impl Journey<'_> {
         self.cx.run_until_parked();
     }
 
+    /// Switch the cart's mode through the rail's own handler -- what the
+    /// `Edit | Play` buttons call. Not a simulated click: a journey's
+    /// coordinates are taken through the Live transform of a canvas laid
+    /// out at the device size, and the rail's click wiring is asserted in
+    /// the panel's own tests.
     fn set_mode(&mut self, mode: EditorMode) {
-        self.panel.update(self.cx, |panel, _| {
-            let live = live_mut_of(panel);
-            live.mode = mode;
-            live.mailbox.set_mode(mode).expect("the mode command sends");
-        });
+        self.panel
+            .update(self.cx, |panel, cx| panel.set_live_mode(mode, cx));
     }
 
+    /// Pick a tool through the rail's own handler, as the radio does.
     fn set_tool(&mut self, tool: u8) {
-        self.panel.update(self.cx, |panel, _| {
-            live_mut_of(panel)
-                .mailbox
-                .set_tool(tool)
-                .expect("the tool command sends");
-        });
+        self.panel
+            .update(self.cx, |panel, cx| panel.set_live_tool(tool, cx));
     }
 }
 
@@ -556,6 +592,12 @@ async fn drag_moves_the_entity_and_the_outline_follows(cx: &mut TestAppContext) 
     );
     assert!(journey.undo(), "the whole drag is one entry");
     assert_eq!(journey.entity_pos(BOX_A as usize), BOX_A_POS);
+    let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
+    assert_eq!(
+        [rect[0], rect[1]],
+        BOX_A_POS,
+        "and the CART moved back too: the undone world was re-sent"
+    );
     assert!(!journey.undo(), "and there was only the one");
 }
 
@@ -578,11 +620,7 @@ async fn undo_after_a_drag_moves_it_back_on_the_cart(cx: &mut TestAppContext) {
         [BOX_A_POS[0] + 30.0, BOX_A_POS[1]]
     );
 
-    journey
-        .panel
-        .update(journey.cx, |panel, cx| panel.undo_impl(cx));
-    journey.settle();
-    journey.frames(2);
+    assert!(journey.undo(), "the drag left one entry to undo");
 
     let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
     assert_eq!(
@@ -627,9 +665,10 @@ async fn shift_click_toggles_and_marquee_selects_two(cx: &mut TestAppContext) {
     journey.drag_to(to);
     journey.frames(2);
     journey.panel.read_with(journey.cx, |panel, _| {
-        assert!(
-            live_of(panel).marquee.is_some(),
-            "the panel draws the band the cart is dragging out"
+        assert_eq!(
+            live_of(panel).marquee,
+            Some([20.0, 30.0, 140.0, 80.0]),
+            "the panel draws the band the cart is dragging out, corner to corner"
         );
     });
     journey.release(to);
@@ -708,6 +747,8 @@ async fn nudge_delete_select_all_through_the_keymap(cx: &mut TestAppContext) {
         [BOX_A_POS[0] + 1.0, BOX_A_POS[1]],
         "one arrow is one pixel"
     );
+    let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
+    assert_eq!(rect[0], BOX_A_POS[0] + 1.0, "and the outline moved with it");
 
     journey.action(&NudgeRightTile);
     journey.frames(3);
@@ -716,6 +757,8 @@ async fn nudge_delete_select_all_through_the_keymap(cx: &mut TestAppContext) {
         [BOX_A_POS[0] + 17.0, BOX_A_POS[1]],
         "and the tile arrow is sixteen"
     );
+    let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
+    assert_eq!(rect[0], BOX_A_POS[0] + 17.0);
 
     journey.action(&SelectAll);
     journey.frames(3);
@@ -725,6 +768,11 @@ async fn nudge_delete_select_all_through_the_keymap(cx: &mut TestAppContext) {
         "the cart selected its whole table (the camera entity counts)"
     );
 
+    assert_eq!(
+        journey.cart_rows(),
+        3,
+        "the cart is drawing all three before the delete"
+    );
     journey.action(&DeleteSelected);
     journey.frames(4);
     assert_eq!(journey.cart_rows(), 0, "the cart has nothing left to draw");
@@ -773,6 +821,20 @@ async fn an_instance_drags_as_a_group_and_undoes_as_one(cx: &mut TestAppContext)
     );
     assert!(journey.undo(), "one entry for the whole group drag");
     assert_eq!(journey.instance_pos(0), INSTANCE_POS);
+    let back: Vec<[f64; 4]> = journey
+        .overlay()
+        .into_iter()
+        .filter(|(selection, _, _)| *selection == Selection::Instance(0))
+        .map(|(_, rect, _)| rect)
+        .collect();
+    assert_eq!(
+        back,
+        vec![
+            [INSTANCE_POS[0], INSTANCE_POS[1], 16.0, 16.0],
+            [member_b[0], member_b[1], 16.0, 16.0],
+        ],
+        "and both members are back on the cart, not just in the document"
+    );
     assert!(!journey.undo(), "and only the one");
 }
 
@@ -818,18 +880,20 @@ async fn play_mode_ignores_clicks_and_runs_the_game(cx: &mut TestAppContext) {
     assert!(journey.selected().is_empty());
 }
 
-/// 9. A cart's own edit system sees the frame's pointer first and can
-///    consume it, which takes the click away from the built-in select.
+/// 9. A cart tool claims the frame's pointer: with the tool selected the
+///    built-in select is inert, the tool sees the press, and `consumed`
+///    keeps the edit system BEHIND it off the same press.
+///
+///    `consumed` gates only the systems that run later -- the runtime
+///    schedules `edit_builtin` first (`sync::install`), so nothing can
+///    take a press away from the built-in select by consuming it. Taking
+///    the pointer off the built-ins is `SetTool`'s job.
 #[gpui::test]
-#[ignore = "the runtime schedules `edit_builtin` BEFORE the cart's edit \
-            systems (sync::install), so `EditorInput::consumed` is always \
-            false when the built-in select hit-tests: nothing can claim a \
-            tool-0 pointer ahead of it, and edit_builtin's own \
-            `!input.consumed` guard is unreachable. Claiming the pointer \
-            works only via SetTool (journey 10)."]
-async fn a_user_edit_system_sees_the_click_and_can_consume_it(cx: &mut TestAppContext) {
-    USER_TOOL_PRESSES.store(0, Ordering::SeqCst);
-    let mut journey = journey(cx, "worlds/journey.toml", USER_TOOL_TABLE, NO_SYSTEMS).await;
+async fn a_cart_tool_claims_the_pointer_from_the_systems_behind_it(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", TWO_TOOL_TABLE, NO_SYSTEMS).await;
+    journey.reset_tool_counters();
+    journey.set_tool(1);
+    journey.frames(2);
 
     let at = journey.on(BOX_A_POS);
     journey.click(at, Modifiers::none());
@@ -839,9 +903,14 @@ async fn a_user_edit_system_sees_the_click_and_can_consume_it(cx: &mut TestAppCo
         1,
         "the cart's edit system got the press"
     );
+    assert_eq!(
+        LATE_TOOL_PRESSES.load(Ordering::SeqCst),
+        0,
+        "and consuming it kept the system behind it off the same press"
+    );
     assert!(
         journey.selected().is_empty(),
-        "and consuming it left the built-in select nothing to do"
+        "the built-in select is not the active tool: nothing was selected"
     );
 }
 
@@ -849,8 +918,8 @@ async fn a_user_edit_system_sees_the_click_and_can_consume_it(cx: &mut TestAppCo
 ///     and switching back turns them on again.
 #[gpui::test]
 async fn switching_the_tool_makes_the_builtins_inert(cx: &mut TestAppContext) {
-    USER_TOOL_PRESSES.store(0, Ordering::SeqCst);
     let mut journey = journey(cx, "worlds/journey.toml", USER_TOOL_TABLE, NO_SYSTEMS).await;
+    journey.reset_tool_counters();
 
     journey.set_tool(1);
     journey.frames(2);

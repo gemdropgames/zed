@@ -1340,6 +1340,21 @@ impl OpenWorld {
                 // framing -- the camera origin the Design renderer frames
                 // -- not wherever the design pan happens to sit.
                 live.pending_camera = Some(active_camera_origin(&self.store.state()));
+                // A greeting resets the cart to Edit and to its select
+                // tool, and nothing else re-applies either: the mailbox
+                // re-sends only the (deprecated) system mask. Without this
+                // a re-greeted session shows a rail the cart is not
+                // obeying.
+                if live.tool != 0
+                    && let Err(error) = live.mailbox.set_tool(live.tool)
+                {
+                    log::warn!("GGO: live tool: {error}");
+                }
+                if live.mode != EditorMode::Edit
+                    && let Err(error) = live.mailbox.set_mode(live.mode)
+                {
+                    log::warn!("GGO: live mode: {error}");
+                }
             }
             // `is_connected` never goes false on its own; a cart that was
             // reset or unplugged is only visible as a session that stopped
@@ -1846,11 +1861,11 @@ pub struct WorldPanel {
     /// session: a fallback to Design is what turns Live off, and the user
     /// turning it back on is what turns it on again.
     canvas_mode: CanvasMode,
-    /// Which of the cart's systems the user wants running, sticky for the
-    /// same reason [`Self::canvas_mode`] is: leaving Live to look at the
-    /// design view should not silently re-arm the systems the user turned
-    /// off. Seeded into every new [`LiveView`] by [`Self::start_live`].
-    live_sys_mask: u64,
+    /// Which tool the user picked, sticky for the same reason
+    /// [`Self::canvas_mode`] is: leaving Live to look at the design view
+    /// should not silently hand the pointer back to the select tool.
+    /// Seeded into every new [`LiveView`] by [`Self::start_live`].
+    live_tool: u8,
     /// The link to the viewer cart THIS panel booted. One per panel, so
     /// each world tab drives its own viewer run: sharing one cart between
     /// tabs would make whichever world was greeted last the only one the
@@ -1903,7 +1918,7 @@ impl WorldPanel {
             retired_previous: Vec::new(),
             cell_clipboard: None,
             canvas_mode: CanvasMode::Live,
-            live_sys_mask: 0,
+            live_tool: 0,
             live_endpoint: None,
             live_boot_pending: false,
             dock: None,
@@ -1925,9 +1940,9 @@ impl WorldPanel {
     /// the next world tab with them. Called only by the paths the USER
     /// drives; a fallback to Design leaves the sticky choice alone.
     fn note_sticky_live(&self, cx: &mut App) {
-        let (mode, sys_mask) = (self.canvas_mode, self.live_sys_mask);
+        let (mode, tool) = (self.canvas_mode, self.live_tool);
         if let Some(dock) = self.dock.as_ref() {
-            dock.update(cx, |dock, _| dock.note_sticky(mode, sys_mask)).ok();
+            dock.update(cx, |dock, _| dock.note_sticky(mode, tool)).ok();
         }
     }
 
@@ -2628,8 +2643,9 @@ impl WorldPanel {
                 // is still its rel -- but the panel stays in Entities.
                 // Silently: the mode was withdrawn by the user's own
                 // later edit, which is not an error to report.
-                let still_wanted =
-                    this.paint_target_rel(&target).is_some_and(|(now, _)| now == rel);
+                let still_wanted = this
+                    .paint_target_rel(&target)
+                    .is_some_and(|(now, _)| now == rel);
                 let ViewerState::Ready(open) = &mut this.state else {
                     return;
                 };
@@ -4140,7 +4156,12 @@ impl WorldPanel {
     /// out-of-bounds handler fires for every release anywhere in the
     /// window, and a click in another panel is not a sample the cart has
     /// any use for.
-    fn canvas_button_up_out(&mut self, local: [f64; 2], button: MouseButton, modifiers: &Modifiers) {
+    fn canvas_button_up_out(
+        &mut self,
+        local: [f64; 2],
+        button: MouseButton,
+        modifiers: &Modifiers,
+    ) {
         if self.live_button_held(button) {
             self.canvas_button_up(local, button, modifiers);
         }
@@ -4220,6 +4241,17 @@ impl WorldPanel {
             bottom_right[0] - top_left[0],
             bottom_right[1] - top_left[1],
         ])
+    }
+
+    /// The band the Live overlay paints right now, in world px as an
+    /// origin and a size -- the same value `render_canvas` hands the
+    /// scene.
+    #[cfg(test)]
+    fn test_live_marquee(&self) -> Option<[f64; 4]> {
+        match &self.state {
+            ViewerState::Ready(open) => open.live.as_ref().and_then(live::LiveView::marquee_rect),
+            _ => None,
+        }
     }
 
     /// The DESIGN view's pan, which no Live gesture may touch.
@@ -4555,6 +4587,10 @@ impl WorldPanel {
     /// unfocused editors' text from the doc (a focused editor keeps the
     /// user's in-progress buffer, ggo-ide's `field_edit` rule).
     fn ensure_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The cart owns the entities while its game systems run, so the
+        // fields describe a play-through: an edit committed into one would
+        // be overwritten by the next frame and written to the file.
+        let read_only = self.live_playing();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -4569,6 +4605,9 @@ impl WorldPanel {
 
         if same_targets {
             for entry in &mut open.inspector {
+                entry
+                    .editor
+                    .update(cx, |editor, _| editor.set_read_only(read_only));
                 let text = inspector::display_text(&entry.target, &state, &open.schemas);
                 if entry.last_display == text {
                     continue;
@@ -4590,6 +4629,7 @@ impl WorldPanel {
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
                 editor.set_text(text.clone(), window, cx);
+                editor.set_read_only(read_only);
                 editor
             });
             let subscription = cx.subscribe_in(&editor, window, Self::handle_editor_event);
@@ -4893,19 +4933,10 @@ impl WorldPanel {
         };
         let mut live = LiveView::new(endpoint, now);
         live.poll = Some(poll);
-        live.sys_mask = self.live_sys_mask;
-        if live.sys_mask != 0 {
-            // Not just bookkeeping: the mailbox re-applies a NON-ZERO mask
-            // after every greeting, and the cart clears its own on each
-            // one. Arming it here is what carries the user's choices into
-            // a session whose `HelloAck` has not arrived yet.
-            // Task 3 removes the rail this mask drives.
-            #[allow(deprecated)]
-            let sent = live.mailbox.set_sys_mask(live.sys_mask);
-            if let Err(error) = sent {
-                log::warn!("GGO: live system mask: {error}");
-            }
-        }
+        // Carried into the session before its greeting: the push itself
+        // waits for the cart to answer (`live_step`), since a cart resets
+        // to its select tool on every greeting.
+        live.tool = self.live_tool;
         open.live = Some(live);
         open.live_error = None;
         if !self.live_tick(cx)
@@ -5081,38 +5112,66 @@ impl WorldPanel {
         self.note_sticky_live(cx);
     }
 
-    /// Turn one of the cart's own systems on or off for this session. The
-    /// mask is the panel's to remember: `LinkMailbox::set_sys_mask`
-    /// re-applies it after every greeting, so only changes go on the wire.
-    fn set_live_system(&mut self, index: usize, on: bool, cx: &mut Context<Self>) {
-        let Some(bit) = live::system_bit(index) else {
-            return;
-        };
+    /// Switch the cart between its edit systems and its game systems.
+    ///
+    /// The rail reads [`live::LiveView::mode`] back, so the state moves
+    /// here rather than waiting for the cart to confirm: the wire has no
+    /// mode report, and a switch that only showed once the cart answered
+    /// would never show at all. Whatever the mode change means for the
+    /// SELECTION is the cart's (it clears its own on entering Play); the
+    /// mirror follows it back.
+    pub(crate) fn set_live_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
         let Some(live) = open.live.as_mut() else {
             return;
         };
-        let mask = if on {
-            live.sys_mask | bit
-        } else {
-            live.sys_mask & !bit
-        };
-        live.sys_mask = mask;
-        // Task 3 removes the rail this mask drives.
-        #[allow(deprecated)]
-        let sent = live.mailbox.set_sys_mask(mask);
-        if let Err(error) = sent {
-            // The rail's own toggle draws from `sys_mask`, so a push that
-            // never left would otherwise show the system as switched with
-            // the cart still running it.
-            log::warn!("GGO: live system mask: {error}");
+        if live.mode == mode {
+            return;
+        }
+        live.mode = mode;
+        if let Err(error) = live.mailbox.set_mode(mode) {
+            // The rail already reads the new mode, so a push that never
+            // left would otherwise show a cart switched that is not.
+            log::warn!("GGO: live mode: {error}");
             open.live_error = Some(format!("live update: {error}"));
         }
-        self.live_sys_mask = mask;
+        cx.notify();
+    }
+
+    /// Pick the tool the cart runs the pointer through. Sticky on the
+    /// panel (and through it the dock) for the same reason the canvas mode
+    /// is: the next session is the same user's.
+    pub(crate) fn set_live_tool(&mut self, tool: u8, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(live) = open.live.as_mut() else {
+            return;
+        };
+        live.tool = tool;
+        if let Err(error) = live.mailbox.set_tool(tool) {
+            log::warn!("GGO: live tool: {error}");
+            open.live_error = Some(format!("live update: {error}"));
+        }
+        self.live_tool = tool;
         self.note_sticky_live(cx);
         cx.notify();
+    }
+
+    /// Whether the CART is playing rather than editing: the game systems
+    /// are moving the entities, so the document under them is not the
+    /// user's to edit.
+    fn live_playing(&self) -> bool {
+        self.live_active()
+            && match &self.state {
+                ViewerState::Ready(open) => open
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.mode == EditorMode::Play),
+                _ => false,
+            }
     }
 
     /// Leave Live mode deliberately: the session goes, and so does the
@@ -6418,10 +6477,11 @@ impl WorldPanel {
         )
     }
 
-    /// The systems rail: one checkbox per system the cart named in its
-    /// greeting. Live's alone -- the names come off the `HelloAck`, and in
-    /// Design mode there is no cart whose systems could be switched.
-    fn render_systems_rail(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The edit rail: the cart's `Edit | Play` switch and the tool radio
+    /// its greeting named. Live's alone -- the mode is the CART's system
+    /// table and the tool names come off the `HelloAck`, and in Design
+    /// mode there is no cart to run either.
+    fn render_edit_rail(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.live_active() {
             return None;
         }
@@ -6432,42 +6492,87 @@ impl WorldPanel {
         if live.status != LiveStatus::Connected {
             return None;
         }
-        // Task 3 removes the rail these names fill.
-        #[allow(deprecated)]
-        let names = live.mailbox.system_names();
-        let rows = live::system_rows(names, live.sys_mask);
+        let playing = live.mode == EditorMode::Play;
+        let mut rail = h_flex()
+            .gap_1()
+            .px_1()
+            .pb_1()
+            .child(self.render_edit_mode_half(
+                "ggo-world-mode-edit",
+                "Edit",
+                EditorMode::Edit,
+                live.mode,
+                "Run the cart's edit systems",
+                cx,
+            ))
+            .child(self.render_edit_mode_half(
+                "ggo-world-mode-play",
+                "Play",
+                EditorMode::Play,
+                live.mode,
+                "Run the cart's game systems",
+                cx,
+            ));
+        let rows = live::tool_rows(live.mailbox.tool_names(), live.tool);
         if rows.is_empty() {
-            return None;
+            return Some(rail.into_any_element());
         }
-        let mut rail = v_flex().gap_1().px_1().pb_1().child(
-            Label::new("Systems")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        );
-        for (index, (name, on)) in rows.into_iter().enumerate() {
+        rail = rail.child(Divider::vertical());
+        for (number, (name, on)) in rows.into_iter().enumerate() {
+            // `tool_rows` drops anything a `u8` cannot number, so this
+            // cast is the row's own tool number.
+            let tool = number as u8;
             let weak = cx.weak_entity();
             rail = rail.child(
                 // Wrapped for the `debug_selector` for the same reason the
-                // Save button is: `Checkbox` is a `RenderOnce`. The checked
-                // state is in the selector because a `ToggleState` is
-                // otherwise invisible to a test.
+                // Save button is: `Button` is a `RenderOnce` and records no
+                // bounds of its own, and a `toggle_state` is invisible to a
+                // test.
                 div()
                     .flex_none()
                     .debug_selector(move || {
-                        format!("ggo-world-system-{index}-{}", toggle_suffix(on))
+                        format!("ggo-world-tool-{number}-{}", toggle_suffix(on))
                     })
                     .child(
-                        Checkbox::new(("ggo-world-system", index), ToggleState::from(on))
-                            .label(SharedString::new(name))
-                            .on_click(move |toggle, _window, cx| {
-                                let on = matches!(toggle, ToggleState::Selected);
-                                weak.update(cx, |this, cx| this.set_live_system(index, on, cx))
+                        Button::new(("ggo-world-tool", number), SharedString::new(name))
+                            .label_size(LabelSize::XSmall)
+                            .toggle_state(on)
+                            // The tools ARE the edit table: nothing behind
+                            // them is running while the game is.
+                            .disabled(playing)
+                            .on_click(move |_, _window, cx| {
+                                weak.update(cx, |this, cx| this.set_live_tool(tool, cx))
                                     .ok();
                             }),
                     ),
             );
         }
         Some(rail.into_any_element())
+    }
+
+    /// One half of the rail's `Edit | Play` switch.
+    fn render_edit_mode_half(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        mode: EditorMode,
+        current: EditorMode,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = current == mode;
+        div()
+            .flex_none()
+            .debug_selector(move || format!("{id}-{}", toggle_suffix(selected)))
+            .child(
+                Button::new(id, label)
+                    .label_size(LabelSize::XSmall)
+                    .toggle_state(selected)
+                    .tooltip(ui::Tooltip::text(tooltip))
+                    .on_click(
+                        cx.listener(move |this, _, _window, cx| this.set_live_mode(mode, cx)),
+                    ),
+            )
     }
 
     /// The view-control row under the toolbar: the `Design | Live` switch,
@@ -6712,11 +6817,7 @@ impl WorldPanel {
             });
             // The band is the CART's: it decides what a drag on empty space
             // means, and the host only draws what it reports.
-            let marquee = open
-                .live
-                .as_ref()
-                .and_then(|live| live.marquee)
-                .map(|[x0, y0, x1, y1]| [x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()]);
+            let marquee = open.live.as_ref().and_then(live::LiveView::marquee_rect);
             let accent = cx.theme().colors().text_accent;
             // Read here, not in the closures: prepaint runs while this
             // entity is borrowed, so the geometry inputs travel as values.
@@ -6845,6 +6946,10 @@ impl WorldPanel {
                     }
                 }),
             )
+            // Never add `.on_click` (or a drag listener) to this div: gpui
+            // suppresses hover updates while a click is pending on the
+            // element (`pending_mouse_down`), which is exactly the held
+            // button whose release this handler has to flush.
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if *hovered {
                     return;
@@ -7001,6 +7106,10 @@ impl WorldPanel {
             unreachable!("inspector renders only in the Ready state");
         };
         let schemas = &open.schemas;
+        // Every control that CHANGES the document is off while the cart is
+        // playing; the field editors are held read-only by
+        // `ensure_inspector`.
+        let playing = self.live_playing();
         let mut col = v_flex()
             .gap_1()
             .child(Label::new(format!("Entity #{entity_ix}")).size(LabelSize::Small));
@@ -7018,6 +7127,7 @@ impl WorldPanel {
                                 IconName::Trash,
                             )
                             .icon_size(IconSize::XSmall)
+                            .disabled(playing)
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     // Direct undoable removal (ggo-ide's
@@ -7053,6 +7163,7 @@ impl WorldPanel {
                                         ToggleState::from(checked),
                                     )
                                     .label(SharedString::from(field.clone()))
+                                    .disabled(playing)
                                     .on_click(
                                         move |toggle, _window, cx| {
                                             let value = matches!(toggle, ToggleState::Selected);
@@ -7276,11 +7387,9 @@ impl WorldPanel {
                 }
                 menu
             });
-            col = col.child(DropdownMenu::new(
-                "ggo-add-component",
-                "Add component…",
-                menu,
-            ));
+            col = col.child(
+                DropdownMenu::new("ggo-add-component", "Add component…", menu).disabled(playing),
+            );
         }
 
         col.into_any_element()
@@ -7345,6 +7454,7 @@ impl WorldPanel {
             return None;
         };
         let selection = open.primary()?;
+        let playing = self.live_playing();
         let editors: HashMap<inspector::FieldTarget, Entity<Editor>> = open
             .inspector
             .iter()
@@ -7363,6 +7473,19 @@ impl WorldPanel {
             },
             Selection::Instance(i) => self.render_instance_inspector(i, &editors, cx),
         };
+        // Wrapped for the `debug_selector` for the same reason the Save
+        // button is, and rendered as a row of its own rather than as a
+        // state of the fields: "the cart is playing" is why they are
+        // inert, and a greyed field that says nothing is a bug report.
+        let playing_note = playing.then(|| {
+            div()
+                .debug_selector(|| "ggo-world-inspector-disabled".into())
+                .child(
+                    Label::new("Playing — the cart owns these entities")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        });
         Some(
             div()
                 .id("ggo-world-inspector")
@@ -7372,7 +7495,7 @@ impl WorldPanel {
                 .border_l_1()
                 .border_color(cx.theme().colors().border)
                 .overflow_y_scroll()
-                .child(v_flex().p_1().gap_1().child(body))
+                .child(v_flex().p_1().gap_1().children(playing_note).child(body))
                 .into_any_element(),
         )
     }
@@ -7491,7 +7614,7 @@ impl WorldPanel {
             .children(self.render_live_status(cx))
             .child(self.render_view_controls(cx))
             .child(self.render_layers_rail(cx))
-            .children(self.render_systems_rail(cx))
+            .children(self.render_edit_rail(cx))
             .child(body.children(paint))
             .into_any_element()
     }
@@ -14083,14 +14206,15 @@ mod tests {
         tempfile::TempDir,
         &mut gpui::VisualTestContext,
     ) {
-        connected_live_panel_with_systems(cx, &[]).await
+        connected_live_panel_with_tools(cx, &[]).await
     }
 
-    /// [`connected_live_panel`], with the cart greeting as a build that
-    /// carries `systems` -- the names the Live systems rail lists.
-    async fn connected_live_panel_with_systems<'a>(
+    /// [`connected_live_panel`], with the cart greeting as a build whose
+    /// tool names are `tools` -- what the rail's tool radio lists, tool 0
+    /// first.
+    async fn connected_live_panel_with_tools<'a>(
         cx: &'a mut TestAppContext,
-        systems: &[&str],
+        tools: &[&str],
     ) -> (
         Entity<WorldPanel>,
         Arc<ggo_common::LinkEndpoint>,
@@ -14103,7 +14227,7 @@ mod tests {
         cx.run_until_parked();
         cart_says(
             &endpoint,
-            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, systems),
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, tools),
         );
         cx.run_until_parked();
         panel.update(cx, |panel, _| {
@@ -14205,10 +14329,11 @@ mod tests {
             let open = open_of(panel);
             let live = open.live.as_ref().expect("a live session");
             assert_eq!(live.status, LiveStatus::Connected);
-            // Task 3 removes the rail these names fill.
-            #[allow(deprecated)]
-            let names = live.mailbox.system_names();
-            assert_eq!(names, ["animate"]);
+            assert_eq!(
+                live.mailbox.tool_names(),
+                ["animate"],
+                "the rail lists what the cart greeted with"
+            );
             assert_eq!(
                 live.index_map.len(),
                 4,
@@ -14478,7 +14603,10 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
         cx.run_until_parked();
 
         let notifications = Rc::new(std::cell::Cell::new(0usize));
@@ -14523,7 +14651,10 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             let open = open_of(panel);
@@ -14563,7 +14694,10 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
         cx.run_until_parked();
 
         panel.update_in(cx, |panel, window, cx| {
@@ -14676,11 +14810,19 @@ mod tests {
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert_eq!(live_of(panel).marquee, Some([10.0, 20.0, 30.0, 50.0]));
+            assert_eq!(
+                panel.test_live_marquee(),
+                Some([10.0, 20.0, 20.0, 30.0]),
+                "and the overlay paints it as an origin and a size"
+            );
         });
 
         cart_marquee(&endpoint, false, [0, 0, 0, 0]);
         cx.run_until_parked();
-        panel.read_with(cx, |panel, _| assert_eq!(live_of(panel).marquee, None));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).marquee, None);
+            assert_eq!(panel.test_live_marquee(), None, "and stops painting it");
+        });
     }
 
     /// A cart-side drag: the `Begin` opens the gesture, every frame of rows
@@ -16347,7 +16489,10 @@ mod tests {
             live.world_sync = live::WorldSync::Acked(0);
             live.mailbox.hello().expect("the link accepts a greeting");
         });
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             let live = live_of(panel);
@@ -16380,7 +16525,10 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
         cx.run_until_parked();
         let origin = panel.read_with(cx, |panel, _| {
             active_camera_origin(&open_of(panel).store.state())
@@ -16403,7 +16551,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------- mode switch, systems, status
+    // ---------------------------------- mode switch, edit rail, status
 
     /// The `-on`/`-off` halves of each stateful `debug_selector` this
     /// module asserts on. Named because `debug_bounds` takes `&'static
@@ -16412,9 +16560,16 @@ mod tests {
     const MODE_LIVE: (&str, &str) = ("ggo-world-mode-live-on", "ggo-world-mode-live-off");
     /// The Live boot screen's `debug_selector`.
     const LIVE_LOADING: &str = "ggo-world-live-loading";
-    const SYSTEM_0: (&str, &str) = ("ggo-world-system-0-on", "ggo-world-system-0-off");
-    const SYSTEM_1: (&str, &str) = ("ggo-world-system-1-on", "ggo-world-system-1-off");
-    const SYSTEM_2: (&str, &str) = ("ggo-world-system-2-on", "ggo-world-system-2-off");
+    /// The cart's own `Edit | Play` switch on the edit rail -- not the
+    /// `Design | Live` one above it, which picks the RENDERER.
+    const MODE_EDIT: (&str, &str) = ("ggo-world-mode-edit-on", "ggo-world-mode-edit-off");
+    const MODE_PLAY: (&str, &str) = ("ggo-world-mode-play-on", "ggo-world-mode-play-off");
+    const TOOL_0: (&str, &str) = ("ggo-world-tool-0-on", "ggo-world-tool-0-off");
+    const TOOL_1: (&str, &str) = ("ggo-world-tool-1-on", "ggo-world-tool-1-off");
+    const TOOL_2: (&str, &str) = ("ggo-world-tool-2-on", "ggo-world-tool-2-off");
+    /// The marker the inspector renders in Play, where the cart owns the
+    /// world and the document is not the user's to edit.
+    const INSPECTOR_DISABLED: &str = "ggo-world-inspector-disabled";
 
     /// The state a stateful `debug_selector` pair is rendering, or `None`
     /// when neither half is on screen.
@@ -16444,60 +16599,140 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// Ticking a system in the rail moves the session mask AND tells the
-    /// cart; the mailbox re-applies the mask itself after every greeting,
-    /// so the panel only has to push the changes.
-    #[gpui::test]
-    async fn toggling_a_system_sends_the_mask(cx: &mut TestAppContext) {
-        let (panel, endpoint, _dir, cx) =
-            connected_live_panel_with_systems(cx, &["animate", "ai"]).await;
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                {
-                    // Task 3 removes the rail these names fill.
-                    #[allow(deprecated)]
-                    let names = live_of(panel).mailbox.system_names();
-                    names
-                },
-                ["animate", "ai"],
-                "the rail lists what the cart greeted with"
-            );
-            assert_eq!(
-                live_of(panel).sys_mask,
-                0,
-                "editor systems only until the user asks otherwise"
-            );
+    /// The one host message of `kind` the session has queued, or a panic
+    /// naming what was on the wire instead. Returned undecoded: a
+    /// `HostMsg` borrows the bytes it was decoded from.
+    fn sent_host_msg(endpoint: &ggo_common::LinkEndpoint, kind: u8) -> Vec<u8> {
+        let sent = host_sent(endpoint);
+        sent.iter()
+            .find(|message| message.first() == Some(&kind))
+            .cloned()
+            .unwrap_or_else(|| panic!("no host message of kind {kind:#04x} on the wire: {sent:?}"))
+    }
+
+    /// Give the panel a selection, so the inspector has something to draw.
+    fn select_first_entity(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) {
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.selected = vec![Selection::Entity(0)];
+            cx.notify();
         });
+        cx.run_until_parked();
+    }
+
+    /// The rail's `Edit | Play` switch is the CART's mode: the click goes
+    /// out as `SetMode`, and Play greys the inspector -- the entities are
+    /// the game's while it runs, and a field edit would be written over.
+    #[gpui::test]
+    async fn clicking_play_sends_the_mode_and_greys_the_inspector(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) =
+            connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
+        select_first_entity(&panel, cx);
+        show_panel(cx);
+        assert_eq!(
+            toggle_of(cx, MODE_EDIT),
+            Some(true),
+            "a session comes up editing"
+        );
+        assert_eq!(toggle_of(cx, MODE_PLAY), Some(false));
+        assert!(
+            cx.debug_bounds(INSPECTOR_DISABLED).is_none(),
+            "and the inspector takes edits in Edit"
+        );
         host_sent(&endpoint);
 
-        panel.update(cx, |panel, cx| panel.set_live_system(1, true, cx));
+        let play = cx.debug_bounds(MODE_PLAY.1).expect("the Play half");
+        cx.simulate_click(play.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
-        let sent = host_sent(&endpoint);
-        match sent
-            .iter()
-            .find(|message| message.first() == Some(&0x07))
-            .and_then(|message| emerald_editor_runtime::wire::decode_host(message))
-        {
-            Some(emerald_editor_runtime::wire::HostMsg::SysMask { mask }) => {
-                assert_eq!(mask, 0b10)
+        let sent = sent_host_msg(&endpoint, 0x0D);
+        match emerald_editor_runtime::wire::decode_host(&sent) {
+            Some(emerald_editor_runtime::wire::HostMsg::SetMode { mode }) => assert_eq!(
+                mode,
+                emerald_editor_runtime::wire::mode::PLAY,
+                "the cart is told to run its game table"
+            ),
+            other => panic!("{other:?}"),
+        }
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).mode, EditorMode::Play)
+        });
+        assert_eq!(toggle_of(cx, MODE_PLAY), Some(true));
+        assert_eq!(
+            toggle_of(cx, MODE_EDIT),
+            Some(false),
+            "and both halves move together"
+        );
+        assert!(
+            cx.debug_bounds(INSPECTOR_DISABLED).is_some(),
+            "Play greys the inspector"
+        );
+        panel.read_with(cx, |panel, cx| {
+            let open = open_of(panel);
+            assert!(
+                !open.inspector.is_empty(),
+                "the fields are still listed, just not editable"
+            );
+            assert!(
+                open.inspector
+                    .iter()
+                    .all(|entry| entry.editor.read(cx).read_only(cx)),
+                "and every field editor refuses typing"
+            );
+        });
+
+        host_sent(&endpoint);
+        let edit = cx.debug_bounds(MODE_EDIT.1).expect("the Edit half");
+        cx.simulate_click(edit.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let sent = sent_host_msg(&endpoint, 0x0D);
+        match emerald_editor_runtime::wire::decode_host(&sent) {
+            Some(emerald_editor_runtime::wire::HostMsg::SetMode { mode }) => {
+                assert_eq!(mode, emerald_editor_runtime::wire::mode::EDIT)
             }
             other => panic!("{other:?}"),
         }
-        panel.read_with(cx, |panel, _| assert_eq!(live_of(panel).sys_mask, 0b10));
+        assert!(
+            cx.debug_bounds(INSPECTOR_DISABLED).is_none(),
+            "and Edit hands the inspector back"
+        );
+    }
 
+    /// The tool radio is the cart's greeting: one entry per name it sent,
+    /// tool 0 (its built-in select) active until the user picks another,
+    /// and the pick goes out as `SetTool`.
+    #[gpui::test]
+    async fn the_tool_radio_lists_the_carts_tools_and_sends_the_pick(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) =
+            connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
+        show_panel(cx);
+        assert_eq!(
+            toggle_of(cx, TOOL_0),
+            Some(true),
+            "select until told otherwise"
+        );
+        assert_eq!(toggle_of(cx, TOOL_1), Some(false));
+        assert_eq!(toggle_of(cx, TOOL_2), None, "only the tools the cart named");
         host_sent(&endpoint);
-        panel.update(cx, |panel, cx| panel.set_live_system(1, false, cx));
+
+        let paint = cx.debug_bounds(TOOL_1.1).expect("the second tool");
+        cx.simulate_click(paint.center(), gpui::Modifiers::default());
         cx.run_until_parked();
-        panel.read_with(cx, |panel, _| assert_eq!(live_of(panel).sys_mask, 0));
-        match host_sent(&endpoint)
-            .iter()
-            .find(|message| message.first() == Some(&0x07))
-            .and_then(|message| emerald_editor_runtime::wire::decode_host(message))
-        {
-            Some(emerald_editor_runtime::wire::HostMsg::SysMask { mask }) => assert_eq!(mask, 0),
+
+        let sent = sent_host_msg(&endpoint, 0x0E);
+        match emerald_editor_runtime::wire::decode_host(&sent) {
+            Some(emerald_editor_runtime::wire::HostMsg::SetTool { tool }) => assert_eq!(tool, 1),
             other => panic!("{other:?}"),
         }
+        panel.read_with(cx, |panel, _| assert_eq!(live_of(panel).tool, 1));
+        assert_eq!(toggle_of(cx, TOOL_1), Some(true));
+        assert_eq!(
+            toggle_of(cx, TOOL_0),
+            Some(false),
+            "a radio, not a checkbox"
+        );
     }
 
     /// The switch is a real mode change on both sides: Design ends the
@@ -16800,65 +17035,52 @@ mod tests {
     }
 
     /// The rail is Live's alone, and only once the cart has greeted: the
-    /// names arrive on the `HelloAck`.
+    /// mode is the cart's and the tool names arrive on the `HelloAck`.
     #[gpui::test]
-    async fn the_systems_rail_is_live_only(cx: &mut TestAppContext) {
+    async fn the_edit_rail_is_live_only(cx: &mut TestAppContext) {
         let (panel, _endpoint, _dir, cx) =
-            connected_live_panel_with_systems(cx, &["animate", "ai"]).await;
+            connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
         show_panel(cx);
-        assert_eq!(toggle_of(cx, SYSTEM_0), Some(false));
-        assert_eq!(toggle_of(cx, SYSTEM_1), Some(false));
-        assert_eq!(
-            toggle_of(cx, SYSTEM_2),
-            None,
-            "only the systems the cart named"
-        );
-
-        panel.update(cx, |panel, cx| panel.set_live_system(1, true, cx));
-        cx.run_until_parked();
-        assert_eq!(
-            toggle_of(cx, SYSTEM_1),
-            Some(true),
-            "the box reads the session mask back"
-        );
-        assert_eq!(toggle_of(cx, SYSTEM_0), Some(false));
+        assert_eq!(toggle_of(cx, MODE_EDIT), Some(true));
+        assert_eq!(toggle_of(cx, TOOL_0), Some(true));
 
         // The mode alone decides, not the session: a connected cart the
-        // design renderer is drawing over has no systems to offer.
+        // design renderer is drawing over has no mode to switch.
         panel.update(cx, |panel, cx| {
             panel.canvas_mode = CanvasMode::Design;
             cx.notify();
         });
         cx.run_until_parked();
         assert_eq!(
-            toggle_of(cx, SYSTEM_0),
+            toggle_of(cx, MODE_EDIT),
             None,
             "Design mode never shows the rail"
         );
+        assert_eq!(toggle_of(cx, TOOL_0), None);
 
         panel.update_in(cx, |panel, window, cx| {
             panel.set_canvas_mode(CanvasMode::Live, window, cx)
         });
         cx.run_until_parked();
         assert_eq!(
-            toggle_of(cx, SYSTEM_0),
-            Some(false),
+            toggle_of(cx, MODE_EDIT),
+            Some(true),
             "and back again with the session still up"
         );
     }
 
-    /// The rail is a vertical list, not a wrapped row: one system per
-    /// line, in one column (spec: "the systems toggle is a vertical
-    /// list").
+    /// The rail is one row: the mode switch, then the tools beside it.
     #[gpui::test]
-    async fn the_systems_rail_is_a_vertical_list(cx: &mut TestAppContext) {
+    async fn the_edit_rail_is_one_row(cx: &mut TestAppContext) {
         let (_panel, _endpoint, _dir, cx) =
-            connected_live_panel_with_systems(cx, &["animate", "physics"]).await;
+            connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
         show_panel(cx);
-        let first = cx.debug_bounds(SYSTEM_0.1).expect("row 0");
-        let second = cx.debug_bounds(SYSTEM_1.1).expect("row 1");
-        assert_eq!(first.origin.x, second.origin.x, "same column");
-        assert!(second.origin.y > first.origin.y, "stacked");
+        let edit = cx.debug_bounds(MODE_EDIT.0).expect("the Edit half");
+        let first = cx.debug_bounds(TOOL_0.0).expect("tool 0");
+        let second = cx.debug_bounds(TOOL_1.1).expect("tool 1");
+        assert_eq!(first.origin.y, second.origin.y, "same row");
+        assert!(second.origin.x > first.origin.x, "side by side");
+        assert!(first.origin.x > edit.origin.x, "the mode switch leads");
     }
 
     /// The status line belongs to LIVE mode, not to the session: it
@@ -16878,7 +17100,10 @@ mod tests {
         );
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]));
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert_eq!(live_of(panel).status, LiveStatus::Connected)
@@ -16947,17 +17172,17 @@ mod tests {
         );
     }
 
-    /// The systems the user turned on outlive the session they were turned
-    /// on in: leaving Live to look at the design view and coming back must
-    /// not silently re-arm gameplay systems over the user's entities.
+    /// The tool the user picked outlives the session it was picked in:
+    /// leaving Live to look at the design view and coming back must not
+    /// silently hand the pointer back to the select tool.
     #[gpui::test]
-    async fn the_system_mask_survives_a_trip_through_design(cx: &mut TestAppContext) {
+    async fn the_tool_survives_a_trip_through_design(cx: &mut TestAppContext) {
         let (panel, first, _dir, cx) =
-            connected_live_panel_with_systems(cx, &["animate", "ai"]).await;
-        panel.update(cx, |panel, cx| panel.set_live_system(1, true, cx));
+            connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
+        panel.update(cx, |panel, cx| panel.set_live_tool(1, cx));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.live_sys_mask, 0b10, "the panel remembers it")
+            assert_eq!(panel.live_tool, 1, "the panel remembers it")
         });
 
         panel.update_in(cx, |panel, window, cx| {
@@ -16973,28 +17198,29 @@ mod tests {
         assert!(!Arc::ptr_eq(&endpoint, &first), "a second viewer");
         panel.read_with(cx, |panel, _| {
             assert_eq!(
-                live_of(panel).sys_mask,
-                0b10,
+                live_of(panel).tool,
+                1,
                 "the new session starts where the old one left off"
             )
         });
 
-        // And the CART is told, which is the half that matters: the
-        // mailbox re-applies a non-zero mask after every greeting.
+        // And the CART is told, which is the half that matters: a greeting
+        // resets the cart to its select tool, and nothing else re-arms it.
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
         host_sent(&endpoint);
-        cart_says(&endpoint, hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &["animate", "ai"]));
+        cart_says(
+            &endpoint,
+            hello_ack(
+                emerald_editor_runtime::wire::LINK_PROTO_VERSION,
+                &["Select", "paint"],
+            ),
+        );
         cx.run_until_parked();
-        match host_sent(&endpoint)
-            .iter()
-            .find(|message| message.first() == Some(&0x07))
-            .and_then(|message| emerald_editor_runtime::wire::decode_host(message))
-        {
-            Some(emerald_editor_runtime::wire::HostMsg::SysMask { mask }) => {
-                assert_eq!(mask, 0b10)
-            }
-            other => panic!("the greeting must re-arm the mask: {other:?}"),
+        let sent = sent_host_msg(&endpoint, 0x0E);
+        match emerald_editor_runtime::wire::decode_host(&sent) {
+            Some(emerald_editor_runtime::wire::HostMsg::SetTool { tool }) => assert_eq!(tool, 1),
+            other => panic!("the greeting must re-arm the tool: {other:?}"),
         }
     }
 

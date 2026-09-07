@@ -55,7 +55,7 @@ pub struct WorldDock {
     /// DOCK (spec) rather than read back off the active panel, so closing
     /// the last world tab does not reset them.
     canvas_mode: CanvasMode,
-    live_sys_mask: u64,
+    live_tool: u8,
     _active_item: Option<Subscription>,
     #[cfg(test)]
     test_root_override: Option<std::path::PathBuf>,
@@ -82,7 +82,7 @@ impl WorldDock {
             active: None,
             panels: Vec::new(),
             canvas_mode: CanvasMode::Live,
-            live_sys_mask: 0,
+            live_tool: 0,
             _active_item,
             #[cfg(test)]
             test_root_override: None,
@@ -137,9 +137,9 @@ impl WorldDock {
 
     /// Record the Live choices a new [`OpenMode::Sticky`] tab inherits.
     /// Called by whichever panel the user changed them on.
-    pub(crate) fn note_sticky(&mut self, canvas_mode: CanvasMode, live_sys_mask: u64) {
+    pub(crate) fn note_sticky(&mut self, canvas_mode: CanvasMode, live_tool: u8) {
         self.canvas_mode = canvas_mode;
-        self.live_sys_mask = live_sys_mask;
+        self.live_tool = live_tool;
     }
 
     /// [`Self::open_world_in`] in the mode the user last chose.
@@ -176,10 +176,10 @@ impl WorldDock {
             OpenMode::Sticky => self.canvas_mode,
             OpenMode::Design => CanvasMode::Design,
         };
-        // The mask rides along either way: it says which of the cart's
-        // systems the user wants running, which only matters once a tab
-        // is in Live and is theirs whenever it gets there.
-        let live_sys_mask = self.live_sys_mask;
+        // The tool rides along either way: it says which tool the cart
+        // runs the pointer through, which only matters once a tab is in
+        // Live and is theirs whenever it gets there.
+        let live_tool = self.live_tool;
         let panel = match existing {
             Some(panel) => {
                 // `self.active` is assigned below, so the `activate_item`
@@ -205,7 +205,7 @@ impl WorldDock {
                 let panel = cx.new(|cx| {
                     let mut panel = WorldPanel::new(Some(weak_workspace), cx);
                     panel.canvas_mode = canvas_mode;
-                    panel.live_sys_mask = live_sys_mask;
+                    panel.live_tool = live_tool;
                     panel.set_dock(weak_dock);
                     #[cfg(test)]
                     {
@@ -644,16 +644,19 @@ pub(crate) mod tests {
     /// dirty is no longer a reason to refuse OTHER worlds either -- they
     /// get their own tabs -- which is what the second half asserts.
     #[gpui::test]
-    async fn re_opening_a_dirty_world_activates_its_tab_without_reloading(
-        cx: &mut TestAppContext,
-    ) {
+    async fn re_opening_a_dirty_world_activates_its_tab_without_reloading(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         let open = |rel: &'static str, cx: &mut gpui::VisualTestContext| {
             workspace.update_in(cx, |ws, window, cx| {
-                ggo_common::open_in_panel(ws, window, cx, move |dock: &mut WorldDock, window, cx| {
-                    dock.open_world(rel, window, cx);
-                })
+                ggo_common::open_in_panel(
+                    ws,
+                    window,
+                    cx,
+                    move |dock: &mut WorldDock, window, cx| {
+                        dock.open_world(rel, window, cx);
+                    },
+                )
             });
             cx.run_until_parked();
         };
@@ -733,9 +736,14 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         let open = |rel: &'static str, cx: &mut gpui::VisualTestContext| {
             workspace.update_in(cx, |ws, window, cx| {
-                ggo_common::open_in_panel(ws, window, cx, move |dock: &mut WorldDock, window, cx| {
-                    dock.open_world(rel, window, cx);
-                })
+                ggo_common::open_in_panel(
+                    ws,
+                    window,
+                    cx,
+                    move |dock: &mut WorldDock, window, cx| {
+                        dock.open_world(rel, window, cx);
+                    },
+                )
             });
             cx.run_until_parked();
         };
@@ -892,9 +900,14 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         let open = |rel: &'static str, cx: &mut gpui::VisualTestContext| {
             workspace.update_in(cx, |ws, window, cx| {
-                ggo_common::open_in_panel(ws, window, cx, move |dock: &mut WorldDock, window, cx| {
-                    dock.open_world(rel, window, cx);
-                })
+                ggo_common::open_in_panel(
+                    ws,
+                    window,
+                    cx,
+                    move |dock: &mut WorldDock, window, cx| {
+                        dock.open_world(rel, window, cx);
+                    },
+                )
             });
             cx.run_until_parked();
         };

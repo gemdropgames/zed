@@ -194,9 +194,9 @@ pub fn overlay_rows(
         .iter()
         .filter_map(|row| {
             let selection = live.index_map.selection_of(row.index)?;
-            counts.contains(selection).then(|| {
-                (selection, row.drawn(), selected.contains(&selection))
-            })
+            counts
+                .contains(selection)
+                .then(|| (selection, row.drawn(), selected.contains(&selection)))
         })
         .collect()
 }
@@ -515,27 +515,19 @@ pub enum LiveStatus {
     Failed(String),
 }
 
-/// Which bit of the session's system mask a system's position in
-/// [`LinkMailbox::system_names`] owns, or `None` past bit 63: the mask is
-/// a `u64` and the cart's name list is `u8`-counted, so it can name more
-/// systems than the mask can address.
-pub fn system_bit(index: usize) -> Option<u64> {
-    u32::try_from(index)
-        .ok()
-        .and_then(|shift| 1u64.checked_shl(shift))
-}
-
-/// The systems rail's rows: each of the cart's systems and whether `mask`
-/// has it on. Names with no mask bit are dropped rather than shown
-/// unusable. Borrowed from the mailbox's own list -- this runs once per
-/// render of a connected session, which is once per cart frame.
-pub fn system_rows(names: &[String], mask: u64) -> Vec<(&str, bool)> {
+/// The tool radio's rows: each tool the cart named and whether it is the
+/// active one. A tool is selected by its POSITION in the cart's list, so
+/// names past what a `u8` can number are dropped rather than shown
+/// unusable -- the cart can name more tools than `SetTool` can reach.
+/// Borrowed from the mailbox's own list: this runs once per render of a
+/// connected session, which is once per cart frame.
+pub fn tool_rows(names: &[String], tool: u8) -> Vec<(&str, bool)> {
     names
         .iter()
         .enumerate()
         .filter_map(|(index, name)| {
-            let bit = system_bit(index)?;
-            Some((name.as_str(), mask & bit != 0))
+            let number = u8::try_from(index).ok()?;
+            Some((name.as_str(), number == tool))
         })
         .collect()
 }
@@ -743,10 +735,11 @@ pub struct LiveView {
     /// fills it. A slot re-dirtied while this queue is draining is re-read
     /// and moved to the BACK rather than restarting the cycle.
     pub layer_queue: VecDeque<LayerLoad>,
-    /// Which of the cart's own systems are enabled, one bit per entry of
-    /// [`LinkMailbox::system_names`]. The mailbox re-applies this after
-    /// every greeting on its own, so the panel only pushes changes.
-    pub sys_mask: u64,
+    /// Which tool the cart is running the pointer through: 0 is its
+    /// built-in select, `n` the `n - 1`th of the edit systems it named in
+    /// its greeting ([`LinkMailbox::tool_names`]). The cart resets to 0 on
+    /// every greeting, so a re-greeted session has to be told again.
+    pub tool: u8,
     pub poll: Option<Task<()>>,
 }
 
@@ -791,11 +784,19 @@ impl LiveView {
             pointer_buttons: 0,
             pending_commands: Vec::new(),
             layer_queue: VecDeque::new(),
-            // Editor systems only: a viewer that ran the cart's gameplay
-            // systems would move the entities the user is dragging.
-            sys_mask: 0,
+            // The cart's built-in select tool, which is what a session
+            // that has not been told otherwise is running.
+            tool: 0,
             poll: None,
         }
+    }
+
+    /// The band the overlay paints, as an origin and a size in world px:
+    /// the cart reports two CORNERS, and either of them may be the one
+    /// being dragged.
+    pub fn marquee_rect(&self) -> Option<[f64; 4]> {
+        let [x0, y0, x1, y1] = self.marquee?;
+        Some([x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()])
     }
 
     /// The camera the picture and the outlines are placed with: the
@@ -874,9 +875,7 @@ impl LiveView {
             }
             return None;
         };
-        let edge = self
-            .last_pointer
-            .is_none_or(|last| !steady(&last, &sample));
+        let edge = self.last_pointer.is_none_or(|last| !steady(&last, &sample));
         self.pointer_repeats = if edge { POINTER_EDGE_REPEATS } else { 0 };
         self.last_pointer = Some(sample);
         Some(sample)
@@ -1544,37 +1543,47 @@ mod tests {
     }
 
     #[test]
-    fn a_system_owns_the_mask_bit_at_its_position_and_nothing_past_63() {
-        assert_eq!(system_bit(0), Some(1));
-        assert_eq!(system_bit(1), Some(0b10));
-        assert_eq!(system_bit(63), Some(1 << 63));
-        assert_eq!(system_bit(64), None, "the mask is a u64");
-        assert_eq!(system_bit(usize::MAX), None);
-    }
-
-    #[test]
-    fn the_systems_rail_reads_each_name_off_its_own_bit() {
-        let names = vec!["animate".to_string(), "ai".to_string(), "audio".to_string()];
+    fn the_tool_radio_marks_the_active_tool_and_nothing_else() {
+        let names = vec![
+            "Select".to_string(),
+            "paint".to_string(),
+            "poke".to_string(),
+        ];
         assert_eq!(
-            system_rows(&names, 0),
-            [("animate", false), ("ai", false), ("audio", false)]
+            tool_rows(&names, 0),
+            [("Select", true), ("paint", false), ("poke", false)]
         );
         assert_eq!(
-            system_rows(&names, 0b101),
-            [("animate", true), ("ai", false), ("audio", true)]
+            tool_rows(&names, 2),
+            [("Select", false), ("paint", false), ("poke", true)]
         );
-        assert!(system_rows(&[], u64::MAX).is_empty());
+        assert!(tool_rows(&[], 0).is_empty());
     }
 
-    /// A cart may name more systems than a `u64` has bits; those have no
-    /// bit to toggle, so the rail must not offer a control that does
-    /// nothing.
+    /// A cart may name more tools than a `u8` tool byte can select; those
+    /// rows have no number to send, so the radio must not offer them.
     #[test]
-    fn the_systems_rail_drops_names_that_have_no_mask_bit() {
-        let names: Vec<String> = (0..70).map(|index| format!("s{index}")).collect();
-        let rows = system_rows(&names, u64::MAX);
-        assert_eq!(rows.len(), 64);
-        assert_eq!(rows[63].0, "s63");
+    fn the_tool_radio_drops_names_a_tool_byte_cannot_name() {
+        let names: Vec<String> = (0..300).map(|index| format!("t{index}")).collect();
+        let rows = tool_rows(&names, 0);
+        assert_eq!(rows.len(), 256);
+        assert_eq!(rows[255].0, "t255");
+    }
+
+    /// The band the overlay paints is the cart's two corners normalised to
+    /// an origin and a size -- either corner may be the dragged one.
+    #[test]
+    fn the_marquee_rect_is_the_carts_band_normalised() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        assert_eq!(live.marquee_rect(), None);
+        live.marquee = Some([10.0, 20.0, 30.0, 50.0]);
+        assert_eq!(live.marquee_rect(), Some([10.0, 20.0, 20.0, 30.0]));
+        live.marquee = Some([30.0, 50.0, 10.0, 20.0]);
+        assert_eq!(
+            live.marquee_rect(),
+            Some([10.0, 20.0, 20.0, 30.0]),
+            "a band dragged up-left is the same rect"
+        );
     }
 
     #[test]
