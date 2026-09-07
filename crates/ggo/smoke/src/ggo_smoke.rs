@@ -3155,7 +3155,9 @@ mod tests {
                 cx,
             )
         });
-        cx.default_global::<SmokeViewerRuns>().0.push((endpoint, run));
+        cx.default_global::<SmokeViewerRuns>()
+            .0
+            .push((endpoint, run));
         true
     }
 
@@ -3571,6 +3573,31 @@ mod tests {
 
         // Let the pokes drain before the save asks the cart what it holds.
         pump_live(cx, LIVE_DRAIN).await;
+
+        // The save's layer fold reads the CART's cells back over the
+        // document's only for a slot the panel believes is in step, and
+        // skips one it does not -- so without this the `.map` assertion
+        // at the end of the journey would pass either way, including
+        // through the document alone with the cart never having heard a
+        // single cell of the stroke.
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_live_layer_synced(0),
+                Some(true),
+                "the cart's bg0 is the document's: every cell of the stroke \
+                 went out, and the save will read the layer back rather than \
+                 leaving the slot to the session's own write"
+            );
+        });
+        // An absence needs a witness -- one rendered frame at a canvas
+        // swap comes back with no debug bounds at all -- so the Save
+        // button, which is always on the toolbar, stands in for "this
+        // frame drew the toolbar".
+        assert!(
+            cx.debug_bounds("ggo-world-save").is_some()
+                && cx.debug_bounds("ggo-world-paint-error").is_none(),
+            "and no cell was refused on the way to the cart"
+        );
 
         // ---- the save, which asks the CART for both
 
