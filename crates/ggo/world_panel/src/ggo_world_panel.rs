@@ -1273,6 +1273,12 @@ impl OpenWorld {
         // Field-precise borrow on purpose: the steps below read the
         // document (`store`, `merged`, `root`, `view`) while the session
         // is borrowed mutably.
+        // A greeting's re-push of the tool and mode happens under the
+        // session borrow, while the status row is only settled at the end
+        // of the tick: carried out rather than written straight to
+        // `live_error`, which the push block below would clear on its way
+        // past.
+        let mut connect_error: Option<String> = None;
         let Some(live) = self.live.as_mut() else {
             return LiveStep::default();
         };
@@ -1377,15 +1383,25 @@ impl OpenWorld {
                 // re-sends only the (deprecated) system mask. Without this
                 // a re-greeted session shows a rail the cart is not
                 // obeying.
+                //
+                // A re-push that fails is the same defect `set_live_mode`
+                // reports: the rail keeps showing a tool and a mode the
+                // cart is not running, so it goes on the status row too.
                 if live.tool != 0
                     && let Err(error) = live.mailbox.set_tool(live.tool)
                 {
                     log::warn!("GGO: live tool: {error}");
+                    connect_error = Some(format!("live update: {error}"));
                 }
-                if live.mode != EditorMode::Edit
-                    && let Err(error) = live.mailbox.set_mode(live.mode)
-                {
-                    log::warn!("GGO: live mode: {error}");
+                if live.mode != EditorMode::Edit {
+                    match live.mailbox.set_mode(live.mode) {
+                        Ok(()) => live.mode_push_failed = false,
+                        Err(error) => {
+                            live.mode_push_failed = true;
+                            log::warn!("GGO: live mode: {error}");
+                            connect_error = Some(format!("live update: {error}"));
+                        }
+                    }
                 }
             }
             // `is_connected` never goes false on its own; a cart that was
@@ -1504,7 +1520,7 @@ impl OpenWorld {
             // A layer or camera push that worked must not take a world
             // failure off the status row while that world is still unsent.
             let world_held_back = live.world_dirty && !world_ready;
-            let mut live_error = None;
+            let mut live_error = connect_error.take();
             if world_ready {
                 // follow-up: this encode is on the UI thread; it belongs on
                 // a background task with the blob applied on a later tick.
@@ -1582,7 +1598,9 @@ impl OpenWorld {
             // Assigned even when it is `None`: a push that succeeded after
             // an earlier failure has to take the message off the toolbar.
             let keep_error = world_held_back && live_error.is_none();
-            if acted && !keep_error && live_error != self.live_error {
+            // `live_error.is_some()` as well as `acted`: a greeting's
+            // re-push can fail on a tick that had nothing else to send.
+            if (acted || live_error.is_some()) && !keep_error && live_error != self.live_error {
                 self.live_error = live_error;
                 changed = true;
             }
@@ -2405,9 +2423,10 @@ impl WorldPanel {
     /// the current view center, ggo-ide's `WorldMsg::AddEntity` -- then
     /// select it.
     fn add_entity_impl(&mut self, cx: &mut Context<Self>) {
-        // The toolbar stays on screen in paint mode, so its buttons are
-        // reachable: gate them like every other entity mutation.
-        if self.in_paint_mode() {
+        // The toolbar stays on screen in paint mode and in Play, so its
+        // buttons are reachable: gate them like every other entity
+        // mutation.
+        if self.in_paint_mode() || self.live_playing() {
             return;
         }
         let ViewerState::Ready(open) = &mut self.state else {
@@ -2451,7 +2470,10 @@ impl WorldPanel {
     /// undo returns it to the default spot, second removes it), select
     /// it, and resolve its subtree so it renders immediately.
     fn add_instance_impl(&mut self, stem: String, cx: &mut Context<Self>) {
-        if self.in_paint_mode() || !self.instance_candidates().contains(&stem) {
+        if self.in_paint_mode()
+            || self.live_playing()
+            || !self.instance_candidates().contains(&stem)
+        {
             return;
         }
         let ViewerState::Ready(open) = &mut self.state else {
@@ -3415,6 +3437,12 @@ impl WorldPanel {
     }
 
     fn undo_impl(&mut self, cx: &mut Context<Self>) {
+        // Play is the game's: its entities have moved on from whatever the
+        // document says, and stepping the history would push a world the
+        // play-through has left behind.
+        if self.live_playing() {
+            return;
+        }
         if self.step_paint_history(MapDocStore::undo, cx) {
             return;
         }
@@ -3439,6 +3467,9 @@ impl WorldPanel {
     }
 
     fn redo_impl(&mut self, cx: &mut Context<Self>) {
+        if self.live_playing() {
+            return;
+        }
         if self.step_paint_history(MapDocStore::redo, cx) {
             return;
         }
@@ -4810,6 +4841,13 @@ impl WorldPanel {
     }
 
     fn commit_editor(&mut self, editor_id: EntityId, cx: &mut Context<Self>) {
+        // The inspector is read-only in Play, but a read-only editor still
+        // takes focus -- and a click on the canvas blurs it, which commits.
+        // `commit_field` builds an op from text nobody typed, and the whole
+        // world would go back out to a running cart over that blur.
+        if self.live_playing() {
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -4824,7 +4862,10 @@ impl WorldPanel {
         let state = open.store.state();
         if let Some(op) = inspector::commit_field(&target, &text, &state, &open.schemas) {
             open.store.apply(op);
-            open.note_doc_changed();
+            // `state` is the document as it was BEFORE the op, which is how
+            // a commit of unchanged text -- an op the store folds away --
+            // is kept from re-sending the world over a blur.
+            open.note_doc_stepped(&state);
             // A committed field can NAME an asset (a Sprite/Tilemap stem):
             // loads are otherwise only resolved at world-open and
             // instance-add, so a freshly named asset would not render
@@ -5202,15 +5243,22 @@ impl WorldPanel {
         let Some(live) = open.live.as_mut() else {
             return;
         };
-        if live.mode == mode {
+        // Not just `live.mode == mode`: a pick whose push failed left the
+        // rail showing a mode the cart is not in, and pressing it again is
+        // the only way back -- taking that for a no-op strands the session.
+        if live.mode == mode && !live.mode_push_failed {
             return;
         }
         live.mode = mode;
-        if let Err(error) = live.mailbox.set_mode(mode) {
-            // The rail already reads the new mode, so a push that never
-            // left would otherwise show a cart switched that is not.
-            log::warn!("GGO: live mode: {error}");
-            open.live_error = Some(format!("live update: {error}"));
+        match live.mailbox.set_mode(mode) {
+            Ok(()) => live.mode_push_failed = false,
+            Err(error) => {
+                // The rail already reads the new mode, so a push that never
+                // left would otherwise show a cart switched that is not.
+                live.mode_push_failed = true;
+                log::warn!("GGO: live mode: {error}");
+                open.live_error = Some(format!("live update: {error}"));
+            }
         }
         cx.notify();
     }
@@ -5515,6 +5563,9 @@ impl WorldPanel {
         // raise a "not world TOML" error over a paste that never wanted it.
         if self.in_paint_mode() {
             self.paste_cells(cx);
+            return;
+        }
+        if self.live_playing() {
             return;
         }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
@@ -6257,7 +6308,18 @@ impl WorldPanel {
         // button, so they cannot drift apart from each other.
         let dirty = self.dirty_world_name().is_some();
         let has_selection = !open.selected.is_empty();
-        let candidates = self.instance_candidates();
+        // While the cart plays, the entities are the game's: every button
+        // that would mutate the document is greyed out (Delete is not --
+        // it is forwarded to the cart, which owns the despawn).
+        let playing = self.live_playing();
+        // The picker has no `disabled`, so Play empties it instead: an
+        // add-instance entry that `add_instance_impl` would refuse is an
+        // affordance that lies.
+        let candidates = if playing {
+            Vec::new()
+        } else {
+            self.instance_candidates()
+        };
         let weak = cx.weak_entity();
 
         // Add-instance picker over the cycle-guarded candidate stems.
@@ -6367,11 +6429,23 @@ impl WorldPanel {
                     ))
                     .on_click(cx.listener(|this, _, _, cx| this.emulate_popout_impl(cx))),
             )
+            // Each wrapper carries the `debug_selector` for the reason the
+            // Save button's does: a DISABLED button records no bounds of
+            // its own. The wrapper resolves either way, so the suffix is
+            // what says WHICH -- greyed out is a state a test has to be
+            // able to read, not infer from a click that does nothing.
             .child(
-                IconButton::new("ggo-world-add-entity", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Add entity"))
-                    .on_click(cx.listener(|this, _, _, cx| this.add_entity_impl(cx))),
+                div()
+                    .debug_selector(move || {
+                        format!("ggo-world-add-entity-{}", toggle_suffix(!playing))
+                    })
+                    .child(
+                        IconButton::new("ggo-world-add-entity", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Add entity"))
+                            .disabled(playing)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_entity_impl(cx))),
+                    ),
             )
             .child(DropdownMenu::new(
                 "ggo-world-add-instance",
@@ -6388,16 +6462,26 @@ impl WorldPanel {
                     ),
             )
             .child(
-                IconButton::new("ggo-world-undo", IconName::Undo)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Undo"))
-                    .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
+                div()
+                    .debug_selector(move || format!("ggo-world-undo-{}", toggle_suffix(!playing)))
+                    .child(
+                        IconButton::new("ggo-world-undo", IconName::Undo)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Undo"))
+                            .disabled(playing)
+                            .on_click(cx.listener(|this, _, _, cx| this.undo_impl(cx))),
+                    ),
             )
             .child(
-                IconButton::new("ggo-world-redo", IconName::RotateCw)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Redo"))
-                    .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
+                div()
+                    .debug_selector(move || format!("ggo-world-redo-{}", toggle_suffix(!playing)))
+                    .child(
+                        IconButton::new("ggo-world-redo", IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Redo"))
+                            .disabled(playing)
+                            .on_click(cx.listener(|this, _, _, cx| this.redo_impl(cx))),
+                    ),
             )
             // The wrapper carries the `debug_selector`: `Button` is a
             // `RenderOnce`, and a DISABLED button records no bounds of its
@@ -7024,7 +7108,12 @@ impl WorldPanel {
             // Never add `.on_click` (or a drag listener) to this div: gpui
             // suppresses hover updates while a click is pending on the
             // element (`pending_mouse_down`), which is exactly the held
-            // button whose release this handler has to flush.
+            // button whose release this handler has to flush. Worse than
+            // suppression, the MouseMove path (`div.rs`) computes
+            // `is_hovered = has_mouse_down.is_none() && ...`, so with a
+            // click listener a move made WITH the button down reads as
+            // "not hovered" and fires `on_hover(false)` mid-drag ON the
+            // canvas -- a release the user never made.
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if *hovered {
                     return;
@@ -15450,13 +15539,19 @@ mod tests {
 
         panel.update(cx, |panel, cx| panel.undo_impl(cx));
         panel.read_with(cx, |panel, _| {
-            assert!(live_of(panel).world_dirty, "the cart is owed the whole world");
+            assert!(
+                live_of(panel).world_dirty,
+                "the cart is owed the whole world"
+            );
         });
         let sent = settle_live(&panel, &endpoint, cx);
 
         let (transforms, blobbed) = sent_transforms(&sent);
         assert!(blobbed, "the restored entity went out as a world blob");
-        assert!(transforms.is_empty(), "and not as transforms: {transforms:?}");
+        assert!(
+            transforms.is_empty(),
+            "and not as transforms: {transforms:?}"
+        );
     }
 
     /// How many undo entries the open document has, by unwinding the whole
@@ -16901,6 +16996,175 @@ mod tests {
             cx.debug_bounds(INSPECTOR_DISABLED).is_none(),
             "and Edit hands the inspector back"
         );
+    }
+
+    /// Play is the CART's: every affordance that would mutate the
+    /// document is greyed out, and the actions behind them refuse too --
+    /// a keybinding is not stopped by a disabled button. The one edit that
+    /// still works is Delete, which is forwarded to the cart.
+    #[gpui::test]
+    async fn play_blocks_every_document_mutation(cx: &mut TestAppContext) {
+        const MUTATORS: [(&str, &str); 3] = [
+            ("ggo-world-undo-on", "ggo-world-undo-off"),
+            ("ggo-world-redo-on", "ggo-world-redo-off"),
+            ("ggo-world-add-entity-on", "ggo-world-add-entity-off"),
+        ];
+
+        let (panel, endpoint, _dir, cx) =
+            connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
+        select_first_entity(&panel, cx);
+        show_panel(cx);
+        for pair in MUTATORS {
+            assert_eq!(
+                toggle_of(cx, pair),
+                Some(true),
+                "{} is live in Edit",
+                pair.0
+            );
+        }
+        assert_eq!(
+            toggle_of(cx, TOOL_1),
+            Some(false),
+            "and the cart's tools are pickable"
+        );
+
+        // Something to undo.
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [12.0, 12.0],
+                    gesture: None,
+                },
+                cx,
+            )
+        });
+        settle_live(&panel, &endpoint, cx);
+        let moved = panel.read_with(cx, |panel, _| entity_pos_of(panel, 0));
+        assert_eq!(moved, [12.0, 12.0]);
+
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        cx.run_until_parked();
+        show_panel(cx);
+        host_sent(&endpoint);
+        let generation = panel.read_with(cx, |panel, _| open_of(panel).doc_generation);
+
+        for pair in MUTATORS {
+            assert_eq!(
+                toggle_of(cx, pair),
+                Some(false),
+                "{} is greyed out while the game runs",
+                pair.0
+            );
+        }
+        // The tool radio is greyed too -- the tools ARE the edit table --
+        // but its wrapper's suffix carries which tool is PICKED, so what
+        // proves the button dead is that clicking it picks nothing.
+        let paint = cx.debug_bounds(TOOL_1.1).expect("the second tool");
+        cx.simulate_click(paint.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(live_of(panel).tool, 0, "no tool is pickable in Play")
+        });
+
+        cx.update(|window, cx| window.dispatch_action(Undo.boxed_clone(), cx));
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        panel.update(cx, |panel, cx| {
+            panel.add_instance_impl("worlds/sub".to_string(), cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(entity_pos_of(panel, 0), moved, "the undo did nothing");
+            assert_eq!(
+                open_of(panel).doc_generation,
+                generation,
+                "and nothing else moved the document either"
+            );
+            assert!(!live_of(panel).world_dirty, "so the cart is owed nothing");
+        });
+        let (transforms, blobbed) = sent_transforms(&settle_live(&panel, &endpoint, cx));
+        assert!(!blobbed, "no world went out to the playing cart");
+        assert!(transforms.is_empty(), "and no transforms: {transforms:?}");
+    }
+
+    /// A click on the canvas blurs whatever inspector field had focus, and
+    /// the blur commits. In Play that must build no op at all; in Edit an
+    /// unchanged field is an op the store folds away, and neither may put
+    /// the world back on the wire.
+    #[gpui::test]
+    async fn an_unchanged_blur_never_re_sends_the_world(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        select_first_entity(&panel, cx);
+        show_panel(cx);
+        let editor = field_editor(&panel, cx, "Transform", "z");
+        let generation = panel.read_with(cx, |panel, _| open_of(panel).doc_generation);
+
+        panel.update(cx, |panel, cx| panel.commit_editor(editor.entity_id(), cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).doc_generation,
+                generation,
+                "a commit of unchanged text is not a document change"
+            );
+            assert!(!live_of(panel).world_dirty, "so the cart is owed nothing");
+        });
+
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        cx.run_until_parked();
+        host_sent(&endpoint);
+        panel.update_in(cx, |panel, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text("9", window, cx));
+            panel.commit_editor(editor.entity_id(), cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).doc_generation,
+                generation,
+                "a blur in Play commits nothing, whatever the field says"
+            );
+            assert!(!live_of(panel).world_dirty);
+        });
+        let (_, blobbed) = sent_transforms(&settle_live(&panel, &endpoint, cx));
+        assert!(!blobbed, "and no world blob reset the play-through");
+    }
+
+    /// A mode push that failed left the rail showing a mode the cart is
+    /// not in, so pressing the same half again has to try once more --
+    /// the state is optimistic, and treating the retry as a no-op is what
+    /// would strand the session.
+    #[gpui::test]
+    async fn a_failed_mode_push_is_retried_by_the_same_pick(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        assert!(
+            host_sent(&endpoint)
+                .iter()
+                .all(|message| message.first() != Some(&0x0D)),
+            "the mode the cart already took is not re-sent"
+        );
+
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).mode_push_failed = true;
+        });
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        assert_eq!(
+            sent_host_msg(&endpoint, 0x0D).first(),
+            Some(&0x0D),
+            "but a pick whose push never left goes out again"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).mode_push_failed,
+                "and the retry that worked clears the mark"
+            );
+        });
     }
 
     /// The tool radio is the cart's greeting: one entry per name it sent,

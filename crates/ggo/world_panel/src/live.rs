@@ -778,6 +778,11 @@ pub struct LiveView {
     /// its entities move because the game moved them, and folding that
     /// into the document would rewrite the world from a play-through.
     pub mode: EditorMode,
+    /// Whether the last `SetMode` push failed. The rail reads `mode` back
+    /// optimistically, so without this a retry of the same pick would be
+    /// taken for a no-op and the cart would stay in the mode the user can
+    /// see it is not in.
+    pub mode_push_failed: bool,
     pub world_dirty: bool,
     /// The document generation whose encode last failed, and the cart-clock
     /// instant that generation may be tried again at. Encoding walks every
@@ -867,6 +872,7 @@ impl LiveView {
             auto_gesture: None,
             auto_gestures: 0,
             mode: EditorMode::default(),
+            mode_push_failed: false,
             world_dirty: false,
             world_retry_at: None,
             layers_dirty: LayerDirty::default(),
@@ -1560,7 +1566,11 @@ mod tests {
 
         let mut renamed = before.clone();
         renamed.instances[0].world = "worlds/other".to_string();
-        assert_eq!(moves_between(&before, &renamed), None, "a re-pointed instance");
+        assert_eq!(
+            moves_between(&before, &renamed),
+            None,
+            "a re-pointed instance"
+        );
     }
 
     /// The replay: a direct entity takes the document position, while each
@@ -1604,7 +1614,11 @@ mod tests {
         assert_eq!(live.transform_replay(&before, &after), None, "a world owed");
         live.world_dirty = false;
         live.world_sync = WorldSync::Sending;
-        assert_eq!(live.transform_replay(&before, &after), None, "a world in flight");
+        assert_eq!(
+            live.transform_replay(&before, &after),
+            None,
+            "a world in flight"
+        );
         live.world_sync = WorldSync::Loaded;
         live.mode = EditorMode::Play;
         assert_eq!(live.transform_replay(&before, &after), None, "Play");
