@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use emerald_editor_link::{EntityRow, LinkIo, LinkMailbox};
+use emerald_editor_link::{EditCommand, EntityRow, LinkIo, LinkMailbox};
 use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::View;
 use ggo_worldlib::render::{DEVICE_SCREEN_H, DEVICE_SCREEN_W, Selection};
@@ -284,6 +284,40 @@ pub fn scale_step(scale: u32, dir: i32) -> u32 {
     };
     next.clamp(1, LIVE_SCALE_MAX)
 }
+
+/// One pointer sample as the cart reads it: where the cursor is in DEVICE
+/// pixels, which buttons are held (bit 0 left, 1 middle, 2 right), which
+/// modifiers (bit 0 shift, 1 ctrl/cmd, 2 alt), and the host's snap toggle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerState {
+    pub device: (i16, i16),
+    pub buttons: u8,
+    pub modifiers: u8,
+    pub snap: bool,
+}
+
+/// Canvas-relative px -> the cart's device px: back out the frame origin
+/// and the integer scale [`geometry`] drew the picture at. Floored, so
+/// every canvas px inside one device pixel names that pixel rather than
+/// the next one; the `as` cast saturates at the `i16` bounds (and maps
+/// NaN to zero), which is the clamp a cursor far outside the frame needs.
+///
+/// The inverse of the transform the picture is painted through, and it
+/// has to stay that way: the cart hit-tests what the host aimed at.
+pub fn device_from_canvas(local: [f64; 2], frame_rect: [f64; 4], scale: u32) -> (i16, i16) {
+    let scale = f64::from(scale.max(1));
+    let device = |value: f64, origin: f64| ((value - origin) / scale).floor() as i16;
+    (
+        device(local[0], frame_rect[0]),
+        device(local[1], frame_rect[1]),
+    )
+}
+
+/// How many pointer samples may wait for the wire. The queue drains one
+/// per tick and a tick is a cart frame, so it only fills while the link
+/// is not moving at all -- and what a cart that comes back needs is the
+/// freshest state, not a quarter second of history.
+const POINTER_QUEUE_MAX: usize = 16;
 
 /// The world blob for the open document: `world_to_toml` -> `encode_toml_at`.
 pub fn encode_world(store: &WorldDocStore, assets_root: &Path) -> anyhow::Result<Vec<u8>> {
@@ -634,13 +668,23 @@ pub struct LiveView {
     /// A camera the host owes the cart (a pan, a look-around, the
     /// document's own framing at the greeting), flushed once per tick.
     pub pending_camera: Option<[f64; 2]>,
-    /// The last camera the host actually put on the wire. Stands in for
-    /// [`Self::camera`] until the cart has reported one of its own, so the
-    /// greeting's framing places the overlay instead of the world origin.
-    pub sent_camera: Option<[f64; 2]>,
-    /// A middle-drag in progress: where the cursor went down, and the
-    /// camera that drag started from.
-    pub pan_drag: Option<([f64; 2], [f64; 2])>,
+    /// Pointer samples owed the cart, oldest first: one goes out per tick
+    /// ([`Self::push_pointer`] says why the queue is not a single slot).
+    pub pending_pointer: VecDeque<PointerState>,
+    /// Whether the sample at the back of that queue is a plain move --
+    /// the only kind another move is allowed to fold onto.
+    pointer_moving: bool,
+    /// The last sample actually put on the wire, which is what the next
+    /// one is a move OF once the queue has drained.
+    last_pointer: Option<PointerState>,
+    /// Which mouse buttons the host believes are held, as the cart's own
+    /// bit layout. gpui reports one button per event, so the mask has to
+    /// be carried between them.
+    pub pointer_buttons: u8,
+    /// Edit commands owed the cart, in the order the user asked for them.
+    /// Flushed whole every tick: a command is a discrete request, and
+    /// dropping one would silently swallow a keypress.
+    pub pending_commands: Vec<EditCommand>,
     /// Slots still to push, ascending, one per tick: the cart's APP
     /// receive queue is four datagrams deep, and a blob transfer already
     /// fills it. A slot re-dirtied while this queue is draining is re-read
@@ -684,8 +728,11 @@ impl LiveView {
             scale: None,
             camera: None,
             pending_camera: None,
-            sent_camera: None,
-            pan_drag: None,
+            pending_pointer: VecDeque::new(),
+            pointer_moving: false,
+            last_pointer: None,
+            pointer_buttons: 0,
+            pending_commands: Vec::new(),
             layer_queue: VecDeque::new(),
             // Editor systems only: a viewer that ran the cart's gameplay
             // systems would move the entities the user is dragging.
@@ -694,28 +741,68 @@ impl LiveView {
         }
     }
 
-    /// The camera the OVERLAY is placed with: the cart's own report, else
-    /// the last camera the host sent (which stands in only until the cart
-    /// has reported one), else the origin. Never a camera still owed --
-    /// a cart system that moves the camera has to be able to win, so the
-    /// picture and the outlines lag together by one report rather than
-    /// the outlines running ahead of the frame.
+    /// The camera the picture and the outlines are placed with: the
+    /// cart's own report, else the origin. Never a camera still owed --
+    /// the cart owns the camera now (it pans on the forwarded pointer),
+    /// so the outlines follow the frame rather than running ahead of it.
     pub fn overlay_camera(&self) -> [f64; 2] {
-        self.camera.or(self.sent_camera).unwrap_or([0.0, 0.0])
+        self.camera.unwrap_or([0.0, 0.0])
     }
 
-    /// The camera a pan or a look-around moves FROM: what the host has
-    /// already decided -- a camera still owed, else the last one sent,
-    /// else the cart's report. The opposite precedence to
-    /// [`Self::overlay_camera`], so two gestures in a row compose instead
-    /// of the second restarting from a report that has not caught up.
-    /// [`Self::sent_camera`] is dropped the moment the cart's report
-    /// moves, so a cart-driven camera still wins here in the end.
-    pub fn input_camera(&self) -> [f64; 2] {
-        self.pending_camera
-            .or(self.sent_camera)
-            .or(self.camera)
-            .unwrap_or([0.0, 0.0])
+    /// Queue one pointer sample for the cart.
+    ///
+    /// A move folds onto a move: the cart reads the newest pointer of a
+    /// frame, and a position that was superseded before it ever went out
+    /// is worth nothing. Nothing else folds:
+    ///
+    /// * A sample whose buttons or modifiers CHANGED is queued behind --
+    ///   the cart derives `just_pressed`/`just_released` from consecutive
+    ///   samples, so a press and the release that ends it inside one tick
+    ///   have to reach it as two frames' input. Folding them would lose
+    ///   the click, and reordering them would leave a press it never sees
+    ///   released.
+    /// * A move never folds onto a press or a release either, even though
+    ///   the buttons match: the press point is what the cart hit-tests
+    ///   and the release point is where a marquee settles, and both would
+    ///   drift to wherever the cursor got to inside the same tick.
+    pub fn push_pointer(&mut self, sample: PointerState) {
+        let previous = self.pending_pointer.back().copied().or(self.last_pointer);
+        let moving = previous.is_some_and(|previous| {
+            previous.buttons == sample.buttons
+                && previous.modifiers == sample.modifiers
+                && previous.snap == sample.snap
+        });
+        if moving
+            && self.pointer_moving
+            && let Some(back) = self.pending_pointer.back_mut()
+        {
+            *back = sample;
+            return;
+        }
+        self.pointer_moving = moving;
+        self.pending_pointer.push_back(sample);
+        while self.pending_pointer.len() > POINTER_QUEUE_MAX {
+            self.pending_pointer.pop_front();
+        }
+    }
+
+    /// The one pointer sample this tick owes the cart, if any.
+    pub fn take_pointer(&mut self) -> Option<PointerState> {
+        let sample = self.pending_pointer.pop_front()?;
+        self.last_pointer = Some(sample);
+        Some(sample)
+    }
+
+    /// Drop every input the host owes a cart that is being replaced: the
+    /// new cart has never seen the buttons this mask says are held, and a
+    /// press queued for the outgoing one would arrive as a press it never
+    /// gets a release for.
+    pub fn forget_input(&mut self) {
+        self.pending_pointer.clear();
+        self.pending_commands.clear();
+        self.pointer_moving = false;
+        self.last_pointer = None;
+        self.pointer_buttons = 0;
     }
 
     /// The cart clock: emulator-derived, monotonic, and frozen while the
@@ -845,6 +932,123 @@ mod tests {
             "a counter that only moves forward leaves the base alone"
         );
         assert_eq!(rebase_epoch(epoch, 5, 5), epoch, "and so does a paused one");
+    }
+
+    #[test]
+    fn device_from_canvas_backs_out_the_frame_origin_and_the_scale() {
+        let frame = [20.0, 20.0, 640.0, 480.0];
+        assert_eq!(device_from_canvas([100.0, 80.0], frame, 2), (40, 30));
+        // Every canvas px inside one device pixel names THAT pixel: a
+        // click on the right half of a doubled pixel is not the next one.
+        assert_eq!(device_from_canvas([101.0, 81.0], frame, 2), (40, 30));
+        // Outside the frame is negative, not clamped to it: the cart is
+        // the one that decides a miss.
+        assert_eq!(device_from_canvas([18.0, 16.0], frame, 2), (-1, -2));
+        assert_eq!(device_from_canvas([20.0, 20.0], frame, 1), (0, 0));
+    }
+
+    #[test]
+    fn device_from_canvas_saturates_out_of_range_and_zeroes_nan() {
+        let frame = [0.0, 0.0, 320.0, 240.0];
+        assert_eq!(
+            device_from_canvas([1.0e9, -1.0e9], frame, 1),
+            (i16::MAX, i16::MIN)
+        );
+        assert_eq!(device_from_canvas([f64::NAN, f64::NAN], frame, 1), (0, 0));
+        // A zero scale would divide by zero; `geometry` never yields one,
+        // and the floor is one anyway.
+        assert_eq!(device_from_canvas([5.0, 5.0], frame, 0), (5, 5));
+    }
+
+    fn sample(device: (i16, i16), buttons: u8) -> PointerState {
+        PointerState {
+            device,
+            buttons,
+            modifiers: 0,
+            snap: false,
+        }
+    }
+
+    fn queued(live: &LiveView) -> Vec<PointerState> {
+        live.pending_pointer.iter().copied().collect()
+    }
+
+    /// A move supersedes the move before it, but a button edge never
+    /// supersedes anything and nothing supersedes an edge: the cart reads
+    /// press and release off consecutive samples, and hit-tests the press
+    /// at the point it was made.
+    #[test]
+    fn a_moved_pointer_folds_in_but_a_button_edge_queues_behind_it() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        live.push_pointer(sample((1, 1), 0));
+        live.push_pointer(sample((2, 2), 0));
+        live.push_pointer(sample((3, 3), 0));
+        assert_eq!(
+            queued(&live),
+            vec![sample((1, 1), 0), sample((3, 3), 0)],
+            "moves fold onto the move ahead of them"
+        );
+        assert_eq!(live.take_pointer(), Some(sample((1, 1), 0)));
+        assert_eq!(live.take_pointer(), Some(sample((3, 3), 0)));
+
+        // A press, a drag inside the same tick, and the release that ends
+        // it: three samples, and the press keeps the point it was made at.
+        live.push_pointer(sample((3, 3), 1));
+        live.push_pointer(sample((4, 4), 1));
+        live.push_pointer(sample((5, 5), 1));
+        live.push_pointer(sample((5, 5), 0));
+        assert_eq!(
+            queued(&live),
+            vec![sample((3, 3), 1), sample((5, 5), 1), sample((5, 5), 0)]
+        );
+    }
+
+    /// Once the queue has drained, a move is measured against the sample
+    /// that WENT OUT -- otherwise every tick would leave one more sample
+    /// behind than it sent.
+    #[test]
+    fn a_move_after_a_drained_move_keeps_the_queue_at_one() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        live.push_pointer(sample((1, 1), 0));
+        assert_eq!(live.take_pointer(), Some(sample((1, 1), 0)));
+        for step in 2..10 {
+            live.push_pointer(sample((step, step), 0));
+            assert_eq!(live.pending_pointer.len(), 1);
+        }
+        assert_eq!(live.take_pointer(), Some(sample((9, 9), 0)));
+        assert_eq!(live.take_pointer(), None);
+    }
+
+    /// The queue is bounded: a link that stops draining must not grow it
+    /// without limit, and what a cart that comes back needs is the
+    /// freshest state.
+    #[test]
+    fn the_pointer_queue_is_bounded_by_the_newest_samples() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        // Every sample a button edge, so none of them folds away.
+        let pushes = i16::try_from(POINTER_QUEUE_MAX).unwrap_or(i16::MAX) * 2;
+        for step in 0..pushes {
+            live.push_pointer(sample((step, step), u8::try_from(step % 2).unwrap_or(0)));
+        }
+        assert_eq!(live.pending_pointer.len(), POINTER_QUEUE_MAX);
+        assert_eq!(
+            live.pending_pointer.back().copied(),
+            Some(sample((pushes - 1, pushes - 1), 1)),
+            "the newest sample is the one kept"
+        );
+    }
+
+    /// A cart being replaced takes the host's idea of the mouse with it.
+    #[test]
+    fn a_forgotten_session_leaves_no_button_held() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        live.pointer_buttons = 1;
+        live.push_pointer(sample((4, 4), 1));
+        live.pending_commands.push(EditCommand::Delete);
+        live.forget_input();
+        assert!(live.pending_pointer.is_empty());
+        assert!(live.pending_commands.is_empty());
+        assert_eq!(live.pointer_buttons, 0);
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub use live::CanvasMode;
 pub use world_canvas_item::WorldCanvasItem;
 pub use world_dock::{OpenMode, WorldDock};
 
-use emerald_editor_link::GestureKind;
+use emerald_editor_link::{EditCommand, GestureKind};
 use live::{LiveStatus, LiveView};
 
 use std::cell::RefCell;
@@ -47,9 +47,9 @@ use std::time::Instant;
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
-    RenderImage, ScrollWheelEvent, Styled, Subscription, Task, WeakEntity, Window, actions, div,
-    px,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task, WeakEntity, Window, actions,
+    div, px,
 };
 use serde_json::Value;
 use ui::prelude::*;
@@ -1334,6 +1334,7 @@ impl OpenWorld {
                 live.world_retry_at = None;
                 live.world_sync = live::WorldSync::Sending;
                 live.layers_dirty.mark_all();
+                live.forget_input();
                 // Where the cart starts looking is the document's own
                 // framing -- the camera origin the Design renderer frames
                 // -- not wherever the design pan happens to sit.
@@ -1377,6 +1378,32 @@ impl OpenWorld {
             let ranges = live.index_map.instance_ranges();
             if let Err(error) = live.mailbox.groups(&ranges) {
                 log::warn!("GGO: live groups: {error}");
+            }
+        }
+        // Input is never held back, not even mid-transfer: the cart reads
+        // its press and release edges off consecutive pointer samples, so
+        // a sample deferred until a blob finished would leave a button
+        // stuck down for the length of the transfer. One pointer per tick
+        // -- a tick is a cart frame -- and every queued command. Both are
+        // fire-and-forget (`LinkMailbox::pointer`), so a send that fails
+        // is logged and superseded rather than retried, and neither
+        // touches the status row the pushes below own.
+        if live.status == LiveStatus::Connected {
+            if let Some(pointer) = live.take_pointer()
+                && let Err(error) = live.mailbox.pointer(
+                    pointer.device.0,
+                    pointer.device.1,
+                    pointer.buttons,
+                    pointer.modifiers,
+                    pointer.snap,
+                )
+            {
+                log::warn!("GGO: live pointer: {error}");
+            }
+            for command in std::mem::take(&mut live.pending_commands) {
+                if let Err(error) = live.mailbox.command(command) {
+                    log::warn!("GGO: live command: {error}");
+                }
             }
         }
         // One update per tick, and none while a blob is in flight: the
@@ -1474,8 +1501,6 @@ impl OpenWorld {
                     // nothing left to re-send it.
                     live.pending_camera = Some([x, y]);
                     live_error = Some(format!("live camera: {error}"));
-                } else {
-                    live.sent_camera = Some([x, y]);
                 }
             }
             // Assigned even when it is `None`: a push that succeeded after
@@ -1501,16 +1526,6 @@ impl OpenWorld {
             .mailbox
             .camera()
             .map(|(x, y)| [live::from_raw(x), live::from_raw(y)]);
-        if live.camera != camera_before {
-            // The cart has moved the camera since the host last spoke, so
-            // the host's own value is stale and must stop anchoring input
-            // -- otherwise a cart system that moves the camera would be
-            // undone by the user's next drag. Only on a CHANGE: the push
-            // above ran earlier this same tick and the mailbox was polled
-            // before it, so an unconditional clear would throw away a
-            // camera the cart has not had a chance to report yet.
-            live.sent_camera = None;
-        }
         changed |= live.camera != camera_before;
         // Cloning the `Arc` only -- the emu panel owns dropping the image
         // it replaces (see `LinkEndpoint::frame`).
@@ -2899,6 +2914,12 @@ impl WorldPanel {
             self.update_paint_session(cx, PaintSession::delete_selection);
             return;
         }
+        // The cart despawns its own selection and reports what went; the
+        // confirm below guards a DOCUMENT edit the host is not making.
+        if self.live_active() {
+            self.live_command(EditCommand::Delete);
+            return;
+        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -2946,6 +2967,10 @@ impl WorldPanel {
         if self.in_paint_mode() {
             return;
         }
+        if self.live_active() {
+            self.live_command(EditCommand::SelectAll);
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -2962,6 +2987,10 @@ impl WorldPanel {
     fn clear_selection_impl(&mut self, cx: &mut Context<Self>) {
         if self.in_paint_mode() {
             self.escape_paint_mode(cx);
+            return;
+        }
+        if self.live_active() {
+            self.live_command(EditCommand::ClearSelection);
             return;
         }
         let ViewerState::Ready(open) = &mut self.state else {
@@ -2995,12 +3024,21 @@ impl WorldPanel {
         let Some(delta) = drag_ops::nudge_delta(key, tile) else {
             return;
         };
+        // In Live the arrows are the cart's, selection or not: it owns
+        // what is selected and where its camera looks, and the host has
+        // no camera of its own left to move.
+        if self.live_active() {
+            self.live_command(EditCommand::Nudge {
+                dx: delta[0] as i32,
+                dy: delta[1] as i32,
+            });
+            return;
+        }
         // Painting takes the entity selection out of play (see
         // [`Self::in_paint_mode`]) without clearing it, so the arrows keep
         // their look-around meaning there rather than moving an entity the
         // user can't even see selected.
         let painting = self.in_paint_mode();
-        let live_active = self.live_active();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -3027,12 +3065,6 @@ impl WorldPanel {
                 }
             };
             let look = [sign(delta[0]) * step, sign(delta[1]) * step];
-            // In Live the look-around is a middle-drag by another name: it
-            // moves the CART's camera and leaves the design pan alone.
-            if live_active {
-                self.live_pan_by(look, cx);
-                return;
-            }
             let mut view = open.view.borrow_mut();
             let Some(pan) = view.pan else {
                 return;
@@ -3860,12 +3892,9 @@ impl WorldPanel {
     /// device frame centered at the effective scale, offset by the cart's
     /// camera. Returns `(view, frame bounds, scale)`.
     ///
-    /// The camera is the cart's own REPORT, falling back to the last one
-    /// the host sent and then to the origin -- never the camera a pan
-    /// still owes the cart. A cart system that moves the camera has to be
-    /// able to win, so the picture and the outlines lag together by one
-    /// report rather than the outlines running ahead of the frame. The
-    /// INPUT anchor is the other way round; see [`Self::live_pan_begin`].
+    /// The camera is the cart's own REPORT, falling back to the origin:
+    /// the cart owns the camera, so the picture and the outlines move
+    /// together off the same report.
     fn live_camera_for(&self, size: [f64; 2]) -> Option<(View, [f64; 4], u32)> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
@@ -3887,74 +3916,174 @@ impl WorldPanel {
         }
     }
 
-    /// Middle-button down in Live: anchor a camera pan at `cursor`
-    /// ([`live::LiveView::input_camera`] is the anchor, and says why).
-    fn live_pan_begin(&mut self, cursor: [f64; 2]) {
-        if let ViewerState::Ready(open) = &mut self.state
-            && let Some(live) = open.live.as_mut()
-        {
-            live.pan_drag = Some((cursor, live.input_camera()));
+    /// The cart's modifier bits for a mouse event: 0 shift, 1 ctrl/cmd,
+    /// 2 alt (`EditorInput.modifiers`).
+    fn modifier_bits(modifiers: &Modifiers) -> u8 {
+        u8::from(modifiers.shift)
+            | (u8::from(modifiers.secondary()) << 1)
+            | (u8::from(modifiers.alt) << 2)
+    }
+
+    /// The cart's button bit for a mouse button: 0 left, 1 middle, 2
+    /// right. `None` for the buttons the cart has no bit for.
+    fn button_bit(button: MouseButton) -> Option<u8> {
+        match button {
+            MouseButton::Left => Some(1),
+            MouseButton::Middle => Some(2),
+            MouseButton::Right => Some(4),
+            _ => None,
         }
     }
 
-    /// A move during a Live camera pan. Returns whether one was in flight.
-    fn live_pan_move(&mut self, cursor: [f64; 2], size: [f64; 2], cx: &mut Context<Self>) -> bool {
-        let Some((_, _, scale)) = self.live_camera_for(size) else {
-            return false;
-        };
+    /// The held-button mask after `button` went down (or up). gpui reports
+    /// one button per event, so the mask is the panel's to carry.
+    fn live_buttons_after(&mut self, button: MouseButton, down: bool) -> u8 {
+        let bit = Self::button_bit(button);
         let ViewerState::Ready(open) = &mut self.state else {
-            return false;
+            return 0;
         };
         let Some(live) = open.live.as_mut() else {
-            return false;
+            return 0;
         };
-        let Some((start, start_camera)) = live.pan_drag else {
-            return false;
-        };
-        let scaled = f64::from(scale);
-        // Dragging the picture right moves the camera left.
-        live.pending_camera = Some([
-            start_camera[0] - (cursor[0] - start[0]) / scaled,
-            start_camera[1] - (cursor[1] - start[1]) / scaled,
-        ]);
-        cx.notify();
-        true
-    }
-
-    /// End a Live camera pan. Returns whether one was in flight.
-    fn live_pan_end(&mut self) -> bool {
-        if let ViewerState::Ready(open) = &mut self.state
-            && let Some(live) = open.live.as_mut()
-        {
-            return live.pan_drag.take().is_some();
+        if let Some(bit) = bit {
+            if down {
+                live.pointer_buttons |= bit;
+            } else {
+                live.pointer_buttons &= !bit;
+            }
         }
-        false
+        live.pointer_buttons
     }
 
-    /// Move the cart's camera by `screen_delta` canvas px -- the Live twin
-    /// of nudging the design pan.
-    fn live_pan_by(&mut self, screen_delta: [f64; 2], cx: &mut Context<Self>) -> bool {
+    /// The held-button mask for a move event. gpui reports at most one
+    /// held button on a move, and none at all once every button is up --
+    /// which is how a release that landed off the canvas still reaches
+    /// the cart instead of leaving a button stuck down there.
+    fn live_buttons_moving(&mut self, pressed: Option<MouseButton>) -> u8 {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return 0;
+        };
+        let Some(live) = open.live.as_mut() else {
+            return 0;
+        };
+        if pressed.is_none() {
+            live.pointer_buttons = 0;
+        }
+        live.pointer_buttons
+    }
+
+    /// Queue one pointer sample for the cart: canvas-relative `local` px
+    /// through the inverse of the Live geometry, with the buttons and
+    /// modifiers held as the cursor got there.
+    ///
+    /// The host interprets NOTHING here -- no hit test, no marquee, no
+    /// drag, no camera. The cart runs the gesture and publishes what it
+    /// did, and [`Self::mirror_cart_state`] is the only path that turns
+    /// any of it into a document op.
+    fn live_pointer(&mut self, local: [f64; 2], buttons: u8, modifiers: u8) {
         let Some(size) = self.live_canvas_size() else {
-            return false;
+            return;
         };
-        let Some((_, _, scale)) = self.live_camera_for(size) else {
-            return false;
+        // The same geometry the picture is painted through, so the device
+        // px the cart hit-tests are the pixel the user aimed at.
+        let Some((_, frame_rect, scale)) = self.live_camera_for(size) else {
+            return;
         };
         let ViewerState::Ready(open) = &mut self.state else {
-            return false;
+            return;
         };
+        let snap = open.snap;
         let Some(live) = open.live.as_mut() else {
-            return false;
+            return;
         };
-        // The same anchor a middle-drag takes, and for the same reason.
-        let camera = live.input_camera();
-        let scaled = f64::from(scale);
-        live.pending_camera = Some([
-            camera[0] + screen_delta[0] / scaled,
-            camera[1] + screen_delta[1] / scaled,
-        ]);
-        cx.notify();
+        live.push_pointer(live::PointerState {
+            device: live::device_from_canvas(local, frame_rect, scale),
+            buttons,
+            modifiers,
+            snap,
+        });
+    }
+
+    /// Queue one edit command for the cart. In Live every semantic edit --
+    /// nudge, delete, duplicate, select all, clear -- runs against the
+    /// CART's selection, which the document only mirrors; the host applies
+    /// no op of its own and waits for the rows to come back.
+    fn live_command(&mut self, command: EditCommand) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(live) = open.live.as_mut()
+        {
+            live.pending_commands.push(command);
+        }
+    }
+
+    /// Whether a canvas gesture belongs to the cart rather than to the
+    /// host. Paint mode is the exception, and only for the LEFT button:
+    /// the brush is the host's in both modes
+    /// (`canvas_primary_down_with`), while the middle drag that pans the
+    /// cart's camera has to keep working under it. `None` is a move with
+    /// nothing held, which no stroke can be.
+    fn live_owns_button(&self, button: Option<MouseButton>) -> bool {
+        self.live_active() && !(button == Some(MouseButton::Left) && self.in_paint_mode())
+    }
+
+    /// A mouse button went down over the canvas. Returns whether the cart
+    /// took it, in which case the host does not hit-test.
+    fn canvas_button_down(
+        &mut self,
+        local: [f64; 2],
+        button: MouseButton,
+        modifiers: &Modifiers,
+    ) -> bool {
+        if !self.live_owns_button(Some(button)) {
+            return false;
+        }
+        let buttons = self.live_buttons_after(button, true);
+        self.live_pointer(local, buttons, Self::modifier_bits(modifiers));
         true
+    }
+
+    /// A mouse button came up over the canvas; see
+    /// [`Self::canvas_button_down`].
+    fn canvas_button_up(
+        &mut self,
+        local: [f64; 2],
+        button: MouseButton,
+        modifiers: &Modifiers,
+    ) -> bool {
+        if !self.live_owns_button(Some(button)) {
+            return false;
+        }
+        let buttons = self.live_buttons_after(button, false);
+        self.live_pointer(local, buttons, Self::modifier_bits(modifiers));
+        true
+    }
+
+    /// The cursor moved over the canvas; see [`Self::canvas_button_down`].
+    fn canvas_pointer_move(
+        &mut self,
+        local: [f64; 2],
+        pressed: Option<MouseButton>,
+        modifiers: &Modifiers,
+    ) -> bool {
+        if !self.live_owns_button(pressed) {
+            return false;
+        }
+        let buttons = self.live_buttons_moving(pressed);
+        self.live_pointer(local, buttons, Self::modifier_bits(modifiers));
+        true
+    }
+
+    /// Window px -> canvas-relative px through the bounds the canvas
+    /// element stamped at its last layout.
+    fn canvas_local(&self, position: gpui::Point<Pixels>) -> Option<[f64; 2]> {
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let bounds = open.view.borrow().last_bounds?;
+        Some([
+            f64::from(position.x - bounds.origin.x),
+            f64::from(position.y - bounds.origin.y),
+        ])
     }
 
     /// One wheel notch in Live: the picture scale steps, and nothing goes
@@ -4031,9 +4160,10 @@ impl WorldPanel {
             self.paint_at_local(local, Some(shift), cx);
             return;
         }
-        // Task 2 hands this gesture to the cart: in Live the cart owns
-        // every interaction, so the host neither hit-tests nor drags. It
-        // still runs the paint branch above -- painting is the host's.
+        // In Live the cart owns every interaction: the press was
+        // forwarded (`canvas_button_down`) and the host neither hit-tests
+        // nor drags. The paint branch above still runs -- the brush is
+        // the host's in both modes.
         if self.live_active() {
             return;
         }
@@ -4096,8 +4226,8 @@ impl WorldPanel {
     /// double-click). Reports whether it entered, so the caller can fall
     /// back to the ordinary select-and-arm-a-drag on anything else.
     fn canvas_double_click(&mut self, local: [f64; 2], cx: &mut Context<Self>) -> bool {
-        // Task 2: the same reason the single click bows out in Live -- the
-        // entity under the cursor is the cart's to name, not the host's.
+        // The same reason the single click bows out in Live: the entity
+        // under the cursor is the cart's to name, not the host's.
         if self.in_paint_mode() || self.live_active() {
             return false;
         }
@@ -4128,9 +4258,9 @@ impl WorldPanel {
             self.paint_at_local(local, None, cx);
             return;
         }
-        // Task 2 hands this gesture to the cart: in Live the cart owns
-        // every interaction, so the host neither hit-tests nor drags. It
-        // still runs the paint branch above -- painting is the host's.
+        // In Live the move was forwarded (`canvas_pointer_move`); the
+        // drag it continues is the cart's. The paint branch above still
+        // runs -- the brush is the host's in both modes.
         if self.live_active() {
             return;
         }
@@ -4177,9 +4307,9 @@ impl WorldPanel {
             self.end_canvas_paint(cx);
             return;
         }
-        // Task 2 hands this gesture to the cart: in Live the cart owns
-        // every interaction, so the host neither hit-tests nor drags. It
-        // still runs the paint branch above -- painting is the host's.
+        // In Live the release was forwarded (`canvas_button_up`); the
+        // band or drag it settles is the cart's. The paint branch above
+        // still runs -- the brush is the host's in both modes.
         if self.live_active() {
             return;
         }
@@ -4220,20 +4350,10 @@ impl WorldPanel {
 
     /// Middle-mouse pan handling for a move event. Returns true if the
     /// event belonged to an in-flight pan (handled or cancelled).
+    ///
+    /// DESIGN only: in Live the middle drag is forwarded to the cart like
+    /// every other pointer sample, and the cart moves its own camera.
     fn handle_pan_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
-        // In Live the pan does not move the picture -- it moves the CART's
-        // camera, and the cart re-renders from there. The design pan is
-        // left exactly where the design view had it.
-        if self.live_active() {
-            if event.pressed_button != Some(MouseButton::Middle) {
-                return self.live_pan_end();
-            }
-            let cursor = [f64::from(event.position.x), f64::from(event.position.y)];
-            let Some(size) = self.live_canvas_size() else {
-                return false;
-            };
-            return self.live_pan_move(cursor, size, cx);
-        }
         let ViewerState::Ready(open) = &mut self.state else {
             return false;
         };
@@ -5181,6 +5301,12 @@ impl WorldPanel {
 
     /// Copy + paste without touching the clipboard.
     fn duplicate_impl(&mut self, cx: &mut Context<Self>) {
+        // The cart copies its own selection and reports the spawns; the
+        // document hears about them through the mirror.
+        if self.live_active() {
+            self.live_command(EditCommand::Duplicate);
+            return;
+        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -6567,19 +6693,14 @@ impl WorldPanel {
                     // Take focus so the panel's Undo/Redo/Save bindings
                     // apply (and any in-progress field edit blur-commits).
                     window.focus(&this.focus_handle, cx);
-                    let local = {
-                        let ViewerState::Ready(open) = &this.state else {
-                            return;
-                        };
-                        let v = open.view.borrow();
-                        let Some(bounds) = v.last_bounds else {
-                            return;
-                        };
-                        [
-                            f64::from(event.position.x - bounds.origin.x),
-                            f64::from(event.position.y - bounds.origin.y),
-                        ]
+                    let Some(local) = this.canvas_local(event.position) else {
+                        return;
                     };
+                    // In Live the press is the cart's: it hit-tests, it
+                    // selects, it decides what a second click means.
+                    if this.canvas_button_down(local, MouseButton::Left, &event.modifiers) {
+                        return;
+                    }
                     // A double-click that opens a Tilemap entity for
                     // painting must NOT also arm a placement drag on it:
                     // the first click already selected it, and the drag
@@ -6592,7 +6713,12 @@ impl WorldPanel {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if let Some(local) = this.canvas_local(event.position)
+                        && this.canvas_button_up(local, MouseButton::Left, &event.modifiers)
+                    {
+                        return;
+                    }
                     this.canvas_primary_up(cx);
                 }),
             )
@@ -6600,8 +6726,11 @@ impl WorldPanel {
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
                     let cursor = [f64::from(event.position.x), f64::from(event.position.y)];
-                    if this.live_active() {
-                        this.live_pan_begin(cursor);
+                    // The Live camera pan is the cart's own edit system,
+                    // driven by the very same forwarded pointer.
+                    if let Some(local) = this.canvas_local(event.position)
+                        && this.canvas_button_down(local, MouseButton::Middle, &event.modifiers)
+                    {
                         return;
                     }
                     let ViewerState::Ready(open) = &this.state else {
@@ -6649,6 +6778,11 @@ impl WorldPanel {
                         ]);
                     }
                 }
+                if let Some(local) = this.canvas_local(event.position)
+                    && this.canvas_pointer_move(local, event.pressed_button, &event.modifiers)
+                {
+                    return;
+                }
                 if this.handle_pan_move(event, cx) {
                     return;
                 }
@@ -6659,13 +6793,33 @@ impl WorldPanel {
             }))
             .on_mouse_up(
                 MouseButton::Middle,
-                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                    if this.live_active() {
-                        this.live_pan_end();
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    if let Some(local) = this.canvas_local(event.position)
+                        && this.canvas_button_up(local, MouseButton::Middle, &event.modifiers)
+                    {
                         return;
                     }
                     if let ViewerState::Ready(open) = &this.state {
                         open.view.borrow_mut().drag = None;
+                    }
+                }),
+            )
+            // Right-button samples exist for the cart alone -- a user edit
+            // system may bind it -- so these listeners do nothing in
+            // Design, where the canvas has no right-button gesture.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                    if let Some(local) = this.canvas_local(event.position) {
+                        this.canvas_button_down(local, MouseButton::Right, &event.modifiers);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    if let Some(local) = this.canvas_local(event.position) {
+                        this.canvas_button_up(local, MouseButton::Right, &event.modifiers);
                     }
                 }),
             )
@@ -14545,7 +14699,7 @@ mod tests {
             .iter()
             .filter_map(|message| match wire::decode_host(message) {
                 Some(HostMsg::Groups {
-                    more: false,
+                    remaining: 0,
                     groups,
                 }) => Some(groups.collect()),
                 _ => None,
@@ -14643,16 +14797,6 @@ mod tests {
         clear_world_dirty(&panel, cx);
 
         panel.update(cx, |panel, cx| {
-            let ViewerState::Ready(open) = &mut panel.state else {
-                panic!("expected Ready");
-            };
-            open.selected = vec![Selection::Entity(0)];
-            panel.nudge_impl("ArrowRight", false, cx);
-        });
-        panel.read_with(cx, |panel, _| assert!(live_of(panel).world_dirty, "nudge"));
-        clear_world_dirty(&panel, cx);
-
-        panel.update(cx, |panel, cx| {
             panel.add_instance_impl("worlds/sub".to_string(), cx)
         });
         panel.read_with(cx, |panel, _| {
@@ -14701,9 +14845,11 @@ mod tests {
 
     /// Arrow keys with nothing selected look around, which in Live is a
     /// camera move -- the same contract a middle-drag has, and the design
-    /// pan stays where the design view left it.
+    /// The arrows in Live are the cart's: it owns the selection they move
+    /// and the camera they look around with, so the host queues a
+    /// `Nudge` and changes nothing of its own.
     #[gpui::test]
-    async fn looking_around_with_the_arrows_moves_the_live_camera(cx: &mut TestAppContext) {
+    async fn the_arrows_in_live_go_to_the_cart_as_a_nudge(cx: &mut TestAppContext) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
         host_sent(&endpoint);
         let design_pan_before = panel.read_with(cx, |panel, _| panel.test_design_pan());
@@ -14712,33 +14858,34 @@ mod tests {
                 panic!("expected Ready");
             };
             open.selected.clear();
-            open.view.borrow_mut().last_bounds = Some(gpui::bounds(
-                gpui::point(px(0.), px(0.)),
-                gpui::size(px(800.), px(600.)),
-            ));
-            // The anchor is what the host has already decided -- here the
-            // camera the greeting sent -- not the world origin.
-            let anchor = live_of(panel).sent_camera.expect("the greeting sent one");
             panel.nudge_impl("ArrowRight", false, cx);
-            // 800x600 fits the 320x240 frame twice over: a
-            // `CAMERA_PAN_STEP_PX` step on screen is half that in world px.
-            assert_eq!(
-                live_of(panel).pending_camera,
-                Some([anchor[0] + CAMERA_PAN_STEP_PX / 2.0, anchor[1]])
-            );
+            panel.nudge_impl("ArrowUp", true, cx);
         });
+        endpoint.tick();
+        cx.run_until_parked();
+        let sent = host_sent(&endpoint);
+        assert_eq!(
+            commands_in(&sent),
+            vec![
+                (emerald_editor_runtime::wire::command::NUDGE, 1, 0),
+                (emerald_editor_runtime::wire::command::NUDGE, 0, -16),
+            ],
+            "one pixel, then one tile"
+        );
+        assert!(
+            sent.iter().all(|message| message.first() != Some(&0x03)),
+            "the host has no camera of its own to move any more"
+        );
         assert_eq!(
             panel.read_with(cx, |panel, _| panel.test_design_pan()),
             design_pan_before
         );
-        endpoint.tick();
-        cx.run_until_parked();
-        assert!(
-            host_sent(&endpoint)
-                .iter()
-                .any(|message| message.first() == Some(&0x03)),
-            "Camera sent"
-        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !open_of(panel).store.state().dirty,
+                "the document is the cart's to move, not the host's"
+            );
+        });
     }
 
     /// Reset view in Live is the Live framing's own reset: back to the
@@ -14808,118 +14955,6 @@ mod tests {
             [20.0, 20.0, 32.0, 32.0],
             "the report, not the owed camera, places the outline"
         );
-        // The INPUT anchor is the other way round: a further pan starts
-        // from what the host already decided, or it would fight itself.
-        panel.update(cx, |panel, _| panel.live_pan_begin([0.0, 0.0]));
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                live_of(panel).pan_drag.map(|(_, camera)| camera),
-                Some([200.0, 150.0])
-            );
-        });
-    }
-
-    /// A report that MOVES retires the camera the host last sent: a cart
-    /// system that drives the camera must not be undone by the user's
-    /// next drag anchoring on a value the cart has already left behind.
-    #[gpui::test]
-    async fn a_moved_cart_camera_retires_the_one_the_host_sent(cx: &mut TestAppContext) {
-        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        // A: the cart reports where the greeting put it.
-        cart_camera(&endpoint, 10.0, 20.0);
-        cart_frame(&endpoint, 3);
-        cx.run_until_parked();
-
-        // B: the host pushes a camera of its own and it goes out.
-        panel.update(cx, |panel, cx| {
-            live_mut_of(panel).pending_camera = Some([50.0, 60.0]);
-            cx.notify();
-        });
-        endpoint.tick();
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            let live = live_of(panel);
-            assert_eq!(live.sent_camera, Some([50.0, 60.0]));
-            assert_eq!(
-                live.input_camera(),
-                [50.0, 60.0],
-                "the host's own push anchors input until the cart answers"
-            );
-        });
-
-        // C: the cart reports something else again -- a camera system, not
-        // the host's push, deciding where the view is.
-        cart_camera(&endpoint, 200.0, 100.0);
-        cart_frame(&endpoint, 4);
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            let live = live_of(panel);
-            assert_eq!(live.camera, Some([200.0, 100.0]));
-            assert_eq!(live.sent_camera, None, "the report retired it");
-            assert_eq!(live.input_camera(), [200.0, 100.0]);
-        });
-
-        // And a middle-drag starts from C.
-        host_sent(&endpoint);
-        panel.update(cx, |panel, cx| {
-            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
-                gpui::point(px(0.), px(0.)),
-                gpui::size(px(640.), px(480.)),
-            ));
-            panel.live_pan_begin([200.0, 200.0]);
-            assert!(
-                panel.handle_pan_move(&move_event(230.0, 210.0, Some(MouseButton::Middle)), cx)
-            );
-        });
-        endpoint.tick();
-        cx.run_until_parked();
-        let sent = host_sent(&endpoint);
-        let camera = sent
-            .iter()
-            .rev()
-            .find(|message| message.first() == Some(&0x03))
-            .expect("a Camera went out");
-        match emerald_editor_runtime::wire::decode_host(camera) {
-            // 640x480 fits the frame at scale 2: a 30x10 px drag is 15x5
-            // world px, and dragging right moves the camera left.
-            Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
-                assert_eq!((x, y), (live::to_raw(185.0), live::to_raw(95.0)));
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// Before the cart's first camera report the overlay uses the camera
-    /// the host last SENT, so the greeting's own framing places the
-    /// outlines rather than the world origin.
-    #[gpui::test]
-    async fn the_live_overlay_falls_back_to_the_camera_the_host_sent(cx: &mut TestAppContext) {
-        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        cart_rows(&endpoint, &[(0, 0.0, 0.0)]);
-        cart_frame(&endpoint, 3);
-        cx.run_until_parked();
-        let origin = panel.read_with(cx, |panel, _| {
-            let expected = active_camera_origin(&open_of(panel).store.state());
-            let live = live_of(panel);
-            assert_eq!(live.camera, None, "the cart has reported nothing");
-            assert_eq!(
-                live.sent_camera,
-                Some(expected),
-                "the greeting's camera was recorded as it went out"
-            );
-            expected
-        });
-        // 640x480 fits the frame at scale 2 with a (0, 0) frame origin.
-        let rect = panel.read_with(cx, |panel, _| {
-            panel
-                .test_live_row_screen_rect(0, [640.0, 480.0])
-                .expect("a published row")
-        });
-        assert_eq!(
-            [rect[0], rect[1]],
-            [-origin[0] * 2.0, -origin[1] * 2.0],
-            "world (0, 0) seen from the camera the host sent"
-        );
     }
 
     /// The Live prepaint stamps `ViewShared.last_bounds` itself -- it must
@@ -14963,53 +14998,319 @@ mod tests {
         );
     }
 
-    /// A middle-drag in Live moves the CART's camera and leaves the design
-    /// pan alone -- the two views keep their own framing.
+    /// Every `Pointer` the host put on the wire, in order.
+    fn pointers_in(sent: &[Vec<u8>]) -> Vec<(i16, i16, u8, u8, bool)> {
+        use emerald_editor_runtime::wire::{self, HostMsg};
+        sent.iter()
+            .filter_map(|message| match wire::decode_host(message) {
+                Some(HostMsg::Pointer {
+                    x,
+                    y,
+                    buttons,
+                    modifiers,
+                    snap,
+                }) => Some((x, y, buttons, modifiers, snap)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `Command` the host put on the wire, in order.
+    fn commands_in(sent: &[Vec<u8>]) -> Vec<(u8, i32, i32)> {
+        use emerald_editor_runtime::wire::{self, HostMsg};
+        sent.iter()
+            .filter_map(|message| match wire::decode_host(message) {
+                Some(HostMsg::Command { kind, a, b }) => Some((kind, a, b)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One turn of the live poll, and everything it put on the wire.
+    fn live_tick_sent(
+        endpoint: &ggo_common::LinkEndpoint,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<Vec<u8>> {
+        endpoint.tick();
+        cx.run_until_parked();
+        host_sent(endpoint)
+    }
+
+    /// The whole Live gesture, forwarded: press, move and release reach
+    /// the cart as device px with the buttons held, and the host neither
+    /// selects nor moves anything of its own.
     #[gpui::test]
-    async fn a_middle_drag_in_live_sends_the_camera_and_never_touches_the_design_pan(
+    async fn a_live_gesture_is_forwarded_and_changes_nothing_host_side(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cart_frame(&endpoint, 3);
+        cx.run_until_parked();
+        host_sent(&endpoint);
+        // The 800x600 canvas the helper stamped fits the 320x240 frame at
+        // scale 2, with the frame origin at (80, 60).
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.snap = true;
+        });
+
+        panel.update(cx, |panel, _| {
+            assert!(panel.canvas_button_down(
+                [100.0, 80.0],
+                MouseButton::Left,
+                &Modifiers::shift()
+            ));
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(10, 10, 1, 1, true)],
+            "device px, left held, shift, and the host's snap toggle"
+        );
+
+        panel.update(cx, |panel, _| {
+            assert!(panel.canvas_pointer_move(
+                [140.0, 100.0],
+                Some(MouseButton::Left),
+                &Modifiers::none()
+            ));
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(30, 20, 1, 0, true)],
+            "the drag keeps the button held"
+        );
+
+        panel.update(cx, |panel, _| {
+            assert!(panel.canvas_button_up([140.0, 100.0], MouseButton::Left, &Modifiers::none()));
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(30, 20, 0, 0, true)],
+            "and the release lets it go"
+        );
+
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            assert!(open.selected.is_empty(), "the host never hit-tested");
+            assert!(open.marquee.is_none(), "nor started a band");
+            assert!(
+                !open.store.state().dirty,
+                "nor moved anything: the cart owns the gesture"
+            );
+        });
+    }
+
+    /// A press and the release that ends it inside ONE tick both reach the
+    /// cart, in order and on separate frames: it derives its press and
+    /// release edges from consecutive samples, so folding them would lose
+    /// the click and swapping them would leave a press it never sees
+    /// released.
+    #[gpui::test]
+    async fn a_press_and_release_in_one_tick_reach_the_cart_in_order(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, _| {
+            panel.canvas_button_down([100.0, 80.0], MouseButton::Left, &Modifiers::none());
+            panel.canvas_pointer_move([104.0, 80.0], Some(MouseButton::Left), &Modifiers::none());
+            panel.canvas_button_up([104.0, 80.0], MouseButton::Left, &Modifiers::none());
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(10, 10, 1, 0, false)],
+            "the press goes first, at the point it was made"
+        );
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(12, 10, 1, 0, false)],
+            "then the drag inside it"
+        );
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(12, 10, 0, 0, false)],
+            "and the release last, so no press is left held"
+        );
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            Vec::new(),
+            "an idle tick sends nothing"
+        );
+    }
+
+    /// A middle-drag in Live is forwarded like any other sample -- the
+    /// cart pans its own camera from it -- and the design pan is left
+    /// exactly where the design view had it.
+    #[gpui::test]
+    async fn a_middle_drag_in_live_is_forwarded_and_never_touches_the_design_pan(
         cx: &mut TestAppContext,
     ) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        // A report supersedes the camera the greeting sent, so this is
-        // what the drag anchors on.
         cart_camera(&endpoint, 100.0, 50.0);
         cart_frame(&endpoint, 3);
         cx.run_until_parked();
         host_sent(&endpoint);
         let design_pan_before = panel.read_with(cx, |panel, _| panel.test_design_pan());
 
-        panel.update(cx, |panel, cx| {
-            // A 640x480 canvas fits the 320x240 frame at scale 2, so the
-            // 30x10 px drag below is 15x5 world px.
-            open_of(panel).view.borrow_mut().last_bounds = Some(gpui::bounds(
-                gpui::point(px(0.), px(0.)),
-                gpui::size(px(640.), px(480.)),
+        panel.update(cx, |panel, _| {
+            assert!(panel.canvas_button_down(
+                [100.0, 80.0],
+                MouseButton::Middle,
+                &Modifiers::none()
             ));
-            panel.live_pan_begin([200.0, 200.0]);
-            assert!(
-                panel.handle_pan_move(&move_event(230.0, 210.0, Some(MouseButton::Middle)), cx)
+        });
+        let sent = live_tick_sent(&endpoint, cx);
+        assert_eq!(pointers_in(&sent), vec![(10, 10, 2, 0, false)]);
+        assert!(
+            sent.iter().all(|message| message.first() != Some(&0x03)),
+            "the camera is the cart's own to move now"
+        );
+
+        panel.update(cx, |panel, _| {
+            assert!(panel.canvas_pointer_move(
+                [160.0, 100.0],
+                Some(MouseButton::Middle),
+                &Modifiers::none()
+            ));
+        });
+        let sent = live_tick_sent(&endpoint, cx);
+        assert_eq!(pointers_in(&sent), vec![(40, 20, 2, 0, false)]);
+        assert!(sent.iter().all(|message| message.first() != Some(&0x03)));
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_design_pan(), design_pan_before);
+            assert_eq!(
+                live_of(panel).pending_camera,
+                None,
+                "the host owes the cart no camera"
             );
         });
-        endpoint.tick();
-        cx.run_until_parked();
+    }
 
-        let sent = host_sent(&endpoint);
-        let camera = sent
-            .iter()
-            .rev()
-            .find(|message| message.first() == Some(&0x03))
-            .expect("a Camera went out");
-        match emerald_editor_runtime::wire::decode_host(camera) {
-            Some(emerald_editor_runtime::wire::HostMsg::Camera { x, y }) => {
-                // Dragging the picture right moves the camera left.
-                assert_eq!((x, y), (live::to_raw(85.0), live::to_raw(45.0)));
-            }
-            other => panic!("{other:?}"),
-        }
+    /// A release the canvas never gets a mouse-up for -- the button came
+    /// up somewhere else -- still reaches the cart on the next move, or
+    /// the cart would drag until the end of the session.
+    #[gpui::test]
+    async fn a_move_with_no_button_held_releases_the_cart_s_press(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, _| {
+            panel.canvas_button_down([100.0, 80.0], MouseButton::Left, &Modifiers::none());
+        });
         assert_eq!(
-            panel.read_with(cx, |panel, _| panel.test_design_pan()),
-            design_pan_before
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(10, 10, 1, 0, false)]
         );
+        panel.update(cx, |panel, _| {
+            panel.canvas_pointer_move([120.0, 80.0], None, &Modifiers::none());
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(20, 10, 0, 0, false)]
+        );
+    }
+
+    /// Delete, duplicate, select-all and clear in Live are commands to the
+    /// cart against ITS selection; the host applies no op of its own, not
+    /// even to a selection the mirror left behind.
+    #[gpui::test]
+    async fn live_edit_actions_go_to_the_cart_as_commands(cx: &mut TestAppContext) {
+        use emerald_editor_runtime::wire::command;
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        let entities_before =
+            panel.read_with(cx, |panel, _| open_of(panel).store.state().entities.len());
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.selected = vec![Selection::Entity(0)];
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.select_all_impl(cx);
+            panel.duplicate_impl(cx);
+            panel.delete_selected_impl(window, cx);
+            panel.clear_selection_impl(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            commands_in(&live_tick_sent(&endpoint, cx)),
+            vec![
+                (command::SELECT_ALL, 0, 0),
+                (command::DUPLICATE, 0, 0),
+                (command::DELETE, 0, 0),
+                (command::CLEAR_SELECTION, 0, 0),
+            ],
+            "every command of the tick goes out, in the order asked for"
+        );
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            assert_eq!(
+                open.store.state().entities.len(),
+                entities_before,
+                "the host deleted and duplicated nothing"
+            );
+            assert!(!open.store.state().dirty);
+            assert_eq!(
+                open.selected,
+                vec![Selection::Entity(0)],
+                "and left the mirrored selection for the cart to replace"
+            );
+        });
+    }
+
+    /// Paint mode keeps the LEFT button in both modes -- the brush is the
+    /// host's -- but nothing else: the middle drag that pans the cart's
+    /// camera has to keep working while a map is under the brush.
+    #[gpui::test]
+    async fn painting_in_live_keeps_the_brush_but_not_the_camera(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, _| {
+            assert!(
+                !panel.canvas_button_down([100.0, 80.0], MouseButton::Left, &Modifiers::none()),
+                "the brush keeps the left button"
+            );
+            assert!(
+                panel.canvas_button_down([100.0, 80.0], MouseButton::Middle, &Modifiers::none()),
+                "the camera pan is still the cart's"
+            );
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(10, 10, 2, 0, false)]
+        );
+    }
+
+    /// A cart being replaced takes the host's idea of the mouse with it: a
+    /// press queued for the outgoing cart would reach the new one as a
+    /// press it never gets a release for.
+    #[gpui::test]
+    async fn a_greeting_drops_the_input_owed_the_previous_cart(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, _| {
+            panel.canvas_button_down([100.0, 80.0], MouseButton::Left, &Modifiers::none());
+            live_mut_of(panel).status = LiveStatus::Connecting;
+        });
+        let sent = live_tick_sent(&endpoint, cx);
+        assert_eq!(
+            pointers_in(&sent),
+            Vec::new(),
+            "nothing goes out while the session is re-greeting"
+        );
+        panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert!(live.pending_pointer.is_empty());
+            assert_eq!(live.pointer_buttons, 0);
+        });
     }
 
     /// The wheel in Live steps the integer picture scale; it never touches
