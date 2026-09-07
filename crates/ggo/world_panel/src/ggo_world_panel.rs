@@ -1374,6 +1374,7 @@ impl OpenWorld {
                 live.world_sync = live::WorldSync::Sending;
                 live.layers_dirty.mark_all();
                 live.forget_input();
+                live.forget_gestures();
                 // Where the cart starts looking is the document's own
                 // framing -- the camera origin the Design renderer frames
                 // -- not wherever the design pan happens to sit.
@@ -16267,7 +16268,10 @@ mod tests {
 
     /// A cart being replaced takes the host's idea of the mouse with it: a
     /// press queued for the outgoing cart would reach the new one as a
-    /// press it never gets a release for.
+    /// press it never gets a release for. The one sample that does go out
+    /// is the RELEASE of whatever the host thought was held -- a greeting
+    /// resets the link's mirrors, not the cart's pointer fields, so a
+    /// button left down there is one the new session still believes is.
     #[gpui::test]
     async fn a_greeting_drops_the_input_owed_the_previous_cart(cx: &mut TestAppContext) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
@@ -16279,8 +16283,8 @@ mod tests {
         let sent = live_tick_sent(&endpoint, cx);
         assert_eq!(
             pointers_in(&sent),
-            Vec::new(),
-            "nothing goes out while the session is re-greeting"
+            vec![(10, 10, 0, 0, false)],
+            "the press never left, and the new cart is told nothing is held"
         );
         panel.read_with(cx, |panel, _| {
             let live = live_of(panel);

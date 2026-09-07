@@ -84,8 +84,13 @@ const GAME_TABLE: emerald_editor_runtime::link::SystemTable = &[("slide", slide_
 /// outlines and hit-tests it as the 16x16 fallback box at `pos`
 /// (`drawn_footprint`).
 fn boxed_entity(pos: [f64; 2]) -> WorldEntity {
+    boxed_entity_z(pos, 0.0)
+}
+
+/// [`boxed_entity`] at a chosen depth: the cart hit-tests topmost by `z`.
+fn boxed_entity_z(pos: [f64; 2], z: f64) -> WorldEntity {
     WorldEntity {
-        components: json!({ "Transform": { "pos": pos, "z": 0.0 } })
+        components: json!({ "Transform": { "pos": pos, "z": z } })
             .as_object()
             .expect("an object literal")
             .clone(),
@@ -120,6 +125,15 @@ const BOX_B_POS: [f64; 2] = [100.0, 50.0];
 const INSTANCE_POS: [f64; 2] = [100.0, 120.0];
 /// The second member's offset inside `worlds/pair`.
 const PAIR_SPREAD: f64 = 24.0;
+/// `worlds/grid`'s one box, authored on the 16 px grid.
+const GRID_BOX: u32 = 1;
+const GRID_BOX_POS: [f64; 2] = [32.0, 48.0];
+/// `worlds/stacked`'s two boxes: same place, `STACK_TOP` the higher `z`.
+const STACK_POS: [f64; 2] = [152.0, 112.0];
+const STACK_TOP: u32 = 2;
+/// How many boxes `worlds/many` holds. With the camera that is more than
+/// the 60 indices one `Selection` datagram carries.
+const MANY_BOXES: u32 = 70;
 
 /// The journey worlds, written over whatever `routed_project`'s own
 /// fixture left behind.
@@ -179,6 +193,50 @@ fn write_journey_fixture(root: &std::path::Path) {
         },
     )
     .expect("the instanced world writes");
+    // On the 16 px grid already, so a snapped drag lands on it exactly.
+    write_world(
+        root,
+        "worlds/grid.toml",
+        &WorldFile {
+            entities: vec![origin_camera(), boxed_entity(GRID_BOX_POS)],
+            instances: vec![],
+            backgrounds: vec![],
+        },
+    )
+    .expect("the grid world writes");
+    // Two boxes in the same place at different depths, near the middle of
+    // the device screen so they stay on the canvas at a stepped-up scale.
+    write_world(
+        root,
+        "worlds/stacked.toml",
+        &WorldFile {
+            entities: vec![
+                origin_camera(),
+                boxed_entity_z(STACK_POS, 0.0),
+                boxed_entity_z(STACK_POS, 5.0),
+            ],
+            instances: vec![],
+            backgrounds: vec![],
+        },
+    )
+    .expect("the stacked world writes");
+    // More entities than one `Selection` datagram carries, so selecting
+    // them all has to arrive in parts.
+    let mut many = vec![origin_camera()];
+    many.extend((0..MANY_BOXES).map(|index| {
+        let index = f64::from(index);
+        boxed_entity([(index % 20.0) * 16.0, (index / 20.0).floor() * 16.0 + 16.0])
+    }));
+    write_world(
+        root,
+        "worlds/many.toml",
+        &WorldFile {
+            entities: many,
+            instances: vec![],
+            backgrounds: vec![],
+        },
+    )
+    .expect("the crowded world writes");
 }
 
 // ------------------------------------------------------- panel + harness
@@ -533,6 +591,56 @@ impl Journey<'_> {
     fn set_mode(&mut self, mode: EditorMode) {
         self.panel
             .update(self.cx, |panel, cx| panel.set_live_mode(mode, cx));
+    }
+
+    /// Turn the snap toggle on or off, as the view row's checkbox does --
+    /// it writes the same field, and every pointer sample carries it.
+    fn set_snap(&mut self, on: bool) {
+        self.panel.update(self.cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.snap = on;
+            cx.notify();
+        });
+    }
+
+    /// A release the canvas never sees: gpui delivers `on_mouse_up` only
+    /// to the element under the cursor, so a drag that ends off the canvas
+    /// comes back through the hover-out flush and the out-of-bounds
+    /// release, in that order -- both of which the canvas div wires up.
+    fn release_off_canvas(&mut self, at: [f64; 2]) -> (bool, bool) {
+        self.panel.update(self.cx, |panel, _| {
+            let flushed = panel.live_release_held();
+            let held_after = panel.live_button_held(MouseButton::Left);
+            panel.canvas_button_up_out(at, MouseButton::Left, &Modifiers::none());
+            (flushed, held_after)
+        })
+    }
+
+    /// One wheel notch through the panel's real handler.
+    fn wheel(&mut self, dy: f32) {
+        self.panel.update(self.cx, |panel, cx| {
+            panel.wheel_zoom(&wheel_event(8.0, 8.0, dy), cx)
+        });
+    }
+
+    /// What a rebuilt cart does to a live session: the run goes back to
+    /// `Building` and comes up again, which is what makes the panel greet
+    /// the cart it is now talking to. The harness cart on the far end is
+    /// the same object -- a `Hello` resets its link state, which is the
+    /// half under test.
+    fn regreet(&mut self) {
+        self.endpoint.set_state(ggo_common::ViewerState::Building);
+        self.frames(1);
+        self.endpoint.set_state(ggo_common::ViewerState::Running);
+        self.settle();
+    }
+
+    /// How many undo entries the document has. Destructive (it unwinds the
+    /// whole stack), so a journey asks last.
+    fn undo_depth(&mut self) -> usize {
+        undo_depth(&self.panel, self.cx)
     }
 
     /// Pick a tool through the rail's own handler, as the radio does.
@@ -1007,5 +1115,378 @@ async fn closing_the_tab_stops_the_cart(cx: &mut TestAppContext) {
     assert!(
         endpoint.stop_requested(),
         "closing the tab asked the viewer run to end"
+    );
+}
+
+/// 12. With snap on, the cart lands the drag on the 16 px grid rather than
+///     where the cursor let go -- and the outline the panel draws is on
+///     the grid with it.
+#[gpui::test]
+async fn snap_on_drags_land_on_the_16px_grid(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/grid.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    // Before the press: the toggle rides on every pointer sample, and the
+    // cart reads it on the frame it moves.
+    journey.set_snap(true);
+
+    let start = journey.on(GRID_BOX_POS);
+    journey.press(start, Modifiers::none());
+    journey.frames(2);
+    let to = journey.on([GRID_BOX_POS[0] + 20.0, GRID_BOX_POS[1]]);
+    journey.drag_to(to);
+    journey.frames(2);
+    journey.release(to);
+    journey.frames(3);
+
+    assert_eq!(
+        journey.entity_pos(GRID_BOX as usize),
+        [48.0, 48.0],
+        "20 px past a grid start snaps to the next cell, not to 52"
+    );
+    let (rect, _) = journey.outline(Selection::Entity(GRID_BOX as usize));
+    assert_eq!(
+        [rect[0], rect[1]],
+        [48.0, 48.0],
+        "and the outline is where the cart put the sprite"
+    );
+}
+
+/// 13. Letting go outside the canvas ends the drag once: gpui delivers no
+///     mouse-up to an element the cursor has left, so the hover-out flush
+///     is what closes it -- and the out-of-bounds release behind it must
+///     not send a second edge.
+#[gpui::test]
+async fn releasing_outside_the_canvas_ends_the_drag_once(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let start = journey.on(BOX_A_POS);
+    journey.press(start, Modifiers::none());
+    journey.frames(2);
+    let to = journey.on([BOX_A_POS[0] + 30.0, BOX_A_POS[1]]);
+    journey.drag_to(to);
+    journey.frames(2);
+
+    let (flushed, held_after) = journey.release_off_canvas([600.0, 600.0]);
+    assert!(flushed, "the cursor left with the button down");
+    assert!(
+        !held_after,
+        "and the flush is the ONE release: nothing is left held for the \
+         out-of-bounds handler to send again"
+    );
+    journey.frames(3);
+
+    assert_eq!(
+        journey.entity_pos(BOX_A as usize),
+        [BOX_A_POS[0] + 30.0, BOX_A_POS[1]],
+        "the drag kept what it had moved"
+    );
+
+    // No stuck gesture: the next click is a plain selection, not a drag
+    // resumed from wherever the cursor came back.
+    let box_b = journey.on(BOX_B_POS);
+    journey.click(box_b, Modifiers::none());
+    assert_eq!(
+        journey.selected(),
+        vec![Selection::Entity(BOX_B as usize)],
+        "and the canvas takes clicks again"
+    );
+    assert_eq!(
+        journey.entity_pos(BOX_B as usize),
+        BOX_B_POS,
+        "which moved nothing"
+    );
+    assert_eq!(journey.undo_depth(), 1, "one entry for the whole drag");
+}
+
+/// 14. Escape mid-marquee retires the band on BOTH sides: the panel stops
+///     drawing it and the cart abandons it, so the release that follows
+///     selects nothing.
+///
+/// Ignored: the cart's `ClearSelection` clears `Selection.entities` and
+/// its primary but leaves `EditorState::marquee_anchor` armed
+/// (`edit_systems.rs`, `commands`), so the band survives Escape and the
+/// release still sweeps. An emerald-side fix -- the host cannot retire a
+/// band the cart is republishing every frame.
+#[gpui::test]
+#[ignore = "cart-side: ClearSelection does not drop the marquee anchor"]
+async fn escape_mid_marquee_retires_the_band_on_both_sides(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let from = journey.pt([20.0, 30.0]);
+    let to = journey.pt([140.0, 80.0]);
+    journey.press(from, Modifiers::none());
+    journey.frames(2);
+    journey.drag_to(to);
+    journey.frames(2);
+    journey.panel.read_with(journey.cx, |panel, _| {
+        assert!(live_of(panel).marquee.is_some(), "a band is being dragged");
+    });
+
+    journey.action(&ClearSelection);
+    journey.frames(3);
+    journey.panel.read_with(journey.cx, |panel, _| {
+        assert!(
+            live_of(panel).marquee.is_none(),
+            "Escape stopped the panel drawing it"
+        );
+    });
+
+    journey.release(to);
+    journey.frames(3);
+    assert!(
+        journey.selected().is_empty(),
+        "and the cart abandoned the band rather than applying it on release"
+    );
+}
+
+/// 15. A click on empty space clears the selection -- the cart's own miss
+///     rule, mirrored back into the document.
+#[gpui::test]
+async fn click_on_empty_space_clears_the_selection(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let at = journey.on(BOX_A_POS);
+    journey.click(at, Modifiers::none());
+    assert_eq!(journey.selected(), vec![Selection::Entity(BOX_A as usize)]);
+
+    let empty = journey.pt([200.0, 200.0]);
+    journey.click(empty, Modifiers::none());
+    assert!(
+        journey.selected().is_empty(),
+        "a miss clears what the hit selected"
+    );
+    let (_, selected) = journey.outline(Selection::Entity(BOX_A as usize));
+    assert!(!selected, "and the outline stops being drawn selected");
+}
+
+/// 16. Undoing a delete brings the row back ON THE CART: a restored entity
+///     shifts every index above it, so this one goes out as a world.
+#[gpui::test]
+async fn undo_of_a_delete_brings_the_row_back_on_the_cart(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let at = journey.on(BOX_A_POS);
+    journey.click(at, Modifiers::none());
+    assert_eq!(journey.cart_rows(), 3);
+
+    journey.action(&DeleteSelected);
+    journey.frames(4);
+    assert_eq!(journey.entity_count(), 2, "the document lost it");
+    assert_eq!(journey.cart_rows(), 2, "and so did the cart");
+
+    assert!(
+        journey.undo_resent_the_world(),
+        "a restored entity is a world, not a transform"
+    );
+    assert_eq!(journey.entity_count(), 3);
+    assert_eq!(journey.cart_rows(), 3, "the cart is drawing it again");
+    let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
+    assert_eq!(
+        [rect[0], rect[1]],
+        BOX_A_POS,
+        "back where it was authored, outline and all"
+    );
+}
+
+/// 17. Each nudge is its own gesture on the cart ("one gesture per
+///     command", spec), so two arrows are two undo entries -- not one run
+///     and not one per cart frame.
+#[gpui::test]
+async fn two_nudges_coalesce_into_undo_entries_per_spec(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let at = journey.on(BOX_A_POS);
+    journey.click(at, Modifiers::none());
+
+    journey.action(&NudgeRight);
+    journey.frames(3);
+    journey.action(&NudgeRight);
+    journey.frames(3);
+    assert_eq!(
+        journey.entity_pos(BOX_A as usize),
+        [BOX_A_POS[0] + 2.0, BOX_A_POS[1]],
+        "both arrows moved it"
+    );
+    assert_eq!(
+        journey.undo_depth(),
+        2,
+        "one undo entry per nudge, and no extra for the frames between them"
+    );
+}
+
+/// 18. Two sprites in the same place: the click takes the topmost by `z`.
+#[gpui::test]
+async fn overlapping_sprites_select_the_topmost_by_z(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/stacked.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let at = journey.on(STACK_POS);
+    journey.click(at, Modifiers::none());
+    assert_eq!(
+        journey.selected(),
+        vec![Selection::Entity(STACK_TOP as usize)],
+        "the one drawn on top is the one picked"
+    );
+}
+
+/// 19. A wheel notch steps the picture scale, and the outline stays on the
+///     sprite: it grows with the picture and the hit test still finds it
+///     where it is drawn.
+#[gpui::test]
+async fn wheel_zoom_keeps_the_outline_on_the_sprite(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/stacked.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    // Whatever the tab's own layout fits: the Live prepaint stamps the
+    // canvas bounds, so the starting scale is not the test's to name.
+    let scale_before = journey.scale();
+    let before = journey.screen_rect(STACK_TOP);
+
+    journey.wheel(20.0);
+    journey.frames(2);
+    let scale_after = journey.scale();
+    assert_eq!(
+        scale_after,
+        scale_before + 1.0,
+        "one notch is one step of the integer scale"
+    );
+
+    let after = journey.screen_rect(STACK_TOP);
+    let growth = scale_after / scale_before;
+    assert_eq!(
+        [after[2], after[3]],
+        [before[2] * growth, before[3] * growth],
+        "the outline grew with the picture"
+    );
+    let at = journey.pt(STACK_POS);
+    assert_eq!(
+        [after[0], after[1]],
+        at,
+        "and sits exactly where the panel's own transform puts that world point"
+    );
+
+    // The user's proof: the sprite is still clickable where it is drawn.
+    let on = journey.on(STACK_POS);
+    journey.click(on, Modifiers::none());
+    assert_eq!(
+        journey.selected(),
+        vec![Selection::Entity(STACK_TOP as usize)],
+        "the hit test and the outline agree about the new scale"
+    );
+}
+
+/// 20. A selection too big for one datagram arrives whole: the cart splits
+///     it into parts and the panel reassembles every index before it maps
+///     them back to the document.
+#[gpui::test]
+async fn a_selection_larger_than_one_datagram_arrives_whole(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/many.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let total = MANY_BOXES as usize + 1;
+    assert_eq!(journey.cart_rows(), total, "the cart is drawing them all");
+
+    journey.action(&SelectAll);
+    journey.frames(4);
+
+    journey.panel.read_with(journey.cx, |panel, _| {
+        assert_eq!(
+            live_of(panel).cart_selection.len(),
+            total,
+            "every index of a multi-part selection reached the mailbox"
+        );
+    });
+    assert_eq!(
+        journey.selected().len(),
+        total,
+        "and the document selection is the whole table"
+    );
+}
+
+/// 21. A cart rebuilt mid-drag abandons it cleanly: the greeting resets
+///     both sides, nothing moves by the gesture that was in flight, and
+///     the canvas takes the next click.
+#[gpui::test]
+async fn a_regreet_mid_drag_abandons_the_drag_cleanly(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let start = journey.on(BOX_A_POS);
+    journey.press(start, Modifiers::none());
+    journey.frames(2);
+    let to = journey.on([BOX_A_POS[0] + 30.0, BOX_A_POS[1]]);
+    journey.drag_to(to);
+    journey.frames(2);
+    let mid_drag = journey.entity_pos(BOX_A as usize);
+    assert_eq!(mid_drag, [BOX_A_POS[0] + 30.0, BOX_A_POS[1]]);
+
+    journey.regreet();
+    journey.frames(3);
+
+    assert_eq!(
+        journey.entity_pos(BOX_A as usize),
+        mid_drag,
+        "the abandoned drag moved nothing further"
+    );
+    let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
+    assert_eq!(
+        [rect[0], rect[1]],
+        mid_drag,
+        "and the rebuilt cart was given the document back"
+    );
+    assert!(
+        journey.selected().is_empty(),
+        "a greeting resets the cart's selection"
+    );
+
+    let box_b = journey.on(BOX_B_POS);
+    journey.press(box_b, Modifiers::none());
+    journey.frames(2);
+    assert_eq!(
+        journey.selected(),
+        vec![Selection::Entity(BOX_B as usize)],
+        "and the next press is a plain selection, not a resumed drag"
+    );
+    assert_eq!(journey.entity_pos(BOX_B as usize), BOX_B_POS);
+
+    // The rebuilt cart's gesture ids start over at 1, and the drag it
+    // abandoned was never closed: a stack (or a tag) carried across the
+    // greeting would fold this drag into the abandoned one's undo entry.
+    let onward = journey.on([BOX_B_POS[0] + 20.0, BOX_B_POS[1]]);
+    journey.drag_to(onward);
+    journey.frames(2);
+    journey.release(onward);
+    journey.frames(3);
+    assert_eq!(
+        journey.entity_pos(BOX_B as usize),
+        [BOX_B_POS[0] + 20.0, BOX_B_POS[1]]
+    );
+    assert_eq!(
+        journey.undo_depth(),
+        2,
+        "the new session's drag is its own undo entry"
+    );
+}
+
+/// 22. The accepted limitation, asserted so a change to it fails loudly:
+///     a middle drag pans the cart's camera RESOURCE, and a world whose
+///     scene places an active `Camera` component draws from that instead
+///     -- so the pan is inert. Journey 5 is the same gesture in a world
+///     that authors none.
+#[gpui::test]
+async fn pan_is_inert_in_a_world_that_authors_a_camera(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let from = journey.on(BOX_A_POS);
+    journey.hover(from);
+    journey.frames(2);
+    let camera_before = journey.camera();
+    let screen_before = journey.screen_rect(BOX_A);
+
+    let scale = journey.scale();
+    let to = [from[0] + 30.0 * scale, from[1] + 20.0 * scale];
+    journey.middle_press(from);
+    journey.frames(2);
+    journey.middle_drag_to(to);
+    journey.frames(2);
+    journey.middle_release(to);
+    journey.frames(2);
+
+    assert_eq!(
+        journey.camera(),
+        camera_before,
+        "the scene's own camera is what the cart reports, and the pan did \
+         not touch it (v1 limitation: `effective_camera` prefers the \
+         component)"
+    );
+    assert_eq!(
+        journey.screen_rect(BOX_A),
+        screen_before,
+        "so nothing moved on screen either"
     );
 }

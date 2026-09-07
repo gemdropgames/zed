@@ -774,6 +774,11 @@ pub struct LiveView {
     /// How many synthetic bursts this session has opened, so a new burst
     /// never reuses a retired one's id (which would amend its entry).
     auto_gestures: u32,
+    /// How many sessions this view has greeted. Cart gesture ids restart
+    /// with every session, so the tag carries this too: without it a
+    /// re-greeted cart's gesture `1` would amend the undo entry the
+    /// PREVIOUS cart's gesture `1` opened.
+    gesture_epoch: u32,
     /// Which of the cart's system tables is running. Play is the GAME's:
     /// its entities move because the game moved them, and folding that
     /// into the document would rewrite the world from a play-through.
@@ -871,6 +876,7 @@ impl LiveView {
             gesture: Vec::new(),
             auto_gesture: None,
             auto_gestures: 0,
+            gesture_epoch: 0,
             mode: EditorMode::default(),
             mode_push_failed: false,
             world_dirty: false,
@@ -1093,6 +1099,16 @@ impl LiveView {
     /// press queued for the outgoing one would arrive as a press it never
     /// gets a release for.
     pub fn forget_input(&mut self) {
+        // `Hello` resets the link's own mirrors, not the mailbox's pointer
+        // fields, so a cart that has just greeted still reads the last
+        // sample this session sent -- and a button left down there is a
+        // button the cart believes is STILL down: the first press after
+        // the greeting is no edge at all, and the click does nothing.
+        // Telling the new session everything came up is what the mode
+        // switch does on entering Edit, for the same reason.
+        let released = (self.pointer_buttons != 0)
+            .then(|| self.pending_pointer.back().copied().or(self.last_pointer))
+            .flatten();
         self.pending_pointer.clear();
         self.pending_commands.clear();
         self.forget_transforms();
@@ -1100,6 +1116,9 @@ impl LiveView {
         self.last_pointer = None;
         self.pointer_repeats = 0;
         self.pointer_buttons = 0;
+        if let Some(last) = released {
+            self.push_pointer(PointerState { buttons: 0, ..last });
+        }
     }
 
     /// The cart clock: emulator-derived, monotonic, and frozen while the
@@ -1148,6 +1167,17 @@ impl LiveView {
         self.gesture.retain(|open| *open != id);
     }
 
+    /// Drop every gesture this session had open, and start a new epoch.
+    /// A cart that has just greeted dropped its in-flight drag WITHOUT
+    /// closing it (`sync::reset_session`: the `End` would name an id the
+    /// new host never opened), so an id left on this stack would tag every
+    /// later move and fold unrelated drags into one undo entry.
+    pub fn forget_gestures(&mut self) {
+        self.gesture.clear();
+        self.auto_gesture = None;
+        self.gesture_epoch = self.gesture_epoch.wrapping_add(1);
+    }
+
     /// Open or retire the synthetic burst gesture for a tick that moved
     /// `moved` document items with no cart gesture around them.
     pub fn track_auto_gesture(&mut self, moved: bool) {
@@ -1165,9 +1195,10 @@ impl LiveView {
     /// What this tick's mirrored ops are tagged with: the innermost cart
     /// gesture, else the open burst, else nothing.
     pub fn gesture_tag(&self) -> Option<String> {
+        let epoch = self.gesture_epoch;
         self.gesture
             .last()
-            .map(|id| format!("cart-{id}"))
+            .map(|id| format!("cart-{epoch}-{id}"))
             .or_else(|| self.auto_gesture.map(|id| format!("cart-auto-{id}")))
     }
 
@@ -1449,9 +1480,23 @@ mod tests {
         live.push_pointer(sample((4, 4), 1));
         live.pending_commands.push(EditCommand::Delete);
         live.forget_input();
-        assert!(live.pending_pointer.is_empty());
         assert!(live.pending_commands.is_empty());
         assert_eq!(live.pointer_buttons, 0);
+        assert_eq!(
+            live.pending_pointer.iter().copied().collect::<Vec<_>>(),
+            vec![PointerState {
+                buttons: 0,
+                ..sample((4, 4), 1)
+            }],
+            "and the new cart is told the button came up: its mailbox still \
+             holds the old session's sample, so a press behind a held button \
+             would be no edge at all"
+        );
+        live.forget_input();
+        assert!(
+            live.pending_pointer.is_empty(),
+            "nothing held, nothing to release"
+        );
     }
 
     #[test]
