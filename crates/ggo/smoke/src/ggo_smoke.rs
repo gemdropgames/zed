@@ -3026,4 +3026,630 @@ mod tests {
                 .await;
         }
     }
+
+    // ------------------------- the real artifact: the LIVE world tab
+
+    /// Where the live journey's one entity starts, in world px.
+    ///
+    /// Inside the picture the cart draws and clear of the background map:
+    /// a world with no `Camera` frames itself at `-160,-120`
+    /// (`active_camera_origin`), so the 320x240 device frame shows world
+    /// `-160..160` by `-120..120`, and the fixture's map occupies
+    /// `0..128` by `0..64`. The drag below stays inside the frame too --
+    /// a pointer aimed past its edge would still reach the canvas
+    /// element, but at device coordinates the cart cannot draw.
+    const LIVE_START: [f64; 2] = [100.0, 96.0];
+
+    /// How far the live drag moves the entity, in WORLD px. Aimed through
+    /// the panel's own Live geometry (`test_canvas_point`), so the
+    /// integer picture scale cancels: a screen delta of `30 * scale` is a
+    /// device delta of exactly 30, which is 30 world px at the cart's
+    /// camera.
+    const LIVE_DRAG_PX: f64 = 30.0;
+
+    /// Where the drag leaves it.
+    const LIVE_MOVED: [f64; 2] = [LIVE_START[0] + LIVE_DRAG_PX, LIVE_START[1]];
+
+    /// The live fixture's background map, in CELLS (8 px each).
+    const LIVE_MAP_W: u16 = 16;
+    const LIVE_MAP_H: u16 = 8;
+
+    /// The map row the live stroke paints, and how many cells of it.
+    ///
+    /// Twelve is deliberately past the cart's four-deep APP receive
+    /// queue: one gesture stamps twelve cells, each of which reaches the
+    /// cart as its own `SetCell`, and the cart commits one datagram per
+    /// frame. This is the pin for the poke PACING fix -- unpaced, the
+    /// cart drops what does not fit, and the save below folds its
+    /// (blanked) cells back over the document's.
+    const LIVE_PAINT_ROW: i32 = 1;
+    const LIVE_PAINT_RUN: i32 = 12;
+
+    /// The live journey's world, and its background map -- the first
+    /// worktree-relative (what a click carries), the second
+    /// asset-root-relative (what the document and the sessions name).
+    const LIVE_WORLD_REL: &str = "assets/worlds/live.toml";
+    const LIVE_MAP_REL: &str = "maps/live.bg0.map";
+
+    /// How long the panel's own Live boot may take once the cart is
+    /// RUNNING: the greeting, the world blob, and the first frame drawn.
+    /// The build ahead of it has [`EMD_BUILD_BUDGET`].
+    const LIVE_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long any one exchange driven through the panel may take.
+    const LIVE_STEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// How long the cart-backed save may take to land on disk: a
+    /// snapshot and one layer blob per slot, chunked, plus the write.
+    const LIVE_SAVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long the pokes of one stroke are given to drain before the
+    /// save asks the cart what it is holding. A cart frame is ~16 ms, so
+    /// this is ~120 of them for twelve pokes -- room for any pacing that
+    /// sends at most one per frame.
+    const LIVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// How long the Live picture has to hold still before the journey
+    /// takes its geometry as the one the drag will land in.
+    const LIVE_SETTLED: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// How long the test sleeps between pumps of the app.
+    const LIVE_PUMP: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// The viewer runs this smoke's own booter made, with the endpoints
+    /// driving them.
+    ///
+    /// A `ViewerRun` stops itself when it is dropped and nothing else
+    /// here retains it -- in the app that list is `ggo_emu_panel`'s
+    /// `ViewerRuns` global, which is private to that crate.
+    #[derive(Default)]
+    struct SmokeViewerRuns(
+        Vec<(
+            std::sync::Arc<ggo_common::LinkEndpoint>,
+            Entity<ggo_emu_panel::viewer_run::ViewerRun>,
+        )>,
+    );
+
+    impl gpui::Global for SmokeViewerRuns {}
+
+    /// This smoke's `ViewerBooter`: the same run `ggo_emu_panel`'s booter
+    /// creates, with the same real `emd`, but spawned through
+    /// [`run_child`].
+    ///
+    /// Registered INSTEAD of the emu panel's (which `boot_live` does not
+    /// init) for one reason: `ggo_common::system_proc_runner` hands the
+    /// child this process's environment, and `cargo test` puts the REPO's
+    /// toolchain pin in it -- which beats the fixture's own
+    /// `rust-toolchain.toml` and builds the cart with a toolchain that
+    /// has no riscv target. `viewer_run`'s own `TestViewerRunner` hook is
+    /// `#[cfg(test)]`, so it is not reachable from here.
+    fn smoke_boot_viewer(
+        workspace: &mut Workspace,
+        world_rel: &str,
+        endpoint: std::sync::Arc<ggo_common::LinkEndpoint>,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Workspace>,
+    ) -> bool {
+        use gpui::AppContext as _;
+
+        let project = workspace.project().clone();
+        let root = project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
+        let Some(root) = root else {
+            endpoint.set_state(ggo_common::ViewerState::Stopped(
+                "no project folder is open".to_string(),
+            ));
+            return true;
+        };
+        let runner: ggo_common::ProcRunner = std::sync::Arc::new(|request| run_child(&request));
+        let run = cx.new(|cx| {
+            ggo_emu_panel::viewer_run::ViewerRun::new(
+                world_rel.to_string(),
+                root,
+                runner,
+                endpoint.clone(),
+                Some(project),
+                cx,
+            )
+        });
+        cx.default_global::<SmokeViewerRuns>().0.push((endpoint, run));
+        true
+    }
+
+    /// Boot a workspace over a REAL-fs project at `root`, with the world
+    /// panel registered and this smoke's viewer booter behind it.
+    ///
+    /// Real fs, unlike every other journey in this file: the panel loads
+    /// the world with `std::fs` either way, but the cart is built by a
+    /// real `emd` out of a real directory, and the run watches the
+    /// project the workspace holds.
+    async fn boot_live<'a>(
+        cx: &'a mut TestAppContext,
+        root: &Path,
+    ) -> (Entity<Workspace>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            editor::init(cx);
+            ggo_world_panel::init(cx);
+            ggo_common::bind_default_keymap(cx);
+            ggo_common::register_viewer_booter(cx, smoke_boot_viewer);
+        });
+        let fs = std::sync::Arc::new(project::RealFs::new(None, cx.executor()));
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.run_until_parked();
+        (workspace, cx)
+    }
+
+    /// The live journey's world, written INTO the scaffolded project so
+    /// the cart is built with the same assets the panel sends it.
+    ///
+    /// One entity carrying a `Transform` and nothing else: with no
+    /// `Sprite` the cart hit-tests the 16x16 fallback box at the
+    /// transform, and with no `Camera` the picture is framed on the world
+    /// origin rather than sliding under the drag. One background slot,
+    /// born bound to the fixture tileset and blank.
+    fn write_live_fixture(root: &Path) {
+        write_paint_tileset(root);
+        world_file::write_world(
+            root,
+            LIVE_WORLD_REL,
+            &world_file::WorldFile {
+                entities: vec![world_file::WorldEntity {
+                    components: serde_json::json!({
+                        "Transform": { "pos": LIVE_START, "z": 0.0 },
+                    })
+                    .as_object()
+                    .expect("the fixture components are a json object")
+                    .clone(),
+                }],
+                instances: vec![],
+                backgrounds: vec![world_file::Background {
+                    layer: 0,
+                    map: LIVE_MAP_REL.to_string(),
+                }],
+            },
+        )
+        .expect("worldlib writes the live world fixture");
+        std::fs::create_dir_all(root.join("assets/maps")).expect("the fixture's map directory");
+        ggo_worldlib::sprites::io::save_map(
+            root,
+            "assets/maps/live.bg0.map",
+            &ggo_worldlib::sprites::map_doc::MapState {
+                w: LIVE_MAP_W,
+                h: LIVE_MAP_H,
+                cells: vec![map_blank_cell(); LIVE_MAP_W as usize * LIVE_MAP_H as usize],
+                til_path: "art/mapfx.til".to_string(),
+                pal_path: "art/mapfx.pal".to_string(),
+                dirty: false,
+            },
+        )
+        .expect("worldlib writes the live fixture's background map");
+    }
+
+    /// Pump the app (and with it the panel's live loop) until `ready`, or
+    /// fail naming what never happened. Wall-clock bounded, like every
+    /// other wait in this journey: the cart runs on its own thread and
+    /// its clock is not the executor's.
+    async fn wait_live(
+        cx: &mut gpui::VisualTestContext,
+        budget: std::time::Duration,
+        what: &str,
+        mut ready: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            cx.run_until_parked();
+            if ready(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            cx.background_executor.timer(LIVE_PUMP).await;
+        }
+    }
+
+    /// Pump the app for `budget`, whatever happens -- what a "let the
+    /// cart catch up" wait is, with no state to watch for.
+    async fn pump_live(cx: &mut gpui::VisualTestContext, budget: std::time::Duration) {
+        let until = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < until {
+            cx.run_until_parked();
+            cx.background_executor.timer(LIVE_PUMP).await;
+        }
+        cx.run_until_parked();
+    }
+
+    /// The window point world-pixel `world` is drawn at right now. In
+    /// Live that is the CART's camera and the integer picture scale, both
+    /// of which the panel owns.
+    fn live_point(
+        panel: &Entity<ggo_world_panel::WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        world: [f64; 2],
+    ) -> gpui::Point<gpui::Pixels> {
+        panel.read_with(cx, |panel, _| {
+            panel
+                .test_canvas_point(world)
+                .expect("the live canvas painted")
+        })
+    }
+
+    /// Cell `(x, LIVE_PAINT_ROW)` of the live fixture's background map,
+    /// as the panel's own session holds it.
+    fn live_cell(
+        panel: &Entity<ggo_world_panel::WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        x: usize,
+    ) -> u16 {
+        bg_cell(panel, cx, LIVE_MAP_REL, x, LIVE_PAINT_ROW as usize)
+    }
+
+    /// The whole live spine on artifacts nothing in this fork fabricates,
+    /// through the panel's OWN handlers: `emd` scaffolds a project and
+    /// builds a viewer cart out of it, the world opens as a tab, the tab
+    /// is set to Live (which boots that cart on a real emulator thread),
+    /// and then the panel's live loop -- world blob, layer blobs,
+    /// forwarded pointer, `SetCell` pokes, and the save's `Snapshot` +
+    /// `ReadLayer` round trip -- drives a drag, a paint stroke and a save
+    /// against it.
+    ///
+    /// `smoke_real_editor_cart_boots_greets_and_drags` answers for the
+    /// same cart driven by a `LinkMailbox` the test holds itself; what
+    /// this adds is the PANEL's half, which every other test in the fork
+    /// runs against `CartHarness` -- an unbounded `VecDeque` where the
+    /// real transport is a four-deep COBS-framed comm queue that drops
+    /// what does not fit.
+    ///
+    /// PINS THE POKE PACING FIX: a stroke of [`LIVE_PAINT_RUN`] cells is
+    /// [`LIVE_PAINT_RUN`] `SetCell` datagrams, and a cart that dropped
+    /// the ones past its queue hands those cells back BLANK on the save's
+    /// `ReadLayer` -- which `write_cart_layers` then folds over the
+    /// document's. The `.map` assertion at the end is where that shows.
+    ///
+    /// Gated at RUNTIME rather than behind a cargo feature, the same way
+    /// and with the same lines as the smoke above.
+    #[gpui::test]
+    async fn smoke_real_editor_cart_live_tab_drags_paints_and_saves(cx: &mut TestAppContext) {
+        // Everything here waits on real wall-clock work: an `emd` build,
+        // an emulator thread, a cart answering on its own frame clock.
+        cx.executor().allow_parking();
+        if !emd_on_path() {
+            println!("skip: emd not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a temp dir for the fixture project");
+        if !riscv_target_installed(dir.path()) {
+            println!("skip: riscv32imc target not installed");
+            return;
+        }
+
+        let scaffold = run_child(&ggo_common::ProcRequest::emd(
+            dir.path(),
+            vec![
+                "new".to_string(),
+                "smokelive".to_string(),
+                "fixture".to_string(),
+            ],
+        ));
+        assert!(
+            scaffold.ok,
+            "emd new scaffolds the fixture project: {}",
+            scaffold.transcript()
+        );
+        let root = dir.path().join("fixture");
+        write_live_fixture(&root);
+
+        // Built once here, before the panel boots one of its own: the
+        // first `editor-cart` of a project's life edits the game lib's
+        // sources, and the panel's build is then the incremental one the
+        // Live boot budget is sized for.
+        let prebuild = run_child(&ggo_common::ProcRequest::emd(&root, editor_cart_args()));
+        assert!(
+            prebuild.ok,
+            "emd editor-cart --ggo builds the viewer cart: {}",
+            prebuild.transcript()
+        );
+        let ggo = editor_cart_ggo(&prebuild.lines)
+            .expect("emd editor-cart --ggo names the .ggo in its JSON trailer");
+        assert!(ggo.is_file(), "and wrote it: {}", ggo.display());
+
+        let (workspace, cx) = boot_live(cx, &root).await;
+        let panel = open_world_tab(&workspace, cx, LIVE_WORLD_REL).await;
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.test_entity_count(), 1, "the fixture's one entity");
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(LIVE_START),
+                "at the position the fixture wrote"
+            );
+        });
+
+        // The canvas mode is sticky and a fresh panel starts on Live, so
+        // this is a click only when something left it in Design -- and
+        // clicking the half that is already selected would boot a SECOND
+        // viewer for this tab.
+        if cx.debug_bounds("ggo-world-mode-live-on").is_none() {
+            let live = cx
+                .debug_bounds("ggo-world-mode-live-off")
+                .expect("the Design | Live switch painted");
+            click(cx, live.center());
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("ggo-world-mode-live-on").is_some(),
+            "the canvas is set to Live"
+        );
+
+        // The run this tab booted, through this smoke's own booter.
+        let endpoint = cx.update(|_, cx| {
+            let runs = &cx.default_global::<SmokeViewerRuns>().0;
+            assert_eq!(runs.len(), 1, "the Live tab booted exactly one viewer");
+            runs[0].0.clone()
+        });
+
+        let build_deadline = std::time::Instant::now() + EMD_BUILD_BUDGET;
+        while endpoint.state() != ggo_common::ViewerState::Running {
+            if let ggo_common::ViewerState::Stopped(reason) = endpoint.state() {
+                panic!("the viewer run ended before it booted: {reason}");
+            }
+            assert!(
+                std::time::Instant::now() < build_deadline,
+                "the Live tab's emd editor-cart --ggo never produced a running cart"
+            );
+            cx.run_until_parked();
+            cx.background_executor.timer(LIVE_PUMP).await;
+        }
+
+        // The boot screen stands in for the canvas until the cart has
+        // both greeted and presented a frame, so its absence IS the
+        // panel's own "connected and drawing" -- and the mode switch is
+        // checked with it, because a session that FAILED takes the boot
+        // screen away too, by falling back to Design.
+        wait_live(
+            cx,
+            LIVE_CONNECT_BUDGET,
+            "the live session to connect and draw",
+            |cx| {
+                // A frame that painted NOTHING is a draw this test caught
+                // mid-flight, not a state to read: `debug_bounds` hands
+                // back the last rendered frame, and exactly one of them
+                // lands empty as the canvas trades the boot screen for
+                // the cart's picture. The toolbar's Save button is the
+                // witness -- an open world always paints one.
+                if cx.debug_bounds("ggo-world-save").is_none() {
+                    return false;
+                }
+                assert!(
+                    cx.debug_bounds("ggo-world-mode-live-on").is_some(),
+                    "the live session fell back to the design view (the cart \
+                     is {:?}, and the toolbar {} saying why)",
+                    endpoint.state(),
+                    match cx.debug_bounds("ggo-world-live-error") {
+                        Some(_) => "is",
+                        None => "is not",
+                    }
+                );
+                cx.debug_bounds("ggo-world-live-loading").is_none()
+            },
+        )
+        .await;
+
+        // ---- the drag, through the cart
+
+        // The Live picture moves until the cart has taken everything the
+        // panel owes it. A connected session sends ONE update per tick,
+        // in a fixed order -- the world blob, then a blob per background
+        // slot, then the camera the document frames on -- so the picture
+        // is still sliding (by the 160 px the cameraless framing is
+        // worth) for as long as any of them is outstanding, and a press
+        // aimed before the camera landed misses the entity by that much.
+        // Waiting for the geometry to hold still is waiting for all
+        // three: the camera is the LAST of them.
+        let mut framing: Option<gpui::Point<gpui::Pixels>> = None;
+        let mut held_since = std::time::Instant::now();
+        wait_live(
+            cx,
+            LIVE_STEP_BUDGET,
+            "the live picture to settle on the document's framing",
+            |cx| {
+                let now = panel.read_with(cx, |panel, _| panel.test_canvas_point([0.0, 0.0]));
+                if now != framing {
+                    framing = now;
+                    held_since = std::time::Instant::now();
+                    return false;
+                }
+                now.is_some() && held_since.elapsed() >= LIVE_SETTLED
+            },
+        )
+        .await;
+
+        // Aimed at the middle of the cart's 16x16 fallback footprint,
+        // which it draws from the transform.
+        let press = live_point(&panel, cx, [LIVE_START[0] + 8.0, LIVE_START[1] + 8.0]);
+        let dragged = live_point(
+            &panel,
+            cx,
+            [LIVE_START[0] + 8.0 + LIVE_DRAG_PX, LIVE_START[1] + 8.0],
+        );
+        cx.simulate_mouse_down(press, gpui::MouseButton::Left, Default::default());
+        // The press and the move have to land in different cart frames --
+        // the panel's own queue drains one sample per tick, and waiting
+        // for the cart's selection to come back through the mirror is
+        // what proves the press was seen as a press.
+        wait_live(
+            cx,
+            LIVE_STEP_BUDGET,
+            "the cart to select the pressed entity",
+            |cx| panel.read_with(cx, |panel, _| panel.test_selected_count() == 1),
+        )
+        .await;
+
+        cx.simulate_mouse_move(dragged, gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(dragged, gpui::MouseButton::Left, Default::default());
+        wait_live(
+            cx,
+            LIVE_STEP_BUDGET,
+            "the dragged entity to reach the document",
+            |cx| {
+                panel.read_with(cx, |panel, _| {
+                    panel
+                        .test_entity_position(0)
+                        .is_some_and(|pos| (pos[0] - LIVE_MOVED[0]).abs() < 0.01)
+                })
+            },
+        )
+        .await;
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_entity_position(0),
+                Some(LIVE_MOVED),
+                "the cart moved the entity by exactly what the pointer did, \
+                 and the mirror folded that into the document"
+            );
+            assert!(
+                panel.test_is_dirty(),
+                "and a cart-side move is an unsaved edit of this document"
+            );
+        });
+
+        // ---- the paint stroke, through the cart
+
+        click_bg_slot(cx, "ggo-world-bg-paint-0-on");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_paint_mode_rel().as_deref(),
+                Some(LIVE_MAP_REL),
+                "the rail click put the bg0 map under the brush"
+            );
+            assert!(
+                panel
+                    .test_paint_session(LIVE_MAP_REL)
+                    .is_some_and(|session| session.tileset.is_some()),
+                "and its binding resolved to real art -- an unbound session paints nothing"
+            );
+        });
+
+        // One gesture, `LIVE_PAINT_RUN` cells: press on the first, move
+        // across the rest, release. Every cell it stamps is a `SetCell`
+        // of its own on the way to the cart.
+        let cell_at = |cx: &mut gpui::VisualTestContext, x: i32| {
+            bg_cell_center(&panel, cx, x, LIVE_PAINT_ROW)
+        };
+        let first = cell_at(cx, 0);
+        cx.simulate_mouse_down(first, gpui::MouseButton::Left, Default::default());
+        let mut last = first;
+        for x in 1..LIVE_PAINT_RUN {
+            last = cell_at(cx, x);
+            cx.simulate_mouse_move(last, gpui::MouseButton::Left, Default::default());
+        }
+        cx.simulate_mouse_up(last, gpui::MouseButton::Left, Default::default());
+        cx.run_until_parked();
+
+        for x in 0..LIVE_PAINT_RUN as usize {
+            assert_eq!(
+                live_cell(&panel, cx, x),
+                map_painted_cell(),
+                "the stroke stamped cell {x} of the run into the session"
+            );
+        }
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel
+                    .test_paint_session(LIVE_MAP_REL)
+                    .is_some_and(PaintSession::dirty),
+                "the stroke dirtied the map session"
+            );
+        });
+
+        // Let the pokes drain before the save asks the cart what it holds.
+        pump_live(cx, LIVE_DRAIN).await;
+
+        // ---- the save, which asks the CART for both
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-world-saving").is_some(),
+            "the save is waiting on the cart -- in Live the write happens \
+             on the tick the snapshot and the layer blobs land, not inline"
+        );
+        wait_live(cx, LIVE_SAVE_BUDGET, "the cart-backed save to land", |cx| {
+            panel.read_with(cx, |panel, _| {
+                !panel.test_is_dirty()
+                    && !panel
+                        .test_paint_session(LIVE_MAP_REL)
+                        .is_some_and(PaintSession::dirty)
+            })
+        })
+        .await;
+        assert!(
+            cx.debug_bounds("ggo-world-save-error-copy").is_none()
+                && cx.debug_bounds("ggo-world-live-error").is_none(),
+            "and it landed without an error on the toolbar"
+        );
+
+        // Reap the emulator thread before the fixture -- cart and all --
+        // is deleted out from under it, and before the files the save
+        // just wrote reach the run's own project watch.
+        cx.update(|_, cx| cx.default_global::<SmokeViewerRuns>().0.clear());
+        endpoint.request_stop();
+        let stop_deadline = std::time::Instant::now() + LIVE_STEP_BUDGET;
+        while !matches!(endpoint.state(), ggo_common::ViewerState::Stopped(_)) {
+            assert!(
+                std::time::Instant::now() < stop_deadline,
+                "the viewer run ends when the host asks it to"
+            );
+            cx.run_until_parked();
+            cx.background_executor.timer(LIVE_PUMP).await;
+        }
+
+        // ---- what is on disk
+
+        let saved = world_file::read_world(&root, LIVE_WORLD_REL)
+            .expect("worldlib reopens the world the save wrote");
+        assert_eq!(saved.entities.len(), 1, "still one entity on disk");
+        let pos = saved.entities[0]
+            .components
+            .get("Transform")
+            .and_then(|transform| transform.get("pos"))
+            .and_then(serde_json::Value::as_array)
+            .expect("the saved entity kept its Transform.pos");
+        assert_eq!(
+            (pos[0].as_f64(), pos[1].as_f64()),
+            (Some(LIVE_MOVED[0]), Some(LIVE_MOVED[1])),
+            "the file holds the position the cart dragged the entity to"
+        );
+
+        let on_disk = ggo_worldlib::sprites::io::open_map(&root.join("assets"), LIVE_MAP_REL)
+            .expect("worldlib reopens the map the save wrote");
+        assert_eq!(
+            (on_disk.w, on_disk.h),
+            (LIVE_MAP_W, LIVE_MAP_H),
+            "same size"
+        );
+        let row = LIVE_PAINT_ROW as usize * LIVE_MAP_W as usize;
+        let painted = (0..LIVE_PAINT_RUN as usize)
+            .filter(|x| on_disk.cells[row + x] == map_painted_cell())
+            .count();
+        assert_eq!(
+            painted, LIVE_PAINT_RUN as usize,
+            "every cell of the stroke survived the round trip through the \
+             cart -- a cart that dropped `SetCell` datagrams hands those \
+             cells back blank on the save's ReadLayer, and the fold writes \
+             them over the document's"
+        );
+        assert_eq!(
+            on_disk.cells[0],
+            map_blank_cell(),
+            "and no cell the stroke never touched was painted"
+        );
+    }
 }
