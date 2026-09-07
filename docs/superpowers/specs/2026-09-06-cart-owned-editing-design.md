@@ -281,8 +281,9 @@ message.
   shift-click toggles; marquee selects two; middle-drag pans and the
   outline stays on the sprite; nudge/delete/duplicate; group (instance)
   drag moves all members and undoes as one; Play mode ignores clicks and
-  runs a game system; a user edit system receives the click and
-  `consumed` keeps the built-in select off; inspector edit round-trips
+  runs a game system; a user edit system receives the click; with its tool active the
+  built-in select stays inert, and its `consumed` keeps a later user
+  system off (built-ins run first, so `consumed` never gates them); inspector edit round-trips
   through `SetComponent`; paint a cell, save, reload from disk, the cell
   is there; save after a user system moved an entity writes the moved
   position; tab close stops the cart.
