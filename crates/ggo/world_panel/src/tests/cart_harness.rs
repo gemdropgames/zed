@@ -8,6 +8,7 @@
 //! click and the document op is the shipping code on both sides.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use emerald_editor_runtime::link::{CartLink, SystemTable};
@@ -24,6 +25,12 @@ struct EndpointCartLink {
     /// Payloads decoded out of one drain, handed over one per `recv` --
     /// the cart pops datagrams one at a time.
     pending: VecDeque<Vec<u8>>,
+    /// While set, every cart -> host BLOB datagram is dropped on the
+    /// floor. Only the blob kinds: the rows, the selection and the
+    /// greeting still flow, so the session stays live and a save that
+    /// asked for bytes simply never gets them
+    /// ([`CartHarness::drop_cart_blobs`]).
+    drop_blobs: Arc<AtomicBool>,
 }
 
 impl CartLink for EndpointCartLink {
@@ -55,6 +62,14 @@ impl CartLink for EndpointCartLink {
     }
 
     fn send(&mut self, payload: &[u8]) -> bool {
+        // `0x90 CartBlobBegin`, `0x91 CartBlobChunk`, `0x92 CartBlobEnd`.
+        // `true` all the same: the cart handed the bytes to the wire, and
+        // a wire that then lost them is not something it can tell.
+        if self.drop_blobs.load(Ordering::SeqCst)
+            && matches!(payload.first(), Some(0x90..=0x92))
+        {
+            return true;
+        }
         self.endpoint.push_inbound(payload.to_vec());
         // What the emulator thread does once per presented frame: the
         // panel's poll loop only wakes on a tick (or the 250 ms backstop,
@@ -80,6 +95,8 @@ pub(crate) struct CartHarness {
     /// an atlas entry per frame (see `LinkEndpoint::frame`).
     picture: Arc<gpui::RenderImage>,
     presented: u32,
+    /// Shared with the link: see [`Self::drop_cart_blobs`].
+    drop_blobs: Arc<AtomicBool>,
     /// Held for the harness's lifetime -- see [`MAILBOX_LOCK`]. Last
     /// field, so it is dropped last: the world and schedule that run
     /// against the static mailbox must be gone before the next harness
@@ -114,6 +131,7 @@ impl CartHarness {
             game_systems,
             edit_systems,
         );
+        let drop_blobs = Arc::new(AtomicBool::new(false));
         assert!(
             set_link(
                 &mut world,
@@ -121,6 +139,7 @@ impl CartHarness {
                     endpoint: endpoint.clone(),
                     reader: ggo_comm::MessageReader::default(),
                     pending: VecDeque::new(),
+                    drop_blobs: drop_blobs.clone(),
                 }),
             ),
             "install left an editor runtime to swap the link into"
@@ -133,8 +152,25 @@ impl CartHarness {
             endpoint,
             picture,
             presented: 0,
+            drop_blobs,
             _guard: guard,
         }
+    }
+
+    /// Drop every cart -> host blob from here on: the world snapshot and
+    /// the layer readbacks a save asks for never arrive, which is the one
+    /// failure the host cannot tell from a slow cart until the deadline.
+    pub fn drop_cart_blobs(&self, dropping: bool) {
+        self.drop_blobs.store(dropping, Ordering::SeqCst);
+    }
+
+    /// The cart's OWN copy of background slot `slot`: the source cells
+    /// its layer holds, which is what a `ReadLayer` hands back. `None`
+    /// until a layer has been loaded into the slot.
+    pub fn layer_cells(&self, slot: usize) -> Option<(u16, u16, Vec<u16>)> {
+        let mut buf = [0u16; emerald_editor_runtime::MAX_LAYER_CELLS];
+        let (w, h, len) = emerald_editor_runtime::layer_cells(slot, &mut buf)?;
+        Some((w, h, buf.get(..len)?.to_vec()))
     }
 
     /// One cart frame and the ONE host poll that follows it -- the poll

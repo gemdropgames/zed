@@ -2243,6 +2243,7 @@ impl OpenWorld {
             changed = true;
         }
 
+        let mut appended_any = false;
         for (index, components) in snapshot_adds {
             self.apply_mirror_op(WorldOp::AddEntity { components });
             // The document appends; the cart numbered the entity itself.
@@ -2258,7 +2259,21 @@ impl OpenWorld {
             // cart index on this side, and every row it publishes for it is
             // dropped.
             self.rebuild_index_map();
+            appended_any = true;
             changed = true;
+        }
+        // A selection the cart published for an index the document did not
+        // have yet was dropped as unknown, and the cart does not republish
+        // a set that has not changed. Re-derive it now that the append has
+        // given those indices document entities -- the cart's own
+        // Duplicate SELECTS the copies it makes, and without this they
+        // land in the document unselected.
+        if appended_any {
+            let mapped = self.cart_selection_targets();
+            if mapped != self.selected {
+                self.selected = mapped;
+                changed = true;
+            }
         }
 
         removed_entities.sort_unstable();
@@ -2290,6 +2305,27 @@ impl OpenWorld {
             changed = true;
         }
         changed
+    }
+
+    /// The cart's published selection as document targets, through the
+    /// index map and the document as they stand now. Items the document
+    /// does not (or no longer) has are dropped, and duplicates -- an
+    /// instance whose members are all selected -- collapse to one.
+    fn cart_selection_targets(&self) -> Vec<Selection> {
+        let Some(live) = self.live.as_ref() else {
+            return Vec::new();
+        };
+        let counts = OpenWorld::doc_counts(&self.store.state());
+        let mut mapped: Vec<Selection> = Vec::new();
+        for index in &live.cart_selection {
+            if let Some(target) = live.index_map.selection_of(*index)
+                && counts.contains(target)
+                && !mapped.contains(&target)
+            {
+                mapped.push(target);
+            }
+        }
+        mapped
     }
 
     /// One op for a list the store has to undo in a single step. A single

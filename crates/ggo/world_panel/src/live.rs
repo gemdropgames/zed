@@ -384,7 +384,7 @@ const SPAWN_DEADLINE_FRAMES: u32 = 60;
 /// because the user paused mid-transfer would report a failure the cart
 /// never had. It is also what makes the journeys deterministic -- they
 /// drive frames, not a stopwatch.
-const SAVE_DEADLINE_FRAMES: u32 = 300;
+pub const SAVE_DEADLINE_FRAMES: u32 = 300;
 
 /// The one component whose value is also a row: the mirror places it with
 /// a `SetTransform` rather than a whole-component write, so the two must

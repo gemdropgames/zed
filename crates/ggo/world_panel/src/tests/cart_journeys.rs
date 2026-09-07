@@ -72,7 +72,28 @@ fn slide_first(world: &mut emerald_core::World) {
     }
 }
 
+/// Journey 25's cart-side edit system: on the frame it is armed for, it
+/// moves the fixture's first box by +5 px and reports the entity as
+/// changed -- what a user tool does when it edits the world itself.
+static NUDGE_ARMED: AtomicU32 = AtomicU32::new(0);
+
+fn nudge_box_a(world: &mut emerald_core::World) {
+    if NUDGE_ARMED.swap(0, Ordering::SeqCst) == 0 {
+        return;
+    }
+    // The fixture authors the camera first, so the first box is the
+    // SECOND entity -- `BOX_A`'s tracked index.
+    let Some(entity) = world.iter_entities().nth(BOX_A as usize) else {
+        return;
+    };
+    if let Some(transform) = world.get_mut::<emerald_core::Transform>(entity) {
+        transform.pos = transform.pos.add(emerald_core::Vec2::int(5, 0));
+    }
+    emerald_editor_runtime::mark_dirty(world, entity);
+}
+
 const NO_SYSTEMS: emerald_editor_runtime::link::SystemTable = &[];
+const NUDGE_TABLE: emerald_editor_runtime::link::SystemTable = &[("nudge", nudge_box_a)];
 const USER_TOOL_TABLE: emerald_editor_runtime::link::SystemTable = &[("user", user_tool)];
 /// Two tools in table order: the second sees a press only if the first
 /// left it alone.
@@ -249,7 +270,7 @@ struct Journey<'a> {
     endpoint: Arc<ggo_common::LinkEndpoint>,
     cart: CartHarness,
     cx: &'a mut gpui::VisualTestContext,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 /// A world tab open in Live with a real cart behind it, connected, its
@@ -314,7 +335,7 @@ async fn journey<'a>(
         endpoint,
         cart,
         cx,
-        _dir: dir,
+        dir,
     };
     journey.settle();
     journey
@@ -647,6 +668,121 @@ impl Journey<'_> {
     fn set_tool(&mut self, tool: u8) {
         self.panel
             .update(self.cx, |panel, cx| panel.set_live_tool(tool, cx));
+    }
+
+    /// The world root every fixture was written under.
+    fn root(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    /// Press Save through the keymap and frame the cart until the save has
+    /// settled -- in Live it is the CART that answers, several frames
+    /// later. `budget` is in cart frames, so a journey that expects the
+    /// deadline to fire spends the whole 300 of it.
+    fn save(&mut self, budget: usize) {
+        self.action(&Save);
+        for _ in 0..budget {
+            if !self.save_pending() {
+                return;
+            }
+            self.frames(1);
+        }
+        assert!(!self.save_pending(), "the save never settled");
+    }
+
+    fn save_pending(&mut self) -> bool {
+        self.panel
+            .read_with(self.cx, |panel, _| open_of(panel).save_pending())
+    }
+
+    fn save_error(&mut self) -> Option<String> {
+        self.panel
+            .read_with(self.cx, |panel, _| open_of(panel).save_error.clone())
+    }
+
+    /// Whether the tab is still offering to save something.
+    fn dirty(&mut self) -> bool {
+        self.panel
+            .read_with(self.cx, |panel, _| panel.dirty_world_name().is_some())
+    }
+
+    /// The world as it is ON DISK, re-read rather than derived from the
+    /// document: a save journey has to prove the bytes landed.
+    fn on_disk(&mut self) -> WorldFile {
+        world_file::read_world(self.root(), "worlds/journey.toml").expect("the world file")
+    }
+
+    /// Type `text` into the inspector's editor for one axis of a document
+    /// entity's `Transform.pos` and commit it the way Enter does -- the
+    /// panel's own commit path, not a `set_component` behind it.
+    fn commit_pos(&mut self, entity: usize, axis: usize, text: &str) {
+        let editor = self
+            .panel
+            .read_with(self.cx, |panel, _| {
+                open_of(panel)
+                    .inspector
+                    .iter()
+                    .find(|field| {
+                        matches!(
+                            &field.target,
+                            inspector::FieldTarget::EntityVec2Axis {
+                                entity: held,
+                                component,
+                                field: name,
+                                axis: held_axis,
+                            } if *held == entity
+                                && component == "Transform"
+                                && name == "pos"
+                                && *held_axis == axis
+                        )
+                    })
+                    .map(|field| field.editor.clone())
+            })
+            .expect("an inspector editor for Transform.pos");
+        self.panel.update_in(self.cx, |panel, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+            panel.commit_editor(editor.entity_id(), cx);
+        });
+        self.cx.run_until_parked();
+    }
+
+    /// Link background slot 0 to a real tileset, which is what gives paint
+    /// mode a `.map` to open and the cart a layer to hold.
+    fn add_background(&mut self) {
+        write_test_tileset(self.root(), "tiles/bg.til");
+        self.panel.update(self.cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx)
+        });
+        self.cx.run_until_parked();
+        self.settle();
+    }
+
+    /// Put the brush on background slot 0, as the layers rail does.
+    fn enter_paint(&mut self) {
+        self.panel.update(self.cx, |panel, cx| {
+            assert!(
+                panel.enter_paint_mode(PaintTarget::BgSlot(0), cx),
+                "slot 0 has a map to paint"
+            );
+        });
+        self.cx.run_until_parked();
+    }
+
+    /// One brush click at world `at`, through the canvas's own paint path.
+    fn paint_at(&mut self, at: [f64; 2]) {
+        let local = self.pt(at);
+        self.panel.update_in(self.cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(local, false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        self.frames(2);
+    }
+
+    /// Slot 0's cells as they are ON DISK.
+    fn map_cells_on_disk(&mut self) -> Vec<u16> {
+        io::open_map(self.root(), "maps/journey.bg0.map")
+            .expect("the linked map")
+            .cells
     }
 }
 
@@ -1087,7 +1223,7 @@ async fn closing_the_tab_stops_the_cart(cx: &mut TestAppContext) {
         endpoint,
         cart,
         cx,
-        _dir,
+        dir: _dir,
     } = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     assert!(
         !endpoint.stop_requested(),
@@ -1204,14 +1340,7 @@ async fn releasing_outside_the_canvas_ends_the_drag_once(cx: &mut TestAppContext
 /// 14. Escape mid-marquee retires the band on BOTH sides: the panel stops
 ///     drawing it and the cart abandons it, so the release that follows
 ///     selects nothing.
-///
-/// Ignored: the cart's `ClearSelection` clears `Selection.entities` and
-/// its primary but leaves `EditorState::marquee_anchor` armed
-/// (`edit_systems.rs`, `commands`), so the band survives Escape and the
-/// release still sweeps. An emerald-side fix -- the host cannot retire a
-/// band the cart is republishing every frame.
 #[gpui::test]
-#[ignore = "cart-side: ClearSelection does not drop the marquee anchor"]
 async fn escape_mid_marquee_retires_the_band_on_both_sides(cx: &mut TestAppContext) {
     let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let from = journey.pt([20.0, 30.0]);
@@ -1457,6 +1586,222 @@ async fn a_regreet_mid_drag_abandons_the_drag_cleanly(cx: &mut TestAppContext) {
         2,
         "the new session's drag is its own undo entry"
     );
+}
+
+/// 23. An inspector edit is a cart edit like any other: typing a new x
+///     into `Transform.pos` and committing it (Enter, or a blur) moves
+///     the row ON THE CART, the overlay follows the row back, and the
+///     document holds what was typed.
+#[gpui::test]
+async fn an_inspector_edit_round_trips_through_the_cart(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let at = journey.on(BOX_A_POS);
+    journey.click(at, Modifiers::none());
+    assert_eq!(journey.selected(), vec![Selection::Entity(BOX_A as usize)]);
+    // The inspector's editors are built while the panel renders, and the
+    // fields it builds are the SELECTION's.
+    show_panel(journey.cx);
+
+    journey.commit_pos(BOX_A as usize, 0, "88");
+    journey.settle();
+    journey.frames(2);
+
+    assert_eq!(
+        journey.entity_pos(BOX_A as usize),
+        [88.0, BOX_A_POS[1]],
+        "the document took the typed value"
+    );
+    let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
+    assert_eq!(
+        [rect[0], rect[1]],
+        [88.0, BOX_A_POS[1]],
+        "and the cart moved its row, which is what the overlay draws"
+    );
+    assert_eq!(
+        journey.inspector_position(BOX_A as usize)[0],
+        "88",
+        "the field reads back what the round trip landed on"
+    );
+}
+
+/// 24. A cell painted in Live reaches the CART, a cell at a time -- the
+///     `.map` is not saved yet, so nothing else could have told it -- and
+///     the save then puts that cell on disk.
+#[gpui::test]
+async fn a_cell_painted_in_live_reaches_the_cart_and_the_map(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    journey.add_background();
+    journey.enter_paint();
+    assert_eq!(
+        journey.map_cells_on_disk().first().copied(),
+        Some(live::BLANK_TILE),
+        "the linked map starts blank"
+    );
+
+    journey.paint_at([4.0, 4.0]);
+    let painted = journey.panel.read_with(journey.cx, |panel, _| {
+        panel
+            .test_paint_session("maps/journey.bg0.map")
+            .and_then(|session| session.store.state().cells.first().copied())
+            .expect("a session with cells")
+    });
+    assert_ne!(painted, live::BLANK_TILE, "the brush painted a tile");
+    let (_, _, cells) = journey.cart.layer_cells(0).expect("the cart loaded slot 0");
+    assert_eq!(
+        cells.first().copied(),
+        Some(painted),
+        "the cart's own layer holds the painted cell, before any save"
+    );
+
+    journey.save(400);
+    assert_eq!(journey.save_error(), None, "the save landed");
+    assert_eq!(
+        journey.map_cells_on_disk().first().copied(),
+        Some(painted),
+        "and the `.map` on disk has it"
+    );
+}
+
+/// 25. An edit one of the CART's own systems makes survives a save: the
+///     snapshot is what the save writes, so a position no host command
+///     ever named still reaches the TOML. And Save in Play is refused --
+///     the entities are the game's there, not the author's.
+#[gpui::test]
+async fn a_user_system_edit_survives_a_save(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NUDGE_TABLE, GAME_TABLE).await;
+
+    journey.set_mode(EditorMode::Play);
+    journey.frames(2);
+    journey.action(&Save);
+    journey.frames(2);
+    assert_eq!(
+        journey.save_error().as_deref(),
+        Some("stop the game to save"),
+        "Play is the game's world, not the author's"
+    );
+    journey.set_mode(EditorMode::Edit);
+    journey.settle();
+
+    NUDGE_ARMED.store(1, Ordering::SeqCst);
+    journey.frames(4);
+    assert_eq!(
+        journey.entity_pos(BOX_A as usize),
+        [BOX_A_POS[0] + 5.0, BOX_A_POS[1]],
+        "the cart's own system moved it, and the mirror followed"
+    );
+
+    journey.save(400);
+    assert_eq!(journey.save_error(), None);
+    assert_eq!(
+        journey.on_disk().entities[BOX_A as usize].components["Transform"]["pos"],
+        json!([BOX_A_POS[0] as i64 + 5, BOX_A_POS[1] as i64]),
+        "the TOML has the position the cart's system put it at"
+    );
+    assert!(!journey.dirty(), "and the tab is clean again");
+}
+
+/// 26. Adding and deleting entities in Live are the cart's: `+ Entity`
+///     spawns a row on it, `DeleteSelected` despawns it, and the undo of
+///     the delete puts the row back on the cart.
+#[gpui::test]
+async fn add_and_delete_entities_in_live(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    assert_eq!(journey.cart_rows(), 3);
+
+    journey.panel.update(journey.cx, |panel, cx| panel.add_entity_impl(cx));
+    journey.settle();
+    journey.frames(4);
+    assert_eq!(journey.entity_count(), 4, "the document gained one");
+    assert_eq!(journey.cart_rows(), 4, "and the cart spawned it");
+    assert_eq!(
+        journey.selected(),
+        vec![Selection::Entity(3)],
+        "the new entity is what the DOCUMENT selects"
+    );
+    // ...but not what the cart does: the wire has no host -> cart
+    // selection message, so a spawn the host asked for lands unselected
+    // on the cart and `DeleteSelected` -- which despawns the CART's
+    // selection -- would find nothing. A click is what selects it there.
+    let spawned = journey.entity_pos(3);
+    let at = journey.on(spawned);
+    journey.click(at, Modifiers::none());
+    assert_eq!(journey.selected(), vec![Selection::Entity(3)]);
+
+    journey.action(&DeleteSelected);
+    journey.frames(4);
+    assert_eq!(journey.entity_count(), 3, "the cart despawned it");
+    assert_eq!(journey.cart_rows(), 3);
+
+    assert!(journey.undo(), "there was a delete to undo");
+    assert_eq!(journey.entity_count(), 4);
+    assert_eq!(journey.cart_rows(), 4, "and the cart is drawing it again");
+}
+
+/// 27. The cart never sends the bytes a save asked for: the save fails at
+///     its deadline, the file is left byte for byte as it was, and the
+///     tab stays dirty. A half-written world is worse than none.
+#[gpui::test]
+async fn a_snapshot_that_never_arrives_keeps_the_file(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let start = journey.on(BOX_A_POS);
+    journey.press(start, Modifiers::none());
+    journey.frames(2);
+    let to = journey.on([BOX_A_POS[0] + 20.0, BOX_A_POS[1]]);
+    journey.drag_to(to);
+    journey.frames(2);
+    journey.release(to);
+    journey.frames(2);
+    assert!(journey.dirty(), "the drag left something to save");
+    let before = std::fs::read(journey.root().join("worlds/journey.toml")).expect("the world file");
+
+    journey.cart.drop_cart_blobs(true);
+    journey.save(live::SAVE_DEADLINE_FRAMES as usize + 8);
+
+    assert_eq!(
+        journey.save_error().as_deref(),
+        Some("the cart did not answer in time")
+    );
+    assert!(journey.dirty(), "a failed save keeps the document dirty");
+    assert_eq!(
+        std::fs::read(journey.root().join("worlds/journey.toml")).expect("the world file"),
+        before,
+        "and the file is byte for byte what it was"
+    );
+}
+
+/// 28. Duplicate is the cart's command: it copies the selection at +16 px
+///     and selects the copies, the document gains them at the indices the
+///     cart numbered them with, and the undo despawns them again.
+#[gpui::test]
+async fn duplicate_copies_the_selection_on_the_cart_and_in_the_document(cx: &mut TestAppContext) {
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let at = journey.on(BOX_A_POS);
+    journey.click(at, Modifiers::none());
+    assert_eq!(journey.cart_rows(), 3);
+
+    journey.action(&Duplicate);
+    journey.settle();
+    journey.frames(4);
+
+    assert_eq!(journey.cart_rows(), 4, "the cart made the copy");
+    assert_eq!(journey.entity_count(), 4, "and the document gained it");
+    let copy = Selection::Entity(3);
+    let (rect, selected) = journey.outline(copy);
+    assert_eq!(
+        [rect[0], rect[1]],
+        [BOX_A_POS[0] + 16.0, BOX_A_POS[1] + 16.0],
+        "the copy sits one tile down and right of its original"
+    );
+    assert!(selected, "and the copy is what is selected now");
+    assert_eq!(
+        journey.entity_pos(3),
+        [BOX_A_POS[0] + 16.0, BOX_A_POS[1] + 16.0],
+        "the document holds the copy at the cart's own index"
+    );
+
+    assert!(journey.undo(), "there was a duplicate to undo");
+    assert_eq!(journey.entity_count(), 3);
+    assert_eq!(journey.cart_rows(), 3, "the copy is gone from the cart too");
 }
 
 /// 22. The accepted limitation, asserted so a change to it fails loudly:
