@@ -1221,6 +1221,38 @@ impl OpenWorld {
         }
     }
 
+    /// [`Self::note_doc_changed`] for a step whose BEFORE state is known
+    /// -- undo, redo, and the ops that funnel through `apply_op`. A step
+    /// that MOVED things and changed nothing else is replayed to the cart
+    /// as one `SetTransform` per affected cart index instead of a whole
+    /// world resend: a reload takes the cart's rows away until the blob
+    /// has landed and been redrawn, which is a visible blink for an undo
+    /// that only put a sprite back where it was. Everything else -- an
+    /// added or removed item, a field, a background -- still re-sends,
+    /// because the flattened order the cart indexes in is the encoder's
+    /// to describe.
+    ///
+    /// A step the store folded away -- an op that set a field to the value
+    /// it already held -- is not a document change at all, and re-sending
+    /// the world for one would reset a running cart over a blur.
+    fn note_doc_stepped(&mut self, before: &ggo_worldlib::world_doc::WorldState) {
+        let after = self.store.state();
+        if before.entities == after.entities
+            && before.instances == after.instances
+            && before.backgrounds == after.backgrounds
+        {
+            return;
+        }
+        self.doc_generation = self.doc_generation.wrapping_add(1);
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        match live.transform_replay(before, &after) {
+            Some(transforms) => live.queue_transforms(transforms),
+            None => live.world_dirty = true,
+        }
+    }
+
     /// How big the document is, for the Live lookups. Takes the state
     /// the caller already has: `WorldDocStore::state` deep-clones the
     /// document, so asking per row would clone it per row.
@@ -1427,6 +1459,23 @@ impl OpenWorld {
                         log::warn!("GGO: live command: {error}");
                     }
                 }
+                // ONE transform per tick: the cart commits it into its
+                // single command slot and stops reading datagrams until
+                // the frame after has acked it, so the rest of a burst
+                // would only fill a four-deep queue. A transform that the
+                // mailbox refuses (an index past the cart's cap) is
+                // dropped rather than retried, and never recorded as
+                // sent: the row it would have suppressed is the cart's
+                // own after all.
+                if let Some(transform) = live.pending_transforms.pop_front() {
+                    match live
+                        .mailbox
+                        .set_transform(transform.0, transform.1, transform.2)
+                    {
+                        Ok(()) => live.note_transform_sent(transform),
+                        Err(error) => log::warn!("GGO: live set_transform: {error}"),
+                    }
+                }
             }
         }
         // One update per tick, and none while a blob is in flight: the
@@ -1484,6 +1533,10 @@ impl OpenWorld {
                         // The rows the cart has published are the PREVIOUS
                         // world's until it republishes.
                         live.world_sync = live::WorldSync::Sending;
+                        // The blob places every row itself, and its
+                        // flattening may not be the one these indices
+                        // were computed against.
+                        live.forget_transforms();
                         live.index_map = live::IndexMap::new(
                             self.store.state().entities.len(),
                             &self.instance_counts,
@@ -1654,8 +1707,25 @@ impl OpenWorld {
         // is only recorded.
         let mut rows: Vec<(Selection, [f64; 2], [f64; 2])> = Vec::new();
         let mut removed_entities: Vec<usize> = Vec::new();
+        // Cart indices whose row arrived exactly where an undo's replayed
+        // `SetTransform` put it, retired once seen.
+        let mut replays_landed: Vec<u32> = Vec::new();
         if fold {
             for row in &live.rows {
+                // The host's own undo landing, not cart-side motion:
+                // folding it would write the undone delta back into the
+                // document a second time and open an undo entry for the
+                // undo. Compared in RAW units, which is what went out and
+                // what the cart stored -- a world pixel is not a value
+                // the wire's fixed point can always name exactly.
+                if live.replayed_rows.contains(&(
+                    row.index,
+                    live::to_raw(row.x),
+                    live::to_raw(row.y),
+                )) {
+                    replays_landed.push(row.index);
+                    continue;
+                }
                 let Some(target) = live.index_map.selection_of(row.index) else {
                     continue;
                 };
@@ -1674,6 +1744,8 @@ impl OpenWorld {
                     rows.push((target, [row.x, row.y], before));
                 }
             }
+            live.replayed_rows
+                .retain(|(index, _, _)| !replays_landed.contains(index));
             live.mirror_rows = live.rows.clone();
             removed_entities = removed
                 .iter()
@@ -2319,8 +2391,9 @@ impl WorldPanel {
     /// always reflects the store.
     fn apply_op(&mut self, op: WorldOp, cx: &mut Context<Self>) {
         if let ViewerState::Ready(open) = &mut self.state {
+            let before = open.store.state();
             open.store.apply(op);
-            open.note_doc_changed();
+            open.note_doc_stepped(&before);
             cx.notify();
         }
         self.refresh_instance_counts(cx);
@@ -3351,12 +3424,13 @@ impl WorldPanel {
         // most four entries, and only a real change pays for the re-merge
         // and the recompose.
         let backgrounds_before = self.backgrounds_now();
-        if let ViewerState::Ready(open) = &mut self.state
-            && open.store.undo()
-        {
-            open.prune_selection();
-            open.note_doc_changed();
-            cx.notify();
+        if let ViewerState::Ready(open) = &mut self.state {
+            let before = open.store.state();
+            if open.store.undo() {
+                open.prune_selection();
+                open.note_doc_stepped(&before);
+                cx.notify();
+            }
         }
         self.refresh_instance_counts(cx);
         if self.backgrounds_now() != backgrounds_before {
@@ -3373,11 +3447,12 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        let before = open.store.state();
         if !open.store.redo() {
             return;
         }
         open.prune_selection();
-        open.note_doc_changed();
+        open.note_doc_stepped(&before);
         // A redone add-instance comes back from the undo stack as it was
         // snapshotted -- unresolved -- so it would render as a placeholder
         // until reload. Resolve whatever has neither a subtree nor an
@@ -14180,6 +14255,7 @@ mod tests {
                     || live.layers_dirty.any()
                     || !live.layer_queue.is_empty()
                     || live.pending_camera.is_some()
+                    || !live.pending_transforms.is_empty()
                     || live.mailbox.busy()
                     || !live.loaded()
             });
@@ -15254,6 +15330,133 @@ mod tests {
             sent.iter().all(|message| message.first() != Some(&0x08)),
             "no blob for a mirrored move: {sent:?}"
         );
+    }
+
+    /// Every `SetTransform` in `sent`, as `(cart index, world x, world y)`,
+    /// plus whether a world blob was started in the same batch.
+    fn sent_transforms(sent: &[Vec<u8>]) -> (Vec<(u32, f64, f64)>, bool) {
+        use emerald_editor_runtime::wire::{self, HostMsg};
+
+        let blobbed = sent.iter().any(|message| message.first() == Some(&0x08));
+        let transforms = sent
+            .iter()
+            .filter_map(|message| match wire::decode_host(message) {
+                Some(HostMsg::SetTransform { id, x, y }) => {
+                    Some((id, live::from_raw(x), live::from_raw(y)))
+                }
+                _ => None,
+            })
+            .collect();
+        (transforms, blobbed)
+    }
+
+    /// The cart-side drag of `a_mirrored_move_never_re_sends_the_world`,
+    /// left folded into the document with the session settled.
+    async fn live_panel_after_a_mirrored_drag(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<WorldPanel>,
+        Arc<ggo_common::LinkEndpoint>,
+        tempfile::TempDir,
+        &mut gpui::VisualTestContext,
+    ) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        cart_gesture(&endpoint, GESTURE_BEGIN, 1);
+        cart_rows(&endpoint, &[(0, 40.0, 50.0)]);
+        cx.run_until_parked();
+        cart_gesture(&endpoint, GESTURE_END, 1);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(entity_pos_of(panel, 0), [40.0, 50.0], "the drag folded in");
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+        (panel, endpoint, dir, cx)
+    }
+
+    /// Undoing a MOVE replays it to the cart as a `SetTransform` per
+    /// affected index. The cart is holding the right world already: a blob
+    /// would blank its rows for a round trip to say what one datagram
+    /// says, so there must not be one.
+    #[gpui::test]
+    async fn undo_of_a_move_replays_a_transform_instead_of_the_world(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = live_panel_after_a_mirrored_drag(cx).await;
+
+        panel.update(cx, |panel, cx| panel.undo_impl(cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(entity_pos_of(panel, 0), [4.0, 4.0], "the document undid it");
+            assert!(
+                !live_of(panel).world_dirty,
+                "and owes the cart no world for it"
+            );
+        });
+        let sent = settle_live(&panel, &endpoint, cx);
+
+        let (transforms, blobbed) = sent_transforms(&sent);
+        assert_eq!(
+            transforms,
+            vec![(0, 4.0, 4.0)],
+            "the undone position went out as one SetTransform"
+        );
+        assert!(!blobbed, "and no world blob went with it");
+
+        panel.update(cx, |panel, cx| panel.redo_impl(cx));
+        let sent = settle_live(&panel, &endpoint, cx);
+        let (transforms, blobbed) = sent_transforms(&sent);
+        assert_eq!(
+            transforms,
+            vec![(0, 40.0, 50.0)],
+            "and redo replays the moved position the same way"
+        );
+        assert!(!blobbed);
+    }
+
+    /// A row that comes back where the replayed transform put it is the
+    /// host's own undo landing, not cart-side motion: folding it would
+    /// write the undone delta back and open an undo entry for the undo.
+    #[gpui::test]
+    async fn a_replayed_row_is_not_mirrored_back_into_the_document(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = live_panel_after_a_mirrored_drag(cx).await;
+        panel.update(cx, |panel, cx| panel.undo_impl(cx));
+        settle_live(&panel, &endpoint, cx);
+
+        // The cart applying it: the row comes back at the undone position.
+        cart_rows(&endpoint, &[(0, 4.0, 4.0), (1, 40.0, 8.0)]);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(entity_pos_of(panel, 0), [4.0, 4.0], "and nothing re-folded");
+            assert!(
+                live_of(panel).replayed_rows.is_empty(),
+                "the replay was retired by the row that fulfilled it"
+            );
+        });
+        assert_eq!(undo_depth(&panel, cx), 0, "the undo did not become an edit");
+    }
+
+    /// Only MOVES replay: undoing a despawn puts an entity back, which
+    /// shifts every index above it, and nothing but the blob can say that.
+    #[gpui::test]
+    async fn undo_of_a_removal_still_re_sends_the_world(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        cart_removed(&endpoint, 0);
+        cx.run_until_parked();
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.undo_impl(cx));
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).world_dirty, "the cart is owed the whole world");
+        });
+        let sent = settle_live(&panel, &endpoint, cx);
+
+        let (transforms, blobbed) = sent_transforms(&sent);
+        assert!(blobbed, "the restored entity went out as a world blob");
+        assert!(transforms.is_empty(), "and not as transforms: {transforms:?}");
     }
 
     /// How many undo entries the open document has, by unwinding the whole

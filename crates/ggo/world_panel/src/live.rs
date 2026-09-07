@@ -12,7 +12,7 @@ use emerald_editor_link::{EditCommand, EditorMode, EntityRow, LinkIo, LinkMailbo
 use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::View;
 use ggo_worldlib::render::{DEVICE_SCREEN_H, DEVICE_SCREEN_W, Selection};
-use ggo_worldlib::world_doc::WorldDocStore;
+use ggo_worldlib::world_doc::{WorldDocStore, WorldInstance, WorldState};
 use ggo_worldlib::world_file::world_to_toml;
 use gpui::{RenderImage, Task};
 
@@ -98,6 +98,18 @@ impl IndexMap {
             ranges.push((first, count));
         }
         ranges
+    }
+
+    /// Every cart index a document item owns: the one row a direct entity
+    /// publishes, or an `[[instance]]`'s whole subtree.
+    pub fn indices_of(&self, selection: Selection) -> Vec<u32> {
+        self.entries
+            .iter()
+            .enumerate()
+            // `as` cannot lose anything a cart index can hold: the map is
+            // indexed by the same `u32` the wire carries.
+            .filter_map(|(index, entry)| (*entry == selection).then_some(index as u32))
+            .collect()
     }
 
     /// Read only by the tests: the map's production users address it by
@@ -199,6 +211,69 @@ pub fn overlay_rows(
                 .then(|| (selection, row.drawn(), selected.contains(&selection)))
         })
         .collect()
+}
+
+/// What moved between two states of the same document, when NOTHING else
+/// changed: each moved item, where it is now, and how far it travelled.
+///
+/// `None` the moment anything a `SetTransform` cannot carry differs -- an
+/// added or removed item, another field, a background slot -- because
+/// only the world blob can describe that to the cart. This is how an undo
+/// step, which the store is opaque about, is told from a structural one.
+pub fn moves_between(
+    before: &WorldState,
+    after: &WorldState,
+) -> Option<Vec<(Selection, [f64; 2], [f64; 2])>> {
+    if before.entities.len() != after.entities.len()
+        || before.instances.len() != after.instances.len()
+        || before.backgrounds != after.backgrounds
+    {
+        return None;
+    }
+    let mut moves = Vec::new();
+    for (index, (was, now)) in before.entities.iter().zip(&after.entities).enumerate() {
+        if was == now {
+            continue;
+        }
+        let (Some(from), Some(to)) = (
+            crate::inspector::transform_pos(was),
+            crate::inspector::transform_pos(now),
+        ) else {
+            return None;
+        };
+        // Rewriting the old entity's position and asking whether it is now
+        // the new one is what proves the position was the ONLY difference:
+        // a `SetField` on some other field of the same entity is not
+        // something the cart can be told with a transform.
+        let mut moved = was.clone();
+        crate::inspector::set_transform_pos(&mut moved.components, to);
+        if moved != *now {
+            return None;
+        }
+        moves.push((
+            Selection::Entity(index),
+            to,
+            [to[0] - from[0], to[1] - from[1]],
+        ));
+    }
+    for (index, (was, now)) in before.instances.iter().zip(&after.instances).enumerate() {
+        if was == now {
+            continue;
+        }
+        let moved = WorldInstance {
+            pos: now.pos,
+            ..was.clone()
+        };
+        if moved != *now {
+            return None;
+        }
+        moves.push((
+            Selection::Instance(index),
+            now.pos,
+            [now.pos[0] - was.pos[0], now.pos[1] - was.pos[1]],
+        ));
+    }
+    Some(moves)
 }
 
 /// Pixels -> the runtime's Q16.16 fixed point. Rounds to the nearest raw
@@ -326,6 +401,14 @@ const POINTER_QUEUE_MAX: usize = 16;
 /// one to lose: a request from a quarter second ago has been superseded
 /// by whatever the user asked for since.
 const COMMAND_QUEUE_MAX: usize = 32;
+
+/// How many `SetTransform`s one document step may be replayed as before
+/// the whole world is re-sent instead. The cart commits one of them into
+/// its single command slot per frame, so a big group's replay would
+/// trickle out over that many cart frames -- past this many, the blob
+/// (four datagrams and a round trip, whatever the document's size) is the
+/// cheaper way to say it.
+const TRANSFORM_REPLAY_MAX: usize = 32;
 
 /// How many extra ticks an EDGE is repeated on. A pointer datagram is
 /// fire-and-forget and the cart's APP receive queue is four deep, so the
@@ -730,6 +813,19 @@ pub struct LiveView {
     /// Flushed whole every tick: a command is a discrete request, and
     /// dropping one would silently swallow a keypress.
     pub pending_commands: Vec<EditCommand>,
+    /// `SetTransform`s owed the cart -- `(cart index, raw x, raw y)` --
+    /// from an undo or redo of a move. One goes out per tick: the cart
+    /// commits a transform into its ONE command slot and reads no further
+    /// datagram until the frame after, so a burst sent in a single tick
+    /// would sit in a four-deep receive queue and be dropped past the
+    /// fourth.
+    pub pending_transforms: VecDeque<(u32, i32, i32)>,
+    /// Transforms already on the wire, in the raw units they were sent in.
+    /// A row that comes back at exactly one of these is the HOST's own
+    /// undo landing, not cart-side motion, and folding it would apply the
+    /// undone delta a second time -- an instance member has no document
+    /// position of its own, so the mirror can only read it as a delta.
+    pub replayed_rows: Vec<(u32, i32, i32)>,
     /// Slots still to push, ascending, one per tick: the cart's APP
     /// receive queue is four datagrams deep, and a blob transfer already
     /// fills it. A slot re-dirtied while this queue is draining is re-read
@@ -783,6 +879,8 @@ impl LiveView {
             pointer_repeats: 0,
             pointer_buttons: 0,
             pending_commands: Vec::new(),
+            pending_transforms: VecDeque::new(),
+            replayed_rows: Vec::new(),
             layer_queue: VecDeque::new(),
             // The cart's built-in select tool, which is what a session
             // that has not been told otherwise is running.
@@ -890,6 +988,76 @@ impl LiveView {
         }
     }
 
+    /// The `SetTransform`s that replay one document step onto the cart --
+    /// one per affected cart index, in raw units -- or `None` when the
+    /// cart needs the whole world instead: a step that changed more than
+    /// positions, a session whose rows do not describe this document, Play
+    /// (where the entities are the game's), or a step too big to trickle
+    /// out one command per cart frame.
+    pub fn transform_replay(
+        &self,
+        before: &WorldState,
+        after: &WorldState,
+    ) -> Option<Vec<(u32, i32, i32)>> {
+        // The same window the mirror folds in: the cart's indices only
+        // describe this document while the world handshake is settled,
+        // and in Play the game owns where its entities are.
+        if self.mode != EditorMode::Edit || !self.loaded() || self.world_dirty {
+            return None;
+        }
+        let mut transforms = Vec::new();
+        for (target, pos, delta) in moves_between(before, after)? {
+            for index in self.index_map.indices_of(target) {
+                let at = match target {
+                    // A direct entity's row IS its `Transform.pos`.
+                    Selection::Entity(_) => pos,
+                    // An instance member has no position of its own in the
+                    // document -- only the `[[instance]]` does -- so each
+                    // member moves from where the cart has it by the same
+                    // delta. A member the cart has not published cannot be
+                    // placed at all, and the world has to go instead.
+                    Selection::Instance(_) => {
+                        let row = self.rows.iter().find(|row| row.index == index)?;
+                        [row.x + delta[0], row.y + delta[1]]
+                    }
+                };
+                transforms.push((index, to_raw(at[0]), to_raw(at[1])));
+            }
+        }
+        (!transforms.is_empty() && transforms.len() <= TRANSFORM_REPLAY_MAX).then_some(transforms)
+    }
+
+    /// Queue transforms for the cart, superseding anything still owed for
+    /// the same index: the last place the document put a row is the only
+    /// one worth sending.
+    pub fn queue_transforms(&mut self, transforms: Vec<(u32, i32, i32)>) {
+        for (index, x, y) in transforms {
+            self.pending_transforms
+                .retain(|(queued, _, _)| *queued != index);
+            self.replayed_rows.retain(|(sent, _, _)| *sent != index);
+            self.pending_transforms.push_back((index, x, y));
+        }
+    }
+
+    /// Note that `transform` went out, so the row it produces is not
+    /// mirrored back into the document ([`Self::replayed_rows`]).
+    pub fn note_transform_sent(&mut self, transform: (u32, i32, i32)) {
+        self.replayed_rows.push(transform);
+        // A transform the cart never applies (a row it has since dropped)
+        // would otherwise hold its entry forever, suppressing one honest
+        // fold at that exact position.
+        while self.replayed_rows.len() > TRANSFORM_REPLAY_MAX {
+            self.replayed_rows.remove(0);
+        }
+    }
+
+    /// Forget every transform this session owed or sent -- the cart is
+    /// being handed a whole world, which places the rows itself.
+    pub fn forget_transforms(&mut self) {
+        self.pending_transforms.clear();
+        self.replayed_rows.clear();
+    }
+
     /// Tell the cart every button the host thinks is held has come up, at
     /// the last point it was told about. `false` when there was nothing
     /// held.
@@ -921,6 +1089,7 @@ impl LiveView {
     pub fn forget_input(&mut self) {
         self.pending_pointer.clear();
         self.pending_commands.clear();
+        self.forget_transforms();
         self.pointer_moving = false;
         self.last_pointer = None;
         self.pointer_repeats = 0;
@@ -1328,6 +1497,138 @@ mod tests {
             [(0, 1), (1, 2)],
             "an instance that flattens to nothing owns no range"
         );
+    }
+
+    /// A one-entity, one-instance document: entity 0 at `entity`, the
+    /// `[[instance]]` at `instance`.
+    fn doc_state(entity: [f64; 2], instance: [f64; 2]) -> WorldState {
+        WorldState {
+            entities: vec![ggo_worldlib::world_file::WorldEntity {
+                components: serde_json::json!({ "Transform": { "pos": entity, "z": 0.0 } })
+                    .as_object()
+                    .expect("an object literal")
+                    .clone(),
+            }],
+            instances: vec![WorldInstance {
+                world: "worlds/pair".to_string(),
+                pos: instance,
+                background_priority: false,
+                resolved: None,
+                error: None,
+            }],
+            backgrounds: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    /// Only positions: anything else the step touched means the cart has
+    /// to be handed the whole world instead.
+    #[test]
+    fn moves_between_reports_positions_and_refuses_everything_else() {
+        let before = doc_state([4.0, 4.0], [10.0, 10.0]);
+        assert_eq!(
+            moves_between(&before, &before),
+            Some(Vec::new()),
+            "a step that moved nothing moved nothing"
+        );
+        let after = doc_state([40.0, 50.0], [10.0, 10.0]);
+        assert_eq!(
+            moves_between(&before, &after),
+            Some(vec![(Selection::Entity(0), [40.0, 50.0], [36.0, 46.0])])
+        );
+        let after = doc_state([4.0, 4.0], [30.0, 10.0]);
+        assert_eq!(
+            moves_between(&before, &after),
+            Some(vec![(Selection::Instance(0), [30.0, 10.0], [20.0, 0.0])])
+        );
+
+        let mut structural = before.clone();
+        structural.entities.push(before.entities[0].clone());
+        assert_eq!(moves_between(&before, &structural), None, "an added entity");
+
+        let mut field = before.clone();
+        if let Some(serde_json::Value::Object(transform)) =
+            field.entities[0].components.get_mut("Transform")
+        {
+            transform.insert("z".to_string(), serde_json::json!(3.0));
+        }
+        assert_eq!(
+            moves_between(&before, &field),
+            None,
+            "a field beside the position is not something a transform carries"
+        );
+
+        let mut renamed = before.clone();
+        renamed.instances[0].world = "worlds/other".to_string();
+        assert_eq!(moves_between(&before, &renamed), None, "a re-pointed instance");
+    }
+
+    /// The replay: a direct entity takes the document position, while each
+    /// instance MEMBER moves from where the cart has it by the instance's
+    /// delta -- the document has no position for a member at all.
+    #[test]
+    fn transform_replay_moves_instance_members_by_the_delta() {
+        let live = offline_view(
+            vec![row(0, 4.0, 4.0), row(1, 10.0, 10.0), row(2, 10.0, 34.0)],
+            1,
+            &[2],
+        );
+        let before = doc_state([4.0, 4.0], [10.0, 10.0]);
+        let after = doc_state([40.0, 50.0], [30.0, 10.0]);
+        assert_eq!(
+            live.transform_replay(&before, &after),
+            Some(vec![
+                (0, to_raw(40.0), to_raw(50.0)),
+                (1, to_raw(30.0), to_raw(10.0)),
+                (2, to_raw(30.0), to_raw(34.0)),
+            ])
+        );
+        assert_eq!(
+            live.transform_replay(&before, &before),
+            None,
+            "a step with nothing to replay is not a replay"
+        );
+    }
+
+    /// The replay window is the mirror's: the cart's indices only describe
+    /// this document while the world handshake is settled, and in Play the
+    /// entities are the game's to place.
+    #[test]
+    fn a_session_out_of_step_with_the_document_replays_nothing() {
+        let before = doc_state([4.0, 4.0], [10.0, 10.0]);
+        let after = doc_state([40.0, 50.0], [10.0, 10.0]);
+        let mut live = offline_view(vec![row(0, 4.0, 4.0)], 1, &[]);
+        assert!(live.transform_replay(&before, &after).is_some());
+
+        live.world_dirty = true;
+        assert_eq!(live.transform_replay(&before, &after), None, "a world owed");
+        live.world_dirty = false;
+        live.world_sync = WorldSync::Sending;
+        assert_eq!(live.transform_replay(&before, &after), None, "a world in flight");
+        live.world_sync = WorldSync::Loaded;
+        live.mode = EditorMode::Play;
+        assert_eq!(live.transform_replay(&before, &after), None, "Play");
+    }
+
+    /// The queue supersedes per index and retires what the cart proved it
+    /// applied, so a stale replay cannot suppress an honest fold forever.
+    #[test]
+    fn queued_transforms_supersede_and_are_capped() {
+        let mut live = offline_view(Vec::new(), 1, &[]);
+        live.queue_transforms(vec![(0, 1, 1), (1, 2, 2)]);
+        live.queue_transforms(vec![(0, 9, 9)]);
+        assert_eq!(
+            live.pending_transforms.iter().copied().collect::<Vec<_>>(),
+            vec![(1, 2, 2), (0, 9, 9)],
+            "the second ask for index 0 replaced the first"
+        );
+        for index in 0..TRANSFORM_REPLAY_MAX as u32 + 1 {
+            live.note_transform_sent((index, 0, 0));
+        }
+        assert_eq!(live.replayed_rows.len(), TRANSFORM_REPLAY_MAX);
+        live.forget_transforms();
+        assert!(live.pending_transforms.is_empty());
+        assert!(live.replayed_rows.is_empty());
     }
 
     /// A session with no cart behind it, for the pure lookups: they read

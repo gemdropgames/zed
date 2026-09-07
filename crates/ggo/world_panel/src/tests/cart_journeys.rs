@@ -275,6 +275,7 @@ impl Journey<'_> {
                     || live.layers_dirty.any()
                     || !live.layer_queue.is_empty()
                     || live.pending_camera.is_some()
+                    || !live.pending_transforms.is_empty()
                     || live.mailbox.busy()
                     || !live.loaded()
             });
@@ -398,6 +399,22 @@ impl Journey<'_> {
         self.settle();
         self.frames(2);
         self.doc_generation() != before
+    }
+
+    /// [`Self::undo`], reporting whether the panel armed a WHOLE-WORLD
+    /// resend for the step. That flag is what tells a move replayed to the
+    /// cart as `SetTransform`s from a structural undo, which nothing but
+    /// the blob can describe.
+    fn undo_resent_the_world(&mut self) -> bool {
+        let before = self.doc_generation();
+        self.panel.update(self.cx, |panel, cx| panel.undo_impl(cx));
+        let resent = self
+            .panel
+            .read_with(self.cx, |panel, _| live_of(panel).world_dirty);
+        assert_ne!(self.doc_generation(), before, "there was an entry to undo");
+        self.settle();
+        self.frames(2);
+        resent
     }
 
     /// The document's change counter, which every applied op moves.
@@ -596,14 +613,15 @@ async fn drag_moves_the_entity_and_the_outline_follows(cx: &mut TestAppContext) 
     assert_eq!(
         [rect[0], rect[1]],
         BOX_A_POS,
-        "and the CART moved back too: the undone world was re-sent"
+        "and the CART moved back too: the undo was replayed to it"
     );
     assert!(!journey.undo(), "and there was only the one");
 }
 
-/// 3. Undoing a cart-side drag moves the entity back ON THE CART: the
-///    document re-sends the world and the rows (and the outline) come back
-///    where they started.
+/// 3. Undoing a cart-side drag moves the entity back ON THE CART -- and
+///    does it with a `SetTransform`, not a world reload: the cart is
+///    holding the right world already, and blanking its rows for a blob
+///    round trip is a visible blink for an undone drag.
 #[gpui::test]
 async fn undo_after_a_drag_moves_it_back_on_the_cart(cx: &mut TestAppContext) {
     let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
@@ -620,13 +638,16 @@ async fn undo_after_a_drag_moves_it_back_on_the_cart(cx: &mut TestAppContext) {
         [BOX_A_POS[0] + 30.0, BOX_A_POS[1]]
     );
 
-    assert!(journey.undo(), "the drag left one entry to undo");
+    assert!(
+        !journey.undo_resent_the_world(),
+        "an undone move is replayed to the cart, not re-sent as a world"
+    );
 
     let (rect, _) = journey.outline(Selection::Entity(BOX_A as usize));
     assert_eq!(
         [rect[0], rect[1]],
         BOX_A_POS,
-        "the cart re-loaded the undone world and republished the row there"
+        "and the cart put the row back where the transform said"
     );
 }
 
@@ -819,7 +840,10 @@ async fn an_instance_drags_as_a_group_and_undoes_as_one(cx: &mut TestAppContext)
         [INSTANCE_POS[0] + 20.0, INSTANCE_POS[1]],
         "the document moved the [[instance]], not its members"
     );
-    assert!(journey.undo(), "one entry for the whole group drag");
+    assert!(
+        !journey.undo_resent_the_world(),
+        "an undone group move is replayed member by member, not re-sent"
+    );
     assert_eq!(journey.instance_pos(0), INSTANCE_POS);
     let back: Vec<[f64; 4]> = journey
         .overlay()
