@@ -15,6 +15,12 @@ path = "src/ggo_smoke.rs"
 
 [dev-dependencies]
 editor.workspace = true
+# GGO -- the host half of the editor link, driven directly in the real-`emd`
+# smoke: that journey greets and drags a cart the world panel is not in.
+emerald-editor-link.workspace = true
+# GGO -- `encode_toml_at`, to turn the smoke's one-entity world into the
+# blob the link carries.
+emerald-world.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 ggo_common.workspace = true
 # A throwaway database per emulator journey: a run that reaches the end of
@@ -41,5 +47,9 @@ project = { workspace = true, features = ["test-support"] }
 # other ggo panels' dev-deps document.
 remote_connection = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
+# The real-`emd` smoke spawns its own children (`emd new`, `rustup`) and
+# has to scrub the toolchain `cargo test` pins out of their environment,
+# which `ggo_common::run_capture` -- rightly -- does not do.
+smol.workspace = true
 tempfile.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

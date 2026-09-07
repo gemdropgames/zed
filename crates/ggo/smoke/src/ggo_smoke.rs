@@ -2531,4 +2531,496 @@ mod tests {
             );
         });
     }
+
+    // ------------------------------------ the real artifact: emd -> cart
+
+    /// The riscv triple the viewer cart is built for -- the one the
+    /// scaffold's own `rust-toolchain.toml` installs (`emd new`'s template
+    /// pins `targets = ["riscv32imc-unknown-none-elf"]`, and `emd`'s
+    /// `cargo build` inherits it from the project directory).
+    const CART_TARGET: &str = "riscv32imc-unknown-none-elf";
+
+    /// How long the fixture's `emd editor-cart --ggo` may take. Wall
+    /// clock, and generous: it is a real cargo build of emerald's engine
+    /// crates plus the game lib, cross-compiled for the cart.
+    const EMD_BUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// How long the booted cart has to answer the greeting. Deliberately
+    /// not the build's budget: the 30 s is about the BOOT, which begins
+    /// once `emd` has produced the `.ggo`.
+    const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How often an unanswered greeting is repeated while connecting --
+    /// the cadence the world panel's own live loop uses (its constant is
+    /// private to that crate).
+    const HELLO_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// How long any one exchange after the greeting may take: the world
+    /// blob's chunked transfer, the rows that follow it, and the cart's
+    /// answer to a pointer sample.
+    const LINK_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// How long the viewer's `emd` runner must stay uncalled once the
+    /// build's outputs have landed on disk. This is the regression for
+    /// 44b35aa55c: every `ViewerRun` watches its project, and the
+    /// `<name>-editor.{ggo,cart}` and `.tmp/` the build itself writes
+    /// looked like source changes, so the viewer rebuilt forever. Well
+    /// past the panel's 300 ms watch debounce, so a loop would have gone
+    /// round several times inside it.
+    const NO_REBUILD_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Pointer button bit 0 (`emerald-editor-runtime`'s `Button::Left`).
+    const LEFT_BUTTON: u8 = 1;
+
+    /// How far the smoke drags, in device pixels.
+    const DRAG_PX: i16 = 30;
+
+    /// The world the smoke drives, sent over the LINK rather than packed
+    /// into the cart -- the editor cart boots empty by design, which is
+    /// the whole point of the live view.
+    ///
+    /// One entity carrying a `Transform` and nothing else: with no
+    /// `Sprite` the cart hit-tests it through the 16x16 fallback box at
+    /// its transform, and -- the part that matters -- with no `Camera`
+    /// anywhere in the world the cart's effective camera stays at the
+    /// origin, so a device pixel is a world pixel for the whole drag. The
+    /// scaffold's own world puts the camera ON its only entity, which
+    /// would slide the camera under the pointer as the drag moved it.
+    const SMOKE_WORLD: &str = "[[entity]]\nTransform = { pos = [64, 64], z = 0 }\n";
+
+    /// The host half of the link over the viewer run's endpoint. Two
+    /// lines, and deliberately its own copy of them: `ggo_world_panel`'s
+    /// `live::EndpointIo` is private to that crate, and this journey is
+    /// about the CART, so it drives the published mailbox directly rather
+    /// than through the panel that usually holds it.
+    struct EndpointIo(std::sync::Arc<ggo_common::LinkEndpoint>);
+
+    impl emerald_editor_link::LinkIo for EndpointIo {
+        fn send(&mut self, payload: &[u8]) -> std::io::Result<()> {
+            self.0.send_app(payload).map_err(|reason| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, reason)
+            })
+        }
+
+        fn recv(&mut self) -> Vec<Vec<u8>> {
+            self.0.try_recv_inbound()
+        }
+    }
+
+    type SmokeLink = emerald_editor_link::LinkMailbox<EndpointIo>;
+
+    /// `which emd`, decided in process: the binary this fork would spawn
+    /// (`GGO_EMD` when it is set), resolved against `PATH` the way the
+    /// spawn would resolve it.
+    fn emd_on_path() -> bool {
+        let bin = ggo_common::emd_bin();
+        let named = Path::new(&bin);
+        if named.components().count() > 1 {
+            return named.is_file();
+        }
+        std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|dir| dir.join(&bin).is_file())
+        })
+    }
+
+    /// Run one child of this smoke -- niced like every other build the
+    /// fork starts -- and hand back what `ggo_common::run_capture` would:
+    /// stdout's lines, then stderr's.
+    ///
+    /// Not `ggo_common::system_proc_runner`, for one reason: `cargo test`
+    /// runs this process under the toolchain the REPO pins and passes that
+    /// pin to every child through `RUSTUP_TOOLCHAIN`/`CARGO`, where it
+    /// overrides the `rust-toolchain.toml` of whatever directory the child
+    /// runs in. The fixture project pins the toolchain that carries the
+    /// cart's riscv target, so an inherited pin would have `emd` build the
+    /// cart with a toolchain that cannot target it at all. Zed is never
+    /// launched from `cargo test`, so this is the harness's problem rather
+    /// than the runner's, and it is fixed here rather than there.
+    fn run_child(request: &ggo_common::ProcRequest) -> ggo_common::ProcCapture {
+        let mut command = smol::process::Command::new("nice");
+        command
+            .args(["-n", "19", "ionice", "-c2", "-n7"])
+            .arg(&request.bin)
+            .args(&request.args)
+            .current_dir(&request.cwd)
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .env_remove("CARGO")
+            .env_remove("RUSTC")
+            // Points at the pinned toolchain's shared libraries, which a
+            // differently-pinned child's `rustc` would load over its own.
+            .env_remove("LD_LIBRARY_PATH");
+        let output = match smol::block_on(command.output()) {
+            Ok(output) => output,
+            Err(error) => {
+                return ggo_common::ProcCapture {
+                    ok: false,
+                    lines: vec![format!("{}: {error}", request.command_line())],
+                };
+            }
+        };
+        let split = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        };
+        ggo_common::ProcCapture {
+            ok: output.status.success(),
+            lines: split(&output.stdout)
+                .into_iter()
+                .chain(split(&output.stderr))
+                .collect(),
+        }
+    }
+
+    /// Is the cart's target installed for the toolchain the FIXTURE will
+    /// build under? Asked from `cwd` -- the smoke's own temp directory --
+    /// rather than from the repo, because rustup answers per directory and
+    /// this checkout pins a toolchain the fixture never uses.
+    fn riscv_target_installed(cwd: &Path) -> bool {
+        let capture = run_child(&ggo_common::ProcRequest::new(
+            "rustup",
+            cwd,
+            vec![
+                "target".to_string(),
+                "list".to_string(),
+                "--installed".to_string(),
+            ],
+        ));
+        capture.ok && capture.lines.iter().any(|line| line.trim() == CART_TARGET)
+    }
+
+    /// `emd editor-cart --ggo`'s argv and the `.ggo` its JSON trailer
+    /// names -- the two halves of the contract `ViewerRun` builds against.
+    /// Spelled out here rather than called from `ggo_emu_panel::menu`,
+    /// which is private to that crate; the point of running the command
+    /// again from the smoke is to have the REAL `emd` answer for both.
+    fn editor_cart_args() -> Vec<String> {
+        vec!["editor-cart".to_string(), "--ggo".to_string()]
+    }
+
+    fn editor_cart_ggo(lines: &[String]) -> Option<std::path::PathBuf> {
+        lines.iter().rev().find_map(|line| {
+            let ggo = serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("ggo")?
+                .as_str()?
+                .to_string();
+            Some(std::path::PathBuf::from(ggo))
+        })
+    }
+
+    /// One slice of the host's live loop: poll the mailbox and let gpui's
+    /// foreground tasks (the viewer run's frame pump) have the thread.
+    ///
+    /// The 10 ms is not decoration: `LinkMailbox::poll` is the only thing
+    /// that retries an overdue chunk, and its `ACK_TIMEOUT` is 100 ms, so
+    /// a slower loop stretches every retry to its own period.
+    async fn link_tick(mailbox: &mut SmokeLink, cx: &mut TestAppContext) {
+        mailbox
+            .poll(std::time::Instant::now())
+            .expect("the viewer link stays open");
+        cx.background_executor
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    /// Drive the link until `ready`, or fail naming what never happened.
+    async fn wait_on_link(
+        mailbox: &mut SmokeLink,
+        cx: &mut TestAppContext,
+        budget: std::time::Duration,
+        what: &str,
+        ready: impl Fn(&SmokeLink) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + budget;
+        while !ready(mailbox) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            link_tick(mailbox, cx).await;
+        }
+    }
+
+    /// The cart's row for `index`, as of the last poll.
+    fn cart_row(
+        mailbox: &SmokeLink,
+        index: u32,
+    ) -> Option<emerald_editor_link::EntityRow> {
+        mailbox
+            .entities()
+            .iter()
+            .find(|row| row.index == index)
+            .copied()
+    }
+
+    /// Q16.16 to whole pixels, for aiming the pointer at a row.
+    fn whole_px(raw: i32) -> i32 {
+        raw >> 16
+    }
+
+    /// The whole real pipeline, on artifacts nothing in this fork
+    /// fabricates: `emd` scaffolds a project, `emd editor-cart --ggo`
+    /// builds the viewer cart out of it, `ViewerRun` boots that `.ggo` on
+    /// a real emulator thread, and the host greets the cart, loads a world
+    /// into it and drags an entity with the pointer. Every other live-view
+    /// test in the fork answers for a hand-rolled datagram; this one
+    /// answers for the real emerald runtime on the real port.
+    ///
+    /// Gated at RUNTIME rather than behind a cargo feature: a checkout
+    /// without `emd`, or without the cart's riscv target, must still run
+    /// `cargo test -p ggo_smoke` green.
+    #[gpui::test]
+    async fn smoke_real_editor_cart_boots_greets_and_drags(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+
+        // Everything here waits on real wall-clock work: an `emd` build, an
+        // emulator thread, a cart answering on its own frame clock.
+        cx.executor().allow_parking();
+        if !emd_on_path() {
+            println!("skip: emd not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a temp dir for the fixture project");
+        if !riscv_target_installed(dir.path()) {
+            println!("skip: riscv32imc target not installed");
+            return;
+        }
+
+        let scaffold = run_child(&ggo_common::ProcRequest::emd(
+            dir.path(),
+            vec![
+                "new".to_string(),
+                "smokefix".to_string(),
+                "fixture".to_string(),
+            ],
+        ));
+        assert!(
+            scaffold.ok,
+            "emd new scaffolds the fixture project: {}",
+            scaffold.transcript()
+        );
+        let root = dir.path().join("fixture");
+        assert!(
+            root.join(ggo_common::EMERALD_MANIFEST).is_file(),
+            "and the scaffold is an emerald project"
+        );
+
+        // Built once HERE, before anything watches the directory, and not
+        // only to warm the target dir: the first `editor-cart` of a
+        // project's life appends the scene-registry and system-table stubs
+        // to the game lib's own `lib.rs` and adds a dependency to its
+        // manifest. Those are real source edits, and letting them land
+        // under the watch below would make the viewer rebuild for a reason
+        // that has nothing to do with the regression this asserts.
+        let prebuild = run_child(&ggo_common::ProcRequest::emd(&root, editor_cart_args()));
+        assert!(
+            prebuild.ok,
+            "emd editor-cart --ggo builds the viewer cart: {}",
+            prebuild.transcript()
+        );
+        let ggo = editor_cart_ggo(&prebuild.lines)
+            .expect("emd editor-cart --ggo names the .ggo in its JSON trailer");
+        assert!(ggo.is_file(), "and wrote it: {}", ggo.display());
+
+        // A REAL-fs project, unlike every other journey in this file: the
+        // rebuild loop 44b35aa55c fixed is a file-watch defect, and a
+        // `FakeFs` cannot see what `emd` writes to the disk.
+        cx.update(|cx| {
+            // What a project needs to exist at all (the settings store its
+            // client reads). No panel is registered: this journey opens no
+            // window, it drives the link Live mode drives.
+            AppState::test(cx);
+        });
+        let project = Project::test(
+            std::sync::Arc::new(project::RealFs::new(None, cx.executor())),
+            [root.as_path()],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+
+        // The viewer's own `emd`, counted. The count is the assertion at
+        // the end: one build, however many outputs it drops into the
+        // watched directory.
+        let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner: ggo_common::ProcRunner = std::sync::Arc::new({
+            let builds = builds.clone();
+            move |request| {
+                builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                run_child(&request)
+            }
+        });
+        let endpoint = ggo_common::LinkEndpoint::new();
+        // Both bindings are held for the whole journey, for two different
+        // reasons. A `ViewerRun` stops itself when it is dropped, and
+        // nothing else here retains it (the world panel's boot path parks
+        // it in the `ViewerRuns` global, which this test does not go
+        // through). And the run SUBSCRIBES to the project without
+        // retaining it: a gpui entity nothing holds is dropped, taking its
+        // worktree scanner -- and every change event the no-rebuild window
+        // below asserts the absence of -- with it. In the app the
+        // workspace holds the project; here `project` does, and without it
+        // that assertion would pass because nothing was ever watching.
+        let _run = cx.new(|cx| {
+            ggo_emu_panel::viewer_run::ViewerRun::new(
+                "assets/worlds/main.toml".to_string(),
+                root.clone(),
+                runner,
+                endpoint.clone(),
+                Some(project.clone()),
+                cx,
+            )
+        });
+
+        let build_deadline = std::time::Instant::now() + EMD_BUILD_BUDGET;
+        loop {
+            match endpoint.state() {
+                ggo_common::ViewerState::Running => break,
+                ggo_common::ViewerState::Stopped(reason) => {
+                    panic!("the viewer run ended before it booted: {reason}")
+                }
+                ggo_common::ViewerState::Building => {}
+            }
+            assert!(
+                std::time::Instant::now() < build_deadline,
+                "emd editor-cart --ggo never produced a running cart"
+            );
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+        }
+        assert_eq!(
+            builds.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one build got the run running"
+        );
+
+        let mut mailbox = SmokeLink::new(EndpointIo(endpoint.clone()));
+        mailbox.hello().expect("the link accepts a greeting");
+        let mut last_hello = std::time::Instant::now();
+        let connect_deadline = std::time::Instant::now() + CONNECT_BUDGET;
+        while !mailbox.is_connected() {
+            assert!(
+                std::time::Instant::now() < connect_deadline,
+                "the booted cart never answered the greeting"
+            );
+            if last_hello.elapsed() >= HELLO_RETRY {
+                last_hello = std::time::Instant::now();
+                mailbox.hello().expect("the link accepts a re-greeting");
+            }
+            link_tick(&mut mailbox, cx).await;
+        }
+        assert_eq!(
+            mailbox.proto_version_mismatch(),
+            None,
+            "and it speaks this host's link protocol"
+        );
+
+        let blob = emerald_world::encode_toml_at(SMOKE_WORLD, &root.join("assets"))
+            .expect("the smoke world encodes");
+        mailbox.load_world(&blob).expect("the world blob is queued");
+        wait_on_link(
+            &mut mailbox,
+            cx,
+            LINK_BUDGET,
+            "the cart to publish the loaded world's row",
+            |mailbox| cart_row(mailbox, 0).is_some(),
+        )
+        .await;
+        let before = cart_row(&mailbox, 0).expect("the row is there");
+        assert_eq!(
+            mailbox.camera(),
+            Some((0, 0)),
+            "a world with no camera leaves the cart at the origin, so a \
+             device pixel is a world pixel for the drag below"
+        );
+
+        // Aim at the middle of the drawn footprint the cart reports, in
+        // device pixels: the row's transform is raw Q16.16, and `ox`/`oy`
+        // are where the sprite is drawn relative to it.
+        let press_x = (whole_px(before.x) + before.ox as i32 + before.w as i32 / 2) as i16;
+        let press_y = (whole_px(before.y) + before.oy as i32 + before.h as i32 / 2) as i16;
+        mailbox
+            .pointer(press_x, press_y, LEFT_BUTTON, 0, false)
+            .expect("the press goes out");
+        // The press and the move must land in DIFFERENT cart frames: the
+        // cart takes the newest pointer of each frame, and one that
+        // arrived already moved would be a click 30 px away from the
+        // entity rather than the start of a drag. Waiting for the cart's
+        // own selection is what proves the press was seen.
+        wait_on_link(
+            &mut mailbox,
+            cx,
+            LINK_BUDGET,
+            "the cart to select the pressed entity",
+            |mailbox| mailbox.selection() == [0],
+        )
+        .await;
+
+        mailbox
+            .pointer(press_x + DRAG_PX, press_y, LEFT_BUTTON, 0, false)
+            .expect("the drag sample goes out");
+        wait_on_link(
+            &mut mailbox,
+            cx,
+            LINK_BUDGET,
+            "the dragged row to move",
+            |mailbox| cart_row(mailbox, 0).is_some_and(|row| row.x != before.x),
+        )
+        .await;
+        mailbox
+            .pointer(press_x + DRAG_PX, press_y, 0, 0, false)
+            .expect("the release goes out");
+        // Let the release land and the cart report the row it settled on,
+        // rather than reading the first moved row off the wire.
+        for _ in 0..20 {
+            link_tick(&mut mailbox, cx).await;
+        }
+
+        let after = cart_row(&mailbox, 0).expect("the row survived the drag");
+        assert_eq!(
+            after.x - before.x,
+            i32::from(DRAG_PX) << 16,
+            "the pointer moved the entity by exactly what the drag moved, \
+             in the cart's own Q16.16"
+        );
+        assert_eq!(after.y, before.y, "and only along the axis it was dragged");
+
+        // The regression window. The build's outputs landed several
+        // seconds ago (the greeting, the world transfer and the drag all
+        // happened since), and the watch debounce is 300 ms, so a viewer
+        // that treats its own `.ggo`, `.cart` or `.tmp/` as a source
+        // change has had every chance to start build number two.
+        let quiet_until = std::time::Instant::now() + NO_REBUILD_WINDOW;
+        while std::time::Instant::now() < quiet_until {
+            assert_eq!(
+                builds.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the viewer's own build outputs must not look like source \
+                 changes -- a second emd here is the 44b35aa55c rebuild loop"
+            );
+            link_tick(&mut mailbox, cx).await;
+        }
+        assert_eq!(
+            endpoint.state(),
+            ggo_common::ViewerState::Running,
+            "and the cart the drag ran on is still the one that is running"
+        );
+
+        // Reap the emulator thread before the fixture -- cart and all --
+        // is deleted out from under it.
+        endpoint.request_stop();
+        let stop_deadline = std::time::Instant::now() + LINK_BUDGET;
+        while !matches!(endpoint.state(), ggo_common::ViewerState::Stopped(_)) {
+            assert!(
+                std::time::Instant::now() < stop_deadline,
+                "the viewer run ends when the host asks it to"
+            );
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+    }
 }

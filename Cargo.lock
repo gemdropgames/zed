@@ -7615,6 +7615,8 @@ name = "ggo_smoke"
 version = "0.1.0"
 dependencies = [
  "editor",
+ "emerald-editor-link",
+ "emerald-world",
  "ggo-db",
  "ggo-worldlib",
  "ggo_audio_panel",
@@ -7632,6 +7634,7 @@ dependencies = [
  "project",
  "remote_connection",
  "serde_json",
+ "smol",
  "tempfile",
  "workspace",
 ]
