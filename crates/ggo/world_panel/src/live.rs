@@ -1049,6 +1049,15 @@ pub struct LiveView {
     /// fills it. A slot re-dirtied while this queue is draining is re-read
     /// and moved to the BACK rather than restarting the cycle.
     pub layer_queue: VecDeque<LayerLoad>,
+    /// Per background slot: whether the cart's layer holds the cells the
+    /// DOCUMENT has. A layer blob carries the map as it is on disk, and a
+    /// paint session keeps its cells in memory until it is saved -- so a
+    /// slot pushed with unsaved paint behind it leaves the cart showing
+    /// the pre-stroke map, and a save must leave that slot to the
+    /// session's own write rather than fold the cart's cells back over
+    /// the stroke. A per-cell poke that goes out keeps the flag; one that
+    /// is refused or skipped clears it.
+    pub layer_synced: [bool; 4],
     /// Which tool the cart is running the pointer through: 0 is its
     /// built-in select, `n` the `n - 1`th of the edit systems it named in
     /// its greeting ([`LinkMailbox::tool_names`]). The cart resets to 0 on
@@ -1107,11 +1116,42 @@ impl LiveView {
             saving: None,
             replayed_rows: Vec::new(),
             layer_queue: VecDeque::new(),
+            // Nothing has been pushed yet, so the cart holds no layer of
+            // this document's.
+            layer_synced: [false; 4],
             // The cart's built-in select tool, which is what a session
             // that has not been told otherwise is running.
             tool: 0,
             poll: None,
         }
+    }
+
+    /// Whether the cart's copy of background slot `slot` is the cells the
+    /// document holds -- see [`Self::layer_synced`].
+    pub fn layer_is_synced(&self, slot: u8) -> bool {
+        self.layer_synced
+            .get(usize::from(slot))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub fn set_layer_synced(&mut self, slot: u8, synced: bool) {
+        if let Some(flag) = self.layer_synced.get_mut(usize::from(slot)) {
+            *flag = synced;
+        }
+    }
+
+    /// Whether a whole-slot push is queued or on the wire. A per-cell
+    /// poke must not race one: a `SetCell` is a single datagram while a
+    /// layer blob is many, so a poke sent mid-transfer is overwritten by
+    /// the chunks that land behind it.
+    pub fn layer_push_in_flight(&self) -> bool {
+        self.mailbox.busy() || self.layers_dirty.any() || !self.layer_queue.is_empty()
+    }
+
+    /// Poke one cell of background slot `slot` into the cart's layer.
+    pub fn set_cell(&mut self, slot: u8, x: u16, y: u16, tile: u16) -> std::io::Result<()> {
+        self.mailbox.set_cell(u32::from(slot), x, y, tile)
     }
 
     /// The band the overlay paints, as an origin and a size in world px:

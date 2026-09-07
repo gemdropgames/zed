@@ -1684,16 +1684,32 @@ impl OpenWorld {
                     live.layer_queue
                         .extend(loads.into_iter().filter(|load| dirty.contains(&load.layer)));
                 }
-                if let Some(load) = live.layer_queue.pop_front()
-                    && let Err(error) = live.mailbox.load_layer(
+                if let Some(load) = live.layer_queue.pop_front() {
+                    // The payload is the map ON DISK. An open paint
+                    // session holds its cells in memory until it is saved,
+                    // so a slot with unsaved paint behind it leaves the
+                    // cart showing the pre-stroke map however well the
+                    // push goes -- and a save must not fold that back.
+                    let unsaved = self
+                        .merged
+                        .iter()
+                        .find(|merged| u32::from(merged.layer) == load.layer)
+                        .and_then(|merged| self.sessions.get(&format!("{}.map", merged.stem)))
+                        .is_some_and(PaintSession::dirty);
+                    let slot = u8::try_from(load.layer).unwrap_or(u8::MAX);
+                    match live.mailbox.load_layer(
                         load.layer,
                         load.base,
                         load.budget,
                         &load.map_bytes,
                         &load.tileset_stem,
-                    )
-                {
-                    live_error = Some(format!("live layer {}: {error}", load.layer));
+                    ) {
+                        Ok(()) => live.set_layer_synced(slot, !unsaved),
+                        Err(error) => {
+                            live.set_layer_synced(slot, false);
+                            live_error = Some(format!("live layer {}: {error}", load.layer));
+                        }
+                    }
                 }
             } else if let Some([x, y]) = live.pending_camera.take() {
                 if let Err(error) = live.mailbox.set_camera(live::to_raw(x), live::to_raw(y)) {
@@ -2536,16 +2552,19 @@ impl OpenWorld {
             // so its cells go through an op and the ordinary session save
             // writes them. Only a map with no session open is patched on
             // disk here.
+            // The cart's cells are only the document's to fold back when
+            // the panel knows its layer is in step: a stroke reaches it as
+            // a `SetCell` per cell, but a poke it refused -- or a slot
+            // pushed with unsaved paint behind it -- leaves the cart
+            // holding an older map, and folding that in would erase the
+            // user's paint.
+            let slot_synced = self
+                .live
+                .as_ref()
+                .is_some_and(|live| live.layer_is_synced(*slot) && !live.layer_push_in_flight());
             let patched = match self.sessions.get_mut(&rel) {
                 Some(session) => {
-                    // A DIRTY session holds a stroke the cart has never
-                    // been told about: the panel ships a painted slot as a
-                    // whole `load_layer` on save, so until the stroke has
-                    // been written the cart's shadow is the PRE-stroke map
-                    // and folding it in would erase the user's paint. The
-                    // stroke reaches the cart a moment later, out of
-                    // `write_now`'s re-arm of the slot.
-                    if session.dirty() {
+                    if !slot_synced {
                         continue;
                     }
                     let state = session.store.state();
@@ -3532,6 +3551,7 @@ impl WorldPanel {
         };
         let world = drag_ops::screen_to_world(local[0], local[1], &view);
         let cell = canvas::paint_cell_at(world, anchor);
+        let before = self.live_layer_cells();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -3550,17 +3570,89 @@ impl WorldPanel {
             return;
         }
         let painted = session.paint_at(cell);
-        // Only a BACKGROUND slot is something the cart holds as a layer; a
-        // `Tilemap` entity's map rides along with the world blob.
-        if painted
-            && let EditMode::Paint(PaintTarget::BgSlot(slot)) = open.mode
-            && let Some(live) = open.live.as_mut()
-        {
-            live.layers_dirty.mark(slot);
-        }
         if painted {
+            self.poke_live_cells(before, cx);
             self.refresh_paint_image(&rel, cx);
         } else {
+            cx.notify();
+        }
+    }
+
+    /// The background slot under the brush while the CART is holding its
+    /// map as a layer, with the session's cells as they stand right now.
+    ///
+    /// `None` in Design (the cart's layers are not what the canvas is
+    /// drawing), on a `Tilemap` entity's map (that one rides the world
+    /// blob), and with no session open -- in each case there is nothing
+    /// for a cell poke to reach.
+    fn live_layer_cells(&self) -> Option<(u8, u16, u16, Vec<u16>)> {
+        if !self.live_active() {
+            return None;
+        }
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let EditMode::Paint(PaintTarget::BgSlot(slot)) = open.mode else {
+            return None;
+        };
+        let (rel, _) = self.paint_target_rel(&PaintTarget::BgSlot(slot))?;
+        let state = open.sessions.get(&rel)?.store.state();
+        Some((slot, state.w, state.h, state.cells))
+    }
+
+    /// Tell the cart about every cell a paint edit just changed, as one
+    /// `SetCell` each ("paint strokes send `SetCell`", spec).
+    ///
+    /// `before` is [`Self::live_layer_cells`] taken ahead of the edit. A
+    /// changed SIZE is not pokeable -- the cart's shadow has the dims of
+    /// the load, not the document's -- and neither is a cell the wire
+    /// refuses, so either leaves the slot out of step and a save folds
+    /// the cart's cells back only for a slot that is in step
+    /// (`OpenWorld::write_cart_layers`).
+    fn poke_live_cells(&mut self, before: Option<(u8, u16, u16, Vec<u16>)>, cx: &mut Context<Self>) {
+        let Some((slot, width, height, before)) = before else {
+            return;
+        };
+        let Some((_, now_width, now_height, after)) = self.live_layer_cells() else {
+            return;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some(live) = open.live.as_mut() else {
+            return;
+        };
+        if (now_width, now_height) != (width, height) || width == 0 || live.layer_push_in_flight() {
+            live.set_layer_synced(slot, false);
+            return;
+        }
+        // A poke carries a DIFFERENCE, so it only leaves the cart holding
+        // the document's cells if the cart already held them: a slot whose
+        // shadow is some older map stays out of step however many cells
+        // land on it. Poked anyway -- the picture the cart draws is worth
+        // more than the fold, which has its own fallback.
+        let synced = live.layer_is_synced(slot);
+        let mut refused: Option<String> = None;
+        for (index, (was, now)) in before.iter().zip(after.iter()).enumerate() {
+            if was == now {
+                continue;
+            }
+            let (Ok(x), Ok(y)) = (
+                u16::try_from(index % usize::from(width)),
+                u16::try_from(index / usize::from(width)),
+            ) else {
+                continue;
+            };
+            if let Err(error) = live.set_cell(slot, x, y, *now) {
+                refused = Some(error.to_string());
+                break;
+            }
+        }
+        live.set_layer_synced(slot, synced && refused.is_none());
+        // The user has to be told: the cell is in the document but not in
+        // the picture the cart is drawing.
+        if let Some(error) = refused {
+            open.paint_error = Some(format!("live cell: {error}"));
             cx.notify();
         }
     }
@@ -3582,6 +3674,9 @@ impl WorldPanel {
         let Some((rel, _)) = self.active_paint_target() else {
             return;
         };
+        // The rect-fill tool paints nothing until the release, so this is
+        // the only moment its cells can reach the cart.
+        let before = self.live_layer_cells();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -3589,6 +3684,7 @@ impl WorldPanel {
             return;
         };
         if session.end_gesture() {
+            self.poke_live_cells(before, cx);
             self.refresh_paint_image(&rel, cx);
         } else {
             cx.notify();
@@ -3631,6 +3727,7 @@ impl WorldPanel {
             self.exit_paint_mode(cx);
             return false;
         };
+        let before = self.live_layer_cells();
         let ViewerState::Ready(open) = &mut self.state else {
             return true;
         };
@@ -3639,6 +3736,7 @@ impl WorldPanel {
             .get_mut(&rel)
             .is_some_and(|session| session.step_history(step, project_root.as_deref()));
         if stepped {
+            self.poke_live_cells(before, cx);
             self.refresh_paint_image(&rel, cx);
         }
         true
@@ -3655,7 +3753,11 @@ impl WorldPanel {
         let Some(at) = self.paste_cell_origin() else {
             return;
         };
+        // Cells the cart has to hear about too, exactly as a stroke's do:
+        // a paste the cart never saw is a paste a save reads back over.
+        let before = self.live_layer_cells();
         self.update_paint_session(cx, |session| session.paste_stamp(stamp, at));
+        self.poke_live_cells(before, cx);
     }
 
     fn paste_cell_origin(&self) -> Option<(i32, i32)> {
@@ -3737,7 +3839,9 @@ impl WorldPanel {
         // world's entities. With no cell selection it is a no-op, which is
         // the point: the world's delete must not leak through.
         if self.in_paint_mode() {
+            let before = self.live_layer_cells();
             self.update_paint_session(cx, PaintSession::delete_selection);
+            self.poke_live_cells(before, cx);
             return;
         }
         // The cart despawns its own selection and reports what went; the
@@ -17896,10 +18000,33 @@ mod tests {
         );
     }
 
-    /// Painting a background slot re-sends that slot: the cart holds the
-    /// layers as its own buffers, not as part of the world document.
+    /// Every `SetCell` in `sent`, as `(layer, x, y, tile)`.
+    fn set_cells(sent: &[Vec<u8>]) -> Vec<(u8, u16, u16, u16)> {
+        use emerald_editor_runtime::wire::{self, HostMsg};
+
+        sent.iter()
+            .filter_map(|message| match wire::decode_host(message) {
+                Some(HostMsg::SetCell { layer, x, y, tile }) => Some((layer, x, y, tile)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The cell the background slot's session holds at its origin.
+    fn bg_cell(panel: &WorldPanel, index: usize) -> u16 {
+        panel
+            .test_paint_session("maps/test.bg0.map")
+            .and_then(|session| session.store.state().cells.get(index).copied())
+            .expect("a session with cells")
+    }
+
+    /// A stroke in Live pokes the CART, one `SetCell` per changed cell
+    /// (spec: "paint strokes send `SetCell`"). The layer payloads are read
+    /// from disk and a paint session holds its cells in memory until it is
+    /// saved, so without the poke the cart draws -- and hands back on a
+    /// save -- the pre-stroke map.
     #[gpui::test]
-    async fn painting_in_live_resends_the_layer(cx: &mut TestAppContext) {
+    async fn painting_in_live_pokes_the_cart_per_cell(cx: &mut TestAppContext) {
         let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
         host_sent(&endpoint);
 
@@ -17911,30 +18038,93 @@ mod tests {
             panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
             panel.canvas_primary_up(cx);
         });
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                live_of(panel).layers_dirty.any(),
-                "the stroke marked the slot"
-            );
-        });
-        endpoint.tick();
-        cx.run_until_parked();
 
-        assert!(
-            host_sent(&endpoint)
-                .iter()
-                .any(|message| message.first() == Some(&0x08) && message.get(1) == Some(&1)),
-            "a Layer BlobBegin"
+        let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
+        assert_ne!(painted, live::BLANK_TILE, "the stroke painted a tile");
+        assert_eq!(
+            set_cells(&host_sent(&endpoint)),
+            vec![(0, 0, 0, painted)],
+            "one poke, for the one cell the brush changed"
         );
     }
 
-    /// The layer payloads are read from DISK, and a `PaintSession` holds
-    /// its cells in memory until it is saved -- so the save is what makes
-    /// the stroke's bytes reachable, and it has to re-arm the slot itself.
-    /// Without that the stroke only ever reached the cart if some LATER
-    /// paint happened to re-dirty the slot.
+    /// Erasing pokes the BLANK tile -- the same cell value the map editor
+    /// writes, which is what the cart's layer takes for "nothing here".
     #[gpui::test]
-    async fn saving_a_painted_map_ships_the_painted_cells_to_the_cart(cx: &mut TestAppContext) {
+    async fn erasing_in_live_pokes_the_blank_tile(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, _| {
+            paint_session_mut_of(panel).set_tool(ggo_map_panel::MapTool::Eraser)
+        });
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+
+        assert_eq!(
+            panel.read_with(cx, |panel, _| bg_cell(panel, 0)),
+            live::BLANK_TILE,
+            "the eraser blanked the cell it painted"
+        );
+        assert_eq!(
+            set_cells(&host_sent(&endpoint)),
+            vec![(0, 0, 0, live::BLANK_TILE)]
+        );
+    }
+
+    /// The Design canvas is not the cart's picture, so a stroke there is
+    /// the document's alone: the cart hears about it when the map is
+    /// saved and the slot is pushed, not a cell at a time.
+    ///
+    /// The canvas mode is written straight rather than through
+    /// `set_canvas_mode`, which tears the session down -- what is under
+    /// test is the gate, and a torn-down session would pass it for having
+    /// no cart at all.
+    #[gpui::test]
+    async fn painting_in_design_pokes_nothing(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+            panel.canvas_mode = CanvasMode::Design;
+        });
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        panel.update_in(cx, |panel, _, cx| {
+            let at = drag_ops::world_to_screen(1.0, 1.0, &panel.canvas_view().expect("a view"));
+            panel.canvas_primary_down_with(at, false, cx);
+            panel.canvas_primary_up(cx);
+        });
+
+        assert_ne!(
+            panel.read_with(cx, |panel, _| bg_cell(panel, 0)),
+            live::BLANK_TILE,
+            "the stroke did land on the document"
+        );
+        assert!(
+            set_cells(&host_sent(&endpoint)).is_empty(),
+            "and nothing was poked at the cart"
+        );
+    }
+
+    /// A stroke that the cart heard as a poke survives its own save: the
+    /// cart hands the poked cells back, the fold finds nothing to change,
+    /// and the write puts the stroke on disk. The re-arm the save does
+    /// afterwards is what re-syncs the whole slot from the file.
+    #[gpui::test]
+    async fn saving_a_painted_map_keeps_the_stroke_the_cart_was_poked_with(
+        cx: &mut TestAppContext,
+    ) {
         let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
 
         panel.update(cx, |panel, cx| {
@@ -17945,16 +18135,77 @@ mod tests {
             panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
             panel.canvas_primary_up(cx);
         });
-        // Everything the stroke itself pushed, so what is asserted below
-        // is what the SAVE sent.
-        settle_live(&panel, &endpoint, cx);
-        host_sent(&endpoint);
+        let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
+        assert_ne!(painted, live::BLANK_TILE, "the stroke painted a tile");
+        assert_eq!(
+            set_cells(&host_sent(&endpoint)),
+            vec![(0, 0, 0, painted)],
+            "and the cart was told about it a cell at a time"
+        );
 
         panel.update(cx, |panel, cx| panel.save_impl(cx));
         cx.run_until_parked();
-        // The save waits on the cart's world. Its layer 0 answer is the
-        // PRE-stroke map (nothing has told it about the stroke yet), which
-        // is exactly what must not be folded back over the session.
+        // What a cart that took the poke holds: the stroke's cell, and
+        // blanks around it.
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(0, vec![transform_bag([4.0, 4.0], 0)])],
+            &[(
+                0,
+                2,
+                2,
+                vec![painted, live::BLANK_TILE, live::BLANK_TILE, live::BLANK_TILE],
+            )],
+        );
+        let sent = settle_live(&panel, &endpoint, cx);
+
+        let saved = io::open_map(dir.path(), "maps/test.bg0.map").expect("the painted map saved");
+        assert_eq!(
+            saved.cells.first().copied(),
+            Some(painted),
+            "the stroke is on disk, not folded away by the readback"
+        );
+        assert_eq!(
+            layer_blob(&sent, 0),
+            Some(live::layer_bytes(saved.w, saved.h, &saved.cells)),
+            "and the save re-armed the slot from the file it just wrote"
+        );
+    }
+
+    /// The other half of the same rule: a slot the panel could NOT keep
+    /// in step -- here a whole-slot push that went out with unsaved paint
+    /// behind it -- is left to the session's own write, because the cart
+    /// is holding the pre-stroke map and folding it back would erase the
+    /// stroke.
+    #[gpui::test]
+    async fn a_save_leaves_an_out_of_step_slot_to_the_session(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
+        // A whole-slot push over the unsaved stroke: the payload is the
+        // map on DISK, so from here the cart's layer 0 is the pre-stroke
+        // map however many pokes preceded it.
+        panel.update(cx, |panel, _| live_mut_of(panel).layers_dirty.mark(0));
+        settle_live(&panel, &endpoint, cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).layer_is_synced(0),
+                "the push carried the pre-stroke bytes"
+            );
+        });
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
         answer_cart_save(
             &panel,
             &endpoint,
@@ -17962,18 +18213,13 @@ mod tests {
             &[(0, vec![transform_bag([4.0, 4.0], 0)])],
             &[(0, 2, 2, vec![live::BLANK_TILE; 4])],
         );
-        let sent = settle_live(&panel, &endpoint, cx);
+        settle_live(&panel, &endpoint, cx);
 
         let saved = io::open_map(dir.path(), "maps/test.bg0.map").expect("the painted map saved");
-        assert_ne!(
-            saved.cells.first().copied(),
-            Some(live::BLANK_TILE),
-            "the stroke must actually have painted a tile"
-        );
         assert_eq!(
-            layer_blob(&sent, 0),
-            Some(live::layer_bytes(saved.w, saved.h, &saved.cells)),
-            "the save's layer blob carries the painted cells, not the pre-stroke map"
+            saved.cells.first().copied(),
+            Some(painted),
+            "the stroke survived a readback that did not know about it"
         );
     }
 
@@ -18419,11 +18665,12 @@ mod tests {
         );
     }
 
-    /// The stroke case the per-slot flags exist for: a slot that is not 0
-    /// has to reach the cart while the stroke is still in flight, which a
-    /// whole-queue rebuild per tick never let happen.
+    /// The stroke case the per-slot flags were built for: a slot that is
+    /// not 0 has to reach the cart while the stroke is still in flight.
+    /// It goes as a poke of the changed cell now, so it needs no queue --
+    /// and no whole slot is re-read for it.
     #[gpui::test]
-    async fn painting_slot_two_mid_stroke_ships_slot_two(cx: &mut TestAppContext) {
+    async fn painting_slot_two_mid_stroke_pokes_slot_two(cx: &mut TestAppContext) {
         let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
         write_test_tileset(dir.path(), "tiles/bg.til");
         panel.update(cx, |panel, cx| {
@@ -18444,11 +18691,18 @@ mod tests {
         endpoint.tick();
         cx.run_until_parked();
 
-        let layers = sent_layers(&host_sent(&endpoint));
+        let sent = host_sent(&endpoint);
         assert_eq!(
-            layers,
+            set_cells(&sent)
+                .into_iter()
+                .map(|(layer, ..)| layer)
+                .collect::<Vec<_>>(),
             [2],
-            "the painted slot goes out, and the three clean ones stay off the wire"
+            "the painted slot is poked, and the three clean ones stay off the wire"
+        );
+        assert!(
+            sent_layers(&sent).is_empty(),
+            "and no whole slot was re-read for one cell"
         );
     }
 
