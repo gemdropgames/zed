@@ -1381,14 +1381,14 @@ impl OpenWorld {
                 log::warn!("GGO: live groups: {error}");
             }
         }
-        // Input is never held back, not even mid-transfer: the cart reads
-        // its press and release edges off consecutive pointer samples, so
-        // a sample deferred until a blob finished would leave a button
-        // stuck down for the length of the transfer. One pointer per tick
-        // -- a tick is a cart frame -- and every queued command. Both are
-        // fire-and-forget (`LinkMailbox::pointer`), so a send that fails
-        // is logged and superseded rather than retried, and neither
-        // touches the status row the pushes below own.
+        // The pointer is never held back, not even mid-transfer: the cart
+        // reads its press and release edges off consecutive samples, so a
+        // sample deferred until a blob finished would leave a button stuck
+        // down for the length of the transfer. One per tick -- a tick is a
+        // cart frame. Both this and the commands below are fire-and-forget
+        // (`LinkMailbox::pointer`), so a send that fails is logged and
+        // superseded rather than retried, and neither touches the status
+        // row the pushes further down own.
         if live.status == LiveStatus::Connected {
             if let Some(pointer) = live.take_pointer()
                 && let Err(error) = live.mailbox.pointer(
@@ -1401,9 +1401,16 @@ impl OpenWorld {
             {
                 log::warn!("GGO: live pointer: {error}");
             }
-            for command in std::mem::take(&mut live.pending_commands) {
-                if let Err(error) = live.mailbox.command(command) {
-                    log::warn!("GGO: live command: {error}");
+            // Commands DO wait for a free receive queue: four blob chunks
+            // and a command are five datagrams into a queue four deep, and
+            // a command is one discrete request -- losing it swallows the
+            // keypress outright, where a lost pointer sample is superseded
+            // by the next one.
+            if !live.mailbox.busy() {
+                for command in std::mem::take(&mut live.pending_commands) {
+                    if let Err(error) = live.mailbox.command(command) {
+                        log::warn!("GGO: live command: {error}");
+                    }
                 }
             }
         }
@@ -3036,21 +3043,23 @@ impl WorldPanel {
         let Some(delta) = drag_ops::nudge_delta(key, tile) else {
             return;
         };
-        // In Live the arrows are the cart's, selection or not: it owns
-        // what is selected and where its camera looks, and the host has
-        // no camera of its own left to move.
-        if self.live_active() {
+        // Painting takes the entity selection out of play (see
+        // [`Self::in_paint_mode`]) without clearing it, so the arrows keep
+        // their look-around meaning there rather than moving an entity the
+        // user can't even see selected. Checked BEFORE Live, the way
+        // [`Self::delete_selected_impl`] checks it: a `Nudge` under the
+        // brush would move the cart's selection out from under it.
+        let painting = self.in_paint_mode();
+        // In Live the arrows are otherwise the cart's, selection or not:
+        // it owns what is selected and where its camera looks, and the
+        // host has no camera of its own left to move.
+        if !painting && self.live_active() {
             self.live_command(EditCommand::Nudge {
                 dx: delta[0] as i32,
                 dy: delta[1] as i32,
             });
             return;
         }
-        // Painting takes the entity selection out of play (see
-        // [`Self::in_paint_mode`]) without clearing it, so the arrows keep
-        // their look-around meaning there rather than moving an entity the
-        // user can't even see selected.
-        let painting = self.in_paint_mode();
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -3984,6 +3993,33 @@ impl WorldPanel {
         live.pointer_buttons
     }
 
+    /// The Live geometry a forwarded sample is placed through -- the
+    /// device frame rect and the integer scale -- or `None` before the
+    /// first Live layout has stamped the canvas.
+    ///
+    /// The SAME geometry the picture is painted through, so the device px
+    /// the cart hit-tests are the pixel the user aimed at.
+    fn live_pointer_geometry(&self) -> Option<([f64; 4], u32)> {
+        let size = self.live_canvas_size()?;
+        let (_, frame_rect, scale) = self.live_camera_for(size)?;
+        Some((frame_rect, scale))
+    }
+
+    /// Whether the host believes `button` is held from a press that
+    /// landed on this canvas.
+    fn live_button_held(&self, button: MouseButton) -> bool {
+        let Some(bit) = Self::button_bit(button) else {
+            return false;
+        };
+        match &self.state {
+            ViewerState::Ready(open) => open
+                .live
+                .as_ref()
+                .is_some_and(|live| live.pointer_buttons & bit != 0),
+            _ => false,
+        }
+    }
+
     /// Queue one pointer sample for the cart: canvas-relative `local` px
     /// through the inverse of the Live geometry, with the buttons and
     /// modifiers held as the cursor got there.
@@ -3993,12 +4029,7 @@ impl WorldPanel {
     /// did, and [`Self::mirror_cart_state`] is the only path that turns
     /// any of it into a document op.
     fn live_pointer(&mut self, local: [f64; 2], buttons: u8, modifiers: u8) {
-        let Some(size) = self.live_canvas_size() else {
-            return;
-        };
-        // The same geometry the picture is painted through, so the device
-        // px the cart hit-tests are the pixel the user aimed at.
-        let Some((_, frame_rect, scale)) = self.live_camera_for(size) else {
+        let Some((frame_rect, scale)) = self.live_pointer_geometry() else {
             return;
         };
         let ViewerState::Ready(open) = &mut self.state else {
@@ -4024,7 +4055,7 @@ impl WorldPanel {
         if let ViewerState::Ready(open) = &mut self.state
             && let Some(live) = open.live.as_mut()
         {
-            live.pending_commands.push(command);
+            live.push_command(command);
         }
     }
 
@@ -4049,6 +4080,12 @@ impl WorldPanel {
         if !self.live_owns_button(Some(button)) {
             return false;
         }
+        // Claimed either way, but the mask only moves once there is a
+        // transform to place the sample through: a press the cart never
+        // heard must not leave the host believing a button is held.
+        if self.live_pointer_geometry().is_none() {
+            return true;
+        }
         let buttons = self.live_buttons_after(button, true);
         self.live_pointer(local, buttons, Self::modifier_bits(modifiers));
         true
@@ -4065,6 +4102,12 @@ impl WorldPanel {
         if !self.live_owns_button(Some(button)) {
             return false;
         }
+        // Claimed either way, but the mask only moves once there is a
+        // transform to place the sample through: a press the cart never
+        // heard must not leave the host believing a button is held.
+        if self.live_pointer_geometry().is_none() {
+            return true;
+        }
         let buttons = self.live_buttons_after(button, false);
         self.live_pointer(local, buttons, Self::modifier_bits(modifiers));
         true
@@ -4080,9 +4123,47 @@ impl WorldPanel {
         if !self.live_owns_button(pressed) {
             return false;
         }
+        if self.live_pointer_geometry().is_none() {
+            return true;
+        }
         let buttons = self.live_buttons_moving(pressed);
         self.live_pointer(local, buttons, Self::modifier_bits(modifiers));
         true
+    }
+
+    /// A button came up somewhere the canvas is not. gpui delivers
+    /// `on_mouse_up` only to the element under the cursor, so without this
+    /// the cart would never hear the release that ended a drag off the
+    /// canvas and would go on dragging until the pointer came back.
+    ///
+    /// Only for a button the host believes went down on THIS canvas: the
+    /// out-of-bounds handler fires for every release anywhere in the
+    /// window, and a click in another panel is not a sample the cart has
+    /// any use for.
+    fn canvas_button_up_out(&mut self, local: [f64; 2], button: MouseButton, modifiers: &Modifiers) {
+        if self.live_button_held(button) {
+            self.canvas_button_up(local, button, modifiers);
+        }
+    }
+
+    /// The cursor left the canvas with a button still held: tell the cart
+    /// it came up, at the last point the cart was told about.
+    ///
+    /// gpui stops delivering moves once the cursor is outside, so a
+    /// gesture left open would freeze at the boundary and then jump to
+    /// wherever the release landed. Ending it here is the same bargain
+    /// the paint stroke strikes at the same boundary.
+    fn live_release_held(&mut self) -> bool {
+        if !self.live_active() {
+            return false;
+        }
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        let snap = open.snap;
+        open.live
+            .as_mut()
+            .is_some_and(|live| live.release_buttons(snap))
     }
 
     /// Window px -> canvas-relative px through the bounds the canvas
@@ -6786,6 +6867,11 @@ impl WorldPanel {
                 if painting {
                     this.end_canvas_paint(cx);
                 }
+                // And the same for the cart's own drag or band: gpui
+                // stops delivering moves the moment the cursor is
+                // outside, so a gesture left open would freeze here and
+                // then jump to wherever the button came up.
+                this.live_release_held();
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 if let ViewerState::Ready(open) = &this.state {
@@ -6839,6 +6925,34 @@ impl WorldPanel {
                 cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
                     if let Some(local) = this.canvas_local(event.position) {
                         this.canvas_button_up(local, MouseButton::Right, &event.modifiers);
+                    }
+                }),
+            )
+            // A release the canvas is not under never reaches the handlers
+            // above (gpui delivers `on_mouse_up` to the hovered element
+            // only, and nothing captures the mouse here), so the cart
+            // would never hear the end of a drag that left the canvas.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    if let Some(local) = this.canvas_local(event.position) {
+                        this.canvas_button_up_out(local, MouseButton::Left, &event.modifiers);
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    if let Some(local) = this.canvas_local(event.position) {
+                        this.canvas_button_up_out(local, MouseButton::Middle, &event.modifiers);
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    if let Some(local) = this.canvas_local(event.position) {
+                        this.canvas_button_up_out(local, MouseButton::Right, &event.modifiers);
                     }
                 }),
             )
@@ -7519,6 +7633,13 @@ impl Focusable for WorldPanel {
 
 #[cfg(test)]
 mod tests {
+    // In `src/tests/`, because a child of this INLINE `mod tests` is only
+    // looked for there -- and they have to be children of it to reach the
+    // helpers above (`live_of`, `overlay_of`, `routed_project`), which are
+    // private to this module.
+    mod cart_harness;
+    mod cart_journeys;
+
     use super::*;
     use ggo_worldlib::world_file::{
         WorldEntity, WorldFile, WorldInstance, read_world, write_world,
@@ -15401,11 +15522,156 @@ mod tests {
             vec![(12, 10, 0, 0, false)],
             "and the release last, so no press is left held"
         );
+        // An edge is the one sample a dropped datagram would cost the
+        // cart outright, so it goes out twice more while nothing else is
+        // queued. Identical, so the cart sees no second release.
+        for _ in 0..2 {
+            assert_eq!(
+                pointers_in(&live_tick_sent(&endpoint, cx)),
+                vec![(12, 10, 0, 0, false)],
+                "the release is repeated"
+            );
+        }
         assert_eq!(
             pointers_in(&live_tick_sent(&endpoint, cx)),
             Vec::new(),
-            "an idle tick sends nothing"
+            "and then an idle tick sends nothing"
         );
+    }
+
+    /// A release the canvas is not under still reaches the cart: gpui
+    /// hands `on_mouse_up` to the hovered element only, so without the
+    /// out-of-bounds path the cart would drag on until the pointer came
+    /// back.
+    #[gpui::test]
+    async fn a_release_off_the_canvas_still_reaches_the_cart(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, _| {
+            panel.canvas_button_down([100.0, 80.0], MouseButton::Left, &Modifiers::none());
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(10, 10, 1, 0, false)]
+        );
+
+        // Up at a point the canvas never covered: the device px go with
+        // it, out of the frame and saturating if need be.
+        panel.update(cx, |panel, _| {
+            panel.canvas_button_up_out([-40.0, 900.0], MouseButton::Left, &Modifiers::none());
+        });
+        assert_eq!(
+            pointers_in(&live_tick_sent(&endpoint, cx)),
+            vec![(-60, 420, 0, 0, false)],
+            "the release goes out with no button held"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).pointer_buttons,
+                0,
+                "and the mask is clear, so the next press is a fresh press"
+            );
+        });
+
+        // A release for a button that never went down on this canvas is
+        // not the cart's business: an out-of-bounds up fires for every
+        // click anywhere in the window. (The wire still carries the edge
+        // repeats, so what is asserted is that nothing NEW was queued.)
+        panel.update(cx, |panel, _| {
+            panel.canvas_button_up_out([-40.0, 900.0], MouseButton::Left, &Modifiers::none());
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).pending_pointer.is_empty());
+        });
+    }
+
+    /// The cursor leaving the canvas with a button held ends the cart's
+    /// gesture there, at the last point the cart was told about -- gpui
+    /// stops delivering moves once it is outside, so a gesture left open
+    /// would freeze and then jump to wherever the button came up.
+    #[gpui::test]
+    async fn leaving_the_canvas_releases_the_button_the_cart_is_holding(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, _| {
+            panel.canvas_button_down([100.0, 80.0], MouseButton::Left, &Modifiers::none());
+            panel.canvas_pointer_move([140.0, 100.0], Some(MouseButton::Left), &Modifiers::none());
+            assert!(panel.live_release_held(), "a button was held");
+            assert!(
+                !panel.live_release_held(),
+                "and nothing is held the second time"
+            );
+        });
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.extend(pointers_in(&live_tick_sent(&endpoint, cx)));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (10, 10, 1, 0, false),
+                (30, 20, 1, 0, false),
+                (30, 20, 0, 0, false)
+            ],
+            "the release lands at the last point the cart was told about"
+        );
+    }
+
+    /// A command queued while a blob window is open waits for it: four
+    /// chunks and a command are five datagrams into a receive queue four
+    /// deep, and a swallowed command is a keypress the user has to guess
+    /// went missing.
+    #[gpui::test]
+    async fn a_command_waits_for_the_carts_receive_queue(cx: &mut TestAppContext) {
+        use emerald_editor_runtime::wire::command;
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).mailbox.busy(), "a world blob is in flight");
+        });
+
+        // Not drained here: the chunks on the wire are what the cart has
+        // to answer for the transfer to finish at all.
+        panel.update(cx, |panel, cx| panel.select_all_impl(cx));
+        endpoint.tick();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).pending_commands.len(),
+                1,
+                "still owed: nothing goes out on top of the transfer"
+            );
+        });
+
+        // Answer the transfer the way the cart does; the first tick with a
+        // free queue is the one that sends it.
+        let sent = settle_live(&panel, &endpoint, cx);
+        assert_eq!(commands_in(&sent), vec![(command::SELECT_ALL, 0, 0)]);
+    }
+
+    /// The arrows under the brush stay the brush's, in Live as in Design:
+    /// a `Nudge` would move the cart's selection out from under it.
+    #[gpui::test]
+    async fn arrows_while_painting_in_live_send_no_command(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| {
+            panel.nudge_impl("ArrowRight", false, cx);
+            panel.nudge_impl("ArrowUp", true, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).pending_commands.is_empty());
+        });
+        assert_eq!(commands_in(&live_tick_sent(&endpoint, cx)), Vec::new());
     }
 
     /// A middle-drag in Live is forwarded like any other sample -- the

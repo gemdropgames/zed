@@ -315,9 +315,33 @@ pub fn device_from_canvas(local: [f64; 2], frame_rect: [f64; 4], scale: u32) -> 
 
 /// How many pointer samples may wait for the wire. The queue drains one
 /// per tick and a tick is a cart frame, so it only fills while the link
-/// is not moving at all -- and what a cart that comes back needs is the
-/// freshest state, not a quarter second of history.
+/// is not moving at all. Overflow drops the oldest sample that carries
+/// nothing but a POSITION ([`LiveView::push_pointer`]): the button and
+/// modifier edges are the ones the cart cannot reconstruct, so they keep
+/// their places even under a stall.
 const POINTER_QUEUE_MAX: usize = 16;
+
+/// How many commands may wait for the wire. They only queue up while a
+/// blob transfer holds the cart's receive queue, and the oldest is the
+/// one to lose: a request from a quarter second ago has been superseded
+/// by whatever the user asked for since.
+const COMMAND_QUEUE_MAX: usize = 32;
+
+/// How many extra ticks an EDGE is repeated on. A pointer datagram is
+/// fire-and-forget and the cart's APP receive queue is four deep, so the
+/// one sample whose loss the cart cannot recover from -- it reads press
+/// and release off consecutive samples -- goes out three times. Repeats
+/// are idempotent: the cart reads pointer STATE, so the same sample twice
+/// is the same buttons twice and no second edge.
+const POINTER_EDGE_REPEATS: u8 = 2;
+
+/// Whether `next` differs from `previous` in nothing but the cursor
+/// position -- the cart sees no edge between the two.
+fn steady(previous: &PointerState, next: &PointerState) -> bool {
+    previous.buttons == next.buttons
+        && previous.modifiers == next.modifiers
+        && previous.snap == next.snap
+}
 
 /// The world blob for the open document: `world_to_toml` -> `encode_toml_at`.
 pub fn encode_world(store: &WorldDocStore, assets_root: &Path) -> anyhow::Result<Vec<u8>> {
@@ -703,6 +727,9 @@ pub struct LiveView {
     /// The last sample actually put on the wire, which is what the next
     /// one is a move OF once the queue has drained.
     last_pointer: Option<PointerState>,
+    /// Ticks still owed a repeat of [`Self::last_pointer`], armed by
+    /// every edge that goes out ([`POINTER_EDGE_REPEATS`]).
+    pointer_repeats: u8,
     /// Which mouse buttons the host believes are held, as the cart's own
     /// bit layout. gpui reports one button per event, so the mask has to
     /// be carried between them.
@@ -760,6 +787,7 @@ impl LiveView {
             pending_pointer: VecDeque::new(),
             pointer_moving: false,
             last_pointer: None,
+            pointer_repeats: 0,
             pointer_buttons: 0,
             pending_commands: Vec::new(),
             layer_queue: VecDeque::new(),
@@ -796,11 +824,7 @@ impl LiveView {
     ///   drift to wherever the cursor got to inside the same tick.
     pub fn push_pointer(&mut self, sample: PointerState) {
         let previous = self.pending_pointer.back().copied().or(self.last_pointer);
-        let moving = previous.is_some_and(|previous| {
-            previous.buttons == sample.buttons
-                && previous.modifiers == sample.modifiers
-                && previous.snap == sample.snap
-        });
+        let moving = previous.is_some_and(|previous| steady(&previous, &sample));
         if moving
             && self.pointer_moving
             && let Some(back) = self.pending_pointer.back_mut()
@@ -811,15 +835,84 @@ impl LiveView {
         self.pointer_moving = moving;
         self.pending_pointer.push_back(sample);
         while self.pending_pointer.len() > POINTER_QUEUE_MAX {
-            self.pending_pointer.pop_front();
+            // The oldest position, not the oldest sample: an edge dropped
+            // here is a press the cart never sees, or a release it never
+            // sees, and it cannot recover either from the samples around
+            // it. With every sample an edge there is nothing to collapse
+            // and the front goes after all.
+            match self.oldest_move() {
+                Some(index) => self.pending_pointer.remove(index),
+                None => self.pending_pointer.pop_front(),
+            };
+            // Whatever is at the back may no longer be a move of what now
+            // precedes it; the next sample queues rather than folding.
+            self.pointer_moving = false;
         }
     }
 
-    /// The one pointer sample this tick owes the cart, if any.
+    /// The oldest queued sample that carries nothing but a position: the
+    /// first one the cart would see no edge at.
+    fn oldest_move(&self) -> Option<usize> {
+        let mut previous = self.last_pointer;
+        for (index, sample) in self.pending_pointer.iter().enumerate() {
+            if previous.is_some_and(|previous| steady(&previous, sample)) {
+                return Some(index);
+            }
+            previous = Some(*sample);
+        }
+        None
+    }
+
+    /// The one pointer sample this tick owes the cart: the next queued
+    /// one, else a repeat of the last edge that went out (see
+    /// [`POINTER_EDGE_REPEATS`]), else nothing.
     pub fn take_pointer(&mut self) -> Option<PointerState> {
-        let sample = self.pending_pointer.pop_front()?;
+        let Some(sample) = self.pending_pointer.pop_front() else {
+            if self.pointer_repeats > 0 {
+                self.pointer_repeats -= 1;
+                return self.last_pointer;
+            }
+            return None;
+        };
+        let edge = self
+            .last_pointer
+            .is_none_or(|last| !steady(&last, &sample));
+        self.pointer_repeats = if edge { POINTER_EDGE_REPEATS } else { 0 };
         self.last_pointer = Some(sample);
         Some(sample)
+    }
+
+    /// Queue one edit command, dropping the oldest once
+    /// [`COMMAND_QUEUE_MAX`] are already waiting.
+    pub fn push_command(&mut self, command: EditCommand) {
+        self.pending_commands.push(command);
+        while self.pending_commands.len() > COMMAND_QUEUE_MAX {
+            self.pending_commands.remove(0);
+        }
+    }
+
+    /// Tell the cart every button the host thinks is held has come up, at
+    /// the last point it was told about. `false` when there was nothing
+    /// held.
+    ///
+    /// The cursor leaving the canvas is one of the ways a release never
+    /// reaches this element, and a gesture left open would resume from
+    /// wherever the pointer came back.
+    pub fn release_buttons(&mut self, snap: bool) -> bool {
+        if self.pointer_buttons == 0 {
+            return false;
+        }
+        self.pointer_buttons = 0;
+        let Some(last) = self.pending_pointer.back().copied().or(self.last_pointer) else {
+            return false;
+        };
+        self.push_pointer(PointerState {
+            device: last.device,
+            buttons: 0,
+            modifiers: last.modifiers,
+            snap,
+        });
+        true
     }
 
     /// Drop every input the host owes a cart that is being replaced: the
@@ -831,6 +924,7 @@ impl LiveView {
         self.pending_commands.clear();
         self.pointer_moving = false;
         self.last_pointer = None;
+        self.pointer_repeats = 0;
         self.pointer_buttons = 0;
     }
 
@@ -1103,6 +1197,73 @@ mod tests {
             live.pending_pointer.back().copied(),
             Some(sample((pushes - 1, pushes - 1), 1)),
             "the newest sample is the one kept"
+        );
+    }
+
+    /// What overflow throws away is the oldest POSITION, never an edge:
+    /// the cart cannot reconstruct a press or a release from the samples
+    /// around it, but a position it was about to leave behind costs it
+    /// nothing.
+    #[test]
+    fn overflow_collapses_the_oldest_move_and_keeps_the_edges() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        // Alternating buttons, so every sample is an edge -- except the
+        // one slipped in at position eight, which only moves.
+        for step in 0..8i16 {
+            live.push_pointer(sample((step, 0), u8::from(step % 2 == 0)));
+        }
+        live.push_pointer(sample((100, 0), u8::from(7 % 2 == 0)));
+        for step in 8..15i16 {
+            live.push_pointer(sample((step, 0), u8::from(step % 2 == 0)));
+        }
+        assert_eq!(live.pending_pointer.len(), POINTER_QUEUE_MAX, "full");
+
+        live.push_pointer(sample((15, 0), u8::from(15 % 2 == 0)));
+        assert_eq!(live.pending_pointer.len(), POINTER_QUEUE_MAX);
+        assert_eq!(
+            queued(&live)
+                .iter()
+                .map(|sample| sample.device.0)
+                .collect::<Vec<_>>(),
+            (0..16).collect::<Vec<i16>>(),
+            "the lone position went; every edge kept its place, in order"
+        );
+    }
+
+    /// Commands are capped too, and the oldest is the one to lose.
+    #[test]
+    fn the_command_queue_drops_the_oldest_when_it_is_full() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        for index in 0..COMMAND_QUEUE_MAX + 2 {
+            live.push_command(EditCommand::Nudge {
+                dx: index as i32,
+                dy: 0,
+            });
+        }
+        assert_eq!(live.pending_commands.len(), COMMAND_QUEUE_MAX);
+        assert_eq!(
+            live.pending_commands.first(),
+            Some(&EditCommand::Nudge { dx: 2, dy: 0 })
+        );
+    }
+
+    /// An edge is repeated on the ticks that follow it while nothing else
+    /// is queued -- identically, so the cart sees one edge, not three.
+    #[test]
+    fn an_edge_is_repeated_and_a_move_is_not() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        live.push_pointer(sample((1, 1), 1));
+        assert_eq!(live.take_pointer(), Some(sample((1, 1), 1)));
+        assert_eq!(live.take_pointer(), Some(sample((1, 1), 1)));
+        assert_eq!(live.take_pointer(), Some(sample((1, 1), 1)));
+        assert_eq!(live.take_pointer(), None, "and no more than twice over");
+
+        live.push_pointer(sample((2, 2), 1));
+        assert_eq!(live.take_pointer(), Some(sample((2, 2), 1)));
+        assert_eq!(
+            live.take_pointer(),
+            None,
+            "a move carries nothing the next sample cannot replace"
         );
     }
 
