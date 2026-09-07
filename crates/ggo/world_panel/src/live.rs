@@ -1327,6 +1327,15 @@ impl LiveView {
         expired
     }
 
+    /// Arm the world resend, and drop every command owed the cart. The
+    /// blob places every row and rebuilds every component itself, and a
+    /// command queued against the flattening it REPLACES would land on
+    /// whatever entity now holds that index.
+    pub fn resend_world(&mut self) {
+        self.world_dirty = true;
+        self.forget_edits();
+    }
+
     /// Forget every command this session owed or sent -- the cart is
     /// being handed a whole world, which places the rows itself.
     ///
@@ -2084,6 +2093,30 @@ mod tests {
             .expect("the frame heartbeats decode");
         assert_eq!(live.expire_spawns(), vec![5]);
         assert!(live.pending_spawns.is_empty());
+    }
+
+    /// A re-greeted cart numbers its gestures from one again, so the tag
+    /// has to change with the session: without the epoch the new cart's
+    /// gesture 1 would amend the undo entry the old cart's gesture 1
+    /// opened, and two unrelated drags would undo as one.
+    #[test]
+    fn a_forgotten_session_retags_the_same_cart_gesture() {
+        let mut live = offline_view(Vec::new(), 1, &[]);
+        live.begin_gesture(1);
+        let before = live.gesture_tag();
+        assert!(before.is_some(), "an open gesture tags this tick's ops");
+        live.forget_gestures();
+        assert_eq!(
+            live.gesture_tag(),
+            None,
+            "and the drag the outgoing cart never closed is not still open"
+        );
+        live.begin_gesture(1);
+        assert_ne!(
+            live.gesture_tag(),
+            before,
+            "the same cart id, a different undo entry"
+        );
     }
 
     /// A session with no cart behind it, for the pure lookups: they read

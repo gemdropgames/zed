@@ -1217,7 +1217,7 @@ impl OpenWorld {
     fn note_doc_changed(&mut self) {
         self.doc_generation = self.doc_generation.wrapping_add(1);
         if let Some(live) = self.live.as_mut() {
-            live.world_dirty = true;
+            live.resend_world();
         }
     }
 
@@ -1250,7 +1250,7 @@ impl OpenWorld {
         };
         match live.plan_replay(before, &after) {
             Some(edits) => live.queue_edits(edits),
-            None => live.world_dirty = true,
+            None => live.resend_world(),
         }
     }
 
@@ -1498,13 +1498,13 @@ impl OpenWorld {
                         live::CartEdit::Component { index, bag, .. } => {
                             if let Err(error) = live.mailbox.set_component(index, &bag) {
                                 log::warn!("GGO: live set_component: {error}");
-                                live.world_dirty = true;
+                                live.resend_world();
                             }
                         }
                         live::CartEdit::Despawn { index } => {
                             if let Err(error) = live.mailbox.despawn(index) {
                                 log::warn!("GGO: live despawn: {error}");
-                                live.world_dirty = true;
+                                live.resend_world();
                             }
                         }
                         live::CartEdit::Spawn { entity, bags } => {
@@ -1522,7 +1522,7 @@ impl OpenWorld {
                                 }
                                 Err(error) => {
                                     log::warn!("GGO: live spawn: {error}");
-                                    live.world_dirty = true;
+                                    live.resend_world();
                                 }
                             }
                         }
@@ -1784,20 +1784,6 @@ impl OpenWorld {
         let mut replays_landed: Vec<u32> = Vec::new();
         if fold {
             for row in &live.rows {
-                // The host's own undo landing, not cart-side motion:
-                // folding it would write the undone delta back into the
-                // document a second time and open an undo entry for the
-                // undo. Compared in RAW units, which is what went out and
-                // what the cart stored -- a world pixel is not a value
-                // the wire's fixed point can always name exactly.
-                if live.replayed_rows.contains(&(
-                    row.index,
-                    live::to_raw(row.x),
-                    live::to_raw(row.y),
-                )) {
-                    replays_landed.push(row.index);
-                    continue;
-                }
                 let Some(target) = live.index_map.selection_of(row.index) else {
                     continue;
                 };
@@ -1812,9 +1798,39 @@ impl OpenWorld {
                 else {
                     continue;
                 };
-                if before != [row.x, row.y] {
-                    rows.push((target, [row.x, row.y], before));
+                if before == [row.x, row.y] {
+                    continue;
                 }
+                // A row that MOVED and had a replay owed for it is that
+                // replay landing -- the host's own undo coming back, not
+                // cart-side motion: folding it would write the undone
+                // delta into the document a second time and open an undo
+                // entry for the undo. An unmoved row answers nothing yet,
+                // which is why this is asked after the movement test and
+                // not before it: the cart applies a transform on the frame
+                // AFTER it takes it, and retiring the entry on the tick it
+                // went out would leave the answer to fold as motion.
+                //
+                // The position is compared in RAW units -- what went out
+                // and what the cart stored, since a world pixel is not a
+                // value the wire's fixed point can always name exactly.
+                // Landing somewhere else is the cart having adjusted the
+                // position (a snap, an edit system that moved it on),
+                // which folds like any other motion; either way the entry
+                // is retired, because holding it would suppress an honest
+                // fold at that exact position for the rest of the session.
+                let replayed = live
+                    .replayed_rows
+                    .iter()
+                    .find(|(index, _, _)| *index == row.index)
+                    .copied();
+                if let Some(replayed) = replayed {
+                    replays_landed.push(row.index);
+                    if replayed == (row.index, live::to_raw(row.x), live::to_raw(row.y)) {
+                        continue;
+                    }
+                }
+                rows.push((target, [row.x, row.y], before));
             }
             live.replayed_rows
                 .retain(|(index, _, _)| !replays_landed.contains(index));
@@ -1884,7 +1900,7 @@ impl OpenWorld {
             }
         }
         if resend_after_spawn {
-            live.world_dirty = true;
+            live.resend_world();
         }
         if ask_for_snapshot && !live.snapshot_pending {
             match live.mailbox.request_snapshot() {
@@ -1894,7 +1910,7 @@ impl OpenWorld {
                 Err(error) => {
                     log::warn!("GGO: live snapshot: {error}");
                     live.added_unknown.clear();
-                    live.world_dirty = true;
+                    live.resend_world();
                 }
             }
         }
@@ -1923,7 +1939,7 @@ impl OpenWorld {
             // failure; the world blob describes the whole table instead.
             live.snapshot_pending = false;
             live.added_unknown.clear();
-            live.world_dirty = true;
+            live.resend_world();
         }
         // Spawns the cart never answered: the protocol has no refusal
         // edge, so the budget running out IS the refusal.
@@ -2094,7 +2110,7 @@ impl OpenWorld {
             if index as usize != appended
                 && let Some(live) = self.live.as_mut()
             {
-                live.world_dirty = true;
+                live.resend_world();
             }
             changed = true;
         }
@@ -2660,6 +2676,17 @@ impl WorldPanel {
     /// notify themselves), so the draw list -- rebuilt per render --
     /// always reflects the store.
     fn apply_op(&mut self, op: WorldOp, cx: &mut Context<Self>) {
+        // Play is the GAME's: the running cart has moved on from whatever
+        // the document says, and every op here arms a resend that would
+        // reload the play-through out from under it. Guarded centrally
+        // rather than per caller -- the layers rail reached the store
+        // through here with nothing in its way. The two paths that
+        // deliberately bypass this one stay bypassed: the mirror
+        // (`apply_mirror_op`, which is the cart reporting its own edit)
+        // and Delete (forwarded to the cart, which ignores it in Play).
+        if self.live_playing() {
+            return;
+        }
         if let ViewerState::Ready(open) = &mut self.state {
             let before = open.store.state();
             open.store.apply(op);
@@ -2794,6 +2821,13 @@ impl WorldPanel {
         /// `NEW_MAP_DEFAULT_DIM`) for the same "new map" idea.
         const NEW_BG_DIM: u16 = 16;
 
+        // Guarded here as well as in `apply_op`: this one writes a `.map`
+        // to disk before it ever reaches the store, and a layer push
+        // behind the refused op would re-send the background to a cart
+        // that is running the game with it already loaded.
+        if self.live_playing() {
+            return;
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
@@ -2830,6 +2864,11 @@ impl WorldPanel {
     /// other worlds may share it, and unlink is undoable where deletion
     /// would not be (`WorldOp::SetBackground`'s own contract).
     fn clear_background_impl(&mut self, layer: u8, cx: &mut Context<Self>) {
+        // As in `add_background_impl`: the refresh below is not an op and
+        // would push the layer again on its own.
+        if self.live_playing() {
+            return;
+        }
         self.apply_op(WorldOp::SetBackground { layer, map: None }, cx);
         self.refresh_backgrounds(cx);
     }
@@ -2945,6 +2984,11 @@ impl WorldPanel {
     /// leaves the world editor exactly as it was, with the reason on the
     /// toolbar.
     fn enter_paint_mode(&mut self, target: PaintTarget, cx: &mut Context<Self>) -> bool {
+        // Painting is an edit of the world the cart is running, and in
+        // Play there is no world of the document's to edit.
+        if self.live_playing() {
+            return false;
+        }
         let Some((rel, _)) = self.paint_target_rel(&target) else {
             return false;
         };
@@ -7080,6 +7124,11 @@ impl WorldPanel {
             unreachable!("render_layers_rail is only called in the Ready state");
         };
         let backgrounds = open.store.state().backgrounds;
+        // Every slot on this rail is a document edit, so the whole rail is
+        // dead while the game runs -- and, as everywhere else, the wrapper
+        // selectors say so rather than leaving a test to infer it from a
+        // click that does nothing.
+        let playing = self.live_playing();
         let mut rail = h_flex().gap_2().px_1().pb_1().flex_wrap().child(
             Label::new("Layers")
                 .size(LabelSize::XSmall)
@@ -7106,7 +7155,9 @@ impl WorldPanel {
                             // shrinkable flex item in the wrapping rail and
                             // the label it holds could squeeze.
                             .flex_none()
-                            .debug_selector(move || format!("ggo-world-bg-paint-{layer}"))
+                            .debug_selector(move || {
+                                format!("ggo-world-bg-paint-{layer}-{}", toggle_suffix(!playing))
+                            })
                             .child(
                                 // The map's name IS the paint-mode entry
                                 // (spec: "click a linked slot in the layers
@@ -7121,6 +7172,7 @@ impl WorldPanel {
                                     open.mode == EditMode::Paint(PaintTarget::BgSlot(layer)),
                                 )
                                 .tooltip(ui::Tooltip::text("Paint this background layer"))
+                                .disabled(playing)
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.enter_paint_mode(PaintTarget::BgSlot(layer), cx);
@@ -7129,12 +7181,23 @@ impl WorldPanel {
                             ),
                     )
                     .child(
-                        IconButton::new(("ggo-world-bg-clear", layer as usize), IconName::Trash)
-                            .icon_size(IconSize::Small)
-                            .tooltip(ui::Tooltip::text("Unlink this background layer"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.clear_background_impl(layer, cx)
-                            })),
+                        div()
+                            .flex_none()
+                            .debug_selector(move || {
+                                format!("ggo-world-bg-clear-{layer}-{}", toggle_suffix(!playing))
+                            })
+                            .child(
+                                IconButton::new(
+                                    ("ggo-world-bg-clear", layer as usize),
+                                    IconName::Trash,
+                                )
+                                .icon_size(IconSize::Small)
+                                .tooltip(ui::Tooltip::text("Unlink this background layer"))
+                                .disabled(playing)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.clear_background_impl(layer, cx)
+                                })),
+                            ),
                     )
                     .into_any_element(),
                 None => {
@@ -7148,7 +7211,9 @@ impl WorldPanel {
                         // bounds are the trigger's -- the menu is deferred.
                         div()
                             .flex_none()
-                            .debug_selector(move || format!("ggo-world-bg-slot-{layer}"))
+                            .debug_selector(move || {
+                                format!("ggo-world-bg-slot-{layer}-{}", toggle_suffix(!playing))
+                            })
                             .child(
                                 PopoverMenu::new(SharedString::from(format!(
                                     "ggo-world-bg-menu-{layer}"
@@ -7158,7 +7223,8 @@ impl WorldPanel {
                                         SharedString::from(format!("ggo-world-bg-slot-{layer}")),
                                         "Add…",
                                     )
-                                    .label_size(LabelSize::XSmall),
+                                    .label_size(LabelSize::XSmall)
+                                    .disabled(playing),
                                 )
                                 // Lazy on purpose: the tileset list is a
                                 // recursive walk of the asset root, and this
@@ -17703,14 +17769,28 @@ mod tests {
     /// still works is Delete, which is forwarded to the cart.
     #[gpui::test]
     async fn play_blocks_every_document_mutation(cx: &mut TestAppContext) {
-        const MUTATORS: [(&str, &str); 3] = [
+        const MUTATORS: [(&str, &str); 6] = [
             ("ggo-world-undo-on", "ggo-world-undo-off"),
             ("ggo-world-redo-on", "ggo-world-redo-off"),
             ("ggo-world-add-entity-on", "ggo-world-add-entity-off"),
+            // The layers rail is a document edit per slot, so it is greyed
+            // out too: the linked slot's paint entry and its unlink, and an
+            // empty slot's "Add…".
+            ("ggo-world-bg-paint-0-on", "ggo-world-bg-paint-0-off"),
+            ("ggo-world-bg-clear-0-on", "ggo-world-bg-clear-0-off"),
+            ("ggo-world-bg-slot-1-on", "ggo-world-bg-slot-1-off"),
         ];
 
-        let (panel, endpoint, _dir, cx) =
+        let (panel, endpoint, dir, cx) =
             connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
+        // Slot 0 linked while the session is still in Edit, so Play has a
+        // background to refuse to unlink.
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx)
+        });
+        cx.run_until_parked();
+        settle_live(&panel, &endpoint, cx);
         select_first_entity(&panel, cx);
         show_panel(cx);
         for pair in MUTATORS {
@@ -17772,9 +17852,31 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.add_instance_impl("worlds/sub".to_string(), cx)
         });
+        // The layers rail and the clipboard reach the store through
+        // `apply_op` like everything else, and neither may move a document
+        // the running cart has left behind.
+        panel.update(cx, |panel, cx| panel.clear_background_impl(0, cx));
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(1, "tiles/bg.til".into(), cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.copy_impl(cx);
+            panel.paste_impl(cx);
+        });
+        assert!(
+            !panel.update(cx, |panel, cx| panel
+                .enter_paint_mode(PaintTarget::BgSlot(0), cx)),
+            "and the brush does not come out over a play-through"
+        );
         cx.run_until_parked();
 
         panel.read_with(cx, |panel, _| {
+            let backgrounds = open_of(panel).store.state().backgrounds;
+            assert_eq!(
+                backgrounds.iter().map(|bg| bg.layer).collect::<Vec<_>>(),
+                vec![0],
+                "slot 0 is still linked and slot 1 was never added"
+            );
             assert_eq!(entity_pos_of(panel, 0), moved, "the undo did nothing");
             assert_eq!(
                 open_of(panel).doc_generation,
@@ -17786,6 +17888,52 @@ mod tests {
         let (transforms, blobbed) = sent_transforms(&settle_live(&panel, &endpoint, cx));
         assert!(!blobbed, "no world went out to the playing cart");
         assert!(transforms.is_empty(), "and no transforms: {transforms:?}");
+    }
+
+    /// A replayed transform that comes back somewhere ELSE is the cart
+    /// having adjusted it, not the host's undo landing: it folds like any
+    /// other motion, and the entry is retired either way -- a held one
+    /// would suppress an honest fold at that exact position forever.
+    #[gpui::test]
+    async fn a_replayed_row_that_lands_elsewhere_folds_and_retires(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).queue_edits(vec![live::CartEdit::Transform {
+                index: 0,
+                x: live::to_raw(40.0),
+                y: live::to_raw(50.0),
+            }]);
+        });
+        settle_live(&panel, &endpoint, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).replayed_rows.len(),
+                1,
+                "the transform went out and is owed an answer"
+            );
+        });
+
+        // One raw unit off what was asked for.
+        let landed = 50.0 + live::from_raw(1);
+        cart_rows(
+            &endpoint,
+            &[(0, 40.0, landed), (1, 40.0, 8.0), (2, 0.0, 0.0), (3, 42.0, 26.0)],
+        );
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                [40.0, landed],
+                "the cart's own adjustment folds like any other motion"
+            );
+            assert!(
+                live_of(panel).replayed_rows.is_empty(),
+                "and the entry is retired all the same"
+            );
+        });
     }
 
     /// A click on the canvas blurs whatever inspector field had focus, and
