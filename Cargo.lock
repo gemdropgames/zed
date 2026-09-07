@@ -7686,6 +7686,7 @@ dependencies = [
  "emerald-editor-link",
  "emerald-editor-runtime",
  "emerald-world",
+ "futures 0.3.32",
  "ggo-asset-formats",
  "ggo-audio",
  "ggo-comm",

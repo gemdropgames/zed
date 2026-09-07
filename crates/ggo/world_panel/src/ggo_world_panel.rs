@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use editor::{Editor, EditorEvent};
+use futures::channel::oneshot;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement,
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
@@ -73,7 +74,9 @@ use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 use ggo_worldlib::sprites::{io, palette565};
 use ggo_worldlib::world_doc::{WorldDocStore, WorldOp};
 use ggo_worldlib::world_file::write_world;
-use ggo_worldlib::world_file::{self, Background, WorldEntity, fragment_to_toml, parse_fragment};
+use ggo_worldlib::world_file::{
+    self, BACKGROUND_LAYER_COUNT, Background, WorldEntity, fragment_to_toml, parse_fragment,
+};
 use ggo_worldlib::world_files::{self, WorldListing};
 use project::ProjectPath;
 
@@ -339,6 +342,53 @@ pub fn world_stem(rel: &str) -> Option<String> {
 fn background_map_rel(world_stem: &str, layer: u8) -> String {
     let stem = world_stem.strip_prefix("worlds/").unwrap_or(world_stem);
     format!("maps/{stem}.bg{layer}.map")
+}
+
+/// The sparse `(x, y, cell)` writes that would make the top-left `w x h`
+/// of a `doc_w x doc_h` map read as `cells` -- what a cart layer readback
+/// changed, and nothing else.
+///
+/// The readback's dimensions are the cart's SHADOW, which it clamped the
+/// map to: a cell past the document's own map is dropped rather than
+/// resizing it, since the cart never saw the rest of the file and cannot
+/// be the authority on what is out there.
+fn cell_writes(
+    doc_cells: &[u16],
+    doc_w: u16,
+    doc_h: u16,
+    w: u16,
+    h: u16,
+    cells: &[u16],
+) -> Vec<(i32, i32, u16)> {
+    let mut writes = Vec::new();
+    for y in 0..h.min(doc_h) {
+        for x in 0..w.min(doc_w) {
+            let from = usize::from(y) * usize::from(w) + usize::from(x);
+            let into = usize::from(y) * usize::from(doc_w) + usize::from(x);
+            let (Some(cell), Some(held)) = (cells.get(from), doc_cells.get(into)) else {
+                continue;
+            };
+            if cell != held {
+                writes.push((i32::from(x), i32::from(y), *cell));
+            }
+        }
+    }
+    writes
+}
+
+/// Patch a `.map` that has no paint session open with the cells the cart
+/// handed back, writing only if they actually differ -- an untouched
+/// `.map` rewritten would wake the emu panel's watch-mode repack over no
+/// edit at all.
+fn patch_map_on_disk(root: &Path, rel: &str, w: u16, h: u16, cells: &[u16]) -> Result<(), String> {
+    let map = io::open_map(root, rel).map_err(|e| e.to_string())?;
+    let writes = cell_writes(&map.cells, map.w, map.h, w, h, cells);
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let mut store = MapDocStore::new(map.til_path, map.pal_path, map.w, map.h, map.cells);
+    store.apply(ggo_worldlib::sprites::map_doc::MapOp::SetCells(writes));
+    io::save_map(root, rel, &store.state()).map_err(|e| e.to_string())
 }
 
 /// `workspace::PathOpenInterceptor` for `**/worlds/**/*.toml`: claim the
@@ -685,6 +735,12 @@ struct OpenWorld {
     gesture_counter: u64,
     inspector: Vec<InspectorEntry>,
     save_error: Option<String>,
+    /// Callers waiting for a save that the cart has not answered yet --
+    /// the workspace `Item::save` a close prompt awaits. Resolved (with
+    /// the write's own result) the moment the save settles; dropping them
+    /// unresolved is what a closed world reports as a failure, since a
+    /// caller that never hears back can never let the tab go.
+    save_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     /// Why the popout Emulate could not launch (failed build or spawn),
     /// shown on the toolbar next to `save_error`.
     popout_error: Option<String>,
@@ -842,6 +898,7 @@ impl OpenWorld {
             gesture_counter: 0,
             inspector: Vec::new(),
             save_error: None,
+            save_waiters: Vec::new(),
             popout_error: None,
             clipboard_error: None,
             audio_sizes: HashMap::new(),
@@ -1668,6 +1725,9 @@ impl OpenWorld {
         changed |= live.frame.as_ref().map(|(number, _)| *number) != frame_before;
         changed |= live.status != status_before;
         changed |= self.mirror_cart_state();
+        // After the mirror, and outside its session borrow: settling a
+        // save applies document ops and writes files.
+        changed |= self.settle_cart_save();
         LiveStep {
             changed,
             failure: None,
@@ -1717,18 +1777,40 @@ impl OpenWorld {
         // new value on every change it makes, its own and the host's.
         let component_changes = live.mailbox.take_component_changes();
         let added = live.mailbox.take_added();
-        // The only cart -> host blob this phase asks for. A blob of
-        // another kind is dropped rather than left in the queue behind it
-        // (Task 3's save takes the layer readbacks).
+        // The two cart -> host blobs the host asks for. A blob of another
+        // kind is dropped rather than left in the queue behind them --
+        // nothing requests one, so one arriving is a cart the host does
+        // not understand, and a queue nobody empties is a queue that
+        // grows. The NEWEST answer per kind wins: a layer re-asked for
+        // mid-transfer comes back twice, the second copy the later one.
         let mut snapshot: Option<Vec<u8>> = None;
-        while let Some((kind, _, body)) = live.mailbox.take_blob() {
-            if kind == CartBlobKind::Snapshot {
-                snapshot = Some(body);
+        let mut layer_blobs: Vec<(u32, Vec<u8>)> = Vec::new();
+        while let Some((kind, index, body)) = live.mailbox.take_blob() {
+            match kind {
+                CartBlobKind::Snapshot => snapshot = Some(body),
+                CartBlobKind::Layer => {
+                    layer_blobs.retain(|(slot, _)| *slot != index);
+                    layer_blobs.push((index, body));
+                }
+                CartBlobKind::Entity | CartBlobKind::Component => {}
             }
         }
         let mut snapshot_failed = false;
+        let mut layer_failed = false;
         while let Some((kind, _)) = live.mailbox.take_failed_blob() {
             snapshot_failed |= kind == CartBlobKind::Snapshot;
+            layer_failed |= kind == CartBlobKind::Layer;
+        }
+        // A save in flight collects the bytes here rather than draining
+        // the queue a second time; `settle_cart_save` (one level up, out
+        // of this borrow) is what turns a complete set into a write.
+        if let Some(save) = live.saving.as_mut() {
+            save.note_blobs(
+                snapshot.as_deref(),
+                &layer_blobs,
+                snapshot_failed,
+                layer_failed,
+            );
         }
 
         let marquee = live.mailbox.marquee().map(|band| band.map(f64::from));
@@ -2168,6 +2250,282 @@ impl OpenWorld {
         // that has changed since its encode was refused from one that has
         // not.
         self.doc_generation = self.doc_generation.wrapping_add(1);
+    }
+
+    /// `to_doc()` -> `write_world` -> `mark_saved`, then the same for every
+    /// dirty paint session. Synchronous by choice: world files are small
+    /// TOML, and the async save ggo-ide uses is an iced task-architecture
+    /// artifact, not an op-flow semantic (writing then `mark_saved` in one
+    /// step also avoids the marked-depth race a mid-flight edit would
+    /// cause).
+    ///
+    /// Every failure is attempted past, so one unwritable `.map` cannot
+    /// strand the others, but the FIRST error is what `save_error` reports
+    /// -- the world write's if it failed, since a document whose own TOML
+    /// did not land is the more serious of the two. `carried` is a failure
+    /// the caller already had (a `.map` the cart's cells could not be
+    /// written into): reported only if these writes all succeed, for the
+    /// same reason.
+    fn write_now(&mut self, carried: Option<String>) {
+        // `self.root`, NOT the worktree root: the doc must be written
+        // back where it was read from (see the `OpenWorld::root` doc).
+        let mut error = match write_world(&self.root, &self.listing.rel_path, &self.store.to_doc())
+        {
+            Ok(()) => {
+                self.store.mark_saved();
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        };
+        let mut written: Vec<String> = Vec::new();
+        for session in self.sessions.values_mut() {
+            // Clean sessions are skipped rather than rewritten: an
+            // untouched `.map` has nothing to write, and touching it would
+            // wake the emu panel's watch-mode repack over no edit at all.
+            if !session.dirty() {
+                continue;
+            }
+            match session.save() {
+                Ok(()) => written.push(session.rel_path.clone()),
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e);
+                    }
+                }
+            }
+        }
+        // A live session reads its layer payloads from DISK, and a paint
+        // session holds its cells in memory until it is saved -- so the
+        // write is the first moment a stroke can reach the cart, and
+        // nothing else re-arms the slots it touched.
+        if !written.is_empty() {
+            let slots: Vec<u8> = self
+                .merged
+                .iter()
+                .filter(|background| {
+                    written
+                        .iter()
+                        .any(|rel| *rel == format!("{}.map", background.stem))
+                })
+                .map(|background| background.layer)
+                .collect();
+            if let Some(live) = self.live.as_mut() {
+                for slot in slots {
+                    live.layers_dirty.mark(slot);
+                }
+            }
+            // A `Tilemap` ENTITY's map is not a cart layer: it rides the
+            // world blob, so its save is a document change.
+            self.note_doc_changed();
+        }
+        self.save_error = error.or(carried);
+        self.settle_save_waiters();
+    }
+
+    /// Whether this world's save is waiting on the cart's answer.
+    fn save_pending(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| live.saving.is_some())
+    }
+
+    /// Hand every caller waiting on a save the result `save_error` now
+    /// says it had. A waiter is resolved exactly once: the receiver is
+    /// gone with the sender.
+    fn settle_save_waiters(&mut self) {
+        let result = match &self.save_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        };
+        for waiter in std::mem::take(&mut self.save_waiters) {
+            // The receiver is dropped whenever the caller stopped caring
+            // (the tab closed under the save), which is not a failure of
+            // this save.
+            waiter.send(result.clone()).ok();
+        }
+    }
+
+    /// Fail a save outright: the file is left exactly as it was, the
+    /// document stays dirty, and the reason goes on the status row.
+    fn fail_save(&mut self, reason: String) {
+        self.save_error = Some(reason);
+        self.settle_save_waiters();
+    }
+
+    /// Turn a cart save that has all its bytes -- or has run out of time
+    /// or of transfers -- into a write. Returns whether anything the panel
+    /// draws moved.
+    ///
+    /// Runs after the mirror, on the tick the last blob lands: the mirror
+    /// may have folded a report out of the very same frame, and the
+    /// snapshot is what settles the disagreement in the cart's favour.
+    fn settle_cart_save(&mut self) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(save) = live.saving.as_ref() else {
+            return false;
+        };
+        let outcome = if let Some(reason) = save.failure() {
+            Err(reason.to_string())
+        } else if !live.loaded() || live.world_dirty {
+            // The cart's indices stopped describing this document part-way
+            // through: whatever it is about to hand back is the previous
+            // world's, and folding it in would write one world's entities
+            // over another's.
+            Err("the world was re-sent to the cart mid-save".to_string())
+        } else if save.timed_out(live.mailbox.frame_seq()) {
+            Err("the cart did not answer in time".to_string())
+        } else {
+            match save.decode(live.mailbox.schemas()) {
+                Some(decoded) => decoded,
+                None => return false,
+            }
+        };
+        if let Some(live) = self.live.as_mut() {
+            live.saving = None;
+        }
+        match outcome {
+            Ok(cart) => {
+                self.fold_cart_entities(&cart);
+                let carried = self.write_cart_layers(&cart);
+                self.write_now(carried);
+            }
+            Err(reason) => self.fail_save(reason),
+        }
+        true
+    }
+
+    /// Rebuild the document's DIRECT entities from the cart's snapshot.
+    ///
+    /// Instance members are skipped: their components live in the
+    /// instanced world file, which this document does not edit (only the
+    /// `[[instance]]`'s own position is the document's, and the row mirror
+    /// already keeps that). A cart index the flattening does not name at
+    /// all is an entity one of the cart's own systems spawned, and it is
+    /// APPENDED.
+    ///
+    /// Nothing is ever REMOVED here. A component the schema table cannot
+    /// convert (one with a `Struct` field) decodes to nothing at all, so
+    /// "the snapshot did not mention it" cannot be told from "the cart no
+    /// longer has it" -- and dropping the document's own value on that
+    /// guess would lose it on every save.
+    fn fold_cart_entities(&mut self, cart: &live::CartSave) {
+        let state = self.store.state();
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let mut ops: Vec<WorldOp> = Vec::new();
+        let mut appended: Vec<&Vec<(String, serde_json::Map<String, Value>)>> = Vec::new();
+        for (index, components) in &cart.entities {
+            let entity = match live.index_map.selection_of(*index) {
+                Some(Selection::Entity(entity)) => entity,
+                Some(Selection::Instance(_)) => continue,
+                None => {
+                    appended.push(components);
+                    continue;
+                }
+            };
+            let Some(held) = state.entities.get(entity) else {
+                continue;
+            };
+            for (component, fields) in components {
+                let Some(current) = held.components.get(component).and_then(Value::as_object)
+                else {
+                    ops.push(WorldOp::AddComponent {
+                        entity,
+                        name: component.clone(),
+                        defaults: fields.clone(),
+                    });
+                    continue;
+                };
+                for (field, value) in fields {
+                    // `SetField` writes over an existing key only, the same
+                    // rule the per-frame component mirror follows: the two
+                    // sides' schemas can differ by a cart rebuild, and a
+                    // field the document does not name is not this save's
+                    // to invent.
+                    let Some(held) = current.get(field) else {
+                        continue;
+                    };
+                    if live::same_value(held, value) {
+                        continue;
+                    }
+                    ops.push(WorldOp::SetField {
+                        entity,
+                        component: component.clone(),
+                        field: field.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
+        // After every edit to the entities that already exist: an append
+        // shifts nothing, but planning against a document that had already
+        // grown would read the new entity's index as an old one's.
+        for components in appended {
+            let components = components
+                .iter()
+                .map(|(name, fields)| (name.clone(), Value::Object(fields.clone())))
+                .collect();
+            ops.push(WorldOp::AddEntity { components });
+        }
+        // One undo entry for the whole hand-back, the way a tick's worth
+        // of mirrored reports folds into one.
+        if let Some(op) = Self::one_step(ops) {
+            self.apply_mirror_op(op);
+        }
+    }
+
+    /// Write the cart's layer cells back into the `.map` files behind the
+    /// background slots. Returns the first failure, if any.
+    ///
+    /// A slot the cart answered `0 x 0` for has NO map on the cart, which
+    /// is not the same as an empty one: the file it would have come from
+    /// is left exactly as it is. The cells are written into the top-left
+    /// of whatever the document's map is, because the dimensions the cart
+    /// reports are its own shadow's -- what it clamped the map to, which
+    /// can be smaller than the file.
+    fn write_cart_layers(&mut self, cart: &live::CartSave) -> Option<String> {
+        let mut error: Option<String> = None;
+        for (slot, w, h, cells) in &cart.layers {
+            if *w == 0 || *h == 0 {
+                continue;
+            }
+            let Some(background) = self.merged.iter().find(|merged| merged.layer == *slot) else {
+                continue;
+            };
+            let rel = format!("{}.map", background.stem);
+            // A session is the map's live document (undo history and all),
+            // so its cells go through an op and the ordinary session save
+            // writes them. Only a map with no session open is patched on
+            // disk here.
+            let patched = match self.sessions.get_mut(&rel) {
+                Some(session) => {
+                    // A DIRTY session holds a stroke the cart has never
+                    // been told about: the panel ships a painted slot as a
+                    // whole `load_layer` on save, so until the stroke has
+                    // been written the cart's shadow is the PRE-stroke map
+                    // and folding it in would erase the user's paint. The
+                    // stroke reaches the cart a moment later, out of
+                    // `write_now`'s re-arm of the slot.
+                    if session.dirty() {
+                        continue;
+                    }
+                    let state = session.store.state();
+                    let writes = cell_writes(&state.cells, state.w, state.h, *w, *h, cells);
+                    if !writes.is_empty() {
+                        session.apply(ggo_worldlib::sprites::map_doc::MapOp::SetCells(writes));
+                    }
+                    continue;
+                }
+                None => patch_map_on_disk(&self.root, &rel, *w, *h, cells),
+            };
+            if let Err(reason) = patched
+                && error.is_none()
+            {
+                error = Some(reason);
+            }
+        }
+        error
     }
 
     /// The current position of every selected item that still exists.
@@ -3810,74 +4168,118 @@ impl WorldPanel {
         }
     }
 
-    /// `to_doc()` -> `write_world` -> `mark_saved`, then the same for every
-    /// dirty paint session. Synchronous by choice: world files are small
-    /// TOML, and the async save ggo-ide uses is an iced task-architecture
-    /// artifact, not an op-flow semantic (writing then `mark_saved` in one
-    /// step also avoids the marked-depth race a mid-flight edit would
-    /// cause).
+    /// Write the open world.
     ///
-    /// Every failure is attempted past, so one unwritable `.map` cannot
-    /// strand the others, but the FIRST error is what `save_error` reports
-    /// -- the world write's if it failed, since a document whose own TOML
-    /// did not land is the more serious of the two.
+    /// In Live the CART owns the world -- its own edit systems move
+    /// entities, rewrite text, paint cells -- so the save first asks it
+    /// for a snapshot and for the source cells of every loaded background
+    /// slot, and only writes once those have landed
+    /// ([`OpenWorld::settle_cart_save`]). Everywhere else, and in every
+    /// Live session whose rows do not describe this document yet, the
+    /// document IS the truth and the write is immediate.
     fn save_impl(&mut self, cx: &mut Context<Self>) {
+        // Play is the game's: its entities are where the play-through put
+        // them, and a snapshot taken mid-run would persist that over the
+        // world the user authored.
+        if self.live_playing() {
+            if let ViewerState::Ready(open) = &mut self.state {
+                open.fail_save("stop the game to save".to_string());
+                cx.notify();
+            }
+            return;
+        }
+        if self.cart_owns_the_world() {
+            self.begin_cart_save(cx);
+            return;
+        }
+        self.write_document_now(cx);
+    }
+
+    /// Write the document as it stands, without asking the cart. The path
+    /// every save took before Live could hand a world back.
+    fn write_document_now(&mut self, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        // `open.root`, NOT `self.project_root`: the doc must be written
-        // back where it was read from (see the `OpenWorld::root` doc).
-        let mut error = match write_world(&open.root, &open.listing.rel_path, &open.store.to_doc())
-        {
-            Ok(()) => {
-                open.store.mark_saved();
-                None
-            }
-            Err(e) => Some(e.to_string()),
-        };
-        let mut written: Vec<String> = Vec::new();
-        for session in open.sessions.values_mut() {
-            // Clean sessions are skipped rather than rewritten: an
-            // untouched `.map` has nothing to write, and touching it would
-            // wake the emu panel's watch-mode repack over no edit at all.
-            if !session.dirty() {
-                continue;
-            }
-            match session.save() {
-                Ok(()) => written.push(session.rel_path.clone()),
-                Err(e) => {
-                    if error.is_none() {
-                        error = Some(e);
-                    }
-                }
-            }
-        }
-        // A live session reads its layer payloads from DISK, and a paint
-        // session holds its cells in memory until it is saved -- so the
-        // write is the first moment a stroke can reach the cart, and
-        // nothing else re-arms the slots it touched.
-        if !written.is_empty() {
-            let slots: Vec<u8> = open
-                .merged
-                .iter()
-                .filter(|background| {
-                    written
-                        .iter()
-                        .any(|rel| *rel == format!("{}.map", background.stem))
-                })
-                .map(|background| background.layer)
-                .collect();
-            if let Some(live) = open.live.as_mut() {
-                for slot in slots {
-                    live.layers_dirty.mark(slot);
-                }
-            }
-            // A `Tilemap` ENTITY's map is not a cart layer: it rides the
-            // world blob, so its save is a document change.
-            open.note_doc_changed();
-        }
-        open.save_error = error;
+        open.write_now(None);
         cx.notify();
+    }
+
+    /// Whether a save must ask the cart for the world before it writes:
+    /// the canvas is showing Live, the session is connected, and its rows
+    /// describe THIS document. A session that has not finished the world
+    /// handshake holds some other world's entities, and the document is
+    /// the only truth there is until it has.
+    fn cart_owns_the_world(&self) -> bool {
+        self.live_active()
+            && match &self.state {
+                ViewerState::Ready(open) => open.live.as_ref().is_some_and(|live| {
+                    live.status == LiveStatus::Connected && live.loaded() && !live.world_dirty
+                }),
+                _ => false,
+            }
+    }
+
+    /// Ask the cart for its world and for every loaded layer's cells. The
+    /// write happens on the tick the last of them lands.
+    fn begin_cart_save(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        // A second Save while the first is still in flight is the same
+        // request: re-asking would only make the cart stream the world
+        // twice, and the waiters already queued settle on the one answer.
+        if open.save_pending() {
+            return;
+        }
+        // Only slots the document has a map behind: an unlinked slot has
+        // no `.map` for the cells to be written into, and the cart answers
+        // it `0 x 0` anyway.
+        let slots: Vec<u8> = open
+            .merged
+            .iter()
+            .map(|background| background.layer)
+            .filter(|layer| usize::from(*layer) < BACKGROUND_LAYER_COUNT)
+            .collect();
+        let Some(live) = open.live.as_mut() else {
+            return;
+        };
+        match live.begin_save(slots) {
+            Ok(()) => open.save_error = None,
+            // Nothing is waiting on an answer that was never asked for, so
+            // this is the whole save: the file is untouched and the
+            // document stays dirty.
+            Err(reason) => open.fail_save(reason),
+        }
+        cx.notify();
+    }
+
+    /// Save, and hand back a task that settles when the write has landed
+    /// or failed -- what `WorldCanvasItem::save` (and so the pane's close
+    /// prompt) awaits. In Design that is immediate; in Live the cart has
+    /// to answer first.
+    pub(crate) fn save_task(&mut self, cx: &mut Context<Self>) -> Task<Result<(), String>> {
+        self.save_impl(cx);
+        let ViewerState::Ready(open) = &mut self.state else {
+            return Task::ready(Ok(()));
+        };
+        if !open.save_pending() {
+            return Task::ready(match &open.save_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            });
+        }
+        let (sender, receiver) = oneshot::channel();
+        open.save_waiters.push(sender);
+        cx.background_spawn(async move {
+            match receiver.await {
+                Ok(result) => result,
+                // The sender went with the open world: the tab was closed
+                // or another world loaded over this one, and the write
+                // this caller asked for never happened.
+                Err(_) => Err("the world was closed before the save landed".to_string()),
+            }
+        })
     }
 
     /// Save on behalf of a "Save" answer to the unsaved-edits prompt,
@@ -3885,8 +4287,14 @@ impl WorldPanel {
     /// let the caller discard the document). Shared by
     /// [`Self::open_rel_path`]'s reload prompt and
     /// [`Self::save_if_open_and_dirty`].
+    ///
+    /// The DOCUMENT write, not the cart round trip [`Self::save_impl`]
+    /// takes in Live: both callers need their answer synchronously, and a
+    /// "did it land?" that could only be answered several cart frames
+    /// later would have to be reported as "no" -- which is a refusal to
+    /// close, or a refused build, over a save that was going to succeed.
     fn save_for_close(&mut self, cx: &mut Context<Self>) -> bool {
-        self.save_impl(cx);
+        self.write_document_now(cx);
         match &self.state {
             ViewerState::Ready(open) => open.save_error.is_none(),
             // The panel can't have gone un-Ready between the prompt and
@@ -5499,6 +5907,15 @@ impl WorldPanel {
             self.stop_live_endpoint();
         }
         if let ViewerState::Ready(open) = &mut self.state {
+            // A save waiting on this session is over: the cart that was
+            // going to hand its world back is gone, and nothing else will
+            // ever answer the blobs it asked for.
+            if open.save_pending() {
+                if let Some(live) = &mut open.live {
+                    live.saving = None;
+                }
+                open.fail_save(format!("the live session ended: {reason}"));
+            }
             open.live_error = Some(reason.clone());
             if let Some(live) = &mut open.live {
                 live.status = LiveStatus::Failed(reason);
@@ -5609,8 +6026,14 @@ impl WorldPanel {
         self.canvas_mode = CanvasMode::Design;
         self.live_boot_pending = false;
         if let ViewerState::Ready(open) = &mut self.state {
+            let saving = open.save_pending();
             open.live = None;
             open.live_error = None;
+            // Same as a failed session: the cart the save was waiting on
+            // is gone with the session the user just left.
+            if saving {
+                open.fail_save("the live session was closed".to_string());
+            }
         }
         self.stop_live_endpoint();
         cx.notify();
@@ -6613,6 +7036,7 @@ impl WorldPanel {
         // One local drives all three of the dot, the title color and the
         // button, so they cannot drift apart from each other.
         let dirty = self.dirty_world_name().is_some();
+        let saving = open.save_pending();
         let has_selection = !open.selected.is_empty();
         // While the cart plays, the entities are the game's: every button
         // that would mutate the document is greyed out (Delete is not --
@@ -6796,10 +7220,20 @@ impl WorldPanel {
             .child(
                 div().debug_selector(|| "ggo-world-save".into()).child(
                     Button::new("ggo-world-save", "Save")
-                        .disabled(!dirty)
+                        .disabled(!dirty || saving)
                         .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
                 ),
             )
+            // In Live the write waits on the cart handing its world back,
+            // which takes cart frames -- so the row says the save is in
+            // flight rather than looking like a button that did nothing.
+            .children(saving.then(|| {
+                div().debug_selector(|| "ggo-world-saving".into()).child(
+                    Label::new("Saving…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            }))
             .children(open.save_error.as_ref().map(|e| {
                 ggo_common::CopyableText::new(
                     "ggo-world-save-error-copy",
@@ -7194,9 +7628,9 @@ impl WorldPanel {
                                 .icon_size(IconSize::Small)
                                 .tooltip(ui::Tooltip::text("Unlink this background layer"))
                                 .disabled(playing)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.clear_background_impl(layer, cx)
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.clear_background_impl(layer, cx),
+                                )),
                             ),
                     )
                     .into_any_element(),
@@ -14668,6 +15102,68 @@ mod tests {
         cart_says(endpoint, end);
     }
 
+    /// A `Snapshot` blob body: `entity_count u32`, then per tracked slot
+    /// `index u32, comp_count u16, bags`.
+    fn snapshot_body(entities: &[(u32, Vec<Vec<u8>>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entities.len() as u32).to_le_bytes());
+        for (index, bags) in entities {
+            body.extend_from_slice(&index.to_le_bytes());
+            body.extend_from_slice(&(bags.len() as u16).to_le_bytes());
+            for bag in bags {
+                body.extend_from_slice(bag);
+            }
+        }
+        body
+    }
+
+    /// A `Layer` blob body: `w u16, h u16, cells [u16; w * h]`. `0 x 0` is
+    /// the cart's answer for a slot with no map.
+    fn layer_body(w: u16, h: u16, cells: &[u16]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&h.to_le_bytes());
+        for cell in cells {
+            body.extend_from_slice(&cell.to_le_bytes());
+        }
+        body
+    }
+
+    /// Answer the readbacks a save in flight asked for, the way the cart
+    /// does: one `Snapshot` blob carrying `entities`, and one `Layer` blob
+    /// per `ReadLayer` the host sent -- `layers` where the slot has an
+    /// entry, `0 x 0` ("no map") where it does not.
+    fn answer_cart_save(
+        panel: &Entity<WorldPanel>,
+        endpoint: &ggo_common::LinkEndpoint,
+        cx: &mut gpui::VisualTestContext,
+        entities: &[(u32, Vec<Vec<u8>>)],
+        layers: &[(u8, u16, u16, Vec<u16>)],
+    ) {
+        use emerald_editor_runtime::wire::{self, HostMsg};
+
+        let mut asked_snapshot = false;
+        let mut asked_layers: Vec<u8> = Vec::new();
+        for message in host_sent(endpoint) {
+            match wire::decode_host(&message) {
+                Some(HostMsg::Snapshot) => asked_snapshot = true,
+                Some(HostMsg::ReadLayer { layer }) => asked_layers.push(layer),
+                _ => {}
+            }
+        }
+        for layer in asked_layers {
+            let body = match layers.iter().find(|(slot, ..)| *slot == layer) {
+                Some((_, w, h, cells)) => layer_body(*w, *h, cells),
+                None => layer_body(0, 0, &[]),
+            };
+            cart_blob(endpoint, 1, u32::from(layer), &body);
+        }
+        if asked_snapshot {
+            cart_blob(endpoint, 0, 0, &snapshot_body(entities));
+        }
+        cart_frames(panel, endpoint, cx, 1);
+    }
+
     /// `0x83 Schema`: `off u16`, then the packed table -- `count u16`,
     /// then per component `name str, field_count u8`, then per field
     /// `name str, kind u8`. The bags only mean anything against this
@@ -14902,7 +15398,9 @@ mod tests {
             dir.path(),
             "worlds/flat.toml",
             &WorldFile {
-                entities: vec![entity(json!({ "Transform": { "pos": [4.0, 4.0], "z": 0 } }))],
+                entities: vec![entity(
+                    json!({ "Transform": { "pos": [4.0, 4.0], "z": 0 } }),
+                )],
                 instances: vec![],
                 backgrounds: vec![],
             },
@@ -15612,8 +16110,7 @@ mod tests {
             let state = open_of(panel).store.state();
             assert_eq!(state.entities[0].components["Transform"]["z"], json!(5));
             assert_eq!(
-                state.entities[0].components["Transform"]["pos"],
-                pos_before,
+                state.entities[0].components["Transform"]["pos"], pos_before,
                 "the position it was already at is not rewritten -- the bag
                  decodes to `4.0` where the document authored `4`, and an op
                  between the two is one the store would fold away anyway"
@@ -17153,6 +17650,16 @@ mod tests {
 
         panel.update(cx, |panel, cx| panel.save_impl(cx));
         cx.run_until_parked();
+        // The save waits on the cart's world. Its layer 0 answer is the
+        // PRE-stroke map (nothing has told it about the stroke yet), which
+        // is exactly what must not be folded back over the session.
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(0, vec![transform_bag([4.0, 4.0], 0)])],
+            &[(0, 2, 2, vec![live::BLANK_TILE; 4])],
+        );
         let sent = settle_live(&panel, &endpoint, cx);
 
         let saved = io::open_map(dir.path(), "maps/test.bg0.map").expect("the painted map saved");
@@ -17165,6 +17672,400 @@ mod tests {
             layer_blob(&sent, 0),
             Some(live::layer_bytes(saved.w, saved.h, &saved.cells)),
             "the save's layer blob carries the painted cells, not the pre-stroke map"
+        );
+    }
+
+    /// A `CartBlobBegin` the cart then gives up on: `0x92 CartBlobEnd`
+    /// carrying [`CART_BLOB_ABANDONED`], which is the only way the host
+    /// learns that bytes it asked for are not coming.
+    fn cart_blob_abandoned(endpoint: &ggo_common::LinkEndpoint, kind: u8, index: u32) {
+        let mut begin = vec![0x90, kind];
+        begin.extend_from_slice(&16u32.to_le_bytes());
+        begin.extend_from_slice(&index.to_le_bytes());
+        cart_says(endpoint, begin);
+        let mut end = vec![0x92];
+        end.extend_from_slice(&emerald_editor_runtime::wire::CART_BLOB_ABANDONED.to_le_bytes());
+        cart_says(endpoint, end);
+    }
+
+    /// The cart owns the live world, so a save in Live writes what the
+    /// CART holds: an entity one of its own systems moved -- with no row
+    /// report the mirror could have folded -- lands in the TOML at the
+    /// position the snapshot carried, components and all.
+    #[gpui::test]
+    async fn a_save_in_live_writes_the_carts_entities(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
+        // Something to save, and a position the snapshot will overrule.
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [8.0, 8.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        show_panel(cx);
+        assert!(
+            cx.debug_bounds("ggo-world-saving").is_none(),
+            "nothing is in flight yet"
+        );
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                open_of(panel).save_pending(),
+                "the save waits on the cart's world"
+            );
+            assert!(
+                panel.dirty_world_name().is_some(),
+                "and nothing is written until it lands"
+            );
+        });
+        assert!(
+            cx.debug_bounds("ggo-world-saving").is_some(),
+            "the status row says the save is in flight"
+        );
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(0, vec![transform_bag([40.0, 12.0], 3)])],
+            &[],
+        );
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!open_of(panel).save_pending(), "the save settled");
+            assert_eq!(open_of(panel).save_error, None);
+            assert!(panel.dirty_world_name().is_none(), "and cleared dirty");
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-world-saving").is_none(),
+            "and the row goes with it"
+        );
+        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([40, 12]),
+            "the TOML has the position the cart reported, not the document's"
+        );
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["z"],
+            json!(3),
+            "and every other field of the snapshot's bag"
+        );
+    }
+
+    /// A snapshot index the document's flattening does not name is an
+    /// entity one of the cart's own systems spawned: it is APPENDED rather
+    /// than dropped, so a save keeps what the cart added.
+    #[gpui::test]
+    async fn a_save_appends_an_entity_the_cart_added(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [8.0, 8.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[
+                (0, vec![transform_bag([8.0, 8.0], 0)]),
+                (1, vec![transform_bag([64.0, 32.0], 1)]),
+            ],
+            &[],
+        );
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).store.state().entities.len(),
+                2,
+                "the document gained the cart's entity"
+            );
+        });
+        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        assert_eq!(on_disk.entities.len(), 2, "and so did the file");
+        assert_eq!(
+            on_disk.entities[1].components["Transform"]["pos"],
+            json!([64, 32])
+        );
+    }
+
+    /// A slot's readback is written into the `.map` behind it, so cells a
+    /// user edit system painted survive the save. A slot the cart answers
+    /// `0 x 0` for has no map at all, and its file is left alone.
+    #[gpui::test]
+    async fn a_save_writes_the_carts_layer_cells(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
+        let before = io::open_map(dir.path(), "maps/test.bg0.map").expect("the linked map");
+        assert_eq!(before.cells.first().copied(), Some(live::BLANK_TILE));
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        // 2 x 2 of the cart's shadow over a 16 x 16 document map: the
+        // dimensions it reports are what it clamped the map to, so the
+        // cells land in the top-left and the rest of the file stands.
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(0, vec![transform_bag([4.0, 4.0], 0)])],
+            &[(0, 2, 2, vec![7, live::BLANK_TILE, live::BLANK_TILE, 9])],
+        );
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).save_error, None);
+        });
+        let saved = io::open_map(dir.path(), "maps/test.bg0.map").expect("the map saved");
+        assert_eq!(
+            saved.w, before.w,
+            "the cart's shadow does not resize the map"
+        );
+        assert_eq!(saved.cells.first().copied(), Some(7), "the painted cell");
+        assert_eq!(
+            saved.cells.get(usize::from(saved.w) + 1).copied(),
+            Some(9),
+            "placed by the readback's own row stride, not the file's"
+        );
+    }
+
+    /// A cart that gives up on a blob the save asked for fails the save:
+    /// the file is left exactly as it was, the document stays dirty, and
+    /// the status row says why. A half-written world is worse than none.
+    #[gpui::test]
+    async fn a_failed_cart_blob_fails_the_save_and_keeps_the_file(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [8.0, 8.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        cart_blob_abandoned(&endpoint, 0, 0);
+        cart_frames(&panel, &endpoint, cx, 1);
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!open_of(panel).save_pending(), "the save is over");
+            assert_eq!(
+                open_of(panel).save_error.as_deref(),
+                Some("the cart could not send its world")
+            );
+            assert!(
+                panel.dirty_world_name().is_some(),
+                "a failed save keeps the document dirty"
+            );
+        });
+        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([4, 4]),
+            "the file is untouched"
+        );
+    }
+
+    /// A save that the cart never answers gives up after
+    /// [`live::SAVE_DEADLINE_FRAMES`] of ITS clock, with the same
+    /// file-untouched discipline as a failed transfer.
+    #[gpui::test]
+    async fn a_save_the_cart_never_answers_times_out(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [8.0, 8.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        cart_frames(&panel, &endpoint, cx, 301);
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).save_error.as_deref(),
+                Some("the cart did not answer in time")
+            );
+            assert!(panel.dirty_world_name().is_some());
+        });
+        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([4, 4])
+        );
+    }
+
+    /// Play is the GAME's world: its entities are where the play-through
+    /// put them, so a save is refused outright rather than persisting a
+    /// run. Nothing is asked of the cart and nothing is written.
+    #[gpui::test]
+    async fn a_save_in_play_is_refused(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [8.0, 8.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).save_error.as_deref(),
+                Some("stop the game to save")
+            );
+            assert!(!open_of(panel).save_pending(), "nothing was asked for");
+            assert!(panel.dirty_world_name().is_some(), "and nothing written");
+        });
+        assert!(
+            host_sent(&endpoint).is_empty(),
+            "no snapshot or readback goes out"
+        );
+        assert!(
+            !dir.path().join("worlds/flat.toml").exists()
+                || world_file::read_world(dir.path(), "worlds/flat.toml")
+                    .unwrap()
+                    .entities[0]
+                    .components["Transform"]["pos"]
+                    == json!([4, 4]),
+            "the file is untouched"
+        );
+    }
+
+    /// The world tab's `Item::save` -- what the pane's close prompt
+    /// awaits -- settles on the cart's answer, not ahead of it: an `Ok`
+    /// returned before the write would let "Save" discard a document
+    /// nothing had written.
+    #[gpui::test]
+    async fn the_tabs_save_waits_for_the_carts_world(cx: &mut TestAppContext) {
+        use workspace::item::{Item, SaveOptions};
+
+        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = cx.update(|_, cx| cx.new(|cx| WorldCanvasItem::new(panel.clone(), cx)));
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [8.0, 8.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        let save = cx.update(|window, cx| {
+            item.update(cx, |item, cx| {
+                item.save(SaveOptions::default(), project, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(open_of(panel).save_pending(), "still waiting on the cart");
+        });
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(0, vec![transform_bag([40.0, 12.0], 0)])],
+            &[],
+        );
+        save.await.expect("the save landed");
+
+        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([40, 12]),
+            "and wrote the cart's world"
+        );
+        item.read_with(cx, |item, cx| {
+            assert!(!item.is_dirty(cx), "the tab is clean again");
+        });
+    }
+
+    /// Design saves the document, as it always did: no snapshot, no
+    /// readback, and the write lands on the spot.
+    #[gpui::test]
+    async fn a_save_in_design_writes_the_document_without_the_cart(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [8.0, 8.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_canvas_mode(CanvasMode::Design, window, cx);
+        });
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).save_error, None);
+            assert!(panel.dirty_world_name().is_none(), "written on the spot");
+        });
+        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        assert_eq!(
+            on_disk.entities[0].components["Transform"]["pos"],
+            json!([8, 8]),
+            "the DOCUMENT's position, which is the only truth in Design"
+        );
+        assert!(
+            !host_sent(&endpoint)
+                .iter()
+                .any(|message| message.first() == Some(&0x12)),
+            "no snapshot is asked for"
         );
     }
 
@@ -17920,7 +18821,12 @@ mod tests {
         let landed = 50.0 + live::from_raw(1);
         cart_rows(
             &endpoint,
-            &[(0, 40.0, landed), (1, 40.0, 8.0), (2, 0.0, 0.0), (3, 42.0, 26.0)],
+            &[
+                (0, 40.0, landed),
+                (1, 40.0, 8.0),
+                (2, 0.0, 0.0),
+                (3, 42.0, 26.0),
+            ],
         );
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {

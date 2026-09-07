@@ -376,6 +376,16 @@ const REPLAY_MAX: usize = 32;
 /// waiting ([`LinkMailbox::spawn`] names the same budget).
 const SPAWN_DEADLINE_FRAMES: u32 = 60;
 
+/// How many cart frames a save may wait for the snapshot and the layer
+/// readbacks it asked for -- five seconds of a cart running at 60 Hz.
+///
+/// Measured on the CART's own frame counter, not on wall time: the
+/// emulator's clock stops while it is paused, and a save that timed out
+/// because the user paused mid-transfer would report a failure the cart
+/// never had. It is also what makes the journeys deterministic -- they
+/// drive frames, not a stopwatch.
+const SAVE_DEADLINE_FRAMES: u32 = 300;
+
 /// The one component whose value is also a row: the mirror places it with
 /// a `SetTransform` rather than a whole-component write, so the two must
 /// never be owed for the same entity at once.
@@ -754,6 +764,122 @@ pub enum AddedEntity {
     Unknown(u32),
 }
 
+/// A save that has asked the cart for the world it is holding and is
+/// waiting for the bytes.
+///
+/// The cart owns the live world: its own edit systems move entities,
+/// rewrite `Text`, paint cells. So a save in Live writes what the CART
+/// has, not what the document last told it -- which means the snapshot
+/// and every loaded layer have to land before anything reaches disk.
+pub struct SaveWait {
+    /// Layer slots the readbacks were asked for, ascending. A slot is
+    /// answered exactly once here: a re-ask mid-transfer would come back
+    /// twice, and the newest answer overwrites the older.
+    wanted: Vec<u8>,
+    /// What each answered slot came back as, `(slot, w, h, cells)`. A
+    /// `0 x 0` answer is the cart's "this slot has no map", which is not
+    /// something to write.
+    layers: Vec<(u8, u16, u16, Vec<u16>)>,
+    /// The snapshot body, once its blob has arrived whole.
+    snapshot: Option<Vec<u8>>,
+    /// The cart frame the requests went out on, which is what
+    /// [`SAVE_DEADLINE_FRAMES`] is measured from.
+    started: u32,
+    /// Why the transfer failed, if the cart gave up on one of the blobs.
+    /// The save is over at that point: a partial world must never be
+    /// written over a whole one.
+    failure: Option<String>,
+}
+
+/// The world as the cart handed it back, decoded and ready to be folded
+/// into the document.
+pub struct CartSave {
+    /// Every entity the cart tracks, as `(cart index, components)`, in the
+    /// order the cart numbered them. A component the schema table cannot
+    /// convert is absent, which is what makes the document keep its own
+    /// value for it.
+    pub entities: Vec<(u32, Vec<(String, serde_json::Map<String, Value>)>)>,
+    /// The cells of every layer slot that HAS a map, `(slot, w, h,
+    /// cells)`.
+    pub layers: Vec<(u8, u16, u16, Vec<u16>)>,
+}
+
+impl SaveWait {
+    /// Fold this tick's cart -> host blobs in. `snapshot` and `layers` are
+    /// what completed, `failed_snapshot`/`failed_layers` what the cart
+    /// gave up on.
+    pub fn note_blobs(
+        &mut self,
+        snapshot: Option<&[u8]>,
+        layers: &[(u32, Vec<u8>)],
+        failed_snapshot: bool,
+        failed_layers: bool,
+    ) {
+        if let Some(body) = snapshot {
+            self.snapshot = Some(body.to_vec());
+        }
+        for (slot, body) in layers {
+            let Ok(slot) = u8::try_from(*slot) else {
+                continue;
+            };
+            if !self.wanted.contains(&slot) {
+                continue;
+            }
+            let Some((w, h, cells)) = emerald_editor_link::parse_layer(body) else {
+                self.failure = Some(format!("the cart's layer {slot} readback was malformed"));
+                continue;
+            };
+            self.layers.retain(|(answered, ..)| *answered != slot);
+            self.layers.push((slot, w, h, cells));
+        }
+        if failed_snapshot {
+            self.failure = Some("the cart could not send its world".to_string());
+        }
+        if failed_layers {
+            self.failure = Some("the cart could not send a background layer".to_string());
+        }
+    }
+
+    /// The whole answer, once every blob has landed; `None` while any is
+    /// still owed. A snapshot that will not parse fails the save rather
+    /// than writing the entities that happened to decode.
+    pub fn decode(
+        &self,
+        schemas: &[emerald_editor_link::SchemaEntry],
+    ) -> Option<Result<CartSave, String>> {
+        let snapshot = self.snapshot.as_ref()?;
+        if self.layers.len() != self.wanted.len() {
+            return None;
+        }
+        let Some(parsed) = emerald_editor_link::parse_snapshot(snapshot) else {
+            return Some(Err("the cart's world snapshot was malformed".to_string()));
+        };
+        let entities = parsed
+            .into_iter()
+            .map(|(index, bags)| {
+                let components = bags
+                    .iter()
+                    .filter_map(|bag| crate::bags::fields_from_bag(schemas, bag))
+                    .collect();
+                (index, components)
+            })
+            .collect();
+        let mut layers = self.layers.clone();
+        layers.sort_by_key(|(slot, ..)| *slot);
+        Some(Ok(CartSave { entities, layers }))
+    }
+
+    /// Why the transfer failed, if it has.
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
+    /// Whether the cart has run out of frames to answer in.
+    pub fn timed_out(&self, frame_seq: u32) -> bool {
+        frame_seq.saturating_sub(self.started) >= SAVE_DEADLINE_FRAMES
+    }
+}
+
 /// One live session: the link to the viewer cart running the open world,
 /// and everything the panel mirrors off it.
 pub struct LiveView {
@@ -905,6 +1031,9 @@ pub struct LiveView {
     pub added_unknown: Vec<u32>,
     /// Whether a snapshot the host asked for is still owed.
     pub snapshot_pending: bool,
+    /// The save waiting on the cart's world, if one is in flight. Set by
+    /// [`Self::begin_save`] and cleared when the write lands or fails.
+    pub saving: Option<SaveWait>,
     /// Transforms already on the wire, in the raw units they were sent in.
     /// A row that comes back at exactly one of these is the HOST's own
     /// undo landing, not cart-side motion, and folding it would apply the
@@ -971,6 +1100,7 @@ impl LiveView {
             spawn_echoes: 0,
             added_unknown: Vec::new(),
             snapshot_pending: false,
+            saving: None,
             replayed_rows: Vec::new(),
             layer_queue: VecDeque::new(),
             // The cart's built-in select tool, which is what a session
@@ -1159,9 +1289,7 @@ impl LiveView {
             // else shifts every document index above it while the cart
             // keeps its slot empty, and the two flattenings stop
             // describing each other.
-            None if before.entities.len() == after.entities.len() + 1
-                && self.spawnable(after) =>
-            {
+            None if before.entities.len() == after.entities.len() + 1 && self.spawnable(after) => {
                 edits.push(CartEdit::Despawn {
                     index: u32::try_from(after.entities.len()).ok()?,
                 });
@@ -1325,6 +1453,34 @@ impl LiveView {
         expired.sort_unstable();
         expired.reverse();
         expired
+    }
+
+    /// Ask the cart for the world it is holding: its whole entity table,
+    /// and the source cells of every layer slot in `slots`.
+    ///
+    /// Both requests go out together rather than one per tick: they are
+    /// answered as BLOBS, which the cart streams back on its own schedule,
+    /// and the host's four-deep send queue is not what a readback occupies.
+    /// `Err` when the cart refused one of them outright -- nothing is
+    /// waiting for an answer in that case, so the caller reports the
+    /// failure and leaves the file alone.
+    pub fn begin_save(&mut self, slots: Vec<u8>) -> Result<(), String> {
+        self.mailbox
+            .request_snapshot()
+            .map_err(|error| format!("the cart refused a world snapshot: {error}"))?;
+        for slot in &slots {
+            self.mailbox
+                .read_layer(u32::from(*slot))
+                .map_err(|error| format!("the cart refused layer {slot}: {error}"))?;
+        }
+        self.saving = Some(SaveWait {
+            wanted: slots,
+            layers: Vec::new(),
+            snapshot: None,
+            started: self.mailbox.frame_seq(),
+            failure: None,
+        });
+        Ok(())
     }
 
     /// Arm the world resend, and drop every command owed the cart. The
@@ -2077,7 +2233,11 @@ mod tests {
 
         live.note_spawn_sent(4);
         live.forget_edits();
-        assert_eq!(live.claim_added(9), AddedEntity::Echo, "the blob carried it");
+        assert_eq!(
+            live.claim_added(9),
+            AddedEntity::Echo,
+            "the blob carried it"
+        );
         assert_eq!(live.claim_added(9), AddedEntity::Unknown(9), "once only");
 
         live.note_spawn_sent(5);

@@ -168,17 +168,12 @@ impl Item for WorldCanvasItem {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        let result = self.panel.update(cx, |panel, cx| {
-            panel.save_impl(cx);
-            match &panel.state {
-                ViewerState::Ready(open) => match &open.save_error {
-                    Some(e) => Err(anyhow::anyhow!(e.clone())),
-                    None => Ok(()),
-                },
-                _ => Ok(()),
-            }
-        });
-        Task::ready(result)
+        // Awaited, not immediate: in Live the write only happens once the
+        // cart has handed its world back, and an `Ok` returned ahead of
+        // that would let the close prompt discard a document nothing had
+        // written yet.
+        let save = self.panel.update(cx, |panel, cx| panel.save_task(cx));
+        cx.background_spawn(async move { save.await.map_err(|e| anyhow::anyhow!(e)) })
     }
 }
 
