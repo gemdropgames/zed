@@ -1,7 +1,7 @@
 //! Live mode's pure half: the link transport over the emu panel's
 //! endpoint, the cart-index <-> document-selection map (the encoder's
 //! order: direct entities, then each instance's subtree depth-first),
-//! hit-testing over the cart's published rects, and the payload builders.
+//! the overlay rows the canvas outlines, and the payload builders.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -57,23 +57,47 @@ impl IndexMap {
     }
 }
 
-/// The lookups the Live gestures need: turning a click on the cart's
-/// picture back into a document selection, and back again to drive the
-/// entities a drag moves.
+/// The lookups the Live mirror needs: turning a row the cart published
+/// back into a document selection, and back again to name the cart
+/// indices a document item owns.
 impl IndexMap {
     pub fn selection_of(&self, cart_index: u32) -> Option<Selection> {
         self.entries.get(cart_index as usize).copied()
     }
 
-    /// Every cart index that belongs to `selection` (one for an entity, a
-    /// contiguous run for an instance).
-    pub fn indices_of(&self, selection: Selection) -> Vec<u32> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| **entry == selection)
-            .map(|(index, _)| index as u32)
-            .collect()
+    /// Each `[[instance]]`'s `(first cart index, count)` run, in instance
+    /// order -- the group table the cart selects and drags whole. Derived
+    /// from the map rather than from the counts it was built with so the
+    /// ranges can never disagree with the indices the rows are resolved
+    /// through.
+    pub fn instance_ranges(&self) -> Vec<(u32, u32)> {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        let mut open: Option<(usize, u32, u32)> = None;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let instance = match entry {
+                Selection::Instance(instance) => Some(*instance),
+                Selection::Entity(_) => None,
+            };
+            match (open, instance) {
+                (Some((current, first, count)), Some(instance)) if current == instance => {
+                    open = Some((current, first, count + 1));
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some((_, first, count)) = open.take() {
+                ranges.push((first, count));
+            }
+            if let Some(instance) = instance {
+                // `as` cannot lose anything a cart index can hold: the map
+                // is indexed by the same `u32` the wire carries.
+                open = Some((instance, index as u32, 1));
+            }
+        }
+        if let Some((_, first, count)) = open {
+            ranges.push((first, count));
+        }
+        ranges
     }
 
     /// Read only by the tests: the map's production users address it by
@@ -116,8 +140,8 @@ impl DocCounts {
 /// One published row from the cart, in world pixels. `x`/`y` are the
 /// entity's TRANSFORM -- what a drag writes back through `SetTransform` --
 /// while the sprite is DRAWN at `(x + ox, y + oy)` sized `(w, h)`. The two
-/// differ for a centered sprite, so hit-testing and the overlay use
-/// [`CartRow::drawn`] and only drags use `x`/`y`.
+/// differ for a centered sprite, so the overlay uses [`CartRow::drawn`]
+/// and only the document mirror uses `x`/`y`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CartRow {
     pub index: u32,
@@ -152,32 +176,6 @@ pub fn rows_from(entities: &[EntityRow]) -> Vec<CartRow> {
         .collect()
 }
 
-fn contains(row: &CartRow, x: f64, y: f64) -> bool {
-    let [left, top, w, h] = row.drawn();
-    x >= left && x < left + w && y >= top && y < top + h
-}
-
-/// Topmost (last) row under a world point, as the cart draws later rows
-/// above earlier ones.
-pub fn hit_row(rows: &[CartRow], x: f64, y: f64) -> Option<u32> {
-    rows.iter()
-        .rev()
-        .find(|row| contains(row, x, y))
-        .map(|row| row.index)
-}
-
-pub fn rows_in_rect(rows: &[CartRow], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<u32> {
-    let (left, right) = (x0.min(x1), x0.max(x1));
-    let (top, bottom) = (y0.min(y1), y0.max(y1));
-    rows.iter()
-        .filter(|row| {
-            let [row_left, row_top, w, h] = row.drawn();
-            row_left < right && row_left + w > left && row_top < bottom && row_top + h > top
-        })
-        .map(|row| row.index)
-        .collect()
-}
-
 /// The Live overlay: one entry per published cart rect that still maps to
 /// something in the document -- the selection it stands for, its world
 /// rect, and whether it is selected. Empty until the cart has republished
@@ -199,64 +197,6 @@ pub fn overlay_rows(
             counts.contains(selection).then(|| {
                 (selection, row.drawn(), selected.contains(&selection))
             })
-        })
-        .collect()
-}
-
-/// The document selection under a world point: the topmost cart rect
-/// there, mapped back through the flattened index map. Nothing until the
-/// cart has republished for the world the panel last sent, for the reason
-/// [`overlay_rows`] draws nothing then: the rows are the PREVIOUS world's
-/// while the index map is already the new one's, so a hit would name the
-/// wrong document item -- and the user cannot even see what they hit.
-pub fn hit(live: &LiveView, counts: DocCounts, world: [f64; 2]) -> Option<Selection> {
-    if !live.loaded() {
-        return None;
-    }
-    let index = hit_row(&live.rows, world[0], world[1])?;
-    let selection = live.index_map.selection_of(index)?;
-    counts.contains(selection).then_some(selection)
-}
-
-/// Every document selection a rubber-band covers, in cart order and
-/// without repeats (an instance owns a contiguous run of cart indices).
-pub fn hits_in_rect(
-    live: &LiveView,
-    counts: DocCounts,
-    start: [f64; 2],
-    current: [f64; 2],
-) -> Vec<Selection> {
-    if !live.loaded() {
-        return Vec::new();
-    }
-    let mut hits = Vec::new();
-    for index in rows_in_rect(&live.rows, start[0], start[1], current[0], current[1]) {
-        if let Some(selection) = live.index_map.selection_of(index)
-            && counts.contains(selection)
-            && !hits.contains(&selection)
-        {
-            hits.push(selection);
-        }
-    }
-    hits
-}
-
-/// Where every cart index the selection owns sits right now, in the
-/// runtime's raw fixed point -- the anchors a live drag adds its delta to.
-/// Deliberately the TRANSFORM (`row.x`/`row.y`), not the drawn rect: the
-/// delta goes back as an absolute `SetTransform`, so folding the sprite's
-/// draw offset in here would teleport a centered sprite by that offset on
-/// the first drag.
-pub fn drag_origins(live: &LiveView, selected: &[Selection]) -> Vec<(u32, i32, i32)> {
-    if !live.loaded() {
-        return Vec::new();
-    }
-    selected
-        .iter()
-        .flat_map(|selection| live.index_map.indices_of(*selection))
-        .filter_map(|index| {
-            let row = live.rows.iter().find(|row| row.index == index)?;
-            Some((index, to_raw(row.x), to_raw(row.y)))
         })
         .collect()
 }
@@ -657,21 +597,28 @@ pub struct LiveView {
     pub rows: Vec<CartRow>,
     pub index_map: IndexMap,
     pub world_sync: WorldSync,
-    /// Where each cart index a drag is moving sat when the drag began, in
-    /// the runtime's raw fixed point -- `SetTransform` is absolute, so the
-    /// mirror of a drag is "origin + the delta the document just took".
-    /// Cleared on release.
-    pub drag_origin: Vec<(u32, i32, i32)>,
-    /// The absolute `SetTransform` payloads an in-flight drag still owes
-    /// the cart, one per moved row. REPLACED (never appended to) by each
-    /// mouse-move and flushed once per tick, which is one cart frame: the
-    /// cart's APP receive queue is four datagrams deep, so a drag that put
-    /// one datagram per row on the wire per move event would overrun it.
+    /// The rows the document mirror has already folded in, as the last
+    /// tick left them. An instance's members have no document position of
+    /// their own -- the document only knows where the `[[instance]]` sits
+    /// -- so a member row is mirrored as the DELTA against this baseline,
+    /// and there is nothing to measure against until it exists.
     ///
-    /// Resolved to absolute positions at the move rather than kept as a
-    /// delta so the last one still flushes after the release has dropped
-    /// [`Self::drag_origin`].
-    pub pending_transforms: Vec<(u32, i32, i32)>,
+    /// Cleared whenever the cart's rows stop describing the open document
+    /// (a world blob in flight): the rows that follow are the previous
+    /// world's, and differencing across that boundary would move an
+    /// instance by the gap between two unrelated worlds.
+    pub mirror_rows: Vec<CartRow>,
+    /// The cart's selection as it last published it, in its own flattened
+    /// indices -- what the mirror compares against to tell "the cart
+    /// selected something else" from "the cart re-sent the same set".
+    pub cart_selection: Vec<u32>,
+    /// The rubber band the cart is dragging out, in world px as
+    /// `[x0, y0, x1, y1]`; `None` when there is none to draw.
+    pub marquee: Option<[f64; 4]>,
+    /// The cart gesture the mirror is folding document ops into, if one is
+    /// open: every op tagged with it amends ONE undo entry, so a whole
+    /// cart-side drag undoes in a single step.
+    pub gesture: Option<u32>,
     pub world_dirty: bool,
     /// The document generation whose encode last failed, and the cart-clock
     /// instant that generation may be tried again at. Encoding walks every
@@ -727,8 +674,10 @@ impl LiveView {
             rows: Vec::new(),
             index_map: IndexMap::new(0, &[]),
             world_sync: WorldSync::Loaded,
-            drag_origin: Vec::new(),
-            pending_transforms: Vec::new(),
+            mirror_rows: Vec::new(),
+            cart_selection: Vec::new(),
+            marquee: None,
+            gesture: None,
             world_dirty: false,
             world_retry_at: None,
             layers_dirty: LayerDirty::default(),
@@ -816,30 +765,6 @@ impl LiveView {
             && frame > acked_at
         {
             self.world_sync = WorldSync::Loaded;
-        }
-    }
-
-    /// Put the drag's outstanding moves on the wire: one datagram per
-    /// moved row, once per tick, which is one cart frame. Coalescing
-    /// happens at the other end -- each mouse-move REPLACES
-    /// [`Self::pending_transforms`] -- so the count here is the size of the
-    /// selection, and there is no per-tick cap on top of that.
-    ///
-    /// A selection wider than the cart's four-deep APP receive queue
-    /// therefore sheds its tail every tick, and does so for certain while
-    /// a blob transfer is using the same queue (this deliberately does not
-    /// wait for one: a drag the user can see lagging is worse than a
-    /// datagram queued behind a blob). That is left uncapped on purpose.
-    /// The payloads are ABSOLUTE and idempotent, so a lost one costs a
-    /// frame of staleness on that row and is corrected by the next tick's
-    /// datagram; the release re-sends the whole world anyway. A cap would
-    /// have to choose which rows go stale and would still not bound the
-    /// queue, because the layer and world transfers share it.
-    pub fn flush_pending_transforms(&mut self) {
-        for (index, x, y) in std::mem::take(&mut self.pending_transforms) {
-            if let Err(error) = self.mailbox.set_transform(index, x, y) {
-                log::warn!("GGO: live drag update for cart entity {index}: {error}");
-            }
         }
     }
 }
@@ -945,8 +870,6 @@ mod tests {
         assert_eq!(m.selection_of(4), Some(Selection::Instance(0)));
         assert_eq!(m.selection_of(5), Some(Selection::Instance(1)));
         assert_eq!(m.selection_of(6), None);
-        assert_eq!(m.indices_of(Selection::Instance(0)), [2, 3, 4]);
-        assert_eq!(m.indices_of(Selection::Entity(1)), [1]);
     }
 
     /// An instance whose world is empty (or failed to read -- both count
@@ -956,36 +879,23 @@ mod tests {
         let m = IndexMap::new(2, &[0, 3]);
         assert_eq!(m.len(), 5);
         assert_eq!(m.selection_of(2), Some(Selection::Instance(1)));
-        assert!(m.indices_of(Selection::Instance(0)).is_empty());
-        assert_eq!(m.indices_of(Selection::Instance(1)), [2, 3, 4]);
+        assert_eq!(m.selection_of(4), Some(Selection::Instance(1)));
     }
 
+    /// The group table the cart is handed: one contiguous run per
+    /// `[[instance]]`, and nothing for the direct entities.
     #[test]
-    fn hit_row_prefers_the_last_row_under_the_point() {
-        let rows = vec![
-            CartRow {
-                index: 0,
-                x: 0.0,
-                y: 0.0,
-                w: 16.0,
-                h: 16.0,
-                ox: 0.0,
-                oy: 0.0,
-            },
-            CartRow {
-                index: 1,
-                x: 8.0,
-                y: 8.0,
-                w: 16.0,
-                h: 16.0,
-                ox: 0.0,
-                oy: 0.0,
-            },
-        ];
-        assert_eq!(hit_row(&rows, 10.0, 10.0), Some(1));
-        assert_eq!(hit_row(&rows, 2.0, 2.0), Some(0));
-        assert_eq!(hit_row(&rows, 100.0, 100.0), None);
-        assert_eq!(rows_in_rect(&rows, 0.0, 0.0, 9.0, 9.0), [0, 1]);
+    fn instance_ranges_are_the_contiguous_run_each_instance_owns() {
+        assert_eq!(
+            IndexMap::new(2, &[2, 3]).instance_ranges(),
+            [(2, 2), (4, 3)]
+        );
+        assert!(IndexMap::new(3, &[]).instance_ranges().is_empty());
+        assert_eq!(
+            IndexMap::new(0, &[1, 0, 2]).instance_ranges(),
+            [(0, 1), (1, 2)],
+            "an instance that flattens to nothing owns no range"
+        );
     }
 
     /// A session with no cart behind it, for the pure lookups: they read
@@ -1023,20 +933,10 @@ mod tests {
         }
     }
 
+    /// The overlay outlines the DRAWN rect, which for a centered sprite is
+    /// not the transform box -- the mirror still folds the transform.
     #[test]
-    fn hit_testing_uses_the_drawn_rect_not_the_transform_box() {
-        let rows = vec![centered_row(0, 100.0, 100.0)];
-        // Up and left of the transform: inside the drawn rect (84..116),
-        // outside a 32x32 box anchored at the transform (100..132).
-        assert_eq!(hit_row(&rows, 88.0, 88.0), Some(0));
-        assert_eq!(rows_in_rect(&rows, 85.0, 85.0, 90.0, 90.0), [0]);
-        // Down and right of the drawn rect but inside that transform box.
-        assert_eq!(hit_row(&rows, 120.0, 120.0), None);
-        assert!(rows_in_rect(&rows, 118.0, 118.0, 130.0, 130.0).is_empty());
-    }
-
-    #[test]
-    fn a_centered_row_overlays_the_drawn_rect_but_drags_from_the_transform() {
+    fn a_centered_row_overlays_the_drawn_rect() {
         let mut live = offline_view(vec![centered_row(0, 100.0, 100.0)], 1, &[]);
         live.world_sync = WorldSync::Loaded;
         let counts = DocCounts {
@@ -1047,12 +947,7 @@ mod tests {
         let overlay = overlay_rows(&live, counts, &[]);
         assert_eq!(overlay.len(), 1);
         assert_eq!(overlay[0].1, [84.0, 84.0, 32.0, 32.0]);
-
-        assert_eq!(
-            drag_origins(&live, &[Selection::Entity(0)]),
-            [(0, to_raw(100.0), to_raw(100.0))],
-            "a drag anchors on the transform the cart writes back"
-        );
+        assert_eq!(live.rows[0].x, 100.0, "and the transform is untouched");
     }
 
     /// Two direct entities and one instance contributing two: cart
@@ -1074,81 +969,6 @@ mod tests {
         entities: 2,
         instances: 1,
     };
-
-    #[test]
-    fn hit_maps_the_topmost_row_back_to_its_selection() {
-        let live = fixture_view();
-        assert_eq!(
-            hit(&live, FIXTURE_COUNTS, [41.0, 9.0]),
-            Some(Selection::Entity(1))
-        );
-        // Either of the instance's two rows names the instance itself.
-        assert_eq!(
-            hit(&live, FIXTURE_COUNTS, [81.0, 1.0]),
-            Some(Selection::Instance(0))
-        );
-        assert_eq!(
-            hit(&live, FIXTURE_COUNTS, [97.0, 1.0]),
-            Some(Selection::Instance(0))
-        );
-        assert_eq!(hit(&live, FIXTURE_COUNTS, [500.0, 500.0]), None);
-    }
-
-    /// The index map is rebuilt from counts that can be one tick behind an
-    /// instance edit, so a row can name something the document has since
-    /// lost. That is a miss, not a selection of nothing.
-    #[test]
-    fn a_row_the_document_no_longer_has_is_not_a_hit() {
-        let live = fixture_view();
-        let shrunk = DocCounts {
-            entities: 1,
-            instances: 0,
-        };
-        assert_eq!(hit(&live, shrunk, [41.0, 9.0]), None);
-        assert_eq!(hit(&live, shrunk, [81.0, 1.0]), None);
-        assert_eq!(
-            hit(&live, shrunk, [1.0, 1.0]),
-            Some(Selection::Entity(0)),
-            "the survivor still hits"
-        );
-    }
-
-    #[test]
-    fn hits_in_rect_names_each_selection_once_in_cart_order() {
-        let live = fixture_view();
-        assert_eq!(
-            hits_in_rect(&live, FIXTURE_COUNTS, [0.0, 0.0], [200.0, 200.0]),
-            [
-                Selection::Entity(0),
-                Selection::Entity(1),
-                Selection::Instance(0)
-            ],
-            "the instance owns two rows and is named once"
-        );
-        assert_eq!(
-            hits_in_rect(&live, FIXTURE_COUNTS, [78.0, 0.0], [90.0, 4.0]),
-            [Selection::Instance(0)]
-        );
-        assert!(hits_in_rect(&live, FIXTURE_COUNTS, [500.0, 500.0], [600.0, 600.0]).is_empty());
-    }
-
-    #[test]
-    fn drag_origins_are_every_cart_index_the_selection_owns() {
-        let live = fixture_view();
-        assert_eq!(
-            drag_origins(&live, &[Selection::Instance(0)]),
-            [(2, to_raw(80.0), 0), (3, to_raw(96.0), 0)],
-            "moving an instance moves its whole subtree"
-        );
-        assert_eq!(
-            drag_origins(&live, &[Selection::Entity(1)]),
-            [(1, to_raw(40.0), to_raw(8.0))]
-        );
-        assert!(
-            drag_origins(&live, &[Selection::Entity(9)]).is_empty(),
-            "a selection the map does not cover owns no cart index"
-        );
-    }
 
     #[test]
     fn overlay_rows_wait_for_the_world_blob_and_flag_the_selection() {
