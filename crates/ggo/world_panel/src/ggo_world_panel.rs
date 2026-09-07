@@ -1302,6 +1302,17 @@ impl OpenWorld {
             return;
         }
         self.doc_generation = self.doc_generation.wrapping_add(1);
+        // A step that changed how many DIRECT entities the document has
+        // re-flattens every cart index: the map has to follow it here,
+        // because a replayed step never pushes a world blob and the blob
+        // push is the only other place that rebuilds it.
+        // `refresh_instance_counts` early-returns on an unchanged instance
+        // list, so nothing else would. Without this the entity `+ Entity`
+        // just appended has no cart index at all, and every row the cart
+        // publishes for it is dropped on the floor.
+        if before.entities.len() != after.entities.len() {
+            self.rebuild_index_map();
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -1572,6 +1583,11 @@ impl OpenWorld {
                                 // The transfer queue is full and the spawn
                                 // was NOT sent: it goes back to the front
                                 // and is asked for again next tick.
+                                // Unreachable while this whole flush is
+                                // gated on `!busy()` -- kept because the
+                                // gate is the caller's, not `spawn`'s, and
+                                // a silently dropped spawn is exactly what
+                                // the pending queue exists to prevent.
                                 Ok(false) => {
                                     drop(bodies);
                                     live.pending_edits
@@ -1974,6 +1990,20 @@ impl OpenWorld {
                 }
                 live::AddedEntity::Echo => {}
                 live::AddedEntity::Unknown(index) => {
+                    // Gated on `fold`, like the rows: in Play the entities
+                    // are the GAME's, and an `EntityAdded` nobody asked for
+                    // is reachable there -- the cart's own Duplicate
+                    // command runs in either mode. An entity a
+                    // play-through spawned is not a document entity, so the
+                    // report is dropped rather than folded in.
+                    //
+                    // Only this arm is gated. A spawn the HOST asked for is
+                    // still claimed: dropping its answer would leave the
+                    // pending spawn to expire and take the optimistic
+                    // entity back out from under a cart that did create it.
+                    if !fold {
+                        continue;
+                    }
                     if !live.added_unknown.contains(&index) {
                         live.added_unknown.push(index);
                     }
@@ -2178,6 +2208,10 @@ impl OpenWorld {
             if let Some(op) = Self::one_step(ops) {
                 self.apply_mirror_op(op);
                 self.prune_selection();
+                // A mirrored op never goes through `note_doc_stepped`, so
+                // the entity count it just changed has to re-flatten the
+                // map here.
+                self.rebuild_index_map();
             }
             self.live_error = Some("add entity refused by the cart".to_string());
             changed = true;
@@ -2194,6 +2228,10 @@ impl OpenWorld {
             {
                 live.resend_world();
             }
+            // Same as above: without this the entity the cart added has no
+            // cart index on this side, and every row it publishes for it is
+            // dropped.
+            self.rebuild_index_map();
             changed = true;
         }
 
@@ -5973,6 +6011,19 @@ impl WorldPanel {
             return;
         }
         live.mode = mode;
+        match mode {
+            // The mirror discards every report while the game runs (the
+            // entities are the game's), and the cart republishes nothing
+            // on its way back out -- so what Edit inherits is a document
+            // that may disagree with the cart on every entity. The blob
+            // is the only thing that can say the whole table at once, and
+            // it also puts the play-through's motion back.
+            EditorMode::Edit => live.resend_world(),
+            // Commands planned against the pre-Play document would land on
+            // the game's world; the resend on the way back out re-states
+            // whatever they were owed.
+            EditorMode::Play => live.forget_edits(),
+        }
         match live.mailbox.set_mode(mode) {
             Ok(()) => live.mode_push_failed = false,
             Err(error) => {
@@ -15230,6 +15281,15 @@ mod tests {
             .collect()
     }
 
+    /// One integer field of a bag, read back the way the cart would.
+    fn bag_int(bag: &[u8], field: &str) -> Option<i32> {
+        let (_, reader, _) = emerald_world::FieldReader::from_bag(bag)?;
+        match reader.get(emerald_world::field_hash(field))? {
+            emerald_world::FieldValue::Int(value) => Some(value),
+            _ => None,
+        }
+    }
+
     /// One string field of a bag, read back the way the cart would.
     fn bag_str(bag: &[u8], field: &str) -> Option<String> {
         let (_, reader, _) = emerald_world::FieldReader::from_bag(bag)?;
@@ -16784,8 +16844,250 @@ mod tests {
         assert_eq!(undo_depth(&panel, cx), 0, "the undo did not become an edit");
     }
 
+    /// A whole-component write and a row for the same entity BOTH go out,
+    /// in the order they were asked for. The bag carries the WHOLE
+    /// component (`z` and all); the row carries only x and y. Letting the
+    /// row cancel the bag lost `z`, and the cart -- which rebuilds a
+    /// component whole -- then published it back at its default and the
+    /// mirror undid the user's edit.
+    #[gpui::test]
+    async fn a_queued_component_survives_a_later_move(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_flat(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::SetField {
+                    entity: 0,
+                    component: "Transform".to_string(),
+                    field: "z".to_string(),
+                    value: json!(3),
+                },
+                cx,
+            );
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [40.0, 4.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).pending_edits.len(),
+                2,
+                "both are owed the cart"
+            );
+            assert!(!live_of(panel).world_dirty, "and neither is a resend");
+        });
+
+        let sent = settle_live(&panel, &endpoint, cx);
+        let writes = set_components(&sent);
+        assert_eq!(writes.len(), 1, "the component write was not cancelled");
+        assert_eq!(bag_int(&writes[0].1, "z"), Some(3), "carrying the new z");
+        let (transforms, _) = sent_transforms(&sent);
+        assert_eq!(
+            transforms,
+            vec![(0, 40.0, 4.0)],
+            "and the row behind it places the entity"
+        );
+        // Order matters: the bag holds the position it was PLANNED with,
+        // so the row has to land after it.
+        let bag_at = sent
+            .iter()
+            .position(|message| message.first() == Some(&0x10))
+            .expect("a SetComponent");
+        let row_at = sent
+            .iter()
+            .position(|message| message.first() == Some(&0x02))
+            .expect("a SetTransform");
+        assert!(bag_at < row_at, "the component goes first");
+    }
+
+    /// Two transforms for one index on consecutive ticks: the answers come
+    /// back in the order they went out, and neither folds. Erasing the
+    /// replay record when the second was queued let the FIRST answer read
+    /// as cart-side motion, which is one spurious undo entry per pair of
+    /// undos that straddle a tick.
+    #[gpui::test]
+    async fn back_to_back_replays_both_retire_without_folding(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_flat(cx).await;
+        settle_live(&panel, &endpoint, cx);
+        cart_rows(&endpoint, &[(0, 4.0, 4.0)]);
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [10.0, 4.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        cart_frames(&panel, &endpoint, cx, 1);
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(
+                WorldOp::MoveEntity {
+                    entity: 0,
+                    pos: [20.0, 4.0],
+                    gesture: None,
+                },
+                cx,
+            );
+        });
+        settle_live(&panel, &endpoint, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).replayed_rows.len(),
+                2,
+                "both transforms are on the wire, both awaiting an answer"
+            );
+        });
+
+        // The cart applies them in order, a frame apart, and republishes.
+        cart_rows(&endpoint, &[(0, 10.0, 4.0)]);
+        cx.run_until_parked();
+        cart_rows(&endpoint, &[(0, 20.0, 4.0)]);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                [20.0, 4.0],
+                "the document is where the user put it"
+            );
+        });
+        assert_eq!(
+            undo_depth(&panel, cx),
+            2,
+            "two moves, two entries -- and nothing folded from their answers"
+        );
+    }
+
+    /// The index map has to follow an entity the document just appended:
+    /// nothing else rebuilds it before the next world blob, and a cart row
+    /// for an index the map does not name is dropped on the floor.
+    #[gpui::test]
+    async fn a_row_for_a_just_added_entity_moves_the_document(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_flat(cx).await;
+        settle_live(&panel, &endpoint, cx);
+        panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
+        settle_live(&panel, &endpoint, cx);
+        cart_added(&endpoint, 1);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).world_dirty,
+                "the cart numbered it where the document did"
+            );
+        });
+
+        cart_rows(&endpoint, &[(0, 4.0, 4.0), (1, 90.0, 90.0)]);
+        cx.run_until_parked();
+        cart_rows(&endpoint, &[(0, 4.0, 4.0), (1, 99.0, 90.0)]);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                entity_pos_of(panel, 1),
+                [99.0, 90.0],
+                "dragging the entity just added moves it in the document"
+            );
+        });
+    }
+
+    /// Play discards every report the cart makes, and the cart republishes
+    /// nothing on its own -- so coming back into Edit re-sends the whole
+    /// world, which is the only thing that can say the entity table at
+    /// once. Without it the two sides stay silently out of step.
+    #[gpui::test]
+    async fn leaving_play_re_sends_the_world(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_flat(cx).await;
+        settle_live(&panel, &endpoint, cx);
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        // Reports made while the game runs are the game's, and dropped.
+        cart_component_changed(&endpoint, 0, &transform_bag([77.0, 77.0], 9));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).store.state().entities[0].components["Transform"]["z"],
+                json!(0),
+                "a play-through is not an edit"
+            );
+        });
+
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Edit, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).world_dirty, "the cart is owed the world");
+        });
+        let sent = settle_live(&panel, &endpoint, cx);
+        assert!(
+            sent.iter().any(|message| message.first() == Some(&0x08)),
+            "and the blob goes out"
+        );
+    }
+
+    /// A `ComponentChanged` for an index the flattening does not name --
+    /// past the document's entities and past every instance member -- is
+    /// dropped rather than aimed at whatever sits at that document index.
+    #[gpui::test]
+    async fn a_component_change_for_an_unknown_index_is_dropped(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        let before = panel.read_with(cx, |panel, _| open_of(panel).store.state());
+
+        cart_component_changed(&endpoint, 99, &transform_bag([12.0, 12.0], 8));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).store.state().entities, before.entities);
+            assert!(!live_of(panel).world_dirty, "and it is not a resend either");
+        });
+    }
+
+    /// A `Transform` report whose position differs from the document's IS
+    /// folded, gesture or no gesture: the cart is the authority on where
+    /// its rows are, and a report that arrives after the drag's `End` is
+    /// still the drag's result.
+    #[gpui::test]
+    async fn a_transform_report_after_a_gesture_end_still_moves_the_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_flat(cx).await;
+        settle_live(&panel, &endpoint, cx);
+        cart_rows(&endpoint, &[(0, 4.0, 4.0)]);
+        cx.run_until_parked();
+        cart_gesture(&endpoint, GESTURE_BEGIN, 1);
+        cart_gesture(&endpoint, GESTURE_END, 1);
+        cx.run_until_parked();
+
+        cart_component_changed(&endpoint, 0, &transform_bag([31.0, 17.0], 0));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                [31.0, 17.0],
+                "the cart's own position, folded into the document"
+            );
+        });
+        assert_eq!(undo_depth(&panel, cx), 1, "as one entry of its own");
+    }
+
     /// Only MOVES replay: undoing a despawn puts an entity back, which
     /// shifts every index above it, and nothing but the blob can say that.
+    ///
+    /// This fixture is the INSTANCED one, so what refuses here is
+    /// `spawnable` -- a world with `[[instance]]`s cannot describe any
+    /// structural change as a command. `a_middle_removal_in_a_flat_world_
+    /// sends_the_blob` covers the other reason.
     #[gpui::test]
     async fn undo_of_a_removal_still_re_sends_the_world(cx: &mut TestAppContext) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;

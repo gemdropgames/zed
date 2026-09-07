@@ -1004,6 +1004,11 @@ async fn play_mode_ignores_clicks_and_runs_the_game(cx: &mut TestAppContext) {
     );
 
     journey.set_mode(EditorMode::Edit);
+    // The whole world goes out again on the way back into Edit: every
+    // report the cart made while the game ran was discarded, and the cart
+    // republishes nothing on its own, so the blob is the only thing that
+    // can put the two sides back in step.
+    journey.settle();
     journey.frames(2);
     let (settled, _) = journey.outline(Selection::Entity(0));
     journey.frames(2);

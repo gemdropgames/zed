@@ -1658,6 +1658,13 @@ mod tests {
     /// the layers rail. The button's label is the map's stem, so the
     /// journeys resolve it by the rail's own `debug_selector` rather than
     /// re-spelling the fixture's file name.
+    ///
+    /// `selector` carries the rail's `-on` suffix: a disabled `Button`
+    /// records no bounds of its own, so the wrapper's selector says which
+    /// state it is in (`ggo_world_panel`'s "Play blocks the layers rail").
+    /// Asking for the `-on` one keeps "the journey clicked a button the
+    /// user could actually press" part of the assertion, instead of
+    /// silently clicking a greyed-out affordance.
     fn click_bg_slot(cx: &mut gpui::VisualTestContext, selector: &'static str) {
         let button = cx
             .debug_bounds(selector)
@@ -1761,7 +1768,7 @@ mod tests {
         let panel = open_world_tab(&workspace, cx, "assets/worlds/edit.toml").await;
 
         const MAP_REL: &str = "maps/edit.bg0.map";
-        click_bg_slot(cx, "ggo-world-bg-paint-0");
+        click_bg_slot(cx, "ggo-world-bg-paint-0-on");
         panel.read_with(cx, |panel, _| {
             assert_eq!(
                 panel.test_paint_mode_rel().as_deref(),
@@ -1872,7 +1879,7 @@ mod tests {
         let panel = open_world_tab(&workspace, cx, "assets/worlds/edit.toml").await;
 
         const MAP_REL: &str = "maps/edit.bg0.map";
-        click_bg_slot(cx, "ggo-world-bg-paint-0");
+        click_bg_slot(cx, "ggo-world-bg-paint-0-on");
         click_bg_cell(&panel, cx, 1, 1);
         click_bg_cell(&panel, cx, 2, 1);
         assert_eq!(bg_cell(&panel, cx, MAP_REL, 1, 1), map_painted_cell());
@@ -1943,7 +1950,7 @@ mod tests {
             );
         });
 
-        click_bg_slot(cx, "ggo-world-bg-paint-0");
+        click_bg_slot(cx, "ggo-world-bg-paint-0-on");
         panel.read_with(cx, |panel, _| {
             assert_eq!(
                 panel.test_paint_mode_rel().as_deref(),
@@ -2009,7 +2016,7 @@ mod tests {
             "and nothing has generated its bg1 map yet"
         );
 
-        click_bg_slot(cx, "ggo-world-bg-slot-1");
+        click_bg_slot(cx, "ggo-world-bg-slot-1-on");
         let entry = cx
             .debug_bounds("MENU_ITEM-art/mapfx.til")
             .expect("the empty slot's picker offered the asset root's one tileset");
@@ -2041,7 +2048,7 @@ mod tests {
             "and born blank"
         );
 
-        click_bg_slot(cx, "ggo-world-bg-paint-1");
+        click_bg_slot(cx, "ggo-world-bg-paint-1-on");
         panel.read_with(cx, |panel, _| {
             assert_eq!(
                 panel.test_paint_mode_rel().as_deref(),
@@ -2597,9 +2604,9 @@ mod tests {
 
     impl emerald_editor_link::LinkIo for EndpointIo {
         fn send(&mut self, payload: &[u8]) -> std::io::Result<()> {
-            self.0.send_app(payload).map_err(|reason| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, reason)
-            })
+            self.0
+                .send_app(payload)
+                .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))
         }
 
         fn recv(&mut self) -> Vec<Vec<u8>> {
@@ -2618,9 +2625,8 @@ mod tests {
         if named.components().count() > 1 {
             return named.is_file();
         }
-        std::env::var_os("PATH").is_some_and(|path| {
-            std::env::split_paths(&path).any(|dir| dir.join(&bin).is_file())
-        })
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(&bin).is_file()))
     }
 
     /// Run one child of this smoke -- niced like every other build the
@@ -2744,10 +2750,7 @@ mod tests {
     }
 
     /// The cart's row for `index`, as of the last poll.
-    fn cart_row(
-        mailbox: &SmokeLink,
-        index: u32,
-    ) -> Option<emerald_editor_link::EntityRow> {
+    fn cart_row(mailbox: &SmokeLink, index: u32) -> Option<emerald_editor_link::EntityRow> {
         mailbox
             .entities()
             .iter()

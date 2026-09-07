@@ -707,10 +707,19 @@ impl CartEdit {
     /// Whether this edit says everything `older` would have, so `older`
     /// can be dropped from the queue rather than landing behind it.
     ///
-    /// A `Transform` and a whole-`Transform` write are two ways of saying
-    /// the same thing, and they do NOT commute: the bag was encoded from
-    /// the document as it stood when the step was planned, so an older one
-    /// landing behind a newer row would put the entity back.
+    /// A whole-`Transform` write says everything a `SetTransform` for the
+    /// same row would: its bag carries the position it was planned with,
+    /// so the row is placed either way.
+    ///
+    /// The reverse is NOT true, and this is asymmetric on purpose. A
+    /// `SetTransform` carries only x and y; a queued `Component` bag
+    /// carries the WHOLE component (`z`, and whatever else the schema
+    /// names). Dropping the bag because a later row supersedes its
+    /// position would lose those fields -- and the cart, which rebuilds a
+    /// component whole, would then publish them back at their defaults and
+    /// the mirror would undo the user's edit. So the two stay queued, in
+    /// order: the bag lands first with the position it was planned with,
+    /// and the transform behind it moves the row to where it is now.
     fn supersedes(&self, older: &CartEdit) -> bool {
         let (Some(index), Some(older_index)) = (self.index(), older.index()) else {
             return false;
@@ -718,15 +727,10 @@ impl CartEdit {
         if index != older_index {
             return false;
         }
-        let names_transform = |edit: &CartEdit| match edit {
-            CartEdit::Transform { .. } => true,
-            CartEdit::Component { component, .. } => component == TRANSFORM,
-            _ => false,
-        };
         match self {
             // Nothing owed for an entity that is about to stop existing.
             CartEdit::Despawn { .. } => true,
-            CartEdit::Transform { .. } => names_transform(older),
+            CartEdit::Transform { .. } => matches!(older, CartEdit::Transform { .. }),
             CartEdit::Component { component, .. } => match older {
                 CartEdit::Transform { .. } => component == TRANSFORM,
                 CartEdit::Component {
@@ -1269,8 +1273,22 @@ impl LiveView {
             }
         }
         let shared = before.entities.len().min(after.entities.len());
+        // A step that also changed how MANY entities there are is only
+        // describable when it left every other entity exactly as it was.
+        // Paired positionally, a removal from the middle of a flat world
+        // reads as "entity i became entity i + 1" all the way up, and
+        // would go out as a cascade of whole-component rewrites -- up to
+        // [`REPLAY_MAX`] cart frames of a visibly scrambled world -- before
+        // the despawn at the end put it right. The blob says it in one go.
+        let structural = before.entities.len() != after.entities.len();
         for entity in 0..shared {
             let (was, now) = (before.entities.get(entity)?, after.entities.get(entity)?);
+            if structural {
+                if was != now {
+                    return None;
+                }
+                continue;
+            }
             edits.extend(self.entity_edits(entity, was, now)?);
         }
         match after.entities.len().checked_sub(before.entities.len()) {
@@ -1296,6 +1314,11 @@ impl LiveView {
             }
             _ => return None,
         }
+        // No edits at all means the diff found a difference no command
+        // names -- a step that only reordered an entity's component keys,
+        // say, which is a name-only change with nothing to send. The blob
+        // covers it: it is rare, and a replay of nothing would leave the
+        // step unsaid.
         (!edits.is_empty() && edits.len() <= REPLAY_MAX).then_some(edits)
     }
 
@@ -1390,12 +1413,16 @@ impl LiveView {
     /// Queue cart edits, superseding anything still owed that they
     /// replace: the last thing the document said about a row or a
     /// component is the only one worth sending.
+    /// [`Self::replayed_rows`] is deliberately left alone: an entry there
+    /// is the pending ANSWER to a transform already on the wire, and
+    /// dropping it because a newer edit was queued would let that answer
+    /// fold back into the document as cart-side motion -- two undos
+    /// straddling a tick each opening an undo entry of their own. The
+    /// entries retire on their own, on the first row for that index that
+    /// lands somewhere other than where the replay put it.
     pub fn queue_edits(&mut self, edits: Vec<CartEdit>) {
         for edit in edits {
             self.pending_edits.retain(|queued| !edit.supersedes(queued));
-            if let Some(index) = edit.index() {
-                self.replayed_rows.retain(|(sent, _, _)| *sent != index);
-            }
             self.pending_edits.push_back(edit);
         }
     }
@@ -1450,6 +1477,18 @@ impl LiveView {
             expired.push(pending.doc_entity);
             false
         });
+        // `doc_entity` is an ABSOLUTE document index, and the caller is
+        // about to remove every entity named here. A spawn still pending
+        // above one of them shifts down by as many as sit below it --
+        // without this, two spawns expiring on different ticks revert the
+        // first correctly and then delete the wrong entity for the second.
+        for pending in &mut self.pending_spawns {
+            let below = expired
+                .iter()
+                .filter(|entity| **entity < pending.doc_entity)
+                .count();
+            pending.doc_entity = pending.doc_entity.saturating_sub(below);
+        }
         expired.sort_unstable();
         expired.reverse();
         expired
@@ -2147,6 +2186,44 @@ mod tests {
         );
     }
 
+    /// A removal from the MIDDLE of a flat world is refused, even though
+    /// the count says "one entity dropped". Paired positionally it reads
+    /// as every entity above the hole having been rewritten into its
+    /// neighbour, which would go out as a cascade of whole-component
+    /// writes -- one per cart frame, a visibly scrambled world for as long
+    /// as it took -- before the despawn at the end put it right.
+    #[test]
+    fn a_middle_removal_in_a_flat_world_sends_the_blob() {
+        let live = offline_view(
+            vec![row(0, 4.0, 4.0), row(1, 10.0, 10.0), row(2, 20.0, 20.0)],
+            3,
+            &[],
+        );
+        let mut before = doc_state([4.0, 4.0], [10.0, 10.0]);
+        before.instances.clear();
+        let mut second = before.entities[0].clone();
+        crate::inspector::set_transform_pos(&mut second.components, [10.0, 10.0]);
+        let mut third = before.entities[0].clone();
+        crate::inspector::set_transform_pos(&mut third.components, [20.0, 20.0]);
+        before.entities = vec![before.entities[0].clone(), second, third.clone()];
+
+        let mut off_the_end = before.clone();
+        off_the_end.entities.pop();
+        assert_eq!(
+            live.plan_replay(&before, &off_the_end),
+            Some(vec![CartEdit::Despawn { index: 2 }]),
+            "the last entity still despawns"
+        );
+
+        let mut from_the_middle = before.clone();
+        from_the_middle.entities.remove(1);
+        assert_eq!(
+            live.plan_replay(&before, &from_the_middle),
+            None,
+            "a hole in the middle is the encoder's to describe"
+        );
+    }
+
     /// The replay window is the mirror's: the cart's indices only describe
     /// this document while the world handshake is settled, and in Play the
     /// entities are the game's to place.
@@ -2181,9 +2258,8 @@ mod tests {
             "the second ask for index 0 replaced the first"
         );
 
-        // A whole-`Transform` write and a row are two ways of saying the
-        // same thing, so the newer one takes the older one's place --
-        // either way round.
+        // A whole-`Transform` write says everything a row would, so it
+        // takes a queued row's place.
         let component = CartEdit::Component {
             index: 0,
             component: "Transform".to_string(),
@@ -2192,17 +2268,21 @@ mod tests {
         live.queue_edits(vec![component.clone()]);
         assert_eq!(
             live.pending_edits.iter().cloned().collect::<Vec<_>>(),
-            vec![at(1, 2), component]
+            vec![at(1, 2), component.clone()]
         );
+        // NOT the other way round: the row carries x and y, the bag
+        // carries the whole component. Dropping the bag would lose `z`,
+        // and the cart -- which rebuilds a component whole -- would
+        // publish it back at its default. Both go, in order.
         live.queue_edits(vec![at(0, 3)]);
         assert_eq!(
             live.pending_edits.iter().cloned().collect::<Vec<_>>(),
-            vec![at(1, 2), at(0, 3)]
+            vec![at(1, 2), component.clone(), at(0, 3)]
         );
         live.queue_edits(vec![CartEdit::Despawn { index: 1 }]);
         assert_eq!(
             live.pending_edits.iter().cloned().collect::<Vec<_>>(),
-            vec![at(0, 3), CartEdit::Despawn { index: 1 }],
+            vec![component, at(0, 3), CartEdit::Despawn { index: 1 }],
             "nothing is owed an entity that is about to stop existing"
         );
 
