@@ -36,6 +36,9 @@ ggo-audio.workspace = true # GGO -- the audio budget line sizes stems against th
 ggo_common.workspace = true
 emerald-editor-link.workspace = true # GGO -- the host half of the editor link (and `EntityRow`, which it re-exports)
 emerald-world.workspace = true # GGO -- encode_toml_at for the live world blob
+# GGO -- `Fixed`/`Vec2` to feed `emerald-world`'s `FieldWriter` when
+# `bags` encodes a component back into a field bag.
+emerald-core.workspace = true # GGO
 # GGO -- wired ahead of its first use (the layers rail lands before the
 # painting does): world-hosted map editing paints a background layer with
 # `ggo_map_panel`'s own `PaintSession`/`MapTool` rather than growing a

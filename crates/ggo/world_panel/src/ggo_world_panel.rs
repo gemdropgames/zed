@@ -24,6 +24,7 @@
 //! deselect).
 
 mod audio_budget;
+pub mod bags;
 mod canvas;
 mod inspector;
 mod live;

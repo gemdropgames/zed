@@ -335,6 +335,7 @@ dialoguer = { version = "0.12", default-features = false }
 editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }
 env_var = { path = "crates/env_var" }
+emerald-core = { path = "../emerald/crates/core" } # GGO
 emerald-editor-link = { path = "../emerald/crates/editor-link" } # GGO
 emerald-editor-runtime = { path = "../emerald/crates/editor-runtime" } # GGO
 emerald-world = { path = "../emerald/crates/world", features = ["std"] } # GGO
