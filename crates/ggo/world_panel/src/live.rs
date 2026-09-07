@@ -776,10 +776,17 @@ pub enum AddedEntity {
 /// has, not what the document last told it -- which means the snapshot
 /// and every loaded layer have to land before anything reaches disk.
 pub struct SaveWait {
-    /// Layer slots the readbacks were asked for, ascending. A slot is
-    /// answered exactly once here: a re-ask mid-transfer would come back
-    /// twice, and the newest answer overwrites the older.
+    /// Layer slots the readbacks were (or will be) asked for, in the
+    /// order the merged background set names them -- which is the draw
+    /// order, not an ascending one. A slot is answered exactly once here:
+    /// a re-ask mid-transfer would come back twice, and the newest answer
+    /// overwrites the older.
     wanted: Vec<u8>,
+    /// Whether the readbacks have actually gone out. A save pressed while
+    /// the cart still owes edits waits here first: a snapshot taken ahead
+    /// of a queued `SetTransform` describes the world BEFORE it, and
+    /// folding that back would undo the edit the user just made.
+    requested: bool,
     /// What each answered slot came back as, `(slot, w, h, cells)`. A
     /// `0 x 0` answer is the cart's "this slot has no map", which is not
     /// something to write.
@@ -1544,21 +1551,78 @@ impl LiveView {
     /// waiting for an answer in that case, so the caller reports the
     /// failure and leaves the file alone.
     pub fn begin_save(&mut self, slots: Vec<u8>) -> Result<(), String> {
-        self.mailbox
-            .request_snapshot()
-            .map_err(|error| format!("the cart refused a world snapshot: {error}"))?;
-        for slot in &slots {
-            self.mailbox
-                .read_layer(u32::from(*slot))
-                .map_err(|error| format!("the cart refused layer {slot}: {error}"))?;
-        }
         self.saving = Some(SaveWait {
             wanted: slots,
             layers: Vec::new(),
             snapshot: None,
             started: self.mailbox.frame_seq(),
             failure: None,
+            requested: false,
         });
+        // The deadline runs from the press either way, so a queue that
+        // never drains times the save out rather than leaving it pending
+        // for ever.
+        self.flush_save()
+    }
+
+    /// Whether a save is waiting for the cart to catch up before it asks
+    /// for anything.
+    pub fn save_flushing(&self) -> bool {
+        self.saving.as_ref().is_some_and(|save| !save.requested)
+    }
+
+    /// Whether an edit of this session's is still waiting to go out. The
+    /// queue drains ONE edit per tick, so a save that asked for the
+    /// snapshot on the tick it was pressed would be answered from a world
+    /// the queue had not reached yet -- and the fold would then write that
+    /// stale answer back over the edit.
+    ///
+    /// A transform already ON the wire ([`Self::replayed_rows`]) is
+    /// deliberately not waited for: datagrams are ordered, so a snapshot
+    /// request sent behind one is answered from a cart that has already
+    /// applied it. Waiting for the echo instead would stall every save
+    /// behind a row the cart may never republish -- an entity it has since
+    /// dropped, or one whose replay entry aged out.
+    fn edits_outstanding(&self) -> bool {
+        self.mailbox.busy() || !self.pending_edits.is_empty()
+    }
+
+    /// Send the readbacks a save is waiting on, once the cart has caught
+    /// up with the edits that went before it. A no-op when there is no
+    /// save waiting, and when there is one that has already asked.
+    pub fn flush_save(&mut self) -> Result<(), String> {
+        if !self.saving.as_ref().is_some_and(|save| !save.requested) || self.edits_outstanding() {
+            return Ok(());
+        }
+        let Some(slots) = self.saving.as_ref().map(|save| save.wanted.clone()) else {
+            return Ok(());
+        };
+        let asked = self.ask_for_save(&slots);
+        match asked {
+            Ok(()) => {
+                if let Some(save) = self.saving.as_mut() {
+                    save.requested = true;
+                }
+                Ok(())
+            }
+            // Nothing is waiting on an answer that was never asked for, so
+            // this is the whole save.
+            Err(reason) => {
+                self.saving = None;
+                Err(reason)
+            }
+        }
+    }
+
+    fn ask_for_save(&mut self, slots: &[u8]) -> Result<(), String> {
+        self.mailbox
+            .request_snapshot()
+            .map_err(|error| format!("the cart refused a world snapshot: {error}"))?;
+        for slot in slots {
+            self.mailbox
+                .read_layer(u32::from(*slot))
+                .map_err(|error| format!("the cart refused layer {slot}: {error}"))?;
+        }
         Ok(())
     }
 
