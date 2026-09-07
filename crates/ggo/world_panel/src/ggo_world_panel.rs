@@ -3684,6 +3684,13 @@ impl WorldPanel {
     /// "erase" (read once, at the gesture's start, so a drag keeps
     /// erasing); `None` continues the gesture already in flight.
     fn paint_at_local(&mut self, local: [f64; 2], press: Option<bool>, cx: &mut Context<Self>) {
+        // Entering Play leaves paint mode, so this is the belt to that
+        // brace: while the game runs the cells under the brush are the
+        // game's, and a stroke that reached the session here would poke
+        // them into a running world and be folded back by the next save.
+        if self.live_playing() {
+            return;
+        }
         let Some((rel, anchor)) = self.active_paint_target() else {
             return;
         };
@@ -3739,6 +3746,25 @@ impl WorldPanel {
         let (rel, _) = self.paint_target_rel(&PaintTarget::BgSlot(slot))?;
         let state = open.sessions.get(&rel)?.store.state();
         Some((slot, state.w, state.h, state.cells))
+    }
+
+    /// The background slot under the brush and the shape the cart's layer
+    /// would have to hold to be this document's: its dimensions and the
+    /// tileset it is bound to. Gated exactly as [`Self::live_layer_cells`]
+    /// is -- there is no cart layer to be out of step with otherwise.
+    fn live_layer_shape(&self) -> Option<(u8, u16, u16, String)> {
+        if !self.live_active() {
+            return None;
+        }
+        let ViewerState::Ready(open) = &self.state else {
+            return None;
+        };
+        let EditMode::Paint(PaintTarget::BgSlot(slot)) = open.mode else {
+            return None;
+        };
+        let (rel, _) = self.paint_target_rel(&PaintTarget::BgSlot(slot))?;
+        let state = open.sessions.get(&rel)?.store.state();
+        Some((slot, state.w, state.h, state.til_path))
     }
 
     /// Queue every cell a paint edit just changed for the cart, one
@@ -4004,6 +4030,12 @@ impl WorldPanel {
         // world's entities. With no cell selection it is a no-op, which is
         // the point: the world's delete must not leak through.
         if self.in_paint_mode() {
+            // Refused rather than forwarded: paint mode's delete is the
+            // map's, and the cart's own Delete despawns entities. While
+            // the game runs neither is the user's to ask for.
+            if self.live_playing() {
+                return;
+            }
             let before = self.live_layer_cells();
             self.update_paint_session(cx, PaintSession::delete_selection);
             self.poke_live_cells(before, cx);
@@ -6274,18 +6306,34 @@ impl WorldPanel {
     /// SELECTION is the cart's (it clears its own on entering Play); the
     /// mirror follows it back.
     pub(crate) fn set_live_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
+        // Not just `live.mode == mode`: a pick whose push failed left the
+        // rail showing a mode the cart is not in, and pressing it again is
+        // the only way back -- taking that for a no-op strands the session.
+        let switching = match &self.state {
+            ViewerState::Ready(open) => open
+                .live
+                .as_ref()
+                .is_some_and(|live| live.mode != mode || live.mode_push_failed),
+            _ => false,
+        };
+        if !switching {
+            return;
+        }
+        // The brush writes cells into the map the CART is drawing, and in
+        // Play that map is the running game's. Leaving the mode is what
+        // takes the whole paint column and its gestures with it, rather
+        // than leaving an armed brush over a picture the document no
+        // longer owns. Before the session borrow below, because
+        // `exit_paint_mode` closes the stroke through `&mut self`.
+        if mode == EditorMode::Play && self.in_paint_mode() {
+            self.exit_paint_mode(cx);
+        }
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
         let Some(live) = open.live.as_mut() else {
             return;
         };
-        // Not just `live.mode == mode`: a pick whose push failed left the
-        // rail showing a mode the cart is not in, and pressing it again is
-        // the only way back -- taking that for a no-op strands the session.
-        if live.mode == mode && !live.mode_push_failed {
-            return;
-        }
         live.mode = mode;
         match mode {
             // The mirror discards every report while the game runs (the
@@ -6345,6 +6393,19 @@ impl WorldPanel {
     /// Whether the CART is playing rather than editing: the game systems
     /// are moving the entities, so the document under them is not the
     /// user's to edit.
+    /// Whether the cart has greeted and is taking datagrams -- what makes
+    /// a save in Live something the cart can actually answer.
+    fn live_connected(&self) -> bool {
+        self.live_active()
+            && match &self.state {
+                ViewerState::Ready(open) => open
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.status == LiveStatus::Connected),
+                _ => false,
+            }
+    }
+
     fn live_playing(&self) -> bool {
         self.live_active()
             && match &self.state {
@@ -6627,7 +6688,11 @@ impl WorldPanel {
         // not even consulted, so whatever text happens to be on it cannot
         // raise a "not world TOML" error over a paste that never wanted it.
         if self.in_paint_mode() {
-            self.paste_cells(cx);
+            // The cells the stamp would land on are the running game's
+            // while it plays, exactly as the world's entities are.
+            if !self.live_playing() {
+                self.paste_cells(cx);
+            }
             return;
         }
         if self.live_playing() {
@@ -7373,6 +7438,17 @@ impl WorldPanel {
         // button, so they cannot drift apart from each other.
         let dirty = self.dirty_world_name().is_some();
         let saving = open.save_pending();
+        // In Live the save reads the CART's world back, and the cart's
+        // world moves without the document: an edit system of the user's
+        // own can rewrite a component, spawn or despawn, and none of that
+        // dirties anything on this side. So "is there something to save"
+        // is not a question the document can answer there -- a connected
+        // session always has something to read.
+        let save_disabled = if self.live_active() {
+            !self.live_connected() || saving
+        } else {
+            !dirty || saving
+        };
         let has_selection = !open.selected.is_empty();
         // While the cart plays, the entities are the game's: every button
         // that would mutate the document is greyed out (Delete is not --
@@ -7556,7 +7632,7 @@ impl WorldPanel {
             .child(
                 div().debug_selector(|| "ggo-world-save".into()).child(
                     Button::new("ggo-world-save", "Save")
-                        .disabled(!dirty || saving)
+                        .disabled(save_disabled)
                         .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
                 ),
             )
@@ -8907,6 +8983,39 @@ impl paint_ui::PaintHost for WorldPanel {
         if let Some((rel, _)) = self.active_paint_target() {
             self.refresh_paint_image(&rel, cx);
         }
+    }
+
+    /// The trait's funnel, with the LIVE layer's shape watched across it.
+    ///
+    /// A resize and a tileset rebind both go through here, and neither is
+    /// a cell poke: the cart's shadow keeps the dimensions and the tileset
+    /// it was LOADED with, so after either of them its layer is no longer
+    /// the document's however many cells are poked at it -- and
+    /// `poke_live_cells` bails on a dimension change outright, which is
+    /// what keeps an undo of a resize from being poked cell by cell into a
+    /// shadow of the wrong size. Clearing the flag stops a save folding
+    /// that stale shadow back over the document; re-arming the slot is
+    /// what eventually gets the cart the new map, once the session behind
+    /// it has been written.
+    fn update_paint_session(
+        &mut self,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut PaintSession) -> bool,
+    ) {
+        let before = self.live_layer_shape();
+        if self.paint_session_mut().is_some_and(edit) {
+            self.paint_session_changed(cx);
+        }
+        let after = self.live_layer_shape();
+        if before != after
+            && let Some((slot, ..)) = after
+            && let ViewerState::Ready(open) = &mut self.state
+            && let Some(live) = open.live.as_mut()
+        {
+            live.set_layer_synced(slot, false);
+            live.layers_dirty.mark(slot);
+        }
+        cx.notify();
     }
 
     fn paint_project_root(&self) -> Option<PathBuf> {
@@ -13568,11 +13677,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.canvas_primary_down_with([10., 10.], false, cx);
             panel.canvas_primary_down_with([50., 12.], true, cx);
-            {
-                let open = open_of(panel);
-                open.view.borrow_mut().hover = Some([100.0, 200.0]);
-                let _ = open;
-            }
+            open_of(panel).view.borrow_mut().hover = Some([100.0, 200.0]);
             let before = open_of(panel).store.state().entities.len();
             panel.duplicate_impl(cx);
             let state = open_of(panel).store.state();
@@ -18308,6 +18413,169 @@ mod tests {
         assert!(
             set_cells(&host_sent(&endpoint)).is_empty(),
             "and nothing was poked at the cart"
+        );
+    }
+
+    /// Entering Play leaves paint mode, and every paint path refuses while
+    /// the game runs: the cells under the brush belong to the run, and a
+    /// stroke poked into them would be folded back by the next save.
+    #[gpui::test]
+    async fn play_leaves_paint_mode_and_refuses_the_brush(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.in_paint_mode()));
+
+        panel.update(cx, |panel, cx| {
+            panel.set_live_mode(EditorMode::Play, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !panel.read_with(cx, |panel, _| panel.in_paint_mode()),
+            "Play took the brush off the canvas"
+        );
+
+        // The mode is put back BY HAND: what is under test now is the gate
+        // on each paint path, and a panel that simply left the mode would
+        // pass it for having no brush at all.
+        let before = panel.update(cx, |panel, _| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.mode = EditMode::Paint(PaintTarget::BgSlot(0));
+            }
+            panel.cell_clipboard = Some(Stamp {
+                w: 1,
+                h: 1,
+                cells: vec![0],
+            });
+            paint_session_of(panel).store.state().cells
+        });
+        host_sent(&endpoint);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+            panel.delete_selected_impl(window, cx);
+            panel.paste_impl(cx);
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| paint_session_of(panel).store.state().cells),
+            before,
+            "the click, the delete and the paste all left the map alone"
+        );
+        assert!(
+            set_cells(&live_tick_sent(&endpoint, cx)).is_empty(),
+            "and none of them reached the running cart"
+        );
+    }
+
+    /// A resize in Live takes the slot out of step and re-arms its push:
+    /// the cart's shadow keeps the dimensions it was LOADED with, so a
+    /// save folding it back would write the pre-resize map over the
+    /// document. The flag comes back once the session behind the slot has
+    /// been written and the new map pushed.
+    #[gpui::test]
+    async fn a_resize_in_live_re_arms_the_slot_and_takes_it_out_of_step(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        settle_live(&panel, &endpoint, cx);
+        assert!(
+            panel.read_with(cx, |panel, _| live_of(panel).layer_is_synced(0)),
+            "the pushed slot starts in step"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.update_paint_session(cx, |session| {
+                session.resize(8, 8);
+                true
+            });
+        });
+        panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert!(
+                !live.layer_is_synced(0),
+                "the cart's shadow is the old size"
+            );
+            assert!(live.layers_dirty.any(), "and the slot is owed a push");
+        });
+
+        // The push reads the map from DISK, so the flag only comes back
+        // once the resized session has been written there.
+        panel.update(cx, |panel, _| {
+            paint_session_mut_of(panel).save().expect("the map writes");
+        });
+        settle_live(&panel, &endpoint, cx);
+        assert!(
+            panel.read_with(cx, |panel, _| live_of(panel).layer_is_synced(0)),
+            "and the cart holds the resized map again"
+        );
+    }
+
+    /// A slot the panel knows is out of step is left alone on disk too.
+    /// The fold's gate used to sit INSIDE the open-session arm, so a slot
+    /// with no session -- one whose push failed, say -- had the cart's
+    /// stale cells patched straight onto the `.map`.
+    #[gpui::test]
+    async fn an_out_of_step_slot_with_no_session_is_not_patched_on_disk(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
+        let before = io::open_map(dir.path(), "maps/test.bg0.map")
+            .expect("the linked map")
+            .cells;
+        // No paint mode was ever entered, so there is no session for the
+        // slot -- and the push it is about to be asked for is one the
+        // panel has recorded as failed.
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).set_layer_synced(0, false);
+        });
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(0, vec![transform_bag([4.0, 4.0], 0)])],
+            &[(0, 2, 2, vec![7, 7, 7, 7])],
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).save_error, None, "the save itself landed");
+        });
+        assert_eq!(
+            io::open_map(dir.path(), "maps/test.bg0.map")
+                .expect("the linked map")
+                .cells,
+            before,
+            "and the cart's cells were not written over the map"
+        );
+    }
+
+    /// In Live, Save is offered whenever the cart is connected: a user
+    /// edit system can rewrite the cart's world without the document ever
+    /// moving, so the document's `dirty` is not what says there is
+    /// something to save.
+    #[gpui::test]
+    async fn save_is_offered_in_live_on_a_clean_document(cx: &mut TestAppContext) {
+        let (panel, _endpoint, _dir, cx) = connected_live_panel(cx).await;
+        assert!(
+            panel.read_with(cx, |panel, _| panel.dirty_world_name().is_none()),
+            "nothing has touched the document"
+        );
+
+        // Through a real CLICK: `.disabled` filters the click handler out,
+        // and the wrapper's selector resolves either way -- which is what
+        // tells a greyed button from a live one.
+        let bounds = cx
+            .debug_bounds("ggo-world-save")
+            .expect("the toolbar renders in Live");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| open_of(panel).save_pending()),
+            "the click reached `save_impl`, which asked the cart for its world"
         );
     }
 
