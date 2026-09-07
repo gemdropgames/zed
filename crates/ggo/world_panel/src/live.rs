@@ -1219,7 +1219,7 @@ impl LiveView {
     }
 
     /// The cart has just dropped every background layer it held, so the
-    /// host owes it all four again.
+    /// host owes it the `linked` ones again.
     ///
     /// `CMD_LOAD_WORLD` blanks them (emerald-editor-runtime's
     /// `sync::blank_all_layers`, called on the world blob so a world
@@ -1230,8 +1230,15 @@ impl LiveView {
     /// to mark them. Cells still owed a slot go too: they are a
     /// difference against a map the cart no longer has, and the re-push
     /// carries them anyway.
-    pub fn note_layers_blanked(&mut self) {
-        self.layers_dirty.mark_all();
+    ///
+    /// Only the linked slots are re-armed: what the cart blanked an
+    /// UNLINKED slot to is exactly the 1x1 blank map
+    /// ([`layer_loads`]) would push it, so pushing one is a blob -- a
+    /// whole tick of the link -- spent to change nothing.
+    pub fn note_layers_blanked(&mut self, linked: &[u8]) {
+        for slot in linked {
+            self.layers_dirty.mark(*slot);
+        }
         self.layer_synced = [false; 4];
         self.pending_pokes.clear();
     }

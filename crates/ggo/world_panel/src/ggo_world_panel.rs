@@ -1730,8 +1730,12 @@ impl OpenWorld {
                         // were computed against.
                         live.forget_edits();
                         // And it blanks all four background layers on the
-                        // cart, which only a whole-slot push puts back.
-                        live.note_layers_blanked();
+                        // cart, which only a whole-slot push puts back --
+                        // for the linked slots; the cart's own blank is
+                        // already what an unlinked one would be pushed.
+                        let linked: Vec<u8> =
+                            self.merged.iter().map(|merged| merged.layer).collect();
+                        live.note_layers_blanked(&linked);
                         live.index_map = live::IndexMap::new(
                             self.store.state().entities.len(),
                             &self.instance_counts,
@@ -1775,15 +1779,27 @@ impl OpenWorld {
                     // (`loader::layer_payloads` skips one on disk for the
                     // same reason), so a session with no cells falls back
                     // to the disk map and leaves the slot out of step.
-                    let from_session = dirty_session.and_then(|session| {
-                        let state = session.store.state();
-                        (state.w > 0 && state.h > 0).then(|| {
-                            (
-                                live::layer_bytes(state.w, state.h, &state.cells),
-                                loader::tileset_stem(&state.til_path),
-                            )
-                        })
-                    });
+                    //
+                    // Never over a BLANK load, whatever the session
+                    // holds. That load is the 1x1 clear an unlinked slot
+                    // -- or one whose `.map` would not open -- is pushed
+                    // with, and its tile budget of 1 clamps every cell
+                    // the cart draws: the session's real cells sent
+                    // against it arrive as a blanked layer. Overriding
+                    // there also marked the slot IN STEP, so the next
+                    // save folded those blanks back over the paint. The
+                    // slot is left out of step instead.
+                    let from_session = dirty_session
+                        .filter(|_| load.tileset_stem != live::BLANK_STEM)
+                        .and_then(|session| {
+                            let state = session.store.state();
+                            (state.w > 0 && state.h > 0).then(|| {
+                                (
+                                    live::layer_bytes(state.w, state.h, &state.cells),
+                                    loader::tileset_stem(&state.til_path),
+                                )
+                            })
+                        });
                     let (map_bytes, tileset_stem) = match &from_session {
                         Some((bytes, stem)) => (bytes.as_slice(), stem.as_str()),
                         None => (load.map_bytes.as_slice(), load.tileset_stem.as_str()),
@@ -2756,9 +2772,9 @@ impl OpenWorld {
             //
             // The cart's cells are only the document's to fold back when
             // the panel knows its layer is in step: a stroke reaches it as
-            // a `SetCell` per cell, but a poke it refused -- or a push
-            // that never left -- leaves the cart holding an older map, and
-            // folding that in would erase the user's paint.
+            // a `SetCell` per cell, but a cell it could not queue -- or a
+            // push that never left -- leaves the cart holding an older
+            // map, and folding that in would erase the user's paint.
             //
             // Tested before the session lookup, not inside it: a slot the
             // panel knows is out of step has nothing the document wants,
@@ -3852,6 +3868,16 @@ impl WorldPanel {
     /// queue's cap, so either leaves the slot out of step and a save folds
     /// the cart's cells back only for a slot that is in step
     /// (`OpenWorld::write_cart_layers`).
+    ///
+    /// A whole-slot push in flight is NOT one of those refusals. It used
+    /// to be, and every cell painted during the several ticks a world
+    /// resend spends re-pushing the layers vanished from the picture with
+    /// nothing but a quietly out-of-step slot to show for it. Queued
+    /// instead: a slot's own blob is read from this very session, so it
+    /// CARRIES these cells and `forget_pokes_for` drops the queued copies
+    /// as it goes out; a cell queued after that blob has left waits for a
+    /// free mailbox and lands on top of it. A poke that duplicates a cell
+    /// the blob already carried writes the value that is already there.
     fn poke_live_cells(
         &mut self,
         before: Option<(u8, u16, u16, Vec<u16>)>,
@@ -3875,7 +3901,7 @@ impl WorldPanel {
         let Some(live) = open.live.as_mut() else {
             return;
         };
-        if (now_width, now_height) != (width, height) || width == 0 || live.layer_push_in_flight() {
+        if (now_width, now_height) != (width, height) || width == 0 {
             live.set_layer_synced(slot, false);
             return;
         }
@@ -18807,6 +18833,53 @@ mod tests {
             assert!(
                 live_of(panel).layer_is_synced(0),
                 "and the cart holds what the document holds"
+            );
+        });
+    }
+
+    /// ...but never over a BLANK load. A slot whose `.map` has gone
+    /// missing is CLEARED with the 1x1 blank map, and that load's tile
+    /// budget of 1 clamps every cell the cart draws -- so the session's
+    /// real cells sent against it would arrive as a blanked layer that
+    /// the panel then called in step, and the next save would fold those
+    /// blanks back over the paint.
+    #[gpui::test]
+    async fn a_blank_load_is_not_overridden_by_the_session(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
+        assert_ne!(painted, live::BLANK_TILE, "the stroke painted a tile");
+
+        // What makes slot 0's load blank while its session is still open
+        // and dirty: `loader::layer_payloads` skips a map it cannot open.
+        std::fs::remove_file(dir.path().join("maps/test.bg0.map")).expect("the linked map");
+        panel.update(cx, |panel, _| live_mut_of(panel).layers_dirty.mark(0));
+        let sent = settle_live(&panel, &endpoint, cx);
+
+        let blob = layer_blob(&sent, 0).expect("the slot was pushed");
+        let cell = |at: usize| {
+            blob.get(at..at + 2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        };
+        assert_eq!(
+            (cell(0), cell(2), cell(4)),
+            (Some(1), Some(1), Some(live::BLANK_TILE)),
+            "the 1x1 clear went out, not the session's cells against a \
+             budget that cannot draw them"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !live_of(panel).layer_is_synced(0),
+                "and the slot is out of step, so a save leaves it to the \
+                 session's own write"
             );
         });
     }

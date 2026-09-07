@@ -757,9 +757,15 @@ impl Journey<'_> {
     /// Link background slot 0 to a real tileset, which is what gives paint
     /// mode a `.map` to open and the cart a layer to hold.
     fn add_background(&mut self) {
+        self.add_background_slot(0);
+    }
+
+    /// [`Self::add_background`] for any slot -- a journey that needs the
+    /// layer push cycle to span more than one tick links two.
+    fn add_background_slot(&mut self, slot: u8) {
         write_test_tileset(self.root(), "tiles/bg.til");
         self.panel.update(self.cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx)
+            panel.add_background_impl(slot, "tiles/bg.til".into(), cx)
         });
         self.cx.run_until_parked();
         self.settle();
@@ -2139,4 +2145,81 @@ async fn a_play_round_trip_puts_the_dropped_cells_back(cx: &mut TestAppContext) 
             .read_with(journey.cx, |panel, _| live_of(panel).layer_is_synced(0)),
         "and the slot is in step again without a save"
     );
+}
+
+/// 32. A cell painted while a LAYER PUSH is in flight still reaches the
+///     cart. Every document edit re-sends the world, the world blob
+///     blanks the cart's layers, and the pushes that put them back run
+///     one slot per tick -- a window many ticks wide, with the brush live
+///     throughout it. Refused there (which is what the panel used to do),
+///     the cell stayed in the document, never reached the picture, and
+///     the only trace was the slot quietly going out of step: no error,
+///     nothing armed to send it later.
+#[gpui::test]
+async fn a_cell_painted_during_a_layer_push_still_reaches_the_cart(cx: &mut TestAppContext) {
+    /// The cell painted, in tiles from the origin, and the generated
+    /// background's side.
+    const CELL: usize = 2;
+    const MAP_DIM: usize = 16;
+
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    // Two linked slots, so the push cycle is still going after slot 0's
+    // blob has left -- which is the window the brush has to survive.
+    journey.add_background_slot(0);
+    journey.add_background_slot(1);
+    journey.enter_paint();
+
+    journey.note_doc_changed();
+    let mut mid_push = false;
+    for _ in 0..400 {
+        mid_push = journey.panel.read_with(journey.cx, |panel, _| {
+            let live = live_of(panel);
+            live.layer_is_synced(0) && live.layer_push_in_flight()
+        });
+        if mid_push {
+            break;
+        }
+        journey.frames(1);
+    }
+    assert!(
+        mid_push,
+        "slot 0's blob has gone out with the rest of the cycle behind it"
+    );
+
+    journey.paint_at([CELL as f64 * 16.0 + 8.0, 8.0]);
+    let painted = journey
+        .session_cells()
+        .get(CELL)
+        .copied()
+        .expect("a cell in the session");
+    assert_ne!(painted, live::BLANK_TILE, "the brush painted a tile");
+    assert_eq!(
+        journey
+            .panel
+            .read_with(journey.cx, |panel, _| open_of(panel).paint_error.clone()),
+        None,
+        "and the panel had nothing to complain about"
+    );
+
+    journey.settle();
+    journey.frames(2);
+
+    assert_eq!(
+        journey.cart_layer_cells().get(CELL).copied(),
+        Some(painted),
+        "the cell painted mid-push is in the cart's picture"
+    );
+    assert!(
+        journey
+            .panel
+            .read_with(journey.cx, |panel, _| live_of(panel).layer_is_synced(0)),
+        "and the slot reads as in step, so a save may fold the cart's \
+         cells back"
+    );
+    assert_eq!(
+        journey.map_cells_on_disk().get(CELL).copied(),
+        Some(live::BLANK_TILE),
+        "with nothing saved: the cell reached the cart, not the disk"
+    );
+    assert_eq!(journey.session_cells().len(), MAP_DIM * MAP_DIM);
 }
