@@ -361,10 +361,19 @@ const POINTER_QUEUE_MAX: usize = 16;
 /// by whatever the user asked for since.
 const COMMAND_QUEUE_MAX: usize = 32;
 
-/// How many of those may go out in one tick. The cart's APP receive queue
-/// is four datagrams deep and the tick's pointer sample has already taken
-/// one of those slots, so a longer burst is dropped on arrival -- and a
-/// command is a discrete request, not a sample the next one supersedes.
+/// How many of those may go out in one tick.
+///
+/// NOT the receive queue: a `Command` (like `Pointer`, `SetMode` and
+/// `SetTool`) is written into the mailbox WITHOUT committing, so
+/// `pump_inbound` keeps draining past it and the cart takes a whole
+/// tick's worth in one pass -- only `SetTransform`, `Camera`, `SetCell`,
+/// `SetComponent`, `Despawn`, `Snapshot`, `ReadLayer` and a blob's `End`
+/// commit (`emerald/crates/editor-runtime/src/link.rs`). What does bound
+/// a tick is the cart's per-frame command ring, `EDIT_CMD_RING = 8`, past
+/// which a command is dropped outright and reported as
+/// `dropped_commands`. Three is a latency-conservative fraction of that
+/// ring -- room for the flush to share a frame with the commands the
+/// cart's own rail queues -- not protection against a queue overrun.
 pub const COMMANDS_PER_TICK: usize = 3;
 
 /// How many cell pokes may wait for the wire before the slot is given up
@@ -374,7 +383,7 @@ pub const COMMANDS_PER_TICK: usize = 3;
 /// point where trickling it out is the right answer. Past the cap the
 /// slot is simply left out of step ([`LiveView::layer_synced`]): the cells
 /// are in the DOCUMENT either way, which is what a save writes.
-const POKE_QUEUE_MAX: usize = 1024;
+pub const POKE_QUEUE_MAX: usize = 1024;
 
 /// How many cart commands one document step may be replayed as before
 /// the whole world is re-sent instead. The cart commits one of them into
@@ -400,6 +409,19 @@ const SPAWN_DEADLINE_FRAMES: u32 = 60;
 /// never had. It is also what makes the journeys deterministic -- they
 /// drive frames, not a stopwatch.
 pub const SAVE_DEADLINE_FRAMES: u32 = 300;
+
+/// How many cart frames a save may wait for the edits queued AHEAD of it
+/// before it gives up on ever asking.
+///
+/// Its own budget, and a much longer one, because the two waits are not
+/// the same thing: [`SAVE_DEADLINE_FRAMES`] measures a cart that has been
+/// ASKED and is not answering, while this one measures a cart that is
+/// still being told what the user did -- one cell per frame, up to
+/// [`POKE_QUEUE_MAX`] of them. A full poke queue is 1024 frames of
+/// honest work, so a 300-frame budget here would fail a save behind a big
+/// fill with "the cart did not answer in time" without the cart ever
+/// having been asked anything.
+pub const SAVE_FLUSH_FRAMES: u32 = 1500;
 
 /// The one component whose value is also a row: the mirror places it with
 /// a `SetTransform` rather than a whole-component write, so the two must
@@ -818,8 +840,12 @@ pub struct SaveWait {
     layers: Vec<(u8, u16, u16, Vec<u16>)>,
     /// The snapshot body, once its blob has arrived whole.
     snapshot: Option<Vec<u8>>,
-    /// The cart frame the requests went out on, which is what
-    /// [`SAVE_DEADLINE_FRAMES`] is measured from.
+    /// The cart frame this wait is measured from: the press while the
+    /// save is still flushing the edits ahead of it, and then the frame
+    /// the readbacks actually went out on, re-baselined by
+    /// [`LiveView::flush_save`]. So the two budgets are consecutive, not
+    /// nested -- a save behind a long queue gets its full
+    /// [`SAVE_DEADLINE_FRAMES`] to be answered once it has finally asked.
     started: u32,
     /// Why the transfer failed, if the cart gave up on one of the blobs.
     /// The save is over at that point: a partial world must never be
@@ -910,9 +936,18 @@ impl SaveWait {
         self.failure.as_deref()
     }
 
-    /// Whether the cart has run out of frames to answer in.
-    pub fn timed_out(&self, frame_seq: u32) -> bool {
-        frame_seq.saturating_sub(self.started) >= SAVE_DEADLINE_FRAMES
+    /// Why this save has run out of cart frames, if it has. The two
+    /// waits get their own budgets and their own words: a save that never
+    /// got to ask is not a cart that would not answer, and telling the
+    /// user the second when it was the first sends them looking at the
+    /// wrong thing.
+    pub fn timeout_reason(&self, frame_seq: u32) -> Option<&'static str> {
+        let waited = frame_seq.saturating_sub(self.started);
+        match self.requested {
+            true => (waited >= SAVE_DEADLINE_FRAMES).then_some("the cart did not answer in time"),
+            false => (waited >= SAVE_FLUSH_FRAMES)
+                .then_some("the cart never caught up with the edits before the save"),
+        }
     }
 }
 
@@ -1644,9 +1679,10 @@ impl LiveView {
             failure: None,
             requested: false,
         });
-        // The deadline runs from the press either way, so a queue that
-        // never drains times the save out rather than leaving it pending
-        // for ever.
+        // A queue that never drains still times the save out: the
+        // flushing wait is measured from the press, on
+        // [`SAVE_FLUSH_FRAMES`], and only the answer wait is re-baselined
+        // onto the frame the readbacks go out on.
         self.flush_save()
     }
 
@@ -1687,10 +1723,15 @@ impl LiveView {
             return Ok(());
         };
         let asked = self.ask_for_save(&slots);
+        let frame_seq = self.mailbox.frame_seq();
         match asked {
             Ok(()) => {
                 if let Some(save) = self.saving.as_mut() {
                     save.requested = true;
+                    // The answer budget starts HERE, not at the press: a
+                    // save that spent a thousand frames feeding the cart
+                    // a fill has had nothing to answer with until now.
+                    save.started = frame_seq;
                 }
                 Ok(())
             }
@@ -1732,7 +1773,20 @@ impl LiveView {
     /// is left behind is the `EntityAdded` it will still report, which
     /// [`Self::claim_added`] swallows instead of reading as an entity the
     /// document has never heard of.
+    ///
+    /// Cells owed the cart go too. Entering Play is the case that makes
+    /// this matter: the map a queued cell was computed against is the
+    /// running game's now, and trickling a fill onto it would repaint a
+    /// world the document no longer owns.
     pub fn forget_edits(&mut self) {
+        // Dropped cells take their slot out of step, exactly as
+        // [`Self::push_poke`]'s overflow does: a cell the cart never
+        // heard means its layer is no longer the document's, so a save's
+        // fold must leave that slot to the paint session's own write
+        // rather than reading the cart's cells back over it.
+        while let Some(poke) = self.pending_pokes.pop_front() {
+            self.set_layer_synced(poke.slot, false);
+        }
         self.pending_edits.clear();
         self.replayed_rows.clear();
         self.spawn_echoes += self.pending_spawns.len();
@@ -1785,7 +1839,9 @@ impl LiveView {
         // The incoming cart holds no layer of this document's at all --
         // it is sent whole ones on the greeting -- so a cell owed the
         // outgoing one would land as a difference against a map that was
-        // never there.
+        // never there. Cleared HERE rather than left to `forget_edits`
+        // below so the slots are not marked out of step for it: the
+        // greeting re-sends every layer whole anyway.
         self.pending_pokes.clear();
         self.forget_edits();
         self.pointer_moving = false;
@@ -2125,6 +2181,110 @@ mod tests {
         assert_eq!(
             live.pending_commands.first(),
             Some(&EditCommand::Nudge { dx: 2, dy: 0 })
+        );
+    }
+
+    fn poke(slot: u8, x: u16, y: u16, tile: u16) -> CellPoke {
+        CellPoke { slot, x, y, tile }
+    }
+
+    fn queued_pokes(live: &LiveView) -> Vec<CellPoke> {
+        live.pending_pokes.iter().copied().collect()
+    }
+
+    /// A stroke that crosses its own path owes the cart one cell, with
+    /// the value it ended on -- and in the place the first crossing put
+    /// it. Cells are independent of each other, so re-queueing at the
+    /// back would reorder them for nothing.
+    #[test]
+    fn a_second_poke_for_a_cell_replaces_its_tile_in_place() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        assert!(live.push_poke(poke(0, 1, 1, 5)));
+        assert!(live.push_poke(poke(0, 2, 2, 6)));
+        assert!(live.push_poke(poke(0, 1, 1, 9)));
+        assert_eq!(
+            queued_pokes(&live),
+            vec![poke(0, 1, 1, 9), poke(0, 2, 2, 6)],
+            "two cells, the first still first, holding the newest tile"
+        );
+        // The same cell of ANOTHER slot is another cell.
+        assert!(live.push_poke(poke(1, 1, 1, 3)));
+        assert_eq!(live.pending_pokes.len(), 3);
+        assert_eq!(live.take_poke(), Some(poke(0, 1, 1, 9)));
+    }
+
+    /// Past the cap the cell is REFUSED rather than displacing an older
+    /// one: the caller is what turns that into "the slot is out of step",
+    /// and dropping an already-queued cell instead would leave the cart
+    /// holding a difference nobody is tracking.
+    #[test]
+    fn the_poke_queue_refuses_a_new_cell_past_its_cap() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        for index in 0..POKE_QUEUE_MAX {
+            let x = u16::try_from(index).expect("the cap fits u16");
+            assert!(live.push_poke(poke(0, x, 0, 1)), "cell {index} queued");
+        }
+        assert!(
+            !live.push_poke(poke(0, 0, 1, 1)),
+            "the cell past the cap is refused"
+        );
+        assert_eq!(
+            live.pending_pokes.len(),
+            POKE_QUEUE_MAX,
+            "and none was lost"
+        );
+        assert!(
+            live.push_poke(poke(0, 0, 0, 7)),
+            "a cell already queued is still writable at the cap"
+        );
+        assert_eq!(live.take_poke(), Some(poke(0, 0, 0, 7)));
+    }
+
+    /// A whole-slot blob replaces the very layer the queued cells were a
+    /// difference against, so they go -- that slot's only, and the caller
+    /// is told there were some (which is what takes the slot out of step,
+    /// the blob carrying the map ON DISK).
+    #[test]
+    fn a_layer_push_forgets_only_the_cells_of_the_slot_it_replaces() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        assert!(live.push_poke(poke(0, 1, 1, 5)));
+        assert!(live.push_poke(poke(1, 2, 2, 6)));
+        assert!(live.forget_pokes_for(0), "slot 0 owed cells");
+        assert_eq!(queued_pokes(&live), vec![poke(1, 2, 2, 6)]);
+        assert!(!live.forget_pokes_for(0), "and now it owes none");
+    }
+
+    /// Entering Play (and every other whole-world resend) drops what is
+    /// owed AND says so: a cell the cart never heard means its layer is
+    /// no longer the document's, so the save's fold must leave that slot
+    /// alone rather than reading stale cells back over it.
+    #[test]
+    fn forget_edits_drops_the_cells_and_takes_their_slots_out_of_step() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        live.set_layer_synced(0, true);
+        live.set_layer_synced(1, true);
+        assert!(live.push_poke(poke(0, 1, 1, 5)));
+        live.forget_edits();
+        assert!(!live.pokes_pending(), "nothing is owed the cart");
+        assert!(!live.layer_is_synced(0), "and its slot is out of step");
+        assert!(live.layer_is_synced(1), "the untouched slot is untouched");
+    }
+
+    /// A new cart is sent whole layers on the greeting, so the cells owed
+    /// the OUTGOING one go without taking their slots out of step --
+    /// unlike every other drop.
+    #[test]
+    fn forget_input_drops_the_cells_the_greeting_will_re_send_anyway() {
+        let mut live = offline_view(Vec::new(), 0, &[]);
+        live.set_layer_synced(0, true);
+        assert!(live.push_poke(poke(0, 1, 1, 5)));
+        assert!(live.push_poke(poke(2, 3, 3, 6)));
+        live.forget_input();
+        assert!(!live.pokes_pending(), "the queue is empty");
+        assert!(!live.pokes_pending_for(0));
+        assert!(
+            live.layer_is_synced(0),
+            "and no slot was marked out of step for it"
         );
     }
 

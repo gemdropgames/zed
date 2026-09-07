@@ -156,6 +156,9 @@ pub(crate) struct CartHarness {
     /// Shared with the link: the wire and the four-deep receive queue
     /// behind it ([`Inbound`]).
     inbound: Arc<Mutex<Inbound>>,
+    /// Whether a dropped datagram is allowed to pass silently -- see
+    /// [`Self::allow_drops`].
+    allow_drops: bool,
     /// Held for the harness's lifetime -- see [`MAILBOX_LOCK`]. Last
     /// field, so it is dropped last: the world and schedule that run
     /// against the static mailbox must be gone before the next harness
@@ -213,6 +216,7 @@ impl CartHarness {
             presented: 0,
             drop_blobs,
             inbound,
+            allow_drops: false,
             _guard: guard,
         }
     }
@@ -226,6 +230,18 @@ impl CartHarness {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drops
+    }
+
+    /// Stop failing frames that lose a host -> cart datagram.
+    ///
+    /// The default is to fail, because a drop is silent everywhere else:
+    /// the host's `set_*` returns `Ok` for a datagram the cart will never
+    /// read, so an unpaced burst shows up as a journey that mysteriously
+    /// loses an edit rather than as a link error. Only a journey that
+    /// deliberately overruns the queue may turn it off, and it owes a
+    /// comment saying which burst it means.
+    pub fn allow_drops(&mut self) {
+        self.allow_drops = true;
     }
 
     /// Drop every cart -> host blob from here on: the world snapshot and
@@ -258,10 +274,21 @@ impl CartHarness {
         self.schedule.run(&mut self.world);
         // The cart has stopped reading for this frame, so whatever is
         // still on the wire arrived with its receive queue full.
-        self.inbound
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .settle(&self.endpoint);
+        let dropped = {
+            let mut inbound = self
+                .inbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inbound.settle(&self.endpoint);
+            inbound.drops
+        };
+        assert!(
+            self.allow_drops || dropped == 0,
+            "the cart's four-deep receive queue lost {dropped} host datagram(s): \
+             the host sent a burst it did not pace, and every datagram past \
+             the fourth is one the cart never saw and cannot ask for again \
+             (`CartHarness::allow_drops` if the journey means to overrun it)"
+        );
         self.present(cx);
     }
 

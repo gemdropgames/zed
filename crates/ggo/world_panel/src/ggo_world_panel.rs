@@ -1613,7 +1613,9 @@ impl OpenWorld {
                             }
                         }
                     }
-                } else if let Some(poke) = live.take_poke() {
+                } else if live.mode == EditorMode::Edit
+                    && let Some(poke) = live.take_poke()
+                {
                     // `else`, and one per tick: a `SetCell` commits into
                     // the SAME single command slot an entity command
                     // does, so two of them in a tick is one datagram the
@@ -1621,6 +1623,18 @@ impl OpenWorld {
                     // reach the cart at all -- sending its cells in the
                     // burst the edit produced them in put them into a
                     // four-deep receive queue, which kept four.
+                    //
+                    // Entity edits deliberately win the tick: they are
+                    // discrete requests the user is waiting on, where a
+                    // cell is one of a fill's thousand. Cells cannot be
+                    // starved by it -- `pending_edits` is fed by document
+                    // ops, which are one gesture apiece and drain to
+                    // empty, not a stream.
+                    //
+                    // Gated on Edit as well as on the queue: the mode
+                    // switch drops what is owed, and this is the second
+                    // half of that -- a poke queued in the same tick as
+                    // the switch must not reach the running game.
                     if let Err(error) = live.set_cell(poke.slot, poke.x, poke.y, poke.tile) {
                         // The document has the cell and the cart does
                         // not, so its layer is no longer the document's:
@@ -1636,6 +1650,14 @@ impl OpenWorld {
         // One update per tick, and none while a blob is in flight: the
         // cart's APP receive queue is four datagrams deep and a transfer
         // already fills it.
+        //
+        // `Camera` COMMITS, like a blob's `End` and like the entity edit
+        // or cell poke that may already have gone out above this on the
+        // same tick -- the cart takes one committing datagram per frame,
+        // so at most one of the two is read on the frame it arrives and
+        // the other waits in the queue behind it. That is a frame of
+        // latency, not a loss: nothing here is dropped while the queue
+        // has room, and the queue only fills when a burst is unpaced.
         if live.status == LiveStatus::Connected && !live.mailbox.busy() {
             // A world the panel already failed to push is not re-attempted
             // until the document moves or [`live::ENCODE_RETRY`] of cart
@@ -1660,7 +1682,22 @@ impl OpenWorld {
             // failure off the status row while that world is still unsent.
             let world_held_back = live.world_dirty && !world_ready;
             let mut live_error = connect_error.take();
-            if world_ready {
+            // The camera goes FIRST, ahead of the world and the layers.
+            // It is one datagram where those are blob transfers of a tick
+            // each, and it is what places the whole picture: pushed last,
+            // a fresh session drew several frames from the cart's own
+            // (0, 0) before the document's framing landed, and the
+            // picture -- and every screen coordinate a gesture is aimed
+            // through -- jumped by the camera offset once it did.
+            if let Some([x, y]) = live.pending_camera.take() {
+                if let Err(error) = live.mailbox.set_camera(live::to_raw(x), live::to_raw(y)) {
+                    // Owed again: a camera the cart never heard would
+                    // otherwise leave the picture where it was with
+                    // nothing left to re-send it.
+                    live.pending_camera = Some([x, y]);
+                    live_error = Some(format!("live camera: {error}"));
+                }
+            } else if world_ready {
                 // follow-up: this encode is on the UI thread; it belongs on
                 // a background task with the blob applied on a later tick.
                 let pushed = live::encode_world(&self.store, &self.root).and_then(|blob| {
@@ -1746,14 +1783,6 @@ impl OpenWorld {
                             live_error = Some(format!("live layer {}: {error}", load.layer));
                         }
                     }
-                }
-            } else if let Some([x, y]) = live.pending_camera.take() {
-                if let Err(error) = live.mailbox.set_camera(live::to_raw(x), live::to_raw(y)) {
-                    // Owed again: a camera the cart never heard would
-                    // otherwise leave the picture where it was with
-                    // nothing left to re-send it.
-                    live.pending_camera = Some([x, y]);
-                    live_error = Some(format!("live camera: {error}"));
                 }
             }
             // Assigned even when it is `None`: a push that succeeded after
@@ -2466,6 +2495,18 @@ impl OpenWorld {
         self.live.as_ref().is_some_and(|live| live.saving.is_some())
     }
 
+    /// Whether that save has not even asked yet: it is waiting for the
+    /// cart to catch up with the edits queued ahead of it. A distinct
+    /// state on the toolbar because it is a distinct wait -- the cells of
+    /// a big fill go out one per cart frame, and a user watching a silent
+    /// "Saving…" through a thousand of them has no way to tell working
+    /// from wedged.
+    fn save_flushing(&self) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(live::LiveView::save_flushing)
+    }
+
     /// Hand every caller waiting on a save the result `save_error` now
     /// says it had. A waiter is resolved exactly once: the receiver is
     /// gone with the sender.
@@ -2536,8 +2577,8 @@ impl OpenWorld {
             // world's, and folding it in would write one world's entities
             // over another's.
             Err("the world was re-sent to the cart mid-save".to_string())
-        } else if save.timed_out(live.mailbox.frame_seq()) {
-            Err("the cart did not answer in time".to_string())
+        } else if let Some(reason) = save.timeout_reason(live.mailbox.frame_seq()) {
+            Err(reason.to_string())
         } else {
             match save.decode(live.mailbox.schemas()) {
                 Some(decoded) => decoded,
@@ -4837,6 +4878,24 @@ impl WorldPanel {
             return None;
         };
         inspector::entity_pos(&open.store.state(), index)
+    }
+
+    /// Whether the panel believes the CART's copy of background slot
+    /// `slot` is the document's -- `None` when there is no live session.
+    ///
+    /// `test-support` only, and the point of exposing it is what a save
+    /// does with it: the layer fold reads the cart's cells back over the
+    /// document's ONLY for a slot that is in step, and skips a slot that
+    /// is not. So a smoke test that paints, saves and then asserts the
+    /// cells on disk passes either way -- through the cart, or through
+    /// the document alone with the cart never having heard the stroke.
+    /// Asserting this first is what tells the two apart.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_live_layer_synced(&self, slot: u8) -> Option<bool> {
+        match &self.state {
+            ViewerState::Ready(open) => open.live.as_ref().map(|live| live.layer_is_synced(slot)),
+            _ => None,
+        }
     }
 
     /// How many entities/instances are selected. Selection is an ordered
@@ -7438,12 +7497,21 @@ impl WorldPanel {
         // button, so they cannot drift apart from each other.
         let dirty = self.dirty_world_name().is_some();
         let saving = open.save_pending();
+        let save_flushing = open.save_flushing();
         // In Live the save reads the CART's world back, and the cart's
         // world moves without the document: an edit system of the user's
         // own can rewrite a component, spawn or despawn, and none of that
         // dirties anything on this side. So "is there something to save"
         // is not a question the document can answer there -- a connected
         // session always has something to read.
+        //
+        // Deliberately WIDER than [`Self::cart_owns_the_world`], which
+        // also wants the world handshake finished: a session that is
+        // connected but still owes the cart its world offers Save, and
+        // `save_impl` then takes the plain document write. That is the
+        // right answer there -- the cart is holding some OTHER world's
+        // entities, so there is nothing of this document's to read back
+        // and the document is the only truth there is.
         let save_disabled = if self.live_active() {
             !self.live_connected() || saving
         } else {
@@ -7641,9 +7709,13 @@ impl WorldPanel {
             // flight rather than looking like a button that did nothing.
             .children(saving.then(|| {
                 div().debug_selector(|| "ggo-world-saving".into()).child(
-                    Label::new("Saving…")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Label::new(if save_flushing {
+                        "Saving… waiting for the cart to catch up"
+                    } else {
+                        "Saving…"
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
                 )
             }))
             .children(open.save_error.as_ref().map(|e| {
@@ -7679,12 +7751,19 @@ impl WorldPanel {
                 ggo_common::CopyableText::new("ggo-world-paste-error-copy", e.clone())
                     .size(LabelSize::Small)
             }))
+            // Wrapped for the `debug_selector`, the same reason the live
+            // error row above is: a smoke test has to be able to tell
+            // "no cell was refused" from "the row was never rendered".
             .children(open.paint_error.as_ref().map(|e| {
-                ggo_common::CopyableText::new(
-                    "ggo-world-paint-error-copy",
-                    format!("cannot paint: {e}"),
-                )
-                .size(LabelSize::Small)
+                div()
+                    .debug_selector(|| "ggo-world-paint-error".into())
+                    .child(
+                        ggo_common::CopyableText::new(
+                            "ggo-world-paint-error-copy",
+                            format!("cannot paint: {e}"),
+                        )
+                        .size(LabelSize::Small),
+                    )
             }))
             .into_any_element()
     }
@@ -15944,12 +16023,27 @@ mod tests {
         cx.run_until_parked();
 
         let sent = host_sent(&endpoint);
+        // `0x03 Camera`, before the world and the layer blobs: it is one
+        // datagram, and it is what the whole picture is placed by. Behind
+        // five blob-tick pushes the cart drew from its own (0, 0) for the
+        // first handful of frames and the picture then jumped by the
+        // document's camera offset -- taking every screen coordinate a
+        // gesture is aimed through with it.
+        assert_eq!(
+            sent.first().map(|m| m[0]),
+            Some(0x03),
+            "the camera is the first thing the cart is told"
+        );
+        // And the world follows on the very next tick.
+        cart_frame(&endpoint, 1);
+        cx.run_until_parked();
+        let sent = host_sent(&endpoint);
         assert_eq!(
             sent.first().map(|m| (m[0], m[1])),
             // `0x08 BlobBegin`, then `kind u8`: 0 is the world document
             // (1 would be a background layer).
             Some((0x08, 0x00)),
-            "the world document goes out as soon as the session opens"
+            "the world document goes out on the tick after"
         );
         panel.read_with(cx, |panel, _| {
             let open = open_of(panel);
@@ -16281,6 +16375,10 @@ mod tests {
             &endpoint,
             hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
         );
+        cx.run_until_parked();
+        // The camera goes out on the connect tick and the world blob on
+        // the one after, and it is the blob that rebuilds the index map.
+        cart_frame(&endpoint, 1);
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             let open = open_of(panel);
@@ -19228,6 +19326,206 @@ mod tests {
                 .any(|message| matches!(wire::decode_host(message), Some(HostMsg::Snapshot))),
             "the save asked once the queue had drained"
         );
+    }
+
+    /// Play does not merely stop the brush: it drops the cells still
+    /// owed the cart, and the drain refuses to run outside Edit. A fill
+    /// queued a thousand cells deep would otherwise go on trickling onto
+    /// the RUNNING game's map, one per frame, for the next seventeen
+    /// seconds.
+    #[gpui::test]
+    async fn play_drops_the_cells_still_owed_the_cart(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        host_sent(&endpoint);
+
+        // Two cells and no tick between them: both are still queued when
+        // the mode changes.
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+            panel.canvas_primary_down_with(live_screen_of(panel, [17.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                live_of(panel).pokes_pending(),
+                "two cells are owed the cart"
+            );
+            assert_eq!(
+                panel.test_live_layer_synced(0),
+                Some(true),
+                "and the slot is in step until they are lost"
+            );
+        });
+
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!live_of(panel).pokes_pending(), "Play dropped them");
+            assert_eq!(
+                panel.test_live_layer_synced(0),
+                Some(false),
+                "and said so: the cart's layer is no longer the document's"
+            );
+        });
+        host_sent(&endpoint);
+        cart_frames(&panel, &endpoint, cx, 2);
+        assert_eq!(
+            set_cells(&host_sent(&endpoint)),
+            vec![],
+            "nothing trickles onto the running game"
+        );
+
+        // Belt to that brace: the drain itself is gated on Edit, so a
+        // cell that reached the queue some other way does not go out
+        // either. Queued by hand -- the brush is refused in Play, which
+        // is what makes this unreachable in production.
+        panel.update(cx, |panel, _| {
+            assert!(live_mut_of(panel).push_poke(live::CellPoke {
+                slot: 0,
+                x: 3,
+                y: 3,
+                tile: 7,
+            }));
+        });
+        cart_frames(&panel, &endpoint, cx, 2);
+        assert_eq!(
+            set_cells(&host_sent(&endpoint)),
+            vec![],
+            "the drain does not run outside Edit"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(live_of(panel).pokes_pending(), "the cell is held, not sent");
+        });
+    }
+
+    /// The flushing wait has its OWN budget, and a long one: a save
+    /// pressed behind a big fill is waiting for cells the cart is being
+    /// told about one per frame, not for an answer it has been asked for.
+    /// On the answer budget alone -- 300 frames against a queue that may
+    /// hold 1024 cells -- it would fail with "the cart did not answer in
+    /// time" without the cart ever having been asked anything.
+    #[gpui::test]
+    async fn a_save_behind_a_big_fill_waits_the_queue_out(cx: &mut TestAppContext) {
+        /// More cells than the answer budget has frames.
+        const CELLS: u32 = 400;
+
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, _| {
+            let live = live_mut_of(panel);
+            for index in 0..CELLS {
+                let x = u16::try_from(index).expect("400 fits u16");
+                assert!(live.push_poke(live::CellPoke {
+                    slot: 0,
+                    x,
+                    y: 0,
+                    tile: 5,
+                }));
+            }
+        });
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        cart_frames(&panel, &endpoint, cx, live::SAVE_DEADLINE_FRAMES + 1);
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            assert!(
+                open.save_pending(),
+                "past the ANSWER budget and still saving"
+            );
+            assert_eq!(open.save_error, None, "with nothing to report");
+            assert!(
+                live_of(panel).save_flushing(),
+                "because it has not asked the cart anything yet"
+            );
+        });
+        assert!(
+            !host_sent(&endpoint).iter().any(|message| matches!(
+                emerald_editor_runtime::wire::decode_host(message),
+                Some(emerald_editor_runtime::wire::HostMsg::Snapshot)
+            )),
+            "and nothing was asked of the cart"
+        );
+
+        // The rest of the queue drains, and the readbacks go out then.
+        cart_frames(&panel, &endpoint, cx, CELLS - live::SAVE_DEADLINE_FRAMES);
+        panel.read_with(cx, |panel, _| {
+            assert!(!live_of(panel).pokes_pending(), "every cell went out");
+            assert!(!live_of(panel).save_flushing(), "so the save finally asked");
+            assert!(
+                open_of(panel).save_pending(),
+                "and is waiting on the answer"
+            );
+        });
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(0, vec![transform_bag([4.0, 4.0], 0)])],
+            &[(0, 1, 1, vec![live::BLANK_TILE])],
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).save_error, None, "and the save landed");
+            assert!(!open_of(panel).save_pending());
+        });
+    }
+
+    /// The flushing wait is not unbounded, and it says what it was: a
+    /// queue that never empties fails the save on
+    /// [`live::SAVE_FLUSH_FRAMES`] with the cart's own name cleared --
+    /// "did not answer in time" would send the user looking at a cart
+    /// that was never asked a thing.
+    #[gpui::test]
+    async fn a_queue_that_never_drains_fails_the_save_as_a_flush(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        host_sent(&endpoint);
+        panel.update(cx, |panel, _| {
+            let live = live_mut_of(panel);
+            for x in 0..2u16 {
+                assert!(live.push_poke(live::CellPoke {
+                    slot: 0,
+                    x,
+                    y: 0,
+                    tile: 5,
+                }));
+            }
+        });
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+
+        // The cart's clock jumped past the flushing budget with a cell
+        // still owed -- a real queue drains one per frame, and this is the
+        // same arithmetic without ten thousand `run_until_parked`s.
+        let frame = panel.read_with(cx, |panel, _| live_of(panel).mailbox.frame_seq());
+        cart_frame(&endpoint, frame + live::SAVE_FLUSH_FRAMES + 1);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).save_error.as_deref(),
+                Some("the cart never caught up with the edits before the save"),
+                "named for the wait it actually was"
+            );
+            assert!(!open_of(panel).save_pending(), "and the save is over");
+        });
+        assert!(
+            !host_sent(&endpoint).iter().any(|message| matches!(
+                emerald_editor_runtime::wire::decode_host(message),
+                Some(emerald_editor_runtime::wire::HostMsg::Snapshot)
+            )),
+            "the cart was never asked"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                live_of(panel).pokes_pending(),
+                "the cells are still owed -- the save gave up, the session did not"
+            );
+        });
     }
 
     /// A cart rebuilt under a save is a cart holding a world this save was

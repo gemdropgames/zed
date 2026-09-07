@@ -371,6 +371,13 @@ impl Journey<'_> {
         self.cart.frames(count, self.cx);
     }
 
+    /// See [`CartHarness::allow_drops`] -- for the one journey that means
+    /// to overrun the cart's receive queue.
+    #[allow(dead_code, reason = "the opt-out exists for journeys to reach for")]
+    fn allow_drops(&mut self) {
+        self.cart.allow_drops();
+    }
+
     /// What the Live canvas would outline right now: one entry per
     /// published cart row that still resolves to something in the
     /// document, in the order the cart published them.
