@@ -807,6 +807,21 @@ impl Journey<'_> {
         self.frames(2);
     }
 
+    /// The funnel every document op reaches -- an entity moved, added,
+    /// deleted, an undo, a save that wrote a `.map`
+    /// ([`OpenWorld::note_doc_changed`]): the whole world goes out again
+    /// on the session's next free tick. Called directly because no ONE
+    /// gesture reaches it in Live, where the drags and deletes are the
+    /// cart's own.
+    fn note_doc_changed(&mut self) {
+        self.panel.update(self.cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("the world is open");
+            };
+            open.note_doc_changed();
+        });
+    }
+
     /// Slot 0's cells as the CART holds them.
     fn cart_layer_cells(&mut self) -> Vec<u16> {
         let (_, _, cells) = self.cart.layer_cells(0).expect("the cart loaded slot 0");
@@ -1968,5 +1983,160 @@ async fn pan_is_inert_in_a_world_that_authors_a_camera(cx: &mut TestAppContext) 
         journey.screen_rect(BOX_A),
         screen_before,
         "so nothing moved on screen either"
+    );
+}
+
+/// 30. A document edit re-sends the world, and `CMD_LOAD_WORLD` BLANKS
+///     every background layer the cart holds
+///     (`emerald-editor-runtime`'s `sync::blank_all_layers`, so a world
+///     switch cannot inherit the outgoing world's layers). The panel owes
+///     the cart all four back -- and it owes them from the paint
+///     SESSION's own cells, which are the only place an unsaved stroke
+///     lives. Pushed from disk instead, the fill would come back as the
+///     pre-stroke map; not pushed at all, the background would simply
+///     vanish from the picture on the next entity move.
+#[gpui::test]
+async fn a_world_resend_puts_the_carts_layers_back(cx: &mut TestAppContext) {
+    /// The filled rect, in cells, and the generated background's side.
+    const RECT: (usize, usize) = (4, 3);
+    const MAP_DIM: usize = 16;
+
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    journey.add_background();
+    journey.enter_paint();
+    journey.set_paint_tool(ggo_map_panel::MapTool::RectFill);
+    journey.paint_drag(
+        [8.0, 8.0],
+        [
+            (RECT.0 - 1) as f64 * 16.0 + 8.0,
+            (RECT.1 - 1) as f64 * 16.0 + 8.0,
+        ],
+    );
+    journey.settle();
+    journey.frames(2);
+
+    let painted = journey
+        .session_cells()
+        .first()
+        .copied()
+        .expect("a cell at the origin");
+    assert_ne!(painted, live::BLANK_TILE, "the fill painted a tile");
+    let filled: Vec<usize> = (0..RECT.1)
+        .flat_map(|y| (0..RECT.0).map(move |x| y * MAP_DIM + x))
+        .collect();
+    let missing = |cart: &[u16]| -> Vec<usize> {
+        filled
+            .iter()
+            .copied()
+            .filter(|index| cart.get(*index) != Some(&painted))
+            .collect()
+    };
+    assert!(
+        missing(&journey.cart_layer_cells()).is_empty(),
+        "the pokes put the whole fill on the cart"
+    );
+
+    journey.note_doc_changed();
+    journey.settle();
+    journey.frames(2);
+
+    let cart = journey.cart_layer_cells();
+    assert!(
+        missing(&cart).is_empty(),
+        "the blob blanked the cart's layers and the re-push put the fill \
+         back; {} of {} cells are missing",
+        missing(&cart).len(),
+        filled.len()
+    );
+    assert!(
+        journey
+            .panel
+            .read_with(journey.cx, |panel, _| live_of(panel).layer_is_synced(0)),
+        "and the slot reads as in step, so a save may fold the cart's \
+         cells back"
+    );
+    assert_eq!(
+        journey.map_cells_on_disk().first().copied(),
+        Some(live::BLANK_TILE),
+        "with nothing saved: the re-push read the session, not the disk"
+    );
+}
+
+/// 31. Play drops the cells still owed the cart and takes their slot out
+///     of step (journey-level version of the rule
+///     `play_drops_the_cells_still_owed_the_cart` states). Coming BACK to
+///     Edit re-sends the world, which blanks the cart's layers -- and the
+///     re-push that follows is what puts the dropped cells into the
+///     picture again, rather than leaving the slot stranded until a save.
+#[gpui::test]
+async fn a_play_round_trip_puts_the_dropped_cells_back(cx: &mut TestAppContext) {
+    const RECT: (usize, usize) = (4, 3);
+    const MAP_DIM: usize = 16;
+
+    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    journey.add_background();
+    journey.enter_paint();
+    journey.set_paint_tool(ggo_map_panel::MapTool::RectFill);
+    // `paint_drag` frames twice, so only the first cells of the twelve
+    // have gone out: the rest are still queued when Play takes them.
+    journey.paint_drag(
+        [8.0, 8.0],
+        [
+            (RECT.0 - 1) as f64 * 16.0 + 8.0,
+            (RECT.1 - 1) as f64 * 16.0 + 8.0,
+        ],
+    );
+    let painted = journey
+        .session_cells()
+        .first()
+        .copied()
+        .expect("a cell at the origin");
+    let filled: Vec<usize> = (0..RECT.1)
+        .flat_map(|y| (0..RECT.0).map(move |x| y * MAP_DIM + x))
+        .collect();
+    let missing = |cart: &[u16]| -> Vec<usize> {
+        filled
+            .iter()
+            .copied()
+            .filter(|index| cart.get(*index) != Some(&painted))
+            .collect()
+    };
+    assert!(
+        journey
+            .panel
+            .read_with(journey.cx, |panel, _| live_of(panel).pokes_pending()),
+        "cells are still owed the cart when Play is picked"
+    );
+
+    journey.set_mode(EditorMode::Play);
+    journey.frames(2);
+    assert!(
+        !missing(&journey.cart_layer_cells()).is_empty(),
+        "and Play dropped them, so the cart's layer is behind the document"
+    );
+    assert!(
+        journey
+            .panel
+            .read_with(journey.cx, |panel, _| !live_of(panel).layer_is_synced(0)),
+        "which the slot says"
+    );
+
+    journey.set_mode(EditorMode::Edit);
+    journey.settle();
+    journey.frames(2);
+
+    let cart = journey.cart_layer_cells();
+    assert!(
+        missing(&cart).is_empty(),
+        "coming back to Edit re-sent the world and pushed the layers \
+         behind it; {} of {} cells are still missing",
+        missing(&cart).len(),
+        filled.len()
+    );
+    assert!(
+        journey
+            .panel
+            .read_with(journey.cx, |panel, _| live_of(panel).layer_is_synced(0)),
+        "and the slot is in step again without a save"
     );
 }

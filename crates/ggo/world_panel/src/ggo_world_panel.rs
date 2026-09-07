@@ -1729,6 +1729,9 @@ impl OpenWorld {
                         // flattening may not be the one these indices
                         // were computed against.
                         live.forget_edits();
+                        // And it blanks all four background layers on the
+                        // cart, which only a whole-slot push puts back.
+                        live.note_layers_blanked();
                         live.index_map = live::IndexMap::new(
                             self.store.state().entities.len(),
                             &self.instance_counts,
@@ -1741,8 +1744,8 @@ impl OpenWorld {
                 // slots is what lets a continuous stroke -- which
                 // re-dirties its own slot every tick -- get past the front
                 // of the queue at all; dropping the slot's stale copy
-                // first is what keeps the bytes that do go out the ones on
-                // disk now.
+                // first is what keeps the bytes that do go out the map as
+                // it is NOW.
                 if live.layers_dirty.any() {
                     let dirty = live.layers_dirty.take();
                     let loads = live::layer_loads(&self.root, &self.merged);
@@ -1752,32 +1755,59 @@ impl OpenWorld {
                         .extend(loads.into_iter().filter(|load| dirty.contains(&load.layer)));
                 }
                 if let Some(load) = live.layer_queue.pop_front() {
-                    // The payload is the map ON DISK. An open paint
-                    // session holds its cells in memory until it is saved,
-                    // so a slot with unsaved paint behind it leaves the
-                    // cart showing the pre-stroke map however well the
-                    // push goes -- and a save must not fold that back.
-                    let unsaved = self
+                    // The queued payload is the map ON DISK, and an open
+                    // paint session holds its cells in memory until it is
+                    // saved -- so a slot pushed behind unsaved paint would
+                    // REGRESS the cart's picture to the pre-stroke map.
+                    // The session's own cells are what the document holds
+                    // for that layer, so they are what goes out, with the
+                    // session's tileset so the cells and the tiles they
+                    // index are the same map. The bank stays the queued
+                    // one: `base`/`budget` are a function of which SLOTS
+                    // are linked, not of the map.
+                    let dirty_session = self
                         .merged
                         .iter()
                         .find(|merged| u32::from(merged.layer) == load.layer)
                         .and_then(|merged| self.sessions.get(&format!("{}.map", merged.stem)))
-                        .is_some_and(PaintSession::dirty);
+                        .filter(|session| session.dirty());
+                    // A zero-sized layer would BLANK the slot outright
+                    // (`loader::layer_payloads` skips one on disk for the
+                    // same reason), so a session with no cells falls back
+                    // to the disk map and leaves the slot out of step.
+                    let from_session = dirty_session.and_then(|session| {
+                        let state = session.store.state();
+                        (state.w > 0 && state.h > 0).then(|| {
+                            (
+                                live::layer_bytes(state.w, state.h, &state.cells),
+                                loader::tileset_stem(&state.til_path),
+                            )
+                        })
+                    });
+                    let (map_bytes, tileset_stem) = match &from_session {
+                        Some((bytes, stem)) => (bytes.as_slice(), stem.as_str()),
+                        None => (load.map_bytes.as_slice(), load.tileset_stem.as_str()),
+                    };
                     let slot = u8::try_from(load.layer).unwrap_or(u8::MAX);
                     // The blob replaces the very layer the queued cells
-                    // were a difference against, and it carries the map
-                    // ON DISK -- so they are dropped rather than painted
-                    // over it, and the slot is out of step until the
-                    // session that holds those cells is saved.
-                    let superseded = live.forget_pokes_for(slot);
+                    // were a difference against, so they are dropped
+                    // rather than painted over it -- and it CARRIES them,
+                    // since the payload above is read from the same
+                    // session those cells came from.
+                    live.forget_pokes_for(slot);
                     match live.mailbox.load_layer(
                         load.layer,
                         load.base,
                         load.budget,
-                        &load.map_bytes,
-                        &load.tileset_stem,
+                        map_bytes,
+                        tileset_stem,
                     ) {
-                        Ok(()) => live.set_layer_synced(slot, !unsaved && !superseded),
+                        Ok(()) => {
+                            live.set_layer_synced(
+                                slot,
+                                from_session.is_some() || dirty_session.is_none(),
+                            );
+                        }
                         Err(error) => {
                             live.set_layer_synced(slot, false);
                             live_error = Some(format!("live layer {}: {error}", load.layer));
@@ -2461,11 +2491,9 @@ impl OpenWorld {
         // of what it is already drawing, and `note_doc_changed` would
         // reload the world under a running session for it.
         written.retain(|rel| !from_cart.contains(rel));
-        // A live session reads its layer payloads from DISK, and a paint
-        // session holds its cells in memory until it is saved -- so the
-        // write is the first moment a HOST-side stroke the cart has not
-        // been poked with can reach it, and nothing else re-arms the slots
-        // it touched.
+        // The map on disk is what a slot with no session open is pushed
+        // from, and the write is the moment it stops being the pre-stroke
+        // one. Nothing else re-arms the slots this touched.
         if !written.is_empty() {
             let slots: Vec<u8> = self
                 .merged
@@ -2728,10 +2756,9 @@ impl OpenWorld {
             //
             // The cart's cells are only the document's to fold back when
             // the panel knows its layer is in step: a stroke reaches it as
-            // a `SetCell` per cell, but a poke it refused -- or a slot
-            // pushed with unsaved paint behind it -- leaves the cart
-            // holding an older map, and folding that in would erase the
-            // user's paint.
+            // a `SetCell` per cell, but a poke it refused -- or a push
+            // that never left -- leaves the cart holding an older map, and
+            // folding that in would erase the user's paint.
             //
             // Tested before the session lookup, not inside it: a slot the
             // panel knows is out of step has nothing the document wants,
@@ -18601,11 +18628,8 @@ mod tests {
             assert!(live.layers_dirty.any(), "and the slot is owed a push");
         });
 
-        // The push reads the map from DISK, so the flag only comes back
-        // once the resized session has been written there.
-        panel.update(cx, |panel, _| {
-            paint_session_mut_of(panel).save().expect("the map writes");
-        });
+        // The push reads the SESSION, so the flag comes back on the
+        // re-push -- no save needed to get the resized map to the cart.
         settle_live(&panel, &endpoint, cx);
         assert!(
             panel.read_with(cx, |panel, _| live_of(panel).layer_is_synced(0)),
@@ -18739,11 +18763,57 @@ mod tests {
         );
     }
 
+    /// A whole-slot push over an unsaved stroke carries the SESSION's
+    /// cells, not the map on disk: the session is what the document holds
+    /// for that layer until it is written, and pushing the disk map would
+    /// regress the cart's picture to before the stroke. The slot is in
+    /// step afterwards, because the cart is now drawing exactly what the
+    /// document has.
+    #[gpui::test]
+    async fn a_push_over_unsaved_paint_carries_the_session_cells(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, _, cx| {
+            panel.canvas_primary_down_with(live_screen_of(panel, [1.0, 1.0]), false, cx);
+            panel.canvas_primary_up(cx);
+        });
+        let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
+        assert_ne!(painted, live::BLANK_TILE, "the stroke painted a tile");
+        assert_eq!(
+            io::open_map(dir.path(), "maps/test.bg0.map")
+                .expect("the linked map")
+                .cells
+                .first()
+                .copied(),
+            Some(live::BLANK_TILE),
+            "and the map on disk is still blank -- nothing has been saved"
+        );
+
+        panel.update(cx, |panel, _| live_mut_of(panel).layers_dirty.mark(0));
+        let sent = settle_live(&panel, &endpoint, cx);
+        let blob = layer_blob(&sent, 0).expect("the slot was pushed");
+        assert_eq!(
+            blob.get(4..6)
+                .map(|cell| u16::from_le_bytes([cell[0], cell[1]])),
+            Some(painted),
+            "the blob's first cell is the stroke's, so the picture did not \
+             go back to the pre-stroke map"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                live_of(panel).layer_is_synced(0),
+                "and the cart holds what the document holds"
+            );
+        });
+    }
+
     /// The other half of the same rule: a slot the panel could NOT keep
-    /// in step -- here a whole-slot push that went out with unsaved paint
-    /// behind it -- is left to the session's own write, because the cart
-    /// is holding the pre-stroke map and folding it back would erase the
-    /// stroke.
+    /// in step is left to the session's own write, because the cart is
+    /// holding some older map and folding it back would erase the stroke.
     #[gpui::test]
     async fn a_save_leaves_an_out_of_step_slot_to_the_session(cx: &mut TestAppContext) {
         let (panel, endpoint, dir, cx) = connected_live_panel_with_background(cx).await;
@@ -18757,17 +18827,13 @@ mod tests {
             panel.canvas_primary_up(cx);
         });
         let painted = panel.read_with(cx, |panel, _| bg_cell(panel, 0));
-        // A whole-slot push over the unsaved stroke: the payload is the
-        // map on DISK, so from here the cart's layer 0 is the pre-stroke
-        // map however many pokes preceded it.
-        panel.update(cx, |panel, _| live_mut_of(panel).layers_dirty.mark(0));
-        settle_live(&panel, &endpoint, cx);
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                !live_of(panel).layer_is_synced(0),
-                "the push carried the pre-stroke bytes"
-            );
-        });
+        // The cell owed the cart goes out first: a save behind a queue
+        // that has not drained is still flushing, and never asks.
+        cart_frames(&panel, &endpoint, cx, 3);
+        // Out of step by hand, which is what every real way of getting
+        // there leaves behind: a cell past [`live::POKE_QUEUE_MAX`], a
+        // `SetCell` the mailbox refused, a push that never left.
+        panel.update(cx, |panel, _| live_mut_of(panel).set_layer_synced(0, false));
 
         panel.update(cx, |panel, cx| panel.save_impl(cx));
         cx.run_until_parked();

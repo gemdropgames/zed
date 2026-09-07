@@ -200,6 +200,16 @@ pub fn fill_missing_background_loads(
 
 const TILESET_EXT: &str = ".til";
 
+/// The extension-less form of the `.til` path a `.map` carries -- the
+/// shape `CMD_LOAD_LAYER` wants, and the same shape every other stem in
+/// this module has.
+pub fn tileset_stem(til_path: &str) -> String {
+    til_path
+        .strip_suffix(TILESET_EXT)
+        .unwrap_or(til_path)
+        .to_string()
+}
+
 /// One background slot's cells, ready for the cart's `CMD_LOAD_LAYER`
 /// (`live::layer_bytes`) plus the tileset the slot's map is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,14 +235,9 @@ pub fn layer_payloads(root: &Path, merged: &[MergedBackground]) -> Vec<LayerPayl
         .filter_map(|background| {
             let rel = format!("{}.map", background.stem);
             let map = io::open_map(root, &rel).ok()?;
-            let tileset_stem = map
-                .til_path
-                .strip_suffix(TILESET_EXT)
-                .unwrap_or(&map.til_path)
-                .to_string();
             Some(LayerPayload {
                 slot: background.layer,
-                tileset_stem,
+                tileset_stem: tileset_stem(&map.til_path),
                 w: map.w,
                 h: map.h,
                 cells: map.cells,

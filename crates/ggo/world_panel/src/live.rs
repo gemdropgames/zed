@@ -1126,13 +1126,13 @@ pub struct LiveView {
     /// and moved to the BACK rather than restarting the cycle.
     pub layer_queue: VecDeque<LayerLoad>,
     /// Per background slot: whether the cart's layer holds the cells the
-    /// DOCUMENT has. A layer blob carries the map as it is on disk, and a
-    /// paint session keeps its cells in memory until it is saved -- so a
-    /// slot pushed with unsaved paint behind it leaves the cart showing
-    /// the pre-stroke map, and a save must leave that slot to the
-    /// session's own write rather than fold the cart's cells back over
-    /// the stroke. A per-cell poke that goes out keeps the flag; one that
-    /// is refused or skipped clears it.
+    /// DOCUMENT has. A whole-slot push sets it -- the payload is read
+    /// from the open paint session where there is one and from disk
+    /// otherwise, so either way it is what the document holds. A per-cell
+    /// poke that goes out keeps the flag; one that is refused or skipped
+    /// clears it, and a save must then leave that slot to the paint
+    /// session's own write rather than fold the cart's older cells back
+    /// over the stroke.
     pub layer_synced: [bool; 4],
     /// Which tool the cart is running the pointer through: 0 is its
     /// built-in select, `n` the `n - 1`th of the edit systems it named in
@@ -1216,6 +1216,24 @@ impl LiveView {
         if let Some(flag) = self.layer_synced.get_mut(usize::from(slot)) {
             *flag = synced;
         }
+    }
+
+    /// The cart has just dropped every background layer it held, so the
+    /// host owes it all four again.
+    ///
+    /// `CMD_LOAD_WORLD` blanks them (emerald-editor-runtime's
+    /// `sync::blank_all_layers`, called on the world blob so a world
+    /// switch cannot inherit the outgoing world's layers) -- shadow and
+    /// hardware both. Nothing else re-arms them, so without this the
+    /// backgrounds simply vanish from the Live picture on the next
+    /// document edit and stay gone until a save or a slot change happens
+    /// to mark them. Cells still owed a slot go too: they are a
+    /// difference against a map the cart no longer has, and the re-push
+    /// carries them anyway.
+    pub fn note_layers_blanked(&mut self) {
+        self.layers_dirty.mark_all();
+        self.layer_synced = [false; 4];
+        self.pending_pokes.clear();
     }
 
     /// Whether a whole-slot push is queued or on the wire. A per-cell
@@ -2242,8 +2260,7 @@ mod tests {
 
     /// A whole-slot blob replaces the very layer the queued cells were a
     /// difference against, so they go -- that slot's only, and the caller
-    /// is told there were some (which is what takes the slot out of step,
-    /// the blob carrying the map ON DISK).
+    /// is told there were some.
     #[test]
     fn a_layer_push_forgets_only_the_cells_of_the_slot_it_replaces() {
         let mut live = offline_view(Vec::new(), 0, &[]);
