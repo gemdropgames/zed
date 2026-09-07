@@ -34,7 +34,7 @@ pub use live::CanvasMode;
 pub use world_canvas_item::WorldCanvasItem;
 pub use world_dock::{OpenMode, WorldDock};
 
-use emerald_editor_link::{EditCommand, GestureKind};
+use emerald_editor_link::{EditCommand, EditorMode, GestureKind};
 use live::{LiveStatus, LiveView};
 
 use std::cell::RefCell;
@@ -1566,14 +1566,15 @@ impl OpenWorld {
         // Gesture edges are read before the rows are folded and the ENDS
         // applied after, because the cart emits `Begin` ahead of the
         // frame's rows and `End` behind them: the rows of both frames
-        // belong INSIDE the gesture (`wire.rs`, "Frames"). An `End` whose
-        // `Begin` this session never saw never reaches here -- the mailbox
-        // drops it -- and one that is not the open gesture's closes
-        // nothing, which is what a nested nudge inside a drag needs.
+        // belong INSIDE the gesture (`wire.rs`, "Frames"). A `Begin` while
+        // one is open NESTS (a Nudge mid-drag), so the edges drive a stack
+        // and an `End` pops its own id wherever it sits; one whose `Begin`
+        // this session never saw never reaches here at all -- the mailbox
+        // drops it.
         let mut ended: Vec<u32> = Vec::new();
         for (kind, id) in live.mailbox.take_gestures() {
             match kind {
-                GestureKind::Begin => live.gesture = Some(id),
+                GestureKind::Begin => live.begin_gesture(id),
                 GestureKind::End => ended.push(id),
             }
         }
@@ -1588,17 +1589,23 @@ impl OpenWorld {
             changed = true;
         }
 
-        // Nothing below is meaningful until the cart's rows describe the
-        // document the panel is showing -- see `live::WorldSync`.
-        let loaded = live.loaded();
-        if !loaded {
+        // The cart's rows only describe the open document while the world
+        // handshake is settled: `world_sync` says the blob that went out
+        // has been drawn, and `world_dirty` says another one is still
+        // owed -- which is the window a mirrored despawn opens, where the
+        // document's indices have shifted and the cart's have not.
+        let synced = live.loaded() && !live.world_dirty;
+        // Play is the game's: it moves its own entities, and folding that
+        // would rewrite the document from a play-through.
+        let fold = synced && live.mode == EditorMode::Edit;
+        if !fold {
             live.mirror_rows.clear();
         }
 
         // Only on a change: the cart republishes the same selection after
         // every greeting, and re-applying it would fight nothing but cost
         // a document clone per frame.
-        let selection = (loaded && live.mailbox.selection() != live.cart_selection).then(|| {
+        let selection = (synced && live.mailbox.selection() != live.cart_selection).then(|| {
             live.cart_selection = live.mailbox.selection().to_vec();
             let mut mapped: Vec<Selection> = Vec::new();
             for index in &live.cart_selection {
@@ -1624,7 +1631,7 @@ impl OpenWorld {
         // is only recorded.
         let mut rows: Vec<(Selection, [f64; 2], [f64; 2])> = Vec::new();
         let mut removed_entities: Vec<usize> = Vec::new();
-        if loaded {
+        if fold {
             for row in &live.rows {
                 let Some(target) = live.index_map.selection_of(row.index) else {
                     continue;
@@ -1657,13 +1664,17 @@ impl OpenWorld {
                 })
                 .collect();
         }
-        // Every op this tick folds shares the open gesture's id, so the
-        // store amends one undo entry for the whole cart-side drag.
-        let gesture = live.gesture.map(|id| format!("cart-{id}"));
+        // Motion nobody asked for -- a user edit system animating an
+        // entity -- gets a synthetic gesture for as long as it lasts, so a
+        // burst is one undo entry rather than one per cart frame.
+        live.track_auto_gesture(!rows.is_empty());
+        // Every op this tick folds shares one gesture id, so the store
+        // amends a single undo entry for the whole cart-side drag.
+        let gesture = live.gesture_tag();
+        // Applied after the tag: the cart emits `End` behind the frame's
+        // rows, so those rows are still the closing gesture's.
         for id in ended {
-            if live.gesture == Some(id) {
-                live.gesture = None;
-            }
+            live.end_gesture(id);
         }
 
         // Nothing to fold: the document is not cloned for a tick that has
@@ -4711,6 +4722,13 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        // Design's own gesture state is stranded by the switch: Live's
+        // handlers forward the pointer to the cart instead of feeding
+        // these, so a band or a placement drag armed before the switch
+        // would sit on the canvas until Design came back and a stray
+        // release settled it.
+        open.edit_drag = None;
+        open.marquee = None;
         // A `Failed` session is kept only for its message; it is not a
         // session, so re-entering Live must be able to start a fresh one.
         if open
@@ -13727,6 +13745,26 @@ mod tests {
         Some(out)
     }
 
+    /// Which background slot each layer `BlobBegin` in `sent` opens, in
+    /// order. Decoded rather than read off a byte offset: `BlobBegin` has
+    /// grown a field before `layer` once already, and an offset that goes
+    /// stale reads a neighbouring field as a slot number instead of
+    /// failing.
+    fn sent_layers(sent: &[Vec<u8>]) -> Vec<u8> {
+        use emerald_editor_runtime::wire::{self, BlobKind, HostMsg};
+
+        sent.iter()
+            .filter_map(|message| match wire::decode_host(message) {
+                Some(HostMsg::BlobBegin {
+                    kind: BlobKind::Layer,
+                    layer,
+                    ..
+                }) => Some(layer),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// `0x82 Ack`: `seq u16`.
     fn blob_ack(seq: u16) -> Vec<u8> {
         let mut out = vec![0x82];
@@ -13803,11 +13841,11 @@ mod tests {
         cart_says(endpoint, out);
     }
 
-    /// `0x8A Selection`: `more u8, count u8`, then `count` x `index u32` --
-    /// one datagram, so `more` is always 0 (the cart splits a selection
-    /// wider than `SELECTION_PER_MSG`, which no fixture here reaches).
+    /// `0x8A Selection`: `part u8, total u8, count u8`, then `count` x
+    /// `index u32` -- part 0 of a one-datagram sequence; no fixture here
+    /// is wide enough to make the cart split a selection.
     fn cart_selection(endpoint: &ggo_common::LinkEndpoint, indices: &[u32]) {
-        let mut out = vec![0x8A, 0, indices.len() as u8];
+        let mut out = vec![0x8A, 0, 1, indices.len() as u8];
         for index in indices {
             out.extend_from_slice(&index.to_le_bytes());
         }
@@ -14538,7 +14576,7 @@ mod tests {
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert_eq!(entity_pos_of(panel, 0), [40.0, 50.0]);
-            assert_eq!(live_of(panel).gesture, Some(7));
+            assert_eq!(live_of(panel).gesture, [7]);
         });
 
         cart_rows(&endpoint, &[(0, 60.0, 50.0)]);
@@ -14547,7 +14585,7 @@ mod tests {
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert_eq!(entity_pos_of(panel, 0), [60.0, 50.0]);
-            assert_eq!(live_of(panel).gesture, None, "the End closed it");
+            assert!(live_of(panel).gesture.is_empty(), "the End closed it");
         });
 
         panel.update(cx, |panel, cx| panel.undo_impl(cx));
@@ -14576,7 +14614,7 @@ mod tests {
         cart_gesture(&endpoint, GESTURE_END, 99);
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(live_of(panel).gesture, Some(3));
+            assert_eq!(live_of(panel).gesture, [3], "the stray End closed nothing");
         });
     }
 
@@ -14680,6 +14718,219 @@ mod tests {
         });
     }
 
+    /// The cart nests a Nudge inside a drag: `Begin a, Begin b, End b, End
+    /// a`. Closing the inner gesture has to hand the rest of the drag back
+    /// to the outer one -- with a single gesture slot the frames after
+    /// `End b` are untagged, and each of them is its own undo entry.
+    #[gpui::test]
+    async fn a_nudge_nested_in_a_drag_leaves_three_undo_entries(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+
+        cart_gesture(&endpoint, GESTURE_BEGIN, 1);
+        cart_rows(&endpoint, &[(0, 10.0, 4.0)]);
+        cx.run_until_parked();
+        cart_rows(&endpoint, &[(0, 20.0, 4.0)]);
+        cx.run_until_parked();
+
+        // The nudge, inside the drag.
+        cart_gesture(&endpoint, GESTURE_BEGIN, 2);
+        cart_rows(&endpoint, &[(0, 21.0, 4.0)]);
+        cx.run_until_parked();
+        cart_gesture(&endpoint, GESTURE_END, 2);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).gesture,
+                [1],
+                "the drag is still open underneath it"
+            );
+        });
+
+        // ...and the drag carries on.
+        cart_rows(&endpoint, &[(0, 30.0, 4.0)]);
+        cx.run_until_parked();
+        cart_gesture(&endpoint, GESTURE_END, 1);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(entity_pos_of(panel, 0), [30.0, 4.0]);
+            assert!(live_of(panel).gesture.is_empty());
+        });
+        assert_eq!(
+            undo_depth(&panel, cx),
+            3,
+            "the drag before the nudge, the nudge, and the drag after it"
+        );
+    }
+
+    /// A user edit system animating an entity reports moved rows with no
+    /// gesture around them. That is still one edit to take back, so a
+    /// continuous burst folds under one synthetic gesture rather than
+    /// leaving an undo entry per cart frame.
+    #[gpui::test]
+    async fn an_ungestured_burst_of_motion_is_one_undo_entry(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+
+        for step in 1..=10 {
+            cart_rows(&endpoint, &[(0, 4.0 + f64::from(step), 4.0)]);
+            cx.run_until_parked();
+        }
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(entity_pos_of(panel, 0), [14.0, 4.0]);
+            assert!(
+                live_of(panel).auto_gesture.is_some(),
+                "the burst is still running"
+            );
+        });
+        assert_eq!(undo_depth(&panel, cx), 1, "ten ticks, one entry");
+    }
+
+    /// ...and a tick where nothing moved ends the burst, so the motion
+    /// that follows is a separate entry rather than an amendment of one
+    /// the user has stopped thinking about.
+    #[gpui::test]
+    async fn a_still_tick_ends_the_burst(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+
+        cart_rows(&endpoint, &[(0, 10.0, 4.0)]);
+        cx.run_until_parked();
+        cart_rows(&endpoint, &[(0, 10.0, 4.0)]);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                live_of(panel).auto_gesture,
+                None,
+                "the still tick retired it"
+            );
+        });
+        cart_rows(&endpoint, &[(0, 20.0, 4.0)]);
+        cx.run_until_parked();
+        assert_eq!(undo_depth(&panel, cx), 2, "two bursts, two entries");
+    }
+
+    /// Play runs the GAME's systems: its entities move because the game
+    /// moved them, and folding that would rewrite the document from a
+    /// play-through. The rows still land, because the overlay is drawn
+    /// from them.
+    #[gpui::test]
+    async fn play_mode_folds_no_rows_into_the_document(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).mode = EditorMode::Play;
+        });
+
+        cart_rows(&endpoint, &[(0, 90.0, 90.0)]);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                entity_pos_of(panel, 0),
+                [4.0, 4.0],
+                "the game moved it, not the user"
+            );
+            assert_eq!(
+                live_of(panel).rows.first().map(|row| [row.x, row.y]),
+                Some([90.0, 90.0]),
+                "and the overlay still follows the frame"
+            );
+        });
+        assert_eq!(undo_depth(&panel, cx), 0, "no ops at all");
+    }
+
+    /// A mirrored despawn shifts every document index above it while the
+    /// cart's table keeps the emptied slot, so until the reload lands the
+    /// two flattenings do not describe each other. Nothing more is folded
+    /// through the index map in that window -- a row folded through it
+    /// would move whichever entity slid down into the slot.
+    #[gpui::test]
+    async fn rows_are_not_folded_while_the_reload_is_still_owed(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
+        cart_fixture_rows(&endpoint);
+        cx.run_until_parked();
+        // The encoder walks the instanced world to flatten this document;
+        // without it every re-send fails, which is how the test holds the
+        // window open instead of racing the next tick's blob.
+        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+
+        cart_removed(&endpoint, 0);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let live = live_of(panel);
+            assert!(live.world_dirty, "the reload is owed");
+            assert!(live.loaded(), "and the rows still LOOK current");
+            assert_eq!(open_of(panel).store.state().entities.len(), 2);
+        });
+
+        // The cart is still holding the pre-despawn world, so its index 1
+        // is the entity the document now calls 0 -- and its index 2 is the
+        // camera the document now calls 1.
+        cart_rows(&endpoint, &[(1, 50.0, 8.0), (2, 0.0, 0.0), (3, 32.0, 16.0)]);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            assert_eq!(
+                inspector::entity_pos(&state, 1),
+                Some([0.0, 0.0]),
+                "the camera did not take the other entity's move"
+            );
+            assert_eq!(inspector::entity_pos(&state, 0), Some([40.0, 8.0]));
+        });
+        assert_eq!(undo_depth(&panel, cx), 1, "only the despawn");
+    }
+
+    /// Both members of a two-member instance move by the same delta. The
+    /// document owns the `[[instance]]`, not its members, so that is ONE
+    /// `MoveInstance` and one undo entry -- not one per member.
+    #[gpui::test]
+    async fn both_members_of_an_instance_move_it_once(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
+        // The fixture's `worlds/sub` contributes one entity; this is the
+        // map the same document would have if it contributed two. Nothing
+        // recomputes it here -- the map is rebuilt by a world push or a
+        // recount, and the document has not moved.
+        panel.update(cx, |panel, _| {
+            live_mut_of(panel).index_map = live::IndexMap::new(3, &[2]);
+        });
+        cart_rows(
+            &endpoint,
+            &[
+                (0, 4.0, 4.0),
+                (1, 40.0, 8.0),
+                (2, 0.0, 0.0),
+                (3, 32.0, 16.0),
+                (4, 48.0, 16.0),
+            ],
+        );
+        cx.run_until_parked();
+
+        cart_rows(
+            &endpoint,
+            &[
+                (0, 4.0, 4.0),
+                (1, 40.0, 8.0),
+                (2, 0.0, 0.0),
+                (3, 40.0, 24.0),
+                (4, 56.0, 24.0),
+            ],
+        );
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                open_of(panel).store.state().instances[0].pos,
+                [40.0, 24.0],
+                "the instance took its primary member's delta"
+            );
+        });
+        assert_eq!(undo_depth(&panel, cx), 1, "one entry, not one per member");
+    }
+
     /// The cart groups its own selection and drags, so it is handed the
     /// document's `[[instance]]` spans once the world it describes has
     /// landed.
@@ -14699,7 +14950,8 @@ mod tests {
             .iter()
             .filter_map(|message| match wire::decode_host(message) {
                 Some(HostMsg::Groups {
-                    remaining: 0,
+                    part: 0,
+                    total: 1,
                     groups,
                 }) => Some(groups.collect()),
                 _ => None,
@@ -14738,6 +14990,23 @@ mod tests {
             sent.iter().all(|message| message.first() != Some(&0x08)),
             "no blob for a mirrored move: {sent:?}"
         );
+    }
+
+    /// How many undo entries the open document has, by unwinding the whole
+    /// stack. Destructive on purpose: a test that asks this is asserting
+    /// on the SHAPE of the history, which is what a mirrored gesture is
+    /// judged by, and it has nothing to do afterwards.
+    fn undo_depth(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) -> usize {
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            let mut depth = 0;
+            while open.store.undo() {
+                depth += 1;
+            }
+            depth
+        })
     }
 
     /// Clear the flag, so the next funnel under test has to set it on its
@@ -15467,11 +15736,7 @@ mod tests {
         });
 
         let sent = settle_live(&panel, &endpoint, cx);
-        let layers: Vec<u8> = sent
-            .iter()
-            .filter(|message| message.first() == Some(&0x08) && message.get(1) == Some(&1))
-            .filter_map(|message| message.get(6).copied())
-            .collect();
+        let layers = sent_layers(&sent);
         assert_eq!(
             layers,
             [0, 1, 3, 2],
@@ -15504,11 +15769,7 @@ mod tests {
         endpoint.tick();
         cx.run_until_parked();
 
-        let layers: Vec<u8> = host_sent(&endpoint)
-            .iter()
-            .filter(|message| message.first() == Some(&0x08) && message.get(1) == Some(&1))
-            .filter_map(|message| message.get(6).copied())
-            .collect();
+        let layers = sent_layers(&host_sent(&endpoint));
         assert_eq!(
             layers,
             [2],

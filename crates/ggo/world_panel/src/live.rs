@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use emerald_editor_link::{EditCommand, EntityRow, LinkIo, LinkMailbox};
+use emerald_editor_link::{EditCommand, EditorMode, EntityRow, LinkIo, LinkMailbox};
 use ggo_worldlib::backgrounds::MergedBackground;
 use ggo_worldlib::drag_ops::View;
 use ggo_worldlib::render::{DEVICE_SCREEN_H, DEVICE_SCREEN_W, Selection};
@@ -637,10 +637,11 @@ pub struct LiveView {
     /// -- so a member row is mirrored as the DELTA against this baseline,
     /// and there is nothing to measure against until it exists.
     ///
-    /// Cleared whenever the cart's rows stop describing the open document
-    /// (a world blob in flight): the rows that follow are the previous
-    /// world's, and differencing across that boundary would move an
-    /// instance by the gap between two unrelated worlds.
+    /// Cleared whenever the mirror is not folding -- a world blob in
+    /// flight or still owed, or the cart in Play. The rows on the far side
+    /// of that gap describe a different document (or a play-through), and
+    /// differencing across it would move an instance by the gap between
+    /// two unrelated worlds.
     pub mirror_rows: Vec<CartRow>,
     /// The cart's selection as it last published it, in its own flattened
     /// indices -- what the mirror compares against to tell "the cart
@@ -649,10 +650,35 @@ pub struct LiveView {
     /// The rubber band the cart is dragging out, in world px as
     /// `[x0, y0, x1, y1]`; `None` when there is none to draw.
     pub marquee: Option<[f64; 4]>,
-    /// The cart gesture the mirror is folding document ops into, if one is
-    /// open: every op tagged with it amends ONE undo entry, so a whole
-    /// cart-side drag undoes in a single step.
-    pub gesture: Option<u32>,
+    /// The cart gestures the mirror is folding document ops into,
+    /// outermost first: every op tagged with one amends ONE undo entry, so
+    /// a whole cart-side drag undoes in a single step.
+    ///
+    /// A stack rather than a slot because the cart NESTS -- a Nudge in the
+    /// middle of a drag reports `Begin a, Begin b, End b, End a` -- and
+    /// closing `b` has to hand the rest of the drag back to `a`. A slot
+    /// left those frames untagged, which is one undo entry per frame.
+    ///
+    /// Kept here rather than read off `LinkMailbox::innermost_open`, which
+    /// is the same stack: the mailbox pops on the `End` datagram, and
+    /// `poll` has already run by the time the mirror folds, so its top no
+    /// longer names the gesture this tick's rows were published under. The
+    /// mirror replays the edges instead, applying the `End`s only after
+    /// the fold -- which is the wire's own frame rule.
+    pub gesture: Vec<u32>,
+    /// The synthetic gesture a burst of UNPROMPTED motion folds under. A
+    /// user edit system animating an entity reports moved rows with no
+    /// gesture around them, and one undo entry per cart frame is not an
+    /// undo history. Opened by the first such tick and retired by the
+    /// first tick whose rows all sat still, so one burst is one entry.
+    pub auto_gesture: Option<u32>,
+    /// How many synthetic bursts this session has opened, so a new burst
+    /// never reuses a retired one's id (which would amend its entry).
+    auto_gestures: u32,
+    /// Which of the cart's system tables is running. Play is the GAME's:
+    /// its entities move because the game moved them, and folding that
+    /// into the document would rewrite the world from a play-through.
+    pub mode: EditorMode,
     pub world_dirty: bool,
     /// The document generation whose encode last failed, and the cart-clock
     /// instant that generation may be tried again at. Encoding walks every
@@ -721,7 +747,10 @@ impl LiveView {
             mirror_rows: Vec::new(),
             cart_selection: Vec::new(),
             marquee: None,
-            gesture: None,
+            gesture: Vec::new(),
+            auto_gesture: None,
+            auto_gestures: 0,
+            mode: EditorMode::default(),
             world_dirty: false,
             world_retry_at: None,
             layers_dirty: LayerDirty::default(),
@@ -833,6 +862,45 @@ impl LiveView {
     /// -- see [`WorldSync`].
     pub fn loaded(&self) -> bool {
         self.world_sync == WorldSync::Loaded
+    }
+
+    /// Open a cart gesture, innermost. Re-opening one already on the stack
+    /// does not stack it twice: the cart's ids are unique per session, so
+    /// a repeat is a duplicated datagram, not a second gesture.
+    pub fn begin_gesture(&mut self, id: u32) {
+        if !self.gesture.contains(&id) {
+            self.gesture.push(id);
+        }
+    }
+
+    /// Close `id` wherever it sits on the stack. An id that was never
+    /// opened closes nothing -- a lost `Begin` must not retire the drag
+    /// that is still running underneath it.
+    pub fn end_gesture(&mut self, id: u32) {
+        self.gesture.retain(|open| *open != id);
+    }
+
+    /// Open or retire the synthetic burst gesture for a tick that moved
+    /// `moved` document items with no cart gesture around them.
+    pub fn track_auto_gesture(&mut self, moved: bool) {
+        if !self.gesture.is_empty() || !moved {
+            // A cart gesture takes over the tagging, so the burst ends
+            // here rather than resuming after the drag and folding the
+            // motion on both sides of it into one entry.
+            self.auto_gesture = None;
+        } else if self.auto_gesture.is_none() {
+            self.auto_gestures = self.auto_gestures.wrapping_add(1);
+            self.auto_gesture = Some(self.auto_gestures);
+        }
+    }
+
+    /// What this tick's mirrored ops are tagged with: the innermost cart
+    /// gesture, else the open burst, else nothing.
+    pub fn gesture_tag(&self) -> Option<String> {
+        self.gesture
+            .last()
+            .map(|id| format!("cart-{id}"))
+            .or_else(|| self.auto_gesture.map(|id| format!("cart-auto-{id}")))
     }
 
     /// Advance the world-blob handshake on what the last poll learned: the
