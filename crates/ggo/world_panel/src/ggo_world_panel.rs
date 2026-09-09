@@ -6517,6 +6517,16 @@ impl WorldPanel {
         }
     }
 
+    pub(crate) fn canvas_error(&self) -> Option<String> {
+        match &self.state {
+            ViewerState::Error(error) => Some(error.clone()),
+            ViewerState::Ready(open) if self.canvas_mode == CanvasMode::Live => {
+                open.live_error.clone()
+            }
+            _ => None,
+        }
+    }
+
     /// One turn of the live session. Returns whether the poll loop should
     /// keep going: a session that has no future -- gone, or `Failed` --
     /// never says yes, because `live_step` has nothing left to do for it

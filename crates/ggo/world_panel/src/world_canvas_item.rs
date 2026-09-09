@@ -59,31 +59,36 @@ impl Focusable for WorldCanvasItem {
 
 impl Render for WorldCanvasItem {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let canvas: Option<AnyElement> = self.panel.update(cx, |panel, cx| {
+        let canvas = self.panel.update(cx, |panel, cx| {
             // The image cache's atlas release runs here, on the one
             // render path that paints those images.
             panel.retire_images(window);
+            if let Some(error) = panel.canvas_error() {
+                return world_error(error, cx);
+            }
             match &panel.state {
                 // The boot screen stands in for the canvas, not over it:
                 // there is nothing to paint until the cart is drawing.
-                ViewerState::Ready(_) => Some(match panel.live_loading_text() {
+                ViewerState::Ready(_) => match panel.live_loading_text() {
                     Some(text) => live_loading(text),
                     None => panel.render_canvas(cx),
-                }),
-                _ => None,
+                },
+                ViewerState::Loading { stem } => live_loading(format!("Loading {stem}…")),
+                ViewerState::Empty | ViewerState::Error(_) => no_world_open(),
             }
         });
-        match canvas {
-            Some(canvas) => div().size_full().child(canvas).into_any_element(),
-            None => div()
-                .size_full()
-                .flex()
-                .justify_center()
-                .items_center()
-                .child(Label::new("No world open").color(Color::Muted))
-                .into_any_element(),
-        }
+        div().size_full().child(canvas)
     }
+}
+
+fn no_world_open() -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .justify_center()
+        .items_center()
+        .child(Label::new("No world open").color(Color::Muted))
+        .into_any_element()
 }
 
 /// The Live boot screen: a spinner and what it is waiting for.
@@ -103,6 +108,54 @@ fn live_loading(text: String) -> AnyElement {
                 .with_rotate_animation(2),
         )
         .child(Label::new(text).color(Color::Muted))
+        .into_any_element()
+}
+
+fn world_error(error: String, cx: &App) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_4()
+        .debug_selector(|| "ggo-world-view-error".into())
+        .child(
+            v_flex()
+                .w_full()
+                .max_w(px(720.))
+                .gap_3()
+                .p_4()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().elevated_surface_background)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::Medium)
+                                .color(Color::Error),
+                        )
+                        .child(
+                            Label::new("World view could not be loaded")
+                                .size(LabelSize::Large)
+                                .color(Color::Error),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .p_3()
+                        .rounded_sm()
+                        .debug_selector(|| "ggo-world-view-error-details".into())
+                        .bg(cx.theme().colors().editor_background)
+                        .child(
+                            ggo_common::CopyableText::new("ggo-world-view-error-copy", error)
+                                .size(LabelSize::Small),
+                        ),
+                ),
+        )
         .into_any_element()
 }
 
@@ -215,6 +268,27 @@ mod tests {
                 "the item's render painted the canvas"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_canvas_item_replaces_failed_live_view_with_error(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = crate::tests::ready_panel_in_window(cx, dir.path()).await;
+        let (_item, cx) = cx.add_window_view(|_, cx| WorldCanvasItem::new(panel.clone(), cx));
+
+        panel.update(cx, |panel, cx| {
+            panel.fail_live("build failed: missing prebaked assets".into(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-view-error").is_some(),
+            "the error card replaces the failed canvas"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-view-error-details").is_some(),
+            "the detailed failure is visible and copyable"
+        );
     }
 
     /// `Item::save` routes through the panel's own save path: success

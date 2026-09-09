@@ -115,7 +115,7 @@ fn shared_build(
                     menu::editor_cart_ggo_path(&capture.lines)
                         .ok_or_else(|| "emd editor-cart --ggo printed no .ggo path".to_string())
                 } else {
-                    Err(format!("build failed: {}", menu::failure_reason(&capture)))
+                    Err(build_failure_reason(&capture))
                 };
                 done.store(true, Ordering::Release);
                 outcome
@@ -145,6 +145,15 @@ fn shared_build(
     );
     sweeper.detach();
     build
+}
+
+fn build_failure_reason(capture: &ggo_common::ProcCapture) -> String {
+    format!(
+        "build failed: {}",
+        ggo_common::failure_line(capture, |line| {
+            line.trim_start().starts_with("emd-json:")
+        })
+    )
 }
 
 /// Let go of a finished build, so the next save starts a fresh one rather
@@ -666,6 +675,22 @@ mod tests {
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
         std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
         dir
+    }
+
+    #[test]
+    fn build_failure_uses_the_diagnostic_before_emd_json() {
+        let reason = build_failure_reason(&ggo_common::ProcCapture {
+            ok: false,
+            lines: vec![
+                "emerald: serialize asset section: missing tileset".into(),
+                r#"emd-json: {"ok":false,"error":"serialize asset section"}"#.into(),
+            ],
+        });
+
+        assert_eq!(
+            reason,
+            "build failed: emerald: serialize asset section: missing tileset"
+        );
     }
 
     #[gpui::test]
