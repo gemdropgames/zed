@@ -606,8 +606,8 @@ pub fn layer_loads(root: &Path, merged: &[MergedBackground]) -> VecDeque<LayerLo
 
 // ------------------------------------------------------------- session
 
-/// Which renderer the canvas is showing. Sticky for the session: opening
-/// another world keeps the mode the user last chose.
+/// Which renderer the canvas is showing. User-opened worlds use Live;
+/// Design is retained for non-interactive agent operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanvasMode {
     Design,
@@ -616,8 +616,7 @@ pub enum CanvasMode {
 
 /// Where the live session is between "the viewer cart is being built" and
 /// "the cart is mirroring the document". `Failed` is terminal: the panel
-/// has already fallen back to [`CanvasMode::Design`] and only keeps the
-/// session around so the toolbar can say why.
+/// keeps the session around so the toolbar can say why and offer a retry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LiveStatus {
     Building,

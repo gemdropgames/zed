@@ -256,6 +256,9 @@ mod tests {
                     field("centered", FieldKind::Bool),
                     field("offset", FieldKind::Vec2),
                     field("visible", FieldKind::Bool),
+                    field("rotation", FieldKind::Int),
+                    field("scale_x", FieldKind::Fixed),
+                    field("scale_y", FieldKind::Fixed),
                 ],
             ),
             entry(
@@ -267,6 +270,9 @@ mod tests {
                     field("visible", FieldKind::Bool),
                     field("clip", FieldKind::Str),
                     field("loop", FieldKind::Bool),
+                    field("rotation", FieldKind::Int),
+                    field("scale_x", FieldKind::Fixed),
+                    field("scale_y", FieldKind::Fixed),
                 ],
             ),
             entry(

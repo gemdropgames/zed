@@ -727,11 +727,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The Live choices are the DOCK's (spec), not the active panel's:
-    /// closing the last world tab takes every panel with it, and the next
-    /// world the user opens must still come up the way they left it.
+    /// Legacy Design requests do not change the dock's Live editor choice,
+    /// including after all world tabs have been closed.
     #[gpui::test]
-    async fn the_sticky_mode_survives_closing_the_last_world_tab(cx: &mut TestAppContext) {
+    async fn legacy_design_requests_do_not_change_the_sticky_mode(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         let open = |rel: &'static str, cx: &mut gpui::VisualTestContext| {
@@ -754,13 +753,13 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
 
-        // A second tab inherits it while the first is still open.
+        // A second tab remains Live while the first is still open.
         open("worlds/other.toml", cx);
         let second = dock.read_with(cx, |dock, _| dock.active().expect("a second tab"));
         assert_eq!(
             second.read_with(cx, |panel, _| panel.canvas_mode()),
-            crate::CanvasMode::Design,
-            "a new tab opens the way the last one was showing"
+            crate::CanvasMode::Live,
+            "the removed Design editor cannot become sticky"
         );
 
         // And it survives every panel going away -- including the strong
@@ -788,8 +787,8 @@ pub(crate) mod tests {
         let reopened = dock.read_with(cx, |dock, _| dock.active().expect("a fresh tab"));
         assert_eq!(
             reopened.read_with(cx, |panel, _| panel.canvas_mode()),
-            crate::CanvasMode::Design,
-            "the dock kept the user's choice with no panel left to hold it"
+            crate::CanvasMode::Live,
+            "the dock remains Live with no panel left to hold state"
         );
     }
 
@@ -846,13 +845,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// A boot that fails puts THAT panel back in Design, but the dock's
-    /// sticky mode is the user's own choice and a transient failure must
-    /// not downgrade every tab they open afterwards. (No viewer booter is
-    /// registered in these tests, so the sticky-Live open below boots
-    /// nothing and falls back -- which is the failure under test.)
+    /// A boot failure remains in Live and leaves the dock's sticky mode
+    /// untouched. No viewer booter is registered in this test.
     #[gpui::test]
-    async fn a_fallback_to_design_leaves_the_sticky_mode_alone(cx: &mut TestAppContext) {
+    async fn a_boot_failure_leaves_the_live_editor_and_sticky_mode_alone(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         workspace.update_in(cx, |ws, window, cx| {
@@ -864,8 +860,8 @@ pub(crate) mod tests {
         let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
         assert_eq!(
             panel.read_with(cx, |panel, _| panel.canvas_mode()),
-            crate::CanvasMode::Design,
-            "the boot found no emulator pane and the panel fell back"
+            crate::CanvasMode::Live,
+            "the boot failure does not restore the removed editor"
         );
         assert_eq!(
             dock.read_with(cx, |dock, _| dock.canvas_mode),

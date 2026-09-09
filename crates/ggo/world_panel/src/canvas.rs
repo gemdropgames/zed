@@ -496,8 +496,93 @@ pub struct LiveScene {
     /// An in-flight rubber-band, `[x, y, w, h]` in world px -- the same
     /// band [`Scene`] draws, because the gesture behind it is the same one.
     pub marquee: Option<[f64; 4]>,
+    pub affine: Option<AffineOverlay>,
     pub background: Hsla,
     pub accent: Hsla,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffineHandle {
+    Rotate(usize),
+    ScaleBoth(usize),
+    ScaleX(usize),
+    ScaleY(usize),
+}
+
+#[derive(Clone)]
+pub struct AffineOverlay {
+    pub corners: [[f64; 2]; 4],
+    pub rotate: [[f64; 2]; 4],
+    pub scale_x: [[f64; 2]; 2],
+    pub scale_y: [[f64; 2]; 2],
+}
+
+pub fn affine_overlay(rect: [f64; 4], rotation: f64, scale: [f64; 2], zoom: f64) -> AffineOverlay {
+    let [x, y, width, height] = rect;
+    let center = [x + width / 2.0, y + height / 2.0];
+    let radians = rotation.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let transform = |local: [f64; 2]| {
+        let scaled = [local[0] * scale[0], local[1] * scale[1]];
+        [
+            center[0] + scaled[0] * cos - scaled[1] * sin,
+            center[1] + scaled[0] * sin + scaled[1] * cos,
+        ]
+    };
+    let half = [width / 2.0, height / 2.0];
+    let locals = [
+        [-half[0], -half[1]],
+        [half[0], -half[1]],
+        [half[0], half[1]],
+        [-half[0], half[1]],
+    ];
+    let corners = locals.map(transform);
+    let distance = 18.0 / zoom.max(0.25);
+    let rotate = corners.map(|corner| {
+        let delta = [corner[0] - center[0], corner[1] - center[1]];
+        let length = delta[0].hypot(delta[1]).max(1.0);
+        [
+            corner[0] + delta[0] / length * distance,
+            corner[1] + delta[1] / length * distance,
+        ]
+    });
+    AffineOverlay {
+        corners,
+        rotate,
+        scale_x: [transform([-half[0], 0.0]), transform([half[0], 0.0])],
+        scale_y: [transform([0.0, -half[1]]), transform([0.0, half[1]])],
+    }
+}
+
+impl AffineOverlay {
+    pub fn handles(&self) -> impl Iterator<Item = (AffineHandle, [f64; 2])> + '_ {
+        self.rotate
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, point)| (AffineHandle::Rotate(index), point))
+            .chain(
+                self.corners
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, point)| (AffineHandle::ScaleBoth(index), point)),
+            )
+            .chain(
+                self.scale_x
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, point)| (AffineHandle::ScaleX(index), point)),
+            )
+            .chain(
+                self.scale_y
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, point)| (AffineHandle::ScaleY(index), point)),
+            )
+    }
 }
 
 /// The scene's canvas-relative frame rect in window px.
@@ -516,7 +601,12 @@ pub fn live_frame_bounds_px(canvas_bounds: Bounds<Pixels>, rect: [f64; 4]) -> Bo
 /// is selected.
 const LIVE_ROW_DIM_ALPHA: f32 = 0.35;
 
-pub fn paint_live(scene: &LiveScene, canvas_bounds: Bounds<Pixels>, window: &mut Window) {
+pub fn paint_live(
+    scene: &LiveScene,
+    canvas_bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     window.with_content_mask(
         Some(ContentMask {
             bounds: canvas_bounds,
@@ -541,12 +631,53 @@ pub fn paint_live(scene: &LiveScene, canvas_bounds: Bounds<Pixels>, window: &mut
                 }
                 window.paint_quad(outline(b, color, BorderStyle::default()));
             }
+            if let Some(affine) = &scene.affine {
+                for index in 0..4 {
+                    let from =
+                        world_point(&scene.view, canvas_bounds.origin, affine.corners[index]);
+                    let to = world_point(
+                        &scene.view,
+                        canvas_bounds.origin,
+                        affine.corners[(index + 1) % 4],
+                    );
+                    if let Some(path) = line_path(from, to, 1.0) {
+                        window.paint_path(path, scene.accent);
+                    }
+                }
+                for (handle, world) in affine.handles() {
+                    let screen_point = world_point(&scene.view, canvas_bounds.origin, world);
+                    let (label, radius) = match handle {
+                        AffineHandle::Rotate(_) => ("rotate", 5.0),
+                        _ => ("scale", 4.0),
+                    };
+                    let handle_bounds = bounds(
+                        point(screen_point.x - px(radius), screen_point.y - px(radius)),
+                        size(px(radius * 2.0), px(radius * 2.0)),
+                    );
+                    window.paint_quad(fill(handle_bounds, scene.accent));
+                    paint_label(
+                        label,
+                        point(screen_point.x + px(radius + 2.0), screen_point.y - px(6.0)),
+                        scene.accent,
+                        window,
+                        cx,
+                    );
+                }
+            }
             if let Some([x, y, w, h]) = scene.marquee {
                 let b = item_bounds(&scene.view, canvas_bounds.origin, x, y, w, h);
                 window.paint_quad(outline(b, color(MARQUEE_COLOR), BorderStyle::default()));
             }
         },
     );
+}
+
+fn world_point(view: &View, origin: Point<Pixels>, world: [f64; 2]) -> Point<Pixels> {
+    let screen = drag_ops::world_to_screen(world[0], world[1], view);
+    point(
+        origin.x + px(screen[0] as f32),
+        origin.y + px(screen[1] as f32),
+    )
 }
 
 /// Glyph cell of the engine's fixed 8x8 bitmap font, world px -- must
@@ -653,6 +784,18 @@ fn line_path(p0: Point<Pixels>, p1: Point<Pixels>, width: f32) -> Option<GpuiPat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_overlay_rotates_corners_and_places_axis_handles() {
+        let overlay = affine_overlay([10.0, 20.0, 40.0, 20.0], 90.0, [2.0, 0.5], 2.0);
+        assert!((overlay.corners[0][0] - 35.0).abs() < 1e-9);
+        assert!((overlay.corners[0][1] + 10.0).abs() < 1e-9);
+        assert!((overlay.scale_x[0][0] - 30.0).abs() < 1e-9);
+        assert!((overlay.scale_x[0][1] + 10.0).abs() < 1e-9);
+        assert!((overlay.scale_y[0][0] - 35.0).abs() < 1e-9);
+        assert!((overlay.scale_y[0][1] - 30.0).abs() < 1e-9);
+        assert_eq!(overlay.handles().count(), 12);
+    }
 
     #[test]
     fn zoom_step_walks_the_ladder_and_saturates() {

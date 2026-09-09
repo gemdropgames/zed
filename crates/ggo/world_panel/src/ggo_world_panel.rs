@@ -130,14 +130,8 @@ actions!(
         NudgeUpTile,
         /// Nudges the selection one tile down.
         NudgeDownTile,
-        /// Draws the canvas with the design renderer, ending any live
-        /// session.
-        ToggleDesign,
         /// Draws the canvas with the viewer cart running the open world.
-        ToggleLive,
-        /// Switches the canvas between the design renderer and the viewer
-        /// cart.
-        ToggleCanvasMode
+        ToggleLive
     ]
 );
 
@@ -265,13 +259,8 @@ fn split_world_path(rel: &str) -> Option<(String, WorldListing)> {
     Some((rel[..cut].trim_end_matches('/').to_string(), listing))
 }
 
-/// The component whose `stem` the inspector offers a "go to sprite" jump
-/// for, and the extension that stem resolves with. A `MetaSprite`'s stem is
-/// ASSET-ROOT-relative and extensionless (`sprites/hero`), the same frame
-/// `loader::compose_meta_sprite_rgba` opens it in (`{stem}.spr`).
-#[cfg(test)]
+/// Sprite stems are asset-root-relative and extensionless (`sprites/hero`).
 const META_SPRITE: &str = "MetaSprite";
-#[cfg(test)]
 const SPRITE_COMPONENT: &str = "Sprite";
 
 /// How many stem suggestions render under a focused Asset field.
@@ -636,6 +625,70 @@ struct EditDrag {
     moved: bool,
 }
 
+#[derive(Clone)]
+struct AffineDrag {
+    entity: usize,
+    component: String,
+    fields: serde_json::Map<String, Value>,
+    handle: canvas::AffineHandle,
+    rect: [f64; 4],
+    start_world: [f64; 2],
+    start_rotation: f64,
+    rotation: f64,
+    scale: [f64; 2],
+}
+
+impl AffineDrag {
+    fn update(&mut self, world: [f64; 2]) {
+        let center = [
+            self.rect[0] + self.rect[2] / 2.0,
+            self.rect[1] + self.rect[3] / 2.0,
+        ];
+        match self.handle {
+            canvas::AffineHandle::Rotate(_) => {
+                let start =
+                    (self.start_world[1] - center[1]).atan2(self.start_world[0] - center[0]);
+                let current = (world[1] - center[1]).atan2(world[0] - center[0]);
+                self.rotation = self.start_rotation + (current - start).to_degrees();
+            }
+            canvas::AffineHandle::ScaleBoth(_)
+            | canvas::AffineHandle::ScaleX(_)
+            | canvas::AffineHandle::ScaleY(_) => {
+                let radians = (-self.start_rotation).to_radians();
+                let (sin, cos) = radians.sin_cos();
+                let delta = [world[0] - center[0], world[1] - center[1]];
+                let local = [
+                    delta[0] * cos - delta[1] * sin,
+                    delta[0] * sin + delta[1] * cos,
+                ];
+                let (x_sign, y_sign) = match self.handle {
+                    canvas::AffineHandle::ScaleBoth(index) => (
+                        if matches!(index, 0 | 3) { -1.0 } else { 1.0 },
+                        if matches!(index, 0 | 1) { -1.0 } else { 1.0 },
+                    ),
+                    canvas::AffineHandle::ScaleX(index) => {
+                        (if index == 0 { -1.0 } else { 1.0 }, 1.0)
+                    }
+                    canvas::AffineHandle::ScaleY(index) => {
+                        (1.0, if index == 0 { -1.0 } else { 1.0 })
+                    }
+                    canvas::AffineHandle::Rotate(_) => (1.0, 1.0),
+                };
+                let scale_x =
+                    (local[0] * x_sign / (self.rect[2] / 2.0).max(0.5)).clamp(-128.0, 127.996);
+                let scale_y =
+                    (local[1] * y_sign / (self.rect[3] / 2.0).max(0.5)).clamp(-128.0, 127.996);
+                match self.handle {
+                    canvas::AffineHandle::ScaleBoth(_) => self.scale = [scale_x, scale_y],
+                    canvas::AffineHandle::ScaleX(_) => self.scale[0] = scale_x,
+                    canvas::AffineHandle::ScaleY(_) => self.scale[1] = scale_y,
+                    canvas::AffineHandle::Rotate(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// An in-flight rubber-band selection on empty canvas, in world coords.
 #[derive(Clone)]
 struct Marquee {
@@ -734,6 +787,7 @@ struct OpenWorld {
     /// also defaults ON.
     grid: bool,
     edit_drag: Option<EditDrag>,
+    affine_drag: Option<AffineDrag>,
     /// The gesture id an in-flight RUN of arrow-key nudges shares, so the
     /// store coalesces the run into one undo entry the way it coalesces a
     /// drag. `None` between runs; see [`WorldPanel::nudge_impl`].
@@ -819,7 +873,7 @@ struct OpenWorld {
     /// one, which is how a burst of instance edits resolves to the last.
     _instance_counts_task: Option<Task<()>>,
     /// Why Live mode is not showing, on the toolbar next to `save_error`.
-    /// Set on every fallback to Design, cleared when a session starts.
+    /// Set when the viewer fails, cleared when a session starts.
     live_error: Option<String>,
     /// Bumped by every [`Self::note_doc_changed`]. Read only by the live
     /// session's failed-encode backoff, which has to tell "the same world
@@ -900,6 +954,7 @@ impl OpenWorld {
             snap: false,
             grid: true,
             edit_drag: None,
+            affine_drag: None,
             nudge_gesture: None,
             gesture_counter: 0,
             inspector: Vec::new(),
@@ -2855,13 +2910,10 @@ pub struct WorldPanel {
     /// the system clipboard the world's entity copy uses: a `Stamp` has no
     /// text form, and pasting cells into an editor tab would be nonsense.
     cell_clipboard: Option<Stamp>,
-    /// Which renderer the canvas draws. Sticky across worlds within a
-    /// session: a fallback to Design is what turns Live off, and the user
-    /// turning it back on is what turns it on again.
+    /// Which renderer the canvas draws. User-opened worlds always use Live;
+    /// Design remains only for non-interactive agent opens.
     canvas_mode: CanvasMode,
-    /// Which tool the user picked, sticky for the same reason
-    /// [`Self::canvas_mode`] is: leaving Live to look at the design view
-    /// should not silently hand the pointer back to the select tool.
+    /// Which tool the user picked, retained when the viewer restarts.
     /// Seeded into every new [`LiveView`] by [`Self::start_live`].
     live_tool: u8,
     /// The link to the viewer cart THIS panel booted. One per panel, so
@@ -5354,7 +5406,8 @@ impl WorldPanel {
     /// cart's camera has to keep working under it. `None` is a move with
     /// nothing held, which no stroke can be.
     fn live_owns_button(&self, button: Option<MouseButton>) -> bool {
-        self.live_active() && !(button == Some(MouseButton::Left) && self.in_paint_mode())
+        self.canvas_mode == CanvasMode::Live
+            && !(button == Some(MouseButton::Left) && self.in_paint_mode())
     }
 
     /// A mouse button went down over the canvas. Returns whether the cart
@@ -5513,6 +5566,171 @@ impl WorldPanel {
             bottom_right[0] - top_left[0],
             bottom_right[1] - top_left[1],
         ])
+    }
+
+    fn affine_spec(
+        open: &OpenWorld,
+        state: &ggo_worldlib::world_doc::WorldState,
+    ) -> Option<([f64; 4], f64, [f64; 2])> {
+        let Selection::Entity(entity) = open.primary()? else {
+            return None;
+        };
+        let live = open.live.as_ref()?;
+        let row = live.rows.iter().find(|row| row.index == entity as u32)?;
+        let world_entity = state.entities.get(entity)?;
+        let fields = world_entity
+            .components
+            .get(SPRITE_COMPONENT)
+            .and_then(Value::as_object)
+            .or_else(|| {
+                world_entity
+                    .components
+                    .get(META_SPRITE)
+                    .and_then(Value::as_object)
+            })?;
+        let (rotation, scale) = open
+            .affine_drag
+            .as_ref()
+            .filter(|drag| drag.entity == entity)
+            .map_or_else(
+                || {
+                    (
+                        fields
+                            .get("rotation")
+                            .and_then(Value::as_f64)
+                            .unwrap_or_default(),
+                        [
+                            fields.get("scale_x").and_then(Value::as_f64).unwrap_or(1.0),
+                            fields.get("scale_y").and_then(Value::as_f64).unwrap_or(1.0),
+                        ],
+                    )
+                },
+                |drag| (drag.rotation, drag.scale),
+            );
+        Some((row.drawn(), rotation, scale))
+    }
+
+    fn begin_affine_drag(&mut self, local: [f64; 2]) -> bool {
+        let Some(size) = self.live_canvas_size() else {
+            return false;
+        };
+        let Some((view, _, _)) = self.live_camera_for(size) else {
+            return false;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        let state = open.store.state();
+        let Some(Selection::Entity(entity)) = open.primary() else {
+            return false;
+        };
+        let Some(live) = open.live.as_ref() else {
+            return false;
+        };
+        let Some(row) = live.rows.iter().find(|row| row.index == entity as u32) else {
+            return false;
+        };
+        let Some(world_entity) = state.entities.get(entity) else {
+            return false;
+        };
+        let Some((component, fields)) =
+            [SPRITE_COMPONENT, META_SPRITE]
+                .into_iter()
+                .find_map(|name| {
+                    world_entity
+                        .components
+                        .get(name)
+                        .and_then(Value::as_object)
+                        .map(|fields| (name, fields))
+                })
+        else {
+            return false;
+        };
+        let rotation = fields
+            .get("rotation")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let scale = [
+            fields.get("scale_x").and_then(Value::as_f64).unwrap_or(1.0),
+            fields.get("scale_y").and_then(Value::as_f64).unwrap_or(1.0),
+        ];
+        let overlay = canvas::affine_overlay(row.drawn(), rotation, scale, view.zoom);
+        let handle = overlay.handles().find_map(|(handle, world)| {
+            let screen = drag_ops::world_to_screen(world[0], world[1], &view);
+            ((screen[0] - local[0]).hypot(screen[1] - local[1]) <= 10.0).then_some(handle)
+        });
+        let Some(handle) = handle else {
+            return false;
+        };
+        let start_world = drag_ops::screen_to_world(local[0], local[1], &view);
+        open.affine_drag = Some(AffineDrag {
+            entity,
+            component: component.to_string(),
+            fields: fields.clone(),
+            handle,
+            rect: row.drawn(),
+            start_world,
+            start_rotation: rotation,
+            rotation,
+            scale,
+        });
+        true
+    }
+
+    fn update_affine_drag(&mut self, local: [f64; 2], cx: &mut Context<Self>) -> bool {
+        let Some(size) = self.live_canvas_size() else {
+            return false;
+        };
+        let Some((view, _, _)) = self.live_camera_for(size) else {
+            return false;
+        };
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        let Some(drag) = open.affine_drag.as_mut() else {
+            return false;
+        };
+        drag.update(drag_ops::screen_to_world(local[0], local[1], &view));
+        cx.notify();
+        true
+    }
+
+    fn finish_affine_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        let Some(mut drag) = open.affine_drag.take() else {
+            return false;
+        };
+        let rotation = ((drag.rotation * 256.0 / 360.0).round() * 360.0 / 256.0)
+            .rem_euclid(360.0)
+            .round() as i64;
+        let quantize_scale = |scale: f64| (scale * 256.0).round() / 256.0;
+        drag.fields
+            .insert("rotation".to_string(), Value::from(rotation));
+        drag.fields.insert(
+            "scale_x".to_string(),
+            serde_json::json!(quantize_scale(drag.scale[0])),
+        );
+        drag.fields.insert(
+            "scale_y".to_string(),
+            serde_json::json!(quantize_scale(drag.scale[1])),
+        );
+        self.apply_op(
+            WorldOp::Batch(vec![
+                WorldOp::RemoveComponent {
+                    entity: drag.entity,
+                    name: drag.component.clone(),
+                },
+                WorldOp::AddComponent {
+                    entity: drag.entity,
+                    name: drag.component,
+                    defaults: drag.fields,
+                },
+            ]),
+            cx,
+        );
+        true
     }
 
     /// The band the Live overlay paints right now, in world px as an
@@ -6157,7 +6375,7 @@ impl WorldPanel {
         // do with the one now open, and nothing polls it any more.
         self.stop_live_endpoint();
         let Some(workspace) = self.workspace.clone() else {
-            self.fall_back_to_design(
+            self.fail_live(
                 "the world panel has no workspace to boot the viewer cart in".to_string(),
                 cx,
             );
@@ -6178,7 +6396,7 @@ impl WorldPanel {
                         this.live_endpoint = Some(endpoint.clone());
                         this.start_live(endpoint, cx);
                     }
-                    None => this.fall_back_to_design(
+                    None => this.fail_live(
                         "no emulator pane is available to run the viewer cart".to_string(),
                         cx,
                     ),
@@ -6326,18 +6544,17 @@ impl WorldPanel {
         }
         match step.failure {
             Some(failure) => {
-                self.fall_back_to_design_from(failure, cx);
+                self.fail_live_from(failure, cx);
                 false
             }
             None => true,
         }
     }
 
-    /// Show the design renderer again and say why. The [`LiveView`] (if
-    /// there is one) is kept in [`LiveStatus::Failed`] so the toolbar can
-    /// name the failure; it stops being polled.
-    fn fall_back_to_design(&mut self, reason: String, cx: &mut Context<Self>) {
-        self.fall_back_to_design_from(
+    /// Keep the failed live editor visible and say why. The [`LiveView`] is
+    /// retained in [`LiveStatus::Failed`] so the toolbar can name the failure.
+    fn fail_live(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.fail_live_from(
             LiveFailure {
                 reason,
                 cart_stopped: false,
@@ -6346,13 +6563,13 @@ impl WorldPanel {
         );
     }
 
-    fn fall_back_to_design_from(&mut self, failure: LiveFailure, cx: &mut Context<Self>) {
+    fn fail_live_from(&mut self, failure: LiveFailure, cx: &mut Context<Self>) {
         let LiveFailure {
             reason,
             cart_stopped,
         } = failure;
-        log::warn!("GGO: live world view fell back to the design view: {reason}");
-        self.canvas_mode = CanvasMode::Design;
+        log::warn!("GGO: live world view stopped: {reason}");
+        self.canvas_mode = CanvasMode::Live;
         self.live_boot_pending = false;
         // Deliberately NOT `note_sticky_live`: the dock's sticky mode is
         // the user's choice, and a transient boot failure must not turn
@@ -6385,9 +6602,8 @@ impl WorldPanel {
         cx.notify();
     }
 
-    /// Show `mode` on the canvas, and make it the panel's mode: it is
-    /// sticky, so the next world opened through the explorer comes up the
-    /// same way.
+    /// Start the Live editor. Design requests from retired actions are
+    /// ignored; non-interactive agent opens select Design during creation.
     ///
     /// Live is entered by asking the booter again rather than by reviving
     /// whatever ran before -- the emulator pane owns "is a rebuild
@@ -6399,7 +6615,7 @@ impl WorldPanel {
         cx: &mut Context<Self>,
     ) {
         match mode {
-            CanvasMode::Design => self.leave_live(cx),
+            CanvasMode::Design => return,
             CanvasMode::Live => {
                 self.canvas_mode = CanvasMode::Live;
                 self.enter_live(window, cx);
@@ -6527,25 +6743,6 @@ impl WorldPanel {
                     .is_some_and(|live| live.mode == EditorMode::Play),
                 _ => false,
             }
-    }
-
-    /// Leave Live mode deliberately: the session goes, and so does the
-    /// viewer run behind it.
-    fn leave_live(&mut self, cx: &mut Context<Self>) {
-        self.canvas_mode = CanvasMode::Design;
-        self.live_boot_pending = false;
-        if let ViewerState::Ready(open) = &mut self.state {
-            let saving = open.save_pending();
-            open.live = None;
-            open.live_error = None;
-            // Same as a failed session: the cart the save was waiting on
-            // is gone with the session the user just left.
-            if saving {
-                open.fail_save("the live session was closed".to_string());
-            }
-        }
-        self.stop_live_endpoint();
-        cx.notify();
     }
 
     /// Recount what each `[[instance]]` contributes to the flattened
@@ -7821,58 +8018,6 @@ impl WorldPanel {
             .into_any_element()
     }
 
-    /// The `Design | Live` switch: which renderer draws the canvas. Its
-    /// selected half is [`Self::canvas_mode`] and not [`Self::live_active`]
-    /// -- a Live session that failed still reads as Live here, and says so
-    /// on the status line rather than snapping the switch back silently.
-    fn render_mode_switch(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        h_flex()
-            .gap_0p5()
-            .child(self.render_mode_half(
-                "ggo-world-mode-design",
-                "Design",
-                CanvasMode::Design,
-                "Draw the world with the editor's own renderer",
-                cx,
-            ))
-            .child(self.render_mode_half(
-                "ggo-world-mode-live",
-                "Live",
-                CanvasMode::Live,
-                "Draw the world with the viewer cart running it",
-                cx,
-            ))
-            .into_any_element()
-    }
-
-    fn render_mode_half(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        mode: CanvasMode,
-        tooltip: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let selected = self.canvas_mode == mode;
-        // The wrapper carries the `debug_selector`: `Button` is a
-        // `RenderOnce` and records no bounds of its own. The selected
-        // state is IN the selector because a toggled `Button` is otherwise
-        // indistinguishable from an untoggled one to a test -- `toggle_state`
-        // changes only how it paints.
-        div()
-            .flex_none()
-            .debug_selector(move || format!("{id}-{}", toggle_suffix(selected)))
-            .child(
-                Button::new(id, label)
-                    .label_size(LabelSize::XSmall)
-                    .toggle_state(selected)
-                    .tooltip(ui::Tooltip::text(tooltip))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_canvas_mode(mode, window, cx)
-                    })),
-            )
-    }
-
     /// Where the live session is, under the toolbar. Shown for the whole
     /// of Live mode, including the state a windowless load leaves behind
     /// -- [`Self::canvas_mode`] is sticky, so the close-prompt reload and
@@ -8034,8 +8179,6 @@ impl WorldPanel {
             .gap_1()
             .px_1()
             .pb_1()
-            .child(self.render_mode_switch(cx))
-            .child(Divider::vertical())
             .child(
                 Checkbox::new("ggo-world-grid", ToggleState::from(grid))
                     .label("Grid")
@@ -8270,7 +8413,7 @@ impl WorldPanel {
             ]
         });
 
-        let element = if self.live_active() {
+        let element = if self.canvas_mode == CanvasMode::Live {
             // Cloned per render, never held across ticks: the emu panel
             // retires the frames it replaces (`LinkEndpoint::frame`).
             let frame = open
@@ -8291,6 +8434,7 @@ impl WorldPanel {
                 .live
                 .as_ref()
                 .map_or([0.0, 0.0], live::LiveView::overlay_camera);
+            let affine_spec = Self::affine_spec(open, &state);
             gpui::canvas(
                 move |canvas_bounds, _window, _cx| {
                     // Stamped directly rather than through `layout_camera`:
@@ -8303,18 +8447,22 @@ impl WorldPanel {
                         f64::from(canvas_bounds.size.height),
                     ];
                     let (transform, frame_rect, _) = live::geometry(size, scale_override, camera);
+                    let affine = affine_spec.map(|(rect, rotation, scale)| {
+                        canvas::affine_overlay(rect, rotation, scale, transform.zoom)
+                    });
                     canvas::LiveScene {
                         frame,
                         frame_rect,
                         view: transform,
                         rows,
                         marquee,
+                        affine,
                         background,
                         accent,
                     }
                 },
-                move |canvas_bounds, scene, window, _cx| {
-                    canvas::paint_live(&scene, canvas_bounds, window)
+                move |canvas_bounds, scene, window, cx| {
+                    canvas::paint_live(&scene, canvas_bounds, window, cx)
                 },
             )
             .size_full()
@@ -8362,6 +8510,10 @@ impl WorldPanel {
                     let Some(local) = this.canvas_local(event.position) else {
                         return;
                     };
+                    if this.begin_affine_drag(local) {
+                        cx.notify();
+                        return;
+                    }
                     // In Live the press is the cart's: it hit-tests, it
                     // selects, it decides what a second click means.
                     if this.canvas_button_down(local, MouseButton::Left, &event.modifiers) {
@@ -8380,6 +8532,9 @@ impl WorldPanel {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.finish_affine_drag(cx) {
+                        return;
+                    }
                     if let Some(local) = this.canvas_local(event.position)
                         && this.canvas_button_up(local, MouseButton::Left, &event.modifiers)
                     {
@@ -8442,6 +8597,7 @@ impl WorldPanel {
                 if painting {
                     this.end_canvas_paint(cx);
                 }
+                this.finish_affine_drag(cx);
                 // And the same for the cart's own drag or band: gpui
                 // stops delivering moves the moment the cursor is
                 // outside, so a gesture left open would freeze here and
@@ -8457,6 +8613,11 @@ impl WorldPanel {
                             f64::from(event.position.y - bounds.origin.y),
                         ]);
                     }
+                }
+                if let Some(local) = this.canvas_local(event.position)
+                    && this.update_affine_drag(local, cx)
+                {
+                    return;
                 }
                 if let Some(local) = this.canvas_local(event.position)
                     && this.canvas_pointer_move(local, event.pressed_button, &event.modifiers)
@@ -9202,18 +9363,8 @@ impl Render for WorldPanel {
                 this.delete_selected_impl(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ResetView, _window, cx| this.reset_view_impl(cx)))
-            .on_action(cx.listener(|this, _: &ToggleDesign, window, cx| {
-                this.set_canvas_mode(CanvasMode::Design, window, cx)
-            }))
             .on_action(cx.listener(|this, _: &ToggleLive, window, cx| {
                 this.set_canvas_mode(CanvasMode::Live, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleCanvasMode, window, cx| {
-                let next = match this.canvas_mode {
-                    CanvasMode::Design => CanvasMode::Live,
-                    CanvasMode::Live => CanvasMode::Design,
-                };
-                this.set_canvas_mode(next, window, cx)
             }))
             .on_action(cx.listener(|this, _: &NudgeLeft, _window, cx| {
                 this.nudge_impl("ArrowLeft", false, cx)
@@ -9276,6 +9427,59 @@ mod tests {
     use serde_json::json;
     use workspace::dock::{DockPosition, Panel as _};
     use workspace::{AppState, MultiWorkspace};
+
+    #[test]
+    fn affine_corner_drag_scales_both_axes_without_flipping_at_the_start() {
+        let mut drag = AffineDrag {
+            entity: 0,
+            component: SPRITE_COMPONENT.to_string(),
+            fields: serde_json::Map::new(),
+            handle: canvas::AffineHandle::ScaleBoth(0),
+            rect: [10.0, 20.0, 40.0, 20.0],
+            start_world: [10.0, 20.0],
+            start_rotation: 0.0,
+            rotation: 0.0,
+            scale: [1.0, 1.0],
+        };
+        drag.update([10.0, 20.0]);
+        assert_eq!(drag.scale, [1.0, 1.0]);
+        drag.update([-10.0, 10.0]);
+        assert_eq!(drag.scale, [2.0, 2.0]);
+    }
+
+    #[test]
+    fn affine_edge_drag_changes_only_its_axis() {
+        let mut drag = AffineDrag {
+            entity: 0,
+            component: META_SPRITE.to_string(),
+            fields: serde_json::Map::new(),
+            handle: canvas::AffineHandle::ScaleX(1),
+            rect: [10.0, 20.0, 40.0, 20.0],
+            start_world: [50.0, 30.0],
+            start_rotation: 0.0,
+            rotation: 0.0,
+            scale: [1.0, 1.5],
+        };
+        drag.update([70.0, 50.0]);
+        assert_eq!(drag.scale, [2.0, 1.5]);
+    }
+
+    #[test]
+    fn affine_rotate_drag_uses_the_angle_about_the_sprite_center() {
+        let mut drag = AffineDrag {
+            entity: 0,
+            component: SPRITE_COMPONENT.to_string(),
+            fields: serde_json::Map::new(),
+            handle: canvas::AffineHandle::Rotate(0),
+            rect: [0.0, 0.0, 20.0, 20.0],
+            start_world: [20.0, 10.0],
+            start_rotation: 15.0,
+            rotation: 15.0,
+            scale: [1.0, 1.0],
+        };
+        drag.update([10.0, 20.0]);
+        assert!((drag.rotation - 105.0).abs() < 1e-9);
+    }
 
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
@@ -15750,6 +15954,24 @@ mod tests {
         let components: &[(&str, &[(&str, u8)])] = &[
             ("Transform", &[("pos", VEC2), ("z", INT)]),
             (
+                "Sprite",
+                &[
+                    ("stem", STR),
+                    ("rotation", INT),
+                    ("scale_x", FIXED),
+                    ("scale_y", FIXED),
+                ],
+            ),
+            (
+                "MetaSprite",
+                &[
+                    ("stem", STR),
+                    ("rotation", INT),
+                    ("scale_x", FIXED),
+                    ("scale_y", FIXED),
+                ],
+            ),
+            (
                 "Text",
                 &[
                     ("content", STR),
@@ -15789,6 +16011,21 @@ mod tests {
         );
         writer.int("z", z);
         writer.finish("Transform")
+    }
+
+    fn sprite_bag(stem: &str, rotation: i32, scale: [f64; 2]) -> Vec<u8> {
+        let mut writer = emerald_world::FieldWriter::new();
+        writer.str_("stem", stem);
+        writer.int("rotation", rotation);
+        writer.fixed(
+            "scale_x",
+            emerald_core::Fixed::from_raw(live::to_raw(scale[0])),
+        );
+        writer.fixed(
+            "scale_y",
+            emerald_core::Fixed::from_raw(live::to_raw(scale[1])),
+        );
+        writer.finish(SPRITE_COMPONENT)
     }
 
     /// Every `SetComponent` in `sent`, as `(entity index, bag)`.
@@ -16001,6 +16238,41 @@ mod tests {
         (panel, endpoint, dir, cx)
     }
 
+    async fn connected_live_sprite_panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<WorldPanel>,
+        Arc<ggo_common::LinkEndpoint>,
+        tempfile::TempDir,
+        &mut gpui::VisualTestContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_world(
+            dir.path(),
+            "worlds/affine.toml",
+            &WorldFile {
+                entities: vec![entity(json!({
+                    "Transform": { "pos": [40.0, 40.0], "z": 0 },
+                    "Sprite": { "stem": "sprites/hero" }
+                }))],
+                instances: vec![],
+                backgrounds: vec![],
+            },
+        )
+        .unwrap();
+        let (panel, endpoint, cx) = live_panel_rel(cx, &dir, "worlds/affine.toml").await;
+        endpoint.set_state(ggo_common::ViewerState::Running);
+        cx.run_until_parked();
+        cart_says(
+            &endpoint,
+            hello_ack(emerald_editor_runtime::wire::LINK_PROTO_VERSION, &[]),
+        );
+        cart_schemas(&endpoint);
+        cx.run_until_parked();
+        settle_live(&panel, &endpoint, cx);
+        (panel, endpoint, dir, cx)
+    }
+
     /// [`connected_live_panel`] with slot 0 linked to a real `.til`/`.map`
     /// pair, so paint mode has something to open.
     async fn connected_live_panel_with_background(
@@ -16117,7 +16389,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_stopped_viewer_falls_back_to_design_with_the_reason(cx: &mut TestAppContext) {
+    async fn a_stopped_viewer_stays_live_and_shows_the_reason(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         endpoint.set_state(ggo_common::ViewerState::Stopped(
@@ -16125,7 +16397,7 @@ mod tests {
         ));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             let open = open_of(panel);
             assert!(
                 open.live_error.as_deref().unwrap_or("").contains("no emd"),
@@ -16143,7 +16415,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn no_booter_means_design_mode(cx: &mut TestAppContext) {
+    async fn no_booter_leaves_the_live_error_visible(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let project = routed_project(cx, dir.path(), true).await;
         let (multi_workspace, cx) =
@@ -16155,7 +16427,7 @@ mod tests {
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             assert!(open_of(panel).live.is_none());
             assert!(open_of(panel).live_error.is_some());
         });
@@ -16170,7 +16442,7 @@ mod tests {
         cart_says(&endpoint, hello_ack(0, &[]));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             assert!(
                 open_of(panel)
                     .live_error
@@ -16196,7 +16468,7 @@ mod tests {
         cart_says(&endpoint, hello_ack(0, &[]));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             assert!(
                 panel.live_endpoint.is_none(),
                 "the panel let go of the cart it booted"
@@ -16219,7 +16491,7 @@ mod tests {
         endpoint.set_state(ggo_common::ViewerState::Stopped("gone".into()));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
         });
         assert!(
             !endpoint.stop_requested(),
@@ -16238,7 +16510,7 @@ mod tests {
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             assert!(
                 matches!(
                     open_of(panel).live.as_ref().map(|live| &live.status),
@@ -16286,7 +16558,7 @@ mod tests {
         cx.run_until_parked();
 
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             let live = open_of(panel).live.as_ref().expect("the failed session");
             assert!(matches!(live.status, LiveStatus::Failed(_)));
             assert!(
@@ -16315,7 +16587,7 @@ mod tests {
         endpoint.set_state(ggo_common::ViewerState::Stopped("gone".into()));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
         });
         assert_eq!(BOOTED.with(|booted| booted.borrow().len()), 1);
 
@@ -16511,7 +16783,7 @@ mod tests {
             .advance_clock(live::BUILD_DEADLINE + std::time::Duration::from_secs(1));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             assert!(
                 open_of(panel)
                     .live_error
@@ -16521,24 +16793,6 @@ mod tests {
                 "{:?}",
                 open_of(panel).live_error
             );
-        });
-    }
-
-    /// Leaving Live ends the viewer run rather than leaving a cart burning
-    /// emulator frames for a panel that stopped looking (Phase 2 review).
-    #[gpui::test]
-    async fn leaving_live_stops_the_viewer_run(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (panel, endpoint, cx) = live_panel(cx, &dir).await;
-        endpoint.set_state(ggo_common::ViewerState::Running);
-        cx.run_until_parked();
-        assert!(!endpoint.stop_requested());
-        panel.update(cx, |panel, cx| panel.leave_live(cx));
-        cx.run_until_parked();
-        assert!(endpoint.stop_requested(), "the viewer run is asked to end");
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
-            assert!(open_of(panel).live.is_none());
         });
     }
 
@@ -18940,6 +19194,109 @@ mod tests {
         cart_says(endpoint, end);
     }
 
+    #[gpui::test]
+    async fn affine_drag_smoke_saves_and_reloads_the_sprite_transform(cx: &mut TestAppContext) {
+        let (panel, endpoint, dir, cx) = connected_live_sprite_panel(cx).await;
+        cart_rows(&endpoint, &[(0, 40.0, 40.0)]);
+        cart_selection(&endpoint, &[0]);
+        cart_frame(&endpoint, 1);
+        let image = ggo_common::to_render_image(&vec![0u8; 320 * 240 * 4], 320, 240)
+            .expect("a 320x240 RGBA buffer");
+        *endpoint
+            .frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((1, image));
+        endpoint.tick();
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            open_of(panel).view.borrow_mut().last_bounds = None;
+            cx.notify();
+        });
+        show_panel(cx);
+        let (canvas_origin, from, to) = panel.read_with(cx, |panel, _| {
+            let canvas_bounds = open_of(panel)
+                .view
+                .borrow()
+                .last_bounds
+                .expect("the live canvas was laid out");
+            (
+                canvas_bounds.origin,
+                live_screen_of(panel, [56.0, 56.0]),
+                live_screen_of(panel, [64.0, 64.0]),
+            )
+        });
+        let screen_point = |local: [f64; 2]| {
+            gpui::point(
+                canvas_origin.x + px(local[0] as f32),
+                canvas_origin.y + px(local[1] as f32),
+            )
+        };
+        let from = screen_point(from);
+        let to = screen_point(to);
+        cx.simulate_mouse_move(from, None, Modifiers::default());
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            let sprite = state.entities[0].components[SPRITE_COMPONENT]
+                .as_object()
+                .expect("Sprite fields");
+            assert_eq!(sprite["rotation"], json!(0));
+            assert_eq!(sprite["scale_x"], json!(2.0));
+            assert_eq!(sprite["scale_y"], json!(2.0));
+        });
+        settle_live(&panel, &endpoint, cx);
+        host_sent(&endpoint);
+
+        panel.update(cx, |panel, cx| panel.save_impl(cx));
+        cx.run_until_parked();
+        answer_cart_save(
+            &panel,
+            &endpoint,
+            cx,
+            &[(
+                0,
+                vec![
+                    transform_bag([40.0, 40.0], 0),
+                    sprite_bag("sprites/hero", 0, [2.0, 2.0]),
+                ],
+            )],
+            &[],
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(open_of(panel).save_error, None);
+            assert!(!open_of(panel).save_pending());
+        });
+
+        let on_disk = read_world(dir.path(), "worlds/affine.toml").expect("the saved world");
+        assert_eq!(
+            on_disk.entities[0].components[SPRITE_COMPONENT]["scale_x"],
+            json!(2)
+        );
+        assert_eq!(
+            on_disk.entities[0].components[SPRITE_COMPONENT]["scale_y"],
+            json!(2)
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.reload_from_disk("worlds/affine.toml", cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            let sprite = state.entities[0].components[SPRITE_COMPONENT]
+                .as_object()
+                .expect("the reloaded Sprite fields");
+            assert_eq!(sprite["rotation"], json!(0));
+            assert_eq!(sprite["scale_x"], json!(2));
+            assert_eq!(sprite["scale_y"], json!(2));
+        });
+    }
+
     /// The cart owns the live world, so a save in Live writes what the
     /// CART holds: an entity one of its own systems moved -- with no row
     /// report the mirror could have folded -- lands in the TOML at the
@@ -19776,49 +20133,6 @@ mod tests {
         });
     }
 
-    /// Design saves the document, as it always did: no snapshot, no
-    /// readback, and the write lands on the spot.
-    #[gpui::test]
-    async fn a_save_in_design_writes_the_document_without_the_cart(cx: &mut TestAppContext) {
-        let (panel, endpoint, dir, cx) = connected_live_panel_flat(cx).await;
-        panel.update(cx, |panel, cx| {
-            panel.apply_op(
-                WorldOp::MoveEntity {
-                    entity: 0,
-                    pos: [8.0, 8.0],
-                    gesture: None,
-                },
-                cx,
-            );
-        });
-        settle_live(&panel, &endpoint, cx);
-        panel.update_in(cx, |panel, window, cx| {
-            panel.set_canvas_mode(CanvasMode::Design, window, cx);
-        });
-        cx.run_until_parked();
-        host_sent(&endpoint);
-
-        panel.update(cx, |panel, cx| panel.save_impl(cx));
-        cx.run_until_parked();
-
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(open_of(panel).save_error, None);
-            assert!(panel.dirty_world_name().is_none(), "written on the spot");
-        });
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
-        assert_eq!(
-            on_disk.entities[0].components["Transform"]["pos"],
-            json!([8, 8]),
-            "the DOCUMENT's position, which is the only truth in Design"
-        );
-        assert!(
-            !host_sent(&endpoint)
-                .iter()
-                .any(|message| message.first() == Some(&0x12)),
-            "no snapshot is asked for"
-        );
-    }
-
     /// The slot cycle runs one layer per tick, and dirtiness is PER SLOT:
     /// a slot re-dirtied while the queue is draining is re-read from disk
     /// and moved to the back, while the slots ahead of it keep their
@@ -20278,8 +20592,6 @@ mod tests {
     /// The `-on`/`-off` halves of each stateful `debug_selector` this
     /// module asserts on. Named because `debug_bounds` takes `&'static
     /// str`, so the halves cannot be built from a prefix at the call site.
-    const MODE_DESIGN: (&str, &str) = ("ggo-world-mode-design-on", "ggo-world-mode-design-off");
-    const MODE_LIVE: (&str, &str) = ("ggo-world-mode-live-on", "ggo-world-mode-live-off");
     /// The Live boot screen's `debug_selector`.
     const LIVE_LOADING: &str = "ggo-world-live-loading";
     /// The cart's own `Edit | Play` switch on the edit rail -- not the
@@ -20304,14 +20616,6 @@ mod tests {
             (None, Some(_)) => Some(false),
             _ => None,
         }
-    }
-
-    fn assert_mode(
-        panel: &Entity<WorldPanel>,
-        cx: &mut gpui::VisualTestContext,
-        expected: CanvasMode,
-    ) {
-        panel.read_with(cx, |panel, _| assert_eq!(panel.canvas_mode, expected));
     }
 
     /// Focuses the dock and lets it paint the panel, so `debug_bounds`
@@ -20713,63 +21017,6 @@ mod tests {
         );
     }
 
-    /// The switch is a real mode change on both sides: Design ends the
-    /// session and the viewer run behind it, and Live starts a new one
-    /// rather than reviving the corpse. The DOCUMENT is untouched either
-    /// way -- the mode only decides which renderer draws it.
-    #[gpui::test]
-    async fn switching_to_design_keeps_the_document_and_back_to_live_starts_a_session(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        let entities = panel.read_with(cx, |panel, _| open_of(panel).store.state().entities.len());
-
-        panel.update_in(cx, |panel, window, cx| {
-            panel.set_canvas_mode(CanvasMode::Design, window, cx)
-        });
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
-            assert!(
-                open_of(panel).live.is_none(),
-                "the session goes with the mode"
-            );
-            assert_eq!(
-                open_of(panel).store.state().entities.len(),
-                entities,
-                "the document is the same document"
-            );
-        });
-        assert!(
-            endpoint.stop_requested(),
-            "and the viewer run behind it is stopped"
-        );
-
-        let before = BOOTED.with(|booted| booted.borrow().len());
-        panel.update_in(cx, |panel, window, cx| {
-            panel.set_canvas_mode(CanvasMode::Live, window, cx)
-        });
-        cx.run_until_parked();
-
-        assert_eq!(
-            BOOTED.with(|booted| booted.borrow().len()),
-            before + 1,
-            "asks the booter again; the emu panel decides whether to rebuild"
-        );
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Live);
-            let live = open_of(panel).live.as_ref().expect("a new session");
-            assert!(
-                matches!(live.status, LiveStatus::Building | LiveStatus::Connecting),
-                "a fresh session rather than the old one: {:?}",
-                live.status
-            );
-            assert!(
-                !Arc::ptr_eq(&live.endpoint, &endpoint),
-                "over a fresh endpoint"
-            );
-        });
-    }
-
     /// The Live tab shows a boot screen instead of the canvas until the
     /// cart is both connected and drawing.
     #[gpui::test]
@@ -20977,41 +21224,6 @@ mod tests {
         });
     }
 
-    /// Entering Live defers the boot, so there is a render with the mode
-    /// already flipped and no session behind it. That render must be the
-    /// boot screen: painting the design renderer through it flashes the
-    /// picture the user just switched away from.
-    #[gpui::test]
-    async fn entering_live_paints_the_boot_screen_not_a_design_frame(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (panel, _endpoint, cx) = live_panel(cx, &dir).await;
-        panel.update_in(cx, |panel, window, cx| {
-            panel.set_canvas_mode(CanvasMode::Design, window, cx)
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            panel.read_with(cx, |panel, _| panel.live_loading_text()),
-            None
-        );
-
-        // Asserted INSIDE the update, which is the only place the state
-        // between `enter_live` arming its deferral and the booter
-        // answering can be seen: the deferral runs on the way out.
-        panel.update_in(cx, |panel, window, cx| {
-            panel.set_canvas_mode(CanvasMode::Live, window, cx);
-            assert!(open_of(panel).live.is_none(), "the boot is deferred");
-            assert_eq!(
-                panel.live_loading_text(),
-                Some("Booting viewer for test…".into()),
-                "the boot screen stands in for the canvas"
-            );
-        });
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            assert!(open_of(panel).live.is_some(), "and the boot lands");
-        });
-    }
-
     /// The rail is Live's alone, and only once the cart has greeted: the
     /// mode is the cart's and the tool names arrive on the `HelloAck`.
     #[gpui::test]
@@ -21128,12 +21340,11 @@ mod tests {
             .expect("a way to start one");
 
         // This panel has no workspace to boot a cart in, so the click can
-        // only get as far as the fallback -- which is proof enough that
-        // the button reaches `enter_live`.
+        // only get as far as reporting that failure.
         cx.simulate_click(start.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.canvas_mode, CanvasMode::Design);
+            assert_eq!(panel.canvas_mode, CanvasMode::Live);
             assert!(
                 open_of(panel)
                     .live_error
@@ -21145,61 +21356,9 @@ mod tests {
             );
         });
         assert!(
-            cx.debug_bounds("ggo-world-live-status").is_none(),
-            "and the idle line goes with the mode"
+            cx.debug_bounds("ggo-world-live-status").is_some(),
+            "the live editor remains visible with the failure"
         );
-    }
-
-    /// The tool the user picked outlives the session it was picked in:
-    /// leaving Live to look at the design view and coming back must not
-    /// silently hand the pointer back to the select tool.
-    #[gpui::test]
-    async fn the_tool_survives_a_trip_through_design(cx: &mut TestAppContext) {
-        let (panel, first, _dir, cx) =
-            connected_live_panel_with_tools(cx, &["Select", "paint"]).await;
-        panel.update(cx, |panel, cx| panel.set_live_tool(1, cx));
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.live_tool, 1, "the panel remembers it")
-        });
-
-        panel.update_in(cx, |panel, window, cx| {
-            panel.set_canvas_mode(CanvasMode::Design, window, cx)
-        });
-        panel.update_in(cx, |panel, window, cx| {
-            panel.set_canvas_mode(CanvasMode::Live, window, cx)
-        });
-        cx.run_until_parked();
-        let endpoint = BOOTED
-            .with(|booted| booted.borrow().last().map(|(_, e)| e.clone()))
-            .expect("a second viewer");
-        assert!(!Arc::ptr_eq(&endpoint, &first), "a second viewer");
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                live_of(panel).tool,
-                1,
-                "the new session starts where the old one left off"
-            )
-        });
-
-        // And the CART is told, which is the half that matters: a greeting
-        // resets the cart to its select tool, and nothing else re-arms it.
-        endpoint.set_state(ggo_common::ViewerState::Running);
-        cx.run_until_parked();
-        host_sent(&endpoint);
-        cart_says(
-            &endpoint,
-            hello_ack(
-                emerald_editor_runtime::wire::LINK_PROTO_VERSION,
-                &["Select", "paint"],
-            ),
-        );
-        cx.run_until_parked();
-        let sent = sent_host_msg(&endpoint, 0x0E);
-        match emerald_editor_runtime::wire::decode_host(&sent) {
-            Some(emerald_editor_runtime::wire::HostMsg::SetTool { tool }) => assert_eq!(tool, 1),
-            other => panic!("the greeting must re-arm the tool: {other:?}"),
-        }
     }
 
     /// A session that failed must not read as "Live": the status line
@@ -21210,13 +21369,6 @@ mod tests {
         let (panel, endpoint, cx) = live_panel(cx, &dir).await;
         show_panel(cx);
         endpoint.set_state(ggo_common::ViewerState::Stopped("gone".into()));
-        cx.run_until_parked();
-        // The fallback already flipped the switch to Design; the retry
-        // affordance is for the user who asks for Live again anyway.
-        panel.update(cx, |panel, cx| {
-            panel.canvas_mode = CanvasMode::Live;
-            cx.notify();
-        });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert!(
@@ -21236,62 +21388,5 @@ mod tests {
             before + 1,
             "Retry starts a new session"
         );
-    }
-
-    /// The keymap entry is part of the feature: an action nothing binds
-    /// is a command-palette entry, not a shortcut.
-    #[gpui::test]
-    async fn the_canvas_mode_keystroke_flips_the_switch(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
-        focus_the_panel(&panel, cx);
-        // A windowless load never enters Live, so the panel is sitting in
-        // the sticky Live mode with no session -- which is exactly the
-        // state ctrl-alt-l has to be able to leave.
-        assert_mode(&panel, cx, CanvasMode::Live);
-
-        cx.simulate_keystrokes("ctrl-alt-l");
-        cx.run_until_parked();
-
-        assert_mode(&panel, cx, CanvasMode::Design);
-    }
-
-    /// The switch is on the view-control row in both modes, its buttons
-    /// are wired, and the actions behind them flip the same state.
-    #[gpui::test]
-    async fn the_mode_switch_and_its_actions_flip_the_canvas(cx: &mut TestAppContext) {
-        let (panel, _endpoint, _dir, cx) = connected_live_panel(cx).await;
-        show_panel(cx);
-        assert_eq!(
-            toggle_of(cx, MODE_LIVE),
-            Some(true),
-            "the switch shows which renderer is drawing"
-        );
-        assert_eq!(toggle_of(cx, MODE_DESIGN), Some(false));
-        let design = cx
-            .debug_bounds("ggo-world-mode-design-off")
-            .expect("the switch renders in Live mode too");
-        cx.simulate_click(design.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        assert_mode(&panel, cx, CanvasMode::Design);
-        assert_eq!(toggle_of(cx, MODE_DESIGN), Some(true));
-        assert_eq!(
-            toggle_of(cx, MODE_LIVE),
-            Some(false),
-            "and both halves move together"
-        );
-
-        cx.dispatch_action(ToggleCanvasMode);
-        cx.run_until_parked();
-        assert_mode(&panel, cx, CanvasMode::Live);
-        cx.dispatch_action(ToggleCanvasMode);
-        cx.run_until_parked();
-        assert_mode(&panel, cx, CanvasMode::Design);
-        cx.dispatch_action(ToggleLive);
-        cx.run_until_parked();
-        assert_mode(&panel, cx, CanvasMode::Live);
-        cx.dispatch_action(ToggleDesign);
-        cx.run_until_parked();
-        assert_mode(&panel, cx, CanvasMode::Design);
     }
 }
