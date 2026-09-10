@@ -250,6 +250,75 @@ fn worktree_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     Some(worktree.read(cx).abs_path().to_path_buf())
 }
 
+/// The `.til` whose import record names `png_rel` (both worktree-relative),
+/// i.e. the tileset a re-import of this PNG would rewrite.
+///
+/// Two passes, cheapest first. The neighbour probe reads ONE sidecar --
+/// `<dir>/<stem>.til`, the destination an import defaults to -- and covers
+/// the ordinary case. Only when that misses does the `.ggo-ide/` walk run,
+/// which is what finds a tileset whose destination directory was retargeted
+/// away from its source (the Dir field is user-editable, so `art/hero.png`
+/// may well have been written to `tiles/hero.til`).
+///
+/// The walk is bounded to the hidden sidecar tree -- one small JSON per
+/// tileset, never the asset tree itself -- because this runs while
+/// `ProjectPanel` is LEASED and a slow probe here is a stalled menu.
+///
+/// First match wins when a PNG fed several tilesets. Re-import replays a
+/// RECORD, and there is no basis in the menu for choosing between two of
+/// them; the plain import entry stays available for the other.
+fn til_imported_from(project_root: &Path, png_rel: &str) -> Option<String> {
+    let source_abs = project_root.join(png_rel);
+    let records_this_png = |til_rel: &str| -> bool {
+        load_tileset_meta(project_root, til_rel)
+            .import
+            .is_some_and(|record| record.source_path(project_root) == source_abs)
+    };
+
+    let neighbour = format!("{}.til", png_rel.rsplit_once('.').map_or(png_rel, |(s, _)| s));
+    if records_this_png(&neighbour) {
+        return Some(neighbour);
+    }
+
+    let sidecars = project_root.join(".ggo-ide");
+    let mut found = None;
+    visit_sidecars(&sidecars, &mut |path| {
+        if found.is_some() {
+            return;
+        }
+        let Ok(til_rel) = path.strip_prefix(&sidecars) else {
+            return;
+        };
+        let til_rel = til_rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let Some(til_rel) = til_rel.strip_suffix(".editor.json") else {
+            return;
+        };
+        if til_rel.ends_with(".til") && records_this_png(til_rel) {
+            found = Some(til_rel.to_string());
+        }
+    });
+    found
+}
+
+/// Call `visit` for every `*.editor.json` under `dir`, recursively. An
+/// unreadable directory is simply empty -- a missing `.ggo-ide/` is the
+/// normal state of a project that has never imported anything.
+fn visit_sidecars(dir: &Path, visit: &mut impl FnMut(&Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            visit_sidecars(&path, visit);
+        } else if path.extension().is_some_and(|ext| ext == "json") {
+            visit(&path);
+        }
+    }
+}
+
 /// `workspace::ContextMenuContributor` for a `.png` FILE: "Import as
 /// tileset…".
 ///
@@ -284,32 +353,61 @@ fn contribute_import_menu(
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return Vec::new();
     };
+    // The label states what the click will DO. A PNG that already fed a
+    // tileset re-imports it -- replaying the recorded crop and settings onto
+    // the destination it already has -- while a PNG that fed nothing gets
+    // the plain import it always got. One entry, not two: they are the same
+    // gesture, and offering a "Re-import…" that could only answer "no import
+    // record" is the thing this avoids.
+    let reimport = worktree_root(workspace, cx)
+        .and_then(|project_root| til_imported_from(&project_root, &rel));
     vec![
-        ui::ContextMenuEntry::new("Import as tileset…")
+        ui::ContextMenuEntry::new(import_entry_label(reimport.as_deref()))
             .icon(ui::IconName::Download)
-            .handler(import_png_handler(cx.weak_entity(), rel))
+            .handler(import_png_handler(cx.weak_entity(), rel, reimport))
             .into(),
     ]
 }
 
-/// The "Import as tileset…" entry's handler. Split out from
-/// [`contribute_import_menu`] so a test can invoke exactly what the menu
-/// invokes -- `ContextMenuEntry` keeps its handler private, so a contributed
-/// entry cannot be fired from a test any other way.
+/// What the entry says, given the `.til` this PNG already fed (if any).
+/// Named because `ContextMenuEntry` keeps its label private, so this is the
+/// only thing a test can check.
+fn import_entry_label(til_rel: Option<&str>) -> String {
+    match til_rel {
+        Some(til_rel) => format!("Re-import into {til_rel}…"),
+        None => "Import as tileset…".to_string(),
+    }
+}
+
+/// The import entry's handler. Split out from [`contribute_import_menu`] so
+/// a test can invoke exactly what the menu invokes -- `ContextMenuEntry`
+/// keeps its handler private, so a contributed entry cannot be fired from a
+/// test any other way.
+///
+/// `til_rel` is the tileset a re-import targets, `None` for a first import.
 fn import_png_handler(
     workspace: WeakEntity<Workspace>,
     rel: String,
+    til_rel: Option<String>,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     move |window, cx| {
         let Some(workspace) = workspace.upgrade() else {
             return;
         };
         let rel = rel.clone();
+        let til_rel = til_rel.clone();
         workspace.update(cx, |workspace, cx| {
             let root = worktree_root(workspace, cx);
             open_import_item(workspace, window, cx, move |panel, _window, cx| {
                 panel.adopt_root(root, cx);
-                panel.load_source(&rel, cx);
+                // Both paths leave the wizard OPEN for the user to confirm;
+                // neither writes. `reimport_tileset` differs only in that it
+                // restores the recorded crop and settings and aims the write
+                // back at the recorded destination.
+                match &til_rel {
+                    Some(til_rel) => panel.reimport_tileset(til_rel, cx),
+                    None => panel.load_source(&rel, cx),
+                }
             });
         });
     }
@@ -2479,6 +2577,51 @@ mod tests {
     /// The other half of the rule: the asset rel names the file for
     /// downstream binders, the worktree rel names it for the explorer and the
     /// tileset panel. Confusing the two is what the F4 bug was.
+    /// A `.til` records its SOURCE, so the PNG -> `.til` direction is a
+    /// search. The neighbour probe is one file read and covers the ordinary
+    /// case; the `.ggo-ide/` walk exists for the destination the user
+    /// retargeted, which the neighbour probe cannot see.
+    #[test]
+    fn the_til_a_png_was_imported_into_is_found_either_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_project(root);
+        let record = |source: &str| ImportRecord {
+            source: source.to_string(),
+            ..Default::default()
+        };
+        let write_record = |til_rel: &str, source: &str| {
+            let mut meta = load_tileset_meta(root, til_rel);
+            meta.import = Some(record(source));
+            save_tileset_meta(root, til_rel, &meta).unwrap();
+        };
+
+        assert_eq!(
+            til_imported_from(root, "assets/art/hero.png"),
+            None,
+            "a PNG that fed nothing has no re-import target"
+        );
+
+        write_record("assets/art/hero.til", "assets/art/hero.png");
+        assert_eq!(
+            til_imported_from(root, "assets/art/hero.png").as_deref(),
+            Some("assets/art/hero.til"),
+            "the same-stem neighbour, found without walking anything"
+        );
+
+        // Retargeted: the record lives under a stem the neighbour probe
+        // would never guess, so only the walk finds it.
+        write_record("assets/tiles/moved.til", "assets/art/outside.png");
+        assert_eq!(
+            til_imported_from(root, "assets/art/outside.png").as_deref(),
+            Some("assets/tiles/moved.til")
+        );
+
+        // A record naming a DIFFERENT source must not match, or every PNG
+        // would re-import the first tileset in the tree.
+        assert_eq!(til_imported_from(root, "assets/art/unrelated.png"), None);
+    }
+
     #[test]
     fn worktree_rel_for_re_adds_the_assets_segment() {
         let dir = tempfile::tempdir().unwrap();
@@ -3894,6 +4037,61 @@ mod tests {
     /// committed import then opens the result in `ggo_tileset_panel` -- the
     /// "see what you just made" handoff, which is the one place the
     /// asset-rel/worktree-rel distinction is load-bearing at runtime.
+    /// Right-clicking a PNG that already fed a tileset re-imports THAT
+    /// tileset: the label names it, and the handler restores the recorded
+    /// crop rather than starting from the whole image. The wizard is left
+    /// open either way -- a menu click must not write to disk.
+    #[gpui::test]
+    async fn test_menu_reimports_a_png_that_already_fed_a_tileset(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _, cx) = routed_workspace(cx, dir.path()).await;
+        let root = dir.path();
+
+        assert_eq!(
+            import_entry_label(None),
+            "Import as tileset…",
+            "a PNG that fed nothing gets the plain import it always got"
+        );
+
+        let crop = (TILE_PX, 0, TILE_PX, TILE_PX);
+        let mut meta = load_tileset_meta(root, "assets/art/hero.til");
+        meta.import = Some(ImportRecord {
+            source: "assets/art/hero.png".to_string(),
+            crop: Some(crop),
+            ..Default::default()
+        });
+        save_tileset_meta(root, "assets/art/hero.til", &meta).unwrap();
+
+        let found = til_imported_from(root, "assets/art/hero.png");
+        assert_eq!(found.as_deref(), Some("assets/art/hero.til"));
+        assert_eq!(
+            import_entry_label(found.as_deref()),
+            "Re-import into assets/art/hero.til…"
+        );
+
+        let handler = import_png_handler(
+            workspace.downgrade(),
+            "assets/art/hero.png".to_string(),
+            found,
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.source_rel, "assets/art/hero.png");
+            assert_eq!(
+                open.wizard.region.map(|r| (r.x, r.y, r.w, r.h)),
+                Some(crop),
+                "the recorded crop is replayed, not the whole image"
+            );
+        });
+        assert!(
+            !root.join("assets/art/hero.til").exists(),
+            "the click opens the wizard; only the user's confirm writes"
+        );
+    }
+
     #[gpui::test]
     async fn test_menu_handler_loads_the_png_and_the_commit_opens_the_tileset_panel(
         cx: &mut TestAppContext,
@@ -3901,7 +4099,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, panel, _, cx) = routed_workspace(cx, dir.path()).await;
 
-        let handler = import_png_handler(workspace.downgrade(), "assets/art/hero.png".to_string());
+        let handler = import_png_handler(
+            workspace.downgrade(),
+            "assets/art/hero.png".to_string(),
+            None,
+        );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
