@@ -261,6 +261,56 @@ pub fn open_sprite_item(
     workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
 }
 
+/// What [`refresh_open_sprite`] did about the tab showing `rel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteRefresh {
+    /// No tab had that sprite open -- nothing to do.
+    NotOpen,
+    /// The tab was re-read from disk, so it shows the new artwork.
+    Reloaded,
+    /// The tab had UNSAVED edits, so it was left exactly as it is.
+    KeptUnsaved,
+}
+
+/// Re-read the tab showing `rel` (if any) from disk -- what an import
+/// that just rewrote that sprite's trio owes an already-open editor,
+/// which otherwise keeps rendering the pre-import pixels and would write
+/// them back over the fresh ones on its next save.
+///
+/// A tab with unsaved edits is NEVER reloaded: reloading is destructive
+/// (the panel's own `reload_from_disk` is the "Don't Save" answer, and
+/// drops the undo stack with it), and the user did not ask for it here.
+/// The caller reports [`SpriteRefresh::KeptUnsaved`] instead, leaving the
+/// two versions to be reconciled by the person who made both.
+///
+/// The decision is made synchronously (from the panel's dirty flag, which
+/// costs nothing to read) but the reload itself is DEFERRED: callers run
+/// inside a `Workspace` update, and `reload_from_disk` re-resolves the
+/// project root off that same leased workspace -- doing it inline panics
+/// with "cannot read workspace::Workspace while it is already being
+/// updated" (the fork's leased-hook rule, `crates/ggo/.rules`).
+pub fn refresh_open_sprite(
+    workspace: &mut Workspace,
+    rel: &str,
+    cx: &mut Context<Workspace>,
+) -> SpriteRefresh {
+    let Some(item) = workspace
+        .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+        .find(|item| item.read(cx).rel() == rel)
+    else {
+        return SpriteRefresh::NotOpen;
+    };
+    let panel = item.read(cx).panel().clone();
+    if panel.read(cx).dirty_sprite_name().is_some() {
+        return SpriteRefresh::KeptUnsaved;
+    }
+    let rel = rel.to_string();
+    cx.defer(move |cx| {
+        panel.update(cx, |panel, cx| panel.reload_from_disk(&rel, cx));
+    });
+    SpriteRefresh::Reloaded
+}
+
 /// `workspace::ContextMenuContributor` for `*.spr`: the sprite file ops the
 /// project panel's own menu can't offer.
 ///
@@ -2009,7 +2059,7 @@ impl SpritePanel {
 
     /// The open sprite's display path when it has unsaved edits, else
     /// `None`.
-    fn dirty_sprite_name(&self) -> Option<String> {
+    pub(crate) fn dirty_sprite_name(&self) -> Option<String> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
@@ -4984,6 +5034,116 @@ mod tests {
             workspace.intercept_path_open(&project_path(worktree_id, "notes.txt"), window, cx)
         });
         assert!(!claimed, "everything but .spr opens the normal way");
+    }
+
+    // ---------------------------------------- post-import tab refresh
+
+    /// An import that rewrote an open sprite's trio must leave the tab
+    /// showing the NEW artwork: a clean tab is re-read from disk.
+    #[gpui::test]
+    async fn test_refresh_open_sprite_rereads_a_clean_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "sprites/hero.spr"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Rewrite the trio underneath the open tab, the way an import does.
+        let opened = open_sprite(dir.path(), "sprites/hero.spr").unwrap();
+        let mut state = opened.state;
+        state.frames[0].duration_ms = 640;
+        save_sprite(
+            dir.path(),
+            "sprites/hero.spr",
+            &state,
+            &opened.til_path,
+            &opened.pal_path,
+        )
+        .unwrap();
+
+        let refreshed = workspace.update(cx, |workspace, cx| {
+            refresh_open_sprite(workspace, "sprites/hero.spr", cx)
+        });
+        assert_eq!(refreshed, SpriteRefresh::Reloaded);
+        cx.run_until_parked();
+
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                .next()
+                .expect("the tab is open")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).store.state().frames[0].duration_ms,
+                640,
+                "the tab must show what the import wrote"
+            );
+        });
+    }
+
+    /// A tab with unsaved edits is left ALONE -- reloading it would throw
+    /// away work the user never offered up. The caller reports that.
+    #[gpui::test]
+    async fn test_refresh_open_sprite_keeps_an_unsaved_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = routed_project(cx, dir.path(), true).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_path_open(
+                &project_path(worktree_id, "sprites/hero.spr"),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+                .next()
+                .expect("the tab is open")
+                .read(cx)
+                .panel()
+                .clone()
+        });
+        dirty_the_sprite(&panel, cx);
+
+        let refreshed = workspace.update(cx, |workspace, cx| {
+            refresh_open_sprite(workspace, "sprites/hero.spr", cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(refreshed, SpriteRefresh::KeptUnsaved);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).store.state().frames[0].duration_ms,
+                500,
+                "the unsaved edit must survive"
+            );
+            assert!(panel.dirty_sprite_name().is_some(), "and stay dirty");
+        });
+
+        // A sprite nobody has open is simply not this function's business.
+        let refreshed = workspace.update(cx, |workspace, cx| {
+            refresh_open_sprite(workspace, "sprites/nothing.spr", cx)
+        });
+        assert_eq!(refreshed, SpriteRefresh::NotOpen);
     }
 
     /// A clean panel switches documents without a prompt.

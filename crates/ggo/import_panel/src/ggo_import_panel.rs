@@ -79,6 +79,7 @@
 mod geom;
 mod import_item;
 mod loader;
+mod preserve;
 mod thumbnails;
 
 pub use import_item::{ImportItem, open_import_item};
@@ -1288,16 +1289,30 @@ impl ImportPanel {
             &existing_rels(&dest_root, &parent_dir(&dest_stem)),
             &targets,
         );
-        let confirm = if collisions.is_empty() {
-            Task::ready(true)
-        } else {
-            ggo_common::confirm_destructive(
+        // Overwriting a `.spr` is not the same act as overwriting a
+        // `.til`: the animation work in it is carried over rather than
+        // lost (`preserve`), and the prompt has to say so -- and say what
+        // the positional match assumes -- or the user reads "overwrite?"
+        // and cancels a re-import that would have kept their clips.
+        let preserve_prompt = self.preserve_prompt();
+        // A plain tileset import onto a `.til` that sprites are BOUND to
+        // rewrites the tiles their frames address by index, which silently
+        // rearranges those sprites' artwork. The write is still allowed
+        // (the PNG is the source of truth), but never unannounced.
+        let bound_sprites = self.sprites_bound_to_dest();
+        let confirm = match (&preserve_prompt, collisions.is_empty()) {
+            (Some(message), _) => {
+                ggo_common::confirm_destructive(message, "Replace Artwork", false, window, cx)
+            }
+            (None, false) => ggo_common::confirm_destructive_cascade(
                 &overwrite_message(&collisions),
+                &bound_sprites,
                 "Overwrite",
                 false,
                 window,
                 cx,
-            )
+            ),
+            (None, true) => Task::ready(true),
         };
 
         cx.spawn_in(window, async move |this, cx| {
@@ -1317,18 +1332,42 @@ impl ImportPanel {
                 // Same reason as `offer_source_delete`'s: route through the
                 // window this task was spawned in rather than through an
                 // entity's associated window.
-                cx.update(|window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            if sprite {
-                                ggo_sprite_panel::open_sprite_item(workspace, rel, window, cx);
-                            } else {
-                                ggo_tileset_panel::open_tileset_item(workspace, rel, window, cx);
-                            }
-                        })
-                        .ok();
-                })
-                .ok();
+                let refresh = cx
+                    .update(|window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                // A tab already showing this sprite holds
+                                // the PRE-import document; it has to be
+                                // re-read before it is activated, or the
+                                // user looks at stale pixels and saves
+                                // them back over the import.
+                                let refresh = if sprite {
+                                    ggo_sprite_panel::refresh_open_sprite(workspace, &rel, cx)
+                                } else {
+                                    ggo_sprite_panel::SpriteRefresh::NotOpen
+                                };
+                                if sprite {
+                                    ggo_sprite_panel::open_sprite_item(workspace, rel, window, cx);
+                                } else {
+                                    ggo_tileset_panel::open_tileset_item(workspace, rel, window, cx);
+                                }
+                                refresh
+                            })
+                            .ok()
+                    })
+                    .ok()
+                    .flatten();
+                if refresh == Some(ggo_sprite_panel::SpriteRefresh::KeptUnsaved) {
+                    this.update(cx, |this, cx| {
+                        this.status = Some(
+                            "Imported. The open sprite tab has unsaved edits, so it still shows \
+                             the previous artwork — save or discard it, then reopen."
+                                .to_string(),
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                }
             }
         })
         .detach();
@@ -1384,24 +1423,52 @@ impl ImportPanel {
                 cx.notify();
                 return None;
             }
+            let spr_rel = format!("{dest_stem}.spr");
+            // A `.spr` already at the destination carries animation work
+            // this import must not throw away (`preserve`): its clips,
+            // frame timing and transforms are carried onto the new
+            // artwork by POSITION. When they cannot be (frames removed,
+            // footprint changed, tileset shared), the import is refused
+            // outright rather than silently discarding them -- nothing is
+            // written, so the existing trio survives intact.
+            let existing = io::open_sprite(&dest_root, &spr_rel)
+                .ok()
+                .map(|opened| opened.state);
             // The sprite path quantizes the WHOLE source (worldlib's own
             // `sprite_import` rule, ported from ggo-ide) and writes the
             // `.spr`/`.til`/`.pal` trio in one call; the wizard's tileset
             // preview is not consulted.
-            sprite_import(&rgba, src_w, src_h, open.wizard.reserve_transparent, &rects)
+            let imported = sprite_import(
+                &rgba,
+                src_w,
+                src_h,
+                open.wizard.reserve_transparent,
+                &rects,
+            )
+            .map_err(|e| e.to_string());
+            let imported = match (imported, existing) {
+                (Ok(state), Some(old)) => match preserve::check(&old, &state) {
+                    Ok(()) => Ok(preserve::merge(&old, state)),
+                    Err(mismatch) => {
+                        self.status = Some(preserve::mismatch_message(&mismatch, &spr_rel));
+                        self.last_import = None;
+                        cx.notify();
+                        return None;
+                    }
+                },
+                (imported, _) => imported,
+            };
+            imported.and_then(|state| {
+                io::save_sprite(
+                    &dest_root,
+                    &spr_rel,
+                    &state,
+                    &til_rel,
+                    &format!("{dest_stem}.pal"),
+                )
+                .map(|saved| (spr_rel, saved.tile_count))
                 .map_err(|e| e.to_string())
-                .and_then(|state| {
-                    let spr_rel = format!("{dest_stem}.spr");
-                    io::save_sprite(
-                        &dest_root,
-                        &spr_rel,
-                        &state,
-                        &til_rel,
-                        &format!("{dest_stem}.pal"),
-                    )
-                    .map(|saved| (spr_rel, saved.tile_count))
-                    .map_err(|e| e.to_string())
-                })
+            })
         } else {
             match open.wizard.preview.as_ref() {
                 Some(preview) => {
@@ -1462,6 +1529,51 @@ impl ImportPanel {
     }
 
     // ---------------------------------------------------------- re-import
+
+    /// The `.spr` files bound to the `.til` this commit would overwrite --
+    /// the cascade a plain tileset import carries, since their frames
+    /// address that tileset BY INDEX and this rewrites it.
+    ///
+    /// Empty for a sprite import: that path writes the whole trio, and
+    /// `preserve::check` refuses a shared tileset outright rather than
+    /// warning about it.
+    fn sprites_bound_to_dest(&self) -> Vec<String> {
+        let Some(open) = self.ready() else {
+            return Vec::new();
+        };
+        if open.as_sprite {
+            return Vec::new();
+        }
+        let (dest_root, dest_stem) = open.dest();
+        preserve::bound_cascade(&preserve::sprites_bound_to(
+            &dest_root,
+            &format!("{dest_stem}.til"),
+        ))
+    }
+
+    /// The confirm message for replacing an existing sprite's artwork, or
+    /// `None` when this commit isn't that -- a tileset import, or a
+    /// sprite import with nothing at the destination yet.
+    ///
+    /// Reads the `.spr` that is about to be overwritten purely to COUNT
+    /// what would be preserved; the commit re-opens it for the merge
+    /// itself. Doing it twice is deliberate: the prompt is async, and a
+    /// document read before the user answered is exactly the thing that
+    /// must not be written afterwards.
+    fn preserve_prompt(&self) -> Option<String> {
+        let open = self.ready()?;
+        if !open.as_sprite {
+            return None;
+        }
+        let (dest_root, dest_stem) = open.dest();
+        let spr_rel = format!("{dest_stem}.spr");
+        let existing = io::open_sprite(&dest_root, &spr_rel).ok()?.state;
+        Some(preserve::preserve_message(
+            &spr_rel,
+            existing.clips.len(),
+            existing.frames.len(),
+        ))
+    }
 
     /// The import record the destination tileset carries, if any.
     fn dest_record(&self) -> Option<ImportRecord> {
@@ -4054,6 +4166,215 @@ mod tests {
             "one sprite frame per source frame"
         );
         assert_eq!((opened.state.w_tiles, opened.state.h_tiles), (2, 1));
+    }
+
+    // -------------------------------------- animation preservation (sprite)
+
+    /// Re-import the fixture PNG as a sprite, committing directly (the
+    /// prompt path is covered on its own below).
+    fn commit_sprite(panel: &Entity<ImportPanel>, cx: &mut TestAppContext) -> Option<String> {
+        panel.update(cx, |panel, cx| {
+            panel.set_as_sprite(true, cx);
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.frame_tiles = (Some(1), None);
+            }
+            panel.commit(cx).map(|(imported, _)| imported.asset_rel)
+        })
+    }
+
+    /// Replace the fixture source with a `w`-wide one and reload it, the
+    /// way an artist handing over a revised sheet does.
+    async fn revise_source(
+        panel: &Entity<ImportPanel>,
+        root: &Path,
+        w: usize,
+        cx: &mut TestAppContext,
+    ) {
+        write_png_fixture(
+            &root.join(ASSETS_DIR).join("art/hero.png"),
+            w as u32,
+            SRC_H as u32,
+            &two_tone_rgba(w, SRC_H),
+        );
+        panel.update(cx, |panel, cx| {
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.executor().run_until_parked();
+    }
+
+    /// Give the sprite on disk the animation work a re-import must keep.
+    fn author_animations(assets: &Path, rel: &str) {
+        let opened = io::open_sprite(assets, rel).expect("the import wrote a sprite");
+        let mut state = opened.state;
+        state.frames[0].duration_ms = 250;
+        state.frames[1].duration_ms = 400;
+        state.frames[1].transform = ggo_worldlib::sprites::cow::FrameTransform {
+            angle256: 64,
+            ..ggo_worldlib::sprites::cow::FrameTransform::IDENTITY
+        };
+        state.clips = vec![ggo_worldlib::sprites::cow::ClipEdit {
+            name: "idle".to_string(),
+            from: 0,
+            to: 1,
+            loop_: true,
+        }];
+        io::save_sprite(assets, rel, &state, &opened.til_path, &opened.pal_path)
+            .expect("authoring the fixture's animations must land");
+    }
+
+    /// **The headline preservation test.** The artist widens the sheet and
+    /// the sprite is re-imported: the new artwork lands, the clips and the
+    /// per-frame timing/transform survive on the frames that stayed put,
+    /// and the appended frame arrives with the import's own defaults.
+    #[gpui::test]
+    async fn test_a_sprite_reimport_keeps_the_animations_and_appends_new_frames(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+
+        assert_eq!(commit_sprite(&panel, cx).as_deref(), Some("art/hero.spr"));
+        author_animations(&assets, "art/hero.spr");
+        let before = std::fs::read(assets.join("art/hero.til")).unwrap();
+
+        // 48px at a 1-tile cut is three frames: the two that existed plus
+        // one appended.
+        revise_source(&panel, dir.path(), 48, cx).await;
+        assert_eq!(commit_sprite(&panel, cx).as_deref(), Some("art/hero.spr"));
+
+        let reopened = io::open_sprite(&assets, "art/hero.spr").expect("spr round-trips");
+        assert_eq!(reopened.state.frames.len(), 3, "the new frame was appended");
+        assert_eq!(
+            reopened
+                .state
+                .frames
+                .iter()
+                .map(|f| f.duration_ms)
+                .collect::<Vec<_>>(),
+            vec![250, 400, 100],
+            "kept frames keep their timing; the appended one takes the default"
+        );
+        assert_eq!(reopened.state.frames[1].transform.angle256, 64);
+        assert!(
+            reopened.state.frames[2].transform.is_identity(),
+            "an appended frame has no transform to inherit"
+        );
+        assert_eq!(reopened.state.clips.len(), 1);
+        assert_eq!(reopened.state.clips[0].name, "idle");
+        assert_ne!(
+            std::fs::read(assets.join("art/hero.til")).unwrap(),
+            before,
+            "the artwork itself IS replaced -- the PNG is the source of truth"
+        );
+    }
+
+    /// Frames that vanished make the positional match a lie, so the import
+    /// is refused ENTIRELY: the trio on disk is untouched, and the status
+    /// says why.
+    #[gpui::test]
+    async fn test_a_sprite_reimport_that_loses_frames_is_refused_and_writes_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+
+        revise_source(&panel, dir.path(), 48, cx).await;
+        commit_sprite(&panel, cx).expect("the baseline three-frame import");
+        author_animations(&assets, "art/hero.spr");
+        let before = std::fs::read(assets.join("art/hero.spr")).unwrap();
+
+        revise_source(&panel, dir.path(), 32, cx).await;
+        assert_eq!(commit_sprite(&panel, cx), None, "a losing import refuses");
+
+        assert_eq!(
+            std::fs::read(assets.join("art/hero.spr")).unwrap(),
+            before,
+            "a refused import must leave the sprite exactly as it was"
+        );
+        panel.read_with(cx, |panel, _| {
+            let status = panel.status.clone().expect("the refusal is explained");
+            assert!(status.contains("art/hero.spr"), "{status}");
+            assert!(status.contains("3 frames but the new import has only 2"), "{status}");
+            assert!(panel.last_import.is_none(), "nothing was imported");
+        });
+    }
+
+    /// A plain `.til` re-import onto a tileset a sprite is BOUND to
+    /// rewrites the tiles that sprite's frames address by index. The
+    /// write is allowed, but the confirm must name the sprites at stake
+    /// rather than asking a bare "overwrite?".
+    #[gpui::test]
+    async fn test_overwriting_a_bound_tileset_names_the_sprites_at_stake(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+        // A sprite import first, so `art/hero.til` has a `.spr` bound to it.
+        commit_sprite(&panel, cx).expect("the baseline sprite import");
+
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.set_as_sprite(false, cx);
+                panel.import_impl(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().expect("an existing .til confirms");
+        assert!(message.contains("already exist"), "{message}");
+        assert!(detail.contains("art/hero.spr"), "{detail}");
+        assert!(detail.contains("1 sprite is bound to this tileset"), "{detail}");
+
+        let before = std::fs::read(assets.join("art/hero.til")).unwrap();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(assets.join("art/hero.til")).unwrap(),
+            before,
+            "cancelling the cascade prompt writes nothing"
+        );
+    }
+
+    /// The confirm for an existing sprite must say the animations are
+    /// KEPT (an "overwrite?" would read as "your clips are about to be
+    /// destroyed") and name the assumption the positional match makes.
+    #[gpui::test]
+    async fn test_the_sprite_overwrite_prompt_says_the_animations_are_kept(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+        commit_sprite(&panel, cx).expect("the baseline import");
+        author_animations(&assets, "art/hero.spr");
+
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.set_as_sprite(true, cx);
+                panel.import_impl(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let (message, _detail) = cx.pending_prompt().expect("an existing sprite confirms");
+        assert!(message.contains("keep its 1 clip and frame timing"), "{message}");
+        assert!(message.contains("the first 2 frames"), "{message}");
+        assert!(
+            !message.contains("overwrite?"),
+            "the plain overwrite wording would misdescribe what happens: {message}"
+        );
+
+        let before = std::fs::read(assets.join("art/hero.spr")).unwrap();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(assets.join("art/hero.spr")).unwrap(),
+            before,
+            "a cancelled import writes nothing"
+        );
     }
 
     #[gpui::test]
