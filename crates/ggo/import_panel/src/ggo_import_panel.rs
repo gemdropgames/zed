@@ -61,8 +61,11 @@
 //!   "Import as sprite" toggle above instead.
 //! - **The `{cols}` JSON sidecar** an imported tileset used to get. worldlib
 //!   already declined to port it (`import`'s module doc, deviation #2: this
-//!   native tool banned new sidecars) and `ggo_tileset_panel` resolves an
-//!   imported sheet's columns exactly like a brand-new one's.
+//!   native tool banned new sidecars). The column count itself is NOT lost:
+//!   a commit seeds the editor sidecar's `cols` from the source PNG's own
+//!   tile width ([`OpenImport::imported_cols`]), so the imported sheet opens
+//!   laid out like the art it came from instead of at
+//!   `ggo_tileset_panel`'s fixed fallback width.
 //! - **Legacy `.meta.json` import** -- staying dropped (spec, "Staying
 //!   dropped").
 //! - **Drag-and-drop.** The entry points are the project panel's "Import as
@@ -739,6 +742,31 @@ impl OpenImport {
             .set_reserve_transparent(record.reserve_transparent);
         self.as_sprite = record.as_sprite;
         self.frame_tiles = (record.frame_tiles_w, record.frame_tiles_h);
+    }
+
+    /// The column count the imported sheet should be laid out at: the
+    /// SOURCE PNG's own tile width, so a sheet drawn 6 tiles wide in
+    /// Aseprite opens 6 tiles wide here instead of at `ggo_tileset_panel`'s
+    /// fixed 8-wide fallback.
+    ///
+    /// Tileset import cuts the crop row-major at [`TILE_PX`]
+    /// ([`slice_to_tiles`]), so the crop's tile width IS the sheet's width.
+    /// A sprite import's `.til` is a deduplicated POOL rather than a grid,
+    /// and the nearest thing it has to a natural width is one frame's
+    /// footprint -- which is the crop for an Aseprite source (every frame
+    /// is cropped identically) and the frame cut otherwise.
+    fn imported_cols(&self) -> usize {
+        let crop = self.crop();
+        let width_px = if !self.as_sprite || self.frames.len() > 1 {
+            crop.w
+        } else {
+            frame_rects(crop, self.frame_tiles)
+                .iter()
+                .map(|rect| rect.w)
+                .max()
+                .unwrap_or(crop.w)
+        };
+        width_px.div_ceil(TILE_PX).max(1)
     }
 
     /// Canvas-local coordinates for a window-space `position`, or `None`
@@ -1587,11 +1615,21 @@ impl ImportPanel {
             .and_then(|project_root| worktree_rel_for(project_root, &dest_root, &asset_rel));
         // Remember where this came from, so a changed source can be
         // re-imported with the same crop and settings.
+        let imported_cols = open.imported_cols();
         let record_error = project_root.as_deref().and_then(|project_root| {
             let til_worktree_rel = worktree_rel_for(project_root, &dest_root, &til_rel)?;
             let record = open.import_record(project_root);
             let mut meta = load_tileset_meta(project_root, &til_worktree_rel);
             meta.import = Some(record);
+            // Seed the layout width from the source art, but only when the
+            // sidecar has none: once the tileset panel has written a `cols`
+            // the user chose, a re-import must not throw that away.
+            if meta.cols.is_none() {
+                // `resolve_cols`'s own validity rule (`1..=tile_count`):
+                // a wider hint than the sheet has tiles would be ignored on
+                // load anyway, so it is not worth persisting.
+                meta.cols = Some(imported_cols).filter(|&c| c >= 1 && c <= tile_count);
+            }
             save_tileset_meta(project_root, &til_worktree_rel, &meta).err()
         });
         let imported = Imported {
@@ -4178,6 +4216,90 @@ mod tests {
     }
 
     // ------------------------------------ record, re-import, aseprite (task 6)
+
+    /// The imported sheet is laid out at the SOURCE's own tile width, not
+    /// at `ggo_tileset_panel`'s fixed 8-wide fallback: the 32x16 fixture is
+    /// two tiles wide, so the sidecar it writes says 2. Cropping narrows the
+    /// source, and the recorded width follows the crop.
+    #[gpui::test]
+    async fn test_a_commit_seeds_the_sheet_width_from_the_source_png(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.commit(cx).expect("commit succeeds");
+        });
+        assert_eq!(
+            load_tileset_meta(dir.path(), "assets/art/hero.til").cols,
+            Some(SRC_W / TILE_PX),
+            "an uncropped import is laid out at the PNG's own tile width"
+        );
+
+        // A crop ONE tile wide, written to a fresh destination so the
+        // first commit's sidecar isn't in the way.
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.wizard.commit_region(Some(Region {
+                    x: 0,
+                    y: 0,
+                    w: TILE_PX,
+                    h: TILE_PX,
+                }));
+                open.wizard.set_dest_stem("cropped".to_string());
+            }
+            panel.commit(cx).expect("commit succeeds");
+        });
+        assert_eq!(
+            load_tileset_meta(dir.path(), "assets/art/cropped.til").cols,
+            Some(1),
+            "the crop's tile width is the imported sheet's width"
+        );
+    }
+
+    /// A width the user chose in the tileset panel outlives a re-import:
+    /// the seed only fills a sidecar that has no `cols` yet.
+    #[gpui::test]
+    async fn test_a_reimport_keeps_a_width_the_user_already_chose(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        // 1, not the 2 the source would seed, so the assert can tell the
+        // stored width from the seeded one.
+        let mut meta = load_tileset_meta(dir.path(), "assets/art/hero.til");
+        meta.cols = Some(1);
+        save_tileset_meta(dir.path(), "assets/art/hero.til", &meta).unwrap();
+
+        panel.update(cx, |panel, cx| {
+            panel.commit(cx).expect("commit succeeds");
+        });
+        assert_eq!(
+            load_tileset_meta(dir.path(), "assets/art/hero.til").cols,
+            Some(1),
+            "the import must not overwrite a width the user set"
+        );
+    }
+
+    /// A sprite import's `.til` is a deduplicated pool, so its width comes
+    /// from one FRAME's footprint -- one tile wide here -- and is still
+    /// only written when it fits the pool it describes.
+    #[gpui::test]
+    async fn test_a_sprite_import_records_the_frame_footprint_width(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.as_sprite = true;
+                open.frame_tiles = (Some(1), None);
+            }
+            panel.commit(cx).expect("commit succeeds");
+        });
+        assert_eq!(
+            load_tileset_meta(dir.path(), "assets/art/hero.til").cols,
+            Some(1),
+            "a one-tile-wide frame cut lays the pool out one tile wide"
+        );
+    }
 
     #[gpui::test]
     async fn test_a_commit_records_the_import_and_reimport_replays_it(cx: &mut TestAppContext) {
