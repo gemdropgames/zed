@@ -67,8 +67,7 @@
 //!   dropped").
 //! - **Drag-and-drop.** The entry points are the project panel's "Import as
 //!   tileset…" on a `.png` (the source is already a project path, so the
-//!   destination and the delete-source offer both derive from it with
-//!   nothing to type) and the panel's own "Choose PNG…" native file dialog,
+//!   destination derives from it with nothing to type) and the panel's own "Choose PNG…" native file dialog,
 //!   which exists so source art can live OUTSIDE the repo -- imported
 //!   pixels land as `.til`/`.pal` without the PNG ever entering git
 //!   history.
@@ -105,7 +104,7 @@ use ggo_asset_formats::TILE_PX;
 use ggo_worldlib::sprites::import::DecodedFrame;
 use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, is_importable_source, join_dest_path,
-    slice_to_tiles, source_rel_if_in_project, sprite_import, uniform_rects,
+    slice_to_tiles, sprite_import, uniform_rects,
 };
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::{PAL_SLOTS, slot_rgba};
@@ -815,12 +814,12 @@ pub struct ImportPanel {
     /// load lands.
     pending_record: Option<(ImportRecord, String)>,
     _load_task: Option<Task<()>>,
-    /// A failure or a note worth showing (a refused commit, a delete that
-    /// didn't land). Successes live in [`Self::last_import`] instead, so the
-    /// two can't contradict each other.
+    /// A failure or a note worth showing (a refused commit). Successes
+    /// live in [`Self::last_import`] instead, so the two can't contradict
+    /// each other.
     status: Option<String>,
     /// The last SUCCESSFUL commit. Kept on the PANEL rather than on
-    /// [`OpenImport`] so it survives the source being deleted underneath it
+    /// [`OpenImport`] so it survives the source going away underneath it
     /// -- which is exactly when the user most needs to be told what was
     /// written.
     last_import: Option<Imported>,
@@ -903,7 +902,7 @@ impl ImportPanel {
     /// Commit the wizard; the asset-root-relative rel of what it wrote.
     #[cfg(feature = "test-support")]
     pub fn test_commit(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        self.commit(cx).map(|(imported, _)| imported.asset_rel)
+        self.commit(cx).map(|imported| imported.asset_rel)
     }
 
     pub fn open_source(&mut self, rel: &str, _window: &mut Window, cx: &mut Context<Self>) {
@@ -953,8 +952,7 @@ impl ImportPanel {
 
     /// Load an ABSOLUTE path from the native file dialog. An in-project pick
     /// is routed through [`Self::load_source`] so it behaves exactly like the
-    /// context-menu entry (asset-root derivation, delete-source offer and
-    /// all); an out-of-project pick is rooted at the worktree, with the
+    /// context-menu entry (asset-root derivation and all); an out-of-project pick is rooted at the worktree, with the
     /// destination defaulted into `assets/sprites` (or `assets/` when no
     /// sprites dir exists) for an emerald worktree -- `resolve_dest` re-roots
     /// the commit from there.
@@ -1360,7 +1358,7 @@ impl ImportPanel {
     // ------------------------------------------------------------- commit
 
     /// The Import button / action: confirm any overwrite FIRST, then write,
-    /// then offer to delete the source, then show the result.
+    /// then show the result.
     ///
     /// The collision check is `existing_collisions` over the destination
     /// directory's actual contents. It has to happen before the write and not
@@ -1417,19 +1415,18 @@ impl ImportPanel {
             if !confirm.await {
                 return;
             }
-            let Ok(Some((imported, source))) = this.update(cx, |this, cx| this.commit(cx)) else {
+            let Ok(Some(imported)) = this.update(cx, |this, cx| this.commit(cx)) else {
                 return;
             };
-            if let Some((abs, rel)) = source {
-                Self::offer_source_delete(&this, abs, rel, cx).await;
-            }
             // Show what was just made -- both formats open as center-pane
             // editor tabs now.
             if let (Some(workspace), Some(rel)) = (workspace, imported.worktree_rel) {
                 let sprite = imported.sprite;
-                // Same reason as `offer_source_delete`'s: route through the
-                // window this task was spawned in rather than through an
-                // entity's associated window.
+                // `cx.update` (the AsyncWindowContext's OWN window), NOT
+                // `this.update_in`: `WeakEntity::update_in` resolves the
+                // window from the ENTITY's associated window, and a panel
+                // entity built outside a window update has none. The window
+                // this task was spawned in is the one to route through.
                 let refresh = cx
                     .update(|window, cx| {
                         workspace
@@ -1473,16 +1470,13 @@ impl ImportPanel {
 
     /// Slice the quantized preview into tiles and write the `.til`/`.pal`.
     ///
-    /// Returns the commit's outcome plus the source PNG's
-    /// `(absolute, asset-root-relative)` pair when it is eligible for the
-    /// delete offer, or `None` when the write failed (the status line then
-    /// carries the error).
+    /// Returns the commit's outcome, or `None` when the write failed (the
+    /// status line then carries the error).
     ///
     /// Synchronous, same call `ggo_map_panel::PaintSession::save` makes: a
     /// tileset is one small atomic write and the user is waiting on their
     /// own click.
-    #[allow(clippy::type_complexity)]
-    fn commit(&mut self, cx: &mut Context<Self>) -> Option<(Imported, Option<(PathBuf, String)>)> {
+    fn commit(&mut self, cx: &mut Context<Self>) -> Option<Imported> {
         let project_root = self.project_root.clone();
         let ViewerState::Ready(open) = &mut self.state else {
             return None;
@@ -1588,19 +1582,6 @@ impl ImportPanel {
                 return None;
             }
         };
-        // Offered only for a source inside a REAL emerald asset root --
-        // ggo-ide's own `assetsPrefix` guard, ported: a PNG outside
-        // `assets/` was never going to collide with the packer on a
-        // same-stem `.til`, which is the entire reason the offer exists. The
-        // `emerald_asset_root` re-check matters because `split_png_path`
-        // FALLS BACK to the worktree root for a source outside `assets/` --
-        // without it, that fallback would make every in-worktree PNG look
-        // "in the asset root" and get offered for deletion.
-        let source = emerald_asset_root(&open.source_abs)
-            .is_some_and(|assets| assets == open.root)
-            .then(|| source_rel_if_in_project(&open.source_abs, &open.root))
-            .flatten()
-            .map(|rel| (open.source_abs.clone(), rel));
         let worktree_rel = project_root
             .as_deref()
             .and_then(|project_root| worktree_rel_for(project_root, &dest_root, &asset_rel));
@@ -1623,7 +1604,7 @@ impl ImportPanel {
             record_error.map(|e| format!("Imported, but the import record was not saved: {e}"));
         self.last_import = Some(imported.clone());
         cx.notify();
-        Some((imported, source))
+        Some(imported)
     }
 
     // ---------------------------------------------------------- re-import
@@ -1730,60 +1711,6 @@ impl ImportPanel {
             .replace(std::path::MAIN_SEPARATOR, "/");
         self.pending_record = Some((record, stem));
         self.start_load(source_rel, source_abs, root, dest_dir, cx);
-    }
-
-    /// Offer to delete the source PNG now that its tiles live in a `.til`.
-    ///
-    /// ggo-ide offered this because the packer collides on a same-stem PNG;
-    /// the offer is a confirm, never automatic, and a declined or failed
-    /// delete leaves a successful import successful.
-    async fn offer_source_delete(
-        this: &WeakEntity<Self>,
-        abs: PathBuf,
-        rel: String,
-        cx: &mut gpui::AsyncWindowContext,
-    ) {
-        // `cx.update` (the AsyncWindowContext's OWN window), NOT
-        // `this.update_in`: `WeakEntity::update_in` resolves the window from
-        // the ENTITY's associated window, and a panel entity built outside a
-        // window update has none -- the prompt would silently never be
-        // raised and the offer would read as "declined". The window this task
-        // was spawned in is the one that must show the prompt anyway.
-        let Ok(confirm) = cx.update(|window, cx| {
-            ggo_common::confirm_destructive(
-                &format!("Delete the source PNG {rel}?"),
-                "Delete",
-                false,
-                window,
-                cx,
-            )
-        }) else {
-            return;
-        };
-        if !confirm.await {
-            return;
-        }
-        let removed = std::fs::remove_file(&abs);
-        this.update(cx, |this, cx| {
-            match removed {
-                Ok(()) => {
-                    // The open document's file is gone: keeping the crop
-                    // surface would offer gestures over a source that can no
-                    // longer be re-read. What was WRITTEN survives the
-                    // transition -- `last_import` lives on the panel, not on
-                    // the doc that just went away.
-                    this.state = ViewerState::Empty;
-                }
-                Err(e) => {
-                    // No toast surface yet (F5.2 owns notifications), but a
-                    // silent no-op would be indistinguishable from a bug.
-                    log::error!("GGO: failed to delete source PNG {rel}: {e}");
-                    this.status = Some(format!("Imported, but deleting {rel} failed: {e}"));
-                }
-            }
-            cx.notify();
-        })
-        .ok();
     }
 
     // ------------------------------------------------------------- render
@@ -2864,13 +2791,12 @@ mod tests {
                 "the commit re-roots into the emerald asset tree"
             );
 
-            let (imported, source) = panel.commit(cx).expect("commit succeeds");
+            let imported = panel.commit(cx).expect("commit succeeds");
             assert_eq!(imported.asset_rel, "sprites/hero.til");
             assert_eq!(
                 imported.worktree_rel.as_deref(),
                 Some("assets/sprites/hero.til")
             );
-            assert_eq!(source, None, "no delete offer for an out-of-repo source");
         });
         assert!(assets.join("sprites/hero.til").is_file());
         assert!(png.is_file(), "the external source is untouched");
@@ -2986,7 +2912,7 @@ mod tests {
                 open.as_sprite = true;
                 open.frame_tiles = (Some(1), None);
             }
-            let (imported, _source) = panel.commit(cx).expect("commit succeeds");
+            let imported = panel.commit(cx).expect("commit succeeds");
             assert_eq!(imported.asset_rel, "art/hero.spr");
             assert_eq!(
                 imported.worktree_rel.as_deref(),
@@ -3014,10 +2940,6 @@ mod tests {
         let cx = cx.add_empty_window();
 
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
-        cx.run_until_parked();
-        // The source lives inside the asset root, so the delete offer fires;
-        // decline it -- this test is about the write.
-        cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
 
         let imported = panel
@@ -3060,7 +2982,7 @@ mod tests {
         assert_ne!(reopened.indices[0], tile1);
         assert_ne!(reopened.indices[0], 0, "slot 0 is reserved transparent");
 
-        // The source PNG is untouched by a declined delete.
+        // The source PNG is never touched by an import.
         assert!(assets.join("art/hero.png").is_file());
     }
 
@@ -3106,8 +3028,6 @@ mod tests {
         });
 
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
-        cx.run_until_parked();
-        cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
 
         let reopened = io::open_tileset(&assets, "art/hero.til").unwrap();
@@ -3157,8 +3077,6 @@ mod tests {
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
         cx.simulate_prompt_answer("Overwrite");
         cx.run_until_parked();
-        cx.simulate_prompt_answer("Cancel"); // the source-delete offer
-        cx.run_until_parked();
         assert_ne!(
             std::fs::read(assets.join("art/hero.til")).unwrap(),
             vec![0xAAu8; 128]
@@ -3171,11 +3089,10 @@ mod tests {
         });
     }
 
-    /// The source-PNG cleanup: offered for a source inside the asset root,
-    /// deletes it on confirm, and drops the panel back to Empty (the file it
-    /// was showing is gone) while keeping the status line.
+    /// Importing never deletes the source PNG and never prompts to: the
+    /// source is an input, and its bytes are kept on disk.
     #[gpui::test]
-    async fn test_source_delete_offer_removes_the_png_on_confirm(cx: &mut TestAppContext) {
+    async fn test_import_never_deletes_the_source_png(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         let assets = dir.path().join(ASSETS_DIR);
@@ -3183,26 +3100,25 @@ mod tests {
 
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
         cx.run_until_parked();
-        assert_eq!(
-            cx.pending_prompt().map(|(msg, _)| msg),
-            Some("Delete the source PNG art/hero.png?".to_string()),
-            "the offer names the source ASSET-root-relative"
+        assert!(
+            !cx.has_pending_prompt(),
+            "importing must not offer to delete the source"
         );
-        cx.simulate_prompt_answer("Delete");
-        cx.run_until_parked();
-
-        assert!(!assets.join("art/hero.png").exists(), "the source is gone");
-        assert!(assets.join("art/hero.til").is_file(), "the import survives");
+        assert!(
+            assets.join("art/hero.png").is_file(),
+            "the source is never deleted"
+        );
+        assert!(assets.join("art/hero.til").is_file(), "the import lands");
         panel.read_with(cx, |panel, _| {
             assert!(
-                matches!(panel.state, ViewerState::Empty),
-                "the panel can't keep showing a deleted source"
+                !matches!(panel.state, ViewerState::Empty),
+                "the source is still on disk, so the panel keeps showing it"
             );
             assert!(
                 panel
                     .import_summary()
                     .is_some_and(|s| s.contains("art/hero.til")),
-                "what was written survives the transition"
+                "what was written is still summarized"
             );
         });
     }
@@ -3265,7 +3181,7 @@ mod tests {
         cx.run_until_parked();
         assert!(
             !cx.has_pending_prompt(),
-            "the source is outside assets/, so no delete offer"
+            "no collision at the destination, so no prompt"
         );
 
         let imported = panel
@@ -3326,7 +3242,7 @@ mod tests {
         cx.run_until_parked();
         assert!(
             !cx.has_pending_prompt(),
-            "no collision, and no delete offer for an out-of-assets source"
+            "no collision, so no prompt"
         );
         assert!(dir.path().join("art/outside.png").is_file());
         assert!(dir.path().join("art/outside.til").is_file());
@@ -3702,7 +3618,7 @@ mod tests {
                 ]
             );
 
-            let (imported, _source) = panel.commit(cx).expect("commit succeeds");
+            let imported = panel.commit(cx).expect("commit succeeds");
             assert!(imported.sprite);
             assert_eq!(imported.asset_rel, "art/hero.spr");
         });
@@ -4112,8 +4028,6 @@ mod tests {
 
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
         cx.run_until_parked();
-        cx.simulate_prompt_answer("Cancel"); // keep the source
-        cx.run_until_parked();
 
         let rels: Vec<_> = workspace.read_with(cx, |workspace, cx| {
             workspace
@@ -4358,7 +4272,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             assert_eq!(ready(panel).frames.len(), 3);
             panel.set_as_sprite(true, cx);
-            let (imported, _) = panel.commit(cx).expect("commit succeeds");
+            let imported = panel.commit(cx).expect("commit succeeds");
             assert_eq!(imported.asset_rel, "art/walk.spr");
         });
         let opened = io::open_sprite(&assets, "art/walk.spr").expect("spr round-trips");
@@ -4380,7 +4294,7 @@ mod tests {
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.frame_tiles = (Some(1), None);
             }
-            panel.commit(cx).map(|(imported, _)| imported.asset_rel)
+            panel.commit(cx).map(|imported| imported.asset_rel)
         })
     }
 
