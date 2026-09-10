@@ -19,6 +19,8 @@ ggo-wire.workspace = true # GGO -- LinkEndpoint::send_app frames CHANNEL_APP
 gpui.workspace = true
 schemars.workspace = true # GGO -- the `ReimportTileset` Action derive
 serde.workspace = true
+# GGO -- reading `emd`'s `emd-json:` failure trailer, see `emd_failure_reason`.
+serde_json.workspace = true
 image.workspace = true
 path.workspace = true
 project.workspace = true

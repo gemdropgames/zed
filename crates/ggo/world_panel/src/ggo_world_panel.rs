@@ -6910,8 +6910,12 @@ impl WorldPanel {
             return;
         }
         let out = out_dir.join(ggo_common::pack_out_name(&stem));
-        let pack =
-            ggo_common::ProcRequest::emd(&project_dir, ggo_common::world_pack_args(&out, &stem));
+        let requests = vec![
+            // The world just saved is a source asset; `pack-ggo` reads the
+            // baked card, never `assets/`. See `ggo_common::bake_args`.
+            ggo_common::bake_request(&project_dir),
+            ggo_common::ProcRequest::emd(&project_dir, ggo_common::world_pack_args(&out, &stem)),
+        ];
         let launch = ggo_common::ProcRequest::new(
             ggo_common::ggo_emu_bin(),
             project_dir,
@@ -6922,11 +6926,11 @@ impl WorldPanel {
         self._popout_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let capture = runner(pack);
+                    let capture = ggo_common::run_sequence(&runner, requests);
                     if !capture.ok {
                         return Err(format!(
                             "build failed: {}",
-                            ggo_common::failure_reason(&capture)
+                            ggo_common::emd_failure_reason(&capture)
                         ));
                     }
                     launcher(launch)
@@ -12324,9 +12328,19 @@ mod tests {
         let out = dir.path().join("target/ggo-emulate/worlds-test.ggo");
         {
             let packs = packs.lock().unwrap();
-            assert_eq!(packs.len(), 1, "exactly one pack run");
+            assert_eq!(
+                packs.len(),
+                2,
+                "the saved world is a source asset: a bake, then the pack that \
+                 reads the card it wrote"
+            );
             assert_eq!(
                 packs[0].args,
+                vec!["bake".to_string(), "--json".to_string()],
+                "the bake comes first, in the same project"
+            );
+            assert_eq!(
+                packs[1].args,
                 vec![
                     "pack-ggo".to_string(),
                     "--out".to_string(),
@@ -12337,9 +12351,8 @@ mod tests {
                 ],
                 "the pack argv names the out path and the boot world"
             );
-            assert_eq!(
-                packs[0].cwd,
-                dir.path().to_path_buf(),
+            assert!(
+                packs.iter().all(|pack| pack.cwd == dir.path()),
                 "emd runs in the emerald project root"
             );
         }
@@ -12391,6 +12404,66 @@ mod tests {
                 error.contains("pack output"),
                 "{error:?} should carry emd's last line"
             );
+        });
+    }
+
+    /// A failed BAKE stops the sequence: packing anyway would package the
+    /// previous bake's card and boot assets the user never sees in the
+    /// editor, and the reason shown must be the bake's own.
+    #[gpui::test]
+    async fn test_popout_stops_at_a_failed_bake(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ggo_common::EMERALD_MANIFEST), b"").unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let runs: Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = runs.clone();
+        let runner: ggo_common::ProcRunner = Arc::new(move |request| {
+            let is_bake = request.args.first().map(String::as_str) == Some("bake");
+            recorded.lock().unwrap().push(request);
+            ggo_common::ProcCapture {
+                ok: !is_bake,
+                lines: vec![
+                    r#"emd-json: {"ok":false,"error":"bake assets from /p/assets"}"#.to_string(),
+                ],
+            }
+        });
+        let launches: Arc<std::sync::Mutex<Vec<ggo_common::ProcRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let launched = launches.clone();
+        let launcher: ggo_common::DetachedLauncher = Arc::new(move |request| {
+            launched.lock().unwrap().push(request);
+            Ok(())
+        });
+        panel.update(cx, |panel, cx| {
+            panel.proc_runner = runner;
+            panel.emu_launcher = launcher;
+            panel.emulate_popout_impl(cx);
+        });
+        cx.executor().run_until_parked();
+
+        assert_eq!(
+            runs.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| request.args.first().cloned())
+                .collect::<Vec<_>>(),
+            ["bake".to_string()],
+            "a failed bake must not be followed by a pack"
+        );
+        assert!(
+            launches.lock().unwrap().is_empty(),
+            "nor by a launch of whatever cart was there before"
+        );
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let error = open
+                .popout_error
+                .as_deref()
+                .expect("the failure must be surfaced");
+            assert_eq!(error, "build failed: bake assets from /p/assets");
         });
     }
 

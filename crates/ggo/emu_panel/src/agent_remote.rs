@@ -22,7 +22,6 @@ use ggo_emu_remote::registry::{self, SessionInfo};
 
 use crate::EmuPanel;
 use crate::input::{SELECT_BIT, button_bit};
-use crate::menu;
 
 /// A pack is a cargo build, and it runs ON the single foreground dispatch
 /// loop -- every other socket request queues behind it. Longer than the
@@ -885,7 +884,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             // Like a remote boot: the pack needs a panel to plan on, not a
             // panel someone clicked.
             let panel = panel_or_open(&target_root, target.panel, target.workspace, window, cx)?;
-            let (request, runner, cart) = panel
+            let (requests, runner, cart) = panel
                 .update(cx, |p, cx| p.remote_pack_plan(&world, cx))
                 .map_err(|e| e.to_string())??;
             // BLOCKING child: the runner is the panel's own (a test's fake
@@ -895,7 +894,10 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             // must be left to finish its writes, not killed mid-pack.
             let (finished, wait) = smol::channel::bounded(1);
             cx.background_spawn(async move {
-                finished.send(runner(request)).await.ok();
+                finished
+                    .send(ggo_common::run_sequence(&runner, requests))
+                    .await
+                    .ok();
             })
             .detach();
             let timer = cx.background_executor().timer(HOST_PACK_TIMEOUT);
@@ -918,7 +920,10 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 }
             };
             if !capture.ok {
-                return Err(format!("pack failed: {}", menu::failure_reason(&capture)));
+                return Err(format!(
+                    "pack failed: {}",
+                    ggo_common::emd_failure_reason(&capture)
+                ));
             }
             let tail: Vec<&String> =
                 capture.lines.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect();

@@ -1389,6 +1389,46 @@ pub fn failure_line(capture: &ProcCapture, skip: impl Fn(&str) -> bool) -> Strin
         .unwrap_or_else(|| failure_reason(capture))
 }
 
+/// `emd bake`: convert the project's source `assets/` tree into the
+/// prebaked card (`target/emd-ggo-card`) every packaging command reads.
+///
+/// Packaging (`pack-ggo`, `editor-cart --ggo`) deliberately does NOT bake:
+/// it consumes the card and fails with "prebaked assets not found … run
+/// `emd bake` first" when there is none (emerald's
+/// `commands::pack::prebaked_card`). So a host that packs on the user's
+/// behalf has to bake on their behalf too -- and not only for a project
+/// that never has: a world file is a SOURCE asset, so the edit a panel
+/// just saved reaches the cartridge only through a bake.
+pub fn bake_args() -> Vec<String> {
+    vec!["bake".to_string()]
+}
+
+/// The `emd bake` that has to precede packaging `project_dir`.
+pub fn bake_request(project_dir: impl Into<PathBuf>) -> ProcRequest {
+    ProcRequest::emd(project_dir, bake_args())
+}
+
+/// Run `requests` in order, stopping at the first failure and returning
+/// its capture; on success the LAST capture is returned, because that is
+/// the one carrying the artifact the caller asked for (the `.ggo` path in
+/// `emd editor-cart`'s trailer). An empty sequence is a trivial success.
+///
+/// **Blocking**, like the [`ProcRunner`] it drives: callers run it inside
+/// `cx.background_spawn`.
+pub fn run_sequence(runner: &ProcRunner, requests: Vec<ProcRequest>) -> ProcCapture {
+    let mut capture = ProcCapture {
+        ok: true,
+        lines: Vec::new(),
+    };
+    for request in requests {
+        capture = runner(request);
+        if !capture.ok {
+            return capture;
+        }
+    }
+    capture
+}
+
 /// The last non-blank line of a failed capture -- with `--json` implying
 /// `--quiet`, `emd`'s output on failure is the error report, and the last
 /// line is the actual message (earlier ones are cargo's progress noise).
@@ -1400,6 +1440,45 @@ pub fn failure_reason(capture: &ProcCapture) -> String {
         .find(|line| !line.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| "no output".to_string())
+}
+
+/// Prefix `emd` prints its machine-readable result under, on its last
+/// stdout line on success and on stderr on failure. Same literal as
+/// `ggo_worldlib::emerald::EMD_JSON_PREFIX`; re-stated here because this
+/// crate is the one that has to recognise it while READING a capture, and
+/// it does not depend on that crate.
+pub const EMD_JSON_PREFIX: &str = "emd-json: ";
+
+/// Why a failed `emd` run failed, in the words `emd` itself chose.
+///
+/// A failing `emd` always ends with `emd-json: {"ok":false,"error":…}`
+/// (see emerald's `main`), and that `error` is the ONLY line guaranteed to
+/// describe the failure. Everything before it is transcript: cargo's
+/// progress, and -- the case this exists for -- the SUCCESS banners of the
+/// steps that did work. `emd editor-cart --ggo` on an unbaked project
+/// prints `ggo-pack: wrote …/x-editor.cart (…)` and only then fails at the
+/// asset section, so a "last line that isn't the trailer" rule reports a
+/// successful pack as the failure. Read the trailer first; fall back to
+/// the transcript only when there is no usable `error` in it.
+pub fn emd_failure_reason(capture: &ProcCapture) -> String {
+    emd_trailer_error(&capture.lines)
+        .unwrap_or_else(|| failure_line(capture, |line| line.trim_start().starts_with("emd-json:")))
+}
+
+/// The `error` string of the LAST parseable `emd-json:` trailer that
+/// carries one. `None` when no line is a trailer, none parses, or the
+/// trailer's `error` is absent or blank -- all cases where the transcript
+/// is the better answer than an empty message.
+fn emd_trailer_error(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .filter_map(|line| line.trim_start().strip_prefix(EMD_JSON_PREFIX.trim_end()))
+        .filter_map(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+        .find_map(|value| {
+            let error = value.get("error")?.as_str()?.trim().to_string();
+            (!error.is_empty()).then_some(error)
+        })
 }
 
 /// Spawn `request` detached: no wait, no capture, and the child outlives
@@ -1628,6 +1707,177 @@ mod tests {
             capture.lines[0].contains("ggo-not-a-real-binary"),
             "the failure names the binary: {:?}",
             capture.lines
+        );
+    }
+
+    /// The regression this exists for: `emd editor-cart --ggo` on a
+    /// project whose assets were never baked PACKS the `.cart` fine and
+    /// only then fails, so its last non-trailer line is a success banner.
+    /// Reporting that as the reason told the user "build failed: ggo-pack:
+    /// wrote …" and hid the one line that says what to do.
+    #[test]
+    fn an_emd_failure_is_reported_from_its_json_trailer_not_a_success_banner() {
+        let capture = ProcCapture {
+            ok: false,
+            lines: vec![
+                "ggo-pack: wrote /p/demo-editor.cart (64 byte header + 193624 byte body)".into(),
+                r#"emd-json: {"emd":"0.2.0","error":"prebaked assets not found at /p/target/emd-ggo-card; run `emd bake` first","ok":false}"#.into(),
+            ],
+        };
+
+        assert_eq!(
+            emd_failure_reason(&capture),
+            "prebaked assets not found at /p/target/emd-ggo-card; run `emd bake` first"
+        );
+    }
+
+    /// The trailer wins over an earlier human diagnostic too -- both say
+    /// the same thing, and only the trailer is guaranteed to be there.
+    #[test]
+    fn the_last_trailer_error_wins() {
+        let capture = ProcCapture {
+            ok: false,
+            lines: vec![
+                "emerald: serialize asset section: missing tileset".into(),
+                r#"emd-json: {"ok":false,"error":"first"}"#.into(),
+                r#"emd-json: {"ok":false,"error":"serialize asset section"}"#.into(),
+            ],
+        };
+
+        assert_eq!(emd_failure_reason(&capture), "serialize asset section");
+    }
+
+    /// No usable trailer -- an `emd` too old to print one, a crash before
+    /// it got there, or a spawn failure -- falls back to the transcript,
+    /// skipping any trailer line so a bare `{"ok":false}` is never shown
+    /// to a human as the reason.
+    #[test]
+    fn a_capture_without_a_usable_trailer_falls_back_to_the_transcript() {
+        let no_trailer = ProcCapture {
+            ok: false,
+            lines: vec![
+                "compiling demo_editor".into(),
+                "error: linker `rust-lld` not found".into(),
+            ],
+        };
+        assert_eq!(
+            emd_failure_reason(&no_trailer),
+            "error: linker `rust-lld` not found"
+        );
+
+        let blank_error = ProcCapture {
+            ok: false,
+            lines: vec![
+                "emerald: something went wrong".into(),
+                r#"emd-json: {"ok":false,"error":"   "}"#.into(),
+            ],
+        };
+        assert_eq!(
+            emd_failure_reason(&blank_error),
+            "emerald: something went wrong",
+            "a blank `error` is not a reason"
+        );
+
+        let unparseable = ProcCapture {
+            ok: false,
+            lines: vec![
+                "emerald: something went wrong".into(),
+                "emd-json: {not json".into(),
+            ],
+        };
+        assert_eq!(
+            emd_failure_reason(&unparseable),
+            "emerald: something went wrong"
+        );
+
+        assert_eq!(
+            emd_failure_reason(&ProcCapture {
+                ok: false,
+                lines: Vec::new(),
+            }),
+            "no output"
+        );
+    }
+
+    /// A packing sequence is bake-then-pack: the pack must not run when
+    /// the bake failed (it would package the PREVIOUS bake's card and
+    /// silently boot stale assets), and the capture handed back is the
+    /// failing one, so the reason shown is the bake's.
+    #[test]
+    fn a_sequence_stops_at_the_first_failure() {
+        let ran: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let runner: ProcRunner = Arc::new({
+            let ran = ran.clone();
+            move |request| {
+                let verb = request.args.first().cloned().unwrap_or_default();
+                ran.lock().unwrap().push(verb.clone());
+                ProcCapture {
+                    ok: verb != "bake",
+                    lines: vec![format!("{verb} spoke")],
+                }
+            }
+        });
+
+        let capture = run_sequence(
+            &runner,
+            vec![
+                bake_request("/p"),
+                ProcRequest::emd("/p", vec!["editor-cart".to_string()]),
+            ],
+        );
+
+        assert!(!capture.ok);
+        assert_eq!(capture.lines, vec!["bake spoke".to_string()]);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            vec!["bake".to_string()],
+            "a failed bake must not be followed by a pack"
+        );
+    }
+
+    /// All steps ran: the LAST capture is the answer, because that is the
+    /// one whose trailer names the artifact (`editor-cart`'s `.ggo`).
+    #[test]
+    fn a_whole_sequence_reports_its_last_capture() {
+        let runner: ProcRunner = Arc::new(|request| ProcCapture {
+            ok: true,
+            lines: vec![request.args.first().cloned().unwrap_or_default()],
+        });
+
+        let capture = run_sequence(
+            &runner,
+            vec![
+                bake_request("/p"),
+                ProcRequest::emd("/p", vec!["editor-cart".to_string()]),
+            ],
+        );
+
+        assert!(capture.ok);
+        assert_eq!(capture.lines, vec!["editor-cart".to_string()]);
+    }
+
+    /// `emd` discovers the project from its cwd, so the bake must run in
+    /// the project root the pack does -- and carry `--json` like every
+    /// other request this crate builds.
+    #[test]
+    fn the_bake_request_runs_in_the_project_root_with_json() {
+        let request = bake_request("/p/demo");
+        assert_eq!(request.cwd, std::path::PathBuf::from("/p/demo"));
+        assert_eq!(request.args, ["bake", JSON_FLAG]);
+    }
+
+    /// A spawn failure (`run_capture`'s "running `emd …`: …" line) has no
+    /// trailer at all and must still name the command.
+    #[test]
+    fn a_spawn_failure_is_still_reported_verbatim() {
+        let capture = ProcCapture {
+            ok: false,
+            lines: vec!["running `emd editor-cart --ggo --json`: No such file".into()],
+        };
+
+        assert_eq!(
+            emd_failure_reason(&capture),
+            "running `emd editor-cart --ggo --json`: No such file"
         );
     }
 

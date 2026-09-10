@@ -1898,12 +1898,15 @@ impl EmuPanel {
                 .update(cx, |this, cx| this.prepare_world_build(&world_rel, cx))
                 .ok()
                 .flatten();
-            let Some((request, runner, cart)) = prepared else {
+            let Some((requests, runner, cart)) = prepared else {
                 this.update(cx, |this, cx| this.build_done(generation, cx))
                     .ok();
                 return;
             };
-            let capture = cx.background_spawn(async move { runner(request) }).await;
+            let capture = cx
+                .background_spawn(async move { ggo_common::run_sequence(&runner, requests) })
+                .await;
+
             this.update_in(cx, |this, window, cx| {
                 if this.build_generation != generation {
                     return;
@@ -1911,7 +1914,7 @@ impl EmuPanel {
                 this.build_done(generation, cx);
                 if !capture.ok {
                     this.report_failure(
-                        format!("build failed: {}", menu::failure_reason(&capture)),
+                        format!("build failed: {}", ggo_common::emd_failure_reason(&capture)),
                         cx,
                     );
                     return;
@@ -1947,7 +1950,7 @@ impl EmuPanel {
         &mut self,
         world_rel: &str,
         cx: &mut Context<Self>,
-    ) -> Option<(ggo_common::ProcRequest, ggo_common::ProcRunner, String)> {
+    ) -> Option<(Vec<ggo_common::ProcRequest>, ggo_common::ProcRunner, String)> {
         let mut fail = |this: &mut Self, message: String| {
             this.report_failure(message, cx);
             None
@@ -1981,7 +1984,13 @@ impl EmuPanel {
         // built is not one to aim a 20-minute place-and-route at.
         self.remember_flash_world(&stem);
         Some((
-            ggo_common::ProcRequest::emd(&project_dir, menu::world_pack_args(&out, &stem)),
+            vec![
+                // The world the user just saved is a SOURCE asset; only a
+                // bake puts it in the card `pack-ggo` packs. See
+                // `ggo_common::bake_args`.
+                ggo_common::bake_request(&project_dir),
+                ggo_common::ProcRequest::emd(&project_dir, menu::world_pack_args(&out, &stem)),
+            ],
             self.proc_runner.clone(),
             cart,
         ))
@@ -1997,7 +2006,7 @@ impl EmuPanel {
         &mut self,
         world: &str,
         cx: &mut Context<Self>,
-    ) -> Result<(ggo_common::ProcRequest, ggo_common::ProcRunner, String), String> {
+    ) -> Result<(Vec<ggo_common::ProcRequest>, ggo_common::ProcRunner, String), String> {
         // The panel the agent socket packs on may have been opened by the
         // socket itself a moment ago, and a panel nobody has clicked in has
         // no root yet -- the same refresh `build_and_run` does first.
@@ -5754,15 +5763,20 @@ mod tests {
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "exactly one build");
+        let packs = pack_ggo_calls(&calls);
+        assert_eq!(packs.len(), 1, "exactly one build");
         assert_eq!(
-            calls[0].cwd,
+            calls.lock().unwrap().first().map(|r| r.args.first().cloned()),
+            Some(Some("bake".to_string())),
+            "the saved world is a source asset: the pack reads the card a bake writes"
+        );
+        assert_eq!(
+            packs[0].cwd,
             dir.path(),
             "emd discovers the project from its cwd, so it must be the project root"
         );
         assert_eq!(
-            calls[0].args,
+            packs[0].args,
             [
                 "pack-ggo",
                 "--out",
@@ -5815,10 +5829,10 @@ mod tests {
         assert!(claimed, "init registers a world emulator");
         cx.run_until_parked();
 
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "exactly one build");
+        let packs = pack_ggo_calls(&calls);
+        assert_eq!(packs.len(), 1, "exactly one build");
         assert!(
-            calls[0].args.iter().any(|a| a == "worlds/main"),
+            packs[0].args.iter().any(|a| a == "worlds/main"),
             "the viewed world must be baked in as the boot world"
         );
         panel.update(cx, |panel, cx| {
@@ -5924,7 +5938,7 @@ mod tests {
             ggo_common::emulate_world(workspace, "assets/worlds/main.toml", window, cx)
         });
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(pack_ggo_calls(&calls).len(), 1);
         panel.update_in(cx, |panel, window, cx| panel.set_watch(true, window, cx));
         assert!(panel.read_with(cx, |panel, _| panel.watch));
 
@@ -5946,7 +5960,7 @@ mod tests {
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
-        let before = calls.lock().unwrap().len();
+        let before = pack_ggo_calls(&calls).len();
 
         fake_fs
             .insert_file("/proj/assets/tiles/a.til", b"til".to_vec())
@@ -5955,17 +5969,14 @@ mod tests {
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
         {
-            let calls = calls.lock().unwrap();
+            let packs = pack_ggo_calls(&calls);
             assert_eq!(
-                calls.len(),
+                packs.len(),
                 before + 1,
                 "a save after Run must still re-pack the watched world"
             );
             assert!(
-                calls[calls.len() - 1]
-                    .args
-                    .iter()
-                    .any(|a| a == "worlds/main"),
+                packs[packs.len() - 1].args.iter().any(|a| a == "worlds/main"),
                 "and re-pack THAT world"
             );
         }
@@ -7319,7 +7330,7 @@ mod tests {
             ggo_common::emulate_world(workspace, "assets/worlds/main.toml", window, cx)
         });
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(pack_ggo_calls(&calls).len(), 1);
         panel.update_in(cx, |panel, window, cx| panel.set_watch(true, window, cx));
         assert!(panel.read_with(cx, |panel, _| panel.watch));
 
@@ -7332,7 +7343,7 @@ mod tests {
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
-        let after_dirs = calls.lock().unwrap().len();
+        let after_dirs = pack_ggo_calls(&calls).len();
 
         // Two quick saves collapse into one re-pack.
         fake_fs
@@ -7342,10 +7353,10 @@ mod tests {
             .insert_file("/proj/assets/tiles/a.pal", b"pal".to_vec())
             .await;
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), after_dirs, "still debouncing");
+        assert_eq!(pack_ggo_calls(&calls).len(), after_dirs, "still debouncing");
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
-        let after_save = calls.lock().unwrap().len();
+        let after_save = pack_ggo_calls(&calls).len();
         assert_eq!(after_save, after_dirs + 1, "one re-pack after the debounce");
 
         // The pack's own output landing in the worktree must not loop.
@@ -7356,7 +7367,7 @@ mod tests {
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
         assert_eq!(
-            calls.lock().unwrap().len(),
+            pack_ggo_calls(&calls).len(),
             after_save,
             "no rebuild for the output"
         );
@@ -7376,13 +7387,13 @@ mod tests {
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2 / 3);
         cx.run_until_parked();
         assert_eq!(
-            calls.lock().unwrap().len(),
+            pack_ggo_calls(&calls).len(),
             after_save,
             "the second save re-armed the debounce"
         );
         cx.executor().advance_clock(WATCH_DEBOUNCE);
         cx.run_until_parked();
-        let after_pair = calls.lock().unwrap().len();
+        let after_pair = pack_ggo_calls(&calls).len();
         assert_eq!(after_pair, after_save + 1, "one rebuild for the pair");
         panel.read_with(cx, |panel, _| {
             assert!(!panel.watch_restart_pending, "the restart flag is consumed");
@@ -7396,7 +7407,7 @@ mod tests {
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), after_pair, "off means off");
+        assert_eq!(pack_ggo_calls(&calls).len(), after_pair, "off means off");
     }
 
     // ---------------------------------------------- flash to hardware
@@ -8251,10 +8262,23 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("assets/worlds/arena.toml"), "").unwrap();
         panel.update(cx, |panel, cx| {
-            let (request, _runner, cart) =
+            let (requests, _runner, cart) =
                 panel.remote_pack_plan("worlds/arena", cx).expect("plans");
-            assert!(request.args.iter().any(|a| a == "pack-ggo"), "{:?}", request.args);
-            assert!(request.args.iter().any(|a| a == "worlds/arena"), "{:?}", request.args);
+            let verbs: Vec<&str> = requests
+                .iter()
+                .filter_map(|request| request.args.first().map(String::as_str))
+                .collect();
+            assert_eq!(
+                verbs,
+                ["bake", "pack-ggo"],
+                "the world is a source asset: it reaches the cart only through a bake"
+            );
+            assert!(
+                requests
+                    .last()
+                    .is_some_and(|request| request.args.iter().any(|a| a == "worlds/arena")),
+                "{requests:?}"
+            );
             assert_eq!(cart, "target/ggo-emulate/worlds-arena.ggo");
             assert!(panel.status.is_none(), "a planned pack leaves the row alone");
         });

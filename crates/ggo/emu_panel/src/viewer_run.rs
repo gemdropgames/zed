@@ -24,13 +24,15 @@ use crate::menu;
 /// stopped dropping them and the queue would grow with the run.
 const RETIRE_QUEUE_CAP: usize = 8;
 
-/// Assemble the `emd editor-cart --ggo` invocation for the emerald project
-/// holding `world_rel`, or the reason there isn't one. Free-standing so a
-/// refusal can be decided -- and tested -- without starting a run.
+/// Assemble the `emd` invocations for the emerald project holding
+/// `world_rel`, or the reason there isn't one: a bake, then the viewer
+/// cart build that consumes what it baked (see [`ggo_common::bake_args`]
+/// for why the pack cannot do it itself). Free-standing so a refusal can
+/// be decided -- and tested -- without starting a run.
 pub(crate) fn viewer_build_request(
     project_root: &Path,
     world_rel: &str,
-) -> Result<(ProcRequest, PathBuf), String> {
+) -> Result<(Vec<ProcRequest>, PathBuf), String> {
     let project_dir =
         ggo_common::emerald_project_root(&project_root.join(world_rel)).ok_or_else(|| {
             format!(
@@ -39,7 +41,10 @@ pub(crate) fn viewer_build_request(
             )
         })?;
     Ok((
-        ProcRequest::emd(&project_dir, menu::editor_cart_args()),
+        vec![
+            ggo_common::bake_request(&project_dir),
+            ProcRequest::emd(&project_dir, menu::editor_cart_args()),
+        ],
         project_root.to_path_buf(),
     ))
 }
@@ -89,7 +94,7 @@ impl gpui::Global for ViewerRuns {}
 /// cart. One build per project is what makes that read safe.
 fn shared_build(
     project_dir: &Path,
-    request: ProcRequest,
+    requests: Vec<ProcRequest>,
     runner: ProcRunner,
     cx: &mut App,
 ) -> SharedBuild {
@@ -107,7 +112,7 @@ fn shared_build(
         .background_spawn({
             let done = done.clone();
             async move {
-                let capture = runner(request);
+                let capture = ggo_common::run_sequence(&runner, requests);
                 // Set LAST, and before the result is handed to any waiter:
                 // from here on `emd` is no longer touching the project's
                 // `.ggo`, which is the whole question this flag answers.
@@ -148,12 +153,7 @@ fn shared_build(
 }
 
 fn build_failure_reason(capture: &ggo_common::ProcCapture) -> String {
-    format!(
-        "build failed: {}",
-        ggo_common::failure_line(capture, |line| {
-            line.trim_start().starts_with("emd-json:")
-        })
-    )
+    format!("build failed: {}", ggo_common::emd_failure_reason(capture))
 }
 
 /// Let go of a finished build, so the next save starts a fresh one rather
@@ -368,7 +368,7 @@ impl ViewerRun {
         self._pump_task = None;
         self.drop_session(cx);
         self.endpoint.set_state(ViewerState::Building);
-        let (request, root) = match viewer_build_request(&self.project_root, &self.world_rel) {
+        let (requests, root) = match viewer_build_request(&self.project_root, &self.world_rel) {
             Ok(prepared) => prepared,
             Err(reason) => {
                 self.stop_with(reason, cx);
@@ -378,8 +378,13 @@ impl ViewerRun {
         self.building = true;
         // The cwd `ProcRequest::emd` was built with IS the emerald project
         // root (`emd` discovers the project from its cwd), which is what
-        // every viewer of this project coordinates on.
-        let project_dir = request.cwd.clone();
+        // every viewer of this project coordinates on. Every request in
+        // the sequence shares it, so the first answers for all.
+        let Some(project_dir) = requests.first().map(|request| request.cwd.clone()) else {
+            self.stop_with("nothing to build".to_string(), cx);
+            self.building = false;
+            return;
+        };
         // Joined here, on the UI thread, rather than inside the task: two
         // world views booting in the same turn have to see each other's
         // build, and the task bodies do not run until the turn is over.
@@ -387,7 +392,8 @@ impl ViewerRun {
         // finished build is the registration's own job (`shared_build`
         // spawns that), because a build every waiter dropped out of still
         // has to leave the map.
-        let build = shared_build(&project_dir, request, self.proc_runner.clone(), cx);
+        let build = shared_build(&project_dir, requests, self.proc_runner.clone(), cx);
+
         self._build_task = Some(cx.spawn(async move |this, cx| {
             let outcome = build.await;
             this.update(cx, |this, cx| {
@@ -677,6 +683,62 @@ mod tests {
         dir
     }
 
+    /// How many viewer-cart BUILDS were run. One build is `emd bake` plus
+    /// `emd editor-cart --ggo` (the pack reads the card the bake writes),
+    /// so counting raw invocations would count each build twice; the
+    /// `editor-cart` half is what "a build happened" means.
+    fn builds(calls: &Arc<Mutex<Vec<ggo_common::ProcRequest>>>) -> usize {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.args.first().map(String::as_str) == Some("editor-cart"))
+            .count()
+    }
+
+    /// The verb of each `emd` invocation, in the order they ran.
+    fn verbs(calls: &Arc<Mutex<Vec<ggo_common::ProcRequest>>>) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request.args.first().cloned())
+            .collect()
+    }
+
+    /// A world file is a SOURCE asset: `editor-cart --ggo` packs the
+    /// prebaked card and never converts `assets/` itself, so a viewer
+    /// build has to bake first. Without this the first launch of a fresh
+    /// project fails with "prebaked assets not found … run `emd bake`
+    /// first", and every later launch boots the assets as they were at the
+    /// last manual bake.
+    #[test]
+    fn a_viewer_build_bakes_before_it_packs() {
+        let dir = project_dir();
+        let (requests, root) =
+            viewer_build_request(dir.path(), "assets/worlds/main.toml").expect("an emerald project");
+
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.args.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["bake".to_string(), "--json".to_string()],
+                vec![
+                    "editor-cart".to_string(),
+                    "--ggo".to_string(),
+                    "--json".to_string()
+                ],
+            ]
+        );
+        assert!(
+            requests.iter().all(|request| request.cwd == dir.path()),
+            "emd discovers the project from its cwd, so every step shares it"
+        );
+        assert_eq!(root, dir.path());
+    }
+
     #[test]
     fn build_failure_uses_the_diagnostic_before_emd_json() {
         let reason = build_failure_reason(&ggo_common::ProcCapture {
@@ -687,9 +749,27 @@ mod tests {
             ],
         });
 
+        assert_eq!(reason, "build failed: serialize asset section");
+    }
+
+    /// The `.cart` is packed BEFORE the asset section is built, so a
+    /// failing `editor-cart --ggo` run's last non-trailer line is
+    /// `ggo-pack: wrote …` -- a success. Reporting that as the reason is
+    /// what hid "run `emd bake` first" from the user.
+    #[test]
+    fn build_failure_is_not_the_pack_success_that_preceded_it() {
+        let reason = build_failure_reason(&ggo_common::ProcCapture {
+            ok: false,
+            lines: vec![
+                "ggo-pack: wrote /p/demo-editor.cart (64 byte header + 193624 byte body)".into(),
+                r#"emd-json: {"ok":false,"error":"prebaked assets not found at /p/target/emd-ggo-card; run `emd bake` first"}"#.into(),
+            ],
+        });
+
         assert_eq!(
             reason,
-            "build failed: emerald: serialize asset section: missing tileset"
+            "build failed: prebaked assets not found at /p/target/emd-ggo-card; \
+             run `emd bake` first"
         );
     }
 
@@ -711,8 +791,9 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(
-            calls.lock().unwrap()[0].args,
-            ["editor-cart", "--ggo", "--json"]
+            verbs(&calls),
+            ["bake", "editor-cart"],
+            "the bake feeds the pack the card it reads"
         );
         assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
 
@@ -768,7 +849,7 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(builds(&calls), 1);
 
         run.update(cx, |run, cx| run.rebuild(cx));
         assert_eq!(
@@ -777,11 +858,7 @@ mod tests {
             "the world view is told to wait rather than left on the old run"
         );
         cx.run_until_parked();
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            2,
-            "the viewer cart is built again"
-        );
+        assert_eq!(builds(&calls), 2, "the viewer cart is built again");
         assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
     }
 
@@ -863,7 +940,7 @@ mod tests {
         run.update(cx, |run, cx| run.rebuild(cx));
         cx.run_until_parked();
         assert_eq!(
-            calls.lock().unwrap().len(),
+            builds(&calls),
             2,
             "the build in flight, then one rebuild for both saves"
         );
@@ -902,12 +979,12 @@ mod tests {
         );
         run.read_with(cx, |run, _| assert!(run.is_stopped()));
 
-        let built = calls.lock().unwrap().len();
+        let built = builds(&calls);
         run.update(cx, |run, cx| run.on_sources_changed(cx));
         cx.executor().advance_clock(crate::WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
         assert_eq!(
-            calls.lock().unwrap().len(),
+            builds(&calls),
             built,
             "a save does not resurrect a run the host asked to stop"
         );
@@ -1040,7 +1117,7 @@ mod tests {
         });
         cx.run_until_parked();
         let endpoint = endpoint.expect("the booter claimed the boot");
-        assert_eq!(calls.lock().unwrap().len(), 1, "one editor-cart build");
+        assert_eq!(builds(&calls), 1, "one editor-cart build");
         assert_ne!(endpoint.state(), ggo_common::ViewerState::Building);
         cx.update(|_, cx| {
             assert_eq!(cx.global::<ViewerRuns>().runs.len(), 1, "one run registered");
@@ -1208,11 +1285,7 @@ mod tests {
         let (_run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
         let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
         cx.run_until_parked();
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            1,
-            "one `emd editor-cart` for both viewers"
-        );
+        assert_eq!(builds(&calls), 1, "one `emd editor-cart` for both viewers");
         assert_eq!(a.state(), ggo_common::ViewerState::Running);
         assert_eq!(
             b.state(),
@@ -1242,11 +1315,7 @@ mod tests {
 
         let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
         cx.run_until_parked();
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            1,
-            "one `emd` over the project's one `.ggo`"
-        );
+        assert_eq!(builds(&calls), 1, "one `emd` over the project's one `.ggo`");
         assert_eq!(
             b.state(),
             ggo_common::ViewerState::Running,
@@ -1277,7 +1346,7 @@ mod tests {
         let (_run, endpoint) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner);
         cx.run_until_parked();
         assert_eq!(
-            calls.lock().unwrap().len(),
+            builds(&calls),
             2,
             "so the next viewer gets a fresh cart rather than the stale path"
         );
@@ -1295,7 +1364,7 @@ mod tests {
         let (run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
         let (run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(builds(&calls), 1);
 
         // Both saves land in the same turn, as the shared debounce makes
         // them: it is the joining that is under test, not the timer.
@@ -1303,7 +1372,7 @@ mod tests {
         run_b.update(cx, |run, cx| run.rebuild(cx));
         cx.run_until_parked();
         assert_eq!(
-            calls.lock().unwrap().len(),
+            builds(&calls),
             2,
             "the save built the project once, for both viewers"
         );
@@ -1341,11 +1410,7 @@ mod tests {
         let (_run_two, endpoint_two) =
             spawn_run(cx, two.path(), "assets/worlds/main.toml", runner);
         cx.run_until_parked();
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            2,
-            "each project builds its own cart"
-        );
+        assert_eq!(builds(&calls), 2, "each project builds its own cart");
         assert_eq!(endpoint_one.state(), ggo_common::ViewerState::Running);
         assert_eq!(endpoint_two.state(), ggo_common::ViewerState::Running);
     }
@@ -1502,7 +1567,7 @@ mod tests {
             })
             .expect("the booter claimed the boot");
         cx.run_until_parked();
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(builds(&calls), 1);
 
         let fs = workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).fs().clone());
         fs.as_fake()
@@ -1511,10 +1576,6 @@ mod tests {
         cx.run_until_parked();
         cx.executor().advance_clock(crate::WATCH_DEBOUNCE * 2);
         cx.run_until_parked();
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            2,
-            "the save rebuilt the viewer cart"
-        );
+        assert_eq!(builds(&calls), 2, "the save rebuilt the viewer cart");
     }
 }
