@@ -310,7 +310,7 @@ impl HardwareSetupItem {
             } else {
                 "Pull the latest GGO source into the managed clone -- \
                  recloning it if the pull cannot fast-forward -- and \
-                 reinstall ggo-emu from it"
+                 reinstall ggo from it"
             }))
             .on_click({
                 let panel = self.panel.clone();
@@ -648,16 +648,11 @@ impl Render for HardwareSetupItem {
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
-                                .children(
-                                    progress
-                                        .as_ref()
-                                        .filter(|_| busy)
-                                        .map(|(_, elapsed)| {
-                                            Label::new(elapsed_text(*elapsed))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted)
-                                        }),
-                                )
+                                .children(progress.as_ref().filter(|_| busy).map(|(_, elapsed)| {
+                                    Label::new(elapsed_text(*elapsed))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                }))
                         }))
                     }),
             )
@@ -881,7 +876,7 @@ mod tests {
             ..Default::default()
         };
         let rows = bare.requirements();
-        assert_eq!(rows.len(), 5, "project, repo, ggo-diag, emd, board");
+        assert_eq!(rows.len(), 5, "project, repo, ggo, emd, board");
         assert!(rows.iter().all(|r| !r.satisfied()));
 
         let installable: Vec<&str> = rows
@@ -891,7 +886,7 @@ mod tests {
             .collect();
         assert_eq!(
             installable,
-            vec!["GGO repo", "ggo-diag", "emd"],
+            vec!["GGO repo", "ggo", "emd"],
             "the three ZedGG can fix"
         );
 
@@ -928,7 +923,7 @@ mod tests {
     #[test]
     fn a_satisfied_requirement_reports_where_it_is() {
         let env = HardwareEnv {
-            diag_bin: Some("ggo-diag".into()),
+            diag_bin: Some("ggo".into()),
             emd_bin: Some("emd".into()),
             repo: Some(std::path::PathBuf::from("/repo")),
             ports: vec!["/dev/ttyUSB0".into()],

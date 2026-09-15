@@ -888,14 +888,19 @@ pub fn emd_bin() -> String {
     resolve_bin(std::env::var(EMD_BIN_ENV).ok(), DEFAULT_EMD_BIN)
 }
 
-/// Env var naming a non-default standalone `ggo-emu` binary -- the same
+/// Env var naming a non-default `ggo` binary for the emulator -- the same
 /// convention as [`EMD_BIN_ENV`], for the same reason (no settings
 /// surface in this fork).
 pub const GGO_EMU_BIN_ENV: &str = "GGO_EMU";
 
 /// Bare-name fallback for the standalone `ggo-emu` binary, resolved
 /// against `PATH`.
-pub const DEFAULT_GGO_EMU_BIN: &str = "ggo-emu";
+pub const DEFAULT_GGO_EMU_BIN: &str = "ggo";
+
+/// The mode argument that turns `ggo` into the emulator. The only GemdropGo
+/// host binary is `ggo` (crate `ggo-daemon`); every former standalone tool
+/// is a subcommand of it, and this is the emulator's.
+pub const GGO_EMU_MODE_ARG: &str = "emu";
 
 /// The standalone `ggo-emu` binary to spawn: [`GGO_EMU_BIN_ENV`] when set
 /// and non-blank, else [`DEFAULT_GGO_EMU_BIN`].
@@ -950,6 +955,15 @@ impl ProcRequest {
     /// trailer), not of the command being run -- the builders are shared
     /// with ggo-ide, whose streaming console wants the same flag for the
     /// same reason but adds it at its own call sites.
+    /// A `ggo emu` invocation: the emulator binary from
+    /// [`ggo_emu_bin`] with [`GGO_EMU_MODE_ARG`] ahead of `args`.
+    pub fn ggo_emu(cwd: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(GGO_EMU_MODE_ARG.to_string());
+        argv.extend(args);
+        Self::new(ggo_emu_bin(), cwd, argv)
+    }
+
     pub fn emd(cwd: impl Into<PathBuf>, args: Vec<String>) -> Self {
         let mut args = args;
         if !args.iter().any(|a| a == JSON_FLAG) {
@@ -2246,6 +2260,13 @@ mod tests {
 
     /// A non-`emd` request is passed through verbatim -- no `--json`, which
     /// `ggo-diag` does not have.
+    #[test]
+    fn an_emu_request_selects_the_daemon_emulator_mode() {
+        let req = ProcRequest::ggo_emu("/proj", vec!["game.ggo".into()]);
+        assert_eq!(req.bin, DEFAULT_GGO_EMU_BIN);
+        assert_eq!(req.args, [GGO_EMU_MODE_ARG, "game.ggo"]);
+    }
+
     #[test]
     fn a_plain_request_is_not_given_the_json_flag() {
         let req = ProcRequest::new("ggo-diag", "/repo", vec!["--launch".into()]);

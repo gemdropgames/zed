@@ -53,12 +53,17 @@ pub const EMULATE_LABEL: &str = "Emulate this world (cart)";
 // the home of "what would we run" for the emu panel.
 pub use ggo_common::{PACK_OUT_DIR, failure_reason, pack_out_name, world_pack_args};
 
-/// Env var naming a non-default `ggo-diag` binary -- ggo-ide's Device page
-/// reads the same one (`pages::device::DIAG_BIN_ENV`).
+/// Env var naming a non-default `ggo` binary for diagnostics --
+/// ggo-ide's Device page reads the same one (`pages::device::DIAG_BIN_ENV`).
 pub const DIAG_BIN_ENV: &str = "GGO_DIAG_BIN";
 
-/// Bare-name fallback for the `ggo-diag` binary, resolved against `PATH`.
-pub const DEFAULT_DIAG_BIN: &str = "ggo-diag";
+/// Bare-name fallback for the diagnostics binary, resolved against `PATH`.
+/// The only GemdropGo host binary is `ggo` (crate `ggo-daemon`); the
+/// hardware pipeline is its [`DIAG_MODE_ARG`] subcommand.
+pub const DEFAULT_DIAG_BIN: &str = "ggo";
+
+/// The mode argument that turns `ggo` into the hardware diagnostic.
+pub const DIAG_MODE_ARG: &str = "diag";
 
 /// Env var naming the GGO repo checkout `ggo-diag` runs against. `ggo-diag`
 /// discovers the repo by walking up from its cwd, and this fork's worktree
@@ -296,6 +301,7 @@ pub fn diag_request(env: &DiagEnv) -> Result<ProcRequest, String> {
 /// `--collect-seconds` both fall back to the CLI's own defaults).
 pub fn diag_args(tty: &str) -> Vec<String> {
     vec![
+        DIAG_MODE_ARG.to_string(),
         "--tty".to_string(),
         tty.to_string(),
         "--skip-pnr".to_string(),
@@ -453,14 +459,11 @@ pub(crate) fn emulate_world_handler(
                 .read(cx)
                 .panel::<ggo_world_panel::WorldDock>(cx)
                 .is_none_or(|dock| {
-                    dock.read(cx)
-                        .open_panels()
-                        .into_iter()
-                        .all(|world_panel| {
-                            world_panel.update(cx, |world_panel, cx| {
-                                world_panel.save_if_open_and_dirty(&rel, cx)
-                            })
+                    dock.read(cx).open_panels().into_iter().all(|world_panel| {
+                        world_panel.update(cx, |world_panel, cx| {
+                            world_panel.save_if_open_and_dirty(&rel, cx)
                         })
+                    })
                 }),
             None => return,
         };
@@ -671,24 +674,24 @@ mod tests {
     fn the_diag_argv_launches_the_builtin_cart_without_a_full_pnr() {
         assert_eq!(
             diag_args("/dev/ttyUSB0"),
-            ["--tty", "/dev/ttyUSB0", "--skip-pnr", "--launch"],
-            "bare --launch IS the built-in diagnostic cart"
+            ["diag", "--tty", "/dev/ttyUSB0", "--skip-pnr", "--launch"],
+            "bare --launch IS the built-in diagnostic cart; `diag` selects the daemon mode"
         );
     }
 
     #[test]
     fn a_complete_diag_env_produces_a_request_in_the_repo() {
         let request = diag_request(&DiagEnv {
-            bin: "ggo-diag".into(),
+            bin: "ggo".into(),
             repo: Some(PathBuf::from("/ggo")),
             ports: vec!["/dev/ttyUSB0".into(), "/dev/ttyUSB1".into()],
         })
         .expect("both prerequisites present");
-        assert_eq!(request.bin, "ggo-diag");
+        assert_eq!(request.bin, "ggo");
         assert_eq!(
             request.cwd,
             Path::new("/ggo"),
-            "ggo-diag detects the repo from its cwd"
+            "ggo diag detects the repo from its cwd"
         );
         assert_eq!(request.args, diag_args("/dev/ttyUSB0"));
     }

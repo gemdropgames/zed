@@ -6916,11 +6916,8 @@ impl WorldPanel {
             ggo_common::bake_request(&project_dir),
             ggo_common::ProcRequest::emd(&project_dir, ggo_common::world_pack_args(&out, &stem)),
         ];
-        let launch = ggo_common::ProcRequest::new(
-            ggo_common::ggo_emu_bin(),
-            project_dir,
-            vec![out.to_string_lossy().into_owned()],
-        );
+        let launch =
+            ggo_common::ProcRequest::ggo_emu(project_dir, vec![out.to_string_lossy().into_owned()]);
         let runner = self.proc_runner.clone();
         let launcher = self.emu_launcher.clone();
         self._popout_task = Some(cx.spawn(async move |this, cx| {
@@ -12362,8 +12359,11 @@ mod tests {
             assert_eq!(launches[0].bin, ggo_common::DEFAULT_GGO_EMU_BIN);
             assert_eq!(
                 launches[0].args,
-                vec![out.to_string_lossy().into_owned()],
-                "ggo-emu gets the built cart as its one positional argument"
+                vec![
+                    ggo_common::GGO_EMU_MODE_ARG.to_string(),
+                    out.to_string_lossy().into_owned()
+                ],
+                "ggo emu gets the built cart as its one positional argument"
             );
         }
         panel.update(cx, |panel, _| {

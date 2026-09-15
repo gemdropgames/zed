@@ -73,7 +73,10 @@ pub enum Cmd {
         fault: Option<String>,
     },
     /// Close the Reports tab. With `run`, only if that is the run it shows.
-    CloseReport { workspace: Option<String>, run: Option<i64> },
+    CloseReport {
+        workspace: Option<String>,
+        run: Option<i64>,
+    },
     /// The machine's board-readiness probe: what is missing, which
     /// serial ports were found, whether the repo and the in-IDE
     /// emulator are at different commits.
@@ -94,7 +97,10 @@ pub enum Cmd {
     /// Boot `cart` free-running -- the panel's own Run button, no
     /// lock-step, no inspection tap. Pair with `Pause`/`Resume`,
     /// `Screenshot` and `Uart` to watch a game play itself.
-    Run { workspace: Option<String>, cart: String },
+    Run {
+        workspace: Option<String>,
+        cart: String,
+    },
     /// Pause the live run at the next frame boundary.
     Pause { workspace: Option<String> },
     /// Resume a paused run.
@@ -116,12 +122,18 @@ pub enum Cmd {
     /// `emd pack-ggo` for `world` (a stem like `worlds/arena` or a rel
     /// path like `assets/worlds/arena.toml`), into the project's
     /// `target/ggo-emulate/`. The reply names the cart for `Start`/`Run`.
-    PackWorld { workspace: Option<String>, world: String },
+    PackWorld {
+        workspace: Option<String>,
+        world: String,
+    },
     /// Every world file in the project: `[{stem, rel_path}]`.
     WorldList { workspace: Option<String> },
     /// Open `world` (stem or rel path) in the World panel, as a click
     /// would; the reply names the rel path that opened.
-    WorldOpen { workspace: Option<String>, world: String },
+    WorldOpen {
+        workspace: Option<String>,
+        world: String,
+    },
     /// The open world as authored: entities with their components,
     /// instances, backgrounds, selection, dirty flag. With `world`, opens
     /// it first.
@@ -215,11 +227,21 @@ pub struct Response {
 
 impl Response {
     pub fn ok(id: u64, data: serde_json::Value) -> Self {
-        Self { id, ok: true, error: None, data: Some(data) }
+        Self {
+            id,
+            ok: true,
+            error: None,
+            data: Some(data),
+        }
     }
 
     pub fn err(id: u64, error: impl Into<String>) -> Self {
-        Self { id, ok: false, error: Some(error.into()), data: None }
+        Self {
+            id,
+            ok: false,
+            error: Some(error.into()),
+            data: None,
+        }
     }
 }
 
@@ -371,7 +393,8 @@ mod tests {
 
     #[test]
     fn lockstep_requests_round_trip_with_flattened_cmd() {
-        let req = parse_request(r#"{"id":7,"cmd":"start","workspace":"/w","cart":"wilds.ggo"}"#).unwrap();
+        let req =
+            parse_request(r#"{"id":7,"cmd":"start","workspace":"/w","cart":"wilds.ggo"}"#).unwrap();
         assert_eq!(
             req.cmd,
             Cmd::Start {
@@ -395,10 +418,15 @@ mod tests {
         );
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
-        let req = parse_request(r#"{"id":9,"cmd":"start","cart":"wilds.ggo","freerun":true}"#).unwrap();
+        let req =
+            parse_request(r#"{"id":9,"cmd":"start","cart":"wilds.ggo","freerun":true}"#).unwrap();
         assert_eq!(
             req.cmd,
-            Cmd::Start { workspace: None, cart: "wilds.ggo".to_string(), freerun: true }
+            Cmd::Start {
+                workspace: None,
+                cart: "wilds.ggo".to_string(),
+                freerun: true
+            }
         );
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
@@ -411,12 +439,26 @@ mod tests {
         let req = parse_request(r#"{"id":1,"cmd":"next_frame"}"#).unwrap();
         assert_eq!(
             req.cmd,
-            Cmd::NextFrame { workspace: None, buttons: vec![], screenshot: false, frames: None }
+            Cmd::NextFrame {
+                workspace: None,
+                buttons: vec![],
+                screenshot: false,
+                frames: None
+            }
         );
-        assert_eq!(parse_request(r#"{"id":2,"cmd":"status"}"#).unwrap().cmd, Cmd::Status);
         assert_eq!(
-            parse_request(r#"{"id":3,"cmd":"start","cart":"a.ggo"}"#).unwrap().cmd,
-            Cmd::Start { workspace: None, cart: "a.ggo".to_string(), freerun: false }
+            parse_request(r#"{"id":2,"cmd":"status"}"#).unwrap().cmd,
+            Cmd::Status
+        );
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"start","cart":"a.ggo"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::Start {
+                workspace: None,
+                cart: "a.ggo".to_string(),
+                freerun: false
+            }
         );
     }
 
@@ -430,7 +472,10 @@ mod tests {
             req.cmd,
             Cmd::FlashWorld {
                 workspace: None,
-                config: FlashConfig { world: Some("worlds/chase_cam".to_string()), ..Default::default() },
+                config: FlashConfig {
+                    world: Some("worlds/chase_cam".to_string()),
+                    ..Default::default()
+                },
             }
         );
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -438,8 +483,13 @@ mod tests {
         // Omitted is the safe half of the pair: a place-and-route is
         // twenty minutes, and no caller gets one by forgetting a field.
         assert_eq!(
-            parse_request(r#"{"id":1,"cmd":"flash_world"}"#).unwrap().cmd,
-            Cmd::FlashWorld { workspace: None, config: FlashConfig::default() }
+            parse_request(r#"{"id":1,"cmd":"flash_world"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::FlashWorld {
+                workspace: None,
+                config: FlashConfig::default()
+            }
         );
         // The knobs ride flat beside the command, as the bridge sends them.
         let req = parse_request(
@@ -463,20 +513,32 @@ mod tests {
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
         assert_eq!(
-            parse_request(r#"{"id":2,"cmd":"flash_status"}"#).unwrap().cmd,
+            parse_request(r#"{"id":2,"cmd":"flash_status"}"#)
+                .unwrap()
+                .cmd,
             Cmd::FlashStatus { workspace: None }
         );
         assert_eq!(
-            parse_request(r#"{"id":3,"cmd":"flash_status","workspace":"/w"}"#).unwrap().cmd,
-            Cmd::FlashStatus { workspace: Some("/w".to_string()) }
+            parse_request(r#"{"id":3,"cmd":"flash_status","workspace":"/w"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::FlashStatus {
+                workspace: Some("/w".to_string())
+            }
         );
     }
 
     #[test]
     fn report_requests_round_trip() {
         assert_eq!(
-            parse_request(r#"{"id":1,"cmd":"open_report","run":55}"#).unwrap().cmd,
-            Cmd::OpenReport { workspace: None, run: Some(55), fault: None }
+            parse_request(r#"{"id":1,"cmd":"open_report","run":55}"#)
+                .unwrap()
+                .cmd,
+            Cmd::OpenReport {
+                workspace: None,
+                run: Some(55),
+                fault: None
+            }
         );
         assert_eq!(
             parse_request(r#"{"id":4,"cmd":"open_report","fault":"2026-09-02_08-49-33_marker"}"#)
@@ -489,16 +551,32 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_request(r#"{"id":5,"cmd":"open_report"}"#).unwrap().cmd,
-            Cmd::OpenReport { workspace: None, run: None, fault: None }
+            parse_request(r#"{"id":5,"cmd":"open_report"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::OpenReport {
+                workspace: None,
+                run: None,
+                fault: None
+            }
         );
         assert_eq!(
-            parse_request(r#"{"id":2,"cmd":"close_report"}"#).unwrap().cmd,
-            Cmd::CloseReport { workspace: None, run: None }
+            parse_request(r#"{"id":2,"cmd":"close_report"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::CloseReport {
+                workspace: None,
+                run: None
+            }
         );
         assert_eq!(
-            parse_request(r#"{"id":3,"cmd":"close_report","workspace":"/w","run":55}"#).unwrap().cmd,
-            Cmd::CloseReport { workspace: Some("/w".to_string()), run: Some(55) }
+            parse_request(r#"{"id":3,"cmd":"close_report","workspace":"/w","run":55}"#)
+                .unwrap()
+                .cmd,
+            Cmd::CloseReport {
+                workspace: Some("/w".to_string()),
+                run: Some(55)
+            }
         );
     }
 
@@ -509,23 +587,33 @@ mod tests {
             Cmd::HwEnv { workspace: None }
         );
         assert_eq!(
-            parse_request(r#"{"id":2,"cmd":"flash_cancel","workspace":"/w"}"#).unwrap().cmd,
-            Cmd::FlashCancel { workspace: Some("/w".to_string()) }
+            parse_request(r#"{"id":2,"cmd":"flash_cancel","workspace":"/w"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::FlashCancel {
+                workspace: Some("/w".to_string())
+            }
         );
         let payload = HwEnvPayload {
             ready: false,
-            missing: vec![HwMissing { code: "port".into(), label: "no serial device".into() }],
+            missing: vec![HwMissing {
+                code: "port".into(),
+                label: "no serial device".into(),
+            }],
             ports: vec![],
             stuck_board: false,
             project: Some("/game".into()),
             repo: Some("/repo".into()),
-            diag_bin: Some("ggo-diag".into()),
+            diag_bin: Some("ggo".into()),
             emd_bin: Some("emd".into()),
             version_skew: Some(("5370a5a".into(), "7fe694e".into())),
             emu_commit_in_repo: Some(true),
         };
         let json = serde_json::to_string(&payload).unwrap();
-        assert!(json.contains(r#""missing":[{"code":"port","label":"no serial device"}]"#), "{json}");
+        assert!(
+            json.contains(r#""missing":[{"code":"port","label":"no serial device"}]"#),
+            "{json}"
+        );
         let back: HwEnvPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
     }
@@ -537,34 +625,69 @@ mod tests {
             Cmd::Screenshot { workspace: None }
         );
         assert_eq!(
-            parse_request(r#"{"id":2,"cmd":"uart","tail":40}"#).unwrap().cmd,
-            Cmd::Uart { workspace: None, tail: Some(40) }
+            parse_request(r#"{"id":2,"cmd":"uart","tail":40}"#)
+                .unwrap()
+                .cmd,
+            Cmd::Uart {
+                workspace: None,
+                tail: Some(40)
+            }
         );
         assert_eq!(
             parse_request(r#"{"id":3,"cmd":"uart"}"#).unwrap().cmd,
-            Cmd::Uart { workspace: None, tail: None }
+            Cmd::Uart {
+                workspace: None,
+                tail: None
+            }
         );
     }
 
     #[test]
     fn run_pause_resume_requests_round_trip() {
         assert_eq!(
-            parse_request(r#"{"id":1,"cmd":"run","cart":"target/ggo-emulate/worlds-arena.ggo"}"#).unwrap().cmd,
-            Cmd::Run { workspace: None, cart: "target/ggo-emulate/worlds-arena.ggo".to_string() }
+            parse_request(r#"{"id":1,"cmd":"run","cart":"target/ggo-emulate/worlds-arena.ggo"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::Run {
+                workspace: None,
+                cart: "target/ggo-emulate/worlds-arena.ggo".to_string()
+            }
         );
-        assert_eq!(parse_request(r#"{"id":2,"cmd":"pause"}"#).unwrap().cmd, Cmd::Pause { workspace: None });
-        assert_eq!(parse_request(r#"{"id":3,"cmd":"resume"}"#).unwrap().cmd, Cmd::Resume { workspace: None });
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"pause"}"#).unwrap().cmd,
+            Cmd::Pause { workspace: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"resume"}"#).unwrap().cmd,
+            Cmd::Resume { workspace: None }
+        );
     }
 
     #[test]
     fn debug_requests_default_their_indices() {
         assert_eq!(
-            parse_request(r#"{"id":1,"cmd":"debug","view":"tiles"}"#).unwrap().cmd,
-            Cmd::Debug { workspace: None, view: DebugView::Tiles, bank: 0, palette: 0, layer: 0 }
+            parse_request(r#"{"id":1,"cmd":"debug","view":"tiles"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::Debug {
+                workspace: None,
+                view: DebugView::Tiles,
+                bank: 0,
+                palette: 0,
+                layer: 0
+            }
         );
         assert_eq!(
-            parse_request(r#"{"id":2,"cmd":"debug","view":"map","layer":2}"#).unwrap().cmd,
-            Cmd::Debug { workspace: None, view: DebugView::Map, bank: 0, palette: 0, layer: 2 }
+            parse_request(r#"{"id":2,"cmd":"debug","view":"map","layer":2}"#)
+                .unwrap()
+                .cmd,
+            Cmd::Debug {
+                workspace: None,
+                view: DebugView::Map,
+                bank: 0,
+                palette: 0,
+                layer: 2
+            }
         );
         assert!(parse_request(r#"{"id":3,"cmd":"debug","view":"sprites"}"#).is_err());
     }
@@ -572,8 +695,13 @@ mod tests {
     #[test]
     fn pack_world_request_round_trips() {
         assert_eq!(
-            parse_request(r#"{"id":1,"cmd":"pack_world","world":"worlds/arena"}"#).unwrap().cmd,
-            Cmd::PackWorld { workspace: None, world: "worlds/arena".to_string() }
+            parse_request(r#"{"id":1,"cmd":"pack_world","world":"worlds/arena"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::PackWorld {
+                workspace: None,
+                world: "worlds/arena".to_string()
+            }
         );
     }
 
@@ -589,24 +717,45 @@ mod tests {
             elapsed_s: Some(95),
             detail: Some("boot: SD ready — next: FAT32 mounted (10s budget)".to_string()),
             phases: vec![
-                FlashPhase { title: "Flash board".into(), state: "done".into(), elapsed_s: 12, detail: None },
+                FlashPhase {
+                    title: "Flash board".into(),
+                    state: "done".into(),
+                    elapsed_s: 12,
+                    detail: None,
+                },
                 FlashPhase {
                     title: "Boot verify (UART)".into(),
                     state: "running".into(),
                     elapsed_s: 4,
                     detail: Some("boot: SD ready — next: FAT32 mounted (10s budget)".into()),
                 },
-                FlashPhase { title: "Report".into(), state: "pending".into(), elapsed_s: 0, detail: None },
+                FlashPhase {
+                    title: "Report".into(),
+                    state: "pending".into(),
+                    elapsed_s: 0,
+                    detail: None,
+                },
             ],
-            diag_steps: vec![FlashDiagStep { index: "1".into(), status: "PASS".into() }],
+            diag_steps: vec![FlashDiagStep {
+                index: "1".into(),
+                status: "PASS".into(),
+            }],
             failure: None,
             transcript: Some("/home/x/.zed/logs/ggo-run-20260901-132908-flashing.log".into()),
             console_tail: vec!["  [boot] SD ready — next: FAT32 mounted (10s budget)".into()],
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains(r#""elapsed_s":95"#), "{json}");
-        assert!(json.contains(r#""phases":[{"title":"Flash board","state":"done","elapsed_s":12,"detail":null}"#), "{json}");
-        assert!(json.contains(r#""diag_steps":[{"index":"1","status":"PASS"}]"#), "{json}");
+        assert!(
+            json.contains(
+                r#""phases":[{"title":"Flash board","state":"done","elapsed_s":12,"detail":null}"#
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""diag_steps":[{"index":"1","status":"PASS"}]"#),
+            "{json}"
+        );
         let back: FlashStatusPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
     }
@@ -615,29 +764,47 @@ mod tests {
     /// and the Zed build are installed separately.
     #[test]
     fn flash_status_payload_without_context_fields_is_the_idle_shape() {
-        let old = r#"{"active":false,"phase":null,"verdict":null,"diag_run_id":null,"perf_run_id":null}"#;
+        let old =
+            r#"{"active":false,"phase":null,"verdict":null,"diag_run_id":null,"perf_run_id":null}"#;
         let back: FlashStatusPayload = serde_json::from_str(old).unwrap();
         assert_eq!(back, FlashStatusPayload::default());
     }
 
     #[test]
     fn world_requests_round_trip() {
-        assert_eq!(parse_request(r#"{"id":1,"cmd":"world_list"}"#).unwrap().cmd, Cmd::WorldList { workspace: None });
         assert_eq!(
-            parse_request(r#"{"id":2,"cmd":"world_open","world":"worlds/arena"}"#).unwrap().cmd,
-            Cmd::WorldOpen { workspace: None, world: "worlds/arena".to_string() }
+            parse_request(r#"{"id":1,"cmd":"world_list"}"#).unwrap().cmd,
+            Cmd::WorldList { workspace: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"world_open","world":"worlds/arena"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::WorldOpen {
+                workspace: None,
+                world: "worlds/arena".to_string()
+            }
         );
         assert_eq!(
             parse_request(r#"{"id":3,"cmd":"world_read"}"#).unwrap().cmd,
-            Cmd::WorldRead { workspace: None, world: None }
+            Cmd::WorldRead {
+                workspace: None,
+                world: None
+            }
         );
     }
 
     #[test]
     fn world_screenshot_defaults_to_the_device_screen() {
         assert_eq!(
-            parse_request(r#"{"id":1,"cmd":"world_screenshot"}"#).unwrap().cmd,
-            Cmd::WorldScreenshot { workspace: None, world: None, full: false }
+            parse_request(r#"{"id":1,"cmd":"world_screenshot"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::WorldScreenshot {
+                workspace: None,
+                world: None,
+                full: false
+            }
         );
         assert_eq!(
             parse_request(r#"{"id":2,"cmd":"world_screenshot","world":"worlds/a","full":true}"#)

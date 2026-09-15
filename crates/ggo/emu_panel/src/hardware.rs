@@ -20,7 +20,9 @@ use std::time::Duration;
 use ggo_common::ProcRequest;
 pub use ggo_emu_remote::protocol::FlashConfig;
 
-use crate::menu::{DEFAULT_DIAG_BIN, DIAG_BIN_ENV, DIAG_REPO_ENV, DIAG_TTY_ENV, SERIAL_BY_ID_DIR};
+use crate::menu::{
+    DEFAULT_DIAG_BIN, DIAG_BIN_ENV, DIAG_MODE_ARG, DIAG_REPO_ENV, DIAG_TTY_ENV, SERIAL_BY_ID_DIR,
+};
 
 /// Where a cloned GGO checkout lands when the user has none, under the
 /// same `~/.ggo` the databases already live in.
@@ -35,7 +37,13 @@ pub const EMERALD_REPO_URL: &str = "ssh://git@github.com/gemdropgames/emerald.gi
 
 /// The binaries each repo installs -- `--git <url>` with no package spec
 /// installs every binary in the workspace (or refuses as ambiguous).
-pub const GGO_DIAG_CRATE: &str = "ggo-diag";
+pub const GGO_DIAG_CRATE: &str = "ggo-daemon";
+/// Where [`GGO_DIAG_CRATE`] lives inside the GGO checkout.
+pub const GGO_DIAG_CRATE_DIR: &str = "tools/ggo-daemon";
+/// The binary [`GGO_DIAG_CRATE`] installs: `ggo`, the one GemdropGo host
+/// binary (same as [`DEFAULT_DIAG_BIN`]; the crate name is what `cargo
+/// install` wants, the binary name is what `PATH` wants).
+pub const GGO_BIN: &str = DEFAULT_DIAG_BIN;
 pub const EMD_CRATE: &str = "emerald-cli";
 
 /// One unmet precondition for flashing. A value, not a sentence, so the
@@ -209,7 +217,10 @@ impl HardwareEnv {
             missing: self
                 .missing()
                 .into_iter()
-                .map(|missing| HwMissing { code: missing.code().to_string(), label: missing.label() })
+                .map(|missing| HwMissing {
+                    code: missing.code().to_string(),
+                    label: missing.label(),
+                })
                 .collect(),
             ports: self.ports.clone(),
             stuck_board: self.stuck_board,
@@ -240,9 +251,9 @@ impl HardwareEnv {
     /// diverged history, corrupt objects, a rebased upstream -- falls
     /// back to deleting the clone and cloning fresh, which is safe
     /// precisely because the clone is managed: nothing in it is the
-    /// user's to lose. `cargo install` then rebuilds `ggo-emu` from the
+    /// user's to lose. `cargo install` then rebuilds `ggo` from the
     /// synced source, skipped only when the sync moved nothing and a
-    /// `ggo-emu` is already on PATH -- an install takes minutes and a
+    /// `ggo` is already on PATH -- an install takes minutes and a
     /// no-op sync should not.
     ///
     /// One `sh -c` request rather than several `ProcRequest`s because the
@@ -259,11 +270,13 @@ impl HardwareEnv {
              pre=$(git -C {repo} rev-parse HEAD 2>/dev/null || echo none)\n\
              git -C {repo} pull --ff-only --progress || {{ rm -rf {repo}; git clone --progress {url} {repo}; }}\n\
              post=$(git -C {repo} rev-parse HEAD)\n\
-             if [ \"$pre\" != \"$post\" ] || ! command -v ggo-emu >/dev/null; then\n\
-                 cargo install --locked --path {repo}/tools/ggo-emu\n\
+             if [ \"$pre\" != \"$post\" ] || ! command -v {bin} >/dev/null; then\n\
+                 cargo install --locked --path {repo}/{crate_dir}\n\
              else\n\
-                 echo \"ggo-emu already matches $post\"\n\
-             fi"
+                 echo \"{bin} already matches $post\"\n\
+             fi",
+            bin = GGO_BIN,
+            crate_dir = GGO_DIAG_CRATE_DIR,
         );
         Some(ProcRequest::new(
             "sh",
@@ -463,7 +476,7 @@ impl HardwareEnv {
                 found: self.diag_bin.clone(),
                 remedy: match (&self.diag_bin, self.cargo) {
                     (Some(_), _) => Remedy::Satisfied,
-                    (None, true) => Remedy::Install("cargo install ggo-diag".to_string()),
+                    (None, true) => Remedy::Install(format!("cargo install {GGO_DIAG_CRATE}")),
                     (None, false) => Remedy::Manual(format!(
                         "install Rust (cargo), or set {DIAG_BIN_ENV} to a built binary"
                     )),
@@ -529,6 +542,7 @@ impl HardwareEnv {
 /// shows up. The remedy is the page's own install/update buttons.
 pub fn flash_args(project: &Path, tty: &str, config: &FlashConfig) -> Vec<String> {
     let mut args = vec![
+        DIAG_MODE_ARG.to_string(),
         "--project".to_string(),
         project.to_string_lossy().into_owned(),
         "--tty".to_string(),
@@ -565,7 +579,11 @@ pub fn effective_config(env: &HardwareEnv, config: &FlashConfig) -> FlashConfig 
         world: config.world.clone(),
         rebuild_gateware: config.rebuild_gateware,
         tty: config.tty.clone().or_else(|| env.ports.first().cloned()),
-        baud: Some(config.baud.unwrap_or(ggo_emu_remote::protocol::DEFAULT_BAUD)),
+        baud: Some(
+            config
+                .baud
+                .unwrap_or(ggo_emu_remote::protocol::DEFAULT_BAUD),
+        ),
         collect_seconds: Some(
             config
                 .collect_seconds
@@ -610,7 +628,11 @@ pub fn flash_request(env: &HardwareEnv, config: &FlashConfig) -> Result<ProcRequ
     };
     // The child gets every knob explicitly, so what `effective_config`
     // reports is what runs even if ggo-diag's own defaults move.
-    Ok(ProcRequest::new(bin, repo, flash_args(&project, &tty, &effective_config(env, config))))
+    Ok(ProcRequest::new(
+        bin,
+        repo,
+        flash_args(&project, &tty, &effective_config(env, config)),
+    ))
 }
 
 /// A stage of the pipeline, parsed from `ggo-diag`'s own output. The
@@ -1018,10 +1040,10 @@ pub fn setup_steps(env: &HardwareEnv) -> Vec<SetupStep> {
     let have_repo = env.repo.is_some() || cloning;
     if env.diag_bin.is_none() {
         steps.push(SetupStep {
-            label: "install ggo-diag".to_string(),
+            label: format!("install {GGO_BIN} ({GGO_DIAG_CRATE})"),
             request: cargo_install(
                 &repo,
-                "tools/ggo-diag",
+                GGO_DIAG_CRATE_DIR,
                 GGO_REPO_URL,
                 GGO_DIAG_CRATE,
                 have_repo,
@@ -1498,7 +1520,7 @@ mod tests {
 
     fn ready_env() -> HardwareEnv {
         HardwareEnv {
-            diag_bin: Some("ggo-diag".into()),
+            diag_bin: Some("ggo".into()),
             emd_bin: Some("emd".into()),
             repo: Some(PathBuf::from("/repo")),
             emerald: None,
@@ -1542,16 +1564,26 @@ mod tests {
     fn flash_args_pack_the_project_and_skip_place_and_route() {
         assert_eq!(
             flash_args(Path::new("/game"), "/dev/ttyUSB0", &FlashConfig::default()),
-            vec!["--project", "/game", "--tty", "/dev/ttyUSB0", "--skip-pnr"],
+            vec![
+                "diag",
+                "--project",
+                "/game",
+                "--tty",
+                "/dev/ttyUSB0",
+                "--skip-pnr"
+            ],
         );
     }
 
     #[test]
     fn a_gateware_rebuild_does_not_skip_place_and_route() {
-        let config = FlashConfig { rebuild_gateware: true, ..Default::default() };
+        let config = FlashConfig {
+            rebuild_gateware: true,
+            ..Default::default()
+        };
         assert_eq!(
             flash_args(Path::new("/game"), "/dev/ttyUSB0", &config),
-            vec!["--project", "/game", "--tty", "/dev/ttyUSB0"],
+            vec!["diag", "--project", "/game", "--tty", "/dev/ttyUSB0"],
         );
     }
 
@@ -1570,6 +1602,7 @@ mod tests {
         assert_eq!(
             flash_args(Path::new("/game"), "/dev/ttyUSB3", &config),
             vec![
+                "diag",
                 "--project",
                 "/game",
                 "--tty",
@@ -1596,7 +1629,11 @@ mod tests {
         assert_eq!(effective.tty.as_deref(), Some("/dev/ttyUSB0"));
         assert_eq!(effective.baud, Some(460_800));
         assert_eq!(effective.collect_seconds, Some(120));
-        let named = FlashConfig { tty: Some("/dev/ttyUSB7".into()), baud: Some(9600), ..Default::default() };
+        let named = FlashConfig {
+            tty: Some("/dev/ttyUSB7".into()),
+            baud: Some(9600),
+            ..Default::default()
+        };
         let effective = effective_config(&ready_env(), &named);
         assert_eq!(effective.tty.as_deref(), Some("/dev/ttyUSB7"));
         assert_eq!(effective.baud, Some(9600));
@@ -1609,15 +1646,31 @@ mod tests {
         let mut env = ready_env();
         env.ports.clear();
         assert!(flash_request(&env, &FlashConfig::default()).is_err());
-        let request = flash_request(&env, &FlashConfig { tty: Some("/dev/ttyUSB9".into()), ..Default::default() })
-            .expect("a named port flashes");
-        assert!(request.args.contains(&"/dev/ttyUSB9".to_string()), "{:?}", request.args);
+        let request = flash_request(
+            &env,
+            &FlashConfig {
+                tty: Some("/dev/ttyUSB9".into()),
+                ..Default::default()
+            },
+        )
+        .expect("a named port flashes");
+        assert!(
+            request.args.contains(&"/dev/ttyUSB9".to_string()),
+            "{:?}",
+            request.args
+        );
 
         // A named tty stands in for a missing port, never for a stuck
         // board: nothing would open while the driver is detached.
         env.stuck_board = true;
-        let refused = flash_request(&env, &FlashConfig { tty: Some("/dev/ttyUSB9".into()), ..Default::default() })
-            .expect_err("a stuck board refuses even a named port");
+        let refused = flash_request(
+            &env,
+            &FlashConfig {
+                tty: Some("/dev/ttyUSB9".into()),
+                ..Default::default()
+            },
+        )
+        .expect_err("a stuck board refuses even a named port");
         assert!(refused.contains("replug"), "{refused}");
     }
 
@@ -1626,10 +1679,14 @@ mod tests {
     /// the run.
     #[test]
     fn a_named_world_is_what_the_board_boots() {
-        let arena = FlashConfig { world: Some("worlds/arena".into()), ..Default::default() };
+        let arena = FlashConfig {
+            world: Some("worlds/arena".into()),
+            ..Default::default()
+        };
         assert_eq!(
             flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena),
             vec![
+                "diag",
                 "--project",
                 "/game",
                 "--tty",
@@ -1639,10 +1696,14 @@ mod tests {
                 "--skip-pnr"
             ],
         );
-        let arena_full = FlashConfig { rebuild_gateware: true, ..arena };
+        let arena_full = FlashConfig {
+            rebuild_gateware: true,
+            ..arena
+        };
         assert_eq!(
             flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena_full),
             vec![
+                "diag",
                 "--project",
                 "/game",
                 "--tty",
@@ -1657,11 +1718,11 @@ mod tests {
     fn flash_request_runs_in_the_repo_not_the_project() {
         let request =
             flash_request(&ready_env(), &FlashConfig::default()).expect("a ready machine flashes");
-        assert_eq!(request.bin, "ggo-diag");
+        assert_eq!(request.bin, "ggo");
         assert_eq!(
             request.cwd,
             PathBuf::from("/repo"),
-            "ggo-diag walks up from its cwd to find the repo"
+            "ggo diag walks up from its cwd to find the repo"
         );
         assert!(request.args.contains(&"/game".to_string()));
         assert!(
@@ -1674,15 +1735,33 @@ mod tests {
     /// The world reaches the child, not just [`flash_args`].
     #[test]
     fn flash_request_carries_the_world_through() {
-        let arena = FlashConfig { world: Some("worlds/arena".into()), ..Default::default() };
+        let arena = FlashConfig {
+            world: Some("worlds/arena".into()),
+            ..Default::default()
+        };
         let request = flash_request(&ready_env(), &arena).expect("a ready machine flashes");
         assert_eq!(
             request.args,
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", &effective_config(&ready_env(), &arena))
+            flash_args(
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                &effective_config(&ready_env(), &arena)
+            )
         );
         // Explicit, not left to ggo-diag: the reported set is the run set.
-        assert!(request.args.windows(2).any(|w| w == ["--baud", "460800"]), "{:?}", request.args);
-        assert!(request.args.windows(2).any(|w| w == ["--collect-seconds", "120"]), "{:?}", request.args);
+        assert!(
+            request.args.windows(2).any(|w| w == ["--baud", "460800"]),
+            "{:?}",
+            request.args
+        );
+        assert!(
+            request
+                .args
+                .windows(2)
+                .any(|w| w == ["--collect-seconds", "120"]),
+            "{:?}",
+            request.args
+        );
     }
 
     #[test]
@@ -1698,8 +1777,8 @@ mod tests {
                 Missing::Port
             ]
         );
-        let error =
-            flash_request(&env, &FlashConfig::default()).expect_err("an empty machine cannot flash");
+        let error = flash_request(&env, &FlashConfig::default())
+            .expect_err("an empty machine cannot flash");
         for missing in env.missing() {
             assert!(
                 error.contains(&missing.label()),
@@ -1751,7 +1830,9 @@ mod tests {
         );
         assert_eq!(
             parse_stage("  [boot] boot-rom alive — next: SD ready (10s budget)"),
-            Some(Stage::Boot("boot-rom alive — next: SD ready (10s budget)".into())),
+            Some(Stage::Boot(
+                "boot-rom alive — next: SD ready (10s budget)".into()
+            )),
             "the detail is the stage budget, which the status row shows"
         );
         assert_eq!(
@@ -1850,7 +1931,7 @@ mod tests {
             ..Default::default()
         };
         let steps = setup_steps(&bare);
-        assert_eq!(steps.len(), 3, "clone, ggo-diag, emd");
+        assert_eq!(steps.len(), 3, "clone, ggo, emd");
         assert_eq!(steps[0].request.bin, "git");
         assert_eq!(steps[0].request.args[0], "clone");
         assert!(
@@ -1858,12 +1939,12 @@ mod tests {
                 && GGO_REPO_URL.starts_with("ssh://"),
             "cargo cannot parse scp-style URLs, so one spelling serves both"
         );
-        assert!(steps[1].label.contains("ggo-diag"));
+        assert!(steps[1].label.contains("ggo"));
         assert!(
             steps[1]
                 .request
                 .args
-                .contains(&"/home/u/.ggo/ggo/tools/ggo-diag".to_string()),
+                .contains(&"/home/u/.ggo/ggo/tools/ggo-daemon".to_string()),
             "the clone above IS the checkout to build from: {:?}",
             steps[1].request.args
         );
@@ -1875,7 +1956,7 @@ mod tests {
             );
         }
 
-        // With a checkout, ggo-diag builds from it and no clone runs.
+        // With a checkout, ggo builds from it and no clone runs.
         let mut local = bare.clone();
         local.repo = Some(PathBuf::from("/repo"));
         local.emerald = Some(PathBuf::from("/emerald"));
@@ -1886,7 +1967,7 @@ mod tests {
             steps[0]
                 .request
                 .args
-                .contains(&"/repo/tools/ggo-diag".to_string()),
+                .contains(&"/repo/tools/ggo-daemon".to_string()),
             "{:?}",
             steps[0].request.args
         );
@@ -2055,20 +2136,16 @@ mod tests {
     #[test]
     fn resolve_on_path_finds_bare_names_and_checks_explicit_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("ggo-diag");
+        let bin = dir.path().join("ggo");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         let path_env = dir.path().to_string_lossy().into_owned();
 
         assert_eq!(
-            resolve_on_path("ggo-diag", Some(&path_env)),
-            Some("ggo-diag".to_string()),
+            resolve_on_path("ggo", Some(&path_env)),
+            Some("ggo".to_string()),
             "a bare name resolves against PATH"
         );
-        assert_eq!(
-            resolve_on_path("ggo-diag", None),
-            None,
-            "no PATH, no lookup"
-        );
+        assert_eq!(resolve_on_path("ggo", None), None, "no PATH, no lookup");
         assert_eq!(resolve_on_path("nope", Some(&path_env)), None);
 
         let explicit = bin.to_string_lossy().into_owned();
@@ -2248,7 +2325,11 @@ mod tests {
         std::fs::create_dir_all(main_git.join("refs/heads")).unwrap();
         std::fs::create_dir_all(&worktree_git).unwrap();
         // The branch exists ONLY in the common dir, as git puts it.
-        std::fs::write(main_git.join("refs/heads/feature"), format!("{HEAD_HASH}\n")).unwrap();
+        std::fs::write(
+            main_git.join("refs/heads/feature"),
+            format!("{HEAD_HASH}\n"),
+        )
+        .unwrap();
         std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
         std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
 
@@ -2355,7 +2436,9 @@ mod tests {
     #[test]
     fn run_log_names_are_filename_safe_and_prefixed() {
         use chrono::TimeZone as _;
-        let now = chrono::Local.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap();
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 9, 1, 10, 0, 0)
+            .unwrap();
         assert_eq!(
             run_log_name("flashing world: arena!", now),
             "ggo-run-20260901-100000-flashing-world--arena.log"
@@ -2387,24 +2470,31 @@ mod tests {
 
     /// Only the clone ZedGG made can be synced, and the script carries
     /// every leg: fast-forward pull, reclone as the pull's fallback, and
-    /// the `ggo-emu` install guarded so a no-op sync skips it.
+    /// the `ggo` install guarded so a no-op sync skips it.
     #[test]
     fn only_the_managed_clone_offers_a_sync() {
         let mut env = ready_env();
         env.repo = Some(env.clone_dest.clone());
-        let request = env.sync_request().expect("the managed clone is ours to move");
+        let request = env
+            .sync_request()
+            .expect("the managed clone is ours to move");
         assert_eq!(request.bin, "sh");
-        assert_eq!(request.cwd, env.home, "a reclone leg needs a cwd that survives it");
+        assert_eq!(
+            request.cwd, env.home,
+            "a reclone leg needs a cwd that survives it"
+        );
         let script = &request.args[1];
-        assert!(script.contains("pull --ff-only"), "fast-forward first: {script}");
+        assert!(
+            script.contains("pull --ff-only"),
+            "fast-forward first: {script}"
+        );
         assert!(
             script.contains("|| { rm -rf") && script.contains("git clone"),
             "reclone only as the pull's fallback: {script}"
         );
         assert!(
-            script.contains("cargo install --locked --path")
-                && script.contains("tools/ggo-emu"),
-            "the installed ggo-emu follows the synced source: {script}"
+            script.contains("cargo install --locked --path") && script.contains(GGO_DIAG_CRATE_DIR),
+            "the installed ggo follows the synced source: {script}"
         );
         assert!(
             script.contains("\"$pre\" != \"$post\""),

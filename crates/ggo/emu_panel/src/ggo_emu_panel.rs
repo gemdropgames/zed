@@ -75,9 +75,9 @@
 //! covers the two teardown paths (Stop, and panel release) where no
 //! further render will come.
 
+pub mod agent_remote;
 pub mod audio;
 mod debug;
-pub mod agent_remote;
 mod drive;
 mod emu_item;
 mod hardware;
@@ -944,7 +944,10 @@ impl EmuPanel {
         // and that -- not the caller's `None` -- is what the reply says.
         let effective = hardware::effective_config(
             &env,
-            &hardware::FlashConfig { world: self.flash_world(cx), ..config },
+            &hardware::FlashConfig {
+                world: self.flash_world(cx),
+                ..config
+            },
         );
         // Arm the "open this flash's report when it passes" for the run
         // about to start. Here rather than in `start_board_run`, which
@@ -972,7 +975,10 @@ impl EmuPanel {
         // `start_flash` remembered a named world already; the remembered
         // one is what the argv gets either way, so the two never differ.
         let world = self.flash_world(cx);
-        let config = hardware::FlashConfig { world: world.clone(), ..config.clone() };
+        let config = hardware::FlashConfig {
+            world: world.clone(),
+            ..config.clone()
+        };
         let request = hardware::flash_request(env, &config)?;
         let what = match &world {
             // The timeline's own header: which world is on its way to the
@@ -1349,7 +1355,8 @@ impl EmuPanel {
             None => this
                 .update(cx, |this, cx| {
                     if let Some(status) = this.status.as_mut() {
-                        status.push_str(" — no telemetry frames recorded; opened the run's UART log");
+                        status
+                            .push_str(" — no telemetry frames recorded; opened the run's UART log");
                         cx.notify();
                     }
                 })
@@ -1663,7 +1670,10 @@ impl EmuPanel {
         self.ingest_status = IngestStatus::Idle;
         self._pump_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(frame) = rx.recv().await {
-                if this.update(cx, |this, cx| this.on_frame(frame, cx)).is_err() {
+                if this
+                    .update(cx, |this, cx| this.on_frame(frame, cx))
+                    .is_err()
+                {
                     return;
                 }
                 // Give the executor a turn after EVERY frame. `recv` only
@@ -2955,9 +2965,7 @@ impl EmuPanel {
                     .icon_size(IconSize::Small)
                     .disabled(self.selected.is_none())
                     .tooltip(Tooltip::text("Run cart"))
-                    .on_click(
-                        cx.listener(|this, _event, window, cx| this.run(window, cx)),
-                    ),
+                    .on_click(cx.listener(|this, _event, window, cx| this.run(window, cx))),
             )
             .child(
                 IconButton::new("ggo-emu-stop", IconName::Stop)
@@ -3143,26 +3151,31 @@ impl EmuPanel {
         let max = drive::MAX_SPEED as usize;
         // The live session is the truth while one runs; the setting is
         // what the next run will get.
-        let speed = self.session.as_ref().map(|s| s.speed()).unwrap_or(self.speed);
+        let speed = self
+            .session
+            .as_ref()
+            .map(|s| s.speed())
+            .unwrap_or(self.speed);
         let weak = cx.weak_entity();
         h_flex()
             .gap_1()
             .items_center()
             .child(
-                ui::Slider::new(
-                    "ggo-emu-speed",
-                    ui::slider_fraction(speed as usize, 1, max),
-                )
-                .width(px(72.))
-                .on_change(move |fraction, _window, cx| {
-                    let speed = ui::slider_step(fraction, 1, max) as u32;
-                    weak.update(cx, |this, cx| this.set_speed(speed, cx)).ok();
-                }),
+                ui::Slider::new("ggo-emu-speed", ui::slider_fraction(speed as usize, 1, max))
+                    .width(px(72.))
+                    .on_change(move |fraction, _window, cx| {
+                        let speed = ui::slider_step(fraction, 1, max) as u32;
+                        weak.update(cx, |this, cx| this.set_speed(speed, cx)).ok();
+                    }),
             )
             .child(
                 Label::new(format!("{speed}×"))
                     .size(LabelSize::XSmall)
-                    .color(if speed == 1 { Color::Muted } else { Color::Accent }),
+                    .color(if speed == 1 {
+                        Color::Muted
+                    } else {
+                        Color::Accent
+                    }),
             )
             .into_any_element()
     }
@@ -3459,14 +3472,21 @@ impl EmuPanel {
     }
 
     /// Status row for `agent_remote`'s `status` command.
-    pub(crate) fn remote_status(&self, workspace: String) -> ggo_emu_remote::protocol::WorkspaceStatus {
+    pub(crate) fn remote_status(
+        &self,
+        workspace: String,
+    ) -> ggo_emu_remote::protocol::WorkspaceStatus {
         let run_kind = match self.run_kind {
             RunKind::Cart => ggo_emu_remote::protocol::RunKind::Cart,
             RunKind::World(_) => ggo_emu_remote::protocol::RunKind::World,
         };
         ggo_emu_remote::protocol::WorkspaceStatus {
             workspace,
-            cart: self.session.as_ref().map(|s| s.cart.clone()).or_else(|| self.selected.clone()),
+            cart: self
+                .session
+                .as_ref()
+                .map(|s| s.cart.clone())
+                .or_else(|| self.selected.clone()),
             running: self.session.is_some(),
             paused: self.is_paused(),
             frame: self.frame,
@@ -3562,7 +3582,10 @@ impl EmuPanel {
         let diag_steps = progress
             .diag_steps()
             .iter()
-            .map(|step| FlashDiagStep { index: step.index.clone(), status: step.status.clone() })
+            .map(|step| FlashDiagStep {
+                index: step.index.clone(),
+                status: step.status.clone(),
+            })
             .collect();
         // This run's lines only, and the last 20 of those; the transcript
         // path is there for the rest. ponytail: a console REPLACED by a
@@ -3581,7 +3604,10 @@ impl EmuPanel {
             phases,
             diag_steps,
             failure: progress.failure.clone(),
-            transcript: progress.transcript.as_ref().map(|path| path.display().to_string()),
+            transcript: progress
+                .transcript
+                .as_ref()
+                .map(|path| path.display().to_string()),
             console_tail,
             // Resolved by the post-PASS hop, not here: translating
             // ggo-diag's run id blocks on two database calls, and this
@@ -3610,13 +3636,19 @@ impl EmuPanel {
         self.cancel_flash(cx)
     }
 
-    pub(crate) fn remote_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+    pub(crate) fn remote_stop(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         self.stop(window, cx);
         Ok(())
     }
 
     fn remote_session(&self) -> Result<&drive::Session, String> {
-        self.session.as_ref().ok_or_else(|| "no run live — boot a cart first".to_string())
+        self.session
+            .as_ref()
+            .ok_or_else(|| "no run live — boot a cart first".to_string())
     }
 
     /// Latch the pad mask (level-triggered, exactly like held keys). The
@@ -3661,9 +3693,15 @@ impl EmuPanel {
     /// Progress probe for the dispatcher's boot/step waits: the last
     /// delivered frame number, and the failure status if the run died.
     pub(crate) fn remote_progress(&self) -> (u32, bool, Option<String>) {
-        (self.frame, self.session.is_some(), self.status_is_error.then(|| {
-            self.status.clone().unwrap_or_else(|| "run failed".to_string())
-        }))
+        (
+            self.frame,
+            self.session.is_some(),
+            self.status_is_error.then(|| {
+                self.status
+                    .clone()
+                    .unwrap_or_else(|| "run failed".to_string())
+            }),
+        )
     }
 
     /// Arm the cart's world-inspection tap — lock-step (remote) runs
@@ -5766,7 +5804,11 @@ mod tests {
         let packs = pack_ggo_calls(&calls);
         assert_eq!(packs.len(), 1, "exactly one build");
         assert_eq!(
-            calls.lock().unwrap().first().map(|r| r.args.first().cloned()),
+            calls
+                .lock()
+                .unwrap()
+                .first()
+                .map(|r| r.args.first().cloned()),
             Some(Some("bake".to_string())),
             "the saved world is a source asset: the pack reads the card a bake writes"
         );
@@ -5976,7 +6018,10 @@ mod tests {
                 "a save after Run must still re-pack the watched world"
             );
             assert!(
-                packs[packs.len() - 1].args.iter().any(|a| a == "worlds/main"),
+                packs[packs.len() - 1]
+                    .args
+                    .iter()
+                    .any(|a| a == "worlds/main"),
                 "and re-pack THAT world"
             );
         }
@@ -7464,7 +7509,7 @@ mod tests {
     /// builds a command without needing a board attached.
     fn ready_hardware(root: &std::path::Path) -> hardware::HardwareEnv {
         hardware::HardwareEnv {
-            diag_bin: Some("ggo-diag".into()),
+            diag_bin: Some("ggo".into()),
             emd_bin: Some("emd".into()),
             repo: Some(root.join("repo")),
             emerald: None,
@@ -7496,8 +7541,11 @@ mod tests {
             true,
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7652,8 +7700,11 @@ mod tests {
             ],
             true,
         );
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             panel.flash_charts_window = Some(window.window_handle());
@@ -7682,7 +7733,10 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             let status = panel.status.as_deref().unwrap_or_default();
             assert!(status.starts_with("flashing: PASS"), "{status}");
-            assert!(status.contains("no telemetry"), "the status says why there is no chart: {status}");
+            assert!(
+                status.contains("no telemetry"),
+                "the status says why there is no chart: {status}"
+            );
             assert_eq!(panel.remote_flash_status().perf_run_id, None);
         });
     }
@@ -7725,8 +7779,11 @@ mod tests {
             ],
             true,
         );
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             // What `flash_to_board_with` arms. `start_board_run` is entered
@@ -7782,8 +7839,11 @@ mod tests {
         // transcript line saying which run this flash was.
         seed_flashed_run(db.url());
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             panel.flash_charts_window = Some(window.window_handle());
@@ -7833,8 +7893,11 @@ mod tests {
             true,
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7878,8 +7941,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7910,8 +7976,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request.clone()],
@@ -7947,8 +8016,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "RESULT: FAIL"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -7980,8 +8052,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board", "fujprog: no board"], false);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
@@ -8012,8 +8087,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -8059,8 +8137,11 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, _window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -8124,7 +8205,10 @@ mod tests {
             panel.root_override = None;
             let err = panel
                 .remote_flash(
-                    hardware::FlashConfig { world: Some("worlds/arena".to_string()), ..Default::default() },
+                    hardware::FlashConfig {
+                        world: Some("worlds/arena".to_string()),
+                        ..Default::default()
+                    },
                     window,
                     cx,
                 )
@@ -8144,8 +8228,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -8154,7 +8241,10 @@ mod tests {
                 cx,
             );
             let live = panel.remote_flash_status();
-            assert!(live.active && live.verdict.is_none(), "the run is in flight");
+            assert!(
+                live.active && live.verdict.is_none(),
+                "the run is in flight"
+            );
             let err = panel
                 .remote_flash(hardware::FlashConfig::default(), window, cx)
                 .expect_err("one board, one flash");
@@ -8170,8 +8260,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (streamer, _calls) = fake_streamer(vec!["==> Flash board"], true);
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, _window, cx| {
             panel.start_board_run(
                 vec![request],
@@ -8280,7 +8373,10 @@ mod tests {
                 "{requests:?}"
             );
             assert_eq!(cart, "target/ggo-emulate/worlds-arena.ggo");
-            assert!(panel.status.is_none(), "a planned pack leaves the row alone");
+            assert!(
+                panel.status.is_none(),
+                "a planned pack leaves the row alone"
+            );
         });
     }
 
@@ -8292,9 +8388,7 @@ mod tests {
     /// WITH its run and surfaced only when the payload is reporting that
     /// same run: every other arrangement reports `None`.
     #[gpui::test]
-    async fn test_a_report_id_never_surfaces_beside_another_runs_timeline(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_a_report_id_never_surfaces_beside_another_runs_timeline(cx: &mut TestAppContext) {
         /// A second flash, with a run id of its own.
         const LATER_RUN: &str = "20260901T090000Z-9999999999";
         let dir = tempfile::tempdir().unwrap();
@@ -8308,7 +8402,11 @@ mod tests {
         );
         let (panel, cx) = flashable_panel(cx, dir.path(), first);
         let request = || {
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready")
+            hardware::flash_request(
+                &ready_hardware(dir.path()),
+                &hardware::FlashConfig::default(),
+            )
+            .expect("ready")
         };
         // No charts window: no run's own hop looks anything up, so the
         // stash is the test's to play the landing hops itself.
@@ -8358,7 +8456,10 @@ mod tests {
                 cx,
             );
             let live = panel.remote_flash_status();
-            assert!(live.active && live.diag_run_id.is_none(), "run B is in flight");
+            assert!(
+                live.active && live.diag_run_id.is_none(),
+                "run B is in flight"
+            );
             assert_eq!(
                 live.perf_run_id, None,
                 "a live run has no report yet, least of all the previous run's"
@@ -8398,8 +8499,11 @@ mod tests {
             ],
             true,
         );
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update_in(cx, |panel, window, cx| {
             panel.proc_streamer = streamer;
             panel.flash_charts_window = Some(window.window_handle());
@@ -8451,8 +8555,11 @@ mod tests {
             ],
             false,
         );
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.proc_streamer = streamer;
             panel.start_board_run(
@@ -8469,7 +8576,10 @@ mod tests {
             assert!(!status.active);
             assert_eq!(status.what.as_deref(), Some("flashing worlds/arena"));
             assert_eq!(status.verdict, Some(false));
-            assert_eq!(status.failure.as_deref(), Some("boot stalled at boot-rom alive"));
+            assert_eq!(
+                status.failure.as_deref(),
+                Some("boot stalled at boot-rom alive")
+            );
             assert!(status.elapsed_s.is_some());
             let states: Vec<(&str, &str)> = status
                 .phases
@@ -8491,11 +8601,17 @@ mod tests {
                 "the boot stage and its budget ride on the phase that ran it"
             );
             assert_eq!(
-                (status.diag_steps[0].index.as_str(), status.diag_steps[0].status.as_str()),
+                (
+                    status.diag_steps[0].index.as_str(),
+                    status.diag_steps[0].status.as_str()
+                ),
                 ("1", "running")
             );
             assert!(
-                status.console_tail.iter().any(|line| line == "RESULT: FAIL"),
+                status
+                    .console_tail
+                    .iter()
+                    .any(|line| line == "RESULT: FAIL"),
                 "{:?}",
                 status.console_tail
             );
@@ -8651,7 +8767,11 @@ mod tests {
             // no world of their own, so this is the whole of what makes
             // them re-flash the same one.
             let (request, what, _progress) = panel
-                .flash_plan(&ready_hardware(dir.path()), &hardware::FlashConfig::default(), cx)
+                .flash_plan(
+                    &ready_hardware(dir.path()),
+                    &hardware::FlashConfig::default(),
+                    cx,
+                )
                 .expect("a ready machine flashes");
             assert!(
                 request
@@ -8679,7 +8799,11 @@ mod tests {
                 "a root change drops the world remembered from the old tree"
             );
             let (request, what, _progress) = panel
-                .flash_plan(&ready_hardware(dir.path()), &hardware::FlashConfig::default(), cx)
+                .flash_plan(
+                    &ready_hardware(dir.path()),
+                    &hardware::FlashConfig::default(),
+                    cx,
+                )
                 .expect("a ready machine flashes");
             assert!(
                 !request.args.contains(&"--world".to_string()),
@@ -8713,7 +8837,11 @@ mod tests {
                 "the open document answers when this panel has been told nothing"
             );
             let (request, what, _progress) = panel
-                .flash_plan(&ready_hardware(dir.path()), &hardware::FlashConfig::default(), cx)
+                .flash_plan(
+                    &ready_hardware(dir.path()),
+                    &hardware::FlashConfig::default(),
+                    cx,
+                )
                 .expect("a ready machine flashes");
             assert!(
                 request
@@ -8762,8 +8890,11 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = flashable_panel(cx, dir.path(), streamer);
-        let request =
-            hardware::flash_request(&ready_hardware(dir.path()), &hardware::FlashConfig::default()).expect("ready");
+        let request = hardware::flash_request(
+            &ready_hardware(dir.path()),
+            &hardware::FlashConfig::default(),
+        )
+        .expect("ready");
         panel.update(cx, |panel, cx| {
             panel.start_board_run(
                 vec![request],
