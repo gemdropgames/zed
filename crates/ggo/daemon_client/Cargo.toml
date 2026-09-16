@@ -15,9 +15,12 @@ path = "src/ggo_daemon_client.rs"
 # (see `docs/daemon-api-plan.md` §5 in the GGO repo). Every other panel
 # reaches GemdropGo through this client. P6 adds a test that enforces it.
 #
-# Nothing from the GGO tree is needed yet: P0 is the control plane, which is
-# JSON over a unix socket. `ggo-shm` arrives with P4's frame ring.
 [dependencies]
+# The report row types, re-exported from here. Default features ONLY: the
+# `db` feature is what drags in sqlx and a connection pool, and the whole
+# point of this crate is that the editor no longer opens a database.
+# `ggo-shm` joins it with P4's frame ring.
+ggo-worldlib.workspace = true
 anyhow.workspace = true
 log.workspace = true
 serde.workspace = true

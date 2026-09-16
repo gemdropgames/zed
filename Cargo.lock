@@ -7390,7 +7390,6 @@ dependencies = [
  "flate2",
  "ggo-asset-formats",
  "ggo-comm",
- "ggo-db",
  "ggo-emu-core",
  "ggo-wire",
  "image",
@@ -7464,6 +7463,7 @@ name = "ggo_daemon_client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ggo-worldlib",
  "log",
  "serde",
  "serde_json",

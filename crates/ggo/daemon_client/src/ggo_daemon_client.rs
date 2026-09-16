@@ -184,119 +184,28 @@ impl JobLines {
 
 // ------------------------------------------------------------- reports
 //
-// Mirrors of `ggo_worldlib::charts::reports::{perf_db, diag_db}`'s row
-// types, declared here rather than imported for the reason this whole
-// crate exists: nothing under `crates/ggo/` may link a `ggo-*` crate, and
-// worldlib drags in `ggo-db` (and so sqlx, and so a database pool) -- the
-// exact dependency P1 is removing. The serde field names ARE the wire
-// contract; a rename on either side shows up as a decode failure, which
-// the round-trip tests below pin.
+// The row types are worldlib's own, re-exported rather than mirrored.
+//
+// This crate may link a `ggo-*` crate -- it is the one crate under
+// `crates/ggo/` allowed to. What P1 removes is the DATABASE, not the
+// shapes, and `ggo-worldlib` now keeps its queries behind a `db` feature
+// this crate deliberately leaves off: the types come across, sqlx and the
+// connection pool do not.
+//
+// Re-exporting rather than duplicating means there is no second
+// definition to drift. The serde field names are the wire contract
+// between two independently built processes, and now both processes name
+// the same struct.
 
-/// One run's per-frame sample. Field-for-field `perf_db::FrameRow`.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FrameRow {
-    pub n: i64,
-    pub instrs: i64,
-    pub i_hits: i64,
-    pub i_misses: i64,
-    pub d_hits: i64,
-    pub d_misses: i64,
-    pub scanout_wire: i64,
-    pub blit_wire: i64,
-    pub miss_wire: i64,
-    pub wire_total: i64,
-    pub over_budget: bool,
-    /// `None` for a device run, which has no wire model.
-    pub frame_budget_cycles: Option<i64>,
-    pub apu_underruns: i64,
-    pub bg_evictions: i64,
-    pub fg_evictions: i64,
-    pub spr_evictions: i64,
-    pub tile_load_wire: i64,
-    pub apu_fetch_wire: i64,
-    pub sc_upload: i64,
-    pub sc_oam: i64,
-    pub sc_layer: i64,
-    pub sc_audio: i64,
-    pub sc_other: i64,
-    pub peak_spr_line: i64,
-    pub bg_tiles_distinct: i64,
-    pub spr_tiles_distinct: i64,
-    pub cyc: i64,
-}
+pub use ggo_worldlib::charts::reports::rows::{
+    CartRow, FrameRow, ProfileRow, RunDetail, RunIndexRow, RunRow, UartLine,
+};
 
-/// One cart with its run count and newest run stamp. `perf_db::CartRow`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct CartRow {
-    pub id: i64,
-    pub name: String,
-    pub runs: i64,
-    /// `None` for a cart with no runs yet.
-    pub last_run_at: Option<String>,
-}
-
-/// One run of a cart, with that run's frame aggregates. `perf_db::RunRow`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RunRow {
-    pub id: i64,
-    pub started_at: String,
-    pub frames: i64,
-    pub label: Option<String>,
-    pub over_budget_frames: i64,
-    pub avg_wire_total: Option<f64>,
-    pub max_wire_total: Option<i64>,
-    pub avg_i_misses: Option<f64>,
-    pub avg_d_misses: Option<f64>,
-    pub max_i_misses: Option<i64>,
-    pub max_d_misses: Option<i64>,
-    pub apu_underruns: i64,
-}
-
-/// One run's full detail. `perf_db::RunDetail`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RunDetail {
-    pub id: i64,
-    pub cart_id: i64,
-    pub cart_name: String,
-    pub started_at: String,
-    pub frames: i64,
-    pub frame_budget_cycles: Option<i64>,
-    pub scanout_wire_cycles: Option<i64>,
-    pub refill_cycles: Option<i64>,
-    pub writeback_cycles: Option<i64>,
-    pub wire_wait_cycles: i64,
-    pub label: Option<String>,
-    pub over_budget_frames: i64,
-    pub avg_wire_total: Option<f64>,
-    pub max_wire_total: Option<i64>,
-    pub avg_i_misses: Option<f64>,
-    pub avg_d_misses: Option<f64>,
-    pub max_i_misses: Option<i64>,
-    pub max_d_misses: Option<i64>,
-    pub apu_underruns: i64,
-}
-
-/// One line of a run's index entry. `perf_db::RunIndexRow`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RunIndexRow {
-    pub id: i64,
-    pub started_at: String,
-    pub cart_name: String,
-    pub label: Option<String>,
-    pub frames: i64,
-}
-
-/// A function-level cache-attribution sample. `perf_db::ProfileRow`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ProfileRow {
-    pub frame: i64,
-    pub caller: String,
-    pub func: String,
-    pub misses: i64,
-    pub evicted: i64,
-}
-
-/// One device (`ggo-diag`) run. `diag_db::RunSummary`.
+/// One device (`ggo-diag`) run, as `diag_db::RunSummary` serialises it.
+///
+/// Declared here rather than re-exported: `diag_db` is one of the modules
+/// behind worldlib's `db` feature, because every function in it issues
+/// SQL. Only the row shape is needed on this side.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiagRunSummary {
     pub id: String,
@@ -306,8 +215,8 @@ pub struct DiagRunSummary {
     pub verdict: Option<String>,
 }
 
-/// What a completed ingest created. `ingest::RunId` plus the truncation
-/// note, which is advice for the user rather than a failure.
+/// What a completed ingest created -- `ingest::RunId`, which lives behind
+/// the same `db` feature and for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IngestedRun {
     pub run_id: i64,
