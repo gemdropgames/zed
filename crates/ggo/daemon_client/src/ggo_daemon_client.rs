@@ -109,6 +109,79 @@ pub struct Handshake {
     pub protocol_version: String,
 }
 
+/// A daemon job's state, as `ggo_web_types::JobState` serialises it.
+///
+/// Declared here rather than imported: this crate must build without a
+/// dependency on the GGO tree for everything P0 does, and the tag/rename
+/// attributes below ARE the wire contract -- a mismatch would show as a
+/// decode failure the moment a job finishes, which is the case the
+/// `a_finished_job_decodes_its_exit_code` test pins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum JobState {
+    Running,
+    Done { exit_code: i32 },
+    Failed { error: String },
+}
+
+impl JobState {
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    /// Did this job end badly? A non-zero exit is the tool's own verdict
+    /// on itself, which the hardware page styles differently from a
+    /// spawn that never produced one.
+    pub fn is_error(&self) -> bool {
+        match self {
+            Self::Running => false,
+            Self::Done { exit_code } => *exit_code != 0,
+            Self::Failed { .. } => true,
+        }
+    }
+}
+
+/// One job, as the daemon reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobInfo {
+    pub id: u64,
+    pub args: Vec<String>,
+    #[serde(flatten)]
+    pub state: JobState,
+    pub line_count: usize,
+}
+
+/// One line of a job's output. `index` is monotonic across the whole run,
+/// so a gap in it means lines were evicted from the daemon's buffer --
+/// the count kept counting even though the text is gone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobLine {
+    pub index: usize,
+    pub text: String,
+}
+
+/// One poll's worth of a job: what is new, and how the job is doing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobLines {
+    pub lines: Vec<JobLine>,
+    #[serde(flatten)]
+    pub state: JobState,
+}
+
+impl JobLines {
+    /// The `since` to pass to the next [`Client::job_lines`] call.
+    ///
+    /// One past the highest index seen, or the caller's own `since` when
+    /// the batch was empty -- a caught-up poller must not rewind to 0 and
+    /// replay the whole transcript.
+    pub fn next_since(&self, current: usize) -> usize {
+        self.lines
+            .last()
+            .map(|line| line.index + 1)
+            .unwrap_or(current)
+    }
+}
+
 /// The injection seam: anything that can carry one JSON-RPC request line
 /// and return one response line.
 ///
@@ -284,9 +357,49 @@ impl Client {
     // as a child process. Thin on purpose: the argument shaping belongs
     // here, the policy stays in the panels.
 
-    /// Run a hardware diagnostic (`ggo diag`).
+    /// Run a hardware diagnostic (`ggo diag`) and block until it ends.
+    ///
+    /// Only for runs that finish quickly (`--help`, a probe). A flash is
+    /// minutes of work and must use [`Self::diag_start`] instead, or the
+    /// panel shows nothing until it is over.
     pub fn diag(&self, args: Vec<String>) -> Result<Value> {
         self.call_tool("ggo_diag", json!({"args": args}))
+    }
+
+    /// Start a diagnostic as a daemon job; returns its [`JobInfo`] at once.
+    ///
+    /// Follow it with [`Self::job_lines`]. The daemon runs one diag at a
+    /// time -- two would fight over the board and its UART -- so this
+    /// fails while another is in flight, and the message names the job.
+    pub fn diag_start(&self, args: Vec<String>) -> Result<JobInfo> {
+        let value = self.call_tool("ggo_diag_start", json!({"args": args}))?;
+        serde_json::from_value(value).context("decode the started job")
+    }
+
+    /// Lines from `since` onward, with the job's state.
+    ///
+    /// The socket carries no server-initiated frames, so following a job
+    /// means asking again from the last index seen. Pass
+    /// `next_since` back as `since`; a caught-up poll returns no lines,
+    /// which is not an error.
+    pub fn job_lines(&self, id: u64, since: usize) -> Result<JobLines> {
+        let value = self.call_tool("ggo_job_lines", json!({"id": id, "since": since}))?;
+        serde_json::from_value(value).context("decode the job's lines")
+    }
+
+    /// SIGINT a running job. The reply says whether there was one.
+    pub fn job_cancel(&self, id: u64) -> Result<bool> {
+        let value = self.call_tool("ggo_job_cancel", json!({"id": id}))?;
+        Ok(value
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// Every job this daemon has run.
+    pub fn jobs(&self) -> Result<Vec<JobInfo>> {
+        let value = self.call_tool("ggo_jobs", json!({}))?;
+        serde_json::from_value(value).context("decode the job list")
     }
 
     /// Apply pending migrations to the GemdropGo database.
@@ -676,6 +789,121 @@ mod tests {
             client.flash_status().expect("flash"),
             json!("no board attached")
         );
+    }
+
+    /// A flash is minutes of work, so the panel starts a job and polls it.
+    /// The start must come back decoded, not as raw JSON.
+    #[test]
+    fn starting_a_diagnostic_returns_a_running_job() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_diag_start",
+            json!({"id": 7, "args": ["diag", "--launch"], "state": "running", "line_count": 0}),
+        );
+        let client = client_with(&fake);
+
+        let job = client.diag_start(vec!["--launch".into()]).expect("start");
+        assert_eq!(job.id, 7);
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.state.is_running());
+        assert!(!job.state.is_error(), "a running job has not failed yet");
+    }
+
+    /// Polling must hand back only what is new and say where to resume, or
+    /// a flash transcript arrives duplicated on every poll.
+    #[test]
+    fn polling_a_job_reports_new_lines_and_where_to_resume() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_job_lines",
+            json!({
+                "lines": [
+                    {"index": 4, "text": "==> Flash board"},
+                    {"index": 5, "text": "==> Boot verify (UART)"},
+                ],
+                "state": "running",
+            }),
+        );
+        let client = client_with(&fake);
+
+        let batch = client.job_lines(7, 4).expect("lines");
+        assert_eq!(batch.lines.len(), 2);
+        assert_eq!(batch.lines[0].text, "==> Flash board");
+        assert_eq!(batch.state, JobState::Running);
+        assert_eq!(batch.next_since(4), 6, "resume one past the highest index");
+    }
+
+    /// A caught-up poller gets nothing, which is not an error -- and must
+    /// NOT rewind to 0, which would replay the whole transcript.
+    #[test]
+    fn an_empty_poll_keeps_its_place_rather_than_rewinding() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_job_lines", json!({"lines": [], "state": "running"}));
+        let client = client_with(&fake);
+
+        let batch = client.job_lines(7, 42).expect("lines");
+        assert!(batch.lines.is_empty());
+        assert_eq!(batch.next_since(42), 42);
+    }
+
+    /// The exit code is the tool's own verdict on itself; the hardware
+    /// page styles a failed run differently, so it has to survive decoding.
+    #[test]
+    fn a_finished_job_decodes_its_exit_code() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_job_lines",
+            json!({"lines": [], "state": "done", "exit_code": 2}),
+        );
+        let client = client_with(&fake);
+
+        let batch = client.job_lines(7, 0).expect("lines");
+        assert_eq!(batch.state, JobState::Done { exit_code: 2 });
+        assert!(!batch.state.is_running());
+        assert!(batch.state.is_error(), "a non-zero exit is a failed run");
+    }
+
+    #[test]
+    fn a_job_that_never_started_decodes_as_failed() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_job_lines",
+            json!({"lines": [], "state": "failed", "error": "spawn ggo: No such file"}),
+        );
+        let client = client_with(&fake);
+
+        let batch = client.job_lines(7, 0).expect("lines");
+        assert!(batch.state.is_error());
+        let JobState::Failed { error } = batch.state else {
+            panic!("expected a failed job");
+        };
+        assert!(error.contains("No such file"), "{error}");
+    }
+
+    #[test]
+    fn cancelling_a_job_reports_whether_there_was_one() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_job_cancel", json!({"cancelled": true}));
+        let client = client_with(&fake);
+        assert!(client.job_cancel(7).expect("cancel"));
+
+        fake.on_tool("ggo_job_cancel", json!({"cancelled": false}));
+        assert!(!client.job_cancel(7).expect("cancel"));
+    }
+
+    /// The daemon runs one diag at a time -- two would fight over the
+    /// board and its UART -- so the refusal must reach the panel as text
+    /// naming the job already running.
+    #[test]
+    fn a_second_diagnostic_is_refused_with_the_running_jobs_id() {
+        let fake = FakeDaemon::new();
+        fake.on_tool_error("ggo_diag_start", "a diag job is already running (id 3)");
+        let client = client_with(&fake);
+
+        let Err(error) = client.diag_start(vec!["--launch".into()]) else {
+            panic!("a second diag must be refused");
+        };
+        assert!(error.to_string().contains("id 3"), "{error}");
     }
 
     #[test]
