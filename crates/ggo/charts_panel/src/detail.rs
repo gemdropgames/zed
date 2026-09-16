@@ -66,6 +66,8 @@ use ggo_worldlib::charts::reports::historic::HistoricRunFrames;
 use crate::chart_geom::ChartSpec;
 use crate::chart_set;
 use crate::inspect::{self, Profiles};
+use ggo_daemon_client::Connect;
+
 use crate::loader::{self, RunSamples};
 use crate::report::{self, RunReport};
 
@@ -133,9 +135,9 @@ pub struct Detail {
 /// **The samples' failures are fatal; the overlay's are not** -- see
 /// [`prior_or_none`]. That asymmetry is the whole reason the two loads are
 /// separate statements rather than one `?`-chained expression.
-pub fn load(db_url: &str, run_id: i64) -> Result<Detail, String> {
-    let samples = loader::load_run_samples(db_url, run_id)?;
-    let prior = prior_or_none(db_url, run_id, samples.detail.as_ref().map(|d| d.cart_id));
+pub fn load(connect: &Connect, run_id: i64) -> Result<Detail, String> {
+    let samples = loader::load_run_samples(connect, run_id)?;
+    let prior = prior_or_none(connect, run_id, samples.detail.as_ref().map(|d| d.cart_id));
     Ok(build(&samples, &prior))
 }
 
@@ -161,8 +163,8 @@ pub fn load(db_url: &str, run_id: i64) -> Result<Detail, String> {
 /// a decoration -- would cost more than it explains. It does mean a
 /// transient connection failure reads as "no prior runs of this cart",
 /// which is noted as a residual in this task's report.
-fn prior_or_none(db_url: &str, run_id: i64, cart_id: Option<i64>) -> Vec<HistoricRunFrames> {
-    loader::load_prior_runs(db_url, run_id, cart_id).unwrap_or_default()
+fn prior_or_none(connect: &Connect, run_id: i64, cart_id: Option<i64>) -> Vec<HistoricRunFrames> {
+    loader::load_prior_runs(connect, run_id, cart_id).unwrap_or_default()
 }
 
 /// The pure half of [`load`] -- every derivation, no I/O.
@@ -303,11 +305,11 @@ mod tests {
     #[test]
     fn a_prior_run_query_failure_degrades_to_no_overlay() {
         assert!(
-            loader::load_prior_runs(UNREACHABLE_DB_URL, 5, Some(1)).is_err(),
+            loader::load_prior_runs(&loader::test_connect(UNREACHABLE_DB_URL), 5, Some(1)).is_err(),
             "the fixture has to actually fail, or the degrade below proves nothing"
         );
         assert!(
-            prior_or_none(UNREACHABLE_DB_URL, 5, Some(1)).is_empty(),
+            prior_or_none(&loader::test_connect(UNREACHABLE_DB_URL), 5, Some(1)).is_empty(),
             "a failed overlay load is no overlay, not a failed run detail"
         );
     }
@@ -337,10 +339,10 @@ mod tests {
     /// `select_run`'s error state shows the loader's message.
     #[test]
     fn load_propagates_a_samples_failure_out_of_the_off_thread_pass() {
-        let expected = loader::load_run_samples(UNREACHABLE_DB_URL, 1)
+        let expected = loader::load_run_samples(&loader::test_connect(UNREACHABLE_DB_URL), 1)
             .expect_err("the fixture has to actually fail, or this proves nothing");
         assert_eq!(
-            load(UNREACHABLE_DB_URL, 1),
+            load(&loader::test_connect(UNREACHABLE_DB_URL), 1),
             Err(expected),
             "the loader's error reaches the caller unchanged"
         );
@@ -351,7 +353,7 @@ mod tests {
     #[test]
     fn load_of_a_run_that_was_never_ingested_is_an_empty_detail_not_an_error() {
         let db = ggo_db::TestDb::new();
-        let detail = load(db.url(), 1).unwrap();
+        let detail = load(&loader::test_connect(db.url()), 1).unwrap();
         assert!(detail.charts.is_empty());
         assert!(detail.console.is_empty());
     }

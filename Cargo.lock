@@ -7428,6 +7428,7 @@ dependencies = [
  "ggo-db",
  "ggo-worldlib",
  "ggo_common",
+ "ggo_daemon_client",
  "ggo_emu_remote",
  "gpui",
  "log",

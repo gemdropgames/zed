@@ -12,9 +12,13 @@ workspace = true
 path = "src/ggo_charts_panel.rs"
 
 [dependencies]
-ggo-db.workspace = true # GGO
-ggo-worldlib.workspace = true # GGO -- LinearScale/nice_step, shared with ggo-ide's charts
+# GGO -- pure chart/KPI/report computation over rows the daemon fetched.
+# Default features only: the `db` feature is what would drag sqlx back in.
+ggo-worldlib.workspace = true
 ggo_common.workspace = true
+# GGO -- the one door to GemdropGo: every run, frame and fault this panel
+# shows arrives over the daemon's socket.
+ggo_daemon_client.workspace = true
 ggo_emu_remote.workspace = true
 log.workspace = true
 gpui.workspace = true
@@ -22,6 +26,12 @@ ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+# GGO -- SEEDING ONLY. A test builds the rows it wants with `TestDb`, then
+# reads them back the way the panel does: over the in-process daemon. The
+# production build has no database dependency at all.
+ggo-db.workspace = true
+# GGO -- the in-process daemon, so a panel test never needs `ggo serve`.
+ggo_daemon_client = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

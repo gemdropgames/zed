@@ -37,17 +37,15 @@
 //! `SELECT`, and a server that cannot be reached is an error carrying
 //! [`ggo_db::INSTALL_HINT`] rather than a silent empty list.
 
-use ggo_db::sqlx::postgres::PgRow;
-use ggo_db::sqlx::{self, Row};
+use ggo_daemon_client::Connect;
 use ggo_worldlib::charts::reports::historic::{self, HistoricRunFrames};
-use ggo_worldlib::charts::reports::perf_db;
 
-// Worldlib owns these now (F5.4 Task R1). Re-exported rather than
-// re-declared so `chart_set`'s specs, the KPI derivations in
-// `ggo_worldlib::charts::reports::kpi`, and `ggo_emu_panel`'s ingest
-// round-trip test all name one type -- a private copy is exactly how a
-// panel's numbers drift from the page it mirrors.
-pub use ggo_worldlib::charts::reports::perf_db::{FrameRow, ProfileRow, RunDetail, UartLine};
+// Worldlib owns these, and the daemon client re-exports them. Named
+// through the client rather than worldlib directly so this panel has ONE
+// door to GemdropGo: the types it decodes and the calls that fetch them
+// arrive from the same crate, and worldlib's database half stays
+// unreachable from here.
+pub use ggo_daemon_client::{FrameRow, ProfileRow, RunDetail, UartLine};
 
 /// One row of the runs list: enough to identify a run in the picker.
 /// Selecting one loads its samples through [`load_run_samples`].
@@ -71,54 +69,41 @@ impl RunListing {
     }
 }
 
-/// [`LIST_RUNS_SQL`]' select-list positions.
-const LISTING_ID: usize = 0;
-const LISTING_STARTED_AT: usize = 1;
-const LISTING_CART_NAME: usize = 2;
-const LISTING_LABEL: usize = 3;
-
-/// One db row -> a [`RunListing`], or `None` if the row's leading columns
-/// are NULL. `run.started_at` and `cart.name` are both nullable, and a run
-/// missing either cannot be named in the picker -- it is skipped rather
-/// than shown as a blank row. `label` is nullable by design (only the emu
-/// pane's own runs carry one), so a NULL there is a `None`, not a skip.
-fn row_to_listing(row: &PgRow) -> Option<RunListing> {
-    Some(RunListing {
-        id: row.try_get(LISTING_ID).ok()?,
-        started_at: row.try_get(LISTING_STARTED_AT).ok()?,
-        cart_name: row.try_get(LISTING_CART_NAME).ok()?,
-        label: row.try_get(LISTING_LABEL).ok().flatten(),
-    })
-}
-
-/// Every run across every cart, newest first. `started_at` is nullable
-/// and PostgreSQL sorts NULLs FIRST under `DESC`, so `NULLS LAST` keeps a
-/// run with no start stamp out of the top of the list -- the same
-/// `ORDER BY` (and the same `id DESC` tie-break) `perf_db::run_index`
-/// uses, so the panel's picker and ggo-ide's run list agree on which of
-/// two runs is "newer".
-const LIST_RUNS_SQL: &str = "SELECT r.id, r.started_at, c.name, r.label \
-     FROM run r JOIN cart c ON c.id = r.cart_id \
-     ORDER BY r.started_at DESC NULLS LAST, r.id DESC";
-
 /// Every run across every cart, newest first -- the panel's picker feed.
+///
+/// This used to be local SQL, because worldlib exposed only ggo-ide's
+/// two-level cart -> run drill-down. It is now the daemon's
+/// `ggo_run_index`, which is the same one flat "every run, newest first"
+/// list: same `ORDER BY r.started_at DESC NULLS LAST, r.id DESC`, so the
+/// picker and ggo-ide's run list still agree on which of two runs is
+/// newer. `frames` comes along and is dropped -- a listing only has to
+/// identify a run.
 ///
 /// A database with no runs in it reads as a clean empty list, not an
 /// error: nothing is ingested until `ggo-ide`, `ggo-emu`, `ggo-server` or
 /// this fork's emu pane records a run, and that is an ordinary "nothing
-/// to show yet" state for a fresh machine, not a failure. A postgres that
-/// cannot be reached IS an error, and carries [`ggo_db::INSTALL_HINT`].
+/// to show yet" state for a fresh machine. A daemon that cannot be
+/// reached IS an error.
+///
+/// A run with no `started_at` or no cart name is still skipped rather
+/// than shown as a blank row, but the daemon now decides what those
+/// columns read as: `perf_db` renders a NULL as an empty string, so the
+/// skip is on emptiness rather than on a decode failure.
 ///
 /// **Blocking** -- off-thread only, see this module's doc.
-pub fn list_runs(db_url: &str) -> Result<Vec<RunListing>, String> {
-    ggo_db::block_on(async {
-        let pool = ggo_db::pool_for_async(db_url).await?;
-        let rows = sqlx::query(LIST_RUNS_SQL)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(rows.iter().filter_map(row_to_listing).collect())
-    })
+pub fn list_runs(connect: &Connect) -> Result<Vec<RunListing>, String> {
+    let client = connect().map_err(|e| format!("{e:#}"))?;
+    let rows = client.run_index().map_err(|e| format!("{e:#}"))?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| !row.started_at.is_empty() && !row.cart_name.is_empty())
+        .map(|row| RunListing {
+            id: row.id,
+            started_at: row.started_at,
+            cart_name: row.cart_name,
+            label: row.label,
+        })
+        .collect())
 }
 
 // ------------------------------------------------------- per-run samples
@@ -153,36 +138,32 @@ pub struct RunSamples {
 
 /// One run's frames, profile rows, `run` row and UART.
 ///
-/// **Blocking** (four `perf_db` calls, each one `ggo_db::block_on`), so it
-/// must only ever be called from `cx.background_spawn` -- see this
-/// module's doc.
+/// **Blocking** (four daemon calls), so it must only ever be called from
+/// `cx.background_spawn` -- see this module's doc.
 ///
-/// A run id with no rows reads as an empty result rather than an error:
-/// `perf_db`'s list queries answer that way, and so does its `run_detail`
-/// (`None`).
+/// A run id with no rows reads as an empty result rather than an error,
+/// and a missing `run` row as `None`: the daemon answers that way because
+/// `perf_db` does.
 ///
-/// Every query returns EVERY row -- no `LIMIT`, no SQL-side bucketing --
-/// which is ggo-ide's behavior too. Ingest caps a run at 100,000 frames,
-/// so this is a large scan; acceptable because it runs off-thread, once
-/// per selection.
+/// Every call returns EVERY row -- no `LIMIT`, no bucketing -- which is
+/// ggo-ide's behavior too. Ingest caps a run at 100,000 frames, so this is
+/// a large read; acceptable because it runs off-thread, once per
+/// selection.
 ///
-/// Errors are stringified with `{e:#}`, not `{e}`: `perf_db` builds its
-/// `anyhow::Error`s out of `.context(..)`, whose plain `Display` shows
-/// only the outermost context -- the alternate form appends the chain,
-/// which is where the actual sqlx failure is.
-pub fn load_run_samples(db_url: &str, run_id: i64) -> Result<RunSamples, String> {
-    // `{e:#}` (not `{e}`): `perf_db` returns `anyhow::Error`s built from
-    // `.context(..)`, and the plain `Display` shows only the outermost
-    // context -- the alternate form appends the chain, which is where the
-    // actual sqlx failure is.
+/// Four calls rather than one: the daemon exposes the same four reads
+/// `perf_db` does, and collapsing them into a `ggo_run_samples` would put
+/// a view's shape into the wire protocol. The cost is three extra round
+/// trips on a selection that already scans 100k rows.
+pub fn load_run_samples(connect: &Connect, run_id: i64) -> Result<RunSamples, String> {
+    let client = connect().map_err(|e| format!("{e:#}"))?;
     Ok(RunSamples {
-        frames: perf_db::run_frames(db_url, run_id).map_err(|e| format!("{e:#}"))?,
+        frames: client.run_frames(run_id).map_err(|e| format!("{e:#}"))?,
         // A run with no profile rows is the norm (only a native
         // `--profile` capture writes them), so an empty result here is
-        // not an error -- `perf_db` already answers list queries that way.
-        profile: perf_db::run_profile(db_url, run_id).map_err(|e| format!("{e:#}"))?,
-        detail: perf_db::run_detail(db_url, run_id).map_err(|e| format!("{e:#}"))?,
-        uart: perf_db::run_uart(db_url, run_id).map_err(|e| format!("{e:#}"))?,
+        // not an error.
+        profile: client.run_profile(run_id).map_err(|e| format!("{e:#}"))?,
+        detail: client.run_detail(run_id).map_err(|e| format!("{e:#}"))?,
+        uart: client.run_uart(run_id).map_err(|e| format!("{e:#}"))?,
     })
 }
 
@@ -223,24 +204,26 @@ pub fn load_run_samples(db_url: &str, run_id: i64) -> Result<RunSamples, String>
 /// A cart with no earlier runs yields an empty vec, which is a state the
 /// panel names rather than a failure.
 ///
-/// **Blocking**, and each id costs one `perf_db::run_frames` call: up to
-/// 1 + 5 of them on top of [`load_run_samples`]' four. Off-thread only --
+/// **Blocking**, and each id costs one `run_frames` call: up to 1 + 5 of
+/// them on top of [`load_run_samples`]' four. Off-thread only --
 /// `detail::load` is the one caller, inside `select_run`'s existing
 /// background spawn, and there is deliberately no second, lazier load
 /// path behind the Historic toggle.
 pub fn load_prior_runs(
-    db_url: &str,
+    connect: &Connect,
     run_id: i64,
     cart_id: Option<i64>,
 ) -> Result<Vec<HistoricRunFrames>, String> {
     let Some(cart_id) = cart_id else {
         return Ok(Vec::new());
     };
-    let runs = perf_db::cart_runs(db_url, cart_id).map_err(|e| format!("{e:#}"))?;
+    let client = connect().map_err(|e| format!("{e:#}"))?;
+    let runs = client.cart_runs(cart_id).map_err(|e| format!("{e:#}"))?;
     historic::pick_prior_ids(run_id, &runs)
         .into_iter()
         .map(|id| {
-            perf_db::run_frames(db_url, id)
+            client
+                .run_frames(id)
                 .map(|frames| HistoricRunFrames { id, frames })
                 .map_err(|e| format!("{e:#}"))
         })
@@ -255,9 +238,28 @@ pub fn load_prior_runs(
 pub(crate) const UNREACHABLE_DB_URL: &str =
     "postgres://ggo@localhost/ggo?host=/nonexistent/ggo-pg-socket";
 
+/// A [`Connect`] onto an in-process daemon over `db_url`.
+///
+/// Tests SEED with `TestDb` and read back through this, which is the shape
+/// the panel actually runs: the rows are really written and really
+/// queried, but by the daemon rather than by this crate. Only `faults`
+/// needs a dump directory, and nothing in this module does, so it gets a
+/// path that is never read.
+#[cfg(test)]
+pub(crate) fn test_connect(db_url: &str) -> Connect {
+    test_connect_at(db_url, std::path::PathBuf::from("/nonexistent"))
+}
+
+/// [`test_connect`] with a real dump directory, for the fault tests.
+#[cfg(test)]
+pub(crate) fn test_connect_at(db_url: &str, faults_dir: impl Into<std::path::PathBuf>) -> Connect {
+    ggo_daemon_client::test_daemon::ingesting_connect(db_url, faults_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_db::sqlx;
     use ggo_db::TestDb;
 
     /// Run every statement in order against `db`. Parents before children
@@ -307,7 +309,7 @@ mod tests {
     /// wrong. The hint is what makes the message actionable.
     #[test]
     fn list_runs_of_an_unreachable_database_is_an_error_that_says_what_to_do() {
-        let message = list_runs(UNREACHABLE_DB_URL).expect_err("an unreachable server must fail");
+        let message = list_runs(&test_connect(UNREACHABLE_DB_URL)).expect_err("an unreachable server must fail");
         assert!(
             message.contains(ggo_db::INSTALL_HINT),
             "the error tells the user how to fix it: {message}"
@@ -331,7 +333,7 @@ mod tests {
             ],
         );
 
-        let runs = list_runs(db.url()).unwrap();
+        let runs = list_runs(&test_connect(db.url())).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, 2, "newest started_at sorts first");
         assert_eq!(runs[0].label, None);
@@ -364,7 +366,7 @@ mod tests {
             ],
         );
 
-        let ids: Vec<i64> = list_runs(db.url()).unwrap().iter().map(|r| r.id).collect();
+        let ids: Vec<i64> = list_runs(&test_connect(db.url())).unwrap().iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![2, 1], "equal started_at ties break by id DESC");
     }
 
@@ -384,14 +386,14 @@ mod tests {
             ],
         );
 
-        let ids: Vec<i64> = list_runs(db.url()).unwrap().iter().map(|r| r.id).collect();
+        let ids: Vec<i64> = list_runs(&test_connect(db.url())).unwrap().iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![2], "the unnameable run is dropped, not blanked");
     }
 
     #[test]
     fn list_runs_is_empty_for_a_freshly_migrated_db_with_no_runs() {
         let db = TestDb::new();
-        assert_eq!(list_runs(db.url()).unwrap(), Vec::new());
+        assert_eq!(list_runs(&test_connect(db.url())).unwrap(), Vec::new());
     }
 
     // -------------------------------------------------- per-run samples
@@ -441,7 +443,7 @@ mod tests {
         exec(&db, &["DROP TABLE frame"]);
 
         let message =
-            load_run_samples(db.url(), 1).expect_err("a missing table must fail the read");
+            load_run_samples(&test_connect(db.url()), 1).expect_err("a missing table must fail the read");
         assert!(
             message.contains("querying frame rows"),
             "the context layer names the failing step: {message}"
@@ -459,7 +461,7 @@ mod tests {
     #[test]
     fn load_run_samples_of_an_unreachable_database_says_what_to_do() {
         let message =
-            load_run_samples(UNREACHABLE_DB_URL, 1).expect_err("an unreachable server must fail");
+            load_run_samples(&test_connect(UNREACHABLE_DB_URL), 1).expect_err("an unreachable server must fail");
         assert!(
             message.contains(ggo_db::INSTALL_HINT),
             "the error tells the user how to fix it: {message}"
@@ -497,7 +499,7 @@ mod tests {
             ],
         );
 
-        let samples = load_run_samples(db.url(), 1).unwrap();
+        let samples = load_run_samples(&test_connect(db.url()), 1).unwrap();
         assert_eq!(samples.frames.len(), 2);
         assert_eq!(samples.frames[0].n, 0, "ORDER BY f.n, not insertion order");
         assert_eq!(samples.frames[0].wire_total, 100);
@@ -544,7 +546,7 @@ mod tests {
             ],
         );
 
-        let samples = load_run_samples(db.url(), 1).unwrap();
+        let samples = load_run_samples(&test_connect(db.url()), 1).unwrap();
         assert_eq!(samples.frames.len(), 1);
         assert_eq!(samples.frames[0].wire_total, 42);
         assert!(samples.profile.is_empty());
@@ -599,7 +601,7 @@ mod tests {
     fn load_prior_runs_takes_the_five_nearest_lower_ids_of_the_same_cart() {
         let db = seed_two_carts();
 
-        let prior = load_prior_runs(db.url(), 8, Some(1)).unwrap();
+        let prior = load_prior_runs(&test_connect(db.url()), 8, Some(1)).unwrap();
         let ids: Vec<i64> = prior.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![7, 6, 5, 4, 3], "capped at the ramp's five steps");
         assert_eq!(
@@ -618,11 +620,11 @@ mod tests {
     #[test]
     fn load_prior_runs_of_a_carts_first_run_is_empty() {
         let db = seed_two_carts();
-        assert!(load_prior_runs(db.url(), 1, Some(1)).unwrap().is_empty());
+        assert!(load_prior_runs(&test_connect(db.url()), 1, Some(1)).unwrap().is_empty());
         // ...and a run whose `run` row is gone has no cart to scope to --
         // answered without touching the database at all.
         assert!(
-            load_prior_runs(UNREACHABLE_DB_URL, 8, None)
+            load_prior_runs(&test_connect(UNREACHABLE_DB_URL), 8, None)
                 .unwrap()
                 .is_empty()
         );
@@ -634,7 +636,7 @@ mod tests {
     fn load_run_samples_of_an_unknown_run_is_empty() {
         let db = TestDb::new();
         assert_eq!(
-            load_run_samples(db.url(), 999).unwrap(),
+            load_run_samples(&test_connect(db.url()), 999).unwrap(),
             RunSamples::default()
         );
     }

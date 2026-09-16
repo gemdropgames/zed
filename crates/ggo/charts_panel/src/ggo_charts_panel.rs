@@ -88,7 +88,7 @@ use ui::{Checkbox, Tooltip};
 use workspace::Workspace;
 
 use chart_geom::{ChartSpec, build_chart_scene};
-use ggo_worldlib::charts::reports::faults::{self, FaultDetail, FaultRow};
+use ggo_daemon_client::{Connect, FaultDetail, FaultRow};
 use loader::RunListing;
 
 /// The panel's key-dispatch context identifier. No bindings are scoped to
@@ -528,16 +528,12 @@ pub struct ChartsPanel {
     /// `None` in the unit tests that build a bare panel with no workspace
     /// at all, which is exactly when Re-run has nowhere to go anyway.
     workspace: Option<WeakEntity<Workspace>>,
-    /// Test hook: bypass `ggo_db::url()` and point straight at a fixture
-    /// database (`ggo_world_panel::root_override`'s analog). One url, not
-    /// two: the perf runs the picker lists and the device runs the history
-    /// rail lists are tables in the SAME database now.
-    db_url_override: Option<String>,
-    /// Test hook for `ggo-uartd`'s dump directory. Without it a test that
-    /// opens a fault `stat`s the developer's real `~/.ggo/uartd/faults`,
-    /// so whether the Copy-dump button came out enabled depended on what
-    /// the daemon happened to have left on that machine.
-    faults_dir_override: Option<PathBuf>,
+    /// How this panel reaches the daemon. Every run, frame, device run and
+    /// fault it shows arrives over that socket -- the panel opens no
+    /// database of its own. Injectable so a test can hand back an
+    /// in-process daemon (`ggo_daemon_client::test_daemon`) instead of
+    /// needing `ggo serve` running.
+    connect: Connect,
     state: LoadState,
     load_generation: u64,
     _load_task: Option<Task<()>>,
@@ -629,8 +625,7 @@ impl ChartsPanel {
         Self {
             focus_handle: cx.focus_handle(),
             workspace,
-            db_url_override: None,
-            faults_dir_override: None,
+            connect: ggo_daemon_client::system_connect(),
             state: LoadState::Empty,
             load_generation: 0,
             _load_task: None,
@@ -704,24 +699,6 @@ impl ChartsPanel {
         }))
     }
 
-    /// The database every load here reads: the test override, else
-    /// `ggo-db`'s configured url. `None` only when that url cannot be
-    /// resolved at all (no `HOME`), which every caller renders as its own
-    /// empty/error state rather than treating as a failed query.
-    fn db_url(&self) -> Option<String> {
-        self.db_url_override.clone().or_else(|| ggo_db::url().ok())
-    }
-
-    /// `ggo-uartd`'s dump directory -- [`ggo_common::default_faults_dir`],
-    /// the same one `ggo_reports_panel` imports from. Read-only from here:
-    /// the dumps belong to the daemon, and the panel only points a user
-    /// at one.
-    fn faults_dir(&self) -> Option<PathBuf> {
-        self.faults_dir_override
-            .clone()
-            .or_else(ggo_common::default_faults_dir)
-    }
-
     /// Select a perf run and kick off its load -- same off-thread shape and
     /// same load-generation staleness guard as [`Self::refresh_runs`], on
     /// its own generation counter.
@@ -736,13 +713,7 @@ impl ChartsPanel {
     /// R3's console rides it too. `detail::no_build_here` is the tripwire
     /// that keeps it that way -- see that fn's doc.
     fn select_run(&mut self, run: RunListing, cx: &mut Context<Self>) {
-        let Some(db_url) = self.db_url() else {
-            self.detail = Some(DetailState::Error(
-                "could not resolve a home directory".to_string(),
-            ));
-            cx.notify();
-            return;
-        };
+        let connect = self.connect.clone();
         let run_id = run.id;
         let started_at = run.started_at.clone();
         self.begin_selection(Selection::Perf(run));
@@ -755,7 +726,7 @@ impl ChartsPanel {
         self.detail = Some(DetailState::Loading);
         cx.notify();
 
-        let load = cx.background_spawn(async move { detail::load(&db_url, run_id) });
+        let load = cx.background_spawn(async move { detail::load(&connect, run_id) });
         self._detail_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -778,20 +749,14 @@ impl ChartsPanel {
     /// [`Self::select_run`] -- sharing the counter is what makes switching
     /// between the two kinds discard the load being left behind.
     fn select_device_run(&mut self, run: RunSummary, cx: &mut Context<Self>) {
-        let Some(db_url) = self.db_url() else {
-            self.device_log = Some(DeviceLogState::Error(
-                "could not resolve a home directory".to_string(),
-            ));
-            cx.notify();
-            return;
-        };
+        let connect = self.connect.clone();
         let run_id = run.id.clone();
         self.begin_selection(Selection::Device(run));
         let generation = self.detail_generation;
         self.device_log = Some(DeviceLogState::Loading);
         cx.notify();
 
-        let load = cx.background_spawn(async move { history::log(&db_url, &run_id) });
+        let load = cx.background_spawn(async move { history::log(&connect, &run_id) });
         self._detail_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -862,13 +827,11 @@ impl ChartsPanel {
     /// [`Self::begin_selection`].
     pub fn open_run(&mut self, run_id: i64, cx: &mut Context<Self>) {
         self.refresh_runs(cx);
-        let Some(db_url) = self.db_url() else {
-            return;
-        };
+        let connect = self.connect.clone();
         // Claimed NOW, on the UI thread, not when the lookup lands.
         self.detail_generation += 1;
         let generation = self.detail_generation;
-        let load = cx.background_spawn(async move { loader::list_runs(&db_url) });
+        let load = cx.background_spawn(async move { loader::list_runs(&connect) });
         cx.spawn(async move |this, cx| {
             let listing = load
                 .await
@@ -894,13 +857,11 @@ impl ChartsPanel {
     /// load the history rail uses, so a run that landed a moment ago is
     /// there. Generation-guarded like [`Self::open_run`].
     pub fn open_device_run(&mut self, diag_run_id: String, cx: &mut Context<Self>) {
-        let Some(db_url) = self.db_url() else {
-            return;
-        };
+        let connect = self.connect.clone();
         self.detail_generation += 1;
         let generation = self.detail_generation;
         let load =
-            cx.background_spawn(async move { history::load(&db_url, history::HISTORY_LIMIT) });
+            cx.background_spawn(async move { history::load(&connect, history::HISTORY_LIMIT) });
         cx.spawn(async move |this, cx| {
             let history = load.await;
             let Some(run) = history.runs.into_iter().find(|run| run.id == diag_run_id) else {
@@ -922,13 +883,10 @@ impl ChartsPanel {
     /// `fault` table. The dock's click and the agent's `open_ggo_report`
     /// both land here. Generation-guarded like [`Self::open_run`].
     pub fn open_fault(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(db_url) = self.db_url() else {
-            return;
-        };
+        let connect = self.connect.clone();
         self.detail_generation += 1;
         let generation = self.detail_generation;
         // The load owns `id`; the warn needs it after.
-        let faults_dir = self.faults_dir();
         let missing = id.clone();
         // The state of THIS load, whatever is on screen: opening a fault
         // while another one is showing swaps its body for the message
@@ -942,12 +900,21 @@ impl ChartsPanel {
         // lines) and whether the dump file is still on disk -- that last
         // one a `stat`, which has no business on the UI thread.
         let load = cx.background_spawn(async move {
-            let loaded = faults::load(&db_url, &id)?.map(|detail| {
-                let text = Arc::new(Self::mark_fault_line(&detail));
-                (Arc::new(detail), text)
-            });
-            let raw_path = faults_dir
-                .map(|dir| faults::raw_path(&dir, &id))
+            let client = connect().map_err(|e| format!("{e:#}"))?;
+            let loaded = client
+                .fault(&id)
+                .map_err(|e| format!("{e:#}"))?
+                .map(|detail| {
+                    let text = Arc::new(Self::mark_fault_line(&detail));
+                    (Arc::new(detail), text)
+                });
+            // The daemon owns the dump directory and says where the file
+            // is; whether it is still THERE is a plain `stat` the editor
+            // can do itself, and one the daemon would have to answer with
+            // a second call anyway.
+            let raw_path = client
+                .fault_raw_path(&id)
+                .ok()
                 .filter(|path| path.is_file());
             Ok::<_, String>((loaded, raw_path))
         });
@@ -1011,22 +978,13 @@ impl ChartsPanel {
     /// Read every table from `url` instead of `ggo-db`'s configured
     /// database.
     ///
-    /// Public only so `ggo_emu_panel`'s "Re-run hops to the charts panel"
-    /// test can aim BOTH panels at one throwaway `ggo_db::TestDb` --
-    /// without it that test would read (and write) the developer's real
-    /// database. Production code never calls it; the panel resolves its
-    /// own url through [`ggo_db::url`].
-    pub fn set_db_url_override(&mut self, url: String) {
-        self.db_url_override = Some(url);
-    }
-
-    /// Resolve dump paths under `path` instead of `~/.ggo/uartd/faults`.
-    /// Public for [`Self::set_db_url_override`]'s reason: the reports
-    /// dock's end-to-end test imports a fixture dump directory and the
-    /// tab it opens has to resolve the raw path in that same directory,
-    /// not in the developer's real one.
-    pub fn set_faults_dir_override(&mut self, path: PathBuf) {
-        self.faults_dir_override = Some(path);
+    /// Public only so a cross-panel test can aim BOTH panels at one
+    /// in-process daemon over a throwaway database -- without it such a
+    /// test would read (and write) the developer's real one. Production
+    /// code never calls it; the panel connects through
+    /// [`ggo_daemon_client::system_connect`].
+    pub fn set_connect(&mut self, connect: Connect) {
+        self.connect = connect;
     }
 
     /// Back to the run picker.
@@ -1167,18 +1125,14 @@ impl ChartsPanel {
     /// a run ingested by `ggo-emu`/`ggo-server` while the panel sits open
     /// shows up the next time it's focused.
     fn refresh_runs(&mut self, cx: &mut Context<Self>) {
-        let Some(db_url) = self.db_url() else {
-            self.state = LoadState::Error("could not resolve a home directory".to_string());
-            cx.notify();
-            return;
-        };
+        let connect = self.connect.clone();
 
         self.load_generation += 1;
         let generation = self.load_generation;
         self.state = LoadState::Loading;
         cx.notify();
 
-        let load = cx.background_spawn(async move { loader::list_runs(&db_url) });
+        let load = cx.background_spawn(async move { loader::list_runs(&connect) });
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -1213,14 +1167,7 @@ impl ChartsPanel {
     /// than an error, which is the state `history::NO_DATABASE_URL`
     /// describes.
     fn refresh_history(&mut self, cx: &mut Context<Self>) {
-        let Some(db_url) = self.db_url() else {
-            self.history = HistoryState::Ready(history::History {
-                runs: Vec::new(),
-                note: Some(history::NO_DATABASE_URL.to_string()),
-            });
-            cx.notify();
-            return;
-        };
+        let connect = self.connect.clone();
 
         self.history_generation += 1;
         let generation = self.history_generation;
@@ -1228,7 +1175,7 @@ impl ChartsPanel {
         cx.notify();
 
         let load =
-            cx.background_spawn(async move { history::load(&db_url, history::HISTORY_LIMIT) });
+            cx.background_spawn(async move { history::load(&connect, history::HISTORY_LIMIT) });
         self._history_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -3084,8 +3031,7 @@ mod tests {
 
         let panel = cx.new(|cx| ChartsPanel::new(None, cx));
         panel.update(cx, |panel, cx| {
-            panel.set_db_url_override(db.url().to_string());
-            panel.set_faults_dir_override(faults.clone());
+            panel.set_connect(loader::test_connect_at(db.url(), faults.clone()));
             panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
         });
         cx.run_until_parked();
@@ -3224,8 +3170,7 @@ mod tests {
 
         let panel = cx.new(|cx| ChartsPanel::new(None, cx));
         panel.update(cx, |panel, cx| {
-            panel.set_db_url_override(db.url().to_string());
-            panel.set_faults_dir_override(faults.clone());
+            panel.set_connect(loader::test_connect_at(db.url(), faults.clone()));
             panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
         });
         cx.run_until_parked();
@@ -3294,8 +3239,7 @@ mod tests {
         });
         let (panel, cx) = cx.add_window_view(|_window, cx| ChartsPanel::new(None, cx));
         panel.update(cx, |panel, cx| {
-            panel.set_db_url_override(db.url().to_string());
-            panel.set_faults_dir_override(faults.clone());
+            panel.set_connect(loader::test_connect_at(db.url(), faults.clone()));
             panel.open_fault("2026-09-02_08-49-33_marker".to_string(), cx);
         });
         cx.executor().run_until_parked();
@@ -3346,8 +3290,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
-            panel.set_faults_dir_override(faults.clone());
+            panel.set_connect(loader::test_connect_at(db.url(), faults.clone()));
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -3489,7 +3432,7 @@ mod tests {
     /// A throwaway migrated database plus one inserted run (the same
     /// `ggo_db::TestDb` pattern `ggo-worldlib`'s `perf_db` tests and
     /// `loader::tests::list_runs_reads_seeded_rows_newest_first` use),
-    /// pointed at via `db_url_override` -- proves the panel reaches
+    /// pointed at via `set_connect` -- proves the panel reaches
     /// `Ready` off-thread with the fixture run listed, end to end through
     /// `refresh_runs`/the background load, not just through
     /// `loader::list_runs` directly. Calls `refresh_runs` directly rather
@@ -3511,7 +3454,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(db.url().to_string());
+                panel.set_connect(loader::test_connect(db.url()));
                 panel
             })
         });
@@ -3620,7 +3563,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(db.url().to_string());
+                panel.set_connect(loader::test_connect(db.url()));
                 panel
             })
         });
@@ -3941,7 +3884,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(db_url);
+                panel.set_connect(loader::test_connect(&db_url));
                 panel
             })
         });
@@ -4250,7 +4193,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -4318,7 +4261,7 @@ mod tests {
 
         let (bare, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(bare_db.url().to_string());
+            panel.set_connect(loader::test_connect(bare_db.url()));
             panel
         });
         bare.update(cx, |panel, cx| {
@@ -4390,7 +4333,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -4464,7 +4407,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(db.url().to_string());
+                panel.set_connect(loader::test_connect(db.url()));
                 panel
             })
         });
@@ -4704,7 +4647,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -4791,7 +4734,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(db_url);
+                panel.set_connect(loader::test_connect(&db_url));
                 panel
             })
         });
@@ -4922,7 +4865,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(db.url().to_string());
+                panel.set_connect(loader::test_connect(db.url()));
                 panel
             })
         });
@@ -5007,7 +4950,7 @@ mod tests {
                 .clone()
         });
         panel.update(cx, |panel, cx| {
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel.select_run(
                 RunListing {
                     id: 1,
@@ -5195,7 +5138,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -5520,7 +5463,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -5578,7 +5521,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         // Show a perf run first, so the failure mode this guards against
@@ -6180,7 +6123,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| panel.refresh_history(cx));
@@ -6210,7 +6153,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| panel.refresh_runs(cx));
@@ -6259,7 +6202,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(None, cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| panel.refresh_history(cx));
@@ -6413,7 +6356,7 @@ mod tests {
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             let mut panel = ChartsPanel::new(Some(workspace.downgrade()), cx);
-            panel.db_url_override = Some(db.url().to_string());
+            panel.set_connect(loader::test_connect(db.url()));
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -6514,7 +6457,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(loader::UNREACHABLE_DB_URL.to_string());
+                panel.set_connect(loader::test_connect(loader::UNREACHABLE_DB_URL));
                 panel
             })
         });
@@ -6590,7 +6533,7 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(first_db.url().to_string());
+                panel.set_connect(loader::test_connect(first_db.url()));
                 panel
             })
         });
@@ -6598,7 +6541,7 @@ mod tests {
             panel.refresh_runs(cx);
             // Repointed and refreshed again with the first load still in
             // flight -- the rapid double-activation case.
-            panel.db_url_override = Some(second_db.url().to_string());
+            panel.set_connect(loader::test_connect(second_db.url()));
             panel.refresh_runs(cx);
         });
         cx.executor().run_until_parked();
@@ -6629,13 +6572,13 @@ mod tests {
         let panel = cx.update(|cx| {
             cx.new(|cx| {
                 let mut panel = ChartsPanel::new(None, cx);
-                panel.db_url_override = Some(first_db.url().to_string());
+                panel.set_connect(loader::test_connect(first_db.url()));
                 panel
             })
         });
         panel.update(cx, |panel, cx| {
             panel.refresh_history(cx);
-            panel.db_url_override = Some(second_db.url().to_string());
+            panel.set_connect(loader::test_connect(second_db.url()));
             panel.refresh_history(cx);
         });
         cx.executor().run_until_parked();

@@ -35,9 +35,12 @@
 //! a `BIGINT` (R1/R2's trap (3)). Nothing here ever hands one to the
 //! other -- [`RunSummary::id`] only ever reaches [`log`].
 
-use ggo_worldlib::charts::reports::diag_db;
+use ggo_daemon_client::Connect;
 
-pub use ggo_worldlib::charts::reports::diag_db::RunSummary;
+// The daemon client's mirror of `diag_db::RunSummary` -- named through the
+// client for `loader`'s reason: one door to GemdropGo, and worldlib's
+// database half stays unreachable from here.
+pub use ggo_daemon_client::DiagRunSummary as RunSummary;
 
 /// How many history rows the rail pulls, newest first. ggo-ide's
 /// `pages/device.rs::HISTORY_LIMIT`, itself `ggo-diag --list-runs`' own
@@ -78,8 +81,11 @@ pub struct History {
 /// that errors both come back as an empty rail with a reason, because on
 /// a fresh machine the first is ordinary and the second is not worth
 /// blanking the panel over.
-pub fn load(db_url: &str, limit: i64) -> History {
-    match diag_db::list_runs(db_url, limit) {
+pub fn load(connect: &Connect, limit: i64) -> History {
+    let runs = connect()
+        .map_err(|e| format!("{e:#}"))
+        .and_then(|client| client.diag_runs(Some(limit)).map_err(|e| format!("{e:#}")));
+    match runs {
         Ok(runs) if runs.is_empty() => History {
             runs,
             note: Some(NO_RUNS.to_string()),
@@ -98,8 +104,9 @@ pub fn load(db_url: &str, limit: i64) -> History {
 /// content class ggo-ide's live diag stream carries, which is why its
 /// history viewer reads as "the same log, after the fact" rather than as a
 /// different kind of data. BLOCKING, same rule as [`load`].
-pub fn log(db_url: &str, run_id: &str) -> Result<Vec<String>, String> {
-    diag_db::run_log(db_url, run_id)
+pub fn log(connect: &Connect, run_id: &str) -> Result<Vec<String>, String> {
+    let client = connect().map_err(|e| format!("{e:#}"))?;
+    client.diag_run_log(run_id).map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]
@@ -142,7 +149,7 @@ mod tests {
         seed_diag_run(&db, "run-older", "2026-08-01T00:00:00Z");
         seed_diag_run(&db, "run-newer", "2026-08-02T00:00:00Z");
 
-        let history = load(db.url(), HISTORY_LIMIT);
+        let history = load(&crate::loader::test_connect(db.url()), HISTORY_LIMIT);
         assert_eq!(history.note, None, "a rail with rows needs no reason");
         let ids: Vec<&str> = history.runs.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["run-newer", "run-older"]);
@@ -155,7 +162,7 @@ mod tests {
         let db = TestDb::new();
         seed_diag_run(&db, "run-1", "2026-08-01T00:00:00Z");
         seed_diag_run(&db, "run-2", "2026-08-02T00:00:00Z");
-        assert_eq!(load(db.url(), 1).runs.len(), 1);
+        assert_eq!(load(&crate::loader::test_connect(db.url()), 1).runs.len(), 1);
     }
 
     /// A database with no `runs` rows: an empty rail with a legible
@@ -163,7 +170,7 @@ mod tests {
     #[test]
     fn an_empty_database_says_no_runs_rather_than_erroring() {
         let db = TestDb::new();
-        let history = load(db.url(), HISTORY_LIMIT);
+        let history = load(&crate::loader::test_connect(db.url()), HISTORY_LIMIT);
         assert!(history.runs.is_empty());
         assert_eq!(history.note.as_deref(), Some(NO_RUNS));
     }
@@ -173,7 +180,7 @@ mod tests {
     /// is a different sentence from "there are no runs".
     #[test]
     fn an_unreachable_database_reports_the_reason() {
-        let history = load(UNREACHABLE_DB_URL, HISTORY_LIMIT);
+        let history = load(&crate::loader::test_connect(UNREACHABLE_DB_URL), HISTORY_LIMIT);
         assert!(history.runs.is_empty());
         let note = history.note.expect("an unreachable db must say so");
         assert!(note.contains("could not list device runs"), "{note}");
@@ -200,7 +207,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mid = load(db.url(), HISTORY_LIMIT);
+        let mid = load(&crate::loader::test_connect(db.url()), HISTORY_LIMIT);
         assert_eq!(mid.runs[0].state, "running");
         assert_eq!(mid.runs[0].verdict, None);
 
@@ -220,11 +227,11 @@ mod tests {
             .unwrap();
         });
 
-        let after = load(db.url(), HISTORY_LIMIT);
+        let after = load(&crate::loader::test_connect(db.url()), HISTORY_LIMIT);
         assert_eq!(after.runs[0].state, "done");
         assert_eq!(after.runs[0].verdict.as_deref(), Some("FAIL"));
         assert_eq!(
-            log(db.url(), "run-live").unwrap(),
+            log(&crate::loader::test_connect(db.url()), "run-live").unwrap(),
             vec!["==> compile", "<== compile — ok", "RESULT: FAIL"],
             "the log is the writer's own rows, so it grows with the run"
         );
@@ -235,7 +242,7 @@ mod tests {
         let db = TestDb::new();
         seed_diag_run(&db, "run-1", "2026-08-01T00:00:00Z");
         assert_eq!(
-            log(db.url(), "run-1").unwrap(),
+            log(&crate::loader::test_connect(db.url()), "run-1").unwrap(),
             vec!["==> compile", "<== compile — ok"]
         );
     }
@@ -246,7 +253,7 @@ mod tests {
     fn log_is_empty_for_an_unknown_run_and_errors_for_an_unreachable_db() {
         let db = TestDb::new();
         seed_diag_run(&db, "run-1", "2026-08-01T00:00:00Z");
-        assert!(log(db.url(), "no-such-run").unwrap().is_empty());
-        assert!(log(UNREACHABLE_DB_URL, "run-1").is_err());
+        assert!(log(&crate::loader::test_connect(db.url()), "no-such-run").unwrap().is_empty());
+        assert!(log(&crate::loader::test_connect(UNREACHABLE_DB_URL), "run-1").is_err());
     }
 }
