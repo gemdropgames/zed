@@ -201,6 +201,12 @@ pub use ggo_worldlib::charts::reports::rows::{
     CartRow, FrameRow, ProfileRow, RunDetail, RunIndexRow, RunRow, UartLine,
 };
 
+// The fault types are pure dump-parsing shapes, so they come across the
+// same way: only `faults`' import/list/load touch a database, and those
+// are behind worldlib's `db` feature.
+pub use ggo_worldlib::charts::reports::faults::{FaultDetail, FaultRow};
+pub use ggo_worldlib::charts::reports::uart_diag::{AssetFailure, PanicRow};
+
 /// One device (`ggo-diag`) run, as `diag_db::RunSummary` serialises it.
 ///
 /// Declared here rather than re-exported: `diag_db` is one of the modules
@@ -234,6 +240,20 @@ pub struct IngestedRun {
 /// function, and a test's fake is a closure. `Send + Sync` because calls
 /// happen on `cx.background_spawn`'s thread, never on the UI thread.
 pub type Transport = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
+
+/// How a panel obtains a client.
+///
+/// Injected rather than called directly so a test can hand back a
+/// [`FakeDaemon`]-backed client instead of needing a daemon installed and
+/// running on the machine -- the same reason [`Transport`] is a seam. Lives
+/// here rather than in any one panel because every panel that reaches the
+/// daemon needs it.
+pub type Connect = Arc<dyn Fn() -> Result<Arc<Client>> + Send + Sync>;
+
+/// Connect to the daemon named by the environment, starting it if needed.
+pub fn system_connect() -> Connect {
+    Arc::new(|| Client::connect().map(Arc::new))
+}
 
 /// A connected daemon.
 ///
@@ -470,12 +490,12 @@ impl Client {
         serde_json::from_value(value).context("decode the cart's runs")
     }
 
-    /// One run's full detail.
+    /// One run's full detail, or `None` when there is no such run.
     ///
-    /// An unknown run is an `Err`, not an empty value: the daemon turns
-    /// `perf_db`'s `Ok(None)` into a not-found so a bad id fails at the
-    /// call rather than rendering as a blank page.
-    pub fn run_detail(&self, run_id: i64) -> Result<RunDetail> {
+    /// Absence is not an error: a `run` row can vanish between listing and
+    /// selecting, and the report header falls back to the picker's own
+    /// listing rather than failing the whole view.
+    pub fn run_detail(&self, run_id: i64) -> Result<Option<RunDetail>> {
         let value = self.call_tool("ggo_run_detail", json!({"run_id": run_id}))?;
         serde_json::from_value(value).context("decode the run detail")
     }
@@ -567,6 +587,42 @@ impl Client {
     /// Cartridge flashing availability.
     pub fn flash_status(&self) -> Result<Value> {
         self.call_tool("ggo_flash", json!({}))
+    }
+
+    // ---------------------------------------------------------- faults
+
+    /// Every stored fault dump, newest first.
+    ///
+    /// Fresh dumps on disk are imported by the daemon on the way, so this
+    /// is never stale -- and the editor never touches `~/.ggo` itself.
+    /// `limit` omitted takes the daemon's own default.
+    pub fn faults(&self, limit: Option<i64>) -> Result<Vec<FaultRow>> {
+        let arguments = match limit {
+            Some(limit) => json!({"limit": limit}),
+            None => json!({}),
+        };
+        let value = self.call_tool("ggo_faults", arguments)?;
+        serde_json::from_value(value).context("decode the fault list")
+    }
+
+    /// One fault in full, or `None` when the daemon has already pruned it.
+    ///
+    /// Absence is not an error: dumps are pruned, so a row a panel saw a
+    /// moment ago can be gone, and that is a state to render.
+    pub fn fault(&self, id: &str) -> Result<Option<FaultDetail>> {
+        let value = self.call_tool("ggo_fault", json!({"id": id}))?;
+        serde_json::from_value(value).context("decode the fault")
+    }
+
+    /// Where one fault's raw dump file lives, for showing or opening.
+    pub fn fault_raw_path(&self, id: &str) -> Result<PathBuf> {
+        let value = self.call_tool("ggo_fault_raw_path", json!({"id": id}))?;
+        Ok(PathBuf::from(
+            value
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ))
     }
 }
 
@@ -1123,24 +1179,37 @@ mod tests {
         );
         let client = client_with(&fake);
 
-        let detail = client.run_detail(5).expect("detail");
+        let detail = client.run_detail(5).expect("detail").expect("the run exists");
         assert_eq!(detail.cart_name, "demo");
         assert_eq!(detail.label.as_deref(), Some("worlds/arena"));
         assert_eq!(detail.avg_wire_total, Some(1234.5));
         assert_eq!(detail.avg_i_misses, None, "a run with no frames yet");
     }
 
-    /// An unknown run must fail at the call, not render as a blank page.
+    /// A run that is not there is `None`, not an error: a `run` row can
+    /// vanish between listing and selecting, and the header degrades to
+    /// the picker's listing rather than replacing the whole view with a
+    /// failure.
     #[test]
-    fn an_unknown_run_is_an_error_rather_than_an_empty_detail() {
+    fn an_unknown_run_reads_as_no_detail_rather_than_an_error() {
         let fake = FakeDaemon::new();
-        fake.on_tool_error("ggo_run_detail", "no perf run 999");
+        fake.on_tool("ggo_run_detail", Value::Null);
         let client = client_with(&fake);
 
-        let Err(error) = client.run_detail(999) else {
-            panic!("an unknown run must be an error");
+        assert_eq!(client.run_detail(999).expect("absence is not an error"), None);
+    }
+
+    /// A daemon that really failed still has to reach the caller.
+    #[test]
+    fn a_failed_detail_read_is_still_an_error() {
+        let fake = FakeDaemon::new();
+        fake.on_tool_error("ggo_run_detail", "connection refused");
+        let client = client_with(&fake);
+
+        let Err(error) = client.run_detail(1) else {
+            panic!("a failed read must be an error");
         };
-        assert!(error.to_string().contains("999"), "{error}");
+        assert!(error.to_string().contains("connection refused"), "{error}");
     }
 
     #[test]
@@ -1185,6 +1254,79 @@ mod tests {
         assert_eq!(
             client.diag_run_log("2026-09-02_08-49-33").expect("log").len(),
             2
+        );
+    }
+
+    /// The fault list is the panel's rail feed; a full row has to survive
+    /// the trip, nullable columns included.
+    #[test]
+    fn a_fault_row_decodes_with_its_nullable_columns() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_faults",
+            json!([{
+                "id": "2026-09-02_08-49-33_trap",
+                "source": "ggo-uartd",
+                "at": "2026-09-02_08-49-33",
+                "kind": "trap",
+                "detail": "mcause=0x2",
+                "tty": "/dev/ttyUSB1",
+                "boot_stage": null,
+                "frames": 0,
+                "run_id": null,
+            }]),
+        );
+        let client = client_with(&fake);
+
+        let faults = client.faults(Some(10)).expect("faults");
+        assert_eq!(faults[0].kind, "trap");
+        assert_eq!(faults[0].detail, "mcause=0x2");
+        assert_eq!(faults[0].boot_stage, None, "a dump that never booted");
+        assert_eq!(faults[0].run_id, None, "no run it can be linked to");
+    }
+
+    /// Omitting the limit must send no `limit` key, so the daemon applies
+    /// its own default rather than being handed a guess.
+    #[test]
+    fn omitting_the_fault_limit_sends_no_limit() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_faults", json!([]));
+        let client = client_with(&fake);
+        client.faults(None).expect("faults");
+
+        let calls = fake.calls();
+        let (_, arguments) = calls
+            .iter()
+            .find(|(name, _)| name == "ggo_faults")
+            .expect("asked");
+        assert_eq!(arguments, &json!({}));
+    }
+
+    /// The daemon prunes its dumps, so a fault a panel saw a moment ago
+    /// can be gone. That is a state to render, not a failure.
+    #[test]
+    fn a_pruned_fault_reads_as_none_rather_than_an_error() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_fault", Value::Null);
+        let client = client_with(&fake);
+
+        assert_eq!(client.fault("gone").expect("absence is not an error"), None);
+    }
+
+    /// A dump is hundreds of kilobytes of binary ring buffer, so the raw
+    /// form crosses as a path the caller can show or open.
+    #[test]
+    fn the_raw_dump_comes_back_as_a_path() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_fault_raw_path",
+            json!({"path": "/home/u/.ggo/uartd/faults/2026-09-02_08-49-33_trap.log"}),
+        );
+        let client = client_with(&fake);
+
+        assert_eq!(
+            client.fault_raw_path("2026-09-02_08-49-33_trap").expect("path"),
+            PathBuf::from("/home/u/.ggo/uartd/faults/2026-09-02_08-49-33_trap.log")
         );
     }
 

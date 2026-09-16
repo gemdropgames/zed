@@ -45,15 +45,9 @@ use crate::menu::DIAG_MODE_ARG;
 /// about it, since a drop is only noticed at an await point.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// How a client is obtained. Injected so tests can hand back a
-/// [`ggo_daemon_client::FakeDaemon`]-backed client instead of connecting
-/// to a real daemon -- the same reason [`ProcStreamer`] itself is a seam.
-pub type Connect = Arc<dyn Fn() -> anyhow::Result<Arc<Client>> + Send + Sync>;
-
-/// Connect to the daemon named by the environment, starting it if needed.
-pub fn system_connect() -> Connect {
-    Arc::new(|| Client::connect().map(Arc::new))
-}
+// The connect seam moved to `ggo_daemon_client` once a second panel
+// needed it; re-exported so this module's own callers keep working.
+pub use ggo_daemon_client::{system_connect, Connect};
 
 /// Is this request one the daemon runs?
 ///
