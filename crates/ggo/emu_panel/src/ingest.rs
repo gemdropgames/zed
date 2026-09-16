@@ -15,12 +15,30 @@
 //!   query functions and drive this crate's emulator.
 
 /// Hard cap on frames per run, as the daemon-side writer applies it.
-pub use ggo_worldlib::charts::reports::ingest::MAX_FRAMES;
+///
+/// Named through `rows` rather than `ingest`: the writer is behind
+/// worldlib's `db` feature, which this crate deliberately leaves off, and
+/// the cap is a plain number the editor only ever REPORTS.
+pub use ggo_worldlib::charts::reports::rows::MAX_FRAMES;
 
 #[cfg(test)]
 mod tests {
+    use ggo_daemon_client::Connect;
     use ggo_worldlib::charts::reports::ingest::ingest_run;
     use serde_json::Value as Json;
+
+    /// A [`Connect`] onto an in-process daemon over `db_url`.
+    ///
+    /// These tests write with worldlib's writer directly -- what is under
+    /// test is the SCHEMA agreement -- but read back the way the charts
+    /// panel does, which is over the daemon. Nothing here touches faults,
+    /// so the dump directory is a path that is never read.
+    fn test_connect(db_url: &str) -> Connect {
+        ggo_daemon_client::test_daemon::ingesting_connect(
+            db_url,
+            std::path::PathBuf::from("/nonexistent"),
+        )
+    }
 
     /// The 13 REQUIRED frame arrays, in the writer's column order.
     ///
@@ -102,14 +120,14 @@ mod tests {
         )
         .unwrap();
 
-        let runs = loader::list_runs(db.url()).unwrap();
+        let runs = loader::list_runs(&test_connect(db.url())).unwrap();
         assert_eq!(runs.len(), 1, "the charts panel's picker sees the run");
         assert_eq!(runs[0].id, out.run_id);
         assert_eq!(runs[0].cart_name, "Green Fix");
         assert_eq!(runs[0].label.as_deref(), Some("carts/green.cart"));
         assert!(!runs[0].started_at.is_empty());
 
-        let samples = loader::load_run_samples(db.url(), out.run_id).unwrap();
+        let samples = loader::load_run_samples(&test_connect(db.url()), out.run_id).unwrap();
         assert_eq!(samples.frames.len(), 3);
         // Column order: n, instrs, i_hits, i_misses, ... -- so frame 0 has
         // n = 0, instrs = 1, i_hits = 1, i_misses = 1.
@@ -147,14 +165,14 @@ mod tests {
         let db = ggo_db::TestDb::new();
         let out = ingest_run(db.url(), &perf.perf_json, &finished.uart, Some("green.cart")).unwrap();
 
-        let runs = loader::list_runs(db.url()).unwrap();
+        let runs = loader::list_runs(&test_connect(db.url())).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(
             runs[0].cart_name, "Green Fix",
             "the perf-JSON cart identity is the cart header's own title, \
              exactly as ggo-ide's CartStepper reports it"
         );
-        let samples = loader::load_run_samples(db.url(), out.run_id).unwrap();
+        let samples = loader::load_run_samples(&test_connect(db.url()), out.run_id).unwrap();
         assert_eq!(samples.frames.len() as u64, perf.frames);
         assert!(
             samples

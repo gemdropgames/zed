@@ -97,7 +97,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ggo_worldlib::charts::reports::diag_db;
 use gpui::{
     AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
@@ -1093,15 +1092,6 @@ impl EmuPanel {
         );
     }
 
-    /// The database this panel writes its runs to and reads a flashed
-    /// run's report out of: the test override, else `ggo_db::url()`.
-    /// `None` only when no url resolves at all (no `$HOME`), which every
-    /// caller reports rather than papers over. `ggo_charts_panel`'s
-    /// `db_url` is the same two lines for the same reason.
-    fn db_url(&self) -> Option<String> {
-        self.db_url_override.clone().or_else(|| ggo_db::url().ok())
-    }
-
     /// Run `requests` in order through the streaming runner, feeding every
     /// line to the console and every recognised line to the status row.
     /// Stops at the first failure.
@@ -1121,12 +1111,10 @@ impl EmuPanel {
         // run to fire on. A run started without a window (setup, `git
         // pull`, a test) simply has none, which is the hop's off switch.
         let charts_window = self.flash_charts_window.take();
-        // Resolved here, on the thread the override lives on: the
-        // database holding both ggo-diag's `runs` row for this flash and
-        // the perf run it links to. `None` only when no database url
-        // resolves at all, which is the one case with no report to open
-        // and nothing to say.
-        let report_db_url = self.db_url();
+        // Cloned here, on the thread the override lives on: the daemon
+        // holds both ggo-diag's `runs` row for this flash and the perf run
+        // it links to.
+        let report_connect = self.daemon_connect.clone();
         self.status = None;
         self.status_is_error = false;
         self.console_expanded = true;
@@ -1264,7 +1252,7 @@ impl EmuPanel {
                             cx,
                             diag_run_id,
                             charts_window,
-                            report_db_url,
+                            report_connect,
                         )
                         .await;
                     })
@@ -1323,23 +1311,29 @@ impl EmuPanel {
         cx: &mut AsyncApp,
         diag_run_id: String,
         window: Option<AnyWindowHandle>,
-        report_db_url: Option<String>,
+        connect: job_stream::Connect,
     ) {
         // No window means this run was not a flash (a setup run, a pull, a
         // test) -- and focusing a dock needs one either way.
-        let (Some(window), Some(db_url)) = (window, report_db_url) else {
+        let Some(window) = window else {
             return;
         };
         // Which run this hop is FOR, kept back from the closure that
         // consumes it: by the time the lookup returns, "the last flash"
         // may be somebody else's (see [`Self::remember_flash_perf_run`]).
         let flashed_run = diag_run_id.clone();
-        // BLOCKING: the lookup drives ggo-db's runtime to completion, the
-        // rule `ggo_charts_panel::history::load` carries too -- so it runs
-        // on the background executor and never on the UI thread.
+        // BLOCKING: the lookup is a socket round trip, so it runs on the
+        // background executor and never on the UI thread.
         let local_id = cx
             .background_spawn(async move {
-                match diag_db::device_perf_run_id(&db_url, &diag_run_id) {
+                let looked_up = connect()
+                    .map_err(|e| format!("{e:#}"))
+                    .and_then(|client| {
+                        client
+                            .diag_perf_run_id(&diag_run_id)
+                            .map_err(|e| format!("{e:#}"))
+                    });
+                match looked_up {
                     Ok(local_id) => local_id,
                     Err(e) => {
                         log::warn!("flashed run {diag_run_id}: could not resolve its report: {e}");
@@ -4737,11 +4731,11 @@ mod tests {
 
         // The run really is in the database the charts panel reads --
         // through that panel's own query function.
-        let runs = ggo_charts_panel::loader::list_runs(db.url()).unwrap();
+        let runs = ggo_charts_panel::loader::list_runs(&test_connect(db.url())).unwrap();
         assert_eq!(runs.len(), 1, "one run row for one run");
         assert_eq!(runs[0].cart_name, drive::fixture::GREEN_CART_TITLE);
         assert_eq!(runs[0].label.as_deref(), Some("green.cart"));
-        let samples = ggo_charts_panel::loader::load_run_samples(db.url(), runs[0].id).unwrap();
+        let samples = ggo_charts_panel::loader::load_run_samples(&test_connect(db.url()), runs[0].id).unwrap();
         assert!(
             !samples.frames.is_empty(),
             "the run's perf frames must be readable by the charts panel"
@@ -4950,7 +4944,7 @@ mod tests {
         });
 
         // ...and it really is in the database, readable by the charts panel.
-        let runs = ggo_charts_panel::loader::list_runs(db.url()).unwrap();
+        let runs = ggo_charts_panel::loader::list_runs(&test_connect(db.url())).unwrap();
         assert_eq!(runs.len(), 1, "one run row for the interrupted run");
         assert_eq!(runs[0].label.as_deref(), Some("green.cart"));
     }
@@ -6096,7 +6090,7 @@ mod tests {
         // Both panels on ONE throwaway database, so the run this test
         // ingests is the run the charts panel then reads back.
         charts.update(cx, |charts, _cx| {
-            charts.set_db_url_override(db.url().to_string());
+            charts.set_connect(test_connect(db.url()));
         });
 
         let handler = menu::rerun_handler(workspace.downgrade(), "green.cart".to_string());
@@ -6203,7 +6197,7 @@ mod tests {
                 .clone()
         });
         charts.update(cx, |charts, _cx| {
-            charts.set_db_url_override(db.url().to_string());
+            charts.set_connect(test_connect(db.url()));
         });
 
         panel.update_in(cx, |panel, window, cx| {
@@ -7223,86 +7217,34 @@ mod tests {
     /// A daemon that REALLY ingests, into `db_url`.
     ///
     /// Every path through this panel can reach the end-of-run ingest, and
-    /// that write now goes through the daemon. A test must not depend on
-    /// one being installed and running on the machine -- it would ingest
-    /// into the developer's own database, and an older `ggo` on `PATH`
-    /// fails the call outright with "unknown tool". So the transport is
-    /// answered in-process, by the same `ingest::ingest_run` the real
-    /// daemon calls, pointed at the test's throwaway database. The rows
-    /// the assertions read back are therefore really written.
+    /// that write goes through the daemon now. A test must not depend on
+    /// one being installed and running: it would ingest into the
+    /// developer's own database, and an older `ggo` on `PATH` fails the
+    /// call outright with "unknown tool". The client's in-process daemon
+    /// answers the transport with the same worldlib functions the real one
+    /// calls, so the rows the assertions read back are really written.
+    ///
+    /// Nothing here touches faults, so the dump directory is a path that
+    /// is never read.
     fn ingesting_connect(db_url: String) -> job_stream::Connect {
-        use ggo_worldlib::charts::reports::ingest;
+        test_connect(&db_url)
+    }
 
-        Arc::new(move || {
-            let db_url = db_url.clone();
-            let transport: ggo_daemon_client::Transport = Arc::new(move |line: &str| {
-                let request: serde_json::Value = serde_json::from_str(line)?;
-                let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                let method = request.get("method").and_then(serde_json::Value::as_str);
-                let params = request.get("params").cloned().unwrap_or_default();
+    /// [`ingesting_connect`] for a caller that has a `&str` to hand.
+    fn test_connect(db_url: &str) -> job_stream::Connect {
+        ggo_daemon_client::test_daemon::ingesting_connect(
+            db_url,
+            std::path::PathBuf::from("/nonexistent"),
+        )
+    }
 
-                let result = match method {
-                    Some("initialize") => serde_json::json!({
-                        "protocolVersion": ggo_daemon_client::PROTOCOL_VERSION,
-                        "serverInfo": {"name": "in-process", "version": "test"},
-                    }),
-                    Some("tools/call")
-                        if params.get("name").and_then(serde_json::Value::as_str)
-                            == Some("ggo_ingest_run") =>
-                    {
-                        let arguments = params.get("arguments").cloned().unwrap_or_default();
-                        let perf_json = arguments
-                            .get("perf_json")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default();
-                        let uart: Vec<String> = arguments
-                            .get("uart")
-                            .and_then(serde_json::Value::as_array)
-                            .map(|lines| {
-                                lines
-                                    .iter()
-                                    .filter_map(serde_json::Value::as_str)
-                                    .map(str::to_string)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let label = arguments.get("label").and_then(serde_json::Value::as_str);
-
-                        match ingest::ingest_run(&db_url, perf_json, &uart, label) {
-                            Ok(run) => {
-                                let payload = serde_json::json!({
-                                    "run_id": run.run_id,
-                                    "cart_id": run.cart_id,
-                                    "truncated_frames": run.truncated_frames,
-                                });
-                                serde_json::json!({
-                                    "content": [{"type": "text", "text": payload.to_string()}]
-                                })
-                            }
-                            // The daemon reports a rejected body as a tool
-                            // error, not a transport failure; so does this.
-                            Err(error) => serde_json::json!({
-                                "content": [{"type": "text", "text": error}],
-                                "isError": true,
-                            }),
-                        }
-                    }
-                    other => {
-                        return Ok(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": -32601,
-                                "message": format!("the in-process daemon has no {other:?}"),
-                            }
-                        })
-                        .to_string())
-                    }
-                };
-                Ok(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
-            });
-            ggo_daemon_client::Client::with_transport(transport).map(Arc::new)
-        })
+    /// The perf run `ggo-diag` linked to device run `diag_run_id`, read
+    /// the way the panel reads it: over the daemon.
+    fn perf_run_of(db_url: &str, diag_run_id: &str) -> Option<i64> {
+        test_connect(db_url)()
+            .expect("the in-process daemon connects")
+            .diag_perf_run_id(diag_run_id)
+            .expect("the database reads")
     }
 
     /// A database url nothing can be reached at: its socket directory does
@@ -7829,7 +7771,7 @@ mod tests {
         });
         seed_flashed_run_without_telemetry(db.url());
         charts.update(cx, |charts, _cx| {
-            charts.set_db_url_override(db.url().to_string());
+            charts.set_connect(test_connect(db.url()));
         });
 
         let (streamer, _calls) = fake_streamer(
@@ -7858,9 +7800,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            diag_db::device_perf_run_id(db.url(), FLASHED_RUN)
-                .expect("the database reads")
-                .is_none(),
+            perf_run_of(db.url(), FLASHED_RUN).is_none(),
             "no telemetry means no perf run to resolve"
         );
         charts.read_with(cx, |charts, _| {
@@ -7908,7 +7848,7 @@ mod tests {
         // Both panels on the SAME throwaway database -- which is also the
         // one ggo-diag recorded the flashed run into.
         charts.update(cx, |charts, _cx| {
-            charts.set_db_url_override(db.url().to_string());
+            charts.set_connect(test_connect(db.url()));
         });
 
         let (streamer, _calls) = fake_streamer(
@@ -7955,9 +7895,7 @@ mod tests {
             );
         });
         assert!(
-            diag_db::device_perf_run_id(db.url(), FLASHED_RUN)
-                .expect("the database reads")
-                .is_some(),
+            perf_run_of(db.url(), FLASHED_RUN).is_some(),
             "the run's telemetry is in the db the page reads"
         );
         assert!(
@@ -8656,9 +8594,8 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let local_id = diag_db::device_perf_run_id(db.url(), FLASHED_RUN)
-            .expect("the database reads")
-            .expect("the flashed run has telemetry behind it");
+        let local_id =
+            perf_run_of(db.url(), FLASHED_RUN).expect("the flashed run has telemetry behind it");
         panel.read_with(cx, |panel, _| {
             let status = panel.remote_flash_status();
             assert!(!status.active, "the run ended");
