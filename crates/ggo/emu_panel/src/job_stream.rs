@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use ggo_common::{LineSink, ProcCapture, ProcRequest, ProcStreamer};
+use ggo_common::{LineSink, ProcCapture, ProcRequest, ProcRunner, ProcStreamer};
 use ggo_daemon_client::{Client, JobState};
 
 use crate::menu::DIAG_MODE_ARG;
@@ -83,6 +83,34 @@ pub fn daemon_proc_streamer(connect: Connect, fallback: ProcStreamer) -> ProcStr
 /// the rest.
 pub fn system_daemon_streamer() -> ProcStreamer {
     daemon_proc_streamer(system_connect(), ggo_common::system_proc_streamer())
+}
+
+/// A [`ProcRunner`] that sends `ggo diag` runs to the daemon and
+/// everything else to `fallback`.
+///
+/// The one-shot half of [`daemon_proc_streamer`], for the menu entry that
+/// wants only the finished transcript (`run_hardware_diagnostics`). It
+/// runs the same job through the same daemon; the difference is that
+/// nobody is watching the lines arrive, so the sink is a no-op and the
+/// transcript is read off the capture at the end.
+///
+/// Blocking, like every [`ProcRunner`]: callers are already inside
+/// `cx.background_spawn`. `smol::block_on` is correct here for exactly
+/// that reason -- the same argument `ggo_common::run_capture` makes.
+pub fn daemon_proc_runner(connect: Connect, fallback: ProcRunner) -> ProcRunner {
+    Arc::new(move |request| {
+        if !is_daemon_run(&request) {
+            return fallback(request);
+        }
+        let connect = connect.clone();
+        smol::block_on(async move { run_job(connect, request, Box::new(|_line: &str| {})).await })
+    })
+}
+
+/// The production runner: daemon for diagnostics, child processes for the
+/// rest.
+pub fn system_daemon_runner() -> ProcRunner {
+    daemon_proc_runner(system_connect(), ggo_common::system_proc_runner())
 }
 
 /// Cancels the job if the future is dropped before it finishes.
@@ -319,6 +347,85 @@ mod tests {
             "the daemon must not be asked to run a git clone: {:?}",
             fake.calls()
         );
+    }
+
+    /// The one-shot runner routes by the same rule as the streamer: a
+    /// `git clone` has no daemon tool and must still spawn as a child.
+    #[test]
+    fn a_non_daemon_request_goes_to_the_fallback_runner() {
+        let taken = Arc::new(Mutex::new(false));
+        let fallback: ProcRunner = {
+            let taken = taken.clone();
+            Arc::new(move |_request| {
+                if let Ok(mut taken) = taken.lock() {
+                    *taken = true;
+                }
+                ProcCapture {
+                    ok: true,
+                    lines: vec!["from the fallback".to_string()],
+                }
+            })
+        };
+        let fake = FakeDaemon::new();
+        let runner = daemon_proc_runner(connect_to(&fake), fallback);
+
+        let capture = runner(ProcRequest::new("git", "/repo", vec!["clone".into()]));
+        assert!(capture.ok);
+        assert_eq!(capture.lines, vec!["from the fallback".to_string()]);
+        assert_eq!(*taken.lock().unwrap(), true);
+        assert!(
+            fake.calls().iter().all(|(name, _)| name == "initialize"),
+            "the daemon must not be asked to run a git clone: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// The menu's one-shot diagnostic wants only the finished transcript,
+    /// but it must be the SAME job, run in the same daemon -- nobody is
+    /// watching the lines arrive, so they are read off the capture.
+    #[test]
+    fn the_one_shot_runner_returns_the_daemons_transcript() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_diag_start",
+            json!({"id": 1, "args": ["diag"], "state": "running", "line_count": 0}),
+        );
+        fake.on_tool(
+            "ggo_job_lines",
+            json!({
+                "lines": [{"index": 0, "text": "<<<GEMOS launched>>>"}],
+                "state": "done",
+                "exit_code": 0,
+            }),
+        );
+        let runner = daemon_proc_runner(
+            connect_to(&fake),
+            Arc::new(|request: ProcRequest| {
+                panic!("the fallback ran for {}", request.command_line())
+            }),
+        );
+
+        let capture = runner(diag_request());
+        assert!(capture.ok);
+        assert_eq!(capture.lines, vec!["<<<GEMOS launched>>>".to_string()]);
+    }
+
+    /// A failed one-shot run must report `ok: false`, or the menu entry
+    /// reads a board that never answered as a success.
+    #[test]
+    fn a_failing_one_shot_run_reports_a_failed_capture() {
+        let fake = FakeDaemon::new();
+        fake.on_tool_error("ggo_diag_start", "a diag job is already running (id 3)");
+        let runner = daemon_proc_runner(
+            connect_to(&fake),
+            Arc::new(|request: ProcRequest| {
+                panic!("the fallback ran for {}", request.command_line())
+            }),
+        );
+
+        let capture = runner(diag_request());
+        assert!(!capture.ok);
+        assert!(capture.lines[0].contains("id 3"), "{:?}", capture.lines);
     }
 
     /// The transcript must arrive through the sink as it lands AND be

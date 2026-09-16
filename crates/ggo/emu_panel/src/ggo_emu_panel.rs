@@ -742,7 +742,7 @@ impl EmuPanel {
             selected: None,
             remote_controlled: false,
             run_generation: 0,
-            proc_runner: ggo_common::system_proc_runner(),
+            proc_runner: job_stream::system_daemon_runner(),
             diag_env_override: None,
             build_generation: 0,
             _build_task: None,
