@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use ggo_daemon_client::Connect;
 use ggo_emu_remote::protocol::{Cmd, FlashConfig, Request, Response};
 use ggo_emu_remote::registry::{self, SessionInfo};
 use serde_json::{Value, json};
@@ -236,18 +237,18 @@ fn image_content(shot: &Value) -> Result<Value, String> {
 
 /// Execute one MCP tool call. Returns (content, is_error).
 ///
-/// `db_url` is the database the report tools read, resolved ONCE by the
-/// caller ([`db_url`], from `main`). It is a parameter rather than an
-/// ambient lookup so that the tests can point the report tools at a
-/// throwaway database instead of the developer's own.
+/// `daemon` is how the report tools reach GemdropGo. It is a parameter
+/// rather than an ambient connect so a test can point them at an
+/// in-process daemon over a throwaway database instead of the developer's
+/// own.
 pub fn call_tool(
     name: &str,
     args: &Value,
     dir: &Path,
-    db_url: &str,
+    daemon: &Connect,
     connect: &Connector,
 ) -> (Vec<Value>, bool) {
-    match call_tool_inner(name, args, dir, db_url, connect) {
+    match call_tool_inner(name, args, dir, daemon, connect) {
         Ok(content) => (content, false),
         Err(e) => (vec![json!({ "type": "text", "text": e })], true),
     }
@@ -257,7 +258,7 @@ fn call_tool_inner(
     name: &str,
     args: &Value,
     dir: &Path,
-    db_url: &str,
+    daemon: &Connect,
     connect: &Connector,
 ) -> Result<Vec<Value>, String> {
     let sessions = registry::list(dir);
@@ -275,13 +276,13 @@ fn call_tool_inner(
 
     if name == "list_ggo_reports" {
         let limit = arg_i64(args, "limit").filter(|n| *n > 0).unwrap_or(20) as usize;
-        return list_reports(db_url, &ggo_dir()?, limit);
+        return list_reports(daemon, &ggo_dir()?, limit);
     }
     if name == "fetch_ggo_report" {
         let ggo_dir = ggo_dir()?;
         return match (arg_i64(args, "run"), arg_str(args, "fault")) {
-            (Some(run), _) => fetch_report(db_url, &ggo_dir, run),
-            (None, Some(fault)) => fetch_fault(db_url, &ggo_dir, &fault),
+            (Some(run), _) => fetch_report(daemon, &ggo_dir, run),
+            (None, Some(fault)) => fetch_fault(daemon, &ggo_dir, &fault),
             (None, None) => Err(NEEDS_RUN_OR_FAULT.to_string()),
         };
     }
@@ -434,7 +435,7 @@ fn call_tool_inner(
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "open_ggo_report" => {
-            let cmd = open_report_cmd(db_url, &ggo_dir()?, workspace, args)?;
+            let cmd = open_report_cmd(daemon, workspace, args)?;
             let data = send(&session.socket, cmd, CALL_TIMEOUT, connect)?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
@@ -568,16 +569,15 @@ fn ggo_dir() -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(home).join(".ggo"))
 }
 
-/// The one PostgreSQL database every ggo tool shares -- `$GGO_DATABASE_URL`
-/// when set, else the local `ggo-pg` service. Every report row this module
-/// prints comes from here; `ggo_dir` only supplies the files beside them.
+/// How this server reaches GemdropGo: the daemon named by the
+/// environment, started if it is not already running.
 ///
-/// The server resolves this ONCE, in `main`, and hands it to every
+/// The server builds this ONCE, in `main`, and hands it to every
 /// [`call_tool`]: it is the only place in this crate that reaches for the
-/// ambient database, so a test can never be routed into the developer's
-/// own by accident.
-pub fn db_url() -> Result<String, String> {
-    ggo_db::url()
+/// ambient daemon, so a test can never be routed into the developer's own
+/// database by accident.
+pub fn daemon() -> Connect {
+    ggo_daemon_client::system_connect()
 }
 
 /// How the report tools name the database in their errors. There is no
@@ -608,25 +608,21 @@ const FAULTS_HEADER: &str = "--- faults (local time) ---";
 ///
 /// Device runs need no copying across any more: `ggo-diag` writes its
 /// rows into this same database, so the list reads one source.
-fn list_reports(db_url: &str, ggo_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
-    use ggo_worldlib::charts::reports::{faults, perf_db};
-
-    // Before the reads below: a machine that has only ever run the daemon
-    // has no fault rows at all until this import writes them.
-    let import_error = import_faults(db_url, ggo_dir);
-    let none = |what: String| {
-        let text = format!("{what}{}", import_failure_note(ggo_dir, import_error.as_ref()));
-        Ok(vec![json!({ "type": "text", "text": text })])
-    };
+fn list_reports(daemon: &Connect, ggo_dir: &Path, limit: usize) -> Result<Vec<Value>, String> {
+    let client = client(daemon)?;
+    // The faults come FIRST, as the import used to: when the server is
+    // down both reads fail for one cause, and asking for the runs first
+    // would return their failure alone -- dropping the fault side's
+    // reason, which is the half naming the dump directory.
+    let faults = client.faults(Some(limit as i64));
+    let fault_failure = faults.as_ref().err().map(|e| format!("{e:#}"));
     // The aggregate-free index: `cart_runs` would scan every frame row of
     // every cart for averages this list never prints.
-    let rows: Vec<_> = perf_db::run_index(db_url)
-        // The import note rides along: a failing read plus a failing fault
-        // import usually share one cause, and this is the only exit from
-        // THIS function that would otherwise drop it (`none` above carries
-        // it on the success paths).
-        .map_err(|e| {
-            format!("reading runs: {e:#}{}", import_failure_note(ggo_dir, import_error.as_ref()))
+    let rows: Vec<_> = client
+        .run_index()
+        .map_err(|e| match &fault_failure {
+            Some(note) => format!("reading runs: {e:#} (and {note})"),
+            None => format!("reading runs: {e:#}"),
         })?
         .into_iter()
         .map(|r| (r.started_at, r.id, r.cart_name, r.label, r.frames))
@@ -645,8 +641,15 @@ fn list_reports(db_url: &str, ggo_dir: &Path, limit: usize) -> Result<Vec<Value>
             )
         })
         .collect();
-    let fault_lines: Vec<String> = faults::list(db_url, limit as i64)
-        .map_err(|e| format!("reading faults: {e}"))?
+    // The daemon imports every new dump on its way to answering, so a
+    // fault written seconds ago is in this list without a separate step.
+    // Its failure comes back WITH the rows: an empty faults section and a
+    // failed import are opposite facts, and the caller is owed the
+    // difference.
+    let faults = faults.map_err(|e| format!("reading faults: {e:#}"))?;
+    let import_error = faults.import_error.clone();
+    let fault_lines: Vec<String> = faults
+        .rows
         .iter()
         .map(|f| {
             format!(
@@ -660,7 +663,10 @@ fn list_reports(db_url: &str, ggo_dir: &Path, limit: usize) -> Result<Vec<Value>
         })
         .collect();
     if run_lines.is_empty() && fault_lines.is_empty() {
-        return none("no runs yet".to_string());
+        return Ok(vec![json!({
+            "type": "text",
+            "text": format!("no runs yet{}", import_failure_note(import_error.as_ref())),
+        })]);
     }
     // Two sources, two orders AND two zones: perf runs are ordered by
     // their start stamp and faults by the daemon's, so they are listed as
@@ -684,15 +690,17 @@ fn list_reports(db_url: &str, ggo_dir: &Path, limit: usize) -> Result<Vec<Value>
 
 /// One perf run's paste-ready summary out of the ggo database, with the
 /// ggo-diag log beside it from `ggo_dir`. Both are parameters so tests can
-/// point at a fixture database and a temp directory; production passes
-/// [`db_url`] and `~/.ggo`.
-fn fetch_report(db_url: &str, ggo_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
-    use ggo_worldlib::charts::reports::perf_db;
-
-    let detail = run_detail_or_missing(db_url, run)?;
-    let frames =
-        perf_db::run_frames(db_url, run).map_err(|e| format!("reading run {run} frames: {e:#}"))?;
-    let mut text = perf_db::run_handoff_text(&detail, &frames);
+/// point at an in-process daemon and a temp directory; production passes
+/// the real daemon and `~/.ggo`.
+fn fetch_report(daemon: &Connect, ggo_dir: &Path, run: i64) -> Result<Vec<Value>, String> {
+    let client = client(daemon)?;
+    let detail = run_detail_or_missing(&client, run)?;
+    let frames = client
+        .run_frames(run)
+        .map_err(|e| format!("reading run {run} frames: {e:#}"))?;
+    // The rendering is worldlib's, not a copy: `handoff` is pure, so it
+    // comes across without the database half behind it.
+    let mut text = ggo_worldlib::charts::reports::handoff::run_handoff_text(&detail, &frames);
     let log = ggo_emu_remote::diag_log_path(&ggo_dir.join("diag").join("logs"), &detail.started_at);
     text.push_str(&format!(
         "\nggo_diag_log: {}\n",
@@ -706,30 +714,15 @@ fn faults_dir(ggo_dir: &Path) -> std::path::PathBuf {
     ggo_dir.join("uartd").join("faults")
 }
 
-/// Pull every dump the reports database has not seen into it, returning
-/// why it could not when it could not. Best effort: an unreadable dump is
-/// the daemon's problem and must not fail a tool the rows already answer
-/// -- but a caller looking at an empty faults section is TOLD, since the
-/// failure may be exactly why it is empty. Dumps that individually fail to
-/// parse are skipped (and named on stderr) by `import` itself.
-fn import_faults(db_url: &str, ggo_dir: &Path) -> Option<String> {
-    let dir = faults_dir(ggo_dir);
-    match ggo_worldlib::charts::reports::faults::import(&dir, db_url) {
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("faults: importing {}: {e}", dir.display());
-            Some(e)
-        }
-    }
-}
-
-/// The parenthetical both "nothing to show" messages carry when the
+/// The parenthetical a "nothing to show" message carries when a failed
 /// import is why there is nothing.
-fn import_failure_note(ggo_dir: &Path, error: Option<&String>) -> String {
+///
+/// The daemon owns the dump directory and names it in the error, so this
+/// only has to carry that sentence through -- unlike before, when this
+/// crate resolved the path itself.
+fn import_failure_note(error: Option<&String>) -> String {
     match error {
-        Some(e) => {
-            format!(" (and importing faults from {} failed: {e})", faults_dir(ggo_dir).display())
-        }
+        Some(e) => format!(" (and {e})"),
         None => String::new(),
     }
 }
@@ -743,20 +736,21 @@ const FAULT_LINES_AFTER: usize = 5;
 /// One daemon fault's paste-ready digest out of the ggo database: header,
 /// boot stage, telemetry, parsed panics and asset failures, the fault line
 /// in context, and the path of the raw dump under `ggo_dir`.
-fn fetch_fault(db_url: &str, ggo_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
-    use ggo_worldlib::charts::reports::faults;
-
+fn fetch_fault(daemon: &Connect, ggo_dir: &Path, id: &str) -> Result<Vec<Value>, String> {
+    let client = client(daemon)?;
     // A dump written seconds ago is fetchable by id straight from the
-    // list, without the panel having been opened in between.
-    let import_error = import_faults(db_url, ggo_dir);
-    let detail = faults::load(db_url, id)
-        .map_err(|e| format!("reading fault {id}: {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "no fault {id} in {DB_NAME}{}",
-                import_failure_note(ggo_dir, import_error.as_ref())
-            )
-        })?;
+    // list: the daemon imports on its way to answering, so there is no
+    // separate step here to forget. When that import failed AND the id is
+    // missing, the failure is very likely why -- so it is named.
+    let looked_up = client
+        .fault(id)
+        .map_err(|e| format!("reading fault {id}: {e:#}"))?;
+    let detail = looked_up.fault.ok_or_else(|| {
+        format!(
+            "no fault {id} in {DB_NAME}{}",
+            import_failure_note(looked_up.import_error.as_ref())
+        )
+    })?;
     let row = &detail.row;
     let number = |value: Option<i64>| match value {
         Some(n) => n.to_string(),
@@ -819,7 +813,9 @@ fn fetch_fault(db_url: &str, ggo_dir: &Path, id: &str) -> Result<Vec<Value>, Str
             }
         }
     }
-    let raw = faults::raw_path(&faults_dir(ggo_dir), id);
+    let raw = client
+        .fault_raw_path(id)
+        .unwrap_or_else(|_| faults_dir(ggo_dir).join(format!("{id}.log")));
     // The daemon prunes its dumps and the row outlives the file, so the
     // path alone would be a broken promise.
     let pruned = if raw.is_file() { "" } else { " (pruned; the bytes are in the report db)" };
@@ -831,27 +827,28 @@ fn fetch_fault(db_url: &str, ggo_dir: &Path, id: &str) -> Result<Vec<Value>, Str
 /// a bad id has to be an error here, not a Reports tab that silently
 /// lands on the runs list.
 fn open_report_cmd(
-    db_url: &str,
-    ggo_dir: &Path,
+    daemon: &Connect,
     workspace: Option<String>,
     args: &Value,
 ) -> Result<Cmd, String> {
-    use ggo_worldlib::charts::reports::faults;
-
+    // The argument check comes BEFORE the connect: "you named neither a
+    // run nor a fault" is a mistake in the call, and answering it with
+    // "the daemon is unavailable" would blame the machine for the
+    // caller's typo -- on a machine where the daemon is genuinely down,
+    // that is the more confusing of the two by far.
     match (arg_i64(args, "run"), arg_str(args, "fault")) {
         (Some(run), _) => {
-            run_detail_or_missing(db_url, run)?;
+            run_detail_or_missing(client(daemon)?.as_ref(), run)?;
             Ok(Cmd::OpenReport { workspace, run: Some(run), fault: None })
         }
         (None, Some(fault)) => {
-            let import_error = import_faults(db_url, ggo_dir);
-            if faults::load(db_url, &fault)
-                .map_err(|e| format!("reading fault {fault}: {e}"))?
-                .is_none()
-            {
+            let looked_up = client(daemon)?
+                .fault(&fault)
+                .map_err(|e| format!("reading fault {fault}: {e:#}"))?;
+            if looked_up.fault.is_none() {
                 return Err(format!(
                     "no fault {fault} in {DB_NAME}{}",
-                    import_failure_note(ggo_dir, import_error.as_ref())
+                    import_failure_note(looked_up.import_error.as_ref())
                 ));
             }
             Ok(Cmd::OpenReport { workspace, run: None, fault: Some(fault) })
@@ -869,14 +866,22 @@ const NEEDS_RUN_OR_FAULT: &str =
 /// Board runs need no cloning to be found here: `ggo-diag` and the
 /// emulator's ingest write into the one database this reads.
 fn run_detail_or_missing(
-    db_url: &str,
+    client: &ggo_daemon_client::Client,
     run: i64,
-) -> Result<ggo_worldlib::charts::reports::perf_db::RunDetail, String> {
-    use ggo_worldlib::charts::reports::perf_db;
-
-    perf_db::run_detail(db_url, run)
+) -> Result<ggo_daemon_client::RunDetail, String> {
+    client
+        .run_detail(run)
         .map_err(|e| format!("reading run {run}: {e:#}"))?
         .ok_or_else(|| format!("no run {run} in {DB_NAME}"))
+}
+
+/// One connected client, or why the daemon could not be reached.
+///
+/// "The daemon isn't running" is the likeliest first-run failure here --
+/// an agent calls a report tool on a machine where nothing has started it
+/// -- so it has to arrive as tool text, not as a silent empty list.
+fn client(daemon: &Connect) -> Result<std::sync::Arc<ggo_daemon_client::Client>, String> {
+    daemon().map_err(|e| format!("the GemdropGo daemon is unavailable: {e:#}"))
 }
 
 /// Shape a script report into MCP content: a text summary (frames + uart),
@@ -946,12 +951,12 @@ mod tests {
             }
         };
         let (content, is_err) =
-            call_tool("emu_start", &json!({"cart": "wilds.ggo"}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_start", &json!({"cart": "wilds.ggo"}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""frame":2"#));
 
         let (content, is_err) =
-            call_tool("emu_next_frame", &json!({"buttons": ["right"]}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_next_frame", &json!({"buttons": ["right"]}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""id":5"#));
     }
@@ -969,7 +974,7 @@ mod tests {
             Ok(r#"{"id":1,"ok":true,"data":{"cart":"target/ggo-emulate/worlds-arena.ggo","world":"worlds/arena","lines":[]}}"#.to_string())
         };
         let (content, is_err) =
-            call_tool("cart_pack", &json!({"world": "worlds/arena"}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("cart_pack", &json!({"world": "worlds/arena"}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains("worlds-arena.ggo"));
     }
@@ -985,7 +990,7 @@ mod tests {
         );
         let connect = move |_: &Path, _: &str, _: Duration| -> std::io::Result<String> { Ok(reply.clone()) };
         let (content, is_err) =
-            call_tool("emu_next_frame", &json!({"screenshot": true}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_next_frame", &json!({"screenshot": true}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[1]["type"], "image");
         let png = base64::engine::general_purpose::STANDARD
@@ -1011,10 +1016,10 @@ mod tests {
                 Ok(r#"{"id":1,"ok":true,"data":{"lines":["a","panic: b"]}}"#.to_string())
             }
         };
-        let (content, is_err) = call_tool("emu_screenshot", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("emu_screenshot", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[0]["type"], "image");
-        let (content, is_err) = call_tool("emu_uart", &json!({"tail": 2}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("emu_uart", &json!({"tail": 2}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[0]["text"], "a\npanic: b");
     }
@@ -1030,13 +1035,13 @@ mod tests {
             assert!(line.contains(r#""freerun":true"#), "{line}");
             Ok(r#"{"id":1,"ok":true,"data":{"started":true,"frame":1,"running":true}}"#.to_string())
         };
-        let (content, is_err) = call_tool("emu_start", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("emu_start", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(is_err && content[0]["text"].as_str().unwrap().contains("cart"), "{content:?}");
         let (content, is_err) = call_tool(
             "emu_start",
             &json!({"cart": "a.ggo", "freerun": true}),
             dir.path(),
-            UNREACHABLE_DB_URL,
+            &no_daemon(),
             &connect,
         );
         assert!(!is_err, "{content:?}");
@@ -1056,7 +1061,7 @@ mod tests {
             Ok(r#"{"id":1,"ok":true,"data":{"frame":8,"world":null}}"#.to_string())
         };
         let (content, is_err) =
-            call_tool("emu_next_frame", &json!({"frames": 5}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_next_frame", &json!({"frames": 5}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""frame":8"#));
     }
@@ -1074,7 +1079,7 @@ mod tests {
             ))
         };
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "map", "layer": 2}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_debug", &json!({"view": "map", "layer": 2}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(
             !content[0]["text"].as_str().unwrap().contains("bgra_base64"),
@@ -1082,7 +1087,7 @@ mod tests {
         );
         assert_eq!(content[1]["type"], "image");
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "sprites"}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_debug", &json!({"view": "sprites"}), dir.path(), &no_daemon(), &connect);
         assert!(is_err && content[0]["text"].as_str().unwrap().contains("view must be"), "{content:?}");
     }
 
@@ -1094,11 +1099,11 @@ mod tests {
             panic!("a negative index must never reach the host")
         };
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "map", "layer": -1}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_debug", &json!({"view": "map", "layer": -1}), dir.path(), &no_daemon(), &connect);
         assert!(is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains("layer must be >= 0"), "{content:?}");
         let (content, is_err) =
-            call_tool("emu_debug", &json!({"view": "tiles", "bank": -2}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_debug", &json!({"view": "tiles", "bank": -2}), dir.path(), &no_daemon(), &connect);
         assert!(is_err && content[0]["text"].as_str().unwrap().contains("bank must be >= 0"), "{content:?}");
     }
 
@@ -1110,7 +1115,7 @@ mod tests {
             Ok(r#"{"id":1,"ok":false,"error":"no cart at /proj/nope.ggo"}"#.to_string())
         };
         let (content, is_err) =
-            call_tool("emu_start", &json!({"cart": "nope.ggo"}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("emu_start", &json!({"cart": "nope.ggo"}), dir.path(), &no_daemon(), &connect);
         assert!(is_err);
         assert_eq!(content[0]["text"], "no cart at /proj/nope.ggo");
     }
@@ -1127,9 +1132,9 @@ mod tests {
                 Ok(r#"{"id":1,"ok":true,"data":{"stem":"worlds/arena","dirty":false,"entities":[]}}"#.to_string())
             }
         };
-        let (content, is_err) = call_tool("world_list", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("world_list", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err && content[0]["text"].as_str().unwrap().contains("worlds/arena"), "{content:?}");
-        let (content, is_err) = call_tool("world_read", &json!({"world": "worlds/arena"}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("world_read", &json!({"world": "worlds/arena"}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err && content[0]["text"].as_str().unwrap().contains(r#""dirty":false"#), "{content:?}");
     }
 
@@ -1149,7 +1154,7 @@ mod tests {
             ))
         };
         let (content, is_err) =
-            call_tool("world_screenshot", &json!({"full": true}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("world_screenshot", &json!({"full": true}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert_eq!(content[0]["type"], "image");
     }
@@ -1249,7 +1254,7 @@ mod tests {
             "hw_flash",
             &json!({"world": "worlds/chase_cam", "rebuild_gateware": true, "collect_seconds": 30}),
             dir.path(),
-            UNREACHABLE_DB_URL,
+            &no_daemon(),
             &connect,
         );
         assert!(!is_err, "{content:?}");
@@ -1269,7 +1274,7 @@ mod tests {
             (json!({"world": "worlds/a", "baud": -1}), "baud"),
             (json!({"world": "worlds/a", "collect_seconds": 0}), "collect_seconds"),
         ] {
-            let (content, is_err) = call_tool("hw_flash", &args, dir.path(), UNREACHABLE_DB_URL, &connect);
+            let (content, is_err) = call_tool("hw_flash", &args, dir.path(), &no_daemon(), &connect);
             assert!(is_err, "{content:?}");
             assert!(content[0]["text"].as_str().unwrap().contains(word), "{content:?}");
         }
@@ -1283,7 +1288,7 @@ mod tests {
             assert!(line.contains(r#""cmd":"flash_status""#), "{line}");
             Ok(r#"{"id":1,"ok":true,"data":{"active":true,"phase":"Boot verify (UART)","verdict":null,"diag_run_id":"r1","perf_run_id":null}}"#.to_string())
         };
-        let (content, is_err) = call_tool("hw_flash_status", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("hw_flash_status", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains(r#""phase":"Boot verify (UART)""#), "{text}");
@@ -1301,10 +1306,10 @@ mod tests {
                 Ok(r#"{"id":1,"ok":true,"data":{"cancelled":true}}"#.to_string())
             }
         };
-        let (content, is_err) = call_tool("hw_env", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("hw_env", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""code":"port""#));
-        let (content, is_err) = call_tool("hw_flash_cancel", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("hw_flash_cancel", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""cancelled":true"#));
     }
@@ -1367,7 +1372,7 @@ mod tests {
         };
         // `60.0`, not `60`: MCP clients routinely send whole numbers as floats.
         let (content, is_err) =
-            call_tool("hw_flash_wait", &json!({"timeout_s": 60.0}), dir.path(), UNREACHABLE_DB_URL, &connect);
+            call_tool("hw_flash_wait", &json!({"timeout_s": 60.0}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":false"#));
     }
@@ -1384,13 +1389,13 @@ mod tests {
             Ok(r#"{"id":1,"ok":true,"data":{"active":false,"phase":"Done","verdict":true,"diag_run_id":"r1","perf_run_id":3}}"#.to_string())
         };
         for bad in [json!({"timeout_s": 0}), json!({"timeout_s": -5}), json!({"timeout_s": 0.0})] {
-            let (content, is_err) = call_tool("hw_flash_wait", &bad, dir.path(), UNREACHABLE_DB_URL, &connect);
+            let (content, is_err) = call_tool("hw_flash_wait", &bad, dir.path(), &no_daemon(), &connect);
             assert!(is_err, "{bad} must be rejected: {content:?}");
             assert_eq!(content[0]["text"], "timeout_s must be > 0", "{bad}");
         }
 
         // Omitted is what asks for the default, and still runs normally.
-        let (content, is_err) = call_tool("hw_flash_wait", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("hw_flash_wait", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""verdict":true"#));
         assert_eq!(DEFAULT_FLASH_TIMEOUT_S, 1800);
@@ -1513,6 +1518,25 @@ mod tests {
     /// developer's own database. The report tools get a `TestDb` instead.
     const UNREACHABLE_DB_URL: &str = "postgres://ggo@localhost/ggo?host=/nonexistent/ggo-pg-socket";
 
+    /// A [`Connect`] onto an in-process daemon over `db_url`, reading
+    /// dumps from `<ggo_dir>/uartd/faults`.
+    ///
+    /// Tests SEED with `TestDb` and a fixture `~/.ggo` tree, then read
+    /// back the way the server does. The daemon imports dumps on its way
+    /// to answering, so a dump written under the fixture reaches the list
+    /// exactly as one written by `ggo-uartd` would.
+    fn test_daemon(db_url: &str, ggo_dir: &Path) -> Connect {
+        ggo_daemon_client::test_daemon::ingesting_connect(db_url, faults_dir(ggo_dir))
+    }
+
+    /// The connector every `call_tool` test that does NOT exercise a
+    /// report tool passes: it panics if it is ever called, so a routing
+    /// mistake fails loudly instead of quietly reaching the developer's
+    /// own daemon.
+    fn no_daemon() -> Connect {
+        std::sync::Arc::new(|| panic!("must not reach the daemon"))
+    }
+
     /// A run id no serial sequence will ever hand out, so it is missing
     /// from the seeded fixture database however many runs are inserted
     /// into it.
@@ -1521,7 +1545,7 @@ mod tests {
     #[test]
     fn fetch_report_renders_the_run_handoff_text_and_its_log_path() {
         let (db, dir) = seeded_db();
-        let content = fetch_report(db.url(), dir.path(), 7).unwrap();
+        let content = fetch_report(&test_daemon(db.url(), dir.path()), dir.path(), 7).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains("GemdropGo perf run #7"), "{text}");
         assert!(text.contains("wilds"), "{text}");
@@ -1532,7 +1556,7 @@ mod tests {
         std::fs::create_dir_all(&logs).unwrap();
         let log = logs.join("main_abc1234_2026-08-31T00:00:00Z.log");
         std::fs::write(&log, "").unwrap();
-        let content = fetch_report(db.url(), dir.path(), 7).unwrap();
+        let content = fetch_report(&test_daemon(db.url(), dir.path()), dir.path(), 7).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("ggo_diag_log: {}", log.display())), "{text}");
     }
@@ -1544,13 +1568,13 @@ mod tests {
         std::fs::create_dir_all(&logs).unwrap();
         let log = logs.join("main_abc1234_2026-08-31T00:00:00Z.log");
         std::fs::write(&log, "").unwrap();
-        let content = list_reports(db.url(), dir.path(), 20).unwrap();
+        let content = list_reports(&test_daemon(db.url(), dir.path()), dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], RUNS_HEADER, "{text}");
         assert!(lines[1].starts_with("run 7  2026-08-31T00:00:00Z  wilds  label=board  frames=2  log="), "{text}");
         assert!(text.ends_with(&log.display().to_string()), "{text}");
-        assert_eq!(list_reports(db.url(), dir.path(), 0).unwrap()[0]["text"], "no runs yet");
+        assert_eq!(list_reports(&test_daemon(db.url(), dir.path()), dir.path(), 0).unwrap()[0]["text"], "no runs yet");
     }
 
     /// A migrated database nothing has been recorded into yet is the
@@ -1560,7 +1584,7 @@ mod tests {
         let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
         let text =
-            list_reports(db.url(), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+            list_reports(&test_daemon(db.url(), dir.path()), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
         assert_eq!(text, "no runs yet", "{text}");
     }
 
@@ -1570,7 +1594,7 @@ mod tests {
     #[test]
     fn list_reports_of_an_unreachable_database_is_an_error_that_says_what_to_do() {
         let dir = tempfile::tempdir().unwrap();
-        let err = list_reports(UNREACHABLE_DB_URL, dir.path(), 20).unwrap_err();
+        let err = list_reports(&test_daemon(UNREACHABLE_DB_URL, dir.path()), dir.path(), 20).unwrap_err();
         assert!(err.contains(ggo_db::INSTALL_HINT), "{err}");
     }
 
@@ -1581,7 +1605,7 @@ mod tests {
     fn an_unreachable_database_reports_the_failed_fault_import_too() {
         let dir = tempfile::tempdir().unwrap();
         seed_fault_dump(dir.path());
-        let err = list_reports(UNREACHABLE_DB_URL, dir.path(), 20).unwrap_err();
+        let err = list_reports(&test_daemon(UNREACHABLE_DB_URL, dir.path()), dir.path(), 20).unwrap_err();
         assert!(err.starts_with("reading runs: "), "{err}");
         assert!(err.contains("importing faults from"), "{err}");
         assert!(err.contains("uartd/faults"), "{err}");
@@ -1606,7 +1630,7 @@ mod tests {
             panic!("no socket call for a run that does not exist")
         };
         let (content, is_err) =
-            call_tool("open_ggo_report", &json!({"run": UNKNOWN_RUN}), dir.path(), db.url(), &connect);
+            call_tool("open_ggo_report", &json!({"run": UNKNOWN_RUN}), dir.path(), &test_daemon(db.url(), dir.path()), &connect);
         assert!(is_err, "{content:?}");
         assert!(
             content[0]["text"].as_str().unwrap().contains(&format!("no run {UNKNOWN_RUN}")),
@@ -1622,7 +1646,7 @@ mod tests {
             assert!(line.contains(r#""cmd":"close_report""#) && line.contains(r#""run":55"#), "{line}");
             Ok(r#"{"id":1,"ok":true,"data":{"closed":true}}"#.to_string())
         };
-        let (content, is_err) = call_tool("close_ggo_report", &json!({"run": 55}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("close_ggo_report", &json!({"run": 55}), dir.path(), &no_daemon(), &connect);
         assert!(!is_err, "{content:?}");
         assert!(content[0]["text"].as_str().unwrap().contains(r#""closed":true"#));
     }
@@ -1630,7 +1654,7 @@ mod tests {
     #[test]
     fn fetch_report_unknown_run_is_a_tool_error() {
         let (db, dir) = seeded_db();
-        let err = fetch_report(db.url(), dir.path(), 999).unwrap_err();
+        let err = fetch_report(&test_daemon(db.url(), dir.path()), dir.path(), 999).unwrap_err();
         assert!(err.contains("no run 999"), "{err}");
         assert!(err.contains(DB_NAME), "{err}");
     }
@@ -1641,7 +1665,7 @@ mod tests {
     fn fetch_report_against_an_empty_database_is_a_tool_error() {
         let db = ggo_db::TestDb::new();
         let dir = tempfile::tempdir().unwrap();
-        let err = fetch_report(db.url(), dir.path(), 1).unwrap_err();
+        let err = fetch_report(&test_daemon(db.url(), dir.path()), dir.path(), 1).unwrap_err();
         assert!(err.contains("no run 1"), "{err}");
         assert!(err.contains(DB_NAME), "{err}");
     }
@@ -1651,7 +1675,7 @@ mod tests {
     #[test]
     fn fetch_report_of_an_unreachable_database_says_what_to_do() {
         let dir = tempfile::tempdir().unwrap();
-        let err = fetch_report(UNREACHABLE_DB_URL, dir.path(), 7).unwrap_err();
+        let err = fetch_report(&test_daemon(UNREACHABLE_DB_URL, dir.path()), dir.path(), 7).unwrap_err();
         assert!(err.contains("reading run 7"), "{err}");
         assert!(err.contains(ggo_db::INSTALL_HINT), "{err}");
     }
@@ -1684,7 +1708,7 @@ mod tests {
     fn list_reports_lists_faults_after_the_runs() {
         let (db, dir) = seeded_db();
         seed_fault_dump(dir.path());
-        let content = list_reports(db.url(), dir.path(), 20).unwrap();
+        let content = list_reports(&test_daemon(db.url(), dir.path()), dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
         // The two sections are in DIFFERENT zones -- a run's `started_at`
@@ -1711,7 +1735,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_fault_dump(dir.path());
         let text =
-            list_reports(db.url(), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+            list_reports(&test_daemon(db.url(), dir.path()), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], FAULTS_HEADER, "{text}");
         assert!(lines[1].starts_with("fault 2026-09-02_08-49-33_marker  "), "{text}");
@@ -1722,7 +1746,7 @@ mod tests {
     fn fetch_fault_renders_the_digest_the_marked_line_and_the_raw_path() {
         let (db, dir) = seeded_db();
         let raw = seed_fault_dump(dir.path());
-        let content = fetch_fault(db.url(), dir.path(), FAULT_ID).unwrap();
+        let content = fetch_fault(&test_daemon(db.url(), dir.path()), dir.path(), FAULT_ID).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.starts_with("fault 2026-09-02_08-49-33_marker"), "{text}");
         assert!(text.contains("marker: <<<PANIC>>>"), "{text}");
@@ -1761,7 +1785,7 @@ mod tests {
         break_the_fault_import(&db);
         let dir = tempfile::tempdir().unwrap();
         seed_fault_dump(dir.path());
-        let content = list_reports(db.url(), dir.path(), 20).unwrap();
+        let content = list_reports(&test_daemon(db.url(), dir.path()), dir.path(), 20).unwrap();
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.starts_with("no runs yet"), "{text}");
         assert!(text.contains("importing faults from"), "{text}");
@@ -1776,7 +1800,7 @@ mod tests {
         seed_fault_dump(dir.path());
         break_the_fault_import(&db);
         let text =
-            list_reports(db.url(), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
+            list_reports(&test_daemon(db.url(), dir.path()), dir.path(), 20).unwrap()[0]["text"].as_str().unwrap().to_string();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], RUNS_HEADER, "{text}");
         assert!(lines[1].starts_with("run 7  "), "{text}");
@@ -1790,9 +1814,9 @@ mod tests {
         break_the_fault_import(&db);
         let dir = tempfile::tempdir().unwrap();
         seed_fault_dump(dir.path());
-        let err = fetch_fault(db.url(), dir.path(), FAULT_ID).unwrap_err();
+        let err = fetch_fault(&test_daemon(db.url(), dir.path()), dir.path(), FAULT_ID).unwrap_err();
         let open_err =
-            open_report_cmd(db.url(), dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap_err();
+            open_report_cmd(&test_daemon(db.url(), dir.path()), None, &json!({ "fault": FAULT_ID })).unwrap_err();
         assert!(err.contains(&format!("no fault {FAULT_ID}")), "{err}");
         assert!(err.contains(DB_NAME), "{err}");
         assert!(err.contains("importing faults from"), "{err}");
@@ -1802,7 +1826,7 @@ mod tests {
     #[test]
     fn fetch_fault_unknown_id_is_a_tool_error() {
         let (db, dir) = seeded_db();
-        let err = fetch_fault(db.url(), dir.path(), "nope").unwrap_err();
+        let err = fetch_fault(&test_daemon(db.url(), dir.path()), dir.path(), "nope").unwrap_err();
         assert!(err.contains("no fault nope"), "{err}");
         assert!(err.contains(DB_NAME), "{err}");
     }
@@ -1812,20 +1836,20 @@ mod tests {
         let (db, dir) = seeded_db();
         seed_fault_dump(dir.path());
         let cmd =
-            open_report_cmd(db.url(), dir.path(), None, &json!({ "fault": FAULT_ID })).unwrap();
+            open_report_cmd(&test_daemon(db.url(), dir.path()), None, &json!({ "fault": FAULT_ID })).unwrap();
         let line = serde_json::to_string(&Request { id: 1, cmd }).unwrap();
         assert!(line.contains(r#""cmd":"open_report""#), "{line}");
         assert!(line.contains(&format!(r#""fault":"{FAULT_ID}""#)), "{line}");
 
         assert_eq!(
-            open_report_cmd(db.url(), dir.path(), None, &json!({ "run": 7 })).unwrap(),
+            open_report_cmd(&test_daemon(db.url(), dir.path()), None, &json!({ "run": 7 })).unwrap(),
             Cmd::OpenReport { workspace: None, run: Some(7), fault: None }
         );
 
         let err =
-            open_report_cmd(db.url(), dir.path(), None, &json!({ "fault": "nope" })).unwrap_err();
+            open_report_cmd(&test_daemon(db.url(), dir.path()), None, &json!({ "fault": "nope" })).unwrap_err();
         assert!(err.contains("no fault nope"), "{err}");
-        let err = open_report_cmd(db.url(), dir.path(), None, &json!({})).unwrap_err();
+        let err = open_report_cmd(&test_daemon(db.url(), dir.path()), None, &json!({})).unwrap_err();
         assert!(err.contains("run") && err.contains("fault"), "{err}");
     }
 
@@ -1836,7 +1860,7 @@ mod tests {
         let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
             panic!("no socket call without a report to open")
         };
-        let (content, is_err) = call_tool("open_ggo_report", &json!({}), dir.path(), UNREACHABLE_DB_URL, &connect);
+        let (content, is_err) = call_tool("open_ggo_report", &json!({}), dir.path(), &no_daemon(), &connect);
         assert!(is_err, "{content:?}");
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.contains("run") && text.contains("fault"), "{text}");

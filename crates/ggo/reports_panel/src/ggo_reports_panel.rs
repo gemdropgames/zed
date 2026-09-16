@@ -377,10 +377,9 @@ impl ReportsPanel {
             // `import_failure_note` prints, so an agent and the dock
             // describe one failure one way.
             // The import is the daemon's now: `ggo_faults` digests every
-            // new dump on its way to answering, so there is no separate
-            // step to fail here. What used to be reported as "importing
-            // faults failed" arrives as a failure of the list itself,
-            // below.
+            // new dump on its way to answering. Its failure comes back
+            // WITH the rows rather than as a separate step, and is pushed
+            // onto `notes` below.
             let mut notes = Vec::new();
             let mut failure = None;
             let perf = match loader::list_runs(&connect) {
@@ -416,7 +415,17 @@ impl ReportsPanel {
                         .faults(Some(HISTORY_LIMIT))
                         .map_err(|error| format!("{error:#}"))
                 }) {
-                Ok(rows) => rows,
+                Ok(list) => {
+                    // An import that failed is not fatal -- the rows
+                    // already stored still list -- but it is also not
+                    // nothing: the dumps the daemon wrote are then missing
+                    // from a list that would otherwise read as complete.
+                    if let Some(note) = list.import_error {
+                        log::warn!("reports: {note}");
+                        notes.push(note);
+                    }
+                    list.rows
+                }
                 Err(error) => {
                     failure = failure.or(Some(error));
                     Vec::new()

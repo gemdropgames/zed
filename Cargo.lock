@@ -7502,6 +7502,7 @@ dependencies = [
  "base64 0.22.1",
  "ggo-db",
  "ggo-worldlib",
+ "ggo_daemon_client",
  "ggo_emu_remote",
  "image",
  "serde_json",

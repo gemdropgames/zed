@@ -14,16 +14,21 @@ path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
-# Resolving the one shared database url (`ggo_db::url`), and -- in tests --
-# seeding a throwaway database on the real schema through `ggo_db::TestDb`.
-ggo-db.workspace = true
+# The one door to GemdropGo: every report row this server prints arrives
+# over the daemon's socket.
+ggo_daemon_client.workspace = true
 ggo_emu_remote.workspace = true
-# `fetch_ggo_report`'s reads of the ggo database -- the same query fns the
-# charts panel uses, so the tool and the Reports page can never disagree
-# about a run.
+# `fetch_ggo_report`'s paste-ready rendering (`handoff::run_handoff_text`)
+# -- pure, and the same function the Reports page uses, so the tool and
+# the page can never disagree about a run. Default features only: the `db`
+# feature is what would drag sqlx back in.
 ggo-worldlib.workspace = true
 image.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# SEEDING ONLY. A test builds the rows it wants with `TestDb`, then reads
+# them back the way the server does: over the in-process daemon.
+ggo-db.workspace = true
+ggo_daemon_client = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

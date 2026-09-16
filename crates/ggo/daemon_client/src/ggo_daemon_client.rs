@@ -210,6 +210,25 @@ pub use ggo_worldlib::charts::reports::rows::{
 // same way: only `faults`' import/list/load touch a database, and those
 // are behind worldlib's `db` feature.
 pub use ggo_worldlib::charts::reports::faults::{FaultDetail, FaultRow};
+
+/// [`Client::faults`]' answer: the stored rows, plus why the import
+/// failed when it did.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FaultList {
+    pub rows: Vec<FaultRow>,
+    /// `None` when every dump on disk imported cleanly. When set, an
+    /// empty `rows` may mean "the dumps could not be read" rather than
+    /// "nothing has faulted" -- see [`Client::faults`].
+    pub import_error: Option<String>,
+}
+
+/// [`Client::fault`]'s answer: the fault if it is there, plus why the
+/// import failed when it did.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FaultLookup {
+    pub fault: Option<FaultDetail>,
+    pub import_error: Option<String>,
+}
 pub use ggo_worldlib::charts::reports::uart_diag::{AssetFailure, PanicRow};
 
 /// One device (`ggo-diag`) run, as `diag_db::RunSummary` serialises it.
@@ -596,12 +615,19 @@ impl Client {
 
     // ---------------------------------------------------------- faults
 
-    /// Every stored fault dump, newest first.
+    /// Every stored fault dump, newest first, and why the import failed
+    /// if it did.
     ///
     /// Fresh dumps on disk are imported by the daemon on the way, so this
     /// is never stale -- and the editor never touches `~/.ggo` itself.
     /// `limit` omitted takes the daemon's own default.
-    pub fn faults(&self, limit: Option<i64>) -> Result<Vec<FaultRow>> {
+    ///
+    /// The import error is carried rather than logged because an empty
+    /// list and a failed import are OPPOSITE facts: "this machine has
+    /// never faulted" versus "the dumps from the crash could not be
+    /// read". A caller showing the first when the second is true is
+    /// lying to the user about the one machine that just crashed.
+    pub fn faults(&self, limit: Option<i64>) -> Result<FaultList> {
         let arguments = match limit {
             Some(limit) => json!({"limit": limit}),
             None => json!({}),
@@ -610,11 +636,14 @@ impl Client {
         serde_json::from_value(value).context("decode the fault list")
     }
 
-    /// One fault in full, or `None` when the daemon has already pruned it.
+    /// One fault in full (`None` when the daemon has already pruned it),
+    /// and why the import failed if it did.
     ///
     /// Absence is not an error: dumps are pruned, so a row a panel saw a
-    /// moment ago can be gone, and that is a state to render.
-    pub fn fault(&self, id: &str) -> Result<Option<FaultDetail>> {
+    /// moment ago can be gone, and that is a state to render. The import
+    /// error rides along for [`Self::faults`]' reason -- "no such fault"
+    /// and "the dump could not be imported" are different answers.
+    pub fn fault(&self, id: &str) -> Result<FaultLookup> {
         let value = self.call_tool("ggo_fault", json!({"id": id}))?;
         serde_json::from_value(value).context("decode the fault")
     }
@@ -1269,25 +1298,51 @@ mod tests {
         let fake = FakeDaemon::new();
         fake.on_tool(
             "ggo_faults",
-            json!([{
-                "id": "2026-09-02_08-49-33_trap",
-                "source": "ggo-uartd",
-                "at": "2026-09-02_08-49-33",
-                "kind": "trap",
-                "detail": "mcause=0x2",
-                "tty": "/dev/ttyUSB1",
-                "boot_stage": null,
-                "frames": 0,
-                "run_id": null,
-            }]),
+            json!({
+                "rows": [{
+                    "id": "2026-09-02_08-49-33_trap",
+                    "source": "ggo-uartd",
+                    "at": "2026-09-02_08-49-33",
+                    "kind": "trap",
+                    "detail": "mcause=0x2",
+                    "tty": "/dev/ttyUSB1",
+                    "boot_stage": null,
+                    "frames": 0,
+                    "run_id": null,
+                }],
+                "import_error": null,
+            }),
         );
         let client = client_with(&fake);
 
         let faults = client.faults(Some(10)).expect("faults");
-        assert_eq!(faults[0].kind, "trap");
-        assert_eq!(faults[0].detail, "mcause=0x2");
-        assert_eq!(faults[0].boot_stage, None, "a dump that never booted");
-        assert_eq!(faults[0].run_id, None, "no run it can be linked to");
+        assert_eq!(faults.rows[0].kind, "trap");
+        assert_eq!(faults.rows[0].detail, "mcause=0x2");
+        assert_eq!(faults.rows[0].boot_stage, None, "a dump that never booted");
+        assert_eq!(faults.rows[0].run_id, None, "no run it can be linked to");
+        assert_eq!(faults.import_error, None, "every dump imported cleanly");
+    }
+
+    /// An empty list and a failed import are OPPOSITE facts -- "nothing
+    /// has ever faulted" versus "the dumps from the crash could not be
+    /// read" -- so the reason has to survive the trip rather than being
+    /// left in the daemon's log.
+    #[test]
+    fn an_empty_fault_list_carries_the_reason_it_is_empty() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_faults",
+            json!({
+                "rows": [],
+                "import_error": "importing faults from /home/u/.ggo/uartd/faults failed: boom",
+            }),
+        );
+        let client = client_with(&fake);
+
+        let faults = client.faults(None).expect("faults");
+        assert!(faults.rows.is_empty());
+        let note = faults.import_error.expect("an empty list owes a reason");
+        assert!(note.contains("uartd/faults"), "{note}");
     }
 
     /// Omitting the limit must send no `limit` key, so the daemon applies
@@ -1295,7 +1350,7 @@ mod tests {
     #[test]
     fn omitting_the_fault_limit_sends_no_limit() {
         let fake = FakeDaemon::new();
-        fake.on_tool("ggo_faults", json!([]));
+        fake.on_tool("ggo_faults", json!({"rows": [], "import_error": null}));
         let client = client_with(&fake);
         client.faults(None).expect("faults");
 
@@ -1312,10 +1367,33 @@ mod tests {
     #[test]
     fn a_pruned_fault_reads_as_none_rather_than_an_error() {
         let fake = FakeDaemon::new();
-        fake.on_tool("ggo_fault", Value::Null);
+        fake.on_tool("ggo_fault", json!({"fault": null, "import_error": null}));
         let client = client_with(&fake);
 
-        assert_eq!(client.fault("gone").expect("absence is not an error"), None);
+        let looked_up = client.fault("gone").expect("absence is not an error");
+        assert_eq!(looked_up.fault, None);
+        assert_eq!(looked_up.import_error, None);
+    }
+
+    /// "No such fault" and "the dump could not be imported" are different
+    /// answers, and a caller that shows the first when the second is true
+    /// is lying about the machine that just crashed.
+    #[test]
+    fn a_missing_fault_carries_a_failed_import_alongside_it() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_fault",
+            json!({
+                "fault": null,
+                "import_error": "importing faults from /home/u/.ggo/uartd/faults failed: boom",
+            }),
+        );
+        let client = client_with(&fake);
+
+        let looked_up = client.fault("2026-09-02_08-49-33_trap").expect("lookup");
+        assert_eq!(looked_up.fault, None);
+        let note = looked_up.import_error.expect("the import failed, and that is why");
+        assert!(note.contains("uartd/faults"), "{note}");
     }
 
     /// A dump is hundreds of kilobytes of binary ring buffer, so the raw

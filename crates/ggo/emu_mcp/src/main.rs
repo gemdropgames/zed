@@ -24,23 +24,19 @@ fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let dir = ggo_emu_remote::registry::dir();
-    // One resolution for the life of the server: every tool call reads the
-    // same database, and the tool layer never reaches for it itself. The
-    // only way this fails is an unset $HOME, which also takes `~/.ggo`
-    // with it -- there is no report to serve then, so say so and stop.
-    let db_url = match tools::db_url() {
-        Ok(url) => url,
-        Err(e) => {
-            eprintln!("zedgg-emu-mcp: {e}");
-            return;
-        }
-    };
+    // One connector for the life of the server: every tool call reaches
+    // the same daemon, and the tool layer never reaches for it itself.
+    // Connecting is deferred to the first report call rather than done
+    // here -- a session tool must still work on a machine where the
+    // daemon is not running, and a report tool that cannot reach it says
+    // so in its own answer.
+    let daemon = tools::daemon();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
-        let Some(reply) = rpc::handle_line(&line, &dir, &db_url, &tools::socket_call) else {
+        let Some(reply) = rpc::handle_line(&line, &dir, &daemon, &tools::socket_call) else {
             continue; // notification — nothing to say
         };
         let mut out = reply.to_string();

@@ -83,6 +83,18 @@ pub fn ingesting_daemon(db_url: String, faults_dir: std::path::PathBuf) -> Trans
     })
 }
 
+/// Pull every dump the database has not seen into it, returning why it
+/// could not when it could not -- the real daemon's `import_faults`.
+fn import_faults(faults_dir: &std::path::Path, db_url: &str) -> Option<String> {
+    match faults::import(faults_dir, db_url) {
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "importing faults from {} failed: {error}",
+            faults_dir.display()
+        )),
+    }
+}
+
 /// Every tool this daemon serves, against a real database.
 fn call(db_url: &str, faults_dir: &std::path::Path, name: &str, arguments: &Value) -> Result<Value, String> {
     let run_id = || -> Result<i64, String> {
@@ -128,13 +140,29 @@ fn call(db_url: &str, faults_dir: &std::path::Path, name: &str, arguments: &Valu
         }),
         "ggo_faults" => {
             // The real daemon imports on the way, so this does too --
-            // otherwise a test seeds dumps and reads an empty rail.
-            if let Err(error) = faults::import(faults_dir, db_url) {
-                eprintln!("in-process daemon: importing fault dumps: {error}");
-            }
-            json!(faults::list(db_url, limit(50)).map_err(as_string)?)
+            // otherwise a test seeds dumps and reads an empty rail. The
+            // failure is CARRIED, not logged: an empty list and a failed
+            // import are opposite facts.
+            let import_error = import_faults(faults_dir, db_url);
+            // A failing list and a failing import usually share one cause
+            // (the server is down); the real daemon combines them rather
+            // than dropping the import's reason, so this does too.
+            let rows = faults::list(db_url, limit(50)).map_err(|error| match &import_error {
+                Some(note) => format!("{error} (and {note})"),
+                None => error,
+            })?;
+            json!({"rows": rows, "import_error": import_error})
         }
-        "ggo_fault" => json!(faults::load(db_url, &text_id()?).map_err(as_string)?),
+        "ggo_fault" => {
+            // Imports first, as the real daemon does: a dump written
+            // seconds ago must be fetchable by the id a caller just read
+            // off the list, without a separate step in between.
+            let import_error = import_faults(faults_dir, db_url);
+            json!({
+                "fault": faults::load(db_url, &text_id()?).map_err(as_string)?,
+                "import_error": import_error,
+            })
+        }
         "ggo_fault_raw_path" => json!({
             "path": faults::raw_path(faults_dir, &text_id()?).display().to_string(),
         }),

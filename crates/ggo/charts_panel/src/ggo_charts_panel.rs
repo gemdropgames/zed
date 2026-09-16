@@ -901,13 +901,20 @@ impl ChartsPanel {
         // one a `stat`, which has no business on the UI thread.
         let load = cx.background_spawn(async move {
             let client = connect().map_err(|e| format!("{e:#}"))?;
-            let loaded = client
-                .fault(&id)
-                .map_err(|e| format!("{e:#}"))?
-                .map(|detail| {
-                    let text = Arc::new(Self::mark_fault_line(&detail));
-                    (Arc::new(detail), text)
-                });
+            let looked_up = client.fault(&id).map_err(|e| format!("{e:#}"))?;
+            // A dump that could not be imported is not a dump that is not
+            // there: saying "no such fault" when the truth is "the crash
+            // dump could not be read" is the one lie this view must not
+            // tell.
+            if looked_up.fault.is_none()
+                && let Some(error) = looked_up.import_error
+            {
+                return Err(error);
+            }
+            let loaded = looked_up.fault.map(|detail| {
+                let text = Arc::new(Self::mark_fault_line(&detail));
+                (Arc::new(detail), text)
+            });
             // The daemon owns the dump directory and says where the file
             // is; whether it is still THERE is a plain `stat` the editor
             // can do itself, and one the daemon would have to answer with

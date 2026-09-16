@@ -16,13 +16,13 @@ const SUPPORTED_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 /// Handle one stdin line. `None` means "no reply" (notifications and
 /// unparseable garbage without an id).
 ///
-/// `db_url` is the report database, resolved once by `main` and handed
-/// down so the tool layer never looks it up itself (see
+/// `daemon` is how the report tools reach GemdropGo, built once by `main`
+/// and handed down so the tool layer never reaches for it itself (see
 /// [`crate::tools::call_tool`]).
 pub fn handle_line(
     line: &str,
     registry_dir: &Path,
-    db_url: &str,
+    daemon: &ggo_daemon_client::Connect,
     connect: &Connector,
 ) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
@@ -59,7 +59,7 @@ pub fn handle_line(
         ("tools/call", Some(id)) => {
             let name = msg["params"]["name"].as_str().unwrap_or_default();
             let args = &msg["params"]["arguments"];
-            let (content, is_error) = call_tool(name, args, registry_dir, db_url, connect);
+            let (content, is_error) = call_tool(name, args, registry_dir, daemon, connect);
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -88,18 +88,20 @@ mod tests {
         PathBuf::from("/nonexistent-registry")
     }
 
-    /// None of these tests reach a report tool, so the url they pass is
-    /// only ever carried -- but it points at a socket directory that does
-    /// not exist, so a routing mistake fails loudly instead of reading the
-    /// developer's own database.
-    const NO_DB_URL: &str = "postgres://ggo@localhost/ggo?host=/nonexistent/ggo-pg-socket";
+    /// None of these tests reach a report tool, so the connector they
+    /// pass is only ever carried -- and it panics if it is ever called,
+    /// so a routing mistake fails loudly instead of reaching the
+    /// developer's own daemon.
+    fn no_daemon() -> ggo_daemon_client::Connect {
+        std::sync::Arc::new(|| panic!("must not reach the daemon"))
+    }
 
     #[test]
     fn initialize_answers_with_capabilities_and_echoed_version() {
         let reply = handle_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
             &dir(),
-            NO_DB_URL,
+            &no_daemon(),
             &*no_connect(),
         )
         .unwrap();
@@ -115,7 +117,7 @@ mod tests {
             handle_line(
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
                 &dir(),
-                NO_DB_URL,
+                &no_daemon(),
                 &*no_connect()
             ),
             None
@@ -127,7 +129,7 @@ mod tests {
         let reply = handle_line(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
             &dir(),
-            NO_DB_URL,
+            &no_daemon(),
             &*no_connect(),
         )
         .unwrap();
@@ -139,7 +141,7 @@ mod tests {
         let err = handle_line(
             r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,
             &dir(),
-            NO_DB_URL,
+            &no_daemon(),
             &*no_connect(),
         )
         .unwrap();
@@ -151,7 +153,7 @@ mod tests {
         let reply = handle_line(
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"emu_status"}}"#,
             &dir(),
-            NO_DB_URL,
+            &no_daemon(),
             &*no_connect(),
         )
         .unwrap();
@@ -162,7 +164,7 @@ mod tests {
 
     #[test]
     fn parse_error_replies_with_null_id() {
-        let reply = handle_line("garbage", &dir(), NO_DB_URL, &*no_connect()).unwrap();
+        let reply = handle_line("garbage", &dir(), &no_daemon(), &*no_connect()).unwrap();
         assert_eq!(reply["error"]["code"], -32700);
         assert!(reply["id"].is_null());
     }
