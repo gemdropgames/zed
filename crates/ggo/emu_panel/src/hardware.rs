@@ -540,9 +540,17 @@ impl HardwareEnv {
 /// an older binary on `PATH` exits 2 on the unknown argument rather than
 /// ignoring it, and the transcript on the hardware page is where that
 /// shows up. The remedy is the page's own install/update buttons.
-pub fn flash_args(project: &Path, tty: &str, config: &FlashConfig) -> Vec<String> {
+/// `--repo` is passed EXPLICITLY rather than left to `ggo-diag`'s
+/// `detect_repo()` walk-up, for the reason `menu::diag_args` spells out:
+/// the walk starts at the process's cwd, which is only the right answer
+/// while this is a child process we chose the cwd for. Run through the
+/// daemon the cwd is the daemon's own manifest root, so an implicit
+/// detect would flash from whatever checkout the daemon was built from.
+pub fn flash_args(repo: &Path, project: &Path, tty: &str, config: &FlashConfig) -> Vec<String> {
     let mut args = vec![
         DIAG_MODE_ARG.to_string(),
+        "--repo".to_string(),
+        repo.to_string_lossy().into_owned(),
         "--project".to_string(),
         project.to_string_lossy().into_owned(),
         "--tty".to_string(),
@@ -628,11 +636,8 @@ pub fn flash_request(env: &HardwareEnv, config: &FlashConfig) -> Result<ProcRequ
     };
     // The child gets every knob explicitly, so what `effective_config`
     // reports is what runs even if ggo-diag's own defaults move.
-    Ok(ProcRequest::new(
-        bin,
-        repo,
-        flash_args(&project, &tty, &effective_config(env, config)),
-    ))
+    let args = flash_args(&repo, &project, &tty, &effective_config(env, config));
+    Ok(ProcRequest::new(bin, repo, args))
 }
 
 /// A stage of the pipeline, parsed from `ggo-diag`'s own output. The
@@ -1563,9 +1568,16 @@ mod tests {
     #[test]
     fn flash_args_pack_the_project_and_skip_place_and_route() {
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", &FlashConfig::default()),
+            flash_args(
+                Path::new("/ggo"),
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                &FlashConfig::default()
+            ),
             vec![
                 "diag",
+                "--repo",
+                "/ggo",
                 "--project",
                 "/game",
                 "--tty",
@@ -1575,6 +1587,24 @@ mod tests {
         );
     }
 
+    /// The repo must be NAMED, never left to `ggo-diag`'s cwd walk-up: run
+    /// through the daemon the cwd is the daemon's own build root, so an
+    /// implicit detect would flash from the wrong checkout entirely.
+    #[test]
+    fn the_flash_argv_names_the_repo_rather_than_relying_on_the_cwd() {
+        let args = flash_args(
+            Path::new("/home/dev/ggo"),
+            Path::new("/game"),
+            "/dev/ttyUSB0",
+            &FlashConfig::default(),
+        );
+        let repo = args
+            .iter()
+            .position(|arg| arg == "--repo")
+            .and_then(|at| args.get(at + 1));
+        assert_eq!(repo.map(String::as_str), Some("/home/dev/ggo"));
+    }
+
     #[test]
     fn a_gateware_rebuild_does_not_skip_place_and_route() {
         let config = FlashConfig {
@@ -1582,8 +1612,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", &config),
-            vec!["diag", "--project", "/game", "--tty", "/dev/ttyUSB0"],
+            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &config),
+            vec![
+                "diag",
+                "--repo",
+                "/ggo",
+                "--project",
+                "/game",
+                "--tty",
+                "/dev/ttyUSB0"
+            ],
         );
     }
 
@@ -1600,9 +1638,11 @@ mod tests {
             telemetry: true,
         };
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB3", &config),
+            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB3", &config),
             vec![
                 "diag",
+                "--repo",
+                "/ggo",
                 "--project",
                 "/game",
                 "--tty",
@@ -1615,7 +1655,7 @@ mod tests {
                 "--telemetry"
             ],
         );
-        let args = flash_args(Path::new("/game"), "/dev/ttyUSB0", &FlashConfig::default());
+        let args = flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &FlashConfig::default());
         for flag in ["--baud", "--collect-seconds", "--telemetry", "--world"] {
             assert!(!args.contains(&flag.to_string()), "{flag} in {args:?}");
         }
@@ -1684,9 +1724,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena),
+            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &arena),
             vec![
                 "diag",
+                "--repo",
+                "/ggo",
                 "--project",
                 "/game",
                 "--tty",
@@ -1701,9 +1743,11 @@ mod tests {
             ..arena
         };
         assert_eq!(
-            flash_args(Path::new("/game"), "/dev/ttyUSB0", &arena_full),
+            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &arena_full),
             vec![
                 "diag",
+                "--repo",
+                "/ggo",
                 "--project",
                 "/game",
                 "--tty",
@@ -1743,6 +1787,10 @@ mod tests {
         assert_eq!(
             request.args,
             flash_args(
+                // `ready_env`'s repo, not a literal: the argv's `--repo`
+                // has to be the checkout the env resolved, which is the
+                // whole point of passing it explicitly.
+                Path::new("/repo"),
                 Path::new("/game"),
                 "/dev/ttyUSB0",
                 &effective_config(&ready_env(), &arena)

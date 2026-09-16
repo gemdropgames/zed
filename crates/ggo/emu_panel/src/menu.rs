@@ -288,20 +288,28 @@ pub fn diag_request(env: &DiagEnv) -> Result<ProcRequest, String> {
             missing.join("; ")
         ));
     }
-    Ok(ProcRequest::new(
-        env.bin.clone(),
-        env.repo.clone().expect("checked above"),
-        diag_args(&env.ports[0]),
-    ))
+    let repo = env.repo.clone().expect("checked above");
+    let args = diag_args(&repo, &env.ports[0]);
+    Ok(ProcRequest::new(env.bin.clone(), repo, args))
 }
 
 /// `ggo-diag`'s argv for the built-in diagnostic cart on `tty` -- ggo-ide's
 /// `pages::device::argv::build_args` for a `launch_diag_cart` run, minus
 /// the form fields this entry has no form to collect (`--baud` and
 /// `--collect-seconds` both fall back to the CLI's own defaults).
-pub fn diag_args(tty: &str) -> Vec<String> {
+///
+/// `--repo` is passed EXPLICITLY rather than left to `ggo-diag`'s
+/// `detect_repo()` walk-up. That walk starts at the process's cwd, which
+/// is the right answer only while this is a child process we chose the cwd
+/// for. Run through the daemon the cwd is the daemon's own manifest root
+/// (`api::default_repo_root`), so an implicit detect would silently
+/// diagnose whatever checkout the daemon was built from instead of the
+/// one the user has open. Naming it keeps both paths identical.
+pub fn diag_args(repo: &Path, tty: &str) -> Vec<String> {
     vec![
         DIAG_MODE_ARG.to_string(),
+        "--repo".to_string(),
+        repo.to_string_lossy().into_owned(),
         "--tty".to_string(),
         tty.to_string(),
         "--skip-pnr".to_string(),
@@ -673,10 +681,31 @@ mod tests {
     #[test]
     fn the_diag_argv_launches_the_builtin_cart_without_a_full_pnr() {
         assert_eq!(
-            diag_args("/dev/ttyUSB0"),
-            ["diag", "--tty", "/dev/ttyUSB0", "--skip-pnr", "--launch"],
+            diag_args(Path::new("/ggo"), "/dev/ttyUSB0"),
+            [
+                "diag",
+                "--repo",
+                "/ggo",
+                "--tty",
+                "/dev/ttyUSB0",
+                "--skip-pnr",
+                "--launch"
+            ],
             "bare --launch IS the built-in diagnostic cart; `diag` selects the daemon mode"
         );
+    }
+
+    /// The repo must be NAMED, never left to `ggo-diag`'s cwd walk-up: run
+    /// through the daemon the cwd is the daemon's own build root, so an
+    /// implicit detect would diagnose the wrong checkout entirely.
+    #[test]
+    fn the_diag_argv_names_the_repo_rather_than_relying_on_the_cwd() {
+        let args = diag_args(Path::new("/home/dev/ggo"), "/dev/ttyUSB0");
+        let repo = args
+            .iter()
+            .position(|arg| arg == "--repo")
+            .and_then(|at| args.get(at + 1));
+        assert_eq!(repo.map(String::as_str), Some("/home/dev/ggo"));
     }
 
     #[test]
@@ -691,9 +720,9 @@ mod tests {
         assert_eq!(
             request.cwd,
             Path::new("/ggo"),
-            "ggo diag detects the repo from its cwd"
+            "the cwd still points at the repo for the child-process path"
         );
-        assert_eq!(request.args, diag_args("/dev/ttyUSB0"));
+        assert_eq!(request.args, diag_args(Path::new("/ggo"), "/dev/ttyUSB0"));
     }
 
     /// **The no-hardware case, which is the normal one.** Every missing

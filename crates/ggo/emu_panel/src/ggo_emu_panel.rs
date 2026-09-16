@@ -6524,7 +6524,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].bin, "ggo-diag");
         assert_eq!(calls[0].cwd, dir.path());
-        assert_eq!(calls[0].args, menu::diag_args("/dev/ttyFAKE"));
+        assert_eq!(calls[0].args, menu::diag_args(dir.path(), "/dev/ttyFAKE"));
 
         panel.update(cx, |panel, _cx| {
             assert_eq!(
