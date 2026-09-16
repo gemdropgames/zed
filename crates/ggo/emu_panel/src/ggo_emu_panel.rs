@@ -97,7 +97,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ggo_charts_panel::history::NO_DATABASE_URL;
 use ggo_worldlib::charts::reports::diag_db;
 use gpui::{
     AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable,
@@ -347,17 +346,18 @@ impl IngestStatus {
 }
 
 /// The ingest half of [`EmuPanel::finish_run`]'s background task: what a
-/// finished run becomes on the panel's ingest row. BLOCKING (it writes to
-/// the database), so callers stay off the UI thread. Named rather than
+/// finished run becomes on the panel's ingest row. BLOCKING (it talks to
+/// the daemon), so callers stay off the UI thread. Named rather than
 /// inline in the spawn so the failure paths -- malformed perf JSON, an
-/// unreachable database -- are testable without a real session to end.
+/// unreachable daemon -- are testable without a real session to end.
 ///
-/// `db_url` is the already-resolved database ([`EmuPanel::db_url`]),
-/// `None` only when no url could be resolved at all -- which is why the
-/// tests can reach that branch without touching the environment.
+/// The write goes through the daemon's `ggo_ingest_run` rather than this
+/// process opening a pool: one process owns the database, so the editor
+/// and every other host tool cannot drift onto different SQL. See
+/// `docs/daemon-api-plan.md` §4.2 in the GGO repo.
 fn ingest_finished_run(
     finished: &drive::FinishedRun,
-    db_url: Option<String>,
+    connect: &job_stream::Connect,
     label: &str,
 ) -> IngestStatus {
     match &finished.perf {
@@ -367,18 +367,19 @@ fn ingest_finished_run(
         // picker.
         None => IngestStatus::NoFrames,
         Some(perf) if perf.frames == 0 => IngestStatus::NoFrames,
-        Some(perf) => match db_url {
-            // Not a broken install -- `ggo_db::url()` only fails with no
-            // `$HOME` -- so this says what is true and nothing more, in
-            // the same words the charts and reports panels use for it.
-            None => IngestStatus::Failed(NO_DATABASE_URL.to_string()),
-            Some(db_url) => {
-                match ingest::ingest_run(&db_url, &perf.perf_json, &finished.uart, Some(label)) {
-                    Ok(run) => IngestStatus::Done(run.run_id, run.truncated_frames),
-                    Err(e) => IngestStatus::Failed(e),
-                }
+        Some(perf) => {
+            let client = match connect() {
+                Ok(client) => client,
+                // "The daemon isn't running" is the likeliest first-run
+                // failure, and the run's perf data is already gone by the
+                // time we get here -- so it has to be said, not swallowed.
+                Err(error) => return IngestStatus::Failed(format!("{error:#}")),
+            };
+            match client.ingest_run(&perf.perf_json, &finished.uart, Some(label)) {
+                Ok(run) => IngestStatus::Done(run.run_id, run.truncated_frames),
+                Err(error) => IngestStatus::Failed(format!("{error:#}")),
             }
-        },
+        }
     }
 }
 
@@ -535,6 +536,10 @@ pub struct EmuPanel {
     /// How this panel streams a flash / setup run. Injectable for the
     /// same reason `proc_runner` is: a test scripts the transcript.
     proc_streamer: ggo_common::ProcStreamer,
+    /// How this panel reaches the daemon for the end-of-run perf ingest.
+    /// Injectable for the same reason the two runners are: a test scripts
+    /// the daemon instead of needing one running.
+    daemon_connect: job_stream::Connect,
     /// The flash (or setup) run in flight. Dropping it kills the child --
     /// that is the cancel button.
     flash: Option<FlashRun>,
@@ -779,6 +784,7 @@ impl EmuPanel {
             pending_rebuild: false,
             watch_restart_pending: false,
             proc_streamer: job_stream::system_daemon_streamer(),
+            daemon_connect: job_stream::system_connect(),
             flash: None,
             last_flash: None,
             last_flash_perf_run: None,
@@ -1764,11 +1770,11 @@ impl EmuPanel {
         // sources has an identity to attach; this pane always knows which
         // file it ran.
         let label = session.cart.clone();
-        // Resolved here, on the thread the override lives on.
-        let db_url = self.db_url();
+        // Cloned here, on the thread the override lives on.
+        let connect = self.daemon_connect.clone();
         let finish = cx.background_spawn(async move {
             let finished = session.wait();
-            let status = ingest_finished_run(&finished, db_url, &label);
+            let status = ingest_finished_run(&finished, &connect, &label);
             (finished.reason, finished.is_error, status)
         });
         cx.spawn(async move |this, cx| {
@@ -4917,6 +4923,7 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
             panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = ingesting_connect(db.url().to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
@@ -5673,6 +5680,10 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(root.clone());
             panel.db_url_override = Some(db.url().to_string());
+            // The end-of-run ingest goes through the daemon now; answer it
+            // in-process against this same throwaway database rather than
+            // depending on one running on the machine.
+            panel.daemon_connect = ingesting_connect(db.url().to_string());
         });
         (db, workspace, panel, worktree_id, cx)
     }
@@ -6572,6 +6583,7 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(root.to_path_buf());
             panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = ingesting_connect(db.url().to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
@@ -7090,14 +7102,14 @@ mod tests {
 
     // ------------------------------------------- wave 3: the failed ingest
 
-    /// Malformed perf JSON fails the ingest -- with a reason, and before
-    /// the database is touched. Driven through the same named function
-    /// `finish_run`'s background task calls, with a hand-built
-    /// `FinishedRun` (the real emulator can only emit well-formed perf, so
-    /// this seam is the only way to reach the parse failure).
+    /// A daemon that connects but rejects the body must reach the ingest
+    /// row as a failure carrying the daemon's own reason. The parse now
+    /// happens daemon-side, so this scripts the rejection rather than
+    /// feeding junk to a local parser.
     #[test]
-    fn a_malformed_perf_json_fails_the_ingest_before_touching_the_db() {
-        let db = ggo_db::TestDb::new();
+    fn a_rejected_perf_json_fails_the_ingest_with_the_daemons_reason() {
+        let fake = ggo_daemon_client::FakeDaemon::new();
+        fake.on_tool_error("ggo_ingest_run", "invalid JSON: expected value at line 1");
         let finished = drive::FinishedRun {
             reason: "cart exited".to_string(),
             is_error: false,
@@ -7109,30 +7121,29 @@ mod tests {
             uart: vec!["[run] green.cart".to_string()],
         };
 
-        let status = ingest_finished_run(&finished, Some(db.url().to_string()), "green.cart");
+        let status = ingest_finished_run(&finished, &fake_connect(&fake), "green.cart");
 
         let IngestStatus::Failed(reason) = &status else {
-            panic!("malformed perf output must fail the ingest: {status:?}");
+            panic!("a rejected body must fail the ingest: {status:?}");
         };
-        assert!(!reason.is_empty(), "the failure must carry emd's reason");
+        assert!(
+            reason.contains("invalid JSON"),
+            "the failure must carry the daemon's reason: {reason}"
+        );
         let label = status.label().expect("a failed ingest has a row to show");
         assert!(
             label.starts_with("perf ingest failed:"),
             "the row must read as a failure: {label}"
         );
-        assert_eq!(
-            run_row_count(db.url()),
-            0,
-            "a run that cannot be parsed must not write a run row"
-        );
     }
 
-    /// With no database url at all, the ingest fails with the plain fact
-    /// -- the same sentence the charts and reports panels show -- and NOT
-    /// with an install hint: `ggo_db::url()` only fails when `$HOME` is
-    /// unset, which `scripts/pg-install.sh` would not fix.
+    /// A finished run's perf data is already gone by the time the ingest
+    /// runs, so a daemon that cannot be reached must SAY so rather than
+    /// drop the run silently.
     #[test]
-    fn no_database_url_fails_the_ingest_with_the_shared_wording() {
+    fn an_unreachable_daemon_fails_the_ingest_with_a_reason() {
+        let connect: job_stream::Connect =
+            Arc::new(|| Err(anyhow::anyhow!("connect to /run/ggo.sock: absent")));
         let finished = drive::FinishedRun {
             reason: "cart exited".to_string(),
             is_error: false,
@@ -7144,25 +7155,153 @@ mod tests {
             uart: Vec::new(),
         };
 
-        let status = ingest_finished_run(&finished, None, "green.cart");
+        let status = ingest_finished_run(&finished, &connect, "green.cart");
 
         let IngestStatus::Failed(reason) = &status else {
-            panic!("no database url must fail the ingest: {status:?}");
+            panic!("an unreachable daemon must fail the ingest: {status:?}");
         };
-        assert_eq!(reason, NO_DATABASE_URL);
-        assert!(!reason.contains(ggo_db::INSTALL_HINT), "{reason}");
+        assert!(reason.contains("/run/ggo.sock"), "{reason}");
     }
 
-    /// `run` rows in `db_url`, for the "the ingest wrote nothing"
-    /// assertions. `ggo_db::block_on` because these are gpui/plain tests,
-    /// never `#[tokio::test]`s.
-    fn run_row_count(db_url: &str) -> i64 {
-        ggo_db::block_on(async {
-            let pool = ggo_db::pool_for_async(db_url).await.unwrap();
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run")
-                .fetch_one(&pool)
-                .await
-                .unwrap()
+    /// The run IS stored when it is merely long; the truncation note is
+    /// advice about a very long run, not a failure.
+    #[test]
+    fn a_truncated_ingest_reports_the_run_it_stored() {
+        let fake = ggo_daemon_client::FakeDaemon::new();
+        fake.on_tool(
+            "ggo_ingest_run",
+            serde_json::json!({"run_id": 8, "cart_id": 2, "truncated_frames": 250_000}),
+        );
+        let finished = drive::FinishedRun {
+            reason: "cart exited".to_string(),
+            is_error: false,
+            perf: Some(drive::PerfSnapshot {
+                cart: "Green Fix".to_string(),
+                perf_json: "{}".to_string(),
+                frames: 250_000,
+            }),
+            uart: Vec::new(),
+        };
+
+        let status = ingest_finished_run(&finished, &fake_connect(&fake), "green.cart");
+
+        assert_eq!(status, IngestStatus::Done(8, Some(250_000)));
+        let label = status.label().expect("a stored run has a row to show");
+        assert!(label.contains("truncated"), "{label}");
+    }
+
+    /// A run that never reached a frame boundary must not reach the
+    /// daemon at all -- a zero-frame run row is noise in the picker.
+    #[test]
+    fn a_run_with_no_frames_is_never_sent_to_the_daemon() {
+        let fake = ggo_daemon_client::FakeDaemon::new();
+        let finished = drive::FinishedRun {
+            reason: "cart load failed".to_string(),
+            is_error: true,
+            perf: None,
+            uart: Vec::new(),
+        };
+
+        let status = ingest_finished_run(&finished, &fake_connect(&fake), "green.cart");
+
+        assert_eq!(status, IngestStatus::NoFrames);
+        assert!(
+            fake.calls().is_empty(),
+            "nothing was worth a run row: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// A client over a scripted daemon, for the ingest tests.
+    fn fake_connect(fake: &Arc<ggo_daemon_client::FakeDaemon>) -> job_stream::Connect {
+        let fake = fake.clone();
+        Arc::new(move || {
+            ggo_daemon_client::Client::with_transport(fake.transport()).map(Arc::new)
+        })
+    }
+
+    /// A daemon that REALLY ingests, into `db_url`.
+    ///
+    /// Every path through this panel can reach the end-of-run ingest, and
+    /// that write now goes through the daemon. A test must not depend on
+    /// one being installed and running on the machine -- it would ingest
+    /// into the developer's own database, and an older `ggo` on `PATH`
+    /// fails the call outright with "unknown tool". So the transport is
+    /// answered in-process, by the same `ingest::ingest_run` the real
+    /// daemon calls, pointed at the test's throwaway database. The rows
+    /// the assertions read back are therefore really written.
+    fn ingesting_connect(db_url: String) -> job_stream::Connect {
+        use ggo_worldlib::charts::reports::ingest;
+
+        Arc::new(move || {
+            let db_url = db_url.clone();
+            let transport: ggo_daemon_client::Transport = Arc::new(move |line: &str| {
+                let request: serde_json::Value = serde_json::from_str(line)?;
+                let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let method = request.get("method").and_then(serde_json::Value::as_str);
+                let params = request.get("params").cloned().unwrap_or_default();
+
+                let result = match method {
+                    Some("initialize") => serde_json::json!({
+                        "protocolVersion": ggo_daemon_client::PROTOCOL_VERSION,
+                        "serverInfo": {"name": "in-process", "version": "test"},
+                    }),
+                    Some("tools/call")
+                        if params.get("name").and_then(serde_json::Value::as_str)
+                            == Some("ggo_ingest_run") =>
+                    {
+                        let arguments = params.get("arguments").cloned().unwrap_or_default();
+                        let perf_json = arguments
+                            .get("perf_json")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let uart: Vec<String> = arguments
+                            .get("uart")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|lines| {
+                                lines
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let label = arguments.get("label").and_then(serde_json::Value::as_str);
+
+                        match ingest::ingest_run(&db_url, perf_json, &uart, label) {
+                            Ok(run) => {
+                                let payload = serde_json::json!({
+                                    "run_id": run.run_id,
+                                    "cart_id": run.cart_id,
+                                    "truncated_frames": run.truncated_frames,
+                                });
+                                serde_json::json!({
+                                    "content": [{"type": "text", "text": payload.to_string()}]
+                                })
+                            }
+                            // The daemon reports a rejected body as a tool
+                            // error, not a transport failure; so does this.
+                            Err(error) => serde_json::json!({
+                                "content": [{"type": "text", "text": error}],
+                                "isError": true,
+                            }),
+                        }
+                    }
+                    other => {
+                        return Ok(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32601,
+                                "message": format!("the in-process daemon has no {other:?}"),
+                            }
+                        })
+                        .to_string())
+                    }
+                };
+                Ok(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+            });
+            ggo_daemon_client::Client::with_transport(transport).map(Arc::new)
         })
     }
 
