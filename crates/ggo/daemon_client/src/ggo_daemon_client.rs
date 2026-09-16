@@ -231,6 +231,37 @@ pub struct FaultLookup {
 }
 pub use ggo_worldlib::charts::reports::uart_diag::{AssetFailure, PanicRow};
 
+/// [`Client::audio_probe`]'s answer: one clip's shape, plus the outline a
+/// canvas paints.
+///
+/// The waveform crosses instead of the samples deliberately. A
+/// three-minute clip is megabytes of PCM and ~2048 `(min, max)` pairs of
+/// outline, and the outline is the only form anyone draws -- see
+/// `docs/daemon-api-plan.md` §4.4.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AudioProbe {
+    pub waveform: Vec<(i16, i16)>,
+    pub rate_hz: u32,
+    pub source_channels: u16,
+    pub duration_ms: u64,
+    pub sample_count: usize,
+    /// The rate emerald's own baker would pick for this file, so a tab
+    /// opens on the form the hardware will play.
+    pub default_rate_hz: u32,
+    /// The file's own bytes when it is already a `.adp` -- which ARE its
+    /// baked form. `None` for a source file.
+    pub adp: Option<Vec<u8>>,
+}
+
+/// [`Client::audio_budget`]'s answer: what a blob costs against the
+/// sample region, and the rates a caller may offer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AudioBudget {
+    pub region_bytes: u32,
+    pub sample_region_bytes: u32,
+    pub rates: Vec<u32>,
+}
+
 /// One device (`ggo-diag`) run, as `diag_db::RunSummary` serialises it.
 ///
 /// Declared here rather than re-exported: `diag_db` is one of the modules
@@ -658,6 +689,104 @@ impl Client {
                 .unwrap_or_default(),
         ))
     }
+
+    // ----------------------------------------------------------- audio
+
+    /// Open one `.wav` / `.ogg` / `.adp`: its shape, its outline, and --
+    /// for a `.adp` -- its own bytes.
+    pub fn audio_probe(&self, path: &str) -> Result<AudioProbe> {
+        let value = self.call_tool("ggo_audio_probe", json!({"path": path}))?;
+        serde_json::from_value(value).context("decode the audio probe")
+    }
+
+    /// Bake a source file to a `.adp` blob at `rate_hz`.
+    ///
+    /// The blob comes back rather than being written: the editor holds it
+    /// to preview and to size, and a re-bake at another rate must not
+    /// touch the project. [`Self::audio_write`] is the import.
+    pub fn audio_bake(&self, path: &str, rate_hz: u32) -> Result<Vec<u8>> {
+        let value = self.call_tool(
+            "ggo_audio_bake",
+            json!({"path": path, "rate_hz": rate_hz}),
+        )?;
+        decode_base64_field(&value, "adp").context("decode the baked clip")
+    }
+
+    /// Write a baked blob to `rel` under `root`.
+    pub fn audio_write(&self, root: &str, rel: &str, adp: &[u8]) -> Result<()> {
+        self.call_tool(
+            "ggo_audio_write",
+            json!({"root": root, "rel": rel, "adp": encode_base64(adp)}),
+        )?;
+        Ok(())
+    }
+
+    /// What a baked blob costs against the 384 KiB sample region.
+    pub fn audio_budget(&self, adp: &[u8]) -> Result<AudioBudget> {
+        let value = self.call_tool("ggo_audio_budget", json!({"adp": encode_base64(adp)}))?;
+        serde_json::from_value(value).context("decode the audio budget")
+    }
+}
+
+/// Base64, for the one payload JSON cannot carry: a baked clip is tens of
+/// kilobytes of binary.
+///
+/// Hand-rolled rather than pulling `base64` in for two call sites -- this
+/// crate is the editor's one door to GemdropGo and its dependency list is
+/// worth keeping short. Standard alphabet, padded, as the daemon decodes.
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let index = ((n >> (18 - 6 * i)) & 0x3F) as usize;
+                out.push(ALPHABET[index] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The inverse, for a field the daemon sent as base64.
+fn decode_base64_field(value: &Value, field: &str) -> Result<Vec<u8>> {
+    let text = value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no {field} in the reply"))?;
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        let six = match byte {
+            b'A'..=b'Z' => u32::from(byte - b'A'),
+            b'a'..=b'z' => u32::from(byte - b'a') + 26,
+            b'0'..=b'9' => u32::from(byte - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            // Line breaks are legal in some base64 producers; anything
+            // else is a corrupt payload and must not decode silently.
+            b'\n' | b'\r' => continue,
+            other => bail!("{field} is not base64: byte {other:#04x}"),
+        };
+        acc = (acc << 6) | six;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// Look a string up by path, defaulting to empty -- a handshake field the
@@ -1411,6 +1540,176 @@ mod tests {
             client.fault_raw_path("2026-09-02_08-49-33_trap").expect("path"),
             PathBuf::from("/home/u/.ggo/uartd/faults/2026-09-02_08-49-33_trap.log")
         );
+    }
+
+    // ----------------------------------------------------------- audio
+
+    /// The base64 here is hand-rolled, so it is pinned against the exact
+    /// vectors from RFC 4648 -- including every padding length, which is
+    /// where a hand-rolled encoder goes wrong.
+    #[test]
+    fn base64_matches_the_rfc_vectors_at_every_padding_length() {
+        for (plain, encoded) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(encode_base64(plain), encoded, "encoding {plain:?}");
+            assert_eq!(
+                decode_base64_field(&json!({"adp": encoded}), "adp").expect("decodes"),
+                plain,
+                "decoding {encoded:?}"
+            );
+        }
+    }
+
+    /// Every byte value must survive, not just text: a `.adp` is binary,
+    /// and an encoder that only ever saw ASCII would pass the vectors
+    /// above and still corrupt a clip.
+    #[test]
+    fn base64_round_trips_every_byte_value() {
+        let every: Vec<u8> = (0..=255u8).collect();
+        let encoded = encode_base64(&every);
+        assert_eq!(
+            decode_base64_field(&json!({"adp": encoded}), "adp").expect("decodes"),
+            every
+        );
+    }
+
+    /// A corrupt payload must not decode to something plausible-looking:
+    /// silently truncating a clip is worse than refusing it.
+    #[test]
+    fn a_payload_that_is_not_base64_is_refused() {
+        let error = decode_base64_field(&json!({"adp": "not base64!"}), "adp")
+            .expect_err("`!` is not in the alphabet");
+        assert!(error.to_string().contains("not base64"), "{error}");
+    }
+
+    #[test]
+    fn probing_a_clip_decodes_its_shape_and_outline() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_audio_probe",
+            json!({
+                "waveform": [[-100, 200], [-300, 400]],
+                "rate_hz": 16_000,
+                "source_channels": 2,
+                "duration_ms": 1_500,
+                "sample_count": 24_000,
+                "default_rate_hz": 16_000,
+                "adp": null,
+            }),
+        );
+        let client = client_with(&fake);
+
+        let probe = client.audio_probe("assets/sfx/jump.wav").expect("probe");
+        assert_eq!(probe.rate_hz, 16_000);
+        assert_eq!(probe.source_channels, 2, "a stereo master says so");
+        assert_eq!(probe.duration_ms, 1_500);
+        assert_eq!(probe.waveform, vec![(-100, 200), (-300, 400)]);
+        assert_eq!(probe.adp, None, "a source file has no baked form yet");
+    }
+
+    /// A `.adp`'s own bytes ARE its baked form, and they arrive as base64
+    /// because JSON cannot carry binary.
+    #[test]
+    fn probing_an_adp_returns_its_own_bytes() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_audio_probe",
+            json!({
+                "waveform": [],
+                "rate_hz": 8_000,
+                "source_channels": 1,
+                "duration_ms": 0,
+                "sample_count": 0,
+                "default_rate_hz": 16_000,
+                "adp": [0u8, 1, 2, 255],
+            }),
+        );
+        let client = client_with(&fake);
+
+        let probe = client.audio_probe("assets/sfx/jump.adp").expect("probe");
+        assert_eq!(probe.adp, Some(vec![0, 1, 2, 255]));
+    }
+
+    #[test]
+    fn baking_returns_the_blob_and_never_writes() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_audio_bake", json!({"adp": encode_base64(&[9, 8, 7])}));
+        let client = client_with(&fake);
+
+        assert_eq!(
+            client.audio_bake("assets/sfx/jump.wav", 32_000).expect("bake"),
+            vec![9, 8, 7]
+        );
+        let calls = fake.calls();
+        let (_, arguments) = calls
+            .iter()
+            .find(|(name, _)| name == "ggo_audio_bake")
+            .expect("baked");
+        assert_eq!(arguments["rate_hz"], json!(32_000));
+        assert!(
+            !calls.iter().any(|(name, _)| name == "ggo_audio_write"),
+            "a bake must not touch the project: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn writing_sends_the_blob_as_base64_under_the_project_root() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_audio_write", json!({"written": "assets/sfx/jump.adp"}));
+        let client = client_with(&fake);
+
+        client
+            .audio_write("/proj", "assets/sfx/jump.adp", &[1, 2, 3])
+            .expect("write");
+
+        let calls = fake.calls();
+        let (_, arguments) = calls
+            .iter()
+            .find(|(name, _)| name == "ggo_audio_write")
+            .expect("written");
+        assert_eq!(arguments["root"], json!("/proj"));
+        assert_eq!(arguments["rel"], json!("assets/sfx/jump.adp"));
+        assert_eq!(arguments["adp"], json!(encode_base64(&[1, 2, 3])));
+    }
+
+    #[test]
+    fn the_budget_reports_the_cost_and_the_rates_on_offer() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_audio_budget",
+            json!({
+                "region_bytes": 4_096,
+                "sample_region_bytes": 393_216,
+                "rates": [8_000, 16_000, 32_000],
+            }),
+        );
+        let client = client_with(&fake);
+
+        let budget = client.audio_budget(&[1, 2, 3]).expect("budget");
+        assert_eq!(budget.region_bytes, 4_096);
+        assert_eq!(budget.sample_region_bytes, 393_216);
+        assert_eq!(budget.rates, vec![8_000, 16_000, 32_000]);
+    }
+
+    /// A file that is not audio is the caller's mistake, and the reason
+    /// has to reach a status line rather than a log.
+    #[test]
+    fn a_clip_that_cannot_be_decoded_carries_the_daemons_reason() {
+        let fake = FakeDaemon::new();
+        fake.on_tool_error("ggo_audio_probe", "notes.txt: not a .wav or .ogg");
+        let client = client_with(&fake);
+
+        let Err(error) = client.audio_probe("notes.txt") else {
+            panic!("a .txt is not audio");
+        };
+        assert!(error.to_string().contains("not a .wav or .ogg"), "{error}");
     }
 
     /// Omitting the limit must send no `limit` key at all, so the daemon
