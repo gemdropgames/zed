@@ -287,6 +287,74 @@ pub struct IngestedRun {
     pub truncated_frames: Option<usize>,
 }
 
+// ------------------------------------------------------ live sessions
+//
+// Mirrors of `ggo-daemon`'s `live` types. Declared here rather than
+// re-exported because the daemon is a BINARY crate -- there is no library
+// to depend on -- so the serde attributes below are the wire contract,
+// and the round-trip tests pin them.
+
+/// Where a live session's shared-memory regions are, and at what
+/// geometry: everything needed to map them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Regions {
+    pub frame_path: String,
+    pub audio_path: String,
+    /// The daemon's frame-ring ABI version. Compared against the one this
+    /// build of `ggo-shm` speaks BEFORE mapping, so a mismatch is a
+    /// sentence rather than a misread pixel.
+    pub frame_abi: u32,
+    pub audio_abi: u32,
+    pub width: u32,
+    pub height: u32,
+    pub slots: u32,
+    pub audio_capacity_pairs: u32,
+    /// The rate the audio ring's samples are at -- what a consumer
+    /// resamples FROM.
+    pub mix_rate_hz: u32,
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "ended", rename_all = "snake_case")]
+pub enum Ended {
+    /// Still going.
+    No,
+    /// The cart called `exit`. A non-zero code is the cart's own verdict
+    /// on itself, not an emulator failure -- the panel styles the two
+    /// differently, so they must not be flattened here.
+    Exited { code: i32 },
+    /// The CPU faulted, a frame never reached a boundary, or a region
+    /// write failed.
+    Failed { reason: String },
+    /// A caller asked it to stop.
+    Stopped,
+}
+
+impl Ended {
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::No)
+    }
+
+    /// Did this run end BADLY? A cart exiting -- whatever its code -- is
+    /// the cart finishing, not the emulator failing.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+}
+
+/// A live session's state, without mapping anything.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveStatus {
+    pub frames: u64,
+    /// Frames published into the ring. Equal to `frames` unless a publish
+    /// failed, which is an shm fault rather than an emulator one.
+    pub published: u64,
+    pub paused: bool,
+    #[serde(flatten)]
+    pub ended: Ended,
+}
+
 /// The injection seam: anything that can carry one JSON-RPC request line
 /// and return one response line.
 ///
@@ -725,6 +793,82 @@ impl Client {
     pub fn audio_budget(&self, adp: &[u8]) -> Result<AudioBudget> {
         let value = self.call_tool("ggo_audio_budget", json!({"adp": encode_base64(adp)}))?;
         serde_json::from_value(value).context("decode the audio budget")
+    }
+
+    // --------------------------------------------------- live sessions
+    //
+    // Control and status only. Frames and audio cross through the shm
+    // regions `live_start` names -- nothing here carries a pixel or a
+    // sample, which is the whole reason the split exists.
+
+    /// Boot `cart` into a free-running session and learn where its
+    /// regions are.
+    ///
+    /// The session starts PAUSED at frame zero: a caller that wants to
+    /// step into a cart's first frame can, and one that wants it running
+    /// calls [`Self::live_resume`].
+    pub fn live_start(&self, session: &str, cart: &str) -> Result<Regions> {
+        let value = self.call_tool(
+            "ggo_live_start",
+            json!({"session": session, "cart": cart}),
+        )?;
+        serde_json::from_value(value).context("decode the session regions")
+    }
+
+    /// One live session's frame count, paused flag, and how it ended.
+    pub fn live_status(&self, session: &str) -> Result<LiveStatus> {
+        let value = self.call_tool("ggo_live_status", json!({"session": session}))?;
+        serde_json::from_value(value).context("decode the session status")
+    }
+
+    /// Where a live session's regions are, for a caller mapping them
+    /// after the fact -- a reconnect, or a second viewer.
+    pub fn live_regions(&self, session: &str) -> Result<Regions> {
+        let value = self.call_tool("ggo_live_regions", json!({"session": session}))?;
+        serde_json::from_value(value).context("decode the session regions")
+    }
+
+    /// Park at the next frame boundary.
+    pub fn live_pause(&self, session: &str) -> Result<LiveStatus> {
+        let value = self.call_tool("ggo_live_pause", json!({"session": session}))?;
+        serde_json::from_value(value).context("decode the session status")
+    }
+
+    /// Run. Forgets queued steps: resume means go, not go-then-stop.
+    pub fn live_resume(&self, session: &str) -> Result<LiveStatus> {
+        let value = self.call_tool("ggo_live_resume", json!({"session": session}))?;
+        serde_json::from_value(value).context("decode the session status")
+    }
+
+    /// While paused, run `frames` more frames then park again.
+    pub fn live_step(&self, session: &str, frames: u32) -> Result<LiveStatus> {
+        let value = self.call_tool(
+            "ggo_live_step",
+            json!({"session": session, "count": frames}),
+        )?;
+        serde_json::from_value(value).context("decode the session status")
+    }
+
+    /// Latch the pad; it takes effect at the next frame boundary.
+    ///
+    /// Level-triggered state, not a stream of events: whatever was set
+    /// last is what the next frame sees.
+    pub fn live_input(&self, session: &str, buttons: u32) -> Result<LiveStatus> {
+        let value = self.call_tool(
+            "ggo_live_input",
+            json!({"session": session, "buttons": buttons}),
+        )?;
+        serde_json::from_value(value).context("decode the session status")
+    }
+
+    /// Stop a live session and remove its regions.
+    ///
+    /// Closing one that is not there is not an error -- a panel tidying
+    /// up after a run it already stopped should not have to remember
+    /// which.
+    pub fn live_close(&self, session: &str) -> Result<()> {
+        self.call_tool("ggo_live_close", json!({"session": session}))?;
+        Ok(())
     }
 }
 
@@ -1696,6 +1840,162 @@ mod tests {
         assert_eq!(budget.region_bytes, 4_096);
         assert_eq!(budget.sample_region_bytes, 393_216);
         assert_eq!(budget.rates, vec![8_000, 16_000, 32_000]);
+    }
+
+    // --------------------------------------------------- live sessions
+
+    /// The types here are hand-mirrored (the daemon is a binary crate, so
+    /// there is nothing to import), which makes the serde field names a
+    /// contract between two independently built processes. A FULL region
+    /// answer has to survive, not a convenient subset.
+    #[test]
+    fn starting_a_live_session_decodes_every_region_field() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_live_start",
+            json!({
+                "frame_path": "/run/user/1000/ggo/demo/frames.bin",
+                "audio_path": "/run/user/1000/ggo/demo/audio.bin",
+                "frame_abi": 1,
+                "audio_abi": 1,
+                "width": 320,
+                "height": 240,
+                "slots": 3,
+                "audio_capacity_pairs": 4_096,
+                "mix_rate_hz": 32_020,
+            }),
+        );
+        let client = client_with(&fake);
+
+        let regions = client.live_start("demo", "game.ggo").expect("start");
+        assert_eq!(regions.frame_path, "/run/user/1000/ggo/demo/frames.bin");
+        assert_eq!(regions.audio_path, "/run/user/1000/ggo/demo/audio.bin");
+        assert_eq!(regions.width, 320);
+        assert_eq!(regions.height, 240);
+        assert_eq!(regions.slots, 3);
+        assert_eq!(regions.audio_capacity_pairs, 4_096);
+        assert_eq!(
+            regions.mix_rate_hz, 32_020,
+            "the rate a consumer resamples FROM is the last field a drift drops"
+        );
+
+        let calls = fake.calls();
+        let (_, arguments) = calls
+            .iter()
+            .find(|(name, _)| name == "ggo_live_start")
+            .expect("started");
+        assert_eq!(arguments["session"], json!("demo"));
+        assert_eq!(arguments["cart"], json!("game.ggo"));
+    }
+
+    /// A running session, a cart that exited, and a cart that faulted are
+    /// three different things. The panel styles them differently, so the
+    /// tag must decode -- not collapse to "not running".
+    #[test]
+    fn a_live_status_decodes_each_way_a_run_can_end() {
+        let fake = FakeDaemon::new();
+        let client = client_with(&fake);
+
+        fake.on_tool(
+            "ggo_live_status",
+            json!({"frames": 12, "published": 12, "paused": false, "ended": "no"}),
+        );
+        let running = client.live_status("demo").expect("status");
+        assert_eq!(running.frames, 12);
+        assert_eq!(running.published, 12);
+        assert!(!running.paused);
+        assert_eq!(running.ended, Ended::No);
+        assert!(running.ended.is_running());
+        assert!(!running.ended.is_error());
+
+        fake.on_tool(
+            "ggo_live_status",
+            json!({"frames": 90, "published": 90, "paused": false, "ended": "exited", "code": 3}),
+        );
+        let exited = client.live_status("demo").expect("status");
+        assert_eq!(exited.ended, Ended::Exited { code: 3 });
+        assert!(
+            !exited.ended.is_error(),
+            "a non-zero exit is the cart's verdict on itself, not a failure"
+        );
+
+        fake.on_tool(
+            "ggo_live_status",
+            json!({
+                "frames": 4, "published": 4, "paused": false,
+                "ended": "failed", "reason": "IllegalInstruction",
+            }),
+        );
+        let failed = client.live_status("demo").expect("status");
+        assert!(failed.ended.is_error());
+        let Ended::Failed { reason } = failed.ended else {
+            panic!("expected a failure");
+        };
+        assert!(reason.contains("IllegalInstruction"), "{reason}");
+
+        fake.on_tool(
+            "ggo_live_status",
+            json!({"frames": 7, "published": 7, "paused": true, "ended": "stopped"}),
+        );
+        let stopped = client.live_status("demo").expect("status");
+        assert_eq!(stopped.ended, Ended::Stopped);
+        assert!(!stopped.ended.is_error(), "a stop is not a failure");
+    }
+
+    /// A step names its frame count; a pause and a resume name only the
+    /// session. Each answers with the status after, so a caller never has
+    /// to follow one call with another to learn what happened.
+    #[test]
+    fn the_transport_controls_send_what_they_mean_and_answer_with_status() {
+        let fake = FakeDaemon::new();
+        let paused = json!({"frames": 3, "published": 3, "paused": true, "ended": "no"});
+        fake.on_tool("ggo_live_pause", paused.clone());
+        fake.on_tool("ggo_live_resume", json!({"frames": 3, "published": 3, "paused": false, "ended": "no"}));
+        fake.on_tool("ggo_live_step", paused.clone());
+        fake.on_tool("ggo_live_input", paused);
+        let client = client_with(&fake);
+
+        assert!(client.live_pause("demo").expect("pause").paused);
+        assert!(!client.live_resume("demo").expect("resume").paused);
+        assert_eq!(client.live_step("demo", 5).expect("step").frames, 3);
+        assert!(client.live_input("demo", 0b1010).expect("input").paused);
+
+        let calls = fake.calls();
+        let argument = |name: &str, key: &str| {
+            calls
+                .iter()
+                .find(|(called, _)| called == name)
+                .map(|(_, args)| args[key].clone())
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(argument("ggo_live_step", "count"), json!(5));
+        assert_eq!(argument("ggo_live_input", "buttons"), json!(0b1010));
+        assert_eq!(argument("ggo_live_pause", "session"), json!("demo"));
+    }
+
+    /// Closing a session that is not there is not an error: a panel
+    /// tidying up after a run it already stopped should not have to
+    /// remember which.
+    #[test]
+    fn closing_a_live_session_is_not_an_error_when_there_is_none() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_live_close", json!({"closed": "demo"}));
+        let client = client_with(&fake);
+        client.live_close("demo").expect("close");
+    }
+
+    /// A cart that will not boot has to reach the panel as text: it is
+    /// the likeliest thing to go wrong when a user presses Run.
+    #[test]
+    fn a_live_session_that_cannot_start_carries_the_daemons_reason() {
+        let fake = FakeDaemon::new();
+        fake.on_tool_error("ggo_live_start", "boot cart: bad cart magic");
+        let client = client_with(&fake);
+
+        let Err(error) = client.live_start("demo", "notacart.bin") else {
+            panic!("a bad cart must not start");
+        };
+        assert!(error.to_string().contains("bad cart magic"), "{error}");
     }
 
     /// A file that is not audio is the caller's mistake, and the reason
