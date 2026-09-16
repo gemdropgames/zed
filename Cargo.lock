@@ -7510,6 +7510,7 @@ dependencies = [
 name = "ggo_emu_panel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel 2.5.0",
  "base64 0.22.1",
  "chrono",
@@ -7524,6 +7525,7 @@ dependencies = [
  "ggo-worldlib",
  "ggo_charts_panel",
  "ggo_common",
+ "ggo_daemon_client",
  "ggo_emu_remote",
  "ggo_world_panel",
  "gpui",

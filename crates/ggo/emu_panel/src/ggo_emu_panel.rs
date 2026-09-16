@@ -82,6 +82,7 @@ mod drive;
 mod emu_item;
 mod hardware;
 mod hardware_item;
+mod job_stream;
 mod ingest;
 mod input;
 mod link;
@@ -777,7 +778,7 @@ impl EmuPanel {
             build_is_explicit: false,
             pending_rebuild: false,
             watch_restart_pending: false,
-            proc_streamer: ggo_common::system_proc_streamer(),
+            proc_streamer: job_stream::system_daemon_streamer(),
             flash: None,
             last_flash: None,
             last_flash_perf_run: None,
