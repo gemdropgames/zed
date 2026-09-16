@@ -1,0 +1,30 @@
+[package]
+name = "ggo_daemon_client"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ggo_daemon_client.rs"
+
+# The ONE crate under `crates/ggo/` allowed a dependency on a `ggo-*` crate
+# (see `docs/daemon-api-plan.md` §5 in the GGO repo). Every other panel
+# reaches GemdropGo through this client. P6 adds a test that enforces it.
+#
+# Nothing from the GGO tree is needed yet: P0 is the control plane, which is
+# JSON over a unix socket. `ggo-shm` arrives with P4's frame ring.
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `smol::process::Command`, not `std`'s: this checkout's `clippy.toml`
+# disallows the latter's `spawn`/`output`/`status` outright.
+smol.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

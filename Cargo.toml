@@ -363,6 +363,7 @@ ggo-worldlib = { path = "../ggo/tools/ggo-worldlib" } # GGO
 ggo_audio_panel = { path = "crates/ggo/audio_panel" } # GGO
 ggo_charts_panel = { path = "crates/ggo/charts_panel" } # GGO
 ggo_common = { path = "crates/ggo/common" } # GGO
+ggo_daemon_client = { path = "crates/ggo/daemon_client" } # GGO
 ggo_emerald_panel = { path = "crates/ggo/emerald_panel" } # GGO
 ggo_emu_mcp = { path = "crates/ggo/emu_mcp" } # GGO
 ggo_emu_remote = { path = "crates/ggo/emu_remote" } # GGO
