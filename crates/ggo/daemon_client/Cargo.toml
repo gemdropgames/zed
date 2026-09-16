@@ -11,6 +11,13 @@ workspace = true
 [lib]
 path = "src/ggo_daemon_client.rs"
 
+[features]
+# An in-process daemon for panel tests: real report/fault/ingest answers,
+# served out of a throwaway database, with no `ggo serve` anywhere. Turning
+# it on pulls in worldlib's `db`, which is why it is a feature and not the
+# default -- the production build must never link sqlx.
+test-support = ["ggo-worldlib/db"]
+
 # The ONE crate under `crates/ggo/` allowed a dependency on a `ggo-*` crate
 # (see `docs/daemon-api-plan.md` §5 in the GGO repo). Every other panel
 # reaches GemdropGo through this client. P6 adds a test that enforces it.

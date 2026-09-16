@@ -36,6 +36,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// An in-process daemon backed by a real database, for panel tests. Behind
+// a feature because it links sqlx; see the module's own doc.
+#[cfg(feature = "test-support")]
+pub mod test_daemon;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde_json::{Value, json};
 
