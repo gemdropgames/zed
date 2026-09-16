@@ -2294,9 +2294,10 @@ mod tests {
     }
 
     /// Open `rel` through the fork's interceptor and hand back its
-    /// emulator panel, with the perf ingest pointed at `db_url` -- without
-    /// that redirect a run that reaches the end of `finish_run` writes a
-    /// row into the developer's real ggo database.
+    /// emulator panel, with the perf ingest pointed at an in-process
+    /// daemon over `db_url` -- without that redirect a run that reaches
+    /// the end of `finish_run` ingests a row through the developer's real
+    /// daemon, into the developer's real database.
     fn open_cart(
         workspace: &Entity<Workspace>,
         cx: &mut gpui::VisualTestContext,
@@ -2317,7 +2318,12 @@ mod tests {
                 .test_panel()
         });
         panel.update(cx, |panel, _| {
-            panel.test_set_db_url(db_url.to_string());
+            // Nothing in these journeys reads a fault dump, so the dump
+            // directory is a path that is never opened.
+            panel.test_set_daemon(ggo_daemon_client::test_daemon::ingesting_connect(
+                db_url,
+                std::path::PathBuf::from("/nonexistent"),
+            ));
         });
         cx.run_until_parked();
         panel

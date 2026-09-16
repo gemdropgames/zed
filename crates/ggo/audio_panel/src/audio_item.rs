@@ -44,6 +44,19 @@ impl AudioItem {
         let panel = cx.new(|cx| {
             let mut panel = AudioPanel::new(None, window, cx);
             panel.root_override = Some(root);
+            // Never the machine's own daemon: a test must not depend on
+            // one being installed and running, and an older `ggo` on
+            // `PATH` fails the audio calls outright with "unknown tool".
+            // The in-process one runs the REAL codec, so what these tests
+            // bake is what the daemon would bake.
+            //
+            // The database url is deliberately unreachable: no audio tool
+            // touches a database, so a routing mistake fails loudly here
+            // rather than reading the developer's own.
+            panel.connect = ggo_daemon_client::test_daemon::ingesting_connect(
+                "postgres://ggo@localhost/ggo?host=/nonexistent-ggo-socket",
+                std::path::PathBuf::from("/nonexistent"),
+            );
             panel
         });
         Self::wrap(rel, panel, window, cx)

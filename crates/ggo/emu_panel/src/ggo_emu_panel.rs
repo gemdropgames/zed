@@ -388,14 +388,6 @@ pub struct EmuPanel {
     /// Test hook: bypass workspace worktree discovery
     /// (`ggo_world_panel::root_override`'s analog).
     root_override: Option<PathBuf>,
-    /// Test hook: read and write THIS database instead of `ggo_db::url()`
-    /// -- `ggo_charts_panel`'s `db_url_override`, same name, same reason.
-    /// Load-bearing here rather than merely convenient: without it, any
-    /// test that ran a real cart to completion would write a `run` row
-    /// into the developer's actual database. One field covers both the
-    /// perf ingest and the flashed-run lookup, because ggo-diag's rows and
-    /// ours now live in one database.
-    db_url_override: Option<String>,
     project_root: Option<PathBuf>,
     /// The cart the file explorer last routed here, as a project-relative
     /// `/`-separated path. `None` until something is clicked.
@@ -741,7 +733,6 @@ impl EmuPanel {
             focus_handle,
             workspace,
             root_override: None,
-            db_url_override: None,
             project_root: None,
             selected: None,
             remote_controlled: false,
@@ -3861,17 +3852,16 @@ impl EmuPanel {
         self.status_is_error
     }
 
-    /// Point the perf ingest at `url` instead of `ggo_db::url()`.
+    /// Reach `connect`'s daemon instead of the machine's own.
     ///
     /// The one WRITE hook here, and load-bearing rather than convenient:
     /// a journey that runs a real cart to completion would otherwise
-    /// write a `run` row into the developer's actual database -- exactly
-    /// what `db_url_override` exists to prevent for this crate's own
-    /// tests, which set the same field directly. It redirects a
-    /// destination; it changes no emulator state. `test-support` only.
+    /// ingest a `run` row through the developer's actual daemon, into the
+    /// developer's actual database. It redirects a destination; it
+    /// changes no emulator state. `test-support` only.
     #[cfg(feature = "test-support")]
-    pub fn test_set_db_url(&mut self, url: String) {
-        self.db_url_override = Some(url);
+    pub fn test_set_daemon(&mut self, connect: job_stream::Connect) {
+        self.daemon_connect = connect;
     }
 }
 
@@ -4414,7 +4404,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update_in(cx, |panel, window, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
             panel.refresh_root(cx);
             panel.open_rel_path("green.cart", window, cx);
         });
@@ -4466,7 +4456,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update_in(cx, |panel, window, cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
             panel.refresh_root(cx);
             panel.open_rel_path("green.cart", window, cx);
         });
@@ -4658,7 +4648,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
         });
         // Exactly how the file explorer gets a cart in here.
         panel.update_in(cx, |panel, window, cx| {
@@ -4864,7 +4854,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)
@@ -4916,7 +4906,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
             panel.daemon_connect = ingesting_connect(db.url().to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
@@ -4990,7 +4980,7 @@ mod tests {
 
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _| {
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
         });
         let root = dir.path().to_path_buf();
 
@@ -5673,7 +5663,7 @@ mod tests {
         let db = ggo_db::TestDb::new();
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(root.clone());
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
             // The end-of-run ingest goes through the daemon now; answer it
             // in-process against this same throwaway database rather than
             // depending on one running on the machine.
@@ -6576,7 +6566,7 @@ mod tests {
         let db = ggo_db::TestDb::new();
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(root.to_path_buf());
-            panel.db_url_override = Some(db.url().to_string());
+            panel.daemon_connect = test_connect(db.url());
             panel.daemon_connect = ingesting_connect(db.url().to_string());
         });
         panel.update_in(cx, |panel, window, cx| {
@@ -7267,7 +7257,7 @@ mod tests {
         let (panel, cx) = windowed_panel(cx);
         panel.update(cx, |panel, _cx| {
             panel.root_override = Some(dir.path().to_path_buf());
-            panel.db_url_override = Some(UNREACHABLE_DB_URL.to_string());
+            panel.daemon_connect = test_connect(UNREACHABLE_DB_URL);
         });
         panel.update_in(cx, |panel, window, cx| {
             panel.open_rel_path("green.cart", window, cx)

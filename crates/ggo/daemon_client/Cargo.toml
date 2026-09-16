@@ -16,7 +16,7 @@ path = "src/ggo_daemon_client.rs"
 # served out of a throwaway database, with no `ggo serve` anywhere. Turning
 # it on pulls in worldlib's `db`, which is why it is a feature and not the
 # default -- the production build must never link sqlx.
-test-support = ["ggo-worldlib/db"]
+test-support = ["ggo-worldlib/db", "dep:ggo-audio"]
 
 # The ONE crate under `crates/ggo/` allowed a dependency on a `ggo-*` crate
 # (see `docs/daemon-api-plan.md` §5 in the GGO repo). Every other panel
@@ -28,6 +28,10 @@ test-support = ["ggo-worldlib/db"]
 # point of this crate is that the editor no longer opens a database.
 # `ggo-shm` joins it with P4's frame ring.
 ggo-worldlib.workspace = true
+# The in-process daemon's audio arms run the REAL codec, so a panel test
+# bakes what the daemon would bake. Optional: only `test-support` needs it,
+# and the production client carries no codec at all.
+ggo-audio = { workspace = true, optional = true }
 anyhow.workspace = true
 log.workspace = true
 serde.workspace = true

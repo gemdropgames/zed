@@ -190,6 +190,77 @@ fn call(db_url: &str, faults_dir: &std::path::Path, name: &str, arguments: &Valu
                 "truncated_frames": run.truncated_frames,
             })
         }
+        // The audio tools run the real codec against real files, so a
+        // panel test bakes what the daemon would bake.
+        "ggo_audio_probe" => {
+            let path = std::path::PathBuf::from(
+                arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "ggo_audio_probe needs a path".to_string())?,
+            );
+            let is_adp = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("adp"));
+            let (decoded, adp) = if is_adp {
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                let decoded = ggo_audio::decode_adp(&bytes)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                (decoded, Some(bytes))
+            } else {
+                (
+                    ggo_audio::decode(&path).map_err(|error| format!("{error:#}"))?,
+                    None,
+                )
+            };
+            json!({
+                "waveform": ggo_audio::buckets(&decoded.samples, ggo_audio::WAVEFORM_BUCKETS),
+                "rate_hz": decoded.rate_hz,
+                "source_channels": decoded.source_channels,
+                "duration_ms": decoded.duration_ms(),
+                "sample_count": decoded.samples.len(),
+                "default_rate_hz": ggo_audio::default_rate(&path),
+                "adp": adp,
+            })
+        }
+        "ggo_audio_bake" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "ggo_audio_bake needs a path".to_string())?;
+            let rate_hz = arguments
+                .get("rate_hz")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "ggo_audio_bake needs a rate_hz".to_string())? as u32;
+            let decoded = ggo_audio::decode(std::path::Path::new(path))
+                .map_err(|error| format!("{error:#}"))?;
+            json!({"adp": crate::encode_base64(&ggo_audio::bake(&decoded, rate_hz))})
+        }
+        "ggo_audio_write" => {
+            let root = arguments
+                .get("root")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "ggo_audio_write needs a root".to_string())?;
+            let rel = arguments
+                .get("rel")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "ggo_audio_write needs a rel".to_string())?;
+            let blob = crate::decode_base64_field(&arguments, "adp")
+                .map_err(|error| format!("{error:#}"))?;
+            ggo_audio::write_adp(std::path::Path::new(root), rel, &blob)
+                .map_err(|error| format!("{error:#}"))?;
+            json!({"written": rel})
+        }
+        "ggo_audio_budget" => {
+            let blob = crate::decode_base64_field(&arguments, "adp")
+                .map_err(|error| format!("{error:#}"))?;
+            json!({
+                "region_bytes": ggo_audio::adp_region_bytes(&blob).unwrap_or(0),
+                "sample_region_bytes": ggo_audio::SAMPLE_REGION_BYTES,
+                "rates": ggo_audio::RATES.to_vec(),
+            })
+        }
         other => return Err(format!("the in-process daemon has no {other}")),
     };
     Ok(json!({"content": [{"type": "text", "text": payload.to_string()}]}))

@@ -23,9 +23,14 @@ path = "src/ggo_audio_panel.rs"
 anyhow.workspace = true
 editor.workspace = true
 ggo-asset-formats.workspace = true # GGO -- `parse_adp` for the Baked preview's blocks
-ggo-audio.workspace = true # GGO -- decode / bake / budget
+# GGO -- `Decoded` and the ONE decode left here: the Source-mode preview
+# feeds raw PCM to the `Apu`, and raw PCM is what `ggo_audio_probe`
+# deliberately does not send. Bake/size/write went to the daemon in P3;
+# this goes in P4 with the preview. See `docs/daemon-api-plan.md` §4.4.
+ggo-audio.workspace = true
 ggo-emu-core.workspace = true # GGO -- the standalone `Apu` behind the Baked preview
 ggo_common.workspace = true
+ggo_daemon_client.workspace = true # GGO -- probe / bake / size / write
 ggo_emu_panel.workspace = true # GGO -- the cpal ring the emulator pane already owns
 gpui.workspace = true
 log.workspace = true
@@ -34,6 +39,8 @@ ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+# GGO -- the in-process daemon, so a panel test never needs `ggo serve`.
+ggo_daemon_client = { workspace = true, features = ["test-support"] }
 # `project`'s test-support turns on `remote/test-support`, which adds a
 # `RemoteConnectionOptions` variant that `remote_connection`'s lib only
 # matches on under ITS `test-support` -- same dance every GGO panel's

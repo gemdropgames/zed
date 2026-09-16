@@ -734,7 +734,7 @@ impl Client {
 /// Hand-rolled rather than pulling `base64` in for two call sites -- this
 /// crate is the editor's one door to GemdropGo and its dependency list is
 /// worth keeping short. Standard alphabet, padded, as the daemon decodes.
-fn encode_base64(bytes: &[u8]) -> String {
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -758,7 +758,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 
 /// The inverse, for a field the daemon sent as base64.
-fn decode_base64_field(value: &Value, field: &str) -> Result<Vec<u8>> {
+pub(crate) fn decode_base64_field(value: &Value, field: &str) -> Result<Vec<u8>> {
     let text = value
         .get(field)
         .and_then(Value::as_str)

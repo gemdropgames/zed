@@ -39,11 +39,12 @@ use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState};
 use workspace::Workspace;
 
 use ggo_audio::Decoded;
+use ggo_daemon_client::{AudioBudget, AudioProbe, Connect};
 use ggo_emu_panel::audio::AudioStatus;
 
 pub use audio_item::AudioItem;
 use load::Loaded;
-use preview::{Preview, Spec};
+use preview::{Preview, Spec, BLOCK_BYTES, SAMPLES_PER_BLOCK};
 
 actions!(
     ggo_audio,
@@ -156,8 +157,18 @@ pub(crate) enum ViewerState {
 pub(crate) struct Open {
     pub(crate) rel: String,
     pub(crate) is_adp: bool,
-    pub(crate) decoded: Arc<Decoded>,
+    /// The clip's shape, as the daemon reported it. Its `waveform` is
+    /// moved out into [`Self::waveform`] at load -- see there.
+    pub(crate) probe: AudioProbe,
+    /// The outline the canvas paints, behind an `Arc` because `render`
+    /// runs on every paint and this is ~2048 pairs.
     waveform: Arc<Vec<(i16, i16)>>,
+    /// What a baked blob costs and which rates may be offered -- the
+    /// daemon's answer, so this panel holds no copy of either.
+    pub(crate) budget: AudioBudget,
+    /// PCM for the Source-mode preview only. `None` for a `.adp`, which
+    /// previews from its blob. Goes in P4 with the preview itself.
+    pub(crate) decoded: Option<Arc<Decoded>>,
     /// The rate the bake (and Import) uses. For a `.adp` this is the
     /// file's own rate and cannot change.
     pub(crate) rate: u32,
@@ -181,12 +192,19 @@ pub struct AudioPanel {
     bake_generation: u64,
     _load_task: Option<Task<()>>,
     _bake_task: Option<Task<()>>,
+    /// The budget refresh that follows a bake. Its own field so a rate
+    /// change can supersede it without cancelling the bake it belongs to.
+    _budget_task: Option<Task<()>>,
     /// Shared with the preview thread; the readout line shows its label.
     status: AudioStatus,
     preview: Option<Preview>,
     _playhead_task: Option<Task<()>>,
     /// The Import target path, editable.
     import_target: Entity<Editor>,
+    /// How this panel reaches the daemon: every decode, bake, size and
+    /// write goes over that socket. Injectable so a test can script one
+    /// instead of needing `ggo serve` running.
+    pub(crate) connect: Connect,
 }
 
 impl AudioPanel {
@@ -205,10 +223,12 @@ impl AudioPanel {
             bake_generation: 0,
             _load_task: None,
             _bake_task: None,
+            _budget_task: None,
             status: AudioStatus::new(),
             preview: None,
             _playhead_task: None,
             import_target: cx.new(|cx| Editor::single_line(window, cx)),
+            connect: ggo_daemon_client::system_connect(),
         }
     }
 
@@ -258,7 +278,8 @@ impl AudioPanel {
         self.state = ViewerState::Loading(rel.clone());
         cx.notify();
         let path = root.join(&rel);
-        let loaded = cx.background_spawn(async move { load::load(&path) });
+        let connect = self.connect.clone();
+        let loaded = cx.background_spawn(async move { load::load(&connect, &path) });
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let loaded = loaded.await;
             this.update(cx, |this, cx| {
@@ -282,16 +303,26 @@ impl AudioPanel {
 
     fn set_loaded(&mut self, rel: String, loaded: Loaded, cx: &mut Context<Self>) {
         let is_adp = loaded.adp.is_some();
-        let rate = match &loaded.adp {
-            Some(_) => loaded.decoded.rate_hz,
-            None => ggo_audio::default_rate(Path::new(&rel)),
+        // A `.adp` carries its own rate; a source opens on the rate
+        // emerald's baker would pick, which the daemon reports rather
+        // than this panel deciding it a second time.
+        let rate = match is_adp {
+            true => loaded.probe.rate_hz,
+            false => loaded.probe.default_rate_hz,
         };
         let target = default_import_target(&rel);
+        // Taken, not cloned: the probe carries the outline across the
+        // socket once, and the canvas wants it behind an `Arc` rather
+        // than re-cloned on every paint.
+        let mut probe = loaded.probe;
+        let waveform = Arc::new(std::mem::take(&mut probe.waveform));
         self.state = ViewerState::Ready(Open {
             rel,
             is_adp,
+            probe,
+            waveform,
+            budget: loaded.budget,
             decoded: loaded.decoded,
-            waveform: loaded.waveform,
             rate,
             baked: loaded.adp,
             baking: false,
@@ -316,6 +347,14 @@ impl AudioPanel {
         }
     }
 
+    /// A connected client, or why the daemon could not be reached.
+    ///
+    /// Only the import needs one synchronously -- every other call runs
+    /// inside `cx.background_spawn` and connects there.
+    fn connect(&self) -> anyhow::Result<std::sync::Arc<ggo_daemon_client::Client>> {
+        (self.connect)().map_err(|error| anyhow::anyhow!("the GemdropGo daemon is unavailable: {error:#}"))
+    }
+
     fn open_mut(&mut self) -> Option<&mut Open> {
         match &mut self.state {
             ViewerState::Ready(open) => Some(open),
@@ -336,19 +375,81 @@ impl AudioPanel {
         }
         open.baking = true;
         open.baked = None;
-        let decoded = open.decoded.clone();
         let rate = open.rate;
+        let rel = open.rel.clone();
         cx.notify();
-        let bake = cx.background_spawn(async move { Arc::new(ggo_audio::bake(&decoded, rate)) });
+        let connect = self.connect.clone();
+        let root = self.project_root.clone();
+        // The bake is the daemon's: it owns the codec emerald packs with,
+        // so an editor-baked `.adp` and a pack-baked one cannot drift.
+        let bake = cx.background_spawn(async move {
+            let root = root.ok_or_else(|| "no project folder is open".to_string())?;
+            let client = connect().map_err(|error| format!("{error:#}"))?;
+            client
+                .audio_bake(&root.join(&rel).to_string_lossy(), rate)
+                .map(Arc::new)
+                .map_err(|error| format!("{error:#}"))
+        });
         self._bake_task = Some(cx.spawn(async move |this, cx| {
-            let blob = bake.await;
+            let baked = bake.await;
             this.update(cx, |this, cx| {
                 if this.bake_generation != generation {
                     return;
                 }
+                let mut landed = false;
                 if let Some(open) = this.open_mut() {
-                    open.baked = Some(blob);
                     open.baking = false;
+                    match baked {
+                        Ok(blob) => {
+                            open.baked = Some(blob);
+                            landed = true;
+                        }
+                        // A bake that failed has to say so where the user
+                        // is looking: the readout would otherwise sit at
+                        // "baking…" for ever.
+                        Err(error) => open.error = Some(error),
+                    }
+                }
+                // The readout's numbers belong to THIS blob. Without
+                // this, a re-bake at another rate would leave the
+                // previous rate's block count and percentage on screen.
+                if landed {
+                    this.refresh_budget(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The budget line's numbers for `blob`, fetched off-thread.
+    ///
+    /// Asked of the daemon rather than computed here: the region size and
+    /// the block arithmetic are the codec's, and a second copy in the
+    /// editor is how a readout starts disagreeing with what a cart loads.
+    fn refresh_budget(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.open_mut() else {
+            return;
+        };
+        let Some(blob) = open.baked.clone() else {
+            return;
+        };
+        let generation = self.bake_generation;
+        let connect = self.connect.clone();
+        let budget = cx.background_spawn(async move {
+            connect()
+                .map_err(|error| format!("{error:#}"))?
+                .audio_budget(&blob)
+                .map_err(|error| format!("{error:#}"))
+        });
+        self._budget_task = Some(cx.spawn(async move |this, cx| {
+            let budget = budget.await;
+            this.update(cx, |this, cx| {
+                if this.bake_generation != generation {
+                    return;
+                }
+                if let (Some(open), Ok(budget)) = (this.open_mut(), budget) {
+                    open.budget = budget;
                 }
                 cx.notify();
             })
@@ -410,7 +511,17 @@ impl AudioPanel {
             return;
         };
         let spec = match open.mode {
-            Mode::Source => Spec::Source(open.decoded.clone()),
+            // `decoded` is `None` only for a `.adp`, which has no Source
+            // mode to be in -- but the state is expressible, so it is
+            // answered rather than unwrapped.
+            Mode::Source => match open.decoded.clone() {
+                Some(decoded) => Spec::Source(decoded),
+                None => {
+                    open.error = Some("this file has no source form".to_string());
+                    cx.notify();
+                    return;
+                }
+            },
             Mode::Baked => match &open.baked {
                 Some(blob) => Spec::Baked(blob.clone()),
                 None => {
@@ -490,7 +601,12 @@ impl AudioPanel {
             ViewerState::Ready(_) => anyhow::bail!("still baking — try again in a moment"),
             _ => anyhow::bail!("nothing is open"),
         };
-        ggo_audio::write_adp(&root, &target, &blob)?;
+        // The daemon writes it: temp file plus rename, so a crash cannot
+        // leave half a `.adp` for `emd pack-ggo` to ship.
+        self.connect()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?
+            .audio_write(&root.to_string_lossy(), &target, &blob)
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         Ok(target)
     }
 
@@ -602,24 +718,26 @@ impl AudioPanel {
         };
         let playing = self.preview.is_some();
         let progress = self.preview.as_ref().map(|p| p.progress());
-        let secs = open.decoded.duration_ms() as f32 / 1000.0;
+        let secs = open.probe.duration_ms as f32 / 1000.0;
         let header = format!(
             "{} Hz · {} ch · {secs:.2} s{}",
-            open.decoded.rate_hz,
-            open.decoded.source_channels,
+            open.probe.rate_hz,
+            open.probe.source_channels,
             if open.is_adp { " · baked" } else { "" }
         );
 
         let readout = match (&open.baked, open.baking) {
-            (Some(blob), _) => {
-                let bytes = ggo_audio::adp_region_bytes(blob).unwrap_or(0);
-                let blocks = bytes / 64;
-                let pct = bytes as u64 * 100 / ggo_audio::SAMPLE_REGION_BYTES as u64;
-                let baked_secs = blocks as f32 * 120.0 / open.rate.max(1) as f32;
+            (Some(_), _) => {
+                let bytes = open.budget.region_bytes;
+                let region = open.budget.sample_region_bytes;
+                let blocks = bytes / BLOCK_BYTES;
+                let pct = u64::from(bytes) * 100 / u64::from(region.max(1));
+                let baked_secs =
+                    blocks as f32 * SAMPLES_PER_BLOCK as f32 / open.rate.max(1) as f32;
                 format!(
                     "baked {} Hz · {blocks} blocks · {bytes} B · {pct}% of {} KiB · {baked_secs:.2} s",
                     open.rate,
-                    ggo_audio::SAMPLE_REGION_BYTES / 1024
+                    region / 1024
                 )
             }
             (None, true) => format!("baking at {} Hz…", open.rate),
@@ -628,8 +746,11 @@ impl AudioPanel {
         let audio_label = self.status.state().label(playing);
 
         let weak = cx.weak_entity();
-        let rate_menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-            for rate in ggo_audio::RATES {
+        // The rates on offer are the daemon's -- the one authority on
+        // which rates the baker accepts.
+        let rates = open.budget.rates.clone();
+        let rate_menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            for rate in rates {
                 let weak = weak.clone();
                 menu = menu.entry(
                     SharedString::from(format!("{} kHz", rate / 1000)),
@@ -960,8 +1081,14 @@ mod tests {
 
         panel.read_with(cx, |panel, cx| {
             let open = ready(panel);
-            assert_eq!(open.decoded.rate_hz, 32_000);
-            assert_eq!(open.decoded.samples.len(), 32_000);
+            // The daemon's probe is what the tab shows; the local PCM
+            // exists only to feed a Source-mode preview.
+            assert_eq!(open.probe.rate_hz, 32_000);
+            assert_eq!(open.probe.sample_count, 32_000);
+            assert!(
+                open.decoded.is_some(),
+                "a source file keeps PCM for the Source preview"
+            );
             assert_eq!(open.rate, 16_000, "wav defaults to the SFX rate");
             assert!(!open.is_adp);
             let blob = open.baked.as_ref().expect("bake landed");
@@ -1018,7 +1145,11 @@ mod tests {
             assert!(open.is_adp);
             assert_eq!(open.rate, 16_000);
             assert!(open.baked.is_some(), "the file is its own bake");
-            assert_eq!(open.decoded.samples.len(), (16_000 / 120 + 1) * 120);
+            assert_eq!(open.probe.sample_count, (16_000 / 120 + 1) * 120);
+            assert!(
+                open.decoded.is_none(),
+                "a .adp previews from its blob, so nothing decodes it here"
+            );
             let err = panel.write_import(cx).unwrap_err();
             assert!(err.to_string().contains("already a .adp"), "{err}");
         });

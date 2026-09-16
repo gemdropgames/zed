@@ -46,8 +46,8 @@ const DRAIN_FRAMES: u64 = 20;
 const MIX_RATE_NOMINAL: u64 = 32_000;
 /// Contract §4: `loop_off == 0xFFFF_FFFF` plays once.
 const LOOP_NONE: u32 = ggo_emu_core::apu::ONE_SHOT;
-const SAMPLES_PER_BLOCK: u64 = 120;
-const BLOCK_BYTES: usize = 64;
+pub(crate) const SAMPLES_PER_BLOCK: u64 = 120;
+pub(crate) const BLOCK_BYTES: u32 = 64;
 
 /// A running preview. Dropping it stops the thread.
 pub struct Preview {
@@ -219,7 +219,7 @@ fn run_baked(
     let Some((header, blocks)) = ggo_asset_formats::parse_adp(blob) else {
         return;
     };
-    let len = header.block_count as usize * BLOCK_BYTES;
+    let len = header.block_count as usize * BLOCK_BYTES as usize;
     if len == 0 || header.rate_hz == 0 {
         return;
     }
@@ -238,7 +238,7 @@ fn run_baked(
     if apu.play_sample(0, 0, uploaded as u32, loop_off, step_vol, 0) < 0 {
         return;
     }
-    let total_samples = uploaded as u64 / BLOCK_BYTES as u64 * SAMPLES_PER_BLOCK;
+    let total_samples = uploaded as u64 / u64::from(BLOCK_BYTES) * SAMPLES_PER_BLOCK;
     let frames_total = (total_samples * 60).div_ceil(header.rate_hz as u64).max(1);
     let mut pacer = Pacer {
         last: Instant::now(),

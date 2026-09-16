@@ -1,94 +1,66 @@
-//! Off-thread half of opening a file: decode it (or read a baked `.adp`
-//! back) and reduce it to the fixed-size waveform the canvas paints.
+//! Off-thread half of opening a file.
+//!
+//! The daemon decodes, buckets and sizes: [`probe`] is one
+//! `ggo_audio_probe` round trip that answers everything the tab shows --
+//! rate, channels, duration, the waveform outline, and (for a `.adp`) the
+//! file's own bytes, which ARE its baked form.
+//!
+//! **One local decode survives, and only for a source file.** A `.adp`
+//! previews straight from its blob, so opening one touches no codec here
+//! at all. A `.wav`/`.ogg` in Source mode feeds raw PCM to the `Apu`, and
+//! raw PCM is the one thing the probe deliberately does not send -- see
+//! `docs/daemon-api-plan.md` §4.4. That decode goes in P4, when the
+//! preview moves onto the shm audio ring.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ggo_audio::Decoded;
-
-/// Waveform resolution. Fixed at load rather than derived from the canvas
-/// width so a three-minute track is walked once, not on every paint; the
-/// canvas maps its columns onto these.
-pub const WAVEFORM_BUCKETS: usize = 2048;
+use ggo_daemon_client::{AudioBudget, AudioProbe, Connect};
 
 pub struct Loaded {
-    pub decoded: Arc<Decoded>,
-    /// `(min, max)` per bucket, [`WAVEFORM_BUCKETS`] of them (fewer for a
-    /// clip shorter than that).
-    pub waveform: Arc<Vec<(i16, i16)>>,
-    /// For a `.adp`: the file itself -- it IS the baked form. `None` for a
-    /// source file, whose bake the panel runs separately at the chosen
-    /// rate.
+    /// The clip's shape and outline, as the daemon reported it.
+    pub probe: AudioProbe,
+    /// What a baked blob costs, and the rates the tab may offer. For a
+    /// `.adp` this is its own cost; for a source file it is zero bytes
+    /// and the rate list, until the first bake lands.
+    pub budget: AudioBudget,
+    /// PCM for the Source-mode preview. `None` for a `.adp`, which
+    /// previews from its blob and needs no samples.
+    pub decoded: Option<Arc<Decoded>>,
+    /// For a `.adp`: the file itself. `None` for a source file, whose
+    /// bake the panel asks for separately at the chosen rate.
     pub adp: Option<Arc<Vec<u8>>>,
 }
 
-pub fn is_adp(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("adp"))
-}
+/// **Blocking** (two socket round trips), so callers stay off the UI
+/// thread -- the panel runs this inside `cx.background_spawn`.
+pub fn load(connect: &Connect, path: &Path) -> Result<Loaded> {
+    let client = connect().context("the GemdropGo daemon is unavailable")?;
+    let probe = client
+        .audio_probe(&path.to_string_lossy())
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
 
-pub fn load(path: &Path) -> Result<Loaded> {
-    let (decoded, adp) = if is_adp(path) {
-        let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
-        let decoded = ggo_audio::decode_adp(&bytes).with_context(|| path.display().to_string())?;
-        (decoded, Some(Arc::new(bytes)))
-    } else {
-        (ggo_audio::decode(path)?, None)
+    // A `.adp`'s own bytes are its baked form, so its cost is known now.
+    // A source file has none yet: the empty blob asks the same tool for
+    // the rate list alone, rather than this crate keeping a second copy
+    // of which rates exist.
+    let adp = probe.adp.clone().map(Arc::new);
+    let budget = client
+        .audio_budget(adp.as_deref().map(Vec::as_slice).unwrap_or(&[]))
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+
+    // The one local decode, and only for what the preview will need.
+    let decoded = match adp {
+        Some(_) => None,
+        None => Some(Arc::new(ggo_audio::decode(path)?)),
     };
-    let waveform = buckets(&decoded.samples, WAVEFORM_BUCKETS);
+
     Ok(Loaded {
-        decoded: Arc::new(decoded),
-        waveform: Arc::new(waveform),
+        probe,
+        budget,
+        decoded,
         adp,
     })
-}
-
-/// `(min, max)` over `n` equal slices of `samples` (or one per sample when
-/// there are fewer than `n`).
-pub fn buckets(samples: &[i16], n: usize) -> Vec<(i16, i16)> {
-    if samples.is_empty() || n == 0 {
-        return Vec::new();
-    }
-    let n = n.min(samples.len());
-    (0..n)
-        .map(|i| {
-            let start = i * samples.len() / n;
-            let end = ((i + 1) * samples.len() / n).max(start + 1);
-            let slice = &samples[start..end];
-            let lo = slice.iter().copied().min().unwrap_or(0);
-            let hi = slice.iter().copied().max().unwrap_or(0);
-            (lo, hi)
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn buckets_take_the_extremes_of_each_slice() {
-        let samples: Vec<i16> = (0..8)
-            .map(|i| if i % 2 == 0 { -100 * i } else { 100 * i })
-            .collect();
-        // Slices of two: (0,100), (-200,300), (-400,500), (-600,700).
-        assert_eq!(
-            buckets(&samples, 4),
-            vec![(0, 100), (-200, 300), (-400, 500), (-600, 700)]
-        );
-    }
-
-    #[test]
-    fn short_clips_get_one_bucket_per_sample_and_empty_gets_none() {
-        assert_eq!(buckets(&[5, -5], 2048), vec![(5, 5), (-5, -5)]);
-        assert!(buckets(&[], 2048).is_empty());
-        assert!(buckets(&[1], 0).is_empty());
-    }
-
-    #[test]
-    fn is_adp_is_case_insensitive_on_the_extension() {
-        assert!(is_adp(Path::new("a/b.ADP")));
-        assert!(!is_adp(Path::new("a/b.wav")));
-    }
 }
