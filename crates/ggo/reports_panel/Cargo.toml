@@ -15,11 +15,11 @@ path = "src/ggo_reports_panel.rs"
 # The three producers write two different timestamp shapes; ordering them
 # means parsing both, and the local one needs a zone.
 chrono.workspace = true
-# Resolving the one shared database url (`ggo_db::url`), and -- in tests --
-# a throwaway database per journey through `ggo_db::TestDb`.
-ggo-db.workspace = true # GGO
 ggo-worldlib.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO
+# GGO -- the one door to GemdropGo: perf runs, device runs and fault dumps
+# all arrive over the daemon's socket.
+ggo_daemon_client.workspace = true
 ggo_common.workspace = true # GGO
 gpui.workspace = true
 log.workspace = true
@@ -27,6 +27,10 @@ ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+# GGO -- SEEDING ONLY. A journey builds the rows it wants with `TestDb`,
+# then reads them back the way the panel does: over the in-process daemon.
+ggo-db.workspace = true
+ggo_daemon_client = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

@@ -7619,6 +7619,7 @@ dependencies = [
  "ggo-worldlib",
  "ggo_charts_panel",
  "ggo_common",
+ "ggo_daemon_client",
  "gpui",
  "log",
  "project",

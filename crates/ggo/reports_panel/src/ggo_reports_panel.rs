@@ -23,7 +23,6 @@
 //! in different zones besides.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
@@ -36,10 +35,10 @@ use ui::{ListItem, Tooltip};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
-use ggo_charts_panel::history::{self, HISTORY_LIMIT, NO_DATABASE_URL};
+use ggo_charts_panel::history::{self, HISTORY_LIMIT};
 use ggo_charts_panel::loader::{self, RunListing};
 use ggo_charts_panel::{RunSummary, open_charts_item};
-use ggo_worldlib::charts::reports::faults::{self, FaultRow};
+use ggo_daemon_client::{Connect, FaultRow};
 
 actions!(
     ggo_reports,
@@ -298,8 +297,10 @@ pub struct ReportsPanel {
     loading: bool,
     /// Poll ticks since this activation, for [`reconcile_history_this_tick`].
     poll_tick: u64,
-    db_url_override: Option<String>,
-    faults_dir_override: Option<PathBuf>,
+    /// How this panel reaches the daemon. Perf runs, device runs and
+    /// faults all arrive over that socket; the panel opens no database of
+    /// its own and never reads the dump directory itself.
+    connect: Connect,
     _load_task: Option<Task<()>>,
     _poll_task: Option<Task<()>>,
 }
@@ -320,26 +321,10 @@ impl ReportsPanel {
             generation: 0,
             loading: false,
             poll_tick: 0,
-            db_url_override: None,
-            faults_dir_override: None,
+            connect: ggo_daemon_client::system_connect(),
             _load_task: None,
             _poll_task: None,
         }
-    }
-
-    /// The one database every source lives in -- perf runs, `ggo-diag`'s
-    /// device runs and the imported faults alike.
-    fn db_url(&self) -> Option<String> {
-        self.db_url_override.clone().or_else(|| ggo_db::url().ok())
-    }
-
-    /// Where `ggo-uartd` drops its dumps --
-    /// [`ggo_common::default_faults_dir`], the same directory the charts
-    /// panel resolves a dump's raw path in.
-    fn faults_dir(&self) -> Option<PathBuf> {
-        self.faults_dir_override
-            .clone()
-            .or_else(ggo_common::default_faults_dir)
     }
 
     /// Reload everything, device history included. The activation and
@@ -374,12 +359,7 @@ impl ReportsPanel {
         }
         self.generation += 1;
         let generation = self.generation;
-        let Some(db_url) = self.db_url() else {
-            self.state = LoadState::Error(NO_DATABASE_URL.to_string());
-            cx.notify();
-            return;
-        };
-        let faults_dir = self.faults_dir();
+        let connect = self.connect.clone();
         let known_device = self.device.clone();
         let known_device_note = self.device_note.clone();
         self.loading = true;
@@ -396,16 +376,14 @@ impl ReportsPanel {
             // would otherwise read as complete. Same sentence the MCP's
             // `import_failure_note` prints, so an agent and the dock
             // describe one failure one way.
+            // The import is the daemon's now: `ggo_faults` digests every
+            // new dump on its way to answering, so there is no separate
+            // step to fail here. What used to be reported as "importing
+            // faults failed" arrives as a failure of the list itself,
+            // below.
             let mut notes = Vec::new();
-            if let Some(dir) = faults_dir.as_ref()
-                && let Err(error) = faults::import(dir, &db_url)
-            {
-                let note = format!("importing faults from {} failed: {error}", dir.display());
-                log::warn!("reports: {note}");
-                notes.push(note);
-            }
             let mut failure = None;
-            let perf = match loader::list_runs(&db_url) {
+            let perf = match loader::list_runs(&connect) {
                 Ok(runs) => runs,
                 Err(error) => {
                     failure = Some(error);
@@ -420,7 +398,7 @@ impl ReportsPanel {
             // work the panel can decline.
             let perf = perf.into_iter().take(HISTORY_LIMIT as usize).collect();
             let (device, device_note) = if reconcile_history {
-                let history = history::load(&db_url, HISTORY_LIMIT);
+                let history = history::load(&connect, HISTORY_LIMIT);
                 (history.runs, history.note)
             } else {
                 (known_device, known_device_note)
@@ -431,7 +409,13 @@ impl ReportsPanel {
             // An unreachable database is an ERROR here, not an empty
             // list: a fault section that silently reads as "no dumps"
             // when the server is down hides the one signal the user has.
-            let faults = match faults::list(&db_url, HISTORY_LIMIT) {
+            let faults = match connect()
+                .map_err(|error| format!("{error:#}"))
+                .and_then(|client| {
+                    client
+                        .faults(Some(HISTORY_LIMIT))
+                        .map_err(|error| format!("{error:#}"))
+                }) {
                 Ok(rows) => rows,
                 Err(error) => {
                     failure = failure.or(Some(error));
@@ -526,15 +510,11 @@ impl ReportsPanel {
         });
     }
 
-    /// Read reports from `url` instead of the database `ggo_db::url`
-    /// resolves. Test hook: production resolves its own.
-    pub fn set_db_url_override(&mut self, url: String) {
-        self.db_url_override = Some(url);
-    }
-
-    /// Import dumps from `path` instead of `~/.ggo/uartd/faults`.
-    pub fn set_faults_dir_override(&mut self, path: PathBuf) {
-        self.faults_dir_override = Some(path);
+    /// Reach a different daemon than the one the environment names.
+    /// Test hook: production connects through
+    /// [`ggo_daemon_client::system_connect`].
+    pub fn set_connect(&mut self, connect: Connect) {
+        self.connect = connect;
     }
 
     // -------------------------------------------------------------- render
@@ -777,6 +757,17 @@ mod tests {
     /// created at" fixture.
     const UNREACHABLE_DB_URL: &str = "postgres://ggo@localhost/ggo?host=/nonexistent/ggo-pg-socket";
 
+    /// A [`Connect`] onto an in-process daemon over `db_url`, reading
+    /// dumps from `faults_dir`.
+    ///
+    /// Journeys SEED with `TestDb` and a fixture dump directory, then read
+    /// back the way the panel does. The daemon does the importing, so a
+    /// dump written under `faults_dir` reaches the list exactly as one
+    /// written by `ggo-uartd` would.
+    fn test_connect(db_url: &str, faults_dir: &std::path::Path) -> Connect {
+        ggo_daemon_client::test_daemon::ingesting_connect(db_url, faults_dir)
+    }
+
     fn perf(id: i64, at: &str) -> RunListing {
         RunListing {
             id,
@@ -958,8 +949,7 @@ mod tests {
         write_dump(&faults_dir, "2026-09-02_08-49-33_marker");
         let panel = cx.update(|cx| cx.new(|cx| ReportsPanel::new(None, cx)));
         panel.update(cx, |panel, cx| {
-            panel.set_db_url_override(db.url().to_string());
-            panel.set_faults_dir_override(faults_dir.clone());
+            panel.set_connect(test_connect(db.url(), &faults_dir));
             panel.refresh(cx);
             panel.refresh(cx);
             panel.refresh(cx);
@@ -1004,8 +994,7 @@ mod tests {
         write_dump(&faults_dir, "2026-09-02_08-49-33_marker");
         let panel = cx.update(|cx| cx.new(|cx| ReportsPanel::new(None, cx)));
         panel.update(cx, |panel, cx| {
-            panel.set_db_url_override(UNREACHABLE_DB_URL.to_string());
-            panel.set_faults_dir_override(faults_dir.clone());
+            panel.set_connect(test_connect(UNREACHABLE_DB_URL, &faults_dir));
             panel.refresh(cx);
         });
         cx.run_until_parked();
@@ -1027,22 +1016,20 @@ mod tests {
                 .expect("an empty list owes the reader a reason");
             assert_ne!(note, EMPTY_MESSAGE, "'no reports yet' would be a lie here");
             assert_eq!(note, *error, "and the reason shown IS that failure");
-            // The two best-effort halves recorded their own reasons on the
-            // way past. They are one root cause with the failure above --
-            // the server is down -- so the note the reader sees is that
-            // one line, but neither reason was swallowed.
-            assert!(
-                panel
-                    .notes
-                    .iter()
-                    .any(|n| n.contains("importing faults from")
-                        && n.contains(&faults_dir.display().to_string())),
-                "the directory that could not be imported is named: {:?}",
-                panel.notes
-            );
+            // The device history is best-effort and recorded its own
+            // reason on the way past. It is one root cause with the
+            // failure above -- the server is down -- so the note the
+            // reader sees is that one line, but the reason was not
+            // swallowed.
+            //
+            // There is no separate "importing faults from <dir>" note any
+            // more: the daemon digests new dumps on its way to answering
+            // `ggo_faults`, so an import that cannot happen IS the fault
+            // list failing, which is the `LoadState::Error` asserted
+            // above. One failure, reported once.
             assert!(
                 panel.notes.iter().any(|n| n.contains("device runs")),
-                "and the device history's own reason comes through too: {:?}",
+                "the device history's own reason comes through: {:?}",
                 panel.notes
             );
 
@@ -1088,11 +1075,11 @@ mod tests {
             let item = cx.new(|cx| ggo_charts_panel::ChartsItem::new(workspace.weak_handle(), cx));
             let charts = item.read(cx).panel().clone();
             charts.update(cx, |charts, _| {
-                charts.set_db_url_override(db.url().to_string());
-                // The tab resolves the clicked dump's raw path itself; left
-                // at its default it would `stat` the developer's real
-                // ~/.ggo/uartd/faults instead of this fixture's.
-                charts.set_faults_dir_override(faults_dir.clone());
+                // The tab resolves the clicked dump's raw path through
+                // the daemon; pointed at the same in-process one it lands
+                // in this fixture's directory rather than the developer's
+                // real ~/.ggo/uartd/faults.
+                charts.set_connect(test_connect(db.url(), &faults_dir));
             });
             workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
         });
@@ -1101,8 +1088,7 @@ mod tests {
             .read_with(cx, |workspace, cx| workspace.panel::<ReportsPanel>(cx))
             .expect("init adds the panel to every workspace");
         panel.update(cx, |panel, cx| {
-            panel.set_db_url_override(db.url().to_string());
-            panel.set_faults_dir_override(faults_dir.clone());
+            panel.set_connect(test_connect(db.url(), &faults_dir));
             panel.refresh(cx);
         });
         cx.run_until_parked();
