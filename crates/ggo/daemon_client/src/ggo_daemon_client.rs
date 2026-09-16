@@ -182,6 +182,141 @@ impl JobLines {
     }
 }
 
+// ------------------------------------------------------------- reports
+//
+// Mirrors of `ggo_worldlib::charts::reports::{perf_db, diag_db}`'s row
+// types, declared here rather than imported for the reason this whole
+// crate exists: nothing under `crates/ggo/` may link a `ggo-*` crate, and
+// worldlib drags in `ggo-db` (and so sqlx, and so a database pool) -- the
+// exact dependency P1 is removing. The serde field names ARE the wire
+// contract; a rename on either side shows up as a decode failure, which
+// the round-trip tests below pin.
+
+/// One run's per-frame sample. Field-for-field `perf_db::FrameRow`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FrameRow {
+    pub n: i64,
+    pub instrs: i64,
+    pub i_hits: i64,
+    pub i_misses: i64,
+    pub d_hits: i64,
+    pub d_misses: i64,
+    pub scanout_wire: i64,
+    pub blit_wire: i64,
+    pub miss_wire: i64,
+    pub wire_total: i64,
+    pub over_budget: bool,
+    /// `None` for a device run, which has no wire model.
+    pub frame_budget_cycles: Option<i64>,
+    pub apu_underruns: i64,
+    pub bg_evictions: i64,
+    pub fg_evictions: i64,
+    pub spr_evictions: i64,
+    pub tile_load_wire: i64,
+    pub apu_fetch_wire: i64,
+    pub sc_upload: i64,
+    pub sc_oam: i64,
+    pub sc_layer: i64,
+    pub sc_audio: i64,
+    pub sc_other: i64,
+    pub peak_spr_line: i64,
+    pub bg_tiles_distinct: i64,
+    pub spr_tiles_distinct: i64,
+    pub cyc: i64,
+}
+
+/// One cart with its run count and newest run stamp. `perf_db::CartRow`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CartRow {
+    pub id: i64,
+    pub name: String,
+    pub runs: i64,
+    /// `None` for a cart with no runs yet.
+    pub last_run_at: Option<String>,
+}
+
+/// One run of a cart, with that run's frame aggregates. `perf_db::RunRow`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RunRow {
+    pub id: i64,
+    pub started_at: String,
+    pub frames: i64,
+    pub label: Option<String>,
+    pub over_budget_frames: i64,
+    pub avg_wire_total: Option<f64>,
+    pub max_wire_total: Option<i64>,
+    pub avg_i_misses: Option<f64>,
+    pub avg_d_misses: Option<f64>,
+    pub max_i_misses: Option<i64>,
+    pub max_d_misses: Option<i64>,
+    pub apu_underruns: i64,
+}
+
+/// One run's full detail. `perf_db::RunDetail`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RunDetail {
+    pub id: i64,
+    pub cart_id: i64,
+    pub cart_name: String,
+    pub started_at: String,
+    pub frames: i64,
+    pub frame_budget_cycles: Option<i64>,
+    pub scanout_wire_cycles: Option<i64>,
+    pub refill_cycles: Option<i64>,
+    pub writeback_cycles: Option<i64>,
+    pub wire_wait_cycles: i64,
+    pub label: Option<String>,
+    pub over_budget_frames: i64,
+    pub avg_wire_total: Option<f64>,
+    pub max_wire_total: Option<i64>,
+    pub avg_i_misses: Option<f64>,
+    pub avg_d_misses: Option<f64>,
+    pub max_i_misses: Option<i64>,
+    pub max_d_misses: Option<i64>,
+    pub apu_underruns: i64,
+}
+
+/// One line of a run's index entry. `perf_db::RunIndexRow`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunIndexRow {
+    pub id: i64,
+    pub started_at: String,
+    pub cart_name: String,
+    pub label: Option<String>,
+    pub frames: i64,
+}
+
+/// A function-level cache-attribution sample. `perf_db::ProfileRow`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileRow {
+    pub frame: i64,
+    pub caller: String,
+    pub func: String,
+    pub misses: i64,
+    pub evicted: i64,
+}
+
+/// One device (`ggo-diag`) run. `diag_db::RunSummary`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiagRunSummary {
+    pub id: String,
+    pub started_at: String,
+    pub state: String,
+    /// `None` until the run reaches a verdict.
+    pub verdict: Option<String>,
+}
+
+/// What a completed ingest created. `ingest::RunId` plus the truncation
+/// note, which is advice for the user rather than a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IngestedRun {
+    pub run_id: i64,
+    pub cart_id: i64,
+    /// `Some(original frame count)` when the run was longer than the cap
+    /// and its tail was dropped. The run IS stored -- this is not an error.
+    pub truncated_frames: Option<usize>,
+}
+
 /// The injection seam: anything that can carry one JSON-RPC request line
 /// and return one response line.
 ///
@@ -400,6 +535,104 @@ impl Client {
     pub fn jobs(&self) -> Result<Vec<JobInfo>> {
         let value = self.call_tool("ggo_jobs", json!({}))?;
         serde_json::from_value(value).context("decode the job list")
+    }
+
+    // --------------------------------------------------------- reports
+    //
+    // The read side of the GemdropGo database. Every `SELECT` lives in
+    // the daemon (in `ggo_worldlib::charts::reports`); these only carry
+    // the answer back, so the editor never opens a pool of its own.
+
+    /// Every perf run across every cart, newest first.
+    pub fn run_index(&self) -> Result<Vec<RunIndexRow>> {
+        let value = self.call_tool("ggo_run_index", json!({}))?;
+        serde_json::from_value(value).context("decode the run index")
+    }
+
+    /// Every cart, with its run count and newest run stamp.
+    pub fn carts(&self) -> Result<Vec<CartRow>> {
+        let value = self.call_tool("ggo_carts", json!({}))?;
+        serde_json::from_value(value).context("decode the cart list")
+    }
+
+    /// Every run of one cart, newest first, with frame aggregates.
+    pub fn cart_runs(&self, cart_id: i64) -> Result<Vec<RunRow>> {
+        let value = self.call_tool("ggo_cart_runs", json!({"cart_id": cart_id}))?;
+        serde_json::from_value(value).context("decode the cart's runs")
+    }
+
+    /// One run's full detail.
+    ///
+    /// An unknown run is an `Err`, not an empty value: the daemon turns
+    /// `perf_db`'s `Ok(None)` into a not-found so a bad id fails at the
+    /// call rather than rendering as a blank page.
+    pub fn run_detail(&self, run_id: i64) -> Result<RunDetail> {
+        let value = self.call_tool("ggo_run_detail", json!({"run_id": run_id}))?;
+        serde_json::from_value(value).context("decode the run detail")
+    }
+
+    /// One run's per-frame series -- the charts panel's bulk read.
+    pub fn run_frames(&self, run_id: i64) -> Result<Vec<FrameRow>> {
+        let value = self.call_tool("ggo_run_frames", json!({"run_id": run_id}))?;
+        serde_json::from_value(value).context("decode the run's frames")
+    }
+
+    /// One run's UART lines.
+    pub fn run_uart(&self, run_id: i64) -> Result<Vec<String>> {
+        let value = self.call_tool("ggo_run_uart", json!({"run_id": run_id}))?;
+        serde_json::from_value(value).context("decode the run's uart")
+    }
+
+    /// One run's cache-profile rows.
+    pub fn run_profile(&self, run_id: i64) -> Result<Vec<ProfileRow>> {
+        let value = self.call_tool("ggo_run_profile", json!({"run_id": run_id}))?;
+        serde_json::from_value(value).context("decode the run's profile")
+    }
+
+    /// Device (`ggo-diag`) runs, newest first. `limit` omitted takes the
+    /// daemon's own default.
+    pub fn diag_runs(&self, limit: Option<i64>) -> Result<Vec<DiagRunSummary>> {
+        let arguments = match limit {
+            Some(limit) => json!({"limit": limit}),
+            None => json!({}),
+        };
+        let value = self.call_tool("ggo_diag_runs", arguments)?;
+        serde_json::from_value(value).context("decode the device runs")
+    }
+
+    /// One device run's pipeline narration (`run_log`), in `seq` order.
+    pub fn diag_run_log(&self, run_id: &str) -> Result<Vec<String>> {
+        let value = self.call_tool("ggo_diag_run_log", json!({"run_id": run_id}))?;
+        serde_json::from_value(value).context("decode the device run's log")
+    }
+
+    /// The perf run holding a device run's telemetry, if it has one.
+    ///
+    /// `None` covers both "that run has no perf telemetry" and "there is
+    /// no such device run" -- indistinguishable to every caller, which
+    /// asks this only to decide whether a report exists to open.
+    pub fn diag_perf_run_id(&self, run_id: &str) -> Result<Option<i64>> {
+        let value = self.call_tool("ggo_diag_perf_run", json!({"run_id": run_id}))?;
+        Ok(value.get("perf_run_id").and_then(Value::as_i64))
+    }
+
+    /// Write one finished run: its perf JSON verbatim, its UART lines, and
+    /// an optional `run.label`.
+    ///
+    /// `perf_json` is the exact text the run emitted, passed through
+    /// rather than re-encoded, so the daemon validates the same bytes.
+    pub fn ingest_run(
+        &self,
+        perf_json: &str,
+        uart: &[String],
+        label: Option<&str>,
+    ) -> Result<IngestedRun> {
+        let mut arguments = json!({"perf_json": perf_json, "uart": uart});
+        if let Some(label) = label {
+            arguments["label"] = json!(label);
+        }
+        let value = self.call_tool("ggo_ingest_run", arguments)?;
+        serde_json::from_value(value).context("decode the ingested run")
     }
 
     /// Apply pending migrations to the GemdropGo database.
@@ -904,6 +1137,258 @@ mod tests {
             panic!("a second diag must be refused");
         };
         assert!(error.to_string().contains("id 3"), "{error}");
+    }
+
+    /// The row types here are hand-mirrored from worldlib's, because this
+    /// crate must not link `ggo-db`. That makes the serde field names a
+    /// contract between two independently built processes, so a full row
+    /// -- not a convenient subset -- has to survive the trip.
+    #[test]
+    fn a_full_frame_row_survives_the_wire_field_for_field() {
+        let wire = json!({
+            "n": 7, "instrs": 1_000, "i_hits": 10, "i_misses": 1,
+            "d_hits": 20, "d_misses": 2, "scanout_wire": 30, "blit_wire": 4,
+            "miss_wire": 5, "wire_total": 39, "over_budget": true,
+            "frame_budget_cycles": 550_000, "apu_underruns": 1,
+            "bg_evictions": 6, "fg_evictions": 7, "spr_evictions": 8,
+            "tile_load_wire": 9, "apu_fetch_wire": 11, "sc_upload": 12,
+            "sc_oam": 13, "sc_layer": 14, "sc_audio": 15, "sc_other": 16,
+            "peak_spr_line": 17, "bg_tiles_distinct": 18,
+            "spr_tiles_distinct": 19, "cyc": 20,
+        });
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_run_frames", json!([wire]));
+        let client = client_with(&fake);
+
+        let frames = client.run_frames(42).expect("frames");
+        let frame = frames.first().expect("one frame");
+        assert_eq!(frame.n, 7);
+        assert_eq!(frame.instrs, 1_000);
+        assert!(frame.over_budget, "a bool must not decode as a number");
+        assert_eq!(frame.frame_budget_cycles, Some(550_000));
+        assert_eq!(frame.spr_tiles_distinct, 19);
+        assert_eq!(frame.cyc, 20, "the last field is the one a drift drops");
+    }
+
+    /// A device run has no wire model, so its budget column is NULL. That
+    /// must decode as `None` rather than failing the whole read.
+    #[test]
+    fn a_device_frame_decodes_its_null_budget_as_none() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_run_frames",
+            json!([{
+                "n": 0, "instrs": 0, "i_hits": 0, "i_misses": 0, "d_hits": 0,
+                "d_misses": 0, "scanout_wire": 0, "blit_wire": 0, "miss_wire": 0,
+                "wire_total": 0, "over_budget": false, "frame_budget_cycles": null,
+                "apu_underruns": 0, "bg_evictions": 0, "fg_evictions": 0,
+                "spr_evictions": 0, "tile_load_wire": 0, "apu_fetch_wire": 0,
+                "sc_upload": 0, "sc_oam": 0, "sc_layer": 0, "sc_audio": 0,
+                "sc_other": 0, "peak_spr_line": 0, "bg_tiles_distinct": 0,
+                "spr_tiles_distinct": 0, "cyc": 0,
+            }]),
+        );
+        let client = client_with(&fake);
+
+        let frames = client.run_frames(1).expect("frames");
+        assert_eq!(frames[0].frame_budget_cycles, None);
+    }
+
+    /// `avg_*` are floating point and the rest integral; a run with no
+    /// frames yet has them all NULL.
+    #[test]
+    fn a_run_detail_decodes_its_aggregates_and_their_nulls() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_run_detail",
+            json!({
+                "id": 5, "cart_id": 2, "cart_name": "demo",
+                "started_at": "2026-09-02T08:49:33Z", "frames": 120,
+                "frame_budget_cycles": 550_000, "scanout_wire_cycles": 1,
+                "refill_cycles": 2, "writeback_cycles": 3, "wire_wait_cycles": 4,
+                "label": "worlds/arena", "over_budget_frames": 6,
+                "avg_wire_total": 1234.5, "max_wire_total": 4000,
+                "avg_i_misses": null, "avg_d_misses": null,
+                "max_i_misses": null, "max_d_misses": null, "apu_underruns": 0,
+            }),
+        );
+        let client = client_with(&fake);
+
+        let detail = client.run_detail(5).expect("detail");
+        assert_eq!(detail.cart_name, "demo");
+        assert_eq!(detail.label.as_deref(), Some("worlds/arena"));
+        assert_eq!(detail.avg_wire_total, Some(1234.5));
+        assert_eq!(detail.avg_i_misses, None, "a run with no frames yet");
+    }
+
+    /// An unknown run must fail at the call, not render as a blank page.
+    #[test]
+    fn an_unknown_run_is_an_error_rather_than_an_empty_detail() {
+        let fake = FakeDaemon::new();
+        fake.on_tool_error("ggo_run_detail", "no perf run 999");
+        let client = client_with(&fake);
+
+        let Err(error) = client.run_detail(999) else {
+            panic!("an unknown run must be an error");
+        };
+        assert!(error.to_string().contains("999"), "{error}");
+    }
+
+    #[test]
+    fn the_run_index_and_cart_list_decode() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_run_index",
+            json!([{
+                "id": 9, "started_at": "2026-09-02T08:49:33Z",
+                "cart_name": "demo", "label": null, "frames": 60,
+            }]),
+        );
+        fake.on_tool(
+            "ggo_carts",
+            json!([{"id": 1, "name": "demo", "runs": 3, "last_run_at": null}]),
+        );
+        let client = client_with(&fake);
+
+        let index = client.run_index().expect("index");
+        assert_eq!(index[0].id, 9);
+        assert_eq!(index[0].label, None);
+        let carts = client.carts().expect("carts");
+        assert_eq!(carts[0].name, "demo");
+        assert_eq!(carts[0].last_run_at, None, "a cart with no runs");
+    }
+
+    #[test]
+    fn device_runs_and_their_log_decode() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_diag_runs",
+            json!([{
+                "id": "2026-09-02_08-49-33", "started_at": "2026-09-02_08-49-33",
+                "state": "done", "verdict": "PASS",
+            }]),
+        );
+        fake.on_tool("ggo_diag_run_log", json!(["==> compile", "<== compile ok"]));
+        let client = client_with(&fake);
+
+        let runs = client.diag_runs(Some(10)).expect("diag runs");
+        assert_eq!(runs[0].verdict.as_deref(), Some("PASS"));
+        assert_eq!(
+            client.diag_run_log("2026-09-02_08-49-33").expect("log").len(),
+            2
+        );
+    }
+
+    /// Omitting the limit must send no `limit` key at all, so the daemon
+    /// applies its own default rather than being handed a guess.
+    #[test]
+    fn omitting_the_device_run_limit_sends_no_limit() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_diag_runs", json!([]));
+        let client = client_with(&fake);
+        client.diag_runs(None).expect("diag runs");
+
+        let calls = fake.calls();
+        let (_, arguments) = calls
+            .iter()
+            .find(|(name, _)| name == "ggo_diag_runs")
+            .expect("asked");
+        assert_eq!(arguments, &json!({}));
+    }
+
+    /// Both "no telemetry" and "no such run" arrive as null, and the
+    /// caller only wants to know whether a report exists to open.
+    #[test]
+    fn a_device_run_without_telemetry_reports_no_perf_run() {
+        let fake = FakeDaemon::new();
+        fake.on_tool("ggo_diag_perf_run", json!({"perf_run_id": null}));
+        let client = client_with(&fake);
+        assert_eq!(client.diag_perf_run_id("nope").expect("ask"), None);
+
+        fake.on_tool("ggo_diag_perf_run", json!({"perf_run_id": 77}));
+        assert_eq!(client.diag_perf_run_id("real").expect("ask"), Some(77));
+    }
+
+    /// The perf JSON must cross as the exact text the run emitted, not
+    /// re-encoded: the daemon validates the same bytes.
+    #[test]
+    fn an_ingest_sends_the_perf_json_verbatim_and_returns_the_new_ids() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_ingest_run",
+            json!({"run_id": 12, "cart_id": 3, "truncated_frames": null}),
+        );
+        let client = client_with(&fake);
+
+        let perf_json = r#"{"cart":"demo","frames":{"n":[0]}}"#;
+        let ingested = client
+            .ingest_run(perf_json, &["[run] started".to_string()], Some("worlds/arena"))
+            .expect("ingest");
+        assert_eq!(ingested.run_id, 12);
+        assert_eq!(ingested.cart_id, 3);
+        assert_eq!(ingested.truncated_frames, None);
+
+        let calls = fake.calls();
+        let (_, arguments) = calls
+            .iter()
+            .find(|(name, _)| name == "ggo_ingest_run")
+            .expect("ingested");
+        assert_eq!(
+            arguments["perf_json"],
+            json!(perf_json),
+            "the JSON must not be re-encoded on the way out"
+        );
+        assert_eq!(arguments["uart"], json!(["[run] started"]));
+        assert_eq!(arguments["label"], json!("worlds/arena"));
+    }
+
+    /// A run past the frame cap IS stored; the truncation is advice, not
+    /// a failure, and must not read as one.
+    #[test]
+    fn a_truncated_ingest_still_succeeds_and_says_how_long_the_run_was() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_ingest_run",
+            json!({"run_id": 1, "cart_id": 1, "truncated_frames": 250_000}),
+        );
+        let client = client_with(&fake);
+
+        let ingested = client.ingest_run("{}", &[], None).expect("ingest");
+        assert_eq!(ingested.truncated_frames, Some(250_000));
+    }
+
+    /// Malformed perf JSON is the caller's mistake and has to reach a
+    /// status line as text.
+    #[test]
+    fn a_rejected_ingest_carries_the_daemons_reason() {
+        let fake = FakeDaemon::new();
+        fake.on_tool_error("ggo_ingest_run", "invalid JSON: expected value at line 1");
+        let client = client_with(&fake);
+
+        let Err(error) = client.ingest_run("not json", &[], None) else {
+            panic!("malformed perf JSON must be rejected");
+        };
+        assert!(error.to_string().contains("invalid JSON"), "{error}");
+    }
+
+    /// An ingest with no label must omit the key rather than send null,
+    /// so `run.label` stays absent instead of being written as one.
+    #[test]
+    fn an_ingest_without_a_label_omits_the_key() {
+        let fake = FakeDaemon::new();
+        fake.on_tool(
+            "ggo_ingest_run",
+            json!({"run_id": 1, "cart_id": 1, "truncated_frames": null}),
+        );
+        let client = client_with(&fake);
+        client.ingest_run("{}", &[], None).expect("ingest");
+
+        let calls = fake.calls();
+        let (_, arguments) = calls
+            .iter()
+            .find(|(name, _)| name == "ggo_ingest_run")
+            .expect("ingested");
+        assert!(arguments.get("label").is_none(), "{arguments}");
     }
 
     #[test]
