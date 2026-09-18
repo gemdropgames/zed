@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ggo_common::to_render_image;
-use ggo_worldlib::sprites::cow::SpriteState;
+use ggo_worldlib::sprites::cow::{FrameTransform, SpriteState};
 use ggo_worldlib::sprites::hw;
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::palette565::indices_to_rgba;
@@ -94,18 +94,24 @@ pub fn compose_frames(state: &SpriteState) -> Result<Vec<Arc<RenderImage>>, Stri
     Ok(frames)
 }
 
-/// Compose frame `idx` with its affine transform applied, for the big
-/// preview: worldlib's `compose_frame_rgba_transformed` (identity
-/// delegates to the legacy composer; non-identity renders onto the
-/// doubled DOUBLE_SIZE canvas), bridged to a [`RenderImage`] exactly
-/// like [`compose_frames`]. The strip thumbnails deliberately stay
-/// legacy-composed -- transforms are per-copy PLAY data, and a rotated
-/// thumbnail would hide which tiles the frame actually edits. Callers
-/// cache the result per frame (`OpenSprite::transformed_frames`,
+/// Compose frame `idx` through a clip entry's flip and affine
+/// transform, for the big preview: worldlib's
+/// `compose_frame_rgba_transformed` (a plain entry delegates to the
+/// legacy composer; a transformed one renders onto the doubled
+/// DOUBLE_SIZE canvas), bridged to a [`RenderImage`] exactly like
+/// [`compose_frames`]. The strip thumbnails deliberately stay
+/// legacy-composed -- flips and transforms are per-ENTRY play data, and
+/// a rotated thumbnail would hide which tiles the frame actually edits.
+/// Callers cache the result per entry (`OpenSprite::transformed_frames`,
 /// the ghost-cache idiom): pixels only change on doc mutations, which
 /// clear the cache.
-pub fn compose_transformed_frame(state: &SpriteState, idx: usize) -> Option<Arc<RenderImage>> {
-    let rgba = compose_frame_rgba_transformed(state, idx, false);
+pub fn compose_transformed_frame(
+    state: &SpriteState,
+    idx: usize,
+    transform: FrameTransform,
+    flip: (bool, bool),
+) -> Option<Arc<RenderImage>> {
+    let rgba = compose_frame_rgba_transformed(state, idx, transform, flip, false);
     let (w, h) = rgba.dimensions();
     to_render_image(rgba.as_raw(), w, h)
 }

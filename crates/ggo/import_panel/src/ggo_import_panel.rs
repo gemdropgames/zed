@@ -4523,26 +4523,28 @@ mod tests {
     fn author_animations(assets: &Path, rel: &str) {
         let opened = io::open_sprite(assets, rel).expect("the import wrote a sprite");
         let mut state = opened.state;
-        state.frames[0].duration_ms = 250;
-        state.frames[1].duration_ms = 400;
-        state.frames[1].transform = ggo_worldlib::sprites::cow::FrameTransform {
+        let mut entries: Vec<ggo_worldlib::sprites::cow::ClipEntry> = (0..2)
+            .map(ggo_worldlib::sprites::cow::ClipEntry::of_frame)
+            .collect();
+        entries[0].duration_ms = 250;
+        entries[1].duration_ms = 400;
+        entries[1].transform = ggo_worldlib::sprites::cow::FrameTransform {
             angle256: 64,
             ..ggo_worldlib::sprites::cow::FrameTransform::IDENTITY
         };
         state.clips = vec![ggo_worldlib::sprites::cow::ClipEdit {
             name: "idle".to_string(),
-            from: 0,
-            to: 1,
             loop_: true,
+            entries,
         }];
         io::save_sprite(assets, rel, &state, &opened.til_path, &opened.pal_path)
             .expect("authoring the fixture's animations must land");
     }
 
     /// **The headline preservation test.** The artist widens the sheet and
-    /// the sprite is re-imported: the new artwork lands, the clips and the
-    /// per-frame timing/transform survive on the frames that stayed put,
-    /// and the appended frame arrives with the import's own defaults.
+    /// the sprite is re-imported: the new artwork lands, the clip and its
+    /// per-entry timing/transform survive, and the appended frame simply
+    /// arrives unreferenced.
     #[gpui::test]
     async fn test_a_sprite_reimport_keeps_the_animations_and_appends_new_frames(
         cx: &mut TestAppContext,
@@ -4562,23 +4564,20 @@ mod tests {
 
         let reopened = io::open_sprite(&assets, "art/hero.spr").expect("spr round-trips");
         assert_eq!(reopened.state.frames.len(), 3, "the new frame was appended");
-        assert_eq!(
-            reopened
-                .state
-                .frames
-                .iter()
-                .map(|f| f.duration_ms)
-                .collect::<Vec<_>>(),
-            vec![250, 400, 100],
-            "kept frames keep their timing; the appended one takes the default"
-        );
-        assert_eq!(reopened.state.frames[1].transform.angle256, 64);
-        assert!(
-            reopened.state.frames[2].transform.is_identity(),
-            "an appended frame has no transform to inherit"
-        );
         assert_eq!(reopened.state.clips.len(), 1);
         assert_eq!(reopened.state.clips[0].name, "idle");
+        let entries = &reopened.state.clips[0].entries;
+        assert_eq!(
+            entries.iter().map(|e| e.frame).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the clip still walks the frames it always did"
+        );
+        assert_eq!(
+            entries.iter().map(|e| e.duration_ms).collect::<Vec<_>>(),
+            vec![250, 400],
+            "per-entry timing travels with the clip"
+        );
+        assert_eq!(entries[1].transform.angle256, 64);
         assert_ne!(
             std::fs::read(assets.join("art/hero.til")).unwrap(),
             before,

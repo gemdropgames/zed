@@ -10940,11 +10940,7 @@ mod tests {
                 tile_count: 2,
                 session_tiles: std::collections::HashSet::new(),
                 palette,
-                frames: vec![Frame {
-                    map: vec![1],
-                    duration_ms: 100,
-                    transform: ggo_worldlib::sprites::cow::FrameTransform::IDENTITY,
-                }],
+                frames: vec![Frame { map: vec![1] }],
                 clips: vec![],
                 w_tiles: 1,
                 h_tiles: 1,

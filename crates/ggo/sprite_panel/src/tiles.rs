@@ -157,7 +157,7 @@ pub const AFFINE_PARAM_SETS: usize = 32;
 /// coverage / `SPRITE_LINE_CAP`), `Cache` (the shown frame's worst-row
 /// distinct-tile working set / `SPRITE_CACHE_TILES`; 0 without a frame),
 /// and `Sets` (distinct non-identity transform MATRICES across the
-/// sprite's frames / [`AFFINE_PARAM_SETS`] -- counted on the composed
+/// sprite's CLIP ENTRIES / [`AFFINE_PARAM_SETS`] -- counted on the composed
 /// `matrix()`, the value the runtime's dedup allocator actually keys
 /// sets by, so two transforms that collapse to one matrix cost one
 /// set). Same inputs, same order as ggo-ide `hw_meter::rows` plus the
@@ -169,11 +169,11 @@ pub fn hw_meter_line(state: &SpriteState, frame: Option<&Frame>) -> String {
     let scanline = hw::scanline_coverage(w, h);
     let cache = frame.map_or(0, |f| hw::cache_pressure(&f.map, w, h));
     let mut matrices: Vec<(u32, u32)> = Vec::new();
-    for f in &state.frames {
-        if f.transform.is_identity() {
+    for entry in state.clips.iter().flat_map(|c| c.entries.iter()) {
+        if entry.transform.is_identity() {
             continue;
         }
-        let matrix = f.transform.matrix();
+        let matrix = entry.transform.matrix();
         if !matrices.contains(&matrix) {
             matrices.push(matrix);
         }
@@ -335,10 +335,8 @@ mod tests {
 
     #[test]
     fn hw_meter_counts_distinct_non_identity_transforms() {
-        use ggo_worldlib::sprites::cow::FrameTransform;
+        use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry, FrameTransform};
         let mut s = blank_sprite_state(1, 1).unwrap();
-        let base = s.frames[0].clone();
-        s.frames = vec![base.clone(), base.clone(), base.clone(), base];
         let quarter = FrameTransform {
             angle256: 64,
             ..FrameTransform::IDENTITY
@@ -347,11 +345,16 @@ mod tests {
             sx: 0x0200,
             ..FrameTransform::IDENTITY
         };
-        // Frame 0 stays identity (not counted); 1 and 2 share a matrix
+        s.clips = vec![ClipEdit {
+            name: "spin".to_string(),
+            loop_: true,
+            entries: vec![ClipEntry::of_frame(0); 4],
+        }];
+        // Entry 0 stays identity (not counted); 1 and 2 share a matrix
         // (one set); 3 is distinct (a second set).
-        s.frames[1].transform = quarter;
-        s.frames[2].transform = quarter;
-        s.frames[3].transform = doubled;
+        s.clips[0].entries[1].transform = quarter;
+        s.clips[0].entries[2].transform = quarter;
+        s.clips[0].entries[3].transform = doubled;
         let line = hw_meter_line(&s, s.frames.first());
         assert!(
             line.ends_with(&format!("Sets 2/{AFFINE_PARAM_SETS}")),

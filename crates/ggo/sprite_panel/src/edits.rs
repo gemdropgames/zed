@@ -1,50 +1,22 @@
-//! Pure animation-edit helpers: new-clip defaults, clip-range validation,
-//! duration parsing, and the post-op selection bookkeeping rules -- the
-//! framework-free half of the M5 editing wiring, mirrored from ggo-ide's
-//! `sprites/timeline.rs` message handlers (`AddClip`, `DeleteClip`,
-//! `DeleteFrame`, `DurationSubmit`) so the panel's gpui layer stays thin
-//! and every rule here is directly unit-testable.
+//! Pure animation-edit helpers: new-clip defaults, duration parsing, and
+//! the post-op selection bookkeeping rules -- the framework-free half of
+//! the M5 editing wiring, mirrored from ggo-ide's `sprites/timeline.rs`
+//! message handlers (`AddClip`, `DeleteClip`, `DeleteFrame`,
+//! `DurationSubmit`) so the panel's gpui layer stays thin and every rule
+//! here is directly unit-testable.
 
-use ggo_worldlib::sprites::cow::ClipEdit;
-use ggo_worldlib::sprites::timeline_ops::{MIN_FRAME_MS, clip_ranges_valid};
+use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry};
+use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
 
-/// A freshly-added clip: ggo-ide `Msg::AddClip`'s defaults verbatim --
-/// incrementing `clip{N}` name, a single-frame range on the currently
-/// selected frame (clamped into the strip), not looping.
+/// A freshly-added clip: incrementing `clip{N}` name, one entry on the
+/// currently selected frame (clamped into the strip), not looping.
 pub fn default_new_clip(clip_count: usize, selected_frame: usize, frame_count: usize) -> ClipEdit {
-    let f = selected_frame.min(frame_count.saturating_sub(1));
+    let frame = selected_frame.min(frame_count.saturating_sub(1));
     ClipEdit {
         name: format!("clip{}", clip_count + 1),
-        from: f,
-        to: f,
         loop_: false,
+        entries: vec![ClipEntry::of_frame(frame)],
     }
-}
-
-/// Validate a clip-range edit before it becomes a `ClipSet`: both
-/// endpoints must address a real frame (`timeline_ops::clip_ranges_valid`
-/// on the candidate) and `from <= to` (the brief's rule for TYPED range
-/// edits -- stricter than storage, where a reversed pair is legal and
-/// playback normalizes it; ggo-ide's sliders clamp instead and so can
-/// never produce either failure). `Some(message)` is the inline error to
-/// show; the op must not be applied.
-pub fn clip_range_error(from: usize, to: usize, frame_count: usize) -> Option<String> {
-    let candidate = ClipEdit {
-        name: String::new(),
-        from,
-        to,
-        loop_: false,
-    };
-    if !clip_ranges_valid(std::slice::from_ref(&candidate), frame_count) {
-        return Some(format!(
-            "range {from}-{to} is outside frames 0-{}",
-            frame_count.saturating_sub(1)
-        ));
-    }
-    if from > to {
-        return Some(format!("from {from} > to {to}"));
-    }
-    None
 }
 
 /// A duration field's committed text -> the ms to store: ggo-ide
@@ -165,95 +137,29 @@ pub fn format_fixed88(value: i16) -> String {
     format!("{sign}{whole}.{hundredths:02}")
 }
 
-/// The FRAMES library's display list: one strip index per unique tile
-/// map, first occurrence wins. Range clips duplicate frames physically
-/// when a sequence reuses one; the library hides those copies so it
-/// reads as "the sprite's unique frames" (durations are per-copy and
-/// live in the clip editor, not here).
-pub fn library_indices(frames: &[ggo_worldlib::sprites::cow::Frame]) -> Vec<usize> {
-    let mut seen: Vec<&[u16]> = Vec::new();
-    let mut out = Vec::new();
-    for (ix, frame) in frames.iter().enumerate() {
-        if seen.contains(&frame.map.as_slice()) {
-            continue;
-        }
-        seen.push(&frame.map);
-        out.push(ix);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use ggo_worldlib::sprites::cow::{Frame, FrameTransform};
-
-    fn frame(map: Vec<u16>) -> Frame {
-        Frame {
-            map,
-            duration_ms: 100,
-            transform: FrameTransform::IDENTITY,
-        }
-    }
-
-    #[test]
-    fn library_indices_keep_the_first_of_each_unique_map() {
-        // Range clips duplicate frames physically; the LIBRARY shows one
-        // entry per unique tile map, first occurrence wins.
-        let frames = vec![
-            frame(vec![0]),
-            frame(vec![1]),
-            frame(vec![0]),
-            frame(vec![1]),
-        ];
-        assert_eq!(super::library_indices(&frames), vec![0, 1]);
-    }
-
-    #[test]
-    fn library_indices_of_all_distinct_frames_is_identity() {
-        let frames = vec![frame(vec![0]), frame(vec![1])];
-        assert_eq!(super::library_indices(&frames), vec![0, 1]);
-    }
-
     use super::*;
 
     #[test]
-    fn default_new_clip_uses_incrementing_name_and_the_selected_frame_as_a_point_range() {
+    fn default_new_clip_seeds_one_entry_on_the_selected_frame() {
+        let clip = super::default_new_clip(2, 7, 3);
+        assert_eq!(clip.name, "clip3");
+        assert_eq!(clip.entries.len(), 1);
+        assert_eq!(clip.entries[0].frame, 2, "clamped into the strip");
+    }
+
+    #[test]
+    fn default_new_clip_uses_an_incrementing_name_and_does_not_loop() {
         assert_eq!(
             default_new_clip(0, 2, 4),
             ClipEdit {
                 name: "clip1".into(),
-                from: 2,
-                to: 2,
-                loop_: false
+                loop_: false,
+                entries: vec![ClipEntry::of_frame(2)],
             }
         );
         assert_eq!(default_new_clip(2, 0, 4).name, "clip3");
-    }
-
-    #[test]
-    fn default_new_clip_clamps_a_stale_selection_into_the_strip() {
-        let c = default_new_clip(0, 9, 3);
-        assert_eq!((c.from, c.to), (2, 2));
-    }
-
-    #[test]
-    fn clip_range_error_accepts_in_range_forward_ranges() {
-        assert_eq!(clip_range_error(0, 2, 3), None);
-        assert_eq!(clip_range_error(2, 2, 3), None);
-    }
-
-    #[test]
-    fn clip_range_error_rejects_out_of_range_endpoints() {
-        let e = clip_range_error(0, 3, 3).unwrap();
-        assert!(e.contains("0-3"), "message names the bad range: {e}");
-        assert!(clip_range_error(3, 3, 3).is_some());
-        assert!(clip_range_error(0, 0, 0).is_some(), "no frames, no ranges");
-    }
-
-    #[test]
-    fn clip_range_error_rejects_a_reversed_range() {
-        let e = clip_range_error(2, 1, 3).unwrap();
-        assert!(e.contains('>'), "message shows the inversion: {e}");
     }
 
     #[test]

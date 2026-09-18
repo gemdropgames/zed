@@ -1,26 +1,22 @@
-//! Pure playback-range and strip-layout math for the sprite panel.
+//! Pure playback-timing and strip-layout math for the sprite panel.
 //! The transport semantics mirror ggo-ide's `sprites/timeline.rs`
-//! (`play_range`/`play_loop`/`toggle_play`'s start-offset seeding); the
-//! per-timestamp frame walk itself lives in worldlib
+//! (`play_loop`/`toggle_play`'s start-offset seeding); the
+//! per-timestamp walk itself lives in worldlib
 //! (`timeline_ops::playback_frame_at`) -- this module only resolves the
-//! ACTIVE range/loop pair out of the clip list and computes where in that
-//! range playback starts, so the panel's timer loop stays a thin caller.
+//! ACTIVE duration list and loop flag out of the clip list and computes
+//! where in that list playback starts, so the panel's timer loop stays a
+//! thin caller.
 
-use ggo_worldlib::sprites::cow::ClipEdit;
-use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
+use ggo_worldlib::sprites::cow::{ClipEdit, DEFAULT_FRAME_DURATION_MS, SpriteState};
+use ggo_worldlib::sprites::timeline_ops::{MIN_FRAME_MS, entry_durations};
 
-/// The active playback range: the active clip's `(from, to)` (which may
-/// be stored reversed -- worldlib's walk normalizes), or the whole strip
-/// `(0, frame_count - 1)` when no clip is active (or the index has gone
-/// stale against the clip list) -- ggo-ide `timeline::State::play_range`.
-pub fn play_range(
-    clips: &[ClipEdit],
-    active_clip: Option<usize>,
-    frame_count: usize,
-) -> (usize, usize) {
-    match active_clip.and_then(|i| clips.get(i)) {
-        Some(c) => (c.from, c.to),
-        None => (0, frame_count.saturating_sub(1)),
+/// The durations the transport walks: the active clip's entries in
+/// sequence order, or -- for "All frames" (no clip, or a stale index) --
+/// every frame once at the default duration.
+pub fn play_durations(state: &SpriteState, active_clip: Option<usize>) -> Vec<u16> {
+    match active_clip.and_then(|i| state.clips.get(i)) {
+        Some(c) => entry_durations(&c.entries),
+        None => vec![DEFAULT_FRAME_DURATION_MS; state.frames.len()],
     }
 }
 
@@ -33,19 +29,16 @@ pub fn play_loop(clips: &[ClipEdit], active_clip: Option<usize>) -> bool {
         .is_none_or(|c| c.loop_)
 }
 
-/// The elapsed-ms seed that makes playback START on `from` (clamped into
-/// the range): the sum of the range's frame durations strictly before it,
+/// The elapsed-ms seed that makes playback START at position `from`
+/// (clamped into the list): the sum of the durations strictly before it,
 /// floored to [`MIN_FRAME_MS`] exactly like `playback_frame_at`'s own
 /// accounting -- ggo-ide `timeline::State::toggle_play`'s `start_ms` loop.
-pub fn start_offset_ms(durations: &[u16], range: (usize, usize), from: usize) -> i64 {
-    let lo = range.0.min(range.1);
-    let hi = range.0.max(range.1);
-    let from = from.clamp(lo, hi);
-    let mut ms = 0i64;
-    for i in lo..from {
-        ms += i64::from(durations.get(i).copied().unwrap_or(0).max(MIN_FRAME_MS));
-    }
-    ms
+pub fn start_offset_ms(durations: &[u16], from: usize) -> i64 {
+    let from = from.min(durations.len().saturating_sub(1));
+    durations[..from]
+        .iter()
+        .map(|&d| i64::from(d.max(MIN_FRAME_MS)))
+        .sum()
 }
 
 /// Fit a `w`x`h` image into a `max_px` square preserving aspect ratio
@@ -85,42 +78,70 @@ pub fn preview_display_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_worldlib::sprites::cow::ClipEntry;
+    use ggo_worldlib::sprites::sprite_doc::blank_sprite_state;
     use ggo_worldlib::sprites::timeline_ops::{playback_frame_at, playback_total_ms};
 
-    fn clip(name: &str, from: usize, to: usize, loop_: bool) -> ClipEdit {
+    /// A clip over frames `0..durations.len()`, one entry each, timed by
+    /// `durations`.
+    fn clip(name: &str, durations: &[u16], loop_: bool) -> ClipEdit {
         ClipEdit {
             name: name.to_string(),
-            from,
-            to,
             loop_,
+            entries: durations
+                .iter()
+                .enumerate()
+                .map(|(frame, &duration_ms)| ClipEntry {
+                    duration_ms,
+                    ..ClipEntry::of_frame(frame)
+                })
+                .collect(),
         }
     }
 
-    #[test]
-    fn play_range_none_is_the_whole_strip() {
-        assert_eq!(play_range(&[], None, 4), (0, 3));
-        assert_eq!(play_range(&[clip("walk", 1, 2, true)], None, 4), (0, 3));
+    fn state(frame_count: usize, clips: Vec<ClipEdit>) -> SpriteState {
+        let mut state = blank_sprite_state(1, 1).expect("a 1x1 blank sprite");
+        let blank = state.frames[0].clone();
+        state.frames = vec![blank; frame_count];
+        state.clips = clips;
+        state
     }
 
     #[test]
-    fn play_range_active_clip_is_its_from_to() {
-        let clips = [clip("idle", 0, 0, true), clip("walk", 1, 3, false)];
-        assert_eq!(play_range(&clips, Some(1), 4), (1, 3));
+    fn play_durations_of_the_active_clip_are_its_entries_in_sequence_order() {
+        let s = state(4, vec![clip("walk", &[100, 250], false)]);
+        assert_eq!(play_durations(&s, Some(0)), vec![100, 250]);
     }
 
     #[test]
-    fn play_range_stale_clip_index_falls_back_to_the_whole_strip() {
-        assert_eq!(play_range(&[clip("walk", 1, 2, true)], Some(9), 4), (0, 3));
+    fn play_durations_without_a_clip_is_every_frame_at_the_default() {
+        let s = state(3, vec![clip("walk", &[100, 250], false)]);
+        assert_eq!(play_durations(&s, None), vec![DEFAULT_FRAME_DURATION_MS; 3]);
     }
 
     #[test]
-    fn play_range_of_an_empty_strip_is_0_0() {
-        assert_eq!(play_range(&[], None, 0), (0, 0));
+    fn play_durations_of_a_stale_clip_index_falls_back_to_all_frames() {
+        let s = state(3, vec![clip("walk", &[100, 250], false)]);
+        assert_eq!(
+            play_durations(&s, Some(9)),
+            vec![DEFAULT_FRAME_DURATION_MS; 3]
+        );
+    }
+
+    #[test]
+    fn play_durations_of_an_empty_strip_is_empty() {
+        assert_eq!(
+            play_durations(&state(0, Vec::new()), None),
+            Vec::<u16>::new()
+        );
     }
 
     #[test]
     fn play_loop_defaults_true_for_whole_strip_and_reads_the_clips_flag() {
-        let clips = [clip("once", 0, 2, false), clip("cycle", 0, 2, true)];
+        let clips = [
+            clip("once", &[100, 100], false),
+            clip("cycle", &[100, 100], true),
+        ];
         assert!(play_loop(&clips, None));
         assert!(!play_loop(&clips, Some(0)));
         assert!(play_loop(&clips, Some(1)));
@@ -128,59 +149,58 @@ mod tests {
     }
 
     #[test]
-    fn start_offset_ms_sums_floored_durations_before_the_start_frame() {
-        let d = [100u16, 200, 50];
-        assert_eq!(start_offset_ms(&d, (0, 2), 0), 0);
-        assert_eq!(start_offset_ms(&d, (0, 2), 2), 300);
-        // 50 floors to MIN_FRAME_MS in playback_frame_at's accounting too.
-        let d2 = [100u16, 0, 100];
+    fn start_offset_ms_sums_floored_durations_before_the_start_position() {
+        assert_eq!(start_offset_ms(&[100, 250, 10], 0), 0);
+        assert_eq!(start_offset_ms(&[100, 250, 10], 2), 350);
+        // A sub-floor duration counts as MIN_FRAME_MS here, exactly as
+        // playback_frame_at's own accounting floors it.
         assert_eq!(
-            start_offset_ms(&d2, (0, 2), 2),
+            start_offset_ms(&[100, 0, 100], 2),
             100 + i64::from(MIN_FRAME_MS)
         );
     }
 
     #[test]
-    fn start_offset_ms_clamps_the_start_frame_into_the_range() {
-        let d = [100u16, 200, 50];
-        // Frame 0 selected but the range starts at 1: start ON frame 1.
-        assert_eq!(start_offset_ms(&d, (1, 2), 0), 0);
-        // Selected past the range end: start on the last frame.
-        assert_eq!(start_offset_ms(&d, (0, 1), 5), 100);
+    fn start_offset_ms_clamps_the_start_position_into_the_list() {
+        assert_eq!(start_offset_ms(&[100, 250, 10], 9), 350, "past the end");
+        assert_eq!(start_offset_ms(&[], 3), 0, "nothing to sum");
     }
 
-    /// The brief's test (b): clip-range playback frame selection at
-    /// synthetic timestamps -- the panel-side integration of
-    /// `play_range`/`play_loop` with worldlib's `playback_frame_at`, no
-    /// timer involved.
+    /// The panel-side integration of `play_durations`/`play_loop` with
+    /// worldlib's `playback_frame_at`, at synthetic timestamps, no timer
+    /// involved. The result is a POSITION in the walked list.
     #[test]
-    fn clip_range_playback_hits_expected_frames_at_synthetic_timestamps() {
-        let d = [100u16, 200, 50];
-        let clips = [clip("walk", 1, 2, true), clip("once", 1, 2, false)];
+    fn clip_playback_hits_expected_positions_at_synthetic_timestamps() {
+        let s = state(
+            3,
+            vec![
+                clip("walk", &[200, 50], true),
+                clip("once", &[200, 50], false),
+            ],
+        );
 
-        // Looping clip over frames 1..=2 (durations 200 + 50): walks,
-        // wraps.
-        let range = play_range(&clips, Some(0), 3);
-        let loop_ = play_loop(&clips, Some(0));
-        assert_eq!(range, (1, 2));
+        // Looping clip of two entries (200 + 50): walks, then wraps.
+        let durations = play_durations(&s, Some(0));
+        let loop_ = play_loop(&s.clips, Some(0));
         assert!(loop_);
-        assert_eq!(playback_frame_at(&d, range, 0, loop_), 1);
-        assert_eq!(playback_frame_at(&d, range, 199, loop_), 1);
-        assert_eq!(playback_frame_at(&d, range, 200, loop_), 2);
-        assert_eq!(playback_frame_at(&d, range, 249, loop_), 2);
-        assert_eq!(playback_frame_at(&d, range, 250, loop_), 1, "wraps");
+        assert_eq!(playback_frame_at(&durations, 0, loop_), 0);
+        assert_eq!(playback_frame_at(&durations, 199, loop_), 0);
+        assert_eq!(playback_frame_at(&durations, 200, loop_), 1);
+        assert_eq!(playback_frame_at(&durations, 249, loop_), 1);
+        assert_eq!(playback_frame_at(&durations, 250, loop_), 0, "wraps");
 
-        // Same range, non-looping: holds on the last frame past total.
-        let loop_ = play_loop(&clips, Some(1));
+        // Same timings, non-looping: holds on the last entry past total.
+        let durations = play_durations(&s, Some(1));
+        let loop_ = play_loop(&s.clips, Some(1));
         assert!(!loop_);
-        assert_eq!(playback_total_ms(&d, range), 250);
-        assert_eq!(playback_frame_at(&d, range, 9_999, loop_), 2);
+        assert_eq!(playback_total_ms(&durations), 250);
+        assert_eq!(playback_frame_at(&durations, 9_999, loop_), 1);
 
-        // No active clip: whole strip, loop default, wraps at 350.
-        let range = play_range(&clips, None, 3);
-        let loop_ = play_loop(&clips, None);
-        assert_eq!(playback_frame_at(&d, range, 340, loop_), 2);
-        assert_eq!(playback_frame_at(&d, range, 350, loop_), 0);
+        // No active clip: every frame at the default, looping, wraps at 300.
+        let durations = play_durations(&s, None);
+        let loop_ = play_loop(&s.clips, None);
+        assert_eq!(playback_frame_at(&durations, 290, loop_), 2);
+        assert_eq!(playback_frame_at(&durations, 300, loop_), 0);
     }
 
     #[test]

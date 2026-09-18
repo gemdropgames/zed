@@ -85,7 +85,9 @@ pub(crate) fn tint_strength(dist: i32) -> f32 {
     (DEFAULT_OPACITY * (1.0 - (abs - 1.0) * FALLOFF_PER_STEP)).clamp(0.0, 1.0)
 }
 
-/// One resolved ghost: which frame to draw, how far (signed -- negative
+/// One resolved ghost: which POSITION to draw (a frame index for
+/// whole-strip onion, a clip entry index inside a clip), how far
+/// (signed -- negative
 /// is behind/past, positive is ahead/future; see [`tint_for`]), and at
 /// what alpha. Farthest first, so a nearer (brighter) ghost paints over a
 /// farther one -- the same ordering ggo-ide's `ghost_layers` hands its
@@ -176,24 +178,25 @@ impl OnionState {
         probe.opacity != self.opacity
     }
 
-    /// The ghosts to draw under `frame`, farthest first. Empty when the
-    /// toggle is off (and, naturally, when both counts are 0).
+    /// The ghosts to draw under the current position, farthest first.
+    /// Empty when the toggle is off (and, naturally, when both counts are
+    /// 0).
     ///
-    /// `clip` is the ACTIVE clip, if any: onion walking is confined to it
-    /// and wraps when it loops, exactly as `onion_frames` documents. Its
-    /// `from`/`to` are normalized here because a `ClipEdit` may legally
-    /// store a reversed range and `OnionClip` is specified as the already
-    /// normalized pair.
-    pub fn ghosts(&self, frame: usize, frame_count: usize, clip: Option<&ClipEdit>) -> Vec<Ghost> {
+    /// `clip` is the ACTIVE clip, if any: `position` then indexes the
+    /// clip's ENTRIES rather than the document's frames, the walk is
+    /// confined to them, and it wraps when the clip loops -- exactly as
+    /// `onion_frames` documents. Each [`Ghost::idx`] is a position in the
+    /// same space the caller asked about, so a clip ghost still has to be
+    /// resolved through the clip's entries to reach a frame.
+    pub fn ghosts(&self, position: usize, count: usize, clip: Option<&ClipEdit>) -> Vec<Ghost> {
         if !self.on {
             return Vec::new();
         }
         let clip = clip.map(|c| OnionClip {
-            from: c.from.min(c.to),
-            to: c.from.max(c.to),
+            len: c.entries.len(),
             loop_: c.loop_,
         });
-        let mut ghosts = timeline_ops::onion_frames(frame, frame_count, self.back, self.fwd, clip);
+        let mut ghosts = timeline_ops::onion_frames(position, count, self.back, self.fwd, clip);
         ghosts.sort_by_key(|g| std::cmp::Reverse(g.dist.unsigned_abs()));
         ghosts
             .into_iter()
@@ -216,14 +219,14 @@ impl OnionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_worldlib::sprites::cow::ClipEntry;
     use ggo_worldlib::sprites::timeline_ops::onion_frames;
 
     fn clip(from: usize, to: usize, loop_: bool) -> ClipEdit {
         ClipEdit {
             name: "walk".to_string(),
-            from,
-            to,
             loop_,
+            entries: (from..=to).map(ClipEntry::of_frame).collect(),
         }
     }
 
@@ -394,7 +397,8 @@ mod tests {
     }
 
     /// The active clip confines the walk, and a looping clip wraps -- the
-    /// panel must pass the clip through, not ignore it.
+    /// panel must pass the clip through, not ignore it. Inside a clip the
+    /// positions are the clip's own entry indices.
     #[test]
     fn an_active_clip_confines_the_ghosts_and_a_looping_one_wraps() {
         let s = OnionState {
@@ -403,13 +407,35 @@ mod tests {
             fwd: 1,
             opacity: 1.0,
         };
-        // Non-looping clip [1, 3], sitting on its last frame: nothing ahead.
-        let ghosts = s.ghosts(3, 6, Some(&clip(1, 3, false)));
-        assert_eq!(ghosts.iter().map(|g| g.idx).collect::<Vec<_>>(), vec![2]);
-        // Looping clip, same position: forward wraps to the clip's start.
-        let ghosts = s.ghosts(3, 6, Some(&clip(1, 3, true)));
+        // A three-entry clip, sitting on its LAST position: nothing ahead.
+        let ghosts = s.ghosts(2, 6, Some(&clip(1, 3, false)));
+        assert_eq!(ghosts.iter().map(|g| g.idx).collect::<Vec<_>>(), vec![1]);
+        // Looping, same position: forward wraps to the clip's first entry.
+        let ghosts = s.ghosts(2, 6, Some(&clip(1, 3, true)));
         let idxs: Vec<usize> = ghosts.iter().map(|g| g.idx).collect();
-        assert!(idxs.contains(&2) && idxs.contains(&1), "wrapped: {idxs:?}");
+        assert!(idxs.contains(&1) && idxs.contains(&0), "wrapped: {idxs:?}");
+    }
+
+    /// A clip's ghosts are indices into its ENTRIES, so a clip that walks
+    /// frames out of order still ghosts its neighbours in SEQUENCE order.
+    #[test]
+    fn clip_ghost_positions_ignore_the_document_frame_count() {
+        let s = OnionState {
+            on: true,
+            back: 1,
+            fwd: 1,
+            opacity: 1.0,
+        };
+        let two_entries = clip(4, 5, false);
+        // Position 0 of a two-entry clip: only position 1 is reachable,
+        // no matter how many frames the document holds.
+        assert_eq!(
+            s.ghosts(0, 99, Some(&two_entries))
+                .iter()
+                .map(|g| g.idx)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     // ------------------------------------------------------------ tint
@@ -435,21 +461,5 @@ mod tests {
         assert!((tint_strength(2) - DEFAULT_OPACITY * 0.7).abs() < 1e-6);
         // Never negative even past where the raw falloff would go negative.
         assert!(tint_strength(10) >= 0.0);
-    }
-
-    /// A clip may legally store its range reversed; the ghosts must be the
-    /// same either way (`OnionClip` is specified as the normalized pair).
-    #[test]
-    fn a_reversed_clip_range_resolves_the_same_as_the_forward_one() {
-        let s = OnionState {
-            on: true,
-            back: 1,
-            fwd: 1,
-            opacity: 1.0,
-        };
-        assert_eq!(
-            s.ghosts(2, 6, Some(&clip(1, 3, false))),
-            s.ghosts(2, 6, Some(&clip(3, 1, false)))
-        );
     }
 }

@@ -1,11 +1,11 @@
 //! Guarded-positional animation preservation for a sprite re-import.
 //!
 //! An artist-supplied PNG is the source of truth for PIXELS, but the
-//! animation work -- clip ranges, per-frame durations, per-frame
-//! transforms -- only exists in the `.spr`, and a plain re-import writes
-//! a fresh [`SpriteState`] that has none of it (worldlib's
-//! `import::sprite_import` builds every frame at
-//! `DEFAULT_FRAME_DURATION_MS` with an identity transform and no clips).
+//! animation work -- the clips and, on each of their entries, the
+//! duration, flip, offset and transform that entry plays at -- only
+//! exists in the `.spr`, and a plain re-import writes a fresh
+//! [`SpriteState`] that has none of it (worldlib's
+//! `import::sprite_import` builds a bare frame list and no clips).
 //!
 //! A PNG frame carries no identity, so the ONLY defensible match between
 //! the old document's frames and the new import's is POSITION: frame `i`
@@ -67,25 +67,22 @@ pub(crate) fn check(old: &SpriteState, new: &SpriteState) -> Result<(), Mismatch
     Ok(())
 }
 
-/// Carry `old`'s animation work onto `new`'s artwork, matching frames by
-/// position: frame `i` keeps its duration and transform, frames past the
-/// old document's end keep the import's defaults, and the clips come over
-/// whole.
+/// Carry `old`'s animation work onto `new`'s artwork: the clips come over
+/// WHOLE, each entry keeping the frame it points at (matched by position
+/// -- frame `i` is still frame `i`) along with the duration, flip, offset
+/// and transform it plays at. Frames the old document never had are
+/// simply not referenced by any clip.
 ///
 /// Only meaningful after [`check`] has passed, but written not to depend
-/// on it: a clip whose range does not address `new`'s frames is DROPPED
-/// rather than clamped or trusted, so a caller that skips the check can
-/// still not produce a document that addresses a frame it doesn't have.
+/// on it: a clip with ANY entry past `new`'s frame list is DROPPED rather
+/// than clamped or trusted, so a caller that skips the check can still
+/// not produce a document that addresses a frame it doesn't have.
 pub(crate) fn merge(old: &SpriteState, mut new: SpriteState) -> SpriteState {
-    for (frame, previous) in new.frames.iter_mut().zip(old.frames.iter()) {
-        frame.duration_ms = previous.duration_ms;
-        frame.transform = previous.transform;
-    }
     let frame_count = new.frames.len();
     new.clips = old
         .clips
         .iter()
-        .filter(|clip| clip.from < frame_count && clip.to < frame_count)
+        .filter(|clip| clip.entries.iter().all(|e| e.frame < frame_count))
         .cloned()
         .collect();
     new
@@ -134,9 +131,9 @@ pub(crate) fn mismatch_message(mismatch: &Mismatch, spr_rel: &str) -> String {
             "it is {}x{} tiles but the new import is {}x{}",
             old.0, old.1, new.0, new.1
         ),
-        Mismatch::FewerFrames { old, new } => format!(
-            "it has {old} frames but the new import has only {new}"
-        ),
+        Mismatch::FewerFrames { old, new } => {
+            format!("it has {old} frames but the new import has only {new}")
+        }
         Mismatch::SharedTileset => {
             "its tileset is shared with other sprites, which this import would rewrite".to_string()
         }
@@ -167,15 +164,11 @@ pub(crate) fn preserve_message(spr_rel: &str, clips: usize, frames: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggo_worldlib::sprites::cow::{ClipEdit, Frame, FrameTransform};
+    use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry, Frame, FrameTransform};
     use ggo_worldlib::sprites::hw::TILE_BYTES;
 
-    fn frame(duration_ms: u16) -> Frame {
-        Frame {
-            map: vec![0],
-            duration_ms,
-            transform: FrameTransform::IDENTITY,
-        }
+    fn frame() -> Frame {
+        Frame { map: vec![0] }
     }
 
     fn state(frames: usize, footprint: (u8, u8)) -> SpriteState {
@@ -184,7 +177,7 @@ mod tests {
             tile_count: 1,
             session_tiles: Default::default(),
             palette: [0; 16],
-            frames: (0..frames).map(|_| frame(100)).collect(),
+            frames: (0..frames).map(|_| frame()).collect(),
             clips: Vec::new(),
             w_tiles: footprint.0,
             h_tiles: footprint.1,
@@ -192,46 +185,40 @@ mod tests {
         }
     }
 
+    /// A looping clip with one entry per frame in `from..=to`.
     fn clip(name: &str, from: usize, to: usize) -> ClipEdit {
         ClipEdit {
             name: name.to_string(),
-            from,
-            to,
             loop_: true,
+            entries: (from..=to).map(ClipEntry::of_frame).collect(),
         }
     }
 
     /// The workflow this exists for: the artist appended frames, so every
-    /// old frame is still where it was. Timing, transforms and clips come
-    /// over untouched; the appended frames keep the import's defaults.
+    /// old frame is still where it was. The clips come over whole, and the
+    /// per-entry timing and transform travel with them; the appended
+    /// frames are simply not referenced yet.
     #[test]
-    fn appending_frames_keeps_every_clip_timing_and_transform() {
+    fn appending_frames_keeps_every_clip_with_its_entries() {
         let mut old = state(2, (1, 1));
-        old.frames[0].duration_ms = 250;
-        old.frames[1].duration_ms = 400;
-        old.frames[1].transform = FrameTransform {
+        let mut idle = clip("idle", 0, 1);
+        idle.entries[0].duration_ms = 250;
+        idle.entries[1].duration_ms = 400;
+        idle.entries[1].transform = FrameTransform {
             angle256: 64,
             ..FrameTransform::IDENTITY
         };
-        old.clips = vec![clip("idle", 0, 1)];
+        old.clips = vec![idle.clone()];
         let new = state(4, (1, 1));
 
         assert_eq!(check(&old, &new), Ok(()));
         let merged = merge(&old, new);
+        assert_eq!(merged.frames.len(), 4, "the appended frames are kept");
         assert_eq!(
-            merged.frames.iter().map(|f| f.duration_ms).collect::<Vec<_>>(),
-            vec![250, 400, 100, 100],
-            "old frames keep their timing, appended ones take the import default"
+            merged.clips,
+            vec![idle],
+            "the clip and every entry's timing, flip, offset and transform come over"
         );
-        assert_eq!(
-            merged.frames[1].transform,
-            FrameTransform {
-                angle256: 64,
-                ..FrameTransform::IDENTITY
-            }
-        );
-        assert_eq!(merged.frames[2].transform, FrameTransform::IDENTITY);
-        assert_eq!(merged.clips, vec![clip("idle", 0, 1)]);
     }
 
     /// The artwork is the import's, not the document's -- preservation is
@@ -264,7 +251,11 @@ mod tests {
                 new: (1, 1)
             })
         );
-        assert_eq!(check(&old, &state(3, (2, 1))), Ok(()), "equal counts are fine");
+        assert_eq!(
+            check(&old, &state(3, (2, 1))),
+            Ok(()),
+            "equal counts are fine"
+        );
     }
 
     /// A shared `.til` makes the write reach past this sprite, so it is
@@ -281,7 +272,9 @@ mod tests {
     #[test]
     fn merge_drops_a_clip_that_the_new_frame_list_cannot_hold() {
         let mut old = state(3, (1, 1));
-        old.clips = vec![clip("keep", 0, 1), clip("drop", 1, 2)];
+        let mut reaches_past = clip("drop", 0, 0);
+        reaches_past.entries.push(ClipEntry::of_frame(5));
+        old.clips = vec![clip("keep", 0, 1), reaches_past];
         let merged = merge(&old, state(2, (1, 1)));
         assert_eq!(merged.clips, vec![clip("keep", 0, 1)]);
     }
@@ -333,7 +326,9 @@ mod tests {
             confirm.contains("the first 3 frames"),
             "the confirm names what the positional match assumes"
         );
-        assert!(preserve_message("art/hero.spr", 2, 3).contains("keep its 2 clips and frame timing"));
+        assert!(
+            preserve_message("art/hero.spr", 2, 3).contains("keep its 2 clips and frame timing")
+        );
         assert!(
             preserve_message("art/hero.spr", 0, 3).contains("keep its frame timing"),
             "a sprite with no clips still has timing worth keeping"
