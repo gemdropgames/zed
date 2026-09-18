@@ -193,6 +193,7 @@ impl Item for SpriteEditorItem {
 mod tests {
     use super::*;
     use crate::test_fixtures::write_sprite_fixture;
+    use ggo_worldlib::sprites::cow::ClipEntry;
     use ggo_worldlib::sprites::io::open_sprite;
     use ggo_worldlib::sprites::sprite_doc::DocOp;
     use gpui::TestAppContext;
@@ -253,7 +254,17 @@ mod tests {
 
         item.update(cx, |item, cx| {
             item.panel().clone().update(cx, |panel, cx| {
-                assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+                assert!(panel.apply_doc(
+                    DocOp::ClipEntrySet {
+                        clip: 0,
+                        at: 0,
+                        entry: ClipEntry {
+                            duration_ms: 500,
+                            ..ClipEntry::of_frame(0)
+                        },
+                    },
+                    cx
+                ));
             });
         });
         let save = item.update_in(cx, |item, window, cx| {
@@ -268,7 +279,8 @@ mod tests {
             open_sprite(dir.path(), "sprites/hero.spr")
                 .unwrap()
                 .state
-                .frames[0]
+                .clips[0]
+                .entries[0]
                 .duration_ms,
             500,
             "the edit reached the trio on disk"
@@ -280,7 +292,17 @@ mod tests {
         let bad_root = dir.path().join("sprites/hero.spr");
         item.update(cx, |item, cx| {
             item.panel().clone().update(cx, |panel, cx| {
-                assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 700 }, cx));
+                assert!(panel.apply_doc(
+                    DocOp::ClipEntrySet {
+                        clip: 0,
+                        at: 0,
+                        entry: ClipEntry {
+                            duration_ms: 700,
+                            ..ClipEntry::of_frame(0)
+                        },
+                    },
+                    cx
+                ));
                 if let ViewerState::Ready(open) = &mut panel.state {
                     open.root = bad_root;
                 }

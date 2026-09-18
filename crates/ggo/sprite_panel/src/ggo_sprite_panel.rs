@@ -16,9 +16,9 @@
 //! guard, blur/Enter-committed single-line editors -- with the
 //! sprite-specific pieces split out: `loader` owns everything off the UI
 //! thread (`.spr` open + per-frame compose + the picker sheet),
-//! `playback` owns the pure range/loop/offset/fit math, `edits` owns the
-//! pure edit rules (new-clip defaults, range validation, duration
-//! parsing, post-op selection bookkeeping), `tiles` owns the preview and
+//! `playback` owns the pure duration/loop/offset/fit math, `edits` owns
+//! the pure edit rules (new-clip defaults, duration parsing, post-op
+//! selection bookkeeping), `tiles` owns the preview and
 //! picker hit math and the hw meter line; this module owns the panel
 //! entity, the store wiring, the transport timer loop, and all gpui
 //! glue. Op semantics mirror ggo-ide's `sprites/timeline.rs` message
@@ -64,7 +64,7 @@ use ui::prelude::*;
 use ui::{Checkbox, ContextMenu, DropdownMenu, ToggleState};
 use workspace::Workspace;
 
-use ggo_worldlib::sprites::cow::{ClipEdit, FrameTransform, SpriteState};
+use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry, FrameTransform, SpriteState};
 use ggo_worldlib::sprites::io::{self, open_sprite, save_sprite};
 use ggo_worldlib::sprites::sprite_doc::{
     Anchor, DocOp, MAX_SPRITE_TILES, MIN_SPRITE_TILES, SpriteDocStore, blank_sprite_state,
@@ -938,9 +938,10 @@ fn create_sprite(
         state.frames.resize(NEW_METASPRITE_FRAMES, first);
         state.clips.push(ClipEdit {
             name: NEW_METASPRITE_CLIP.to_string(),
-            from: 0,
-            to: NEW_METASPRITE_FRAMES - 1,
             loop_: true,
+            entries: (0..NEW_METASPRITE_FRAMES)
+                .map(ClipEntry::of_frame)
+                .collect(),
         });
     }
     save_sprite(&root, &rel_path, &state, til_rel, &tileset.pal_path).map_err(|e| e.to_string())?;
@@ -996,22 +997,22 @@ fn rename_seed(source_rel: &str) -> String {
 // ------------------------------------------------------------- view state
 
 /// What one panel text input edits. `Duration` deliberately carries no
-/// frame index -- there is ONE duration editor, always bound to the
-/// currently selected frame, so a selection change re-syncs its text
+/// entry index -- there is ONE duration editor, always bound to the
+/// currently selected clip ENTRY, so a selection change re-syncs its text
 /// instead of rebuilding the editor set. The five transform fields
-/// (rotation in degrees, 8.8 scales and shears as decimals) follow the
-/// same single-editor rule.
+/// (rotation in degrees, 8.8 scales and shears as decimals) and the two
+/// pixel offsets follow the same single-editor rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditTarget {
     ClipName(usize),
-    ClipFrom(usize),
-    ClipTo(usize),
     Duration,
     Rot,
     ScaleX,
     ScaleY,
     ShearX,
     ShearY,
+    OffsetX,
+    OffsetY,
 }
 
 /// One panel text input: the target it edits and the single-line editor
@@ -1029,11 +1030,12 @@ struct EditorEntry {
 /// tick jitter can't drift the transport.
 struct Playing {
     started: Instant,
-    /// Elapsed-ms seed so playback starts ON the selected frame
+    /// Elapsed-ms seed so playback starts AT the selected position
     /// (`playback::start_offset_ms`).
     start_offset_ms: i64,
-    /// The frame the transport is currently showing.
-    frame: usize,
+    /// The sequence POSITION the transport is currently showing: an entry
+    /// index inside the active clip, or a frame index for "All frames".
+    position: usize,
 }
 
 /// A loaded sprite: its doc store, per-frame image cache, transport
@@ -1071,14 +1073,17 @@ struct OpenSprite {
     /// `refresh_after_doc_change`: a doc mutation can change any frame's
     /// pixels, and the key doesn't carry a generation to invalidate by.
     ghost_cache: RefCell<HashMap<(i32, usize), Arc<RenderImage>>>,
-    /// Transformed composes keyed by frame index, shared by the big
-    /// preview and the clip sequence thumbnails
-    /// (`loader::compose_transformed_frame` is pure in the doc state,
-    /// so an entry is stale only after a doc mutation, which clears the
-    /// map in `refresh_after_doc_change` alongside `frames`). `RefCell`
-    /// for the same reason as [`Self::ghost_cache`]: filled from
-    /// [`Self::frame_image`] under `&self` during render.
-    transformed_frames: RefCell<HashMap<usize, Arc<RenderImage>>>,
+    /// Transformed composes keyed by `(frame, mat_ab, mat_cd, flip_h,
+    /// flip_v)` -- everything `loader::compose_transformed_frame` reads
+    /// besides the doc itself. `FrameTransform` is not `Hash`, so the
+    /// key carries its packed matrix instead, which is exactly what the
+    /// composer consumes. Shared by the big preview and the clip
+    /// sequence thumbnails (the composer is pure in the doc state, so an
+    /// entry is stale only after a doc mutation, which clears the map in
+    /// `refresh_after_doc_change` alongside `frames`). `RefCell` for the
+    /// same reason as [`Self::ghost_cache`]: filled from
+    /// [`Self::frame_image_for`] under `&self` during render.
+    transformed_frames: RefCell<HashMap<(usize, u32, u32, bool, bool), Arc<RenderImage>>>,
     /// The bound tileset composed as the tile picker's sheet; same
     /// invalidation as `frames`.
     pool_strip: Option<loader::PoolStrip>,
@@ -1122,17 +1127,23 @@ struct OpenSprite {
     /// of stamping the selection. Cleared by Escape alongside the
     /// selection.
     eraser: bool,
-    /// An open per-frame settings popup: `(owning clip, anchor position)`.
-    /// The frame it edits is `selected_frame` (opening it selects the
-    /// frame, so the preview and the popup agree). Dismissed by
-    /// click-away or Escape.
-    frame_settings: Option<(usize, gpui::Point<Pixels>)>,
+    /// An open per-entry settings popup: `(owning clip, sequence
+    /// position, anchor position)`. Opening it selects that entry, so
+    /// the preview, the popup's editors and the popup agree. Dismissed
+    /// by click-away or Escape.
+    frame_settings: Option<(usize, usize, gpui::Point<Pixels>)>,
     /// The preview image's on-screen bounds, recorded at prepaint by the
     /// overlay canvas so the click handler can map window coords to cell
     /// hits (world_panel's `last_bounds` idiom). `None` until the first
     /// Ready-state paint.
     preview_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     selected_frame: usize,
+    /// The selected clip ENTRY as `(clip, sequence position)`, when the
+    /// selection came from a sequence cell rather than the library.
+    /// Entries carry the per-play metadata (duration, transform, flip,
+    /// offset), so this is what the settings editors bind to; `None`
+    /// means a plain library selection and no entry to edit.
+    selected_entry: Option<(usize, usize)>,
     /// Index into the doc's clips; `None` = whole-sprite range.
     active_clip: Option<usize>,
     /// Onion-skin controls (off by default) -- see [`onion`].
@@ -1145,13 +1156,19 @@ struct OpenSprite {
     /// Clip/duration field editors, rebuilt by `ensure_editors` when the
     /// target set changes.
     editors: Vec<EditorEntry>,
-    /// Inline rejection from a clip-range edit: `(clip index, message)`.
-    /// Cleared on the next applied op.
-    clip_error: Option<(usize, String)>,
     /// A store-level op rejection (shouldn't happen -- ops are
     /// bounds-guarded before apply -- but surfaced instead of swallowed).
     op_error: Option<String>,
     save_error: Option<String>,
+}
+
+/// What the big preview draws: a frame and the entry metadata it is
+/// drawn with (plain for a library selection).
+#[derive(Clone, Copy)]
+struct Shown {
+    frame: usize,
+    transform: FrameTransform,
+    flip: (bool, bool),
 }
 
 impl OpenSprite {
@@ -1189,24 +1206,81 @@ impl OpenSprite {
             frame_settings: None,
             preview_bounds: Rc::new(RefCell::new(None)),
             selected_frame: 0,
+            selected_entry: None,
             active_clip: None,
             onion: onion::OnionState::default(),
             playing: None,
             _tick_task: None,
             editors: Vec::new(),
-            clip_error: None,
             op_error: None,
             save_error: None,
         }
     }
 
-    /// The frame the big preview shows: the transport's while playing,
-    /// the selected frame otherwise (so stopping "resets" the preview to
-    /// the selection).
+    /// The entry at play `position` for the active clip, or the plain
+    /// frame at `position` for "All frames".
+    fn entry_at_position(&self, position: usize) -> Shown {
+        let state = self.store.state();
+        match self
+            .active_clip
+            .and_then(|i| state.clips.get(i))
+            .and_then(|c| c.entries.get(position))
+        {
+            Some(entry) => Shown {
+                frame: entry.frame,
+                transform: entry.transform,
+                flip: (entry.flip_h, entry.flip_v),
+            },
+            None => Shown {
+                frame: position,
+                transform: FrameTransform::IDENTITY,
+                flip: (false, false),
+            },
+        }
+    }
+
+    /// What the big preview draws: the transport's entry while playing,
+    /// the selected entry otherwise, falling back to the plain selected
+    /// frame (so stopping "resets" the preview to the selection).
+    fn shown(&self) -> Shown {
+        if let Some(playing) = &self.playing {
+            return self.entry_at_position(playing.position);
+        }
+        let state = self.store.state();
+        if let Some(entry) = self
+            .selected_entry
+            .and_then(|(clip, position)| state.clips.get(clip)?.entries.get(position))
+        {
+            return Shown {
+                frame: entry.frame,
+                transform: entry.transform,
+                flip: (entry.flip_h, entry.flip_v),
+            };
+        }
+        Shown {
+            frame: self.selected_frame,
+            transform: FrameTransform::IDENTITY,
+            flip: (false, false),
+        }
+    }
+
     fn shown_frame(&self) -> usize {
-        self.playing
-            .as_ref()
-            .map_or(self.selected_frame, |p| p.frame)
+        self.shown().frame
+    }
+
+    /// The sequence position the preview is at: the transport's while
+    /// playing, else the selected entry's when it belongs to the ACTIVE
+    /// clip (a selection in some other clip says nothing about where
+    /// the active sequence is), else the selected frame -- which is a
+    /// position exactly when there is no active clip.
+    fn shown_position(&self) -> usize {
+        if let Some(playing) = &self.playing {
+            return playing.position;
+        }
+        match (self.active_clip, self.selected_entry) {
+            (Some(active), Some((clip, position))) if active == clip => position,
+            _ => self.selected_frame,
+        }
     }
 
     /// The composed sheet behind `view`, if there is one (a sprite
@@ -1270,58 +1344,45 @@ impl OpenSprite {
         }
     }
 
-    /// The image the big preview draws: the shown frame's LEGACY compose
-    /// (the same Arc the strip thumbnail uses) while its transform is
-    /// identity, else the transformed compose on the doubled canvas,
-    /// cached per shown frame until the next doc mutation.
+    /// The image the big preview draws -- see [`Self::frame_image_for`].
     fn preview_image(&self) -> Option<Arc<RenderImage>> {
-        self.frame_image(self.shown_frame())
+        self.frame_image_for(self.shown())
     }
 
-    /// The image any frame draws with (big preview and sequence thumbs
+    /// The image one `Shown` draws with (big preview and sequence thumbs
     /// alike): the LEGACY compose (the same Arc the strip thumbnail
-    /// uses) while the frame's transform is identity, else the
-    /// transformed compose on the doubled canvas, cached per frame
-    /// until the next doc mutation.
-    fn frame_image(&self, idx: usize) -> Option<Arc<RenderImage>> {
-        let state = self.store.state();
-        if state
-            .frames
-            .get(idx)
-            .is_none_or(|f| f.transform.is_identity())
-        {
-            return self.frames.get(idx).cloned();
+    /// uses) while its transform is identity and it is unflipped, else
+    /// the transformed compose on the doubled canvas, cached per
+    /// `(frame, matrix, flip)` until the next doc mutation.
+    fn frame_image_for(&self, shown: Shown) -> Option<Arc<RenderImage>> {
+        if shown.transform.is_identity() && shown.flip == (false, false) {
+            return self.frames.get(shown.frame).cloned();
         }
-        if let Some(image) = self.transformed_frames.borrow().get(&idx) {
+        let (mat_ab, mat_cd) = shown.transform.matrix();
+        let key = (shown.frame, mat_ab, mat_cd, shown.flip.0, shown.flip.1);
+        if let Some(image) = self.transformed_frames.borrow().get(&key) {
             return Some(image.clone());
         }
-        let image = loader::compose_transformed_frame(state, idx)?;
+        let image = loader::compose_transformed_frame(
+            self.store.state(),
+            shown.frame,
+            shown.transform,
+            shown.flip,
+        )?;
         self.transformed_frames
             .borrow_mut()
-            .insert(idx, image.clone());
+            .insert(key, image.clone());
         Some(image)
     }
 
-    /// Whether the shown frame renders through the legacy identity path
-    /// -- the only case the preview's tile grid and cell-click editing
-    /// are geometrically meaningful in (the transformed canvas is
-    /// doubled and rotated, so cell math over it would stamp the wrong
-    /// tiles).
+    /// Whether what the preview shows renders through the legacy
+    /// identity path -- the only case the preview's tile grid and
+    /// cell-click editing are geometrically meaningful in (the
+    /// transformed canvas is doubled and rotated, so cell math over it
+    /// would stamp the wrong tiles).
     fn shown_frame_is_identity(&self) -> bool {
-        self.store
-            .state()
-            .frames
-            .get(self.shown_frame())
-            .is_none_or(|f| f.transform.is_identity())
-    }
-
-    fn durations(&self) -> Vec<u16> {
-        self.store
-            .state()
-            .frames
-            .iter()
-            .map(|f| f.duration_ms)
-            .collect()
+        let shown = self.shown();
+        shown.transform.is_identity() && shown.flip == (false, false)
     }
 
     /// The onion-skin ghosts for the frame currently on screen, farthest
@@ -1335,24 +1396,26 @@ impl OpenSprite {
         }
         let state = self.store.state();
         let clip = self.active_clip.and_then(|i| state.clips.get(i));
-        self.onion
-            .ghosts(self.shown_frame(), state.frames.len(), clip)
+        let count = clip.map_or(state.frames.len(), |c| c.entries.len());
+        self.onion.ghosts(self.shown_position(), count, clip)
     }
 
-    /// The tinted image for one onion-skin ghost, from
-    /// [`Self::ghost_cache`] if this `(dist, idx)` was composed before,
-    /// else composed via [`loader::compose_ghost`] and cached for next
-    /// time. `&self` (not `&mut self`): called from [`render_preview`],
-    /// which only borrows the Ready state immutably -- the cache's
-    /// `RefCell` is what makes filling it in from there sound.
-    fn ghost_image(&self, dist: i32, idx: usize) -> Option<Arc<RenderImage>> {
-        if let Some(image) = self.ghost_cache.borrow().get(&(dist, idx)) {
+    /// The tinted image for one onion-skin ghost at sequence `position`,
+    /// from [`Self::ghost_cache`] if this `(dist, frame)` was composed
+    /// before, else composed via [`loader::compose_ghost`] and cached for
+    /// next time. `&self` (not `&mut self`): called from
+    /// [`render_preview`], which only borrows the Ready state immutably
+    /// -- the cache's `RefCell` is what makes filling it in from there
+    /// sound.
+    fn ghost_image(&self, dist: i32, position: usize) -> Option<Arc<RenderImage>> {
+        let frame = self.entry_at_position(position).frame;
+        if let Some(image) = self.ghost_cache.borrow().get(&(dist, frame)) {
             return Some(image.clone());
         }
-        let image = loader::compose_ghost(self.store.state(), idx, dist)?;
+        let image = loader::compose_ghost(self.store.state(), frame, dist)?;
         self.ghost_cache
             .borrow_mut()
-            .insert((dist, idx), image.clone());
+            .insert((dist, frame), image.clone());
         Some(image)
     }
 }
@@ -2033,6 +2096,27 @@ impl SpritePanel {
             && ix < open.store.state().frames.len()
         {
             open.selected_frame = ix;
+            // A library pick is a PLAIN selection: the settings editors
+            // would otherwise keep editing whichever entry was selected
+            // before, which is not what the preview now shows.
+            open.selected_entry = None;
+            cx.notify();
+        }
+    }
+
+    /// Select sequence position `position` of clip `clip` -- the entry
+    /// the settings editors bind to, and the frame the preview shows.
+    fn select_entry(&mut self, clip: usize, position: usize, cx: &mut Context<Self>) {
+        if let ViewerState::Ready(open) = &mut self.state
+            && let Some(entry) = open
+                .store
+                .state()
+                .clips
+                .get(clip)
+                .and_then(|c| c.entries.get(position))
+        {
+            open.selected_frame = entry.frame;
+            open.selected_entry = Some((clip, position));
             cx.notify();
         }
     }
@@ -2058,10 +2142,10 @@ impl SpritePanel {
     }
 
     /// Play/pause toggle. Play anchors a wall clock, seeds the elapsed
-    /// offset so playback starts on the selected frame (clamped into the
-    /// active range), and spawns the tick loop; pause drops the loop and
-    /// the transport state (the preview falls back to the selected
-    /// frame).
+    /// offset so playback starts at the selected position (clamped into
+    /// the active sequence), and spawns the tick loop; pause drops the
+    /// loop and the transport state (the preview falls back to the
+    /// selection).
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -2075,16 +2159,23 @@ impl SpritePanel {
         if open.store.state().frames.is_empty() {
             return;
         }
-        let durations = open.durations();
-        let state = open.store.state();
-        let range = playback::play_range(&state.clips, open.active_clip, state.frames.len());
-        let start_offset_ms = playback::start_offset_ms(&durations, range, open.selected_frame);
+        let durations = playback::play_durations(open.store.state(), open.active_clip);
+        if durations.is_empty() {
+            return;
+        }
+        // Where the transport starts: the selected entry's position when
+        // it belongs to the active clip, the selected frame when playing
+        // the whole library, else the sequence's head.
+        let start = match (open.active_clip, open.selected_entry) {
+            (Some(active), Some((clip, position))) if active == clip => position,
+            (None, _) => open.selected_frame,
+            _ => 0,
+        };
+        let start_offset_ms = playback::start_offset_ms(&durations, start);
         open.playing = Some(Playing {
             started: Instant::now(),
             start_offset_ms,
-            frame: open
-                .selected_frame
-                .clamp(range.0.min(range.1), range.0.max(range.1)),
+            position: start.min(durations.len() - 1),
         });
         // The timer loop: sleep a tick, recompute the shown frame from
         // wall-clock elapsed, stop when a non-looping range finishes (or
@@ -2107,16 +2198,16 @@ impl SpritePanel {
         cx.notify();
     }
 
-    /// One transport tick: re-read durations/range/loop from the doc
+    /// One transport tick: re-read durations/loop from the doc
     /// (mid-playback edits get picked up immediately, ggo-ide's `tick`
-    /// rule -- a deleted clip falls back to the whole strip via
-    /// `play_range`'s stale-index rule) and recompute the shown frame.
-    /// Notifies only when the shown frame actually changed (or playback
+    /// rule -- a deleted clip falls back to the whole library via
+    /// `play_durations`'s stale-index rule) and recompute the shown
+    /// position. Notifies only when it actually changed (or playback
     /// stopped) -- at 16ms ticks over >= 16ms frames most ticks change
     /// nothing, and a no-op notify would re-render the whole panel at
     /// 60Hz for the duration of playback (M4 review fix). Returns true
     /// when the loop should stop: playback was cancelled, or a
-    /// non-looping range ran past its total (which also resets the
+    /// non-looping sequence ran past its total (which also resets the
     /// preview to the selected frame).
     fn advance_playback(&mut self, cx: &mut Context<Self>) -> bool {
         let ViewerState::Ready(open) = &mut self.state else {
@@ -2126,22 +2217,22 @@ impl SpritePanel {
             return true;
         }
         let state = open.store.state();
-        let durations: Vec<u16> = state.frames.iter().map(|f| f.duration_ms).collect();
-        let range = playback::play_range(&state.clips, open.active_clip, state.frames.len());
+        let durations = playback::play_durations(state, open.active_clip);
         let loop_ = playback::play_loop(&state.clips, open.active_clip);
-        let playing = open
-            .playing
-            .as_mut()
-            .expect("checked playing.is_some() above");
+        let Some(playing) = open.playing.as_mut() else {
+            return true;
+        };
         let t_ms = playing.start_offset_ms + playing.started.elapsed().as_millis() as i64;
-        if !loop_ && t_ms >= playback_total_ms(&durations, range) {
+        // An emptied active clip (its last entry deleted mid-play) has
+        // nothing left to walk.
+        if durations.is_empty() || (!loop_ && t_ms >= playback_total_ms(&durations)) {
             open.playing = None;
             cx.notify();
             return true;
         }
-        let frame = playback_frame_at(&durations, range, t_ms, loop_);
-        if playing.frame != frame {
-            playing.frame = frame;
+        let position = playback_frame_at(&durations, t_ms, loop_);
+        if playing.position != position {
+            playing.position = position;
             cx.notify();
         }
         false
@@ -2204,11 +2295,29 @@ impl SpritePanel {
         if open.active_clip.is_some_and(|c| c >= clip_count) {
             open.active_clip = None;
         }
+        let entry_counts: Vec<usize> = open
+            .store
+            .state()
+            .clips
+            .iter()
+            .map(|c| c.entries.len())
+            .collect();
+        let entry_exists = |clip: usize, position: usize| {
+            entry_counts.get(clip).is_some_and(|&len| position < len)
+        };
+        if open
+            .selected_entry
+            .is_some_and(|(clip, position)| !entry_exists(clip, position))
+        {
+            // The selected entry was removed (or its clip was) under an
+            // op/undo -- the editors have nothing to bind to.
+            open.selected_entry = None;
+        }
         if open
             .frame_settings
-            .is_some_and(|(clip, _)| clip >= clip_count)
+            .is_some_and(|(clip, position, _)| !entry_exists(clip, position))
         {
-            // The popup's owning clip vanished under an undo/delete.
+            // The popup's entry vanished under an undo/delete.
             open.frame_settings = None;
         }
         if open.selection.as_ref().is_some_and(|block| {
@@ -2223,7 +2332,6 @@ impl SpritePanel {
             // stamping whatever tile inherits the index.
             open.selection = None;
         }
-        open.clip_error = None;
         open.op_error = None;
         cx.notify();
     }
@@ -2436,29 +2544,27 @@ impl SpritePanel {
     }
 
     /// Drop a dragged library frame onto clip `clip_ix`'s END slot:
-    /// [`Self::insert_frame_in_clip`] at the sequence's tail.
+    /// [`Self::insert_entry_in_clip`] at the sequence's tail.
     fn drop_frame_on_clip(&mut self, clip_ix: usize, frame_ix: usize, cx: &mut Context<Self>) {
-        let seq_len = match &self.state {
-            ViewerState::Ready(open) => open
-                .store
-                .state()
-                .clips
-                .get(clip_ix)
-                .map(|clip| clip.to.saturating_sub(clip.from) + 1),
-            _ => None,
+        let ViewerState::Ready(open) = &self.state else {
+            return;
         };
-        if let Some(seq_len) = seq_len {
-            self.insert_frame_in_clip(clip_ix, seq_len, frame_ix, cx);
-        }
+        let Some(len) = open
+            .store
+            .state()
+            .clips
+            .get(clip_ix)
+            .map(|c| c.entries.len())
+        else {
+            return;
+        };
+        self.insert_entry_in_clip(clip_ix, len, frame_ix, cx);
     }
 
-    /// Insert a COPY of library frame `frame_ix` at sequence position
-    /// `seq_pos` (0 = before the clip's first frame, len = append) inside
-    /// clip `clip_ix`, extending the range by one. Two doc ops (add,
-    /// range) -- two undo steps; a composite op is the known upgrade if
-    /// that grates. The copy's editor-only name travels; stale indices
-    /// vanish as no-ops.
-    fn insert_frame_in_clip(
+    /// Insert a REFERENCE to library frame `frame_ix` at sequence position
+    /// `seq_pos` (`len` = append) of clip `clip_ix`. Stale indices vanish
+    /// as no-ops.
+    fn insert_entry_in_clip(
         &mut self,
         clip_ix: usize,
         seq_pos: usize,
@@ -2469,92 +2575,201 @@ impl SpritePanel {
             return;
         };
         let state = open.store.state();
-        let Some(clip) = state.clips.get(clip_ix).cloned() else {
+        if frame_ix >= state.frames.len()
+            || state
+                .clips
+                .get(clip_ix)
+                .is_none_or(|c| seq_pos > c.entries.len())
+        {
             return;
-        };
-        let seq_len = clip.to.saturating_sub(clip.from) + 1;
-        if frame_ix >= state.frames.len() || seq_pos > seq_len {
-            return;
-        }
-        let at = clip.from + seq_pos;
-        let mut names = open.frame_names.clone();
-        names.resize(state.frames.len(), String::new());
-        if !self.apply_doc(
-            DocOp::FrameAdd {
-                at,
-                copy_of: Some(frame_ix),
-                map: None,
-            },
-            cx,
-        ) {
-            return;
-        }
-        if let ViewerState::Ready(open) = &mut self.state {
-            names.insert(at, names.get(frame_ix).cloned().unwrap_or_default());
-            open.frame_names = names;
         }
         self.apply_doc(
-            DocOp::ClipSet {
-                at: clip_ix,
-                clip: Some(ClipEdit {
-                    to: clip.to + 1,
-                    ..clip
-                }),
+            DocOp::ClipEntryInsert {
+                clip: clip_ix,
+                at: seq_pos,
+                entry: ClipEntry::of_frame(frame_ix),
             },
             cx,
         );
     }
 
-    /// Duplicate the frame at sequence position `seq_pos` of clip
-    /// `clip_ix` in place: a copy lands right after it and the clip
-    /// range grows by one (the sequence cell's duplicate button).
-    fn duplicate_frame_in_clip(&mut self, clip_ix: usize, seq_pos: usize, cx: &mut Context<Self>) {
+    /// Duplicate the entry at sequence position `seq_pos` of clip
+    /// `clip_ix` in place -- metadata and all (the sequence cell's
+    /// duplicate button).
+    fn duplicate_entry_in_clip(&mut self, clip_ix: usize, seq_pos: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let Some(clip) = open.store.state().clips.get(clip_ix) else {
+        let Some(entry) = open
+            .store
+            .state()
+            .clips
+            .get(clip_ix)
+            .and_then(|c| c.entries.get(seq_pos))
+            .copied()
+        else {
             return;
         };
-        let seq_len = clip.to.saturating_sub(clip.from) + 1;
-        if seq_pos >= seq_len {
-            return;
-        }
-        let frame_ix = clip.from + seq_pos;
-        self.insert_frame_in_clip(clip_ix, seq_pos + 1, frame_ix, cx);
+        self.apply_doc(
+            DocOp::ClipEntryInsert {
+                clip: clip_ix,
+                at: seq_pos + 1,
+                entry,
+            },
+            cx,
+        );
     }
 
-    /// Delete the frame at sequence position `seq_pos` of clip `clip_ix`
-    /// (the sequence cell's delete button). One doc op: the store remaps
-    /// every clip's range itself, dropping a clip whose sole frame died.
-    /// Refuses to drop the document's last frame, like
-    /// [`Self::delete_selected_frame`].
-    fn delete_frame_in_clip(&mut self, clip_ix: usize, seq_pos: usize, cx: &mut Context<Self>) {
+    /// Drop the entry at sequence position `seq_pos` of clip `clip_ix`
+    /// (the sequence cell's delete button). The frame it referenced stays
+    /// in the library -- frames are source data now.
+    fn delete_entry_in_clip(&mut self, clip_ix: usize, seq_pos: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let state = open.store.state();
-        let len = state.frames.len();
-        let Some(clip) = state.clips.get(clip_ix) else {
+        if open
+            .store
+            .state()
+            .clips
+            .get(clip_ix)
+            .is_none_or(|c| seq_pos >= c.entries.len())
+        {
+            return;
+        }
+        if self.apply_doc(
+            DocOp::ClipEntryRemove {
+                clip: clip_ix,
+                at: seq_pos,
+            },
+            cx,
+        ) && let ViewerState::Ready(open) = &mut self.state
+            && open.selected_entry == Some((clip_ix, seq_pos))
+        {
+            open.selected_entry = None;
+        }
+    }
+
+    /// Reorder one clip's sequence: the entry at `from` lands at `to`
+    /// (a post-removal splice index, `FrameMove`'s convention) and stays
+    /// selected.
+    fn move_entry_in_clip(
+        &mut self,
+        clip_ix: usize,
+        from: usize,
+        to: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let seq_len = clip.to.saturating_sub(clip.from) + 1;
-        if seq_pos >= seq_len || len <= 1 {
-            return;
-        }
-        let at = clip.from + seq_pos;
-        if at >= len {
-            return;
-        }
-        let next = edits::selection_after_frame_delete(open.selected_frame, at, len);
-        let mut names = open.frame_names.clone();
-        names.resize(len, String::new());
-        if self.apply_doc(DocOp::FrameDelete { at }, cx)
-            && let ViewerState::Ready(open) = &mut self.state
+        if from == to
+            || open
+                .store
+                .state()
+                .clips
+                .get(clip_ix)
+                .is_none_or(|c| from >= c.entries.len() || to >= c.entries.len())
         {
-            open.selected_frame = next;
-            names.remove(at);
-            open.frame_names = names;
+            return;
         }
+        if self.apply_doc(
+            DocOp::ClipEntryMove {
+                clip: clip_ix,
+                from,
+                to,
+            },
+            cx,
+        ) && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.selected_entry = Some((clip_ix, to));
+        }
+    }
+
+    /// Set one entry's horizontal/vertical flips (the settings popup's
+    /// checkboxes). An unchanged pair is dropped without an op, like
+    /// every other settings field.
+    fn set_entry_flip(
+        &mut self,
+        clip_ix: usize,
+        seq_pos: usize,
+        flip_h: bool,
+        flip_v: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(entry) = open
+            .store
+            .state()
+            .clips
+            .get(clip_ix)
+            .and_then(|c| c.entries.get(seq_pos))
+            .copied()
+        else {
+            return;
+        };
+        if (entry.flip_h, entry.flip_v) == (flip_h, flip_v) {
+            return;
+        }
+        self.apply_doc(
+            DocOp::ClipEntrySet {
+                clip: clip_ix,
+                at: seq_pos,
+                entry: ClipEntry {
+                    flip_h,
+                    flip_v,
+                    ..entry
+                },
+            },
+            cx,
+        );
+    }
+
+    /// A sequence cell dropped on another: inside one clip it reorders,
+    /// across clips it copies the entry in at the drop position.
+    fn drop_entry_at(
+        &mut self,
+        from_clip: usize,
+        from_pos: usize,
+        clip_ix: usize,
+        seq_pos: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if from_clip == clip_ix {
+            self.move_entry_in_clip(clip_ix, from_pos, seq_pos, cx);
+            return;
+        }
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(entry) = open
+            .store
+            .state()
+            .clips
+            .get(from_clip)
+            .and_then(|c| c.entries.get(from_pos))
+            .copied()
+        else {
+            return;
+        };
+        if open
+            .store
+            .state()
+            .clips
+            .get(clip_ix)
+            .is_none_or(|c| seq_pos > c.entries.len())
+        {
+            return;
+        }
+        self.apply_doc(
+            DocOp::ClipEntryInsert {
+                clip: clip_ix,
+                at: seq_pos,
+                entry,
+            },
+            cx,
+        );
     }
 
     /// Set frame `ix`'s editor-only name and persist the sidecar right
@@ -2871,20 +3086,20 @@ impl SpritePanel {
         }
     }
 
-    /// Open the per-frame settings popup for sequence frame `frame_ix`
+    /// Open the per-entry settings popup for sequence position `seq_pos`
     /// of clip `clip_ix`, anchored at `position` (the "..." click).
-    /// Selects the frame so the preview and the popup's editors (which
-    /// target the selected frame) both point at it.
+    /// Selects the entry so the preview and the popup's editors (which
+    /// target the selected entry) both point at it.
     fn open_frame_settings(
         &mut self,
         clip_ix: usize,
-        frame_ix: usize,
+        seq_pos: usize,
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.select_frame(frame_ix, cx);
+        self.select_entry(clip_ix, seq_pos, cx);
         if let ViewerState::Ready(open) = &mut self.state {
-            open.frame_settings = Some((clip_ix, position));
+            open.frame_settings = Some((clip_ix, seq_pos, position));
             cx.notify();
         }
     }
@@ -2918,7 +3133,12 @@ impl SpritePanel {
             return;
         };
         open._tick_task = None;
-        open.selected_frame = playing.frame;
+        open.selected_frame = open.entry_at_position(playing.position).frame;
+        // A PLAIN selection on that frame: the entry's transform/flip
+        // would keep the preview on the doubled canvas, where cell
+        // clicks are refused -- and this exists so the click that
+        // paused can go on to edit pixels.
+        open.selected_entry = None;
         cx.notify();
     }
 
@@ -3084,18 +3304,17 @@ impl SpritePanel {
     ///
     /// - clip name (`Msg::ClipNameSubmit`): trim, byte-clamp
     ///   (`clamp_clip_name_bytes`), empty -> dropped; then `ClipSet`.
-    /// - clip from/to: parse `usize` (unparsable -> dropped, world_panel's
-    ///   commit rule); validate the CANDIDATE range via
-    ///   `edits::clip_range_error` BEFORE building the op -- a failure is
-    ///   shown inline on that clip's row and nothing is applied. (ggo-ide
-    ///   edits ranges with clamped sliders, so its equivalent guard is the
-    ///   clamp itself; typed input needs the explicit check.)
     /// - duration (`Msg::DurationSubmit`): parse-or-0 then floor to
-    ///   `MIN_FRAME_MS` (`edits::parse_duration_ms`), applied to the
-    ///   selected frame.
+    ///   `MIN_FRAME_MS` (`edits::parse_duration_ms`).
+    /// - transforms and offsets: parse (unparsable -> dropped,
+    ///   world_panel's commit rule), merged into the entry's current
+    ///   metadata.
+    ///
+    /// Every field but the clip name edits the SELECTED ENTRY, so a
+    /// commit with nothing selected is dropped.
     ///
     /// Unchanged values are dropped without an op: blur commits every
-    /// focus exit, and a no-change `ClipSet`/`FrameDuration` would still
+    /// focus exit, and a no-change `ClipSet`/`ClipEntrySet` would still
     /// push an undo entry.
     fn commit_edit(&mut self, target: EditTarget, text: String, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
@@ -3119,89 +3338,84 @@ impl SpritePanel {
                     cx,
                 );
             }
-            EditTarget::ClipFrom(i) | EditTarget::ClipTo(i) => {
-                let Some(clip) = open.store.state().clips.get(i).cloned() else {
-                    return;
-                };
-                let Ok(value) = text.trim().parse::<usize>() else {
-                    cx.notify(); // dropped, not committed -- editor re-syncs
-                    return;
-                };
-                let (from, to) = match target {
-                    EditTarget::ClipFrom(_) => (value, clip.to),
-                    _ => (clip.from, value),
-                };
-                if (from, to) == (clip.from, clip.to) {
-                    cx.notify();
-                    return;
-                }
-                let frame_count = open.store.state().frames.len();
-                if let Some(err) = edits::clip_range_error(from, to, frame_count) {
-                    open.clip_error = Some((i, err));
-                    cx.notify();
-                    return;
-                }
-                open.clip_error = None;
-                self.apply_doc(
-                    DocOp::ClipSet {
-                        at: i,
-                        clip: Some(ClipEdit { from, to, ..clip }),
-                    },
-                    cx,
-                );
-            }
-            EditTarget::Duration => {
-                let ms = edits::parse_duration_ms(&text);
-                let at = open.selected_frame;
-                let Some(frame) = open.store.state().frames.get(at) else {
-                    return;
-                };
-                if frame.duration_ms == ms {
-                    cx.notify();
-                    return;
-                }
-                self.apply_doc(DocOp::FrameDuration { at, ms }, cx);
-            }
-            EditTarget::Rot
+            EditTarget::Duration
+            | EditTarget::Rot
             | EditTarget::ScaleX
             | EditTarget::ScaleY
             | EditTarget::ShearX
-            | EditTarget::ShearY => {
-                let frame = open.selected_frame;
-                let Some(current) = open.store.state().frames.get(frame).map(|f| f.transform)
+            | EditTarget::ShearY
+            | EditTarget::OffsetX
+            | EditTarget::OffsetY => {
+                let Some((clip, at)) = open.selected_entry else {
+                    cx.notify(); // nothing selected to edit -- editor re-syncs
+                    return;
+                };
+                let Some(current) = open
+                    .store
+                    .state()
+                    .clips
+                    .get(clip)
+                    .and_then(|c| c.entries.get(at))
+                    .copied()
                 else {
                     return;
                 };
-                // One field parsed and merged into the frame's CURRENT
-                // transform; unparsable input is dropped and the editor
-                // re-syncs from the doc (the duration editor's revert).
+                // One field parsed and merged into the entry's CURRENT
+                // metadata; unparsable input is dropped and the editor
+                // re-syncs from the doc.
+                let transform = current.transform;
                 let merged = match target {
-                    EditTarget::Rot => {
-                        edits::parse_angle_deg(&text).map(|angle256| FrameTransform {
+                    EditTarget::Duration => Some(ClipEntry {
+                        duration_ms: edits::parse_duration_ms(&text),
+                        ..current
+                    }),
+                    EditTarget::Rot => edits::parse_angle_deg(&text).map(|angle256| ClipEntry {
+                        transform: FrameTransform {
                             angle256,
-                            ..current
-                        })
-                    }
-                    EditTarget::ScaleX => {
-                        edits::parse_fixed88(&text).map(|sx| FrameTransform { sx, ..current })
-                    }
-                    EditTarget::ScaleY => {
-                        edits::parse_fixed88(&text).map(|sy| FrameTransform { sy, ..current })
-                    }
-                    EditTarget::ShearX => edits::parse_fixed88(&text)
-                        .map(|shear_x| FrameTransform { shear_x, ..current }),
-                    _ => edits::parse_fixed88(&text)
-                        .map(|shear_y| FrameTransform { shear_y, ..current }),
+                            ..transform
+                        },
+                        ..current
+                    }),
+                    EditTarget::ScaleX => edits::parse_fixed88(&text).map(|sx| ClipEntry {
+                        transform: FrameTransform { sx, ..transform },
+                        ..current
+                    }),
+                    EditTarget::ScaleY => edits::parse_fixed88(&text).map(|sy| ClipEntry {
+                        transform: FrameTransform { sy, ..transform },
+                        ..current
+                    }),
+                    EditTarget::ShearX => edits::parse_fixed88(&text).map(|shear_x| ClipEntry {
+                        transform: FrameTransform {
+                            shear_x,
+                            ..transform
+                        },
+                        ..current
+                    }),
+                    EditTarget::ShearY => edits::parse_fixed88(&text).map(|shear_y| ClipEntry {
+                        transform: FrameTransform {
+                            shear_y,
+                            ..transform
+                        },
+                        ..current
+                    }),
+                    EditTarget::OffsetX => text.trim().parse::<i16>().ok().map(|dx| ClipEntry {
+                        offset: (dx, current.offset.1),
+                        ..current
+                    }),
+                    _ => text.trim().parse::<i16>().ok().map(|dy| ClipEntry {
+                        offset: (current.offset.0, dy),
+                        ..current
+                    }),
                 };
-                let Some(transform) = merged else {
+                let Some(entry) = merged else {
                     cx.notify(); // dropped, not committed -- editor re-syncs
                     return;
                 };
-                if transform == current {
+                if entry == current {
                     cx.notify();
                     return;
                 }
-                self.apply_doc(DocOp::FrameTransformSet { frame, transform }, cx);
+                self.apply_doc(DocOp::ClipEntrySet { clip, at, entry }, cx);
             }
         }
     }
@@ -3210,45 +3424,31 @@ impl SpritePanel {
     fn edit_display_text(
         target: &EditTarget,
         state: &SpriteState,
-        selected_frame: usize,
+        selected_entry: Option<(usize, usize)>,
     ) -> String {
+        if let EditTarget::ClipName(i) = target {
+            return state
+                .clips
+                .get(*i)
+                .map_or_else(String::new, |c| c.name.clone());
+        }
+        // Every other field edits the selected ENTRY; with none selected
+        // the inputs read blank rather than showing a stale value.
+        let Some(entry) = selected_entry
+            .and_then(|(clip, position)| state.clips.get(clip)?.entries.get(position))
+        else {
+            return String::new();
+        };
         match target {
-            EditTarget::ClipName(i) => state
-                .clips
-                .get(*i)
-                .map_or_else(String::new, |c| c.name.clone()),
-            EditTarget::ClipFrom(i) => state
-                .clips
-                .get(*i)
-                .map_or_else(String::new, |c| c.from.to_string()),
-            EditTarget::ClipTo(i) => state
-                .clips
-                .get(*i)
-                .map_or_else(String::new, |c| c.to.to_string()),
-            EditTarget::Duration => state
-                .frames
-                .get(selected_frame)
-                .map_or_else(String::new, |f| f.duration_ms.to_string()),
-            EditTarget::Rot => state
-                .frames
-                .get(selected_frame)
-                .map_or_else(String::new, |f| {
-                    edits::format_angle_deg(f.transform.angle256)
-                }),
-            EditTarget::ScaleX | EditTarget::ScaleY | EditTarget::ShearX | EditTarget::ShearY => {
-                state
-                    .frames
-                    .get(selected_frame)
-                    .map_or_else(String::new, |f| {
-                        let value = match target {
-                            EditTarget::ScaleX => f.transform.sx,
-                            EditTarget::ScaleY => f.transform.sy,
-                            EditTarget::ShearX => f.transform.shear_x,
-                            _ => f.transform.shear_y,
-                        };
-                        edits::format_fixed88(value)
-                    })
-            }
+            EditTarget::Duration => entry.duration_ms.to_string(),
+            EditTarget::Rot => edits::format_angle_deg(entry.transform.angle256),
+            EditTarget::ScaleX => edits::format_fixed88(entry.transform.sx),
+            EditTarget::ScaleY => edits::format_fixed88(entry.transform.sy),
+            EditTarget::ShearX => edits::format_fixed88(entry.transform.shear_x),
+            EditTarget::ShearY => edits::format_fixed88(entry.transform.shear_y),
+            EditTarget::OffsetX => entry.offset.0.to_string(),
+            EditTarget::OffsetY => entry.offset.1.to_string(),
+            EditTarget::ClipName(_) => String::new(),
         }
     }
 
@@ -3262,11 +3462,9 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let mut targets = Vec::with_capacity(open.store.state().clips.len() * 3 + 6);
+        let mut targets = Vec::with_capacity(open.store.state().clips.len() + 8);
         for i in 0..open.store.state().clips.len() {
             targets.push(EditTarget::ClipName(i));
-            targets.push(EditTarget::ClipFrom(i));
-            targets.push(EditTarget::ClipTo(i));
         }
         targets.push(EditTarget::Duration);
         targets.push(EditTarget::Rot);
@@ -3274,6 +3472,8 @@ impl SpritePanel {
         targets.push(EditTarget::ScaleY);
         targets.push(EditTarget::ShearX);
         targets.push(EditTarget::ShearY);
+        targets.push(EditTarget::OffsetX);
+        targets.push(EditTarget::OffsetY);
 
         let same_targets = open.editors.len() == targets.len()
             && open
@@ -3288,7 +3488,7 @@ impl SpritePanel {
                 if entry.editor.focus_handle(cx).is_focused(window) {
                     continue;
                 }
-                let text = Self::edit_display_text(&entry.target, state, open.selected_frame);
+                let text = Self::edit_display_text(&entry.target, state, open.selected_entry);
                 if entry.editor.read(cx).text(cx) != text {
                     entry
                         .editor
@@ -3300,7 +3500,7 @@ impl SpritePanel {
 
         let mut entries = Vec::with_capacity(targets.len());
         for target in targets {
-            let text = Self::edit_display_text(&target, open.store.state(), open.selected_frame);
+            let text = Self::edit_display_text(&target, open.store.state(), open.selected_entry);
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
                 editor.set_text(text, window, cx);
@@ -4164,7 +4364,7 @@ impl SpritePanel {
         };
         let mut cards = h_flex().p_1().gap_1().items_start();
         for (i, clip) in state.clips.iter().enumerate() {
-            let mut row = v_flex()
+            let row = v_flex()
                 .id(("ggo-sprite-clip", i))
                 .min_w(CLIPS_WIDTH)
                 .flex_none()
@@ -4210,17 +4410,6 @@ impl SpritePanel {
                         ),
                 )
                 .child(self.render_sequence_for(i, cx));
-            if let Some((at, message)) = &open.clip_error
-                && *at == i
-            {
-                row = row.child(
-                    ggo_common::CopyableText::new(
-                        "ggo-sprite-clip-error-copy",
-                        SharedString::from(message.clone()),
-                    )
-                    .size(LabelSize::XSmall),
-                );
-            }
             cards = cards.child(row);
         }
         cards = cards.child(
@@ -4248,7 +4437,10 @@ impl SpritePanel {
         let state = open.store.state();
         let len = state.frames.len();
         let selected = open.selected_frame;
-        let meter = tiles::hw_meter_line(state, state.frames.get(selected));
+        // The meter's cache row is documented as the SHOWN frame's
+        // working set (`tiles::hw_meter_line`), which during playback is
+        // the transport's, not the selection's.
+        let meter = tiles::hw_meter_line(state, state.frames.get(open.shown_frame()));
         h_flex()
             .gap_1()
             .p_1()
@@ -4286,10 +4478,11 @@ impl SpritePanel {
 
     /// One clip's play sequence as a thumbnail row, embedded in its own
     /// card -- every clip is directly editable, no activation step. A
-    /// library frame dropped on a thumbnail inserts a copy at that
-    /// position, the trailing dashed slot appends, clicking a thumbnail
-    /// selects (and previews) that frame. The transport's clip dropdown
-    /// is playback-range only and never gates this.
+    /// library frame dropped on a thumbnail inserts a REFERENCE at that
+    /// position, the trailing dashed slot appends, dragging a cell
+    /// reorders (or copies the entry into another clip), and clicking a
+    /// cell selects (and previews) that entry. The transport's clip
+    /// dropdown is playback-range only and never gates this.
     fn render_sequence_for(&self, clip_ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_sequence_for is only called in the Ready state");
@@ -4302,14 +4495,19 @@ impl SpritePanel {
             return div().into_any_element();
         };
         let mut row = h_flex().gap_0p5().items_center();
-        let last = clip.to.min(state.frames.len().saturating_sub(1));
-        for (seq_pos, ix) in (clip.from..=last).enumerate() {
-            let thumb = open.frame_image(ix).map(|image| {
-                let (w, h) = image_px_size(&image);
-                let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
-                img(image).nearest(true).w(px(fit_w)).h(px(fit_h))
-            });
-            let duration_ms = state.frames[ix].duration_ms;
+        for (seq_pos, &entry) in clip.entries.iter().enumerate() {
+            let thumb = open
+                .frame_image_for(Shown {
+                    frame: entry.frame,
+                    transform: entry.transform,
+                    flip: (entry.flip_h, entry.flip_v),
+                })
+                .map(|image| {
+                    let (w, h) = image_px_size(&image);
+                    let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
+                    img(image).nearest(true).w(px(fit_w)).h(px(fit_h))
+                });
+            let label = format!("{} ms", entry.duration_ms);
             row = row.child(
                 v_flex()
                     .id(("ggo-sprite-seq", clip_ix * 1000 + seq_pos))
@@ -4318,7 +4516,7 @@ impl SpritePanel {
                     .p_0p5()
                     .border_1()
                     .rounded_sm()
-                    .border_color(if open.selected_frame == ix {
+                    .border_color(if open.selected_entry == Some((clip_ix, seq_pos)) {
                         accent
                     } else {
                         border
@@ -4338,7 +4536,7 @@ impl SpritePanel {
                             .gap_0p5()
                             .items_center()
                             .child(
-                                Label::new(format!("{duration_ms} ms"))
+                                Label::new(label.clone())
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
                             )
@@ -4348,10 +4546,10 @@ impl SpritePanel {
                                     IconName::Copy,
                                 )
                                 .icon_size(IconSize::XSmall)
-                                .tooltip(ui::Tooltip::text("Duplicate frame"))
+                                .tooltip(ui::Tooltip::text("Duplicate entry"))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.duplicate_frame_in_clip(clip_ix, seq_pos, cx);
+                                        this.duplicate_entry_in_clip(clip_ix, seq_pos, cx);
                                     },
                                 )),
                             )
@@ -4361,10 +4559,10 @@ impl SpritePanel {
                                     IconName::Trash,
                                 )
                                 .icon_size(IconSize::XSmall)
-                                .tooltip(ui::Tooltip::text("Delete frame"))
+                                .tooltip(ui::Tooltip::text("Delete entry"))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.delete_frame_in_clip(clip_ix, seq_pos, cx);
+                                        this.delete_entry_in_clip(clip_ix, seq_pos, cx);
                                     },
                                 )),
                             )
@@ -4374,12 +4572,12 @@ impl SpritePanel {
                                     IconName::Ellipsis,
                                 )
                                 .icon_size(IconSize::XSmall)
-                                .tooltip(ui::Tooltip::text("Frame settings"))
+                                .tooltip(ui::Tooltip::text("Entry settings"))
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         this.open_frame_settings(
                                             clip_ix,
-                                            ix,
+                                            seq_pos,
                                             window.mouse_position(),
                                             cx,
                                         );
@@ -4387,13 +4585,28 @@ impl SpritePanel {
                                 )),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_frame(ix, cx)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_entry(clip_ix, seq_pos, cx)),
+                    )
+                    .on_drag(
+                        DraggedEntry {
+                            clip: clip_ix,
+                            pos: seq_pos,
+                            label: label.into(),
+                        },
+                        |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                    )
                     .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
+                    .drag_over::<DraggedEntry>(move |cell, _, _, _| cell.bg(drop_bg))
                     .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
-                        this.insert_frame_in_clip(clip_ix, seq_pos, dragged.ix, cx);
+                        this.insert_entry_in_clip(clip_ix, seq_pos, dragged.ix, cx);
+                    }))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedEntry, _, cx| {
+                        this.drop_entry_at(dragged.clip, dragged.pos, clip_ix, seq_pos, cx);
                     })),
             );
         }
+        let append_pos = clip.entries.len();
         row = row.child(
             div()
                 .id(("ggo-sprite-seq-append", clip_ix))
@@ -4412,18 +4625,22 @@ impl SpritePanel {
                         .color(Color::Muted),
                 )
                 .drag_over::<DraggedFrame>(move |slot, _, _, _| slot.bg(drop_bg))
+                .drag_over::<DraggedEntry>(move |slot, _, _, _| slot.bg(drop_bg))
                 .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
                     this.drop_frame_on_clip(clip_ix, dragged.ix, cx);
+                }))
+                .on_drop(cx.listener(move |this, dragged: &DraggedEntry, _, cx| {
+                    this.drop_entry_at(dragged.clip, dragged.pos, clip_ix, append_pos, cx);
                 })),
         );
         row.into_any_element()
     }
 
     /// The frames LIBRARY, a right-dock column beside the tile picker:
-    /// one thumbnail + name + duration per frame, click to select (and
-    /// preview), double-click to name, drag out to reorder or to build a
-    /// clip sequence. Its header carries the create/duplicate/delete
-    /// buttons so the area is self-contained.
+    /// one thumbnail + name per frame, click to select (and preview),
+    /// double-click to name, drag out to reorder or to build a clip
+    /// sequence. Its header carries the create/duplicate/delete buttons
+    /// so the area is self-contained.
     fn render_strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_strip is only called in the Ready state");
@@ -4470,65 +4687,63 @@ impl SpritePanel {
             .min_h_0()
             .p_1()
             .overflow_y_scroll()
-            .child(v_flex().gap_1().children(
-                edits::library_indices(&state.frames).into_iter().map(|ix| {
-                    let thumb = open.frames.get(ix).map(|image| {
-                        let (w, h) = image_px_size(image);
-                        let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
-                        img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
-                    });
-                    let label = editor_meta::frame_label(names, ix);
-                    v_flex()
-                        .id(("ggo-sprite-frame", ix))
-                        // Test-only bounds hook (a no-op in release
-                        // builds): the drag-reorder test aims real
-                        // mouse events at the cells.
-                        .debug_selector(|| format!("ggo-sprite-frame-{ix}"))
-                        .items_center()
-                        .gap_0p5()
-                        .p_0p5()
-                        .border_1()
-                        .rounded_sm()
-                        .border_color(if ix == selected { accent } else { border })
-                        .child(
-                            div()
-                                .w(px(THUMB_PX))
-                                .h(px(THUMB_PX))
-                                .flex()
-                                .justify_center()
-                                .items_center()
-                                .children(thumb),
-                        )
-                        .child(Label::new(label.clone()).size(LabelSize::XSmall).color(
-                            if names.get(ix).is_some_and(|n| !n.is_empty()) {
-                                Color::Default
+            .child(v_flex().gap_1().children((0..state.frames.len()).map(|ix| {
+                let thumb = open.frames.get(ix).map(|image| {
+                    let (w, h) = image_px_size(image);
+                    let (fit_w, fit_h) = playback::fit_size(w, h, THUMB_PX);
+                    img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
+                });
+                let label = editor_meta::frame_label(names, ix);
+                v_flex()
+                    .id(("ggo-sprite-frame", ix))
+                    // Test-only bounds hook (a no-op in release
+                    // builds): the drag-reorder test aims real
+                    // mouse events at the cells.
+                    .debug_selector(|| format!("ggo-sprite-frame-{ix}"))
+                    .items_center()
+                    .gap_0p5()
+                    .p_0p5()
+                    .border_1()
+                    .rounded_sm()
+                    .border_color(if ix == selected { accent } else { border })
+                    .child(
+                        div()
+                            .w(px(THUMB_PX))
+                            .h(px(THUMB_PX))
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .children(thumb),
+                    )
+                    .child(Label::new(label.clone()).size(LabelSize::XSmall).color(
+                        if names.get(ix).is_some_and(|n| !n.is_empty()) {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        },
+                    ))
+                    // Single click selects; double click names.
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            if event.click_count() > 1 {
+                                this.begin_name_frame(ix, window, cx);
                             } else {
-                                Color::Muted
-                            },
-                        ))
-                        // Single click selects; double click names.
-                        .on_click(
-                            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                                if event.click_count() > 1 {
-                                    this.begin_name_frame(ix, window, cx);
-                                } else {
-                                    this.select_frame(ix, cx);
-                                }
-                            }),
-                        )
-                        .on_drag(
-                            DraggedFrame {
-                                ix,
-                                label: label.into(),
-                            },
-                            |frame, _, _, cx| cx.new(|_| frame.clone()),
-                        )
-                        .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
-                        .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
-                            this.move_frame_to(dragged.ix, ix, cx);
-                        }))
-                }),
-            ));
+                                this.select_frame(ix, cx);
+                            }
+                        }),
+                    )
+                    .on_drag(
+                        DraggedFrame {
+                            ix,
+                            label: label.into(),
+                        },
+                        |frame, _, _, cx| cx.new(|_| frame.clone()),
+                    )
+                    .drag_over::<DraggedFrame>(move |cell, _, _, _| cell.bg(drop_bg))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedFrame, _, cx| {
+                        this.move_frame_to(dragged.ix, ix, cx);
+                    }))
+            })));
         v_flex()
             .relative()
             .flex_none()
@@ -4550,16 +4765,22 @@ impl SpritePanel {
             .into_any_element()
     }
 
-    /// The per-frame settings popup: an anchored card at the "..."
-    /// click, hosting the SELECTED frame's duration and affine transform
-    /// editors plus the owning clip's From/To range. Click-away or
-    /// Escape dismisses it (pending editor text blur-commits as the
-    /// editors leave focus).
+    /// The per-ENTRY settings popup: an anchored card at the "..."
+    /// click, hosting the selected entry's duration, affine transform,
+    /// pixel offset and flip controls. Click-away or Escape dismisses it
+    /// (pending editor text blur-commits as the editors leave focus).
     fn render_frame_settings(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        let (clip_ix, position) = open.frame_settings?;
+        let (clip_ix, seq_pos, position) = open.frame_settings?;
+        let entry_flip = open
+            .store
+            .state()
+            .clips
+            .get(clip_ix)
+            .and_then(|c| c.entries.get(seq_pos))
+            .map_or((false, false), |e| (e.flip_h, e.flip_v));
         let editor_for = |target: EditTarget| {
             open.editors
                 .iter()
@@ -4595,20 +4816,42 @@ impl SpritePanel {
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().elevated_surface_background)
             .shadow_md()
-            .child(Label::new(format!("Frame {}", open.selected_frame + 1)).size(LabelSize::XSmall))
+            .child(
+                Label::new(format!(
+                    "Entry {} \u{b7} frame {}",
+                    seq_pos + 1,
+                    open.selected_frame + 1
+                ))
+                .size(LabelSize::XSmall),
+            )
             .child(labelled("ms", 56., EditTarget::Duration))
             .child(labelled("rot", 48., EditTarget::Rot))
             .child(labelled("sx", 56., EditTarget::ScaleX))
             .child(labelled("sy", 56., EditTarget::ScaleY))
             .child(labelled("shx", 56., EditTarget::ShearX))
             .child(labelled("shy", 56., EditTarget::ShearY))
+            .child(labelled("dx", 48., EditTarget::OffsetX))
+            .child(labelled("dy", 48., EditTarget::OffsetY))
             .child(
-                Label::new("Clip range")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Checkbox::new("ggo-sprite-entry-flip-h", ToggleState::from(entry_flip.0))
+                            .label("H flip")
+                            .on_click(cx.listener(move |this, toggle: &ToggleState, _, cx| {
+                                let on = matches!(toggle, ToggleState::Selected);
+                                this.set_entry_flip(clip_ix, seq_pos, on, entry_flip.1, cx);
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("ggo-sprite-entry-flip-v", ToggleState::from(entry_flip.1))
+                            .label("V flip")
+                            .on_click(cx.listener(move |this, toggle: &ToggleState, _, cx| {
+                                let on = matches!(toggle, ToggleState::Selected);
+                                this.set_entry_flip(clip_ix, seq_pos, entry_flip.0, on, cx);
+                            })),
+                    ),
             )
-            .child(labelled("from", 40., EditTarget::ClipFrom(clip_ix)))
-            .child(labelled("to", 40., EditTarget::ClipTo(clip_ix)))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_frame_settings(cx)));
         Some(
             gpui::deferred(
@@ -4682,6 +4925,28 @@ struct DraggedFrame {
 }
 
 impl Render for DraggedFrame {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_1()
+            .py_0p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Label::new(self.label.clone()).size(LabelSize::XSmall))
+    }
+}
+
+/// A sequence cell mid-drag: same clip reorders, another clip receives a
+/// copy of the entry.
+#[derive(Clone)]
+struct DraggedEntry {
+    clip: usize,
+    pos: usize,
+    label: SharedString,
+}
+
+impl Render for DraggedEntry {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .px_1()
@@ -4795,10 +5060,11 @@ impl Focusable for SpritePanel {
 
 /// The `.spr`/`.til`/`.pal` fixture trio the crate's tests (and
 /// `sprite_item`'s) write to a real-fs temp project: a 1x1-tile,
-/// 2-frame, 2-tile sprite with one clip.
+/// 2-frame, 2-tile sprite with one two-entry clip (frame 0 for 100 ms,
+/// frame 1 for 200 ms).
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    use ggo_worldlib::sprites::cow::{ClipEdit, Frame, FrameTransform, SpriteState};
+    use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry, Frame, SpriteState};
     use ggo_worldlib::sprites::hw::TILE_BYTES;
     use ggo_worldlib::sprites::io::save_sprite;
 
@@ -4836,10 +5102,6 @@ pub(crate) mod test_fixtures {
     /// 0x22], one 1x1 frame on tile 0. The picker hides blanks, so tests
     /// that need a real multi-tile sheet (marquee, wrap) use this.
     pub(crate) fn write_multi_tile_fixture(root: &std::path::Path) {
-        use ggo_worldlib::sprites::cow::{Frame, SpriteState};
-        use ggo_worldlib::sprites::hw::TILE_BYTES;
-        use ggo_worldlib::sprites::io::save_sprite;
-
         let mut pool = vec![0u8; 3 * TILE_BYTES];
         for b in &mut pool[TILE_BYTES..2 * TILE_BYTES] {
             *b = 0x11;
@@ -4855,11 +5117,7 @@ pub(crate) mod test_fixtures {
             tile_count: 3,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![Frame {
-                map: vec![0],
-                duration_ms: 100,
-                transform: FrameTransform::IDENTITY,
-            }],
+            frames: vec![Frame { map: vec![0] }],
             clips: vec![],
             w_tiles: 1,
             h_tiles: 1,
@@ -4892,23 +5150,20 @@ pub(crate) mod test_fixtures {
             tile_count: 2,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![
-                Frame {
-                    map: vec![0],
-                    duration_ms: 100,
-                    transform: FrameTransform::IDENTITY,
-                },
-                Frame {
-                    map: vec![1],
-                    duration_ms: 200,
-                    transform: FrameTransform::IDENTITY,
-                },
-            ],
+            frames: vec![Frame { map: vec![0] }, Frame { map: vec![1] }],
             clips: vec![ClipEdit {
                 name: "walk".to_string(),
-                from: 1,
-                to: 1,
                 loop_: false,
+                entries: vec![
+                    ClipEntry {
+                        duration_ms: 100,
+                        ..ClipEntry::of_frame(0)
+                    },
+                    ClipEntry {
+                        duration_ms: 200,
+                        ..ClipEntry::of_frame(1)
+                    },
+                ],
             }],
             w_tiles: 1,
             h_tiles: 1,
@@ -4924,10 +5179,9 @@ mod tests {
         save_fixture, write_sprite_fixture, write_sprite_fixture_at, write_sprite_fixture_named,
     };
     use super::*;
-    use ggo_worldlib::sprites::cow::ClipEdit;
+    use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry};
     use ggo_worldlib::sprites::hw::{TILE_BYTES, TILE_PX};
     use ggo_worldlib::sprites::io::{open_sprite, save_tileset};
-    use ggo_worldlib::sprites::sprite_doc::DEFAULT_FRAME_DURATION_MS;
     use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
     use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
     use gpui::TestAppContext;
@@ -5066,9 +5320,9 @@ mod tests {
             let state = open.store.state();
             assert_eq!(state.frames.len(), 2);
             assert_eq!(open.frames.len(), 2, "one thumbnail per frame");
-            assert_eq!(state.frames[0].duration_ms, 100);
-            assert_eq!(state.frames[1].duration_ms, 200);
             assert_eq!(state.clips.len(), 1);
+            assert_eq!(state.clips[0].entries[0].duration_ms, 100);
+            assert_eq!(state.clips[0].entries[1].duration_ms, 200);
             assert_eq!(open.shown_frame(), 0, "not playing => selected frame");
             assert!(!open.store.dirty(), "freshly opened => clean");
 
@@ -5115,8 +5369,8 @@ mod tests {
             };
             assert_eq!(open.active_clip, Some(0));
             assert_eq!(
-                playback::play_range(&open.store.state().clips, open.active_clip, 2),
-                (1, 1)
+                playback::play_durations(open.store.state(), open.active_clip),
+                vec![100, 200]
             );
 
             panel.select_clip(None, cx);
@@ -5128,8 +5382,8 @@ mod tests {
     }
 
     /// The five transform editors follow the Duration editor's plumbing:
-    /// a parsed commit merges ONE field into the selected frame's current
-    /// transform through `DocOp::FrameTransformSet` (one undo step per
+    /// a parsed commit merges ONE field into the selected ENTRY's current
+    /// transform through `DocOp::ClipEntrySet` (one undo step per
     /// commit), junk and unchanged commits push no op, and the unfocused
     /// display text reads back from the doc.
     #[gpui::test]
@@ -5138,30 +5392,44 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 0, cx);
             panel.commit_edit(EditTarget::Rot, "90".into(), cx);
-            assert_eq!(ready(panel).store.state().frames[0].transform.angle256, 64);
+            assert_eq!(
+                ready(panel).store.state().clips[0].entries[0]
+                    .transform
+                    .angle256,
+                64
+            );
             panel.commit_edit(EditTarget::ScaleX, "2.5".into(), cx);
             {
-                let t = ready(panel).store.state().frames[0].transform;
+                let t = ready(panel).store.state().clips[0].entries[0].transform;
                 assert_eq!(t.sx, 0x0280);
                 assert_eq!(t.angle256, 64, "a field commit merges, not replaces");
             }
             assert_eq!(
-                SpritePanel::edit_display_text(&EditTarget::Rot, ready(panel).store.state(), 0),
+                SpritePanel::edit_display_text(
+                    &EditTarget::Rot,
+                    ready(panel).store.state(),
+                    Some((0, 0))
+                ),
                 "90"
             );
             assert_eq!(
-                SpritePanel::edit_display_text(&EditTarget::ScaleX, ready(panel).store.state(), 0),
+                SpritePanel::edit_display_text(
+                    &EditTarget::ScaleX,
+                    ready(panel).store.state(),
+                    Some((0, 0))
+                ),
                 "2.50"
             );
 
-            // Only the SELECTED frame's transform moves.
-            panel.select_frame(1, cx);
+            // Only the SELECTED entry's transform moves.
+            panel.select_entry(0, 1, cx);
             panel.commit_edit(EditTarget::ShearY, "-0.25".into(), cx);
             {
                 let state = ready(panel).store.state();
-                assert_eq!(state.frames[1].transform.shear_y, -0x0040);
-                assert_eq!(state.frames[0].transform.sx, 0x0280);
+                assert_eq!(state.clips[0].entries[1].transform.shear_y, -0x0040);
+                assert_eq!(state.clips[0].entries[0].transform.sx, 0x0280);
             }
 
             // Junk reverts like the duration editor: no op, doc untouched.
@@ -5172,16 +5440,21 @@ mod tests {
 
             // Undo unwinds exactly the three real commits, latest first.
             panel.undo_impl(cx);
-            assert_eq!(ready(panel).store.state().frames[1].transform.shear_y, 0);
+            assert_eq!(
+                ready(panel).store.state().clips[0].entries[1]
+                    .transform
+                    .shear_y,
+                0
+            );
             panel.undo_impl(cx);
             {
-                let t = ready(panel).store.state().frames[0].transform;
+                let t = ready(panel).store.state().clips[0].entries[0].transform;
                 assert_eq!(t.sx, 0x0100, "scale commit undone");
                 assert_eq!(t.angle256, 64, "one field per op");
             }
             panel.undo_impl(cx);
             assert_eq!(
-                ready(panel).store.state().frames[0].transform,
+                ready(panel).store.state().clips[0].entries[0].transform,
                 FrameTransform::IDENTITY
             );
         });
@@ -5198,12 +5471,13 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 0, cx);
             {
                 let open = ready(panel);
                 let image = open.preview_image().expect("identity preview");
                 assert!(
                     Arc::ptr_eq(&image, &open.frames[0]),
-                    "identity frames reuse the legacy composed image"
+                    "identity entries reuse the legacy composed image"
                 );
                 assert_eq!(image_px_size(&image), (TILE_PX as u32, TILE_PX as u32));
             }
@@ -5224,7 +5498,7 @@ mod tests {
                 let again = open.preview_image().expect("cached recompose");
                 assert!(Arc::ptr_eq(&image, &again), "repeat paints hit the cache");
             }
-            // Selecting an identity frame drops back to legacy dims.
+            // Selecting a plain library frame drops back to legacy dims.
             panel.select_frame(1, cx);
             assert_eq!(
                 image_px_size(&ready(panel).preview_image().expect("identity again")),
@@ -5289,12 +5563,22 @@ mod tests {
             let ghosts = ready(panel).ghosts();
             assert_eq!(ghosts.iter().map(|g| g.idx).collect::<Vec<_>>(), vec![0]);
 
-            // An active clip confines the walk: clip 0 is the single frame
-            // 1, so nothing neighbours it inside the clip.
+            // An active clip confines the walk to its ENTRIES: clip 0 has
+            // two, and selecting its second leaves only the first behind.
             panel.select_clip(Some(0), cx);
+            panel.select_entry(0, 1, cx);
+            let ghosts = ready(panel).ghosts();
+            assert_eq!(
+                ghosts.iter().map(|g| g.idx).collect::<Vec<_>>(),
+                vec![0],
+                "ghost indices are POSITIONS inside the active clip"
+            );
+
+            // Nothing precedes the head of a non-looping clip.
+            panel.select_entry(0, 0, cx);
             assert!(
                 ready(panel).ghosts().is_empty(),
-                "a one-frame clip has no neighbours to ghost"
+                "a non-looping clip does not wrap onto its tail"
             );
         });
     }
@@ -5305,7 +5589,17 @@ mod tests {
     /// something to protect.
     fn dirty_the_sprite(panel: &Entity<SpritePanel>, cx: &mut gpui::VisualTestContext) {
         panel.update(cx, |panel, cx| {
-            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+            assert!(panel.apply_doc(
+                DocOp::ClipEntrySet {
+                    clip: 0,
+                    at: 0,
+                    entry: ClipEntry {
+                        duration_ms: 500,
+                        ..ClipEntry::of_frame(0)
+                    },
+                },
+                cx
+            ));
             assert!(
                 panel.dirty_sprite_name().is_some(),
                 "op should dirty the doc"
@@ -5313,10 +5607,10 @@ mod tests {
         });
     }
 
-    /// Read frame 0's duration straight off disk -- the fixture writes
+    /// Read entry 0's duration straight off disk -- the fixture writes
     /// 100ms, [`dirty_the_sprite`] retimes it to 500ms in memory only.
     fn on_disk_duration(root: &std::path::Path) -> u16 {
-        open_sprite(root, "sprites/hero.spr").unwrap().state.frames[0].duration_ms
+        open_sprite(root, "sprites/hero.spr").unwrap().state.clips[0].entries[0].duration_ms
     }
 
     // ------------------------------------------ explorer-driven routing
@@ -5506,7 +5800,7 @@ mod tests {
         // Rewrite the trio underneath the open tab, the way an import does.
         let opened = open_sprite(dir.path(), "sprites/hero.spr").unwrap();
         let mut state = opened.state;
-        state.frames[0].duration_ms = 640;
+        state.clips[0].entries[0].duration_ms = 640;
         save_sprite(
             dir.path(),
             "sprites/hero.spr",
@@ -5533,7 +5827,7 @@ mod tests {
         });
         panel.read_with(cx, |panel, _| {
             assert_eq!(
-                ready(panel).store.state().frames[0].duration_ms,
+                ready(panel).store.state().clips[0].entries[0].duration_ms,
                 640,
                 "the tab must show what the import wrote"
             );
@@ -5577,7 +5871,7 @@ mod tests {
         assert_eq!(refreshed, SpriteRefresh::KeptUnsaved);
         panel.read_with(cx, |panel, _| {
             assert_eq!(
-                ready(panel).store.state().frames[0].duration_ms,
+                ready(panel).store.state().clips[0].entries[0].duration_ms,
                 500,
                 "the unsaved edit must survive"
             );
@@ -5640,7 +5934,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let open = ready(panel);
             assert_eq!(
-                open.store.state().frames[0].duration_ms,
+                open.store.state().clips[0].entries[0].duration_ms,
                 500,
                 "the in-memory edit must survive an already-open click"
             );
@@ -5648,7 +5942,7 @@ mod tests {
 
             panel.undo_impl(cx);
             assert_eq!(
-                ready(panel).store.state().frames[0].duration_ms,
+                ready(panel).store.state().clips[0].entries[0].duration_ms,
                 100,
                 "the undo stack must have survived too"
             );
@@ -5735,10 +6029,9 @@ mod tests {
     }
 
     /// Clip CRUD round trip through the store: add with ggo-ide's
-    /// defaults, rename (trim + apply), retarget the range, toggle loop,
-    /// delete (clearing the active selection) -- then undo each step back
-    /// to the fixture and redo forward again, with the dirty flag
-    /// tracking the whole way.
+    /// defaults, rename (trim + apply), toggle loop, delete (clearing the
+    /// active selection) -- then undo each step back to the fixture and
+    /// redo forward again, with the dirty flag tracking the whole way.
     #[gpui::test]
     async fn test_clip_add_edit_delete_undo_round_trip(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -5754,9 +6047,9 @@ mod tests {
                     clips[1],
                     ClipEdit {
                         name: "clip2".into(), // fixture has 1 clip -> clip{len+1}
-                        from: 0,              // selected frame
-                        to: 0,
-                        loop_: false
+                        loop_: false,
+                        // one entry on the selected frame
+                        entries: vec![ClipEntry::of_frame(0)],
                     }
                 );
                 assert!(open.store.dirty());
@@ -5764,13 +6057,6 @@ mod tests {
 
             panel.commit_edit(EditTarget::ClipName(1), "  run  ".into(), cx);
             assert_eq!(ready(panel).store.state().clips[1].name, "run");
-
-            panel.commit_edit(EditTarget::ClipTo(1), "1".into(), cx);
-            {
-                let open = ready(panel);
-                assert_eq!(open.store.state().clips[1].to, 1);
-                assert!(open.clip_error.is_none());
-            }
 
             panel.set_clip_loop(1, true, cx);
             assert!(ready(panel).store.state().clips[1].loop_);
@@ -5790,8 +6076,6 @@ mod tests {
             assert!(ready(panel).store.state().clips[1].loop_);
             panel.undo_impl(cx); // un-loop
             assert!(!ready(panel).store.state().clips[1].loop_);
-            panel.undo_impl(cx); // un-retarget
-            assert_eq!(ready(panel).store.state().clips[1].to, 0);
             panel.undo_impl(cx); // un-rename
             assert_eq!(ready(panel).store.state().clips[1].name, "clip2");
             panel.undo_impl(cx); // un-add
@@ -5809,53 +6093,16 @@ mod tests {
         });
     }
 
-    /// Clip-edit guards: an out-of-range or reversed typed range is shown
-    /// inline and NOT applied; unparsable text is dropped silently; stale
-    /// clip indices (undo raced a click) are ignored everywhere instead of
-    /// reaching the store's panicking arms.
+    /// Clip-edit guards: whitespace-only renames are dropped, over-long
+    /// ones byte-clamped, and stale clip/frame indices (undo raced a
+    /// click) are ignored everywhere instead of reaching the store's
+    /// rejecting arms.
     #[gpui::test]
     async fn test_clip_edit_guards_and_stale_indices(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            // Fixture clip walk = (1, 1) over 2 frames.
-            panel.commit_edit(EditTarget::ClipTo(0), "9".into(), cx);
-            {
-                let open = ready(panel);
-                assert_eq!(open.store.state().clips[0].to, 1, "not applied");
-                let (at, msg) = open.clip_error.as_ref().expect("inline error set");
-                assert_eq!(*at, 0);
-                assert!(msg.contains("outside frames"), "range message: {msg}");
-            }
-
-            panel.commit_edit(EditTarget::ClipTo(0), "0".into(), cx);
-            {
-                let open = ready(panel);
-                assert_eq!(
-                    open.store.state().clips[0].to,
-                    1,
-                    "reversed range not applied"
-                );
-                let (_, msg) = open.clip_error.as_ref().expect("inline error set");
-                assert!(msg.contains('>'), "inversion message: {msg}");
-            }
-
-            panel.commit_edit(EditTarget::ClipFrom(0), "abc".into(), cx);
-            assert_eq!(
-                ready(panel).store.state().clips[0].from,
-                1,
-                "unparsable text dropped"
-            );
-
-            // A valid edit applies and clears the inline error.
-            panel.commit_edit(EditTarget::ClipFrom(0), "0".into(), cx);
-            {
-                let open = ready(panel);
-                assert_eq!(open.store.state().clips[0].from, 0);
-                assert!(open.clip_error.is_none());
-            }
-
             // Whitespace-only rename is dropped; over-long is byte-clamped.
             panel.commit_edit(EditTarget::ClipName(0), "   ".into(), cx);
             assert_eq!(ready(panel).store.state().clips[0].name, "walk");
@@ -5870,18 +6117,23 @@ mod tests {
             panel.delete_clip(7, cx);
             panel.set_clip_loop(7, true, cx);
             panel.commit_edit(EditTarget::ClipName(7), "x".into(), cx);
-            panel.commit_edit(EditTarget::ClipFrom(7), "0".into(), cx);
             assert_eq!(ready(panel).store.state().clips.len(), 1);
 
-            // Stale FRAME selection: force one, then run every frame op.
+            // Stale FRAME/ENTRY selection: force one, then run every op.
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.selected_frame = 9;
+                open.selected_entry = Some((7, 3));
             }
             panel.delete_selected_frame(cx);
             panel.duplicate_selected_frame(cx);
             panel.move_selected_frame(1, cx);
             panel.commit_edit(EditTarget::Duration, "40".into(), cx);
             assert_eq!(ready(panel).store.state().frames.len(), 2, "all ignored");
+            assert_eq!(
+                ready(panel).store.state().clips[0].entries.len(),
+                2,
+                "and the clip is untouched"
+            );
         });
     }
 
@@ -5896,13 +6148,11 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            // Add blank: appended at the end, default duration.
+            // Add blank: appended at the end.
             panel.add_blank_frame(cx);
             {
                 let open = ready(panel);
-                let state = open.store.state();
-                assert_eq!(state.frames.len(), 3);
-                assert_eq!(state.frames[2].duration_ms, DEFAULT_FRAME_DURATION_MS);
+                assert_eq!(open.store.state().frames.len(), 3);
                 assert_eq!(open.frames.len(), 3, "thumbnail cache refreshed");
             }
 
@@ -5916,7 +6166,6 @@ mod tests {
                 let state = open.store.state();
                 assert_eq!(state.frames.len(), 4);
                 assert_eq!(open.selected_frame, 2);
-                assert_eq!(state.frames[2].duration_ms, 200, "copy_of copies duration");
                 let dup = open.frames[2].as_bytes(0).unwrap();
                 assert!(
                     dup.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
@@ -5924,38 +6173,51 @@ mod tests {
                 );
             }
 
-            // Move the copy left: neighbor swap, selection follows.
+            // Move the copy left: neighbor swap, selection follows and the
+            // red copy's thumbnail lands in the new slot.
             panel.move_selected_frame(-1, cx);
             {
                 let open = ready(panel);
-                let durations: Vec<u16> = open
-                    .store
-                    .state()
-                    .frames
-                    .iter()
-                    .map(|f| f.duration_ms)
-                    .collect();
-                assert_eq!(durations, [100, 200, 200, 100]);
                 assert_eq!(open.selected_frame, 1);
+                let moved = open.frames[1].as_bytes(0).unwrap();
+                assert!(
+                    moved.chunks_exact(4).all(|p| p == [0, 0, 255, 255]),
+                    "the copied red frame moved into slot 1"
+                );
             }
             // Move left at index 0 is a no-op.
             panel.select_frame(0, cx);
             panel.move_selected_frame(-1, cx);
-            assert_eq!(ready(panel).store.state().frames[0].duration_ms, 100);
+            {
+                let open = ready(panel);
+                assert_eq!(open.selected_frame, 0);
+                assert!(
+                    open.frames[0]
+                        .as_bytes(0)
+                        .unwrap()
+                        .chunks_exact(4)
+                        .all(|p| p[3] == 0),
+                    "the transparent frame stayed at 0"
+                );
+            }
 
             // Duration: sub-floor input floors to MIN_FRAME_MS; a real
-            // value sticks; the strip label data (doc) and cache agree.
-            panel.select_frame(3, cx);
+            // value sticks. It edits the selected ENTRY, not a frame.
+            panel.select_entry(0, 0, cx);
             panel.commit_edit(EditTarget::Duration, "1".into(), cx);
             assert_eq!(
-                ready(panel).store.state().frames[3].duration_ms,
+                ready(panel).store.state().clips[0].entries[0].duration_ms,
                 MIN_FRAME_MS
             );
             panel.commit_edit(EditTarget::Duration, "320".into(), cx);
-            assert_eq!(ready(panel).store.state().frames[3].duration_ms, 320);
+            assert_eq!(
+                ready(panel).store.state().clips[0].entries[0].duration_ms,
+                320
+            );
 
             // Delete the selected last frame: selection clamps to the new
-            // end (ggo-ide's rule), fixture clip survives untouched.
+            // end (ggo-ide's rule).
+            panel.select_frame(3, cx);
             panel.delete_selected_frame(cx);
             {
                 let open = ready(panel);
@@ -5973,8 +6235,8 @@ mod tests {
                 assert_eq!(open.selected_frame, 0);
                 assert_eq!(
                     open.store.state().clips.len(),
-                    0,
-                    "deleting the walk clip's sole frame dropped the clip (store rule)"
+                    1,
+                    "an emptied clip survives (store rule); only its entries go"
                 );
             }
             panel.delete_selected_frame(cx);
@@ -5992,7 +6254,11 @@ mod tests {
             {
                 let open = ready(panel);
                 let state = open.store.state();
-                let durations: Vec<u16> = state.frames.iter().map(|f| f.duration_ms).collect();
+                let durations: Vec<u16> = state.clips[0]
+                    .entries
+                    .iter()
+                    .map(|e| e.duration_ms)
+                    .collect();
                 assert_eq!(durations, [100, 200]);
                 assert_eq!(state.clips.len(), 1, "walk clip restored");
                 assert_eq!(open.frames.len(), 2);
@@ -6175,96 +6441,198 @@ mod tests {
         });
     }
 
-    /// The clip row's "Drop frame" slot: dropping a strip frame appends
-    /// a COPY of it right after the clip's last frame and extends the
-    /// clip's range by one -- the dragged frame itself stays put, and
-    /// its editor-only name travels onto the copy.
+    /// The clip row's "Drop frame" slot: dropping a library frame appends
+    /// a REFERENCE to it at the end of the clip's sequence -- the frame
+    /// list itself never grows.
     #[gpui::test]
-    async fn test_dropping_a_frame_on_a_clip_appends_a_copy_and_extends_the_range(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_dropping_a_frame_on_a_clip_appends_a_reference(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
             panel.set_frame_name(0, "idle".to_string(), cx);
-            // Fixture clip "walk" spans 1..=1. Drop frame 0 on its slot.
+            // Fixture clip "walk" = entries [0, 1]. Drop frame 0 on its slot.
             panel.drop_frame_on_clip(0, 0, cx);
             {
                 let open = ready(panel);
                 let state = open.store.state();
-                assert_eq!(state.frames.len(), 3, "a copy was appended");
+                assert_eq!(state.frames.len(), 2, "frames are source data");
                 assert_eq!(
-                    state.frames[2].map, state.frames[0].map,
-                    "the copy shows the dropped frame"
+                    state.clips[0]
+                        .entries
+                        .iter()
+                        .map(|e| e.frame)
+                        .collect::<Vec<_>>(),
+                    vec![0, 1, 0],
+                    "the reference appended at the sequence's tail"
                 );
-                assert_eq!(
-                    (state.clips[0].from, state.clips[0].to),
-                    (1, 2),
-                    "the clip range now covers the copy"
-                );
-                assert_eq!(open.frame_names, vec!["idle", "", "idle"]);
+                assert_eq!(open.frame_names, vec!["idle", ""]);
             }
 
             // A stale clip index is a no-op, not a panic.
             panel.drop_frame_on_clip(9, 0, cx);
-            assert_eq!(ready(panel).store.state().frames.len(), 3);
+            assert_eq!(ready(panel).store.state().clips[0].entries.len(), 3);
         });
     }
 
-    /// The per-frame duplicate/delete buttons on the clip sequence:
-    /// duplicate inserts a copy right after its frame (extending the
-    /// clip), delete removes the frame (the store remaps the clip; a
-    /// clip whose sole frame died vanishes), names follow both ways,
-    /// and stale clip indices are no-ops.
+    /// The per-entry duplicate/delete buttons on the clip sequence:
+    /// duplicate inserts a copy of the entry right after it, delete drops
+    /// just that entry, the frame library is untouched by both, and stale
+    /// clip indices are no-ops.
     #[gpui::test]
     async fn test_duplicate_and_delete_buttons_edit_the_clip_sequence(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
+        let frames_of = |panel: &SpritePanel| {
+            ready(panel).store.state().clips[0]
+                .entries
+                .iter()
+                .map(|e| e.frame)
+                .collect::<Vec<_>>()
+        };
         panel.update(cx, |panel, cx| {
-            panel.set_frame_name(1, "step".to_string(), cx);
-            // Fixture clip "walk" spans 1..=1: duplicate its only frame.
-            panel.duplicate_frame_in_clip(0, 0, cx);
+            // Fixture clip "walk" = entries [0, 1]: duplicate the second.
+            panel.duplicate_entry_in_clip(0, 1, cx);
             {
                 let open = ready(panel);
-                let state = open.store.state();
-                assert_eq!(state.frames.len(), 3, "a copy was inserted");
-                assert_eq!(
-                    state.frames[2].map, state.frames[1].map,
-                    "the copy sits right after its source"
-                );
-                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 2));
-                assert_eq!(open.frame_names, vec!["", "step", "step"]);
+                assert_eq!(open.store.state().frames.len(), 2, "no frame was copied");
+                assert_eq!(frames_of(panel), vec![0, 1, 1]);
             }
 
-            // Delete the copy (sequence position 1 -> physical frame 2).
-            panel.delete_frame_in_clip(0, 1, cx);
+            // Delete the copy again.
+            panel.delete_entry_in_clip(0, 2, cx);
             {
                 let open = ready(panel);
-                let state = open.store.state();
-                assert_eq!(state.frames.len(), 2);
-                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 1));
-                assert_eq!(open.frame_names, vec!["", "step"]);
+                assert_eq!(open.store.state().frames.len(), 2);
+                assert_eq!(frames_of(panel), vec![0, 1]);
             }
 
-            // Deleting the clip's sole frame drops the clip itself.
-            panel.delete_frame_in_clip(0, 0, cx);
+            // Emptying a clip leaves the clip (and every frame) in place.
+            panel.delete_entry_in_clip(0, 0, cx);
+            panel.delete_entry_in_clip(0, 0, cx);
             {
                 let state = ready(panel).store.state();
-                assert_eq!(state.frames.len(), 1);
-                assert!(state.clips.is_empty(), "an empty clip vanishes");
+                assert_eq!(state.frames.len(), 2);
+                assert_eq!(state.clips.len(), 1);
+                assert!(state.clips[0].entries.is_empty());
             }
 
             // Stale indices: no-ops, not panics.
-            panel.duplicate_frame_in_clip(9, 0, cx);
-            panel.delete_frame_in_clip(9, 0, cx);
-            panel.delete_frame_in_clip(0, 0, cx);
-            assert_eq!(ready(panel).store.state().frames.len(), 1);
+            panel.duplicate_entry_in_clip(9, 0, cx);
+            panel.delete_entry_in_clip(9, 0, cx);
+            panel.delete_entry_in_clip(0, 0, cx);
+            assert_eq!(ready(panel).store.state().frames.len(), 2);
         });
     }
 
-    /// The per-frame "..." settings popup: opening selects the frame
+    /// Deleting a clip entry leaves its FRAME in the library: frames are
+    /// source data, entries are references to them.
+    #[gpui::test]
+    async fn test_deleting_an_entry_keeps_the_frame_in_the_library(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.delete_entry_in_clip(0, 1, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 2, "frames are source data");
+            assert_eq!(state.clips[0].entries.len(), 1);
+            assert_eq!(state.clips[0].entries[0].frame, 0);
+        });
+    }
+
+    /// Dropping a library frame INTO a sequence inserts a reference at
+    /// that position -- no frame is copied.
+    #[gpui::test]
+    async fn test_dropping_a_library_frame_inserts_a_reference_not_a_copy(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.insert_entry_in_clip(0, 0, 1, cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 2);
+            assert_eq!(
+                state.clips[0]
+                    .entries
+                    .iter()
+                    .map(|e| e.frame)
+                    .collect::<Vec<_>>(),
+                vec![1, 0, 1]
+            );
+        });
+    }
+
+    /// Dragging a sequence cell onto another reorders the sequence and
+    /// keeps the dragged entry selected.
+    #[gpui::test]
+    async fn test_moving_an_entry_reorders_the_sequence(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.move_entry_in_clip(0, 0, 1, cx);
+            {
+                let open = ready(panel);
+                assert_eq!(
+                    open.store.state().clips[0]
+                        .entries
+                        .iter()
+                        .map(|e| e.frame)
+                        .collect::<Vec<_>>(),
+                    vec![1, 0]
+                );
+                assert_eq!(open.selected_entry, Some((0, 1)));
+            }
+
+            // Stale/degenerate moves are no-ops.
+            panel.move_entry_in_clip(0, 1, 1, cx);
+            panel.move_entry_in_clip(0, 9, 0, cx);
+            panel.move_entry_in_clip(9, 0, 1, cx);
+            assert_eq!(ready(panel).store.state().clips[0].entries.len(), 2);
+        });
+    }
+
+    /// Deleting a LIBRARY frame prunes every entry that referenced it
+    /// (the store's remap), leaving the rest of the sequence intact.
+    #[gpui::test]
+    async fn test_library_delete_prunes_entries(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_frame(1, cx);
+            panel.delete_selected_frame(cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 1);
+            assert_eq!(state.clips[0].entries.len(), 1);
+            assert_eq!(state.clips[0].entries[0].frame, 0);
+        });
+    }
+
+    /// The entry settings fields commit onto the SELECTED entry, and none
+    /// of them touches the frame library.
+    #[gpui::test]
+    async fn test_entry_settings_commit_flip_offset_and_duration(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 1, cx);
+            panel.commit_edit(EditTarget::Duration, "300".into(), cx);
+            panel.commit_edit(EditTarget::OffsetX, "4".into(), cx);
+            panel.commit_edit(EditTarget::OffsetY, "-6".into(), cx);
+            panel.set_entry_flip(0, 1, true, false, cx);
+            let entry = ready(panel).store.state().clips[0].entries[1];
+            assert_eq!(entry.duration_ms, 300);
+            assert_eq!(entry.offset, (4, -6));
+            assert_eq!((entry.flip_h, entry.flip_v), (true, false));
+            assert_eq!(ready(panel).store.state().frames.len(), 2);
+        });
+    }
+
+    /// The per-entry "..." settings popup: opening selects the entry
     /// (preview and editors agree), Escape's path and click-away close
     /// it, and a vanished owning clip closes it on refresh.
     #[gpui::test]
@@ -6273,10 +6641,14 @@ mod tests {
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            panel.open_frame_settings(0, 1, gpui::point(px(50.), px(50.)), cx);
+            panel.open_frame_settings(0, 0, gpui::point(px(50.), px(50.)), cx);
             let open = ready(panel);
-            assert_eq!(open.selected_frame, 1, "opening selects the frame");
-            assert_eq!(open.frame_settings.map(|(c, _)| c), Some(0));
+            assert_eq!(
+                open.selected_entry,
+                Some((0, 0)),
+                "opening selects the entry"
+            );
+            assert_eq!(open.selected_frame, 0, "and the frame it references");
         });
         cx.run_until_parked();
         assert!(
@@ -6312,21 +6684,27 @@ mod tests {
         });
     }
 
-    /// Sequence thumbnails render the frame's TRANSFORM, not the legacy
-    /// composite: a rotated frame's thumb image is the doubled canvas
-    /// (cached per frame until the next doc mutation), identity frames
-    /// reuse the strip's exact Arc.
+    /// Sequence thumbnails render the ENTRY's transform, not the legacy
+    /// composite: a rotated entry's thumb image is the doubled canvas
+    /// (cached per entry look until the next doc mutation), identity
+    /// entries reuse the strip's exact Arc.
     #[gpui::test]
     async fn test_sequence_thumbs_render_the_transform(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            panel.select_frame(1, cx);
+            panel.select_entry(0, 1, cx);
             panel.commit_edit(EditTarget::Rot, "90".into(), cx);
             let open = ready(panel);
+            let rotated = open.store.state().clips[0].entries[1];
             let legacy = open.frames[1].clone();
-            let transformed = open.frame_image(1).expect("composes");
+            let shown = Shown {
+                frame: rotated.frame,
+                transform: rotated.transform,
+                flip: (rotated.flip_h, rotated.flip_v),
+            };
+            let transformed = open.frame_image_for(shown).expect("composes");
             let (w, h) = image_px_size(&transformed);
             let (lw, lh) = image_px_size(&legacy);
             assert_eq!(
@@ -6334,9 +6712,16 @@ mod tests {
                 (lw * 2, lh * 2),
                 "rotated thumb is the doubled canvas"
             );
-            let again = open.frame_image(1).expect("composes");
-            assert!(Arc::ptr_eq(&transformed, &again), "cached per frame");
-            let identity = open.frame_image(0).expect("identity frame");
+            let again = open.frame_image_for(shown).expect("composes");
+            assert!(Arc::ptr_eq(&transformed, &again), "cached per entry look");
+            let plain = open.store.state().clips[0].entries[0];
+            let identity = open
+                .frame_image_for(Shown {
+                    frame: plain.frame,
+                    transform: plain.transform,
+                    flip: (plain.flip_h, plain.flip_v),
+                })
+                .expect("identity entry");
             assert!(
                 Arc::ptr_eq(&identity, &open.frames[0]),
                 "identity thumbs reuse the strip image"
@@ -6345,67 +6730,39 @@ mod tests {
     }
 
     /// The clip sequence row's positional drop: dropping a library frame
-    /// on a sequence thumbnail inserts a COPY at that position INSIDE the
-    /// clip's range (extending it by one); dropping past the end appends
-    /// -- the same op the end slot fires. Names travel; stale indices
-    /// no-op.
+    /// on a sequence thumbnail inserts a reference AT that position;
+    /// dropping on the end slot appends. Stale indices no-op.
     #[gpui::test]
     async fn test_insert_frame_in_clip_at_a_position(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
+        let frames_of = |panel: &SpritePanel| {
+            ready(panel).store.state().clips[0]
+                .entries
+                .iter()
+                .map(|e| e.frame)
+                .collect::<Vec<_>>()
+        };
         panel.update(cx, |panel, cx| {
-            panel.set_frame_name(0, "idle".to_string(), cx);
-            // Fixture clip "walk" spans 1..=1 (its sole frame maps [1]).
-            // Insert a copy of frame 0 at sequence position 0: the copy
-            // lands at strip index 1, BEFORE the clip's old frame.
-            panel.insert_frame_in_clip(0, 0, 0, cx);
-            {
-                let open = ready(panel);
-                let state = open.store.state();
-                assert_eq!(state.frames.len(), 3);
-                assert_eq!(
-                    state.frames[1].map, state.frames[0].map,
-                    "the copy sits first in the clip"
-                );
-                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 2));
-                assert_eq!(open.frame_names, vec!["idle", "idle", ""]);
-            }
+            // Fixture clip "walk" = entries [0, 1].
+            panel.insert_entry_in_clip(0, 0, 0, cx);
+            assert_eq!(frames_of(panel), vec![0, 0, 1]);
 
             // Sequence position == len appends (the end slot's case).
-            panel.insert_frame_in_clip(0, 2, 0, cx);
-            {
-                let state = ready(panel).store.state();
-                assert_eq!(state.frames.len(), 4);
-                assert_eq!((state.clips[0].from, state.clips[0].to), (1, 3));
-                assert_eq!(state.frames[3].map, state.frames[0].map);
-            }
+            panel.insert_entry_in_clip(0, 3, 1, cx);
+            assert_eq!(frames_of(panel), vec![0, 0, 1, 1]);
+            assert_eq!(
+                ready(panel).store.state().frames.len(),
+                2,
+                "the library never grew"
+            );
 
             // Stale clip / frame / position indices all no-op.
-            panel.insert_frame_in_clip(9, 0, 0, cx);
-            panel.insert_frame_in_clip(0, 0, 9, cx);
-            panel.insert_frame_in_clip(0, 9, 0, cx);
-            assert_eq!(ready(panel).store.state().frames.len(), 4);
-        });
-    }
-
-    /// Adding a frame to a clip physically copies it (range clips), but
-    /// the FRAMES library must keep showing only the unique frames --
-    /// the copy is a clip-sequence detail, not a new library entry.
-    #[gpui::test]
-    async fn test_library_stays_unique_after_a_clip_drop(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-
-        panel.update(cx, |panel, cx| {
-            panel.drop_frame_on_clip(0, 0, cx);
-            let state = ready(panel).store.state();
-            assert_eq!(state.frames.len(), 3, "the copy exists physically");
-            assert_eq!(
-                edits::library_indices(&state.frames),
-                vec![0, 1],
-                "the library still lists only the two unique frames"
-            );
+            panel.insert_entry_in_clip(9, 0, 0, cx);
+            panel.insert_entry_in_clip(0, 0, 9, cx);
+            panel.insert_entry_in_clip(0, 9, 0, cx);
+            assert_eq!(frames_of(panel), vec![0, 0, 1, 1]);
         });
     }
 
@@ -7221,17 +7578,21 @@ mod tests {
 
         panel.update_in(cx, |panel, window, cx| {
             window.focus(&panel.focus_handle, cx);
+            panel.select_entry(0, 0, cx);
             panel.commit_edit(EditTarget::Duration, "40".into(), cx);
         });
         panel.read_with(cx, |panel, _| {
-            assert_eq!(ready(panel).store.state().frames[0].duration_ms, 40);
+            assert_eq!(
+                ready(panel).store.state().clips[0].entries[0].duration_ms,
+                40
+            );
         });
 
         cx.simulate_keystrokes("ctrl-z");
         panel.read_with(cx, |panel, _| {
             let open = ready(panel);
             assert_eq!(
-                open.store.state().frames[0].duration_ms,
+                open.store.state().clips[0].entries[0].duration_ms,
                 100,
                 "ctrl-z undoes the duration edit"
             );
@@ -7242,7 +7603,7 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             let open = ready(panel);
             assert_eq!(
-                open.store.state().frames[0].duration_ms,
+                open.store.state().clips[0].entries[0].duration_ms,
                 40,
                 "ctrl-shift-z redoes it"
             );
@@ -7259,6 +7620,7 @@ mod tests {
 
         panel.update_in(cx, |panel, window, cx| {
             window.focus(&panel.focus_handle, cx);
+            panel.select_entry(0, 0, cx);
             panel.commit_edit(EditTarget::Duration, "40".into(), cx);
         });
         assert_eq!(on_disk_duration(dir.path()), 100, "not saved yet");
@@ -7315,7 +7677,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
 
-        panel.update(cx, |panel, cx| panel.toggle_play(cx));
+        panel.update(cx, |panel, cx| {
+            // Clip 0 = entries [frame 0 for 100ms, frame 1 for 200ms].
+            panel.select_clip(Some(0), cx);
+            panel.toggle_play(cx);
+        });
         // Let the tick loop start and park on its first timer.
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _| {
@@ -7324,7 +7690,7 @@ mod tests {
             };
             assert!(open.playing.is_some(), "toggle_play starts the transport");
             assert!(open._tick_task.is_some(), "the tick task is armed");
-            assert_eq!(open.shown_frame(), 0, "playback starts on the selection");
+            assert_eq!(open.shown_frame(), 0, "playback starts at position 0");
             open.playing
                 .as_mut()
                 .expect("checked playing above")
@@ -7337,7 +7703,7 @@ mod tests {
             assert_eq!(
                 ready(panel).shown_frame(),
                 1,
-                "the tick recomputed the shown frame from elapsed time"
+                "the tick recomputed the shown position from elapsed time"
             );
         });
 
@@ -7364,8 +7730,8 @@ mod tests {
     /// Every clip card paints its own sequence WITHOUT any activation
     /// step (the transport's clip dropdown is playback-range only): a
     /// real drag from the FRAMES library onto a sequence thumbnail
-    /// inserts a copy at that position, and clicking a sequence
-    /// thumbnail selects (previews) that frame.
+    /// inserts a reference at that position, and clicking a sequence
+    /// thumbnail selects (previews) that entry.
     #[gpui::test]
     async fn test_rendered_sequence_drop_inserts_and_click_selects(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -7397,25 +7763,30 @@ mod tests {
 
         panel.read_with(cx, |panel, _| {
             let state = ready(panel).store.state();
-            assert_eq!(state.frames.len(), 3, "the drop inserted a copy");
+            assert_eq!(state.frames.len(), 2, "the drop copied no frame");
             assert_eq!(
-                state.frames[1].map, state.frames[0].map,
-                "the copy landed at sequence position 0 (strip index 1)"
+                state.clips[0]
+                    .entries
+                    .iter()
+                    .map(|e| e.frame)
+                    .collect::<Vec<_>>(),
+                vec![0, 0, 1],
+                "a reference to frame 0 landed at sequence position 0"
             );
-            assert_eq!((state.clips[0].from, state.clips[0].to), (1, 2));
         });
 
-        // Clicking the second sequence thumbnail selects its frame.
+        // Clicking the third sequence thumbnail selects its entry.
         cx.run_until_parked();
-        let seq1 = cx
-            .debug_bounds("ggo-sprite-seq-0-1")
-            .expect("the extended sequence paints two thumbs");
-        cx.simulate_click(seq1.center(), gpui::Modifiers::default());
+        let seq2 = cx
+            .debug_bounds("ggo-sprite-seq-0-2")
+            .expect("the extended sequence paints three thumbs");
+        cx.simulate_click(seq2.center(), gpui::Modifiers::default());
         panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert_eq!(open.selected_entry, Some((0, 2)));
             assert_eq!(
-                ready(panel).selected_frame,
-                2,
-                "sequence position 1 is strip frame 2 -- selected and previewed"
+                open.selected_frame, 1,
+                "sequence position 2 references frame 1 -- selected and previewed"
             );
         });
     }
@@ -7470,9 +7841,7 @@ mod tests {
                 vec![1],
                 "the drop moved frame 0 past frame 1"
             );
-            assert_eq!(state.frames[0].duration_ms, 200);
             assert_eq!(state.frames[1].map, vec![0]);
-            assert_eq!(state.frames[1].duration_ms, 100);
             assert_eq!(
                 open.frame_names,
                 ["walk-b", "walk-a"],
@@ -7486,8 +7855,8 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             let state = ready(panel).store.state();
             assert_eq!(
-                (state.frames[0].duration_ms, state.frames[1].duration_ms),
-                (100, 200),
+                (state.frames[0].map.clone(), state.frames[1].map.clone()),
+                (vec![0], vec![1]),
                 "one undo restores the order => the drop was a single FrameMove"
             );
         });
@@ -7542,7 +7911,7 @@ mod tests {
                 open.playing = Some(Playing {
                     started: Instant::now(),
                     start_offset_ms: 0,
-                    frame: 0,
+                    position: 0,
                 });
                 // Arm a (dummy) tick task so the drop assertion below
                 // is not vacuously true.
@@ -7599,6 +7968,7 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 0, cx);
             panel.commit_edit(EditTarget::Duration, "40".into(), cx);
             panel.add_clip(cx);
             assert!(ready(panel).store.dirty());
@@ -7625,7 +7995,7 @@ mod tests {
                 assert_eq!(reopened.state.h_tiles, state.h_tiles);
                 assert_eq!(reopened.til_path, open.til_path);
                 assert_eq!(reopened.pal_path, open.pal_path);
-                assert_eq!(reopened.state.frames[0].duration_ms, 40);
+                assert_eq!(reopened.state.clips[0].entries[0].duration_ms, 40);
                 assert_eq!(reopened.state.clips.len(), 2);
             }
 
@@ -7652,7 +8022,17 @@ mod tests {
         // missing directory would just be created.
         let bad_root = dir.path().join("sprites/hero.spr");
         panel.update(cx, |panel, cx| {
-            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+            assert!(panel.apply_doc(
+                DocOp::ClipEntrySet {
+                    clip: 0,
+                    at: 0,
+                    entry: ClipEntry {
+                        duration_ms: 500,
+                        ..ClipEntry::of_frame(0)
+                    },
+                },
+                cx
+            ));
             if let ViewerState::Ready(open) = &mut panel.state {
                 open.root = bad_root;
             }
@@ -7758,6 +8138,7 @@ mod tests {
                 assert_eq!(open.til_path, "hh.til");
                 assert_eq!(open.pal_path, "hh.pal");
             }
+            panel.select_entry(0, 0, cx);
             panel.commit_edit(EditTarget::Duration, "40".into(), cx);
             panel.save_impl(cx);
             assert!(ready(panel).save_error.is_none());
@@ -7785,7 +8166,7 @@ mod tests {
         // resolves the sidecars and sees the edit.
         let reopened = open_sprite(&assets, "hh.spr").unwrap();
         assert_eq!(reopened.til_path, "hh.til");
-        assert_eq!(reopened.state.frames[0].duration_ms, 40);
+        assert_eq!(reopened.state.clips[0].entries[0].duration_ms, 40);
     }
 
     /// A LEGACY `.spr` (sidecars stored project-root-relative, the wilds
@@ -8183,7 +8564,7 @@ mod tests {
 
         let copy = open_sprite(dir.path(), "sprites/hero-copy.spr").expect("the copy is a .spr");
         assert_eq!(
-            copy.state.frames[0].duration_ms, 500,
+            copy.state.clips[0].entries[0].duration_ms, 500,
             "the copy must carry the unsaved edit the panel is showing"
         );
         assert_eq!(
@@ -8548,9 +8929,10 @@ mod tests {
             opened.state.clips,
             vec![ClipEdit {
                 name: NEW_METASPRITE_CLIP.to_string(),
-                from: 0,
-                to: NEW_METASPRITE_FRAMES - 1,
                 loop_: true,
+                entries: (0..NEW_METASPRITE_FRAMES)
+                    .map(ClipEntry::of_frame)
+                    .collect(),
             }],
             "a metasprite is clip definitions over its frames"
         );
@@ -8617,7 +8999,17 @@ mod tests {
         let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
         let hero = item_panel_for(&workspace, cx, "assets/sprites/hero.spr");
         hero.update(cx, |panel, cx| {
-            assert!(panel.apply_doc(DocOp::FrameDuration { at: 0, ms: 500 }, cx));
+            assert!(panel.apply_doc(
+                DocOp::ClipEntrySet {
+                    clip: 0,
+                    at: 0,
+                    entry: ClipEntry {
+                        duration_ms: 500,
+                        ..ClipEntry::of_frame(0)
+                    },
+                },
+                cx
+            ));
         });
 
         name_inline(
@@ -8646,7 +9038,8 @@ mod tests {
             open_sprite(&assets, "sprites/hero.spr")
                 .unwrap()
                 .state
-                .frames[0]
+                .clips[0]
+                .entries[0]
                 .duration_ms,
             100,
             "and nothing was written for them"
@@ -8883,6 +9276,7 @@ mod tests {
                 assert_eq!(open.source_rel, "assets/sprites/villain.spr");
                 assert_eq!(open.rel_path, "sprites/villain.spr");
             }
+            panel.select_entry(0, 0, cx);
             panel.commit_edit(EditTarget::Duration, "40".into(), cx);
             panel.save_impl(cx);
             assert!(ready(panel).save_error.is_none());
@@ -8891,7 +9285,8 @@ mod tests {
             open_sprite(&assets, "sprites/villain.spr")
                 .unwrap()
                 .state
-                .frames[0]
+                .clips[0]
+                .entries[0]
                 .duration_ms,
             40
         );
