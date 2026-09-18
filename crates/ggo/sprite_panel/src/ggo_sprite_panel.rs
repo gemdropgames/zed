@@ -1268,18 +1268,22 @@ impl OpenSprite {
         self.shown().frame
     }
 
-    /// The sequence position the preview is at: the transport's while
-    /// playing, else the selected entry's when it belongs to the ACTIVE
-    /// clip (a selection in some other clip says nothing about where
-    /// the active sequence is), else the selected frame -- which is a
-    /// position exactly when there is no active clip.
+    /// The sequence position the preview is at -- the same three-way
+    /// rule [`SpritePanel::toggle_play`] seeds the transport with, so
+    /// onion ghosts and playback never disagree about where the
+    /// sequence is: the transport's while playing, else the selected
+    /// entry's when it belongs to the ACTIVE clip, else the head of
+    /// that clip (a selection elsewhere says nothing about it), and
+    /// only with NO active clip does `selected_frame` double as the
+    /// position.
     fn shown_position(&self) -> usize {
         if let Some(playing) = &self.playing {
             return playing.position;
         }
         match (self.active_clip, self.selected_entry) {
             (Some(active), Some((clip, position))) if active == clip => position,
-            _ => self.selected_frame,
+            (Some(_), _) => 0,
+            (None, _) => self.selected_frame,
         }
     }
 
@@ -2213,9 +2217,6 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return true;
         };
-        if open.playing.is_none() {
-            return true;
-        }
         let state = open.store.state();
         let durations = playback::play_durations(state, open.active_clip);
         let loop_ = playback::play_loop(&state.clips, open.active_clip);
@@ -2312,6 +2313,23 @@ impl SpritePanel {
             // The selected entry was removed (or its clip was) under an
             // op/undo -- the editors have nothing to bind to.
             open.selected_entry = None;
+        }
+        let selected_entry_frame = open.selected_entry.and_then(|(clip, position)| {
+            Some(
+                open.store
+                    .state()
+                    .clips
+                    .get(clip)?
+                    .entries
+                    .get(position)?
+                    .frame,
+            )
+        });
+        if let Some(frame) = selected_entry_frame {
+            // A surviving entry can now name a DIFFERENT frame (a library
+            // move or delete remaps every entry), and the library
+            // highlight and the popup title both read `selected_frame`.
+            open.selected_frame = frame;
         }
         if open
             .frame_settings
@@ -2737,7 +2755,23 @@ impl SpritePanel {
         cx: &mut Context<Self>,
     ) {
         if from_clip == clip_ix {
-            self.move_entry_in_clip(clip_ix, from_pos, seq_pos, cx);
+            let ViewerState::Ready(open) = &self.state else {
+                return;
+            };
+            let Some(len) = open
+                .store
+                .state()
+                .clips
+                .get(clip_ix)
+                .map(|c| c.entries.len())
+            else {
+                return;
+            };
+            // The trailing slot passes `len`, which is one past the last
+            // POST-REMOVAL index a move can splice into; clamping lands
+            // the entry at the end (and self-cancels when it is already
+            // there, since `from == to` is a no-op).
+            self.move_entry_in_clip(clip_ix, from_pos, seq_pos.min(len.saturating_sub(1)), cx);
             return;
         }
         let ViewerState::Ready(open) = &self.state else {
@@ -3358,6 +3392,7 @@ impl SpritePanel {
                     .and_then(|c| c.entries.get(at))
                     .copied()
                 else {
+                    cx.notify(); // stale selection -- editor re-syncs
                     return;
                 };
                 // One field parsed and merged into the entry's CURRENT
@@ -6591,6 +6626,74 @@ mod tests {
             panel.move_entry_in_clip(0, 9, 0, cx);
             panel.move_entry_in_clip(9, 0, 1, cx);
             assert_eq!(ready(panel).store.state().clips[0].entries.len(), 2);
+        });
+    }
+
+    /// `drop_entry_at`'s four cases, the sequence row's cell drags:
+    /// inside one clip a cell dropped on another REORDERS and a cell
+    /// dropped on the trailing slot moves to the end; across clips the
+    /// destination gains a COPY (on a cell, or appended at the trailing
+    /// slot) and the source clip keeps its entry. No frame is ever
+    /// copied.
+    #[gpui::test]
+    async fn test_dropping_a_sequence_cell_moves_within_a_clip_and_copies_across(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        let frames_of = |panel: &SpritePanel, clip: usize| {
+            ready(panel).store.state().clips[clip]
+                .entries
+                .iter()
+                .map(|e| e.frame)
+                .collect::<Vec<_>>()
+        };
+        panel.update(cx, |panel, cx| {
+            // A second clip to drag across to: one entry on frame 0.
+            panel.add_clip(cx);
+            assert_eq!(frames_of(panel, 0), vec![0, 1]);
+            assert_eq!(frames_of(panel, 1), vec![0]);
+
+            // Same clip, cell -> cell: a reorder, and the entry stays
+            // selected at its new position.
+            panel.drop_entry_at(0, 0, 0, 1, cx);
+            assert_eq!(frames_of(panel, 0), vec![1, 0]);
+            assert_eq!(ready(panel).selected_entry, Some((0, 1)));
+
+            // Same clip, cell -> trailing slot (`seq_pos == len`): the
+            // entry moves to the end rather than vanishing as a no-op.
+            panel.drop_entry_at(0, 0, 0, 2, cx);
+            assert_eq!(frames_of(panel, 0), vec![0, 1]);
+
+            // The LAST cell on the trailing slot is its own no-op.
+            panel.drop_entry_at(0, 1, 0, 2, cx);
+            assert_eq!(frames_of(panel, 0), vec![0, 1]);
+
+            // Cross clip, cell -> cell: the destination gains a copy.
+            panel.drop_entry_at(0, 1, 1, 0, cx);
+            assert_eq!(frames_of(panel, 1), vec![1, 0]);
+            assert_eq!(
+                frames_of(panel, 0),
+                vec![0, 1],
+                "the source clip keeps its entry"
+            );
+
+            // Cross clip, cell -> trailing slot: append.
+            panel.drop_entry_at(0, 0, 1, 2, cx);
+            assert_eq!(frames_of(panel, 1), vec![1, 0, 0]);
+            assert_eq!(
+                ready(panel).store.state().frames.len(),
+                2,
+                "no frame was copied by any of it"
+            );
+
+            // Stale source / destination / position: no-ops, not panics.
+            panel.drop_entry_at(9, 0, 1, 0, cx);
+            panel.drop_entry_at(0, 9, 1, 0, cx);
+            panel.drop_entry_at(0, 0, 9, 0, cx);
+            panel.drop_entry_at(0, 0, 1, 9, cx);
+            assert_eq!(frames_of(panel, 1), vec![1, 0, 0]);
         });
     }
 
