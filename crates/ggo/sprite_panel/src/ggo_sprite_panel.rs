@@ -43,6 +43,7 @@ mod sprite_item;
 pub use sprite_item::SpriteEditorItem;
 mod onion;
 mod playback;
+pub mod reference_sheet;
 mod tiles;
 
 use std::cell::RefCell;
@@ -609,6 +610,17 @@ impl NewKind {
     }
 }
 
+/// Which sheet the tile picker shows: the deduplicated pool (every
+/// distinct tile once, blanks hidden) or the import-time reference
+/// sheet (the source PNG's layout over that pool, repeats and all).
+/// Both hit-test to pool indices, so the selection works the same way
+/// off either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerView {
+    Tiles,
+    Reference,
+}
+
 /// A new sprite's grid, in tiles. 2x2 `TILE_PX` tiles is the smallest
 /// size that reads as a sprite rather than a single tile, and every
 /// dimension is editable afterwards (`DocOp::Resize`).
@@ -993,6 +1005,13 @@ struct OpenSprite {
     /// The bound tileset composed as the tile picker's sheet; same
     /// invalidation as `frames`.
     pool_strip: Option<loader::PoolStrip>,
+    /// The bound tileset's import-time reference sheet (source PNG
+    /// layout over the pool), if recorded and still valid for the pool.
+    reference: Option<reference_sheet::ReferenceSheet>,
+    /// [`Self::reference`] composed; rebuilt alongside `pool_strip`.
+    reference_strip: Option<loader::PoolStrip>,
+    /// Which sheet the picker shows and hit-tests against.
+    picker_view: PickerView,
     /// The tile picker's wrap width in tiles -- session-only (the `.til`
     /// format has no layout field), so a user can match the picker's
     /// wraparound to the source sheet's. Every recompose of `pool_strip`
@@ -1072,6 +1091,9 @@ impl OpenSprite {
             ghost_cache: RefCell::new(HashMap::new()),
             transformed_frames: RefCell::new(HashMap::new()),
             pool_strip: loaded.pool_strip,
+            reference: loaded.reference,
+            reference_strip: loaded.reference_strip,
+            picker_view: PickerView::Tiles,
             picker_cols: loaded
                 .meta
                 .picker_cols
@@ -1103,6 +1125,30 @@ impl OpenSprite {
         self.playing
             .as_ref()
             .map_or(self.selected_frame, |p| p.frame)
+    }
+
+    /// The sheet the picker currently shows and hit-tests against --
+    /// the reference sheet only while that view is on AND one exists,
+    /// so a sprite without one behaves exactly as before.
+    fn picker_strip(&self) -> Option<&loader::PoolStrip> {
+        match self.picker_view {
+            PickerView::Reference => self.reference_strip.as_ref(),
+            PickerView::Tiles => self.pool_strip.as_ref(),
+        }
+    }
+
+    /// Rebuild the reference sheet's image over the current pool -- a
+    /// doc mutation can repaint any tile it shows, or (dedup fold-back,
+    /// undo across a COW clone) shrink the pool out from under it, in
+    /// which case the sheet is stale and drops away.
+    fn recompose_reference(&mut self) {
+        self.reference_strip = self
+            .reference
+            .as_ref()
+            .and_then(|sheet| loader::compose_reference_strip(self.store.state(), sheet));
+        if self.reference_strip.is_none() && self.picker_view == PickerView::Reference {
+            self.picker_view = PickerView::Tiles;
+        }
     }
 
     /// The image the big preview draws: the shown frame's LEGACY compose
@@ -2005,6 +2051,7 @@ impl SpritePanel {
         open.ghost_cache.borrow_mut().clear();
         open.transformed_frames.borrow_mut().clear();
         open.pool_strip = pool_strip;
+        open.recompose_reference();
         open.selected_frame = open.selected_frame.min(frame_count.saturating_sub(1));
         // Undo/redo of frame adds/deletes can leave the editor-only name
         // list misaligned; re-pad to the frame count so indexing stays
@@ -2405,9 +2452,12 @@ impl SpritePanel {
 
     // ----------------------------------------------------------- tile ops
 
-    /// Select `tile` as a 1x1 block, or deselect on a re-select of the
-    /// already-active single tile (the brief's "clicks don't always
-    /// mutate" affordance, alongside Escape).
+    /// Select `tile` as a 1x1 block, or deselect on re-select of the
+    /// already-active single tile. Positions at the tile's FIRST display
+    /// cell, which is only well-defined on the pool sheet -- production
+    /// clicks go through `on_picker_up`'s clicked-cell path instead, so
+    /// this remains as the tests' pool-index entry point.
+    #[cfg(test)]
     fn select_tile(&mut self, tile: u16, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -2417,7 +2467,7 @@ impl SpritePanel {
         }
         // Position the 1x1 block at the tile's DISPLAY cell -- sheet
         // order excludes blanks, so pool index != sheet index.
-        let Some(strip) = open.pool_strip.as_ref() else {
+        let Some(strip) = open.picker_strip() else {
             return;
         };
         let Some(display_ix) = strip.tiles.iter().position(|&t| t == tile) else {
@@ -2440,7 +2490,7 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
-        let strip = open.pool_strip.as_ref()?;
+        let strip = open.picker_strip()?;
         let bounds = (*open.picker_bounds.borrow())?;
         let local_x = f32::from(position.x - bounds.origin.x);
         let local_y = f32::from(position.y - bounds.origin.y);
@@ -2500,16 +2550,25 @@ impl SpritePanel {
             return;
         };
         let far = rc.unwrap_or(far);
-        let Some(strip) = open.pool_strip.as_ref() else {
+        let Some(strip) = open.picker_strip() else {
             cx.notify();
             return;
         };
         let (cols, display) = (strip.cols, strip.tiles.clone());
         if anchor == far {
+            // Position the block at the CLICKED cell rather than routing
+            // through `select_tile`'s first-occurrence lookup: the
+            // reference sheet shows the same pool tile in many cells.
             match display.get(anchor.1 * cols + anchor.0).copied() {
-                Some(tile) => self.select_tile(tile, cx),
-                None => cx.notify(),
+                Some(tile) if (tile as usize) < open.store.state().tile_count => {
+                    let already =
+                        open.selection.as_ref().and_then(tiles::TileBlock::single) == Some(tile);
+                    open.selection =
+                        (!already).then(|| tiles::marquee_block(anchor, anchor, cols, &display));
+                }
+                _ => {}
             }
+            cx.notify();
             return;
         }
         let block = tiles::marquee_block(anchor, far, cols, &display);
@@ -2557,6 +2616,25 @@ impl SpritePanel {
         }
         open.picker_cols = next;
         open.pool_strip = loader::compose_pool_strip(open.store.state(), next);
+        cx.notify();
+    }
+
+    /// Switch the picker between the pool sheet and the reference sheet.
+    /// The selection is dropped: it is positioned in SHEET cells, and the
+    /// two sheets lay the same pool indices out differently.
+    fn set_picker_view(&mut self, view: PickerView, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if view == PickerView::Reference && open.reference_strip.is_none() {
+            return;
+        }
+        if open.picker_view == view {
+            return;
+        }
+        open.picker_view = view;
+        open.selection = None;
+        open.picker_drag = None;
         cx.notify();
     }
 
@@ -3461,38 +3539,58 @@ impl SpritePanel {
         // Wide enough for the sheet at the chosen wrap, never narrower
         // than the default column (the header row needs the room).
         let sheet_cols = open
-            .pool_strip
-            .as_ref()
+            .picker_strip()
             .map_or(loader::PICKER_COLS, |strip| strip.cols);
         let width = px((PICKER_CELL_PX * sheet_cols as f32 + 12.).max(f32::from(PICKER_WIDTH)));
         let picker_cols = open.picker_cols;
+        let has_reference = open.reference_strip.is_some();
+        let picker_view = open.picker_view;
+        let mut header = h_flex().px_1().pt_1().justify_between().child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new("ggo-sprite-picker-tiles", "Tiles")
+                        .label_size(LabelSize::Small)
+                        .toggle_state(picker_view == PickerView::Tiles)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_picker_view(PickerView::Tiles, cx)
+                        })),
+                )
+                .when(has_reference, |this| {
+                    this.child(
+                        Button::new("ggo-sprite-picker-reference", "Reference")
+                            .label_size(LabelSize::Small)
+                            .toggle_state(picker_view == PickerView::Reference)
+                            .tooltip(ui::Tooltip::text(
+                                "The imported PNG's tile layout over the pool",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_picker_view(PickerView::Reference, cx)
+                            })),
+                    )
+                }),
+        );
+        // The wrap stepper only applies to the pool sheet: the reference
+        // sheet's width IS the source art's.
+        if picker_view == PickerView::Tiles {
+            header = header.child(Self::stepper(
+                "ggo-sprite-picker-cols",
+                format!("{picker_cols} col"),
+                picker_cols > 1,
+                picker_cols < MAX_PICKER_COLS,
+                "Tile picker columns",
+                |this, d, cx| this.step_picker_cols(d, cx),
+                cx,
+            ));
+        }
         let mut column = v_flex()
             .flex_none()
             .w(width)
             .h_full()
             .border_l_1()
             .border_color(border)
-            .child(
-                h_flex()
-                    .px_1()
-                    .pt_1()
-                    .justify_between()
-                    .child(
-                        Label::new("Tiles")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Self::stepper(
-                        "ggo-sprite-picker-cols",
-                        format!("{picker_cols} col"),
-                        picker_cols > 1,
-                        picker_cols < MAX_PICKER_COLS,
-                        "Tile picker columns",
-                        |this, d, cx| this.step_picker_cols(d, cx),
-                        cx,
-                    )),
-            );
-        if let Some(strip) = open.pool_strip.as_ref() {
+            .child(header);
+        if let Some(strip) = open.picker_strip() {
             let sheet_w = px(PICKER_CELL_PX * strip.cols as f32);
             let sheet_h = px(PICKER_CELL_PX * strip.rows as f32);
             let bounds_cell = open.picker_bounds.clone();
@@ -6219,6 +6317,165 @@ mod tests {
                 16,
                 "at-max step drops the op"
             );
+        });
+    }
+
+    /// The reference sheet: a `.reference.json` beside the bound `.til`
+    /// opens as a second picker view laid out as the source art was,
+    /// repeats included; clicks on it select POOL indices the same way;
+    /// a sheet that no longer fits the pool is not offered.
+    #[gpui::test]
+    async fn test_reference_sheet_view_picks_pool_tiles(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        // The fixture pool is [blank, red]: a 2x2 sheet of red/blank/red/red.
+        reference_sheet::save(
+            dir.path(),
+            "sprites/hero.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 2,
+                rows: 2,
+                tiles: vec![1, 0, 1, 1],
+            },
+        )
+        .unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            {
+                let open = ready(panel);
+                assert_eq!(open.picker_view, PickerView::Tiles, "pool view by default");
+                let strip = open.reference_strip.as_ref().expect("reference composed");
+                assert_eq!((strip.cols, strip.rows), (2, 2));
+                assert_eq!(strip.tiles, vec![1, 0, 1, 1]);
+            }
+            panel.set_picker_view(PickerView::Reference, cx);
+            assert_eq!(ready(panel).picker_view, PickerView::Reference);
+            *ready(panel).picker_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX * 2.)),
+            ));
+            // Cell (1, 1) of the reference sheet is pool tile 1.
+            panel.on_picker_down(
+                gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
+                cx,
+            );
+            panel.on_picker_up(
+                gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
+                cx,
+            );
+            let selection = ready(panel).selection.as_ref().expect("selected");
+            assert_eq!(selection.origin, (1, 1), "positioned in reference cells");
+            assert_eq!(selection.single(), Some(1));
+            // Switching views drops the (sheet-positioned) selection.
+            panel.set_picker_view(PickerView::Tiles, cx);
+            assert_eq!(ready(panel).selection, None);
+        });
+
+        // A stale sheet (an index past the pool) is never offered.
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        reference_sheet::save(
+            dir.path(),
+            "sprites/hero.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 1,
+                rows: 1,
+                tiles: vec![7],
+            },
+        )
+        .unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            assert!(ready(panel).reference_strip.is_none());
+            panel.set_picker_view(PickerView::Reference, cx);
+            assert_eq!(ready(panel).picker_view, PickerView::Tiles, "refused");
+        });
+    }
+
+    /// A marquee dragged over the reference sheet selects the block AS
+    /// DRAWN -- repeats and blanks included, since the sheet is the source
+    /// art's layout -- and one stamp copies that block into the frame in
+    /// one undoable op. The pool sheet could never yield this block: it
+    /// shows each tile once and hides blanks.
+    #[gpui::test]
+    async fn test_reference_sheet_marquee_stamps_the_block_as_drawn(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        super::test_fixtures::write_multi_tile_fixture(dir.path());
+        // Pool = [blank, red, green]; art was 2x2: red green / red blank.
+        reference_sheet::save(
+            dir.path(),
+            "sprites/multi.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 2,
+                rows: 2,
+                tiles: vec![1, 2, 1, 0],
+            },
+        )
+        .unwrap();
+        let panel = ready_multi_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Grow the frame to 2x2 so the whole block lands.
+            panel.step_size(1, 1, cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![0, 0, 0, 0]);
+            panel.set_picker_view(PickerView::Reference, cx);
+            *ready(panel).picker_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX * 2.)),
+            ));
+
+            // Drag (0,0) -> (1,1): the whole sheet.
+            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_move(
+                gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
+                cx,
+            );
+            panel.on_picker_up(
+                gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
+                cx,
+            );
+            {
+                let block = ready(panel).selection.as_ref().expect("marquee block");
+                assert_eq!((block.cols, block.rows), (2, 2));
+                assert_eq!(
+                    block.tiles,
+                    vec![Some(1), Some(2), Some(1), Some(0)],
+                    "repeats and the blank come through as real pool indices"
+                );
+            }
+
+            // Stamp at cell 0: the frame becomes the art.
+            panel.set_tile_on_cell(0, cx);
+            assert_eq!(
+                ready(panel).store.state().frames[0].map,
+                vec![1, 2, 1, 0],
+                "frame mirrors the reference block"
+            );
+            panel.undo_impl(cx);
+            assert_eq!(
+                ready(panel).store.state().frames[0].map,
+                vec![0, 0, 0, 0],
+                "one undo reverts the whole stamp"
+            );
+            assert_eq!(
+                ready(panel).picker_view,
+                PickerView::Reference,
+                "the view survives the doc-change recompose"
+            );
+
+            // A partial drag: the left column only (two reds).
+            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_move(gpui::point(px(2.), px(PICKER_CELL_PX + 2.)), cx);
+            panel.on_picker_up(gpui::point(px(2.), px(PICKER_CELL_PX + 2.)), cx);
+            {
+                let block = ready(panel).selection.as_ref().expect("column block");
+                assert_eq!((block.cols, block.rows), (1, 2));
+                assert_eq!(block.tiles, vec![Some(1), Some(1)]);
+            }
+            // Anchored at cell 1 (top-right): fills the right column.
+            panel.set_tile_on_cell(1, cx);
+            assert_eq!(ready(panel).store.state().frames[0].map, vec![0, 1, 0, 1]);
         });
     }
 

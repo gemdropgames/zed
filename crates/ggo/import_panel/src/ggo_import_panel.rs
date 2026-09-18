@@ -104,6 +104,7 @@ use ui::{Checkbox, ToggleState, Tooltip};
 use workspace::Workspace;
 
 use ggo_asset_formats::TILE_PX;
+use ggo_sprite_panel::reference_sheet::{self, ReferenceSheet};
 use ggo_worldlib::sprites::import::DecodedFrame;
 use ggo_worldlib::sprites::import::{
     Mode, Region, WizardState, existing_collisions, is_importable_source, join_dest_path,
@@ -277,7 +278,10 @@ fn til_imported_from(project_root: &Path, png_rel: &str) -> Option<String> {
             .is_some_and(|record| record.source_path(project_root) == source_abs)
     };
 
-    let neighbour = format!("{}.til", png_rel.rsplit_once('.').map_or(png_rel, |(s, _)| s));
+    let neighbour = format!(
+        "{}.til",
+        png_rel.rsplit_once('.').map_or(png_rel, |(s, _)| s)
+    );
     if records_this_png(&neighbour) {
         return Some(neighbour);
     }
@@ -1472,7 +1476,9 @@ impl ImportPanel {
                                 if sprite {
                                     ggo_sprite_panel::open_sprite_item(workspace, rel, window, cx);
                                 } else {
-                                    ggo_tileset_panel::open_tileset_item(workspace, rel, window, cx);
+                                    ggo_tileset_panel::open_tileset_item(
+                                        workspace, rel, window, cx,
+                                    );
                                 }
                                 refresh
                             })
@@ -1515,6 +1521,9 @@ impl ImportPanel {
         // `assets/` tree at all.
         let (dest_root, dest_stem) = open.dest();
         let til_rel = format!("{dest_stem}.til");
+        // The source art's tile layout, recorded beside the (deduplicated)
+        // `.til` so the sprite panel's picker can show the sheet as drawn.
+        let mut reference: Option<ReferenceSheet> = None;
         let written = if open.as_sprite {
             // An Aseprite source's frames ARE the sprite's frames: the crop
             // is applied to each, laid side by side in one strip so the
@@ -1543,6 +1552,13 @@ impl ImportPanel {
                 cx.notify();
                 return None;
             }
+            // How many frames the source laid side by side -- the width
+            // the reference sheet is rebuilt at.
+            let frames_per_row = rects
+                .iter()
+                .take_while(|rect| rect.y == rects[0].y)
+                .count()
+                .max(1);
             let spr_rel = format!("{dest_stem}.spr");
             // A `.spr` already at the destination carries animation work
             // this import must not throw away (`preserve`): its clips,
@@ -1558,14 +1574,9 @@ impl ImportPanel {
             // `sprite_import` rule, ported from ggo-ide) and writes the
             // `.spr`/`.til`/`.pal` trio in one call; the wizard's tileset
             // preview is not consulted.
-            let imported = sprite_import(
-                &rgba,
-                src_w,
-                src_h,
-                open.wizard.reserve_transparent,
-                &rects,
-            )
-            .map_err(|e| e.to_string());
+            let imported =
+                sprite_import(&rgba, src_w, src_h, open.wizard.reserve_transparent, &rects)
+                    .map_err(|e| e.to_string());
             let imported = match (imported, existing) {
                 (Ok(state), Some(old)) => match preserve::check(&old, &state) {
                     Ok(()) => Ok(preserve::merge(&old, state)),
@@ -1586,7 +1597,17 @@ impl ImportPanel {
                     &til_rel,
                     &format!("{dest_stem}.pal"),
                 )
-                .map(|saved| (spr_rel, saved.tile_count))
+                .map(|saved| {
+                    let maps: Vec<Vec<u16>> =
+                        state.frames.iter().map(|frame| frame.map.clone()).collect();
+                    reference = ReferenceSheet::from_frames(
+                        &maps,
+                        state.w_tiles as usize,
+                        state.h_tiles as usize,
+                        frames_per_row,
+                    );
+                    (spr_rel, saved.tile_count)
+                })
                 .map_err(|e| e.to_string())
             })
         } else {
@@ -1594,9 +1615,26 @@ impl ImportPanel {
                 Some(preview) => {
                     let (indices, tile_count) =
                         slice_to_tiles(&preview.indices, preview.w, preview.h);
-                    io::save_tileset(&dest_root, &til_rel, &indices, tile_count, &preview.palette)
-                        .map(|()| (til_rel.clone(), tile_count))
-                        .map_err(|e| e.to_string())
+                    // The `.til` is written as a POOL -- one copy of each
+                    // distinct tile -- and the as-drawn grid goes into the
+                    // reference sheet instead.
+                    let deduped = reference_sheet::dedup_grid(
+                        &indices,
+                        tile_count,
+                        preview.w.div_ceil(TILE_PX),
+                    );
+                    io::save_tileset(
+                        &dest_root,
+                        &til_rel,
+                        &deduped.indices,
+                        deduped.tile_count,
+                        &preview.palette,
+                    )
+                    .map(|()| {
+                        reference = Some(deduped.sheet);
+                        (til_rel.clone(), deduped.tile_count)
+                    })
+                    .map_err(|e| e.to_string())
                 }
                 None => return None,
             }
@@ -1632,14 +1670,23 @@ impl ImportPanel {
             }
             save_tileset_meta(project_root, &til_worktree_rel, &meta).err()
         });
+        // The reference sheet is keyed by the `.til` under the ASSET root,
+        // where the sprite panel reads it back for any sprite bound to it.
+        let reference_error = reference
+            .as_ref()
+            .and_then(|sheet| reference_sheet::save(&dest_root, &til_rel, sheet).err());
         let imported = Imported {
             asset_rel,
             worktree_rel,
             tile_count,
             sprite: open.as_sprite,
         };
-        self.status =
-            record_error.map(|e| format!("Imported, but the import record was not saved: {e}"));
+        self.status = record_error
+            .map(|e| format!("Imported, but the import record was not saved: {e}"))
+            .or_else(|| {
+                reference_error
+                    .map(|e| format!("Imported, but the reference sheet was not saved: {e}"))
+            });
         self.last_import = Some(imported.clone());
         cx.notify();
         Some(imported)
@@ -3278,10 +3325,7 @@ mod tests {
 
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
         cx.run_until_parked();
-        assert!(
-            !cx.has_pending_prompt(),
-            "no collision, so no prompt"
-        );
+        assert!(!cx.has_pending_prompt(), "no collision, so no prompt");
         assert!(dir.path().join("art/outside.png").is_file());
         assert!(dir.path().join("art/outside.til").is_file());
     }
@@ -4256,6 +4300,41 @@ mod tests {
         );
     }
 
+    /// A tileset import writes the `.til` as a POOL -- every distinct
+    /// tile once -- and records the as-drawn grid beside it as a
+    /// reference sheet keyed by the `.til`, under the ASSET root.
+    #[gpui::test]
+    async fn test_a_commit_dedups_the_tileset_and_records_a_reference_sheet(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        // A 4x1-tile source whose two halves repeat: A A B B. Written
+        // AFTER the project fixture, which lays down its own hero.png.
+        let assets = write_project(dir.path());
+        write_png_fixture(
+            &assets.join("art/hero.png"),
+            (TILE_PX * 4) as u32,
+            TILE_PX as u32,
+            &two_tone_rgba(TILE_PX * 4, TILE_PX),
+        );
+        let panel = new_panel(cx, dir.path());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.executor().run_until_parked();
+
+        let imported = panel.update(cx, |panel, cx| panel.commit(cx).expect("commit succeeds"));
+        assert_eq!(imported.tile_count, 2, "four tiles, two distinct");
+        let reopened = io::open_tileset(&assets, "art/hero.til").unwrap();
+        assert_eq!(reopened.tile_count, 2);
+
+        let sheet = reference_sheet::load(&assets, "art/hero.til").expect("reference recorded");
+        assert_eq!((sheet.cols, sheet.rows), (4, 1));
+        assert_eq!(sheet.tiles, vec![0, 0, 1, 1]);
+        assert!(sheet.is_valid_for(reopened.tile_count));
+    }
+
     /// A width the user chose in the tileset panel outlives a re-import:
     /// the seed only fills a sidecar that has no `cols` yet.
     #[gpui::test]
@@ -4534,7 +4613,10 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             let status = panel.status.clone().expect("the refusal is explained");
             assert!(status.contains("art/hero.spr"), "{status}");
-            assert!(status.contains("3 frames but the new import has only 2"), "{status}");
+            assert!(
+                status.contains("3 frames but the new import has only 2"),
+                "{status}"
+            );
             assert!(panel.last_import.is_none(), "nothing was imported");
         });
     }
@@ -4544,9 +4626,7 @@ mod tests {
     /// write is allowed, but the confirm must name the sprites at stake
     /// rather than asking a bare "overwrite?".
     #[gpui::test]
-    async fn test_overwriting_a_bound_tileset_names_the_sprites_at_stake(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_overwriting_a_bound_tileset_names_the_sprites_at_stake(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         let assets = dir.path().join(ASSETS_DIR);
@@ -4564,7 +4644,10 @@ mod tests {
         let (message, detail) = cx.pending_prompt().expect("an existing .til confirms");
         assert!(message.contains("already exist"), "{message}");
         assert!(detail.contains("art/hero.spr"), "{detail}");
-        assert!(detail.contains("1 sprite is bound to this tileset"), "{detail}");
+        assert!(
+            detail.contains("1 sprite is bound to this tileset"),
+            "{detail}"
+        );
 
         let before = std::fs::read(assets.join("art/hero.til")).unwrap();
         cx.simulate_prompt_answer("Cancel");
@@ -4598,7 +4681,10 @@ mod tests {
         });
         cx.run_until_parked();
         let (message, _detail) = cx.pending_prompt().expect("an existing sprite confirms");
-        assert!(message.contains("keep its 1 clip and frame timing"), "{message}");
+        assert!(
+            message.contains("keep its 1 clip and frame timing"),
+            "{message}"
+        );
         assert!(message.contains("the first 2 frames"), "{message}");
         assert!(
             !message.contains("overwrite?"),

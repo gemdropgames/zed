@@ -24,6 +24,7 @@ use gpui::RenderImage;
 
 use crate::editor_meta::{self, EditorMeta};
 use crate::onion;
+use crate::reference_sheet::{self, ReferenceSheet};
 
 /// Everything the panel needs to enter its Ready state, assembled
 /// entirely off the UI thread.
@@ -47,6 +48,12 @@ pub struct LoadedSprite {
     /// save, undo across it). `None` only if the sheet came out with
     /// dimensions gpui can't build an image from.
     pub pool_strip: Option<PoolStrip>,
+    /// The bound tileset's import-time reference sheet (the source PNG's
+    /// tile layout over the pool), when one was recorded and still fits
+    /// the pool -- see [`crate::reference_sheet`].
+    pub reference: Option<ReferenceSheet>,
+    /// [`Self::reference`] composed for the picker's "Reference" view.
+    pub reference_strip: Option<PoolStrip>,
     /// The per-sprite editor-settings sidecar (defaults when absent).
     pub meta: EditorMeta,
 }
@@ -209,13 +216,45 @@ pub fn load_sprite(project_dir: &Path, rel: &str) -> Result<LoadedSprite, String
     let frames = compose_frames(&opened.state)?;
     let meta = editor_meta::load(project_dir, rel);
     let pool_strip = compose_pool_strip(&opened.state, meta.picker_cols.unwrap_or(PICKER_COLS));
+    let reference = reference_sheet::load(project_dir, &opened.til_path)
+        .filter(|sheet| sheet.is_valid_for(opened.state.tile_count));
+    let reference_strip = reference
+        .as_ref()
+        .and_then(|sheet| compose_reference_strip(&opened.state, sheet));
     Ok(LoadedSprite {
         state: opened.state,
         til_path: opened.til_path,
         pal_path: opened.pal_path,
         frames,
         pool_strip,
+        reference,
+        reference_strip,
         meta,
+    })
+}
+
+/// Compose a reference sheet over `state`'s pool: the same sheet shape
+/// as [`compose_pool_strip`], but laid out as the source art was, blanks
+/// and repeats included (every cell is a real pool index, so a click
+/// anywhere on it picks). `None` when the sheet no longer fits the pool.
+pub fn compose_reference_strip(state: &SpriteState, sheet: &ReferenceSheet) -> Option<PoolStrip> {
+    if !sheet.is_valid_for(state.tile_count) {
+        return None;
+    }
+    let indices = unpack_til_to_indices(&state.pool, state.tile_count);
+    let mut shown = Vec::with_capacity(sheet.tiles.len() * TILE_PIXELS);
+    for &t in &sheet.tiles {
+        let off = t as usize * TILE_PIXELS;
+        shown.extend_from_slice(&indices[off..off + TILE_PIXELS]);
+    }
+    let (grid, w, h) = compose_tile_grid(&shown, sheet.tiles.len(), sheet.cols);
+    let rgba = indices_to_rgba(&grid, &state.palette);
+    let image = to_render_image(&rgba, w as u32, h as u32)?;
+    Some(PoolStrip {
+        image,
+        cols: sheet.cols,
+        rows: sheet.rows,
+        tiles: sheet.tiles.clone(),
     })
 }
 
