@@ -120,8 +120,22 @@ const MAX_PICKER_COLS: usize = 32;
 /// column's own padding.
 const PICKER_WIDTH: Pixels = px(PICKER_CELL_PX * loader::PICKER_COLS as f32 + 12.);
 
-/// The clip-CRUD side column's width.
+/// The clip-CRUD side column's width, and the frames column's starting
+/// width before any divider drag.
 const CLIPS_WIDTH: Pixels = px(148.);
+
+/// A divider handle's grab width, straddling the border it sizes -- the
+/// same figure `workspace::dock`'s `RESIZE_HANDLE_SIZE` uses.
+const DIVIDER_SIZE: Pixels = px(6.);
+
+/// The smallest a divider drag may leave any of the three columns (or
+/// the tile picker under the reference sheet).
+const MIN_SECTION: Pixels = px(80.);
+
+/// The smallest a divider drag may leave the reference sheet -- lower
+/// than [`MIN_SECTION`] because collapsing it to a sliver is a
+/// legitimate "show me the pool" gesture.
+const MIN_REFERENCE: Pixels = px(40.);
 
 /// Playback timer cadence. 16ms tracks a 60Hz frame; the ACTUAL frame
 /// shown each tick is recomputed from wall-clock elapsed time
@@ -610,15 +624,78 @@ impl NewKind {
     }
 }
 
-/// Which sheet the tile picker shows: the deduplicated pool (every
-/// distinct tile once, blanks hidden) or the import-time reference
-/// sheet (the source PNG's layout over that pool, repeats and all).
-/// Both hit-test to pool indices, so the selection works the same way
-/// off either.
+/// Which sheet OWNS the selection and the in-flight marquee. Both
+/// sheets -- the deduplicated pool (every distinct tile once, blanks
+/// hidden) and the import-time reference sheet (the source PNG's layout
+/// over that pool, repeats and all) -- are on screen at once, but
+/// `selection` is positioned in SHEET cells, which the two lay out
+/// differently, so exactly one of them can hold it. Pressing the other
+/// sheet moves ownership across and drops the selection. Both hit-test
+/// to pool indices, so a stamp works the same way off either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerView {
     Tiles,
     Reference,
+}
+
+/// Which of the viewer's three session-only dividers a drag is sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Divider {
+    /// Between the preview and the sheets column: sizes the sheets.
+    PreviewSide,
+    /// Between the sheets column and the frames library: sizes frames.
+    SideFrames,
+    /// Between the reference sheet and the tile picker below it.
+    ReferencePicker,
+}
+
+/// A divider mid-drag. `workspace::DraggedDock`'s shape: the drag state
+/// rides on the drag itself and the ghost renders nothing, because the
+/// visible feedback is the resized layout, not a floating chip.
+///
+/// The [`EntityId`] is the panel the handle belongs to, and it is load
+/// bearing: `on_drag_move` fires in the CAPTURE phase on every mounted
+/// listener whose drag type matches, with no hitbox test (gpui's
+/// `div::on_drag_move`), so with two sprite panels open in split panes
+/// a drag in one would otherwise resize both.
+#[derive(Clone, Copy)]
+struct DraggedDivider(Divider, EntityId);
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a divider drag at window position `position` into the new
+/// size of the section that divider controls, clamped so no neighbour
+/// collapses. `body` is the three-column row's bounds and `column` the
+/// sheets column's; `side_width`/`frames_width` are the current widths
+/// of the sheets and frames columns.
+///
+/// Pure so the clamps are testable without a window.
+fn divider_size(
+    divider: Divider,
+    position: gpui::Point<Pixels>,
+    body: Bounds<Pixels>,
+    column: Bounds<Pixels>,
+    side_width: Pixels,
+    frames_width: Pixels,
+) -> Pixels {
+    match divider {
+        Divider::PreviewSide => {
+            let max = (body.size.width - frames_width - MIN_SECTION).max(MIN_SECTION);
+            (body.right() - frames_width - position.x).clamp(MIN_SECTION, max)
+        }
+        Divider::SideFrames => {
+            let max = (body.size.width - side_width - MIN_SECTION).max(MIN_SECTION);
+            (body.right() - position.x).clamp(MIN_SECTION, max)
+        }
+        Divider::ReferencePicker => {
+            let max = (column.size.height - MIN_SECTION).max(MIN_REFERENCE);
+            (position.y - column.top()).clamp(MIN_REFERENCE, max)
+        }
+    }
 }
 
 /// A new sprite's grid, in tiles. 2x2 `TILE_PX` tiles is the smallest
@@ -1010,7 +1087,8 @@ struct OpenSprite {
     reference: Option<reference_sheet::ReferenceSheet>,
     /// [`Self::reference`] composed; rebuilt alongside `pool_strip`.
     reference_strip: Option<loader::PoolStrip>,
-    /// Which sheet the picker shows and hit-tests against.
+    /// Which sheet owns the selection and the marquee -- see
+    /// [`PickerView`].
     picker_view: PickerView,
     /// The tile picker's wrap width in tiles -- session-only (the `.til`
     /// format has no layout field), so a user can match the picker's
@@ -1023,9 +1101,12 @@ struct OpenSprite {
     /// frame count as a safety net (undo/redo of adds and deletes can
     /// shift alignment -- names are best-effort metadata, not doc state).
     frame_names: Vec<String>,
-    /// The tile picker sheet's on-screen bounds, recorded at prepaint --
-    /// same overlay-canvas idiom as [`Self::preview_bounds`].
+    /// The POOL sheet's on-screen bounds, recorded at prepaint -- same
+    /// overlay-canvas idiom as [`Self::preview_bounds`].
     picker_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// The REFERENCE sheet's on-screen bounds; both sheets are drawn at
+    /// once, so each needs its own hit-test rectangle.
+    reference_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// The active selection: a 1x1 block from a plain picker click, or a
     /// larger block from a marquee drag. While `Some`, a preview-cell
     /// click stamps the block anchored there (`FrameTilesSet`); `None`
@@ -1101,6 +1182,7 @@ impl OpenSprite {
                 .clamp(1, MAX_PICKER_COLS),
             frame_names: loaded.meta.frame_names,
             picker_bounds: Rc::new(RefCell::new(None)),
+            reference_bounds: Rc::new(RefCell::new(None)),
             selection: None,
             picker_drag: None,
             eraser: false,
@@ -1127,14 +1209,46 @@ impl OpenSprite {
             .map_or(self.selected_frame, |p| p.frame)
     }
 
-    /// The sheet the picker currently shows and hit-tests against --
-    /// the reference sheet only while that view is on AND one exists,
-    /// so a sprite without one behaves exactly as before.
-    fn picker_strip(&self) -> Option<&loader::PoolStrip> {
-        match self.picker_view {
+    /// The composed sheet behind `view`, if there is one (a sprite
+    /// whose tileset recorded no reference sheet has only the pool).
+    fn strip_for(&self, view: PickerView) -> Option<&loader::PoolStrip> {
+        match view {
             PickerView::Reference => self.reference_strip.as_ref(),
             PickerView::Tiles => self.pool_strip.as_ref(),
         }
+    }
+
+    /// The cell `view`'s sheet records its on-screen bounds into.
+    fn bounds_cell_for(&self, view: PickerView) -> &Rc<RefCell<Option<Bounds<Pixels>>>> {
+        match view {
+            PickerView::Reference => &self.reference_bounds,
+            PickerView::Tiles => &self.picker_bounds,
+        }
+    }
+
+    /// `view`'s sheet's last recorded on-screen bounds.
+    fn bounds_for(&self, view: PickerView) -> Option<Bounds<Pixels>> {
+        *self.bounds_cell_for(view).borrow()
+    }
+
+    /// The sheet the selection and the marquee are positioned in.
+    fn picker_strip(&self) -> Option<&loader::PoolStrip> {
+        self.strip_for(self.picker_view)
+    }
+
+    /// The widest the sheets column needs to be to show both sheets
+    /// unclipped at the current wrap, never narrower than the default
+    /// column (the headers need the room). The starting width, and the
+    /// one in force until a divider drag overrides it.
+    fn auto_side_width(&self) -> Pixels {
+        let cols = self
+            .pool_strip
+            .iter()
+            .chain(self.reference_strip.iter())
+            .map(|strip| strip.cols)
+            .max()
+            .unwrap_or(loader::PICKER_COLS);
+        px((PICKER_CELL_PX * cols as f32 + 12.).max(f32::from(PICKER_WIDTH)))
     }
 
     /// Rebuild the reference sheet's image over the current pool -- a
@@ -1148,6 +1262,11 @@ impl OpenSprite {
             .and_then(|sheet| loader::compose_reference_strip(self.store.state(), sheet));
         if self.reference_strip.is_none() && self.picker_view == PickerView::Reference {
             self.picker_view = PickerView::Tiles;
+            // The selection and the marquee are positioned in the
+            // VANISHED sheet's cells; left alone they would paint on the
+            // pool sheet over whatever tiles happen to sit there.
+            self.selection = None;
+            self.picker_drag = None;
         }
     }
 
@@ -1298,6 +1417,26 @@ pub struct SpritePanel {
     state: ViewerState,
     /// The open "New …"/"Rename …" form, if any.
     form: Option<PanelForm>,
+    /// The sheets column's width once a [`Divider::PreviewSide`] drag
+    /// has set one; `None` means the auto width
+    /// ([`OpenSprite::auto_side_width`]). Never persisted, and PANEL
+    /// lifetime rather than session lifetime: every `.spr` opens its own
+    /// [`SpriteEditorItem`] with its own `SpritePanel`, so a dragged
+    /// layout outlives an in-place refresh or a reload of the SAME file
+    /// and no more than that.
+    side_width: Option<Pixels>,
+    /// The frames library column's width, starting at [`CLIPS_WIDTH`].
+    frames_width: Pixels,
+    /// The reference sheet section's height once a
+    /// [`Divider::ReferencePicker`] drag has set one; `None` splits the
+    /// sheets column evenly between the two sheets.
+    reference_height: Option<Pixels>,
+    /// The three-column body row's on-screen bounds, recorded at
+    /// prepaint so a divider drag's window position becomes a width.
+    body_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// The sheets column's bounds, for the same reason -- the
+    /// reference/picker divider measures down from its top.
+    sheets_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     load_generation: u64,
     _load_task: Option<Task<()>>,
 }
@@ -1371,6 +1510,11 @@ impl SpritePanel {
             project_root: None,
             state: ViewerState::Empty,
             form: None,
+            side_width: None,
+            frames_width: CLIPS_WIDTH,
+            reference_height: None,
+            body_bounds: Rc::new(RefCell::new(None)),
+            sheets_bounds: Rc::new(RefCell::new(None)),
             load_generation: 0,
             _load_task: None,
         }
@@ -2483,15 +2627,15 @@ impl SpritePanel {
         cx.notify();
     }
 
-    /// The picker sheet cell under `position`, clamped into the sheet's
-    /// grid (pad cells included -- the marquee resolves those to `None`
-    /// tiles itself).
+    /// The cell under `position` in the sheet that currently owns the
+    /// selection, clamped into that sheet's grid (pad cells included --
+    /// the marquee resolves those to `None` tiles itself).
     fn picker_cell_rc(&self, position: gpui::Point<Pixels>) -> Option<(usize, usize)> {
         let ViewerState::Ready(open) = &self.state else {
             return None;
         };
         let strip = open.picker_strip()?;
-        let bounds = (*open.picker_bounds.borrow())?;
+        let bounds = open.bounds_for(open.picker_view)?;
         let local_x = f32::from(position.x - bounds.origin.x);
         let local_y = f32::from(position.y - bounds.origin.y);
         let col = ((local_x / PICKER_CELL_PX).floor().max(0.) as usize).min(strip.cols - 1);
@@ -2500,20 +2644,45 @@ impl SpritePanel {
         Some((col, row))
     }
 
-    /// Arm a marquee at the pressed cell. Strict hit test: a press
-    /// OUTSIDE the sheet arms nothing (matching the old click contract),
-    /// unlike move/up which clamp so a drag can leave the sheet.
-    fn on_picker_down(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    /// Arm a marquee at the pressed cell of `view`'s sheet. Strict hit
+    /// test: a press OUTSIDE that sheet arms nothing (matching the old
+    /// click contract), unlike move/up which clamp so a drag can leave
+    /// the sheet.
+    ///
+    /// Pressing the sheet that does NOT currently own the selection
+    /// moves ownership across first: `selection` is positioned in SHEET
+    /// cells and the two sheets lay the same pool indices out
+    /// differently, so the old rectangle means nothing here.
+    fn on_picker_down(
+        &mut self,
+        view: PickerView,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         {
             let ViewerState::Ready(open) = &self.state else {
                 return;
             };
-            let Some(bounds) = *open.picker_bounds.borrow() else {
+            if open.strip_for(view).is_none() {
+                return;
+            }
+            let Some(bounds) = open.bounds_for(view) else {
                 return;
             };
             if !bounds.contains(&position) {
                 return;
             }
+        }
+        if let ViewerState::Ready(open) = &mut self.state
+            && open.picker_view != view
+        {
+            open.picker_view = view;
+            open.selection = None;
+            open.picker_drag = None;
+            // Notified here and not only after the marquee arms: the
+            // dropped selection must stop painting even if the pressed
+            // cell resolves to nothing.
+            cx.notify();
         }
         let Some(rc) = self.picker_cell_rc(position) else {
             return;
@@ -2619,23 +2788,72 @@ impl SpritePanel {
         cx.notify();
     }
 
-    /// Switch the picker between the pool sheet and the reference sheet.
-    /// The selection is dropped: it is positioned in SHEET cells, and the
-    /// two sheets lay the same pool indices out differently.
-    fn set_picker_view(&mut self, view: PickerView, cx: &mut Context<Self>) {
-        let ViewerState::Ready(open) = &mut self.state else {
+    /// Apply one step of a divider drag. Drops out before `notify` when
+    /// the clamped size is the one already in force -- a drag emits a
+    /// move event per mouse position, most of which land in the same
+    /// pixel column once a clamp is biting.
+    fn drag_divider(
+        &mut self,
+        divider: Divider,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(body), Some(column)) = (*self.body_bounds.borrow(), *self.sheets_bounds.borrow())
+        else {
             return;
         };
-        if view == PickerView::Reference && open.reference_strip.is_none() {
-            return;
+        // The RENDERED widths, not the stored ones: the neighbour a
+        // clamp has to respect is the one on screen.
+        let (side_width, frames_width) = self.column_widths();
+        let size = divider_size(divider, position, body, column, side_width, frames_width);
+        let changed = match divider {
+            Divider::PreviewSide => self.side_width.replace(size) != Some(size),
+            Divider::SideFrames => std::mem::replace(&mut self.frames_width, size) != size,
+            Divider::ReferencePicker => self.reference_height.replace(size) != Some(size),
+        };
+        if changed {
+            cx.notify();
         }
-        if open.picker_view == view {
-            return;
-        }
-        open.picker_view = view;
-        open.selection = None;
-        open.picker_drag = None;
-        cx.notify();
+    }
+
+    /// The sheets column's width in force: the dragged one, else the
+    /// open sprite's auto width. UNCLAMPED -- see [`Self::column_widths`]
+    /// for the figure the layout actually uses.
+    fn resolved_side_width(&self) -> Pixels {
+        self.side_width.unwrap_or_else(|| match &self.state {
+            ViewerState::Ready(open) => open.auto_side_width(),
+            _ => PICKER_WIDTH,
+        })
+    }
+
+    /// The sheets and frames columns' widths AS RENDERED: the dragged
+    /// (or auto) values re-clamped against the body's current width.
+    /// [`Self::drag_divider`] clamps against the width at drag time, but
+    /// the pane can be narrowed afterwards -- without this the preview
+    /// squeezes to zero and the `PreviewSide` handle lands left of the
+    /// body, where it cannot be grabbed to undo the state. Only ever
+    /// shrinks the stored values; nothing recorded yet leaves them be.
+    fn column_widths(&self) -> (Pixels, Pixels) {
+        let (side, frames) = (self.resolved_side_width(), self.frames_width);
+        let Some(body) = *self.body_bounds.borrow() else {
+            return (side, frames);
+        };
+        let frames = frames.min((body.size.width - MIN_SECTION * 2.).max(MIN_SECTION));
+        let side = side.min((body.size.width - frames - MIN_SECTION).max(MIN_SECTION));
+        (side, frames)
+    }
+
+    /// The reference section's height AS RENDERED: `None` splits the
+    /// sheets column evenly between the two sheets, and a dragged height
+    /// is re-clamped against the column's current height for the same
+    /// reason [`Self::column_widths`] re-clamps the widths -- a shortened
+    /// pane must not bury the tile picker under it.
+    fn rendered_reference_height(&self) -> Option<Pixels> {
+        let height = self.reference_height?;
+        let Some(column) = *self.sheets_bounds.borrow() else {
+            return Some(height);
+        };
+        Some(height.min((column.size.height - MIN_SECTION).max(MIN_REFERENCE)))
     }
 
     fn deselect_tile(&mut self, cx: &mut Context<Self>) {
@@ -3518,178 +3736,268 @@ impl SpritePanel {
         preview.into_any_element()
     }
 
-    /// The tile picker, beside the frame grid: the BOUND TILESET's tiles
-    /// as one composed sheet (`loader::compose_pool_strip` -- the sprite's
-    /// pool is that `.til`, byte for byte), laid out
-    /// [`loader::PICKER_COLS`] wide at [`PICKER_CELL_PX`] per tile. Click
-    /// a tile to make it active (re-click to deselect), then click a frame
-    /// cell in the preview to place it -- the missing SOURCE half of
-    /// F2/M6's already-shipped `FrameTileSet` placement.
+    /// One picker sheet -- the scrolling image plus its grid overlay,
+    /// its selection rectangle and its mouse handlers. Shared by both
+    /// sheets in the middle column: `view` picks the strip's bounds cell
+    /// and is what a press on this sheet claims ownership as.
     ///
     /// One image plus an absolutely-positioned selection outline, rather
     /// than one element per tile: a `.til` runs to hundreds of tiles, and
     /// the same overlay-canvas + hit-math shape the preview already uses
     /// ([`tiles::picker_tile_at`]) costs one element either way.
+    fn render_sheet(
+        &self,
+        view: PickerView,
+        strip: &loader::PoolStrip,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_sheet is only called in the Ready state");
+        };
+        let bounds_cell = open.bounds_cell_for(view).clone();
+        let border = cx.theme().colors().border;
+        let accent = cx.theme().colors().border_focused;
+        let sheet_w = px(PICKER_CELL_PX * strip.cols as f32);
+        let sheet_h = px(PICKER_CELL_PX * strip.rows as f32);
+        let (grid_cols, grid_rows) = (strip.cols, strip.rows);
+        let pad = tiles::picker_pad_region(strip.tiles.len(), strip.cols);
+        let background = cx.theme().colors().panel_background;
+        // Same static-position trap as the preview overlay: without
+        // explicit insets this canvas would record bounds one
+        // sheet-height below the image it must cover.
+        let overlay = gpui::canvas(
+            move |bounds, _window, _cx| {
+                *bounds_cell.borrow_mut() = Some(bounds);
+            },
+            move |bounds, (), window, _cx| {
+                paint_tile_grid(bounds, grid_cols, grid_rows, border, window);
+                // The sheet's zero-filled partial last row is padding,
+                // not tiles -- cover its grid lines and interior so it
+                // reads as empty space, keeping only the 1px edges
+                // shared with real tiles.
+                if let Some((pad_col, pad_row)) = pad {
+                    let line = px(1.);
+                    window.paint_quad(gpui::fill(
+                        Bounds::from_corners(
+                            gpui::point(
+                                bounds.origin.x + px(pad_col as f32 * PICKER_CELL_PX) + line,
+                                bounds.origin.y + px(pad_row as f32 * PICKER_CELL_PX) + line,
+                            ),
+                            bounds.bottom_right(),
+                        ),
+                        background,
+                    ));
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        // One rect outline serves both the locked-in block selection
+        // and the in-flight marquee (the marquee wins while dragging
+        // so the user sees what a release would select). Only the sheet
+        // that OWNS the selection draws it -- the cells mean nothing on
+        // the other one.
+        let rect = (open.picker_view == view)
+            .then(|| {
+                open.picker_drag
+                    .map(|(a, b)| (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)))
+                    .or_else(|| {
+                        open.selection.as_ref().map(|block| {
+                            let (c, r) = block.origin;
+                            (c, r, c + block.cols - 1, r + block.rows - 1)
+                        })
+                    })
+            })
+            .flatten();
+        let selection = rect.map(|(c0, r0, c1, r1)| {
+            div()
+                .absolute()
+                .left(px(c0 as f32 * PICKER_CELL_PX))
+                .top(px(r0 as f32 * PICKER_CELL_PX))
+                .w(px((c1 - c0 + 1) as f32 * PICKER_CELL_PX))
+                .h(px((r1 - r0 + 1) as f32 * PICKER_CELL_PX))
+                .border_1()
+                .border_color(accent)
+        });
+        div()
+            .id(match view {
+                PickerView::Tiles => "ggo-sprite-tiles",
+                PickerView::Reference => "ggo-sprite-reference",
+            })
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_1()
+            .child(
+                div()
+                    .relative()
+                    .w(sheet_w)
+                    .h(sheet_h)
+                    .child(img(strip.image.clone()).nearest(true).w(sheet_w).h(sheet_h))
+                    .child(overlay)
+                    .children(selection)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.on_picker_down(view, event.position, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            this.on_picker_move(event.position, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                            this.on_picker_up(event.position, cx);
+                        }),
+                    )
+                    // A drag that leaves the sheet must still resolve on
+                    // release, or the marquee stays armed and the next
+                    // move over the sheet keeps widening a rectangle the
+                    // user let go of. `on_picker_up` takes the drag, so
+                    // the other sheet's copy of this handler is a no-op.
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                            this.on_picker_up(event.position, cx);
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One of the three session-only divider grab handles, sized and
+    /// positioned by the caller. `workspace::dock`'s resize-handle
+    /// shape: an occluding strip that starts a [`DraggedDivider`] drag,
+    /// which the body row's `on_drag_move` turns into a size. Callers
+    /// wrap it in `deferred` for the same reason the dock does -- the
+    /// strip straddles a border, and the section on the far side paints
+    /// after it and would otherwise swallow half the grab area.
+    fn divider_handle(divider: Divider, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(match divider {
+                Divider::PreviewSide => "ggo-sprite-divider-side",
+                Divider::SideFrames => "ggo-sprite-divider-frames",
+                Divider::ReferencePicker => "ggo-sprite-divider-reference",
+            })
+            .on_drag(
+                DraggedDivider(divider, cx.entity_id()),
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *dragged)
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .occlude()
+    }
+
+    /// The sheets column, between the preview and the frames library:
+    /// the import-time REFERENCE sheet (the source PNG's tile layout
+    /// over the pool, repeats and all) stacked above the TILE PICKER
+    /// (`loader::compose_pool_strip` -- every distinct tile of the bound
+    /// `.til` once, blanks hidden), each scrolling on its own. Click a
+    /// tile on either to make it active (re-click to deselect), then
+    /// click a frame cell in the preview to place it -- the missing
+    /// SOURCE half of F2/M6's already-shipped `FrameTileSet` placement.
+    ///
+    /// A sprite whose tileset recorded no reference sheet gets the
+    /// picker alone, filling the column.
     fn render_tile_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_tile_picker is only called in the Ready state");
         };
         let border = cx.theme().colors().border;
-        let accent = cx.theme().colors().border_focused;
-        // Wide enough for the sheet at the chosen wrap, never narrower
-        // than the default column (the header row needs the room).
-        let sheet_cols = open
-            .picker_strip()
-            .map_or(loader::PICKER_COLS, |strip| strip.cols);
-        let width = px((PICKER_CELL_PX * sheet_cols as f32 + 12.).max(f32::from(PICKER_WIDTH)));
         let picker_cols = open.picker_cols;
-        let has_reference = open.reference_strip.is_some();
-        let picker_view = open.picker_view;
-        let mut header = h_flex().px_1().pt_1().justify_between().child(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new("ggo-sprite-picker-tiles", "Tiles")
-                        .label_size(LabelSize::Small)
-                        .toggle_state(picker_view == PickerView::Tiles)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.set_picker_view(PickerView::Tiles, cx)
-                        })),
-                )
-                .when(has_reference, |this| {
-                    this.child(
-                        Button::new("ggo-sprite-picker-reference", "Reference")
-                            .label_size(LabelSize::Small)
-                            .toggle_state(picker_view == PickerView::Reference)
-                            .tooltip(ui::Tooltip::text(
-                                "The imported PNG's tile layout over the pool",
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_picker_view(PickerView::Reference, cx)
-                            })),
-                    )
-                }),
-        );
-        // The wrap stepper only applies to the pool sheet: the reference
-        // sheet's width IS the source art's.
-        if picker_view == PickerView::Tiles {
-            header = header.child(Self::stepper(
-                "ggo-sprite-picker-cols",
-                format!("{picker_cols} col"),
-                picker_cols > 1,
-                picker_cols < MAX_PICKER_COLS,
-                "Tile picker columns",
-                |this, d, cx| this.step_picker_cols(d, cx),
-                cx,
-            ));
-        }
+        let bounds_cell = self.sheets_bounds.clone();
         let mut column = v_flex()
+            .relative()
             .flex_none()
-            .w(width)
+            .w(self.column_widths().0)
             .h_full()
             .border_l_1()
             .border_color(border)
-            .child(header);
-        if let Some(strip) = open.picker_strip() {
-            let sheet_w = px(PICKER_CELL_PX * strip.cols as f32);
-            let sheet_h = px(PICKER_CELL_PX * strip.rows as f32);
-            let bounds_cell = open.picker_bounds.clone();
-            let (grid_cols, grid_rows) = (strip.cols, strip.rows);
-            let pad = tiles::picker_pad_region(strip.tiles.len(), strip.cols);
-            let background = cx.theme().colors().panel_background;
-            // Same static-position trap as the preview overlay: without
-            // explicit insets this canvas would record bounds one
-            // sheet-height below the image it must cover.
-            let overlay = gpui::canvas(
-                move |bounds, _window, _cx| {
-                    *bounds_cell.borrow_mut() = Some(bounds);
-                },
-                move |bounds, (), window, _cx| {
-                    paint_tile_grid(bounds, grid_cols, grid_rows, border, window);
-                    // The sheet's zero-filled partial last row is padding,
-                    // not tiles -- cover its grid lines and interior so it
-                    // reads as empty space, keeping only the 1px edges
-                    // shared with real tiles.
-                    if let Some((pad_col, pad_row)) = pad {
-                        let line = px(1.);
-                        window.paint_quad(gpui::fill(
-                            Bounds::from_corners(
-                                gpui::point(
-                                    bounds.origin.x + px(pad_col as f32 * PICKER_CELL_PX) + line,
-                                    bounds.origin.y + px(pad_row as f32 * PICKER_CELL_PX) + line,
-                                ),
-                                bounds.bottom_right(),
-                            ),
-                            background,
-                        ));
-                    }
-                },
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| {
+                        *bounds_cell.borrow_mut() = Some(bounds);
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
             )
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full();
-            // One rect outline serves both the locked-in block selection
-            // and the in-flight marquee (the marquee wins while dragging
-            // so the user sees what a release would select).
-            let rect = open
-                .picker_drag
-                .map(|(a, b)| (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)))
-                .or_else(|| {
-                    open.selection.as_ref().map(|block| {
-                        let (c, r) = block.origin;
-                        (c, r, c + block.cols - 1, r + block.rows - 1)
-                    })
-                });
-            let selection = rect.map(|(c0, r0, c1, r1)| {
-                div()
+            .child(gpui::deferred(
+                Self::divider_handle(Divider::PreviewSide, cx)
                     .absolute()
-                    .left(px(c0 as f32 * PICKER_CELL_PX))
-                    .top(px(r0 as f32 * PICKER_CELL_PX))
-                    .w(px((c1 - c0 + 1) as f32 * PICKER_CELL_PX))
-                    .h(px((r1 - r0 + 1) as f32 * PICKER_CELL_PX))
-                    .border_1()
-                    .border_color(accent)
-            });
+                    .top_0()
+                    .left(-DIVIDER_SIZE / 2.)
+                    .w(DIVIDER_SIZE)
+                    .h_full()
+                    .cursor_col_resize(),
+            ));
+        if let Some(strip) = open.reference_strip.as_ref() {
+            let mut section = v_flex().relative().min_h_0();
+            section = match self.rendered_reference_height() {
+                Some(height) => section.flex_none().h(height),
+                None => section.flex_1(),
+            };
             column = column.child(
-                div()
-                    .id("ggo-sprite-tiles")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_1()
+                section
+                    .border_b_1()
+                    .border_color(border)
                     .child(
-                        div()
-                            .relative()
-                            .w(sheet_w)
-                            .h(sheet_h)
-                            .child(img(strip.image.clone()).nearest(true).w(sheet_w).h(sheet_h))
-                            .child(overlay)
-                            .children(selection)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                    window.focus(&this.focus_handle, cx);
-                                    this.on_picker_down(event.position, cx);
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(
-                                |this, event: &gpui::MouseMoveEvent, _, cx| {
-                                    if event.pressed_button == Some(MouseButton::Left) {
-                                        this.on_picker_move(event.position, cx);
-                                    }
-                                },
-                            ))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
-                                    this.on_picker_up(event.position, cx);
-                                }),
-                            ),
-                    ),
+                        h_flex().px_1().pt_1().child(
+                            Label::new("Reference")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(self.render_sheet(PickerView::Reference, strip, cx))
+                    .child(gpui::deferred(
+                        Self::divider_handle(Divider::ReferencePicker, cx)
+                            .absolute()
+                            .left_0()
+                            .bottom(-DIVIDER_SIZE / 2.)
+                            .w_full()
+                            .h(DIVIDER_SIZE)
+                            .cursor_row_resize(),
+                    )),
             );
         }
-        column.into_any_element()
+        let mut picker = v_flex().flex_1().min_h_0().child(
+            h_flex()
+                .px_1()
+                .pt_1()
+                .justify_between()
+                .child(
+                    Label::new("Tiles")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Self::stepper(
+                    "ggo-sprite-picker-cols",
+                    format!("{picker_cols} col"),
+                    picker_cols > 1,
+                    picker_cols < MAX_PICKER_COLS,
+                    "Tile picker columns",
+                    |this, d, cx| this.step_picker_cols(d, cx),
+                    cx,
+                )),
+        );
+        if let Some(strip) = open.pool_strip.as_ref() {
+            picker = picker.child(self.render_sheet(PickerView::Tiles, strip, cx));
+        }
+        column.child(picker).into_any_element()
     }
 
     /// The open "New …"/"Rename …" form, as a bar above the viewer.
@@ -4222,11 +4530,21 @@ impl SpritePanel {
                 }),
             ));
         v_flex()
+            .relative()
             .flex_none()
-            .w(CLIPS_WIDTH)
+            .w(self.column_widths().1)
             .h_full()
             .border_l_1()
             .border_color(border)
+            .child(gpui::deferred(
+                Self::divider_handle(Divider::SideFrames, cx)
+                    .absolute()
+                    .top_0()
+                    .left(-DIVIDER_SIZE / 2.)
+                    .w(DIVIDER_SIZE)
+                    .h_full()
+                    .cursor_col_resize(),
+            ))
             .child(header)
             .child(strip)
             .into_any_element()
@@ -4305,15 +4623,44 @@ impl SpritePanel {
     }
 
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let bounds_cell = self.body_bounds.clone();
         v_flex()
             .size_full()
             .child(self.render_transport(window, cx))
             .child(self.render_onion(cx))
             .child(
                 h_flex()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
+                    // The drag listener lives on the whole row, not on
+                    // the handles: a fast drag outruns the 6px strip.
+                    // `on_drag_move` fires in the CAPTURE phase for the
+                    // whole window with no hitbox test, so this row sees
+                    // divider drags from OTHER sprite panels in other
+                    // split panes too -- hence the owner filter.
+                    .on_drag_move(cx.listener(
+                        |this, event: &gpui::DragMoveEvent<DraggedDivider>, _, cx| {
+                            let &DraggedDivider(divider, owner) = event.drag(cx);
+                            if owner != cx.entity_id() {
+                                return;
+                            }
+                            this.drag_divider(divider, event.event.position, cx);
+                        },
+                    ))
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _window, _cx| {
+                                *bounds_cell.borrow_mut() = Some(bounds);
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
                     .child(self.render_preview(cx))
                     .child(self.render_tile_picker(cx))
                     .child(self.render_strip(cx)),
@@ -5784,7 +6131,7 @@ mod tests {
             ));
 
             // Drag across both sheet cells: (0,0) -> (1,0).
-            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_down(PickerView::Tiles, gpui::point(px(2.), px(2.)), cx);
             panel.on_picker_move(gpui::point(px(PICKER_CELL_PX + 2.), px(2.)), cx);
             panel.on_picker_up(gpui::point(px(PICKER_CELL_PX + 2.), px(2.)), cx);
             {
@@ -5809,7 +6156,7 @@ mod tests {
             );
 
             // Press-release on one cell still toggles a 1x1 selection.
-            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_down(PickerView::Tiles, gpui::point(px(2.), px(2.)), cx);
             panel.on_picker_up(gpui::point(px(2.), px(2.)), cx);
             assert_eq!(
                 ready(panel)
@@ -5819,7 +6166,7 @@ mod tests {
                 Some(1),
                 "plain click selects the single POOL tile under the cell"
             );
-            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_down(PickerView::Tiles, gpui::point(px(2.), px(2.)), cx);
             panel.on_picker_up(gpui::point(px(2.), px(2.)), cx);
             assert!(
                 ready(panel).selection.is_none(),
@@ -6128,7 +6475,7 @@ mod tests {
 
             // The hero fixture's only pickable tile is pool tile 1 (tile
             // 0 is blank and hidden): sheet cell 0 selects it.
-            panel.on_picker_down(gpui::point(px(12.), px(22.)), cx);
+            panel.on_picker_down(PickerView::Tiles, gpui::point(px(12.), px(22.)), cx);
             panel.on_picker_up(gpui::point(px(12.), px(22.)), cx);
             assert_eq!(selected_single(panel), Some(1), "first cell = pool tile 1");
 
@@ -6141,10 +6488,14 @@ mod tests {
             assert!(!ready(panel).store.dirty());
 
             // Outside the sheet on either side: no selection change.
-            panel.on_picker_down(gpui::point(px(9.), px(22.)), cx);
+            panel.on_picker_down(PickerView::Tiles, gpui::point(px(9.), px(22.)), cx);
             panel.on_picker_up(gpui::point(px(9.), px(22.)), cx);
             assert_eq!(selected_single(panel), Some(1));
-            panel.on_picker_down(gpui::point(px(10. + PICKER_CELL_PX + 1.), px(22.)), cx);
+            panel.on_picker_down(
+                PickerView::Tiles,
+                gpui::point(px(10. + PICKER_CELL_PX + 1.), px(22.)),
+                cx,
+            );
             panel.on_picker_up(gpui::point(px(10. + PICKER_CELL_PX + 1.), px(22.)), cx);
             assert_eq!(
                 selected_single(panel),
@@ -6321,9 +6672,11 @@ mod tests {
     }
 
     /// The reference sheet: a `.reference.json` beside the bound `.til`
-    /// opens as a second picker view laid out as the source art was,
-    /// repeats included; clicks on it select POOL indices the same way;
-    /// a sheet that no longer fits the pool is not offered.
+    /// composes a second sheet laid out as the source art was, repeats
+    /// included; pressing it moves selection ownership onto it and
+    /// selects POOL indices the same way, and pressing the pool sheet
+    /// back drops that (sheet-positioned) selection; a sheet that no
+    /// longer fits the pool is not offered at all.
     #[gpui::test]
     async fn test_reference_sheet_view_picks_pool_tiles(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -6349,14 +6702,21 @@ mod tests {
                 assert_eq!((strip.cols, strip.rows), (2, 2));
                 assert_eq!(strip.tiles, vec![1, 0, 1, 1]);
             }
-            panel.set_picker_view(PickerView::Reference, cx);
-            assert_eq!(ready(panel).picker_view, PickerView::Reference);
-            *ready(panel).picker_bounds.borrow_mut() = Some(Bounds::new(
+            // The two sheets sit at different screen positions; both are
+            // painted, so both bounds are live at once.
+            *ready(panel).reference_bounds.borrow_mut() = Some(Bounds::new(
                 gpui::point(px(0.), px(0.)),
                 gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX * 2.)),
             ));
-            // Cell (1, 1) of the reference sheet is pool tile 1.
+            *ready(panel).picker_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(PICKER_CELL_PX * 4.)),
+                gpui::size(px(PICKER_CELL_PX), px(PICKER_CELL_PX)),
+            ));
+
+            // Cell (1, 1) of the reference sheet is pool tile 1; pressing
+            // there hands the selection to the reference sheet.
             panel.on_picker_down(
+                PickerView::Reference,
                 gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
                 cx,
             );
@@ -6364,11 +6724,19 @@ mod tests {
                 gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
                 cx,
             );
+            assert_eq!(ready(panel).picker_view, PickerView::Reference);
             let selection = ready(panel).selection.as_ref().expect("selected");
             assert_eq!(selection.origin, (1, 1), "positioned in reference cells");
             assert_eq!(selection.single(), Some(1));
-            // Switching views drops the (sheet-positioned) selection.
-            panel.set_picker_view(PickerView::Tiles, cx);
+
+            // Pressing the OTHER sheet drops the (sheet-positioned)
+            // selection before arming its own marquee.
+            panel.on_picker_down(
+                PickerView::Tiles,
+                gpui::point(px(2.), px(PICKER_CELL_PX * 4. + 2.)),
+                cx,
+            );
+            assert_eq!(ready(panel).picker_view, PickerView::Tiles);
             assert_eq!(ready(panel).selection, None);
         });
 
@@ -6388,8 +6756,15 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             assert!(ready(panel).reference_strip.is_none());
-            panel.set_picker_view(PickerView::Reference, cx);
+            // No sheet, no section: a press claiming it is refused even
+            // with bounds stamped in by hand.
+            *ready(panel).reference_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(PICKER_CELL_PX), px(PICKER_CELL_PX)),
+            ));
+            panel.on_picker_down(PickerView::Reference, gpui::point(px(2.), px(2.)), cx);
             assert_eq!(ready(panel).picker_view, PickerView::Tiles, "refused");
+            assert_eq!(ready(panel).picker_drag, None);
         });
     }
 
@@ -6419,14 +6794,13 @@ mod tests {
             // Grow the frame to 2x2 so the whole block lands.
             panel.step_size(1, 1, cx);
             assert_eq!(ready(panel).store.state().frames[0].map, vec![0, 0, 0, 0]);
-            panel.set_picker_view(PickerView::Reference, cx);
-            *ready(panel).picker_bounds.borrow_mut() = Some(Bounds::new(
+            *ready(panel).reference_bounds.borrow_mut() = Some(Bounds::new(
                 gpui::point(px(0.), px(0.)),
                 gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX * 2.)),
             ));
 
             // Drag (0,0) -> (1,1): the whole sheet.
-            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_down(PickerView::Reference, gpui::point(px(2.), px(2.)), cx);
             panel.on_picker_move(
                 gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
                 cx,
@@ -6461,11 +6835,11 @@ mod tests {
             assert_eq!(
                 ready(panel).picker_view,
                 PickerView::Reference,
-                "the view survives the doc-change recompose"
+                "selection ownership survives the doc-change recompose"
             );
 
             // A partial drag: the left column only (two reds).
-            panel.on_picker_down(gpui::point(px(2.), px(2.)), cx);
+            panel.on_picker_down(PickerView::Reference, gpui::point(px(2.), px(2.)), cx);
             panel.on_picker_move(gpui::point(px(2.), px(PICKER_CELL_PX + 2.)), cx);
             panel.on_picker_up(gpui::point(px(2.), px(PICKER_CELL_PX + 2.)), cx);
             {
@@ -6476,6 +6850,187 @@ mod tests {
             // Anchored at cell 1 (top-right): fills the right column.
             panel.set_tile_on_cell(1, cx);
             assert_eq!(ready(panel).store.state().frames[0].map, vec![0, 1, 0, 1]);
+        });
+    }
+
+    /// The three dividers' sizing math and its clamps: each divider
+    /// tracks the pointer inside its usable range, and at the extremes
+    /// leaves every neighbour its minimum rather than collapsing it.
+    #[test]
+    fn test_divider_size_tracks_the_pointer_and_clamps_its_neighbours() {
+        // A 1000x500 body at (100, 50), sheets column 300 wide sitting
+        // between a 148-wide frames column and the preview.
+        let body = Bounds::new(
+            gpui::point(px(100.), px(50.)),
+            gpui::size(px(1000.), px(500.)),
+        );
+        let column = Bounds::new(
+            gpui::point(px(752.), px(50.)),
+            gpui::size(px(300.), px(500.)),
+        );
+        let (side, frames) = (px(300.), px(148.));
+        let at = |divider, x: f32, y: f32| {
+            divider_size(
+                divider,
+                gpui::point(px(x), px(y)),
+                body,
+                column,
+                side,
+                frames,
+            )
+        };
+
+        // Preview/sheets: the sheets run from the pointer to the frames
+        // column's left edge (1100 - 148 = 952).
+        assert_eq!(at(Divider::PreviewSide, 652., 300.), px(300.));
+        // Dragged right past the frames column: the sheets keep 80.
+        assert_eq!(at(Divider::PreviewSide, 1000., 300.), MIN_SECTION);
+        // Dragged off the left edge: the preview keeps 80.
+        assert_eq!(
+            at(Divider::PreviewSide, 0., 300.),
+            px(1000.) - frames - MIN_SECTION
+        );
+
+        // Sheets/frames: the frames column runs from the pointer to the
+        // body's right edge.
+        assert_eq!(at(Divider::SideFrames, 900., 300.), px(200.));
+        assert_eq!(at(Divider::SideFrames, 1099., 300.), MIN_SECTION);
+        // Dragged left past the sheets: the preview keeps 80.
+        assert_eq!(
+            at(Divider::SideFrames, 0., 300.),
+            px(1000.) - side - MIN_SECTION
+        );
+
+        // Reference/picker: measured down from the sheets column's top.
+        assert_eq!(at(Divider::ReferencePicker, 800., 250.), px(200.));
+        assert_eq!(at(Divider::ReferencePicker, 800., 0.), MIN_REFERENCE);
+        // Dragged to the bottom: the tile picker keeps 80.
+        assert_eq!(
+            at(Divider::ReferencePicker, 800., 1000.),
+            px(500.) - MIN_SECTION
+        );
+    }
+
+    /// The dragged sizes are re-clamped AT RENDER, not just at drag
+    /// time: a pane narrowed after the drag must still leave the preview
+    /// its minimum (or the `PreviewSide` handle lands off the body's
+    /// left edge, unreachable) and must not bury the tile picker under
+    /// the reference sheet.
+    #[gpui::test]
+    async fn test_render_reclamps_the_dragged_sizes_when_the_pane_shrinks(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, _| {
+            // Nothing painted yet: the stored values pass through.
+            panel.side_width = Some(px(400.));
+            panel.frames_width = px(300.);
+            panel.reference_height = Some(px(400.));
+            assert_eq!(panel.column_widths(), (px(400.), px(300.)));
+            assert_eq!(panel.rendered_reference_height(), Some(px(400.)));
+
+            // A roomy body leaves them alone.
+            *panel.body_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(1000.), px(600.)),
+            ));
+            *panel.sheets_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(300.), px(0.)),
+                gpui::size(px(400.), px(600.)),
+            ));
+            assert_eq!(panel.column_widths(), (px(400.), px(300.)));
+            assert_eq!(panel.rendered_reference_height(), Some(px(400.)));
+
+            // Narrowed to 500: frames still fit, so only the sheets give
+            // way -- down to exactly what leaves the preview its minimum.
+            *panel.body_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(500.), px(600.)),
+            ));
+            let (side, frames) = panel.column_widths();
+            assert_eq!(frames, px(300.), "frames still fit untouched");
+            assert_eq!(side, px(500.) - px(300.) - MIN_SECTION);
+            assert_eq!(px(500.) - side - frames, MIN_SECTION, "preview minimum");
+
+            // Narrowed to 300: frames give way too, and all three land on
+            // their minimum share rather than one collapsing to nothing.
+            *panel.body_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(300.), px(600.)),
+            ));
+            let (side, frames) = panel.column_widths();
+            assert_eq!(frames, px(300.) - MIN_SECTION * 2.);
+            assert_eq!(side, MIN_SECTION);
+            assert_eq!(px(300.) - side - frames, MIN_SECTION, "preview minimum");
+
+            // Shortened to 200: the tile picker keeps its minimum.
+            *panel.sheets_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(300.), px(0.)),
+                gpui::size(px(400.), px(200.)),
+            ));
+            assert_eq!(
+                panel.rendered_reference_height(),
+                Some(px(200.) - MIN_SECTION)
+            );
+
+            // The stored values are untouched -- the clamps are a render
+            // concern, so widening the pane restores the drag.
+            assert_eq!(panel.side_width, Some(px(400.)));
+            assert_eq!(panel.frames_width, px(300.));
+            assert_eq!(panel.reference_height, Some(px(400.)));
+        });
+    }
+
+    /// A reference sheet that goes stale takes the selection with it:
+    /// `selection` and `picker_drag` are positioned in ITS cells, so
+    /// leaving them behind would paint an outline over unrelated tiles
+    /// on the pool sheet the fallback lands on.
+    #[gpui::test]
+    async fn test_a_vanished_reference_sheet_drops_its_selection(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        reference_sheet::save(
+            dir.path(),
+            "sprites/hero.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 2,
+                rows: 2,
+                tiles: vec![1, 0, 1, 1],
+            },
+        )
+        .unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            *ready(panel).reference_bounds.borrow_mut() = Some(Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(PICKER_CELL_PX * 2.), px(PICKER_CELL_PX * 2.)),
+            ));
+            panel.on_picker_down(
+                PickerView::Reference,
+                gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
+                cx,
+            );
+            panel.on_picker_up(
+                gpui::point(px(PICKER_CELL_PX + 2.), px(PICKER_CELL_PX + 2.)),
+                cx,
+            );
+            assert_eq!(
+                ready(panel).selection.as_ref().map(|b| b.origin),
+                Some((1, 1))
+            );
+
+            // Drop the recorded sheet the way a fold-back does, then
+            // recompose: the fallback to the pool sheet takes the
+            // reference-positioned selection with it.
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.reference = None;
+            open.recompose_reference();
+            assert_eq!(open.picker_view, PickerView::Tiles);
+            assert_eq!(open.selection, None, "stale reference cells dropped");
+            assert_eq!(open.picker_drag, None);
         });
     }
 
