@@ -4680,10 +4680,7 @@ mod tests {
         });
         cx.run_until_parked();
         let (message, _detail) = cx.pending_prompt().expect("an existing sprite confirms");
-        assert!(
-            message.contains("keep its 1 clip and frame timing"),
-            "{message}"
-        );
+        assert!(message.contains("keep its 1 animation"), "{message}");
         assert!(message.contains("the first 2 frames"), "{message}");
         assert!(
             !message.contains("overwrite?"),

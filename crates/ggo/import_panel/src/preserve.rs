@@ -149,16 +149,24 @@ pub(crate) fn mismatch_message(mismatch: &Mismatch, spr_rel: &str) -> String {
 /// EXISTING document's frame count: those are the frames the positional
 /// match assumes still line up, and the ones the user can check.
 pub(crate) fn preserve_message(spr_rel: &str, clips: usize, frames: usize) -> String {
-    let kept = match clips {
-        0 => "frame timing".to_string(),
-        1 => "1 clip and frame timing".to_string(),
-        n => format!("{n} clips and frame timing"),
-    };
-    format!(
-        "{spr_rel} already exists — replace its artwork and keep its {kept}? \
-         Existing frames are matched by position, so this assumes the first {frames} frames \
+    let positional = format!(
+        "Existing frames are matched by position, so this assumes the first {frames} frames \
          of the image still line up."
-    )
+    );
+    // Timing rides on the clips' entries, so a sprite with no clips has
+    // nothing to carry over at all.
+    match clips {
+        0 => {
+            format!("{spr_rel} already exists and has no animations to keep — replace its artwork?")
+        }
+        1 => format!(
+            "{spr_rel} already exists — replace its artwork and keep its 1 animation? {positional}"
+        ),
+        n => format!(
+            "{spr_rel} already exists — replace its artwork and keep its {n} animations? \
+             {positional}"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -321,17 +329,20 @@ mod tests {
         assert!(message.starts_with("cannot keep art/hero.spr's animations: "));
         assert!(message.contains("4 frames but the new import has only 2"));
         let confirm = preserve_message("art/hero.spr", 1, 3);
-        assert!(confirm.contains("keep its 1 clip and frame timing"));
+        assert!(confirm.contains("keep its 1 animation"), "{confirm}");
         assert!(
             confirm.contains("the first 3 frames"),
             "the confirm names what the positional match assumes"
         );
+        assert!(preserve_message("art/hero.spr", 2, 3).contains("keep its 2 animations"));
+        let none = preserve_message("art/hero.spr", 0, 3);
         assert!(
-            preserve_message("art/hero.spr", 2, 3).contains("keep its 2 clips and frame timing")
+            none.contains("has no animations to keep"),
+            "with entry-carried timing a clipless sprite has nothing to preserve: {none}"
         );
         assert!(
-            preserve_message("art/hero.spr", 0, 3).contains("keep its frame timing"),
-            "a sprite with no clips still has timing worth keeping"
+            !none.contains("keep its"),
+            "nothing is offered for keeping: {none}"
         );
     }
 }
