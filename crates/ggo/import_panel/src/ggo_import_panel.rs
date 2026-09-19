@@ -155,6 +155,9 @@ const EMPTY_MESSAGE: &str = "Right-click a .png in the project panel → Import 
 
 /// The quantized preview strip's height.
 const PREVIEW_HEIGHT: Pixels = px(120.);
+/// Floor for the crop canvas so that chrome taller than the pane scrolls
+/// the root instead of flattening the canvas to nothing.
+const CANVAS_MIN_HEIGHT: Pixels = px(120.);
 
 /// The transparency checkerboard behind the source and the preview -- same
 /// square size and greys as the tileset panel's sheet backdrop, so
@@ -1868,6 +1871,8 @@ impl ImportPanel {
             .child(Label::new(open.source_rel.clone()).size(LabelSize::Small))
             .child(
                 h_flex()
+                    .debug_selector(|| "ggo-import-header-row".into())
+                    .flex_wrap()
                     .gap_1()
                     .items_center()
                     .child(
@@ -2159,6 +2164,7 @@ impl ImportPanel {
         let weak_sprite = weak.clone();
 
         v_flex()
+            .debug_selector(|| "ggo-import-footer".into())
             .gap_1()
             .p_1()
             .border_t_1()
@@ -2242,6 +2248,7 @@ impl ImportPanel {
             .child(
                 h_flex()
                     .gap_1()
+                    .flex_wrap()
                     .items_center()
                     .child(
                         Label::new(format!("→ {targets}"))
@@ -2305,9 +2312,20 @@ impl ImportPanel {
         let palette = self.render_palette(cx);
         let footer = self.render_footer(cx);
         v_flex()
+            .id("ggo-import-ready")
             .size_full()
+            .overflow_y_scroll()
             .child(header)
-            .child(div().flex_1().min_h_0().child(canvas))
+            .child(
+                div()
+                    .flex_1()
+                    // A scroll container's automatic minimum is zero, so
+                    // without this floor the fixed chrome below would
+                    // flatten the canvas to nothing instead of pushing the
+                    // root into scrolling.
+                    .min_h(CANVAS_MIN_HEIGHT)
+                    .child(canvas),
+            )
             .child(preview)
             .child(palette)
             .child(footer)
@@ -4886,5 +4904,109 @@ mod tests {
                 "the recorded source is loading"
             );
         });
+    }
+
+    // ------------------------------------------------- overflow in a small pane
+
+    /// The panel Ready and drawn in a real test window, so the rendered
+    /// layout can be resized and wheeled the way a user's pane is.
+    async fn ready_panel_in_window<'a>(
+        cx: &'a mut TestAppContext,
+        root: &Path,
+    ) -> (Entity<ImportPanel>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+            ggo_common::bind_default_keymap(cx);
+        });
+        write_project(root);
+        let root = root.to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = ImportPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_source("assets/art/hero.png", cx);
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// A wheel over `position` with `delta` pixels, pumped.
+    fn wheel(cx: &mut gpui::VisualTestContext, position: gpui::Point<Pixels>, delta: (f32, f32)) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(delta.0), px(delta.1))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// Overflow class B: the header's control row wraps onto more rows in a
+    /// narrow pane instead of running the zoom slider off the edge.
+    #[gpui::test]
+    async fn test_b_the_header_row_wraps_in_a_narrow_pane(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(size(px(900.), px(600.)));
+        cx.run_until_parked();
+        let wide = cx
+            .debug_bounds("ggo-import-header-row")
+            .expect("the header row in a wide pane");
+
+        cx.simulate_resize(size(px(220.), px(600.)));
+        cx.run_until_parked();
+        let narrow = cx
+            .debug_bounds("ggo-import-header-row")
+            .expect("the header row in a narrow pane");
+
+        assert!(
+            narrow.size.height >= wide.size.height * 2.,
+            "a narrow pane must wrap the header onto at least two rows: wide {:?}, narrow {:?}",
+            wide.size,
+            narrow.size
+        );
+    }
+
+    /// Overflow class C: chrome taller than the pane scrolls the root
+    /// rather than crushing the crop canvas to nothing.
+    #[gpui::test]
+    async fn test_c_a_short_pane_scrolls_instead_of_crushing_the_canvas(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(size(px(520.), px(220.)));
+        cx.run_until_parked();
+
+        let canvas = panel
+            .read_with(cx, |panel, _| *ready(panel).canvas_bounds.borrow())
+            .expect("the canvas records its bounds at prepaint");
+        assert!(
+            canvas.size.height >= CANVAS_MIN_HEIGHT,
+            "the canvas must keep its floor in a short pane: {canvas:?}"
+        );
+
+        let before = cx
+            .debug_bounds("ggo-import-footer")
+            .expect("the footer holding the Import button");
+        let header = cx
+            .debug_bounds("ggo-import-header-row")
+            .expect("the header is the chrome above the canvas");
+        wheel(cx, header.center(), (0., -80.));
+
+        let after = cx
+            .debug_bounds("ggo-import-footer")
+            .expect("the footer survives the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "wheeling down a short pane must bring the Import button up into the pane: \
+             before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
     }
 }
