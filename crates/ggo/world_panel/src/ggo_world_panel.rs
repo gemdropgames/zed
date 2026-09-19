@@ -153,6 +153,9 @@ const LIST_WIDTH: Pixels = px(140.);
 /// under the brush -- wider than the inspector because the tileset strip
 /// inside it is a picking surface, not a field.
 const PAINT_WIDTH: Pixels = px(280.);
+/// Floor for the Ready body so that chrome taller than the dock scrolls
+/// the root instead of flattening the columns to nothing.
+const BODY_MIN_HEIGHT: Pixels = px(120.);
 /// Paste/duplicate offset when the cursor is not over the canvas: one tile.
 const PASTE_OFFSET_PX: f64 = 16.0;
 
@@ -7268,7 +7271,7 @@ impl WorldPanel {
             .w(LIST_WIDTH)
             .h_full()
             .flex_none()
-            .overflow_y_scroll()
+            .overflow_scroll()
             .child(v_flex().children(rows.into_iter().map(|(target, label)| {
                 let selected = open.selected.contains(&target);
                 let row = div()
@@ -7827,6 +7830,8 @@ impl WorldPanel {
             if dirty { " ●" } else { "" }
         );
         h_flex()
+            .debug_selector(|| "ggo-world-toolbar".into())
+            .flex_wrap()
             .gap_1()
             .p_1()
             .border_b_1()
@@ -8107,6 +8112,7 @@ impl WorldPanel {
         }
         let playing = live.mode == EditorMode::Play;
         let mut rail = h_flex()
+            .flex_wrap()
             .gap_1()
             .px_1()
             .pb_1()
@@ -8201,6 +8207,7 @@ impl WorldPanel {
         let grid_weak = cx.weak_entity();
         let snap_weak = cx.weak_entity();
         h_flex()
+            .flex_wrap()
             .gap_1()
             .px_1()
             .pb_1()
@@ -9145,6 +9152,7 @@ impl WorldPanel {
         Some(
             div()
                 .id("ggo-world-inspector")
+                .debug_selector(|| "ggo-world-inspector".into())
                 .w(INSPECTOR_WIDTH)
                 .h_full()
                 .flex_none()
@@ -9202,7 +9210,7 @@ impl WorldPanel {
                 .flex_none()
                 .border_l_1()
                 .border_color(cx.theme().colors().border)
-                .overflow_y_scroll()
+                .overflow_scroll()
                 .child(
                     v_flex()
                         .p_1()
@@ -9260,12 +9268,24 @@ impl WorldPanel {
             (self.render_entity_list(cx), inspector)
         });
         let toolbar = self.render_toolbar(window, cx);
-        let mut body = h_flex().flex_1().min_h_0().items_stretch();
+        let mut body = h_flex()
+            .id("ggo-world-body")
+            .debug_selector(|| "ggo-world-body".into())
+            .flex_1()
+            .min_h_0()
+            // A scroll container's automatic minimum is zero, so without
+            // this floor the chrome above would flatten the columns to
+            // nothing instead of pushing the root into scrolling.
+            .min_h(BODY_MIN_HEIGHT)
+            .overflow_x_scroll()
+            .items_stretch();
         if let Some((list, inspector)) = entities {
             body = body.child(list).children(inspector);
         }
         v_flex()
+            .id("ggo-world-ready")
             .size_full()
+            .overflow_y_scroll()
             .child(toolbar)
             .children(self.render_live_status(cx))
             .child(self.render_view_controls(cx))
@@ -21438,6 +21458,108 @@ mod tests {
             BOOTED.with(|booted| booted.borrow().len()),
             before + 1,
             "Retry starts a new session"
+        );
+    }
+
+    /// A wheel over `position` with `delta` pixels, pumped.
+    fn wheel(cx: &mut gpui::VisualTestContext, position: gpui::Point<Pixels>, delta: (f32, f32)) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(delta.0), px(delta.1))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// Overflow class B: the toolbar wraps onto more rows in a narrow
+    /// dock instead of running off its edge.
+    #[gpui::test]
+    async fn test_b_the_toolbar_wraps_in_a_narrow_dock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+        let wide = cx
+            .debug_bounds("ggo-world-toolbar")
+            .expect("the toolbar in a wide dock");
+
+        cx.simulate_resize(gpui::size(px(200.), px(600.)));
+        cx.run_until_parked();
+        let narrow = cx
+            .debug_bounds("ggo-world-toolbar")
+            .expect("the toolbar in a narrow dock");
+
+        assert!(
+            narrow.size.height > wide.size.height,
+            "a narrow dock must wrap the toolbar onto more rows: wide {:?}, narrow {:?}",
+            wide.size,
+            narrow.size
+        );
+    }
+
+    /// Overflow class C: chrome taller than the dock scrolls the root
+    /// rather than crushing the body to nothing.
+    #[gpui::test]
+    async fn test_c_a_short_dock_scrolls_instead_of_crushing_the_body(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(500.), px(150.)));
+        cx.run_until_parked();
+
+        let before = cx.debug_bounds("ggo-world-body").expect("the ready body");
+        assert!(
+            before.size.height >= BODY_MIN_HEIGHT,
+            "the body must keep its floor in a short dock: {before:?}"
+        );
+
+        let toolbar = cx
+            .debug_bounds("ggo-world-toolbar")
+            .expect("the toolbar is the chrome above the body");
+        wheel(cx, toolbar.center(), (0., -60.));
+
+        let after = cx
+            .debug_bounds("ggo-world-body")
+            .expect("the ready body survives the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "wheeling down a short dock must scroll the chrome up: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// Overflow class D: the fixed-width columns push the body into
+    /// sideways scrolling rather than hanging off the dock's edge.
+    #[gpui::test]
+    async fn test_d_the_side_columns_scroll_sideways_in_a_narrow_dock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(220.), px(600.)));
+        cx.run_until_parked();
+
+        let body = cx.debug_bounds("ggo-world-body").expect("the ready body");
+        let before = cx
+            .debug_bounds("ggo-world-inspector")
+            .expect("the inspector column");
+        assert!(
+            before.origin.x + before.size.width > body.origin.x + body.size.width,
+            "the columns must overflow the body for this to test anything: {before:?} in {body:?}"
+        );
+
+        wheel(cx, body.center(), (-80., 0.));
+
+        let after = cx
+            .debug_bounds("ggo-world-inspector")
+            .expect("the inspector column survives the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the columns into reach: before {:?}, after {:?}",
+            before.origin,
+            after.origin
         );
     }
 }

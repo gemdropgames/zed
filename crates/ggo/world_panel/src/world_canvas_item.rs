@@ -112,15 +112,21 @@ fn live_loading(text: String) -> AnyElement {
 }
 
 fn world_error(error: String, cx: &App) -> AnyElement {
-    div()
+    v_flex()
+        .id("ggo-world-view-error")
         .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
         .p_4()
+        .overflow_y_scroll()
         .debug_selector(|| "ggo-world-view-error".into())
         .child(
+            // Auto margins down a COLUMN, not `justify_center`: a
+            // scroller's range is `-overflow..=0`, so a card centred in
+            // the pane starts at a negative offset no scroll can reach.
+            // An auto margin along the flex MAIN axis collapses to zero
+            // once free space goes negative, so the card centres while it
+            // fits and tops out at the pane's edge once it does not.
             v_flex()
+                .m_auto()
                 .w_full()
                 .max_w(px(720.))
                 .gap_3()
@@ -395,5 +401,56 @@ mod tests {
         item.read_with(cx, |item, cx| {
             assert!(!item.is_dirty(cx), "the discarded world is clean again");
         });
+    }
+
+    /// Overflow class A/C: a failure long enough to outgrow a short pane
+    /// must still be readable to its end -- the card scrolls instead of
+    /// being clipped by the centred box that holds it.
+    #[gpui::test]
+    async fn test_a_a_long_error_card_scrolls_into_reach(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = crate::tests::ready_panel_in_window(cx, dir.path()).await;
+        let (_item, cx) = cx.add_window_view(|_, cx| WorldCanvasItem::new(panel.clone(), cx));
+        cx.simulate_resize(gpui::size(px(400.), px(160.)));
+
+        let long = (0..40)
+            .map(|line| format!("line {line}: the cart refused this world"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panel.update(cx, |panel, cx| panel.fail_live(long, cx));
+        cx.run_until_parked();
+
+        let box_bounds = cx
+            .debug_bounds("ggo-world-view-error")
+            .expect("the error card replaces the failed canvas");
+        let before = cx
+            .debug_bounds("ggo-world-view-error-details")
+            .expect("the detail block is laid out");
+        assert!(
+            before.size.height > box_bounds.size.height,
+            "the detail must outgrow the pane for this to test anything: {before:?} in {box_bounds:?}"
+        );
+        assert!(
+            before.origin.y >= box_bounds.origin.y,
+            "an overflowing card must start AT the pane's top, not centred above              where no scroll can reach it: {before:?} in {box_bounds:?}"
+        );
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: box_bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-80.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds("ggo-world-view-error-details")
+            .expect("the detail block survives the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "a downward wheel must scroll the error card: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
     }
 }
