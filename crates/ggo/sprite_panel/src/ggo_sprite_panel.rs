@@ -19,7 +19,7 @@
 //! `playback` owns the pure duration/loop/offset/fit math, `edits` owns
 //! the pure edit rules (new-clip defaults, duration parsing, post-op
 //! selection bookkeeping), `tiles` owns the preview and
-//! picker hit math and the hw meter line; this module owns the panel
+//! picker hit math; this module owns the panel
 //! entity, the store wiring, the transport timer loop, and all gpui
 //! glue. Op semantics mirror ggo-ide's `sprites/timeline.rs` message
 //! handlers; guards are still re-checked here BEFORE apply -- the store
@@ -41,7 +41,6 @@ mod edits;
 mod loader;
 mod sprite_item;
 pub use sprite_item::SpriteEditorItem;
-mod onion;
 mod playback;
 pub mod reference_sheet;
 mod tiles;
@@ -156,9 +155,9 @@ const MIN_REFERENCE: Pixels = px(40.);
 
 /// The floor under the body row (preview + sheets + frames). The row is
 /// the only `flex_1` child of the panel's column, so without a floor the
-/// fixed chrome above and below it -- transport, onion, frame ops, the
-/// clips strip -- crushes it to nothing in a short pane instead of
-/// making the panel scroll.
+/// fixed chrome above and below it -- the transport and the clips strip
+/// -- crushes it to nothing in a short pane instead of making the panel
+/// scroll.
 const BODY_MIN_HEIGHT: Pixels = px(120.);
 
 /// The cap on the anchored frame-settings popup, past which it scrolls:
@@ -675,7 +674,7 @@ enum Divider {
     SideFrames,
     /// Between the reference sheet and the tile picker below it.
     ReferencePicker,
-    /// Between the frame-op row and the clips strip: sizes the strip.
+    /// Between the body row and the clips strip: sizes the strip.
     Clips,
 }
 
@@ -1112,17 +1111,6 @@ struct OpenSprite {
     /// One composed BGRA image per frame index; rebuilt wholesale after
     /// every doc mutation (see `loader::LoadedSprite::frames`).
     frames: Vec<Arc<RenderImage>>,
-    /// Onion-skin ghost images, composed and tinted lazily on first paint
-    /// and kept keyed by `(dist, frame idx)` -- `loader::compose_ghost`'s
-    /// output is pure in both, so the same key always produces the same
-    /// image and there is no reason to recompose it on every render.
-    /// `RefCell` because [`Self::render_preview`] (and `ghosts`, which it
-    /// calls) only ever sees `&self` -- same interior-mutability idiom as
-    /// [`Self::preview_bounds`]/[`Self::picker_bounds`], just caching
-    /// pixels instead of layout. Cleared alongside `frames` in
-    /// `refresh_after_doc_change`: a doc mutation can change any frame's
-    /// pixels, and the key doesn't carry a generation to invalidate by.
-    ghost_cache: RefCell<HashMap<(i32, usize), Arc<RenderImage>>>,
     /// Transformed composes keyed by `(frame, mat_ab, mat_cd, flip_h,
     /// flip_v)` -- everything `loader::compose_transformed_frame` reads
     /// besides the doc itself. `FrameTransform` is not `Hash`, so the
@@ -1130,9 +1118,11 @@ struct OpenSprite {
     /// composer consumes. Shared by the big preview and the clip
     /// sequence thumbnails (the composer is pure in the doc state, so an
     /// entry is stale only after a doc mutation, which clears the map in
-    /// `refresh_after_doc_change` alongside `frames`). `RefCell` for the
-    /// same reason as [`Self::ghost_cache`]: filled from
-    /// [`Self::frame_image_for`] under `&self` during render.
+    /// `refresh_after_doc_change` alongside `frames`). `RefCell` because
+    /// [`Self::frame_image_for`] fills it under `&self` during render --
+    /// the same interior-mutability idiom as
+    /// [`Self::preview_bounds`]/[`Self::picker_bounds`], just caching
+    /// pixels instead of layout.
     transformed_frames: RefCell<HashMap<(usize, u32, u32, bool, bool), Arc<RenderImage>>>,
     /// The bound tileset composed as the tile picker's sheet; same
     /// invalidation as `frames`.
@@ -1173,10 +1163,6 @@ struct OpenSprite {
     /// armed on mouse-down, updated while dragging, resolved into
     /// `selection` on mouse-up.
     picker_drag: Option<((usize, usize), (usize, usize))>,
-    /// The Eraser tool: while on, preview clicks blank the cell instead
-    /// of stamping the selection. Cleared by Escape alongside the
-    /// selection.
-    eraser: bool,
     /// An open per-entry settings popup: `(owning clip, sequence
     /// position, anchor position)`. Opening it selects that entry, so
     /// the preview, the popup's editors and the popup agree. Dismissed
@@ -1196,8 +1182,6 @@ struct OpenSprite {
     selected_entry: Option<(usize, usize)>,
     /// Index into the doc's clips; `None` = whole-sprite range.
     active_clip: Option<usize>,
-    /// Onion-skin controls (off by default) -- see [`onion`].
-    onion: onion::OnionState,
     playing: Option<Playing>,
     /// The transport's timer loop -- dropping it (new sprite selected,
     /// panel dropped) cancels playback; a finished loop leaves a spent
@@ -1236,7 +1220,6 @@ impl OpenSprite {
             pal_path: loaded.pal_path,
             store: SpriteDocStore::new(loaded.state),
             frames: loaded.frames,
-            ghost_cache: RefCell::new(HashMap::new()),
             transformed_frames: RefCell::new(HashMap::new()),
             pool_strip: loaded.pool_strip,
             reference: loaded.reference,
@@ -1252,13 +1235,11 @@ impl OpenSprite {
             reference_bounds: Rc::new(RefCell::new(None)),
             selection: None,
             picker_drag: None,
-            eraser: false,
             frame_settings: None,
             preview_bounds: Rc::new(RefCell::new(None)),
             selected_frame: 0,
             selected_entry: None,
             active_clip: None,
-            onion: onion::OnionState::default(),
             playing: None,
             _tick_task: None,
             editors: Vec::new(),
@@ -1311,29 +1292,6 @@ impl OpenSprite {
             frame: self.selected_frame,
             transform: FrameTransform::IDENTITY,
             flip: (false, false),
-        }
-    }
-
-    fn shown_frame(&self) -> usize {
-        self.shown().frame
-    }
-
-    /// The sequence position the preview is at -- the same three-way
-    /// rule [`SpritePanel::toggle_play`] seeds the transport with, so
-    /// onion ghosts and playback never disagree about where the
-    /// sequence is: the transport's while playing, else the selected
-    /// entry's when it belongs to the ACTIVE clip, else the head of
-    /// that clip (a selection elsewhere says nothing about it), and
-    /// only with NO active clip does `selected_frame` double as the
-    /// position.
-    fn shown_position(&self) -> usize {
-        if let Some(playing) = &self.playing {
-            return playing.position;
-        }
-        match (self.active_clip, self.selected_entry) {
-            (Some(active), Some((clip, position))) if active == clip => position,
-            (Some(_), _) => 0,
-            (None, _) => self.selected_frame,
         }
     }
 
@@ -1439,39 +1397,6 @@ impl OpenSprite {
         shown.transform.is_identity() && shown.flip == (false, false)
     }
 
-    /// The onion-skin ghosts for the frame currently on screen, farthest
-    /// first. Empty while the toggle is off -- and while PLAYING, which
-    /// ggo-ide does not special-case but which is meaningless here: the
-    /// transport already shows the neighbouring frames in sequence, and
-    /// stacking ghosts under a moving image only smears it.
-    fn ghosts(&self) -> Vec<onion::Ghost> {
-        if self.playing.is_some() {
-            return Vec::new();
-        }
-        let state = self.store.state();
-        let clip = self.active_clip.and_then(|i| state.clips.get(i));
-        let count = clip.map_or(state.frames.len(), |c| c.entries.len());
-        self.onion.ghosts(self.shown_position(), count, clip)
-    }
-
-    /// The tinted image for one onion-skin ghost at sequence `position`,
-    /// from [`Self::ghost_cache`] if this `(dist, frame)` was composed
-    /// before, else composed via [`loader::compose_ghost`] and cached for
-    /// next time. `&self` (not `&mut self`): called from
-    /// [`render_preview`], which only borrows the Ready state immutably
-    /// -- the cache's `RefCell` is what makes filling it in from there
-    /// sound.
-    fn ghost_image(&self, dist: i32, position: usize) -> Option<Arc<RenderImage>> {
-        let frame = self.entry_at_position(position).frame;
-        if let Some(image) = self.ghost_cache.borrow().get(&(dist, frame)) {
-            return Some(image.clone());
-        }
-        let image = loader::compose_ghost(self.store.state(), frame, dist)?;
-        self.ghost_cache
-            .borrow_mut()
-            .insert((dist, frame), image.clone());
-        Some(image)
-    }
 }
 
 enum ViewerState {
@@ -1563,8 +1488,17 @@ pub struct SpritePanel {
     /// The sheets column's bounds, for the same reason -- the
     /// reference/picker divider measures down from its top.
     sheets_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// Whether the sheets column's reference/tile sections show their
+    /// sheets at all. Session-only and panel-lifetime, like the dragged
+    /// widths beside them: a hidden section keeps its header row (the
+    /// way back) and hands its space to the other one.
+    reference_visible: bool,
+    tiles_visible: bool,
     load_generation: u64,
     _load_task: Option<Task<()>>,
+    /// The in-flight delete confirmation, if one is up -- dropping the
+    /// panel drops the prompt's continuation with it.
+    _confirm_task: Option<Task<()>>,
 }
 
 impl SpritePanel {
@@ -1643,8 +1577,11 @@ impl SpritePanel {
             panel_bounds: Rc::new(RefCell::new(None)),
             body_bounds: Rc::new(RefCell::new(None)),
             sheets_bounds: Rc::new(RefCell::new(None)),
+            reference_visible: true,
+            tiles_visible: true,
             load_generation: 0,
             _load_task: None,
+            _confirm_task: None,
         }
     }
 
@@ -2196,16 +2133,6 @@ impl SpritePanel {
         }
     }
 
-    /// Mutate the onion-skin controls and repaint. One entry point for all
-    /// four (toggle, back, forward, opacity) so every control shares the
-    /// Ready guard and the notify.
-    fn update_onion(&mut self, edit: impl FnOnce(&mut onion::OnionState), cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            edit(&mut open.onion);
-            cx.notify();
-        }
-    }
-
     /// Play/pause toggle. Play anchors a wall clock, seeds the elapsed
     /// offset so playback starts at the selected position (clamped into
     /// the active sequence), and spawns the tick loop; pause drops the
@@ -2357,7 +2284,6 @@ impl SpritePanel {
         let clip_count = open.store.state().clips.len();
         let tile_count = open.store.state().tile_count;
         open.frames = frames;
-        open.ghost_cache.borrow_mut().clear();
         open.transformed_frames.borrow_mut().clear();
         open.pool_strip = pool_strip;
         open.recompose_reference();
@@ -2531,13 +2457,12 @@ impl SpritePanel {
         );
     }
 
-    /// Duplicate the selected frame right after itself and select the
-    /// copy -- ggo-ide `Msg::DupFrame`.
-    fn duplicate_selected_frame(&mut self, cx: &mut Context<Self>) {
+    /// Duplicate frame `i` right after itself and select the copy --
+    /// ggo-ide `Msg::DupFrame`.
+    fn duplicate_frame(&mut self, i: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let i = open.selected_frame;
         let pre_len = open.store.state().frames.len();
         if i >= pre_len {
             return;
@@ -2561,56 +2486,79 @@ impl SpritePanel {
         }
     }
 
-    /// Delete the selected frame -- ggo-ide `Msg::DeleteFrame`: refuses to
-    /// drop the last frame; the store adjusts clip ranges in the same op;
-    /// the selection follows `edits::selection_after_frame_delete`.
-    fn delete_selected_frame(&mut self, cx: &mut Context<Self>) {
+    /// Delete frame `ix`, confirming FIRST when any clip still plays it:
+    /// `DocOp::FrameDelete` drops every entry that references the frame
+    /// in the same undo step, which is a bigger edit than the button
+    /// says on its own, so the prompt names the cascade per clip.
+    /// An unreferenced frame deletes straight away.
+    fn delete_frame(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        let i = open.selected_frame;
         let len = open.store.state().frames.len();
-        if len <= 1 || i >= len {
+        if len <= 1 || ix >= len {
             return; // always keep at least one frame
         }
-        let next = edits::selection_after_frame_delete(i, i, len);
+        let label = editor_meta::frame_label(&open.frame_names, ix);
+        let cascade: Vec<String> = open
+            .store
+            .state()
+            .clips
+            .iter()
+            .filter_map(|clip| {
+                let count = clip.entries.iter().filter(|e| e.frame == ix).count();
+                (count > 0).then(|| {
+                    format!(
+                        "{}: {count} {} removed",
+                        clip.name,
+                        if count == 1 { "entry" } else { "entries" }
+                    )
+                })
+            })
+            .collect();
+        if cascade.is_empty() {
+            self.delete_frame_now(ix, cx);
+            return;
+        }
+        let answer = ggo_common::confirm_destructive_cascade(
+            &format!("Delete frame {label}?"),
+            &cascade,
+            "Delete",
+            false,
+            window,
+            cx,
+        );
+        self._confirm_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if !answer.await {
+                return;
+            }
+            // Re-checked on the far side of the await by `delete_frame_now`
+            // itself: the dialog was up for a while, and an undo or a
+            // reload may have taken the frame out from under it.
+            this.update(cx, |this, cx| this.delete_frame_now(ix, cx)).ok();
+        }));
+    }
+
+    /// Delete frame `ix` -- ggo-ide `Msg::DeleteFrame`: refuses to drop
+    /// the last frame; the store adjusts clip ranges in the same op; the
+    /// selection follows `edits::selection_after_frame_delete`.
+    fn delete_frame_now(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let len = open.store.state().frames.len();
+        if len <= 1 || ix >= len {
+            return; // always keep at least one frame
+        }
+        let next = edits::selection_after_frame_delete(open.selected_frame, ix, len);
         let mut names = open.frame_names.clone();
         names.resize(len, String::new());
-        if self.apply_doc(DocOp::FrameDelete { at: i }, cx)
+        if self.apply_doc(DocOp::FrameDelete { at: ix }, cx)
             && let ViewerState::Ready(open) = &mut self.state
         {
             open.selected_frame = next;
-            names.remove(i);
+            names.remove(ix);
             open.frame_names = names;
-        }
-    }
-
-    /// Move the selected frame one slot left/right -- ggo-ide
-    /// `Msg::MoveFrame`: for an ADJACENT move, `to` is already the correct
-    /// post-removal splice index (a neighbor swap), so no drop-target
-    /// conversion is needed; the selection follows the moved frame.
-    fn move_selected_frame(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let ViewerState::Ready(open) = &self.state else {
-            return;
-        };
-        let i = open.selected_frame;
-        let len = open.store.state().frames.len();
-        let to = if delta < 0 {
-            i.checked_sub(1)
-        } else {
-            i.checked_add(1)
-        };
-        let Some(to) = to else {
-            return;
-        };
-        if i >= len || to >= len {
-            return;
-        }
-        if self.apply_doc(DocOp::FrameMove { from: i, to }, cx)
-            && let ViewerState::Ready(open) = &mut self.state
-        {
-            open.selected_frame = to;
-            move_name(&mut open.frame_names, i, to);
         }
     }
 
@@ -3199,12 +3147,10 @@ impl SpritePanel {
         if let ViewerState::Ready(open) = &mut self.state
             && (open.selection.is_some()
                 || open.picker_drag.is_some()
-                || open.eraser
                 || open.frame_settings.is_some())
         {
             open.selection = None;
             open.picker_drag = None;
-            open.eraser = false;
             open.frame_settings = None;
             cx.notify();
         }
@@ -3233,14 +3179,6 @@ impl SpritePanel {
             && open.frame_settings.is_some()
         {
             open.frame_settings = None;
-            cx.notify();
-        }
-    }
-
-    /// The Eraser toggle: while on, preview clicks blank cells.
-    fn toggle_eraser(&mut self, cx: &mut Context<Self>) {
-        if let ViewerState::Ready(open) = &mut self.state {
-            open.eraser = !open.eraser;
             cx.notify();
         }
     }
@@ -3289,29 +3227,6 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
-        if open.eraser {
-            let frame = open.selected_frame;
-            let state = open.store.state();
-            let Some(&current) = state.frames.get(frame).and_then(|f| f.map.get(cell)) else {
-                return;
-            };
-            let off = current as usize * ggo_worldlib::sprites::hw::TILE_BYTES;
-            let already_blank = state
-                .pool
-                .get(off..off + ggo_worldlib::sprites::hw::TILE_BYTES)
-                .is_some_and(|tile| tile.iter().all(|&b| b == 0));
-            if already_blank {
-                return; // erasing a blank cell -- no op to push
-            }
-            self.apply_doc(
-                DocOp::FrameCellsErase {
-                    frame,
-                    cells: vec![cell],
-                },
-                cx,
-            );
-            return;
-        }
         let Some(block) = open.selection.as_ref() else {
             return;
         };
@@ -3758,38 +3673,17 @@ impl SpritePanel {
             .into_any_element()
     }
 
-    /// Transport row: play/pause, the clip selector, undo/redo/save, and
-    /// the sprite name with world_panel's dirty dot.
-    fn render_transport(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Transport row: the sprite's size steppers, undo/redo/save, the
+    /// sprite name with world_panel's dirty dot, and whatever the last
+    /// save or doc op failed with. Play and the clip selector drive the
+    /// CLIP strip, so they live down there with it.
+    fn render_transport(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_transport is only called in the Ready state");
         };
-        let playing = open.playing.is_some();
         let dirty = open.store.dirty();
         let state = open.store.state();
-        let clip_label: SharedString = match open.active_clip.and_then(|i| state.clips.get(i)) {
-            Some(c) => c.name.clone().into(),
-            None => "All frames".into(),
-        };
-        let clip_names: Vec<String> = state.clips.iter().map(|c| c.name.clone()).collect();
         let title = format!("{}{}", open.source_rel, if dirty { " ●" } else { "" });
-        let weak = cx.weak_entity();
-        let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-            {
-                let weak = weak.clone();
-                menu = menu.entry("All frames", None, move |_window, cx| {
-                    weak.update(cx, |this, cx| this.select_clip(None, cx)).ok();
-                });
-            }
-            for (ix, name) in clip_names.into_iter().enumerate() {
-                let weak = weak.clone();
-                menu = menu.entry(SharedString::from(name), None, move |_window, cx| {
-                    weak.update(cx, |this, cx| this.select_clip(Some(ix), cx))
-                        .ok();
-                });
-            }
-            menu
-        });
         h_flex()
             .debug_selector(|| "ggo-sprite-transport".into())
             .flex_wrap()
@@ -3797,11 +3691,6 @@ impl SpritePanel {
             .p_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(
-                Button::new("ggo-sprite-play", if playing { "Pause" } else { "Play" })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
-            )
-            .child(DropdownMenu::new("ggo-sprite-clip", clip_label, menu))
             .child(Self::stepper(
                 "ggo-sprite-w",
                 format!("W {}", state.w_tiles),
@@ -3850,13 +3739,20 @@ impl SpritePanel {
                 )
                 .size(LabelSize::Small)
             }))
+            .children(open.op_error.as_ref().map(|e| {
+                ggo_common::CopyableText::new(
+                    "ggo-sprite-op-error-copy",
+                    SharedString::from(e.clone()),
+                )
+                .size(LabelSize::XSmall)
+            }))
             .into_any_element()
     }
 
     /// A `-`/`+` stepper with a small label between the buttons, disabled
     /// at its clamps so the row shows its own limits (the import panel's
-    /// zoom-stepper idiom). Shared by the onion row, the transport's W/H
-    /// size steppers, and the tile picker's cols stepper.
+    /// zoom-stepper idiom). Shared by the transport's W/H size steppers
+    /// and the tile picker's cols stepper.
     fn stepper(
         id: &'static str,
         label: String,
@@ -3887,76 +3783,6 @@ impl SpritePanel {
                     .disabled(!can_inc)
                     .on_click(cx.listener(move |this, _, _, cx| step(this, 1, cx))),
             )
-    }
-
-    /// The onion-skin control row: the toggle, a `-`/`+` stepper for the
-    /// back and forward ghost counts, and one for the opacity -- ggo-ide's
-    /// `timeline::State::transport_row` onion group, minus its slider (see
-    /// [`onion`]'s module doc). The steppers are disabled once the counts
-    /// hit their clamp so the row shows its own limits, matching the
-    /// import panel's zoom stepper.
-    fn render_onion(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_onion is only called in the Ready state");
-        };
-        let o = open.onion;
-        h_flex()
-            .flex_wrap()
-            .gap_1()
-            .px_1()
-            .pb_1()
-            .child(
-                Checkbox::new("ggo-sprite-eraser", ToggleState::from(open.eraser))
-                    .label("Eraser")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_eraser(cx))),
-            )
-            .child(
-                Checkbox::new("ggo-sprite-onion", ToggleState::from(o.on))
-                    .label("Onion")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.update_onion(onion::OnionState::toggle, cx)
-                    })),
-            )
-            .child(Self::stepper(
-                "ggo-sprite-onion-back",
-                format!("back {}", o.back),
-                o.can_step_back(-1),
-                o.can_step_back(1),
-                "Ghost frames behind",
-                |this, d, cx| this.update_onion(|s| s.step_back(d), cx),
-                cx,
-            ))
-            .child(Self::stepper(
-                "ggo-sprite-onion-fwd",
-                format!("fwd {}", o.fwd),
-                o.can_step_fwd(-1),
-                o.can_step_fwd(1),
-                "Ghost frames ahead",
-                |this, d, cx| this.update_onion(|s| s.step_fwd(d), cx),
-                cx,
-            ))
-            .child({
-                let weak = cx.weak_entity();
-                h_flex()
-                    .gap_0p5()
-                    .items_center()
-                    .child(
-                        Label::new(format!("{}%", (o.opacity * 100.0).round() as i32))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        ui::Slider::new("ggo-sprite-onion-opacity", o.opacity)
-                            .width(px(72.))
-                            .on_change(move |value, _window, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.update_onion(|s| s.set_opacity(value), cx)
-                                })
-                                .ok();
-                            }),
-                    )
-            })
-            .into_any_element()
     }
 
     /// The big center preview: the shown frame fit into a [`PREVIEW_PX`]
@@ -4024,31 +3850,6 @@ impl SpritePanel {
             .top_0()
             .left_0()
             .size_full();
-            // Onion ghosts, farthest first, each absolutely positioned over
-            // the same box as the real frame and drawn BEFORE it (so the
-            // current frame is on top). Frames all share the sprite's
-            // dimensions, so one fit box serves them all. Each ghost is
-            // its OWN tinted image (red behind, blue ahead --
-            // `loader::compose_ghost`), not the plain `open.frames` entry:
-            // `ghost.alpha` still governs the layer's overall opacity here,
-            // exactly as before this fast-follow -- the tint is baked into
-            // the pixels underneath it, not a replacement for it.
-            let ghosts: Vec<gpui::AnyElement> = open
-                .ghosts()
-                .into_iter()
-                .filter_map(|ghost| {
-                    let image = open.ghost_image(ghost.dist, ghost.idx)?;
-                    Some(
-                        img(image)
-                            .nearest(true)
-                            .absolute()
-                            .w(px(fit_w))
-                            .h(px(fit_h))
-                            .opacity(ghost.alpha)
-                            .into_any_element(),
-                    )
-                })
-                .collect();
             preview = preview.child(
                 div()
                     .relative()
@@ -4061,7 +3862,6 @@ impl SpritePanel {
                     .m_auto()
                     .w(px(fit_w))
                     .h(px(fit_h))
-                    .children(ghosts)
                     .child(img(image).nearest(true).w(px(fit_w)).h(px(fit_h)))
                     .child(overlay)
                     .on_mouse_down(
@@ -4163,11 +3963,13 @@ impl SpritePanel {
                 .border_1()
                 .border_color(accent)
         });
+        let name = match view {
+            PickerView::Tiles => "ggo-sprite-tiles",
+            PickerView::Reference => "ggo-sprite-reference",
+        };
         div()
-            .id(match view {
-                PickerView::Tiles => "ggo-sprite-tiles",
-                PickerView::Reference => "ggo-sprite-reference",
-            })
+            .id(name)
+            .debug_selector(|| name.into())
             .flex_1()
             .min_h_0()
             .min_w_0()
@@ -4295,23 +4097,48 @@ impl SpritePanel {
                     .cursor_col_resize(),
             ));
         if let Some(strip) = open.reference_strip.as_ref() {
+            let visible = self.reference_visible;
             let mut section = v_flex().relative().min_h_0();
-            section = match self.rendered_reference_height() {
-                Some(height) => section.flex_none().h(height),
-                None => section.flex_1(),
+            // A hidden section is its header row and nothing else, so
+            // the other sheet takes the space it was holding.
+            section = if !visible {
+                section.flex_none()
+            } else {
+                match self.rendered_reference_height() {
+                    Some(height) => section.flex_none().h(height),
+                    None => section.flex_1(),
+                }
             };
-            column = column.child(
-                section
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
-                        h_flex().px_1().pt_1().child(
+            section = section
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .px_1()
+                        .pt_1()
+                        .gap_1()
+                        .items_center()
+                        .child(
                             Label::new("Reference")
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
-                        ),
-                    )
+                        )
+                        .child(Self::visibility_toggle(
+                            "ggo-sprite-reference-visible",
+                            visible,
+                            |this, cx| {
+                                this.reference_visible = !this.reference_visible;
+                                cx.notify();
+                            },
+                            cx,
+                        )),
+                );
+            if visible {
+                section = section
                     .child(self.render_sheet(PickerView::Reference, strip, cx))
+                    // The handle drags the boundary between the two
+                    // sheets: with one of them hidden there is no
+                    // boundary to drag.
                     .child(gpui::deferred(
                         Self::divider_handle(Divider::ReferencePicker, cx)
                             .absolute()
@@ -4320,18 +4147,40 @@ impl SpritePanel {
                             .w_full()
                             .h(DIVIDER_SIZE)
                             .cursor_row_resize(),
-                    )),
-            );
+                    ));
+            }
+            column = column.child(section);
         }
-        let mut picker = v_flex().flex_1().min_h_0().child(
+        let tiles_visible = self.tiles_visible;
+        let mut picker = v_flex();
+        picker = if tiles_visible {
+            picker.flex_1().min_h_0()
+        } else {
+            picker.flex_none()
+        };
+        picker = picker.child(
             h_flex()
                 .px_1()
                 .pt_1()
                 .justify_between()
                 .child(
-                    Label::new("Tiles")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Label::new("Tiles")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Self::visibility_toggle(
+                            "ggo-sprite-tiles-visible",
+                            tiles_visible,
+                            |this, cx| {
+                                this.tiles_visible = !this.tiles_visible;
+                                cx.notify();
+                            },
+                            cx,
+                        )),
                 )
                 .child(Self::stepper(
                     "ggo-sprite-picker-cols",
@@ -4343,10 +4192,31 @@ impl SpritePanel {
                     cx,
                 )),
         );
-        if let Some(strip) = open.pool_strip.as_ref() {
+        if tiles_visible
+            && let Some(strip) = open.pool_strip.as_ref()
+        {
             picker = picker.child(self.render_sheet(PickerView::Tiles, strip, cx));
         }
         column.child(picker).into_any_element()
+    }
+
+    /// The eye that hides one of the sheets column's two sections. The
+    /// `-on`/`-off` debug selector is what a rendered test toggles and
+    /// reads back (an `IconButton`'s id is not a selector).
+    fn visibility_toggle(
+        id: &'static str,
+        visible: bool,
+        toggle: fn(&mut SpritePanel, &mut Context<SpritePanel>),
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .debug_selector(move || format!("{id}-{}", if visible { "on" } else { "off" }))
+            .child(
+                IconButton::new(id, if visible { IconName::Eye } else { IconName::EyeOff })
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Show/hide"))
+                    .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+            )
     }
 
     /// The open "New …"/"Rename …" form, as a bar above the viewer.
@@ -4499,16 +4369,41 @@ impl SpritePanel {
     /// sequence beside it -- stacked in a vertical scroller whose height
     /// the [`Divider::Clips`] handle sizes, with "+ Clip" in a footer
     /// under the scroller so it stays reachable however many clips there
-    /// are. Click a row to activate its clip.
+    /// are -- beside play/pause and the clip selector, the two controls
+    /// that act on the clips rather than on the document. Click a row to
+    /// activate its clip.
     ///
     /// Each sequence gets its OWN sideways scroller: a long clip scrolls
     /// under its header rather than dragging the whole strip sideways
     /// and taking every clip's name off screen with it.
-    fn render_clips(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_clips(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_clips is only called in the Ready state");
         };
         let state = open.store.state();
+        let playing = open.playing.is_some();
+        let clip_label: SharedString = match open.active_clip.and_then(|i| state.clips.get(i)) {
+            Some(c) => c.name.clone().into(),
+            None => "All frames".into(),
+        };
+        let clip_names: Vec<String> = state.clips.iter().map(|c| c.name.clone()).collect();
+        let weak = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+            {
+                let weak = weak.clone();
+                menu = menu.entry("All frames", None, move |_window, cx| {
+                    weak.update(cx, |this, cx| this.select_clip(None, cx)).ok();
+                });
+            }
+            for (ix, name) in clip_names.into_iter().enumerate() {
+                let weak = weak.clone();
+                menu = menu.entry(SharedString::from(name), None, move |_window, cx| {
+                    weak.update(cx, |this, cx| this.select_clip(Some(ix), cx))
+                        .ok();
+                });
+            }
+            menu
+        });
         let editor_for = |target: EditTarget| {
             open.editors
                 .iter()
@@ -4607,62 +4502,33 @@ impl SpritePanel {
             ))
             .child(strip)
             .child(
-                h_flex().flex_none().px_1().pb_1().child(
-                    Button::new("ggo-sprite-clip-add", "+ Clip")
-                        .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
-                ),
+                h_flex()
+                    .flex_none()
+                    .flex_wrap()
+                    .gap_1()
+                    .px_1()
+                    .pb_1()
+                    .child(
+                        div()
+                            .debug_selector(|| "ggo-sprite-play".into())
+                            .child(
+                                Button::new(
+                                    "ggo-sprite-play",
+                                    if playing { "Pause" } else { "Play" },
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "ggo-sprite-clip-picker".into())
+                            .child(DropdownMenu::new("ggo-sprite-clip", clip_label, menu)),
+                    )
+                    .child(
+                        Button::new("ggo-sprite-clip-add", "+ Clip")
+                            .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
+                    ),
             )
-            .into_any_element()
-    }
-
-    /// Frame-op row above the strip: add/duplicate/delete/move buttons
-    /// acting on the selected frame, its duration editor, and the
-    /// hardware budget line (which used to head the tile palette; the
-    /// palette became a narrow side column in F5.2, too narrow for it).
-    fn render_frame_ops(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_frame_ops is only called in the Ready state");
-        };
-        let state = open.store.state();
-        let len = state.frames.len();
-        let selected = open.selected_frame;
-        // The meter's cache row is documented as the SHOWN frame's
-        // working set (`tiles::hw_meter_line`), which during playback is
-        // the transport's, not the selection's.
-        let meter = tiles::hw_meter_line(state, state.frames.get(open.shown_frame()));
-        h_flex()
-            .flex_wrap()
-            .gap_1()
-            .p_1()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                IconButton::new("ggo-sprite-frame-left", IconName::ChevronLeft)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Move frame left"))
-                    .disabled(selected == 0)
-                    .on_click(cx.listener(|this, _, _, cx| this.move_selected_frame(-1, cx))),
-            )
-            .child(
-                IconButton::new("ggo-sprite-frame-right", IconName::ChevronRight)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Move frame right"))
-                    .disabled(selected + 1 >= len)
-                    .on_click(cx.listener(|this, _, _, cx| this.move_selected_frame(1, cx))),
-            )
-            .child(div().flex_1())
-            .child(
-                Label::new(SharedString::from(meter))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .children(open.op_error.as_ref().map(|e| {
-                ggo_common::CopyableText::new(
-                    "ggo-sprite-op-error-copy",
-                    SharedString::from(e.clone()),
-                )
-                .size(LabelSize::XSmall)
-            }))
             .into_any_element()
     }
 
@@ -4732,7 +4598,7 @@ impl SpritePanel {
                             )
                             .child(
                                 IconButton::new(
-                                    ("ggo-sprite-frame-dup", clip_ix * 1000 + seq_pos),
+                                    ("ggo-sprite-entry-dup", clip_ix * 1000 + seq_pos),
                                     IconName::Copy,
                                 )
                                 .icon_size(IconSize::XSmall)
@@ -4829,8 +4695,9 @@ impl SpritePanel {
     /// The frames LIBRARY, a right-dock column beside the tile picker:
     /// one thumbnail + name per frame, click to select (and preview),
     /// double-click to name, drag out to reorder or to build a clip
-    /// sequence. Its header carries the create/duplicate/delete buttons
-    /// so the area is self-contained.
+    /// sequence. The header carries the add button; duplicate and delete
+    /// are per CELL, so they name the frame they act on instead of
+    /// acting on whatever happens to be selected.
     fn render_strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_strip is only called in the Ready state");
@@ -4843,6 +4710,10 @@ impl SpritePanel {
         let frame_count = state.frames.len();
         let names = &open.frame_names;
         let header = h_flex()
+            .debug_selector(|| "ggo-sprite-frames-header".into())
+            // The add button sits beside the label until the column is
+            // squeezed, and then wraps under it rather than off the edge.
+            .flex_wrap()
             .gap_1()
             .px_1()
             .pt_1()
@@ -4853,23 +4724,14 @@ impl SpritePanel {
                     .color(Color::Muted),
             )
             .child(
-                IconButton::new("ggo-sprite-frame-add", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Add blank frame"))
-                    .on_click(cx.listener(|this, _, _, cx| this.add_blank_frame(cx))),
-            )
-            .child(
-                IconButton::new("ggo-sprite-frame-dup", IconName::Copy)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Duplicate frame"))
-                    .on_click(cx.listener(|this, _, _, cx| this.duplicate_selected_frame(cx))),
-            )
-            .child(
-                IconButton::new("ggo-sprite-frame-delete", IconName::Trash)
-                    .icon_size(IconSize::Small)
-                    .tooltip(ui::Tooltip::text("Delete frame"))
-                    .disabled(frame_count <= 1)
-                    .on_click(cx.listener(|this, _, _, cx| this.delete_selected_frame(cx))),
+                div()
+                    .debug_selector(|| "ggo-sprite-frame-add".into())
+                    .child(
+                        IconButton::new("ggo-sprite-frame-add", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Add blank frame"))
+                            .on_click(cx.listener(|this, _, _, cx| this.add_blank_frame(cx))),
+                    ),
             );
         let strip = div()
             .id("ggo-sprite-strip")
@@ -4905,13 +4767,53 @@ impl SpritePanel {
                             .items_center()
                             .children(thumb),
                     )
-                    .child(Label::new(label.clone()).size(LabelSize::XSmall).color(
-                        if names.get(ix).is_some_and(|n| !n.is_empty()) {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        },
-                    ))
+                    .child(
+                        h_flex()
+                            // Label plus two buttons outgrow a squeezed
+                            // library column; wrapping keeps every one of
+                            // them inside the cell.
+                            .flex_wrap()
+                            .justify_center()
+                            .gap_0p5()
+                            .items_center()
+                            .child(Label::new(label.clone()).size(LabelSize::XSmall).color(
+                                if names.get(ix).is_some_and(|n| !n.is_empty()) {
+                                    Color::Default
+                                } else {
+                                    Color::Muted
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("ggo-sprite-frame-dup-{ix}"))
+                                    .child(
+                                        IconButton::new(("ggo-sprite-frame-dup", ix), IconName::Copy)
+                                            .icon_size(IconSize::XSmall)
+                                            .tooltip(ui::Tooltip::text("Duplicate frame"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.duplicate_frame(ix, cx)
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("ggo-sprite-frame-delete-{ix}"))
+                                    .child(
+                                        IconButton::new(
+                                            ("ggo-sprite-frame-delete", ix),
+                                            IconName::Trash,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(ui::Tooltip::text("Delete frame"))
+                                        .disabled(frame_count <= 1)
+                                        .on_click(cx.listener(
+                                            move |this, _, window, cx| {
+                                                this.delete_frame(ix, window, cx)
+                                            },
+                                        )),
+                                    ),
+                            ),
+                    )
                     // Single click selects; double click names.
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
@@ -5064,14 +4966,13 @@ impl SpritePanel {
         let bounds_cell = self.body_bounds.clone();
         v_flex()
             .id("ggo-sprite-ready")
-            // The transport, onion, frame-op and clips rows are fixed
-            // chrome: past a short enough pane they no longer fit, and
+            // The transport and clips rows are fixed chrome: past a
+            // short enough pane they no longer fit, and
             // the panel scrolls rather than pushing the clips strip out
             // of it.
             .overflow_y_scroll()
             .size_full()
-            .child(self.render_transport(window, cx))
-            .child(self.render_onion(cx))
+            .child(self.render_transport(cx))
             .child(
                 h_flex()
                     .id("ggo-sprite-body")
@@ -5114,8 +5015,7 @@ impl SpritePanel {
                     .child(self.render_tile_picker(cx))
                     .child(self.render_strip(cx)),
             )
-            .child(self.render_frame_ops(cx))
-            .child(self.render_clips(cx))
+            .child(self.render_clips(window, cx))
             .children(self.render_frame_settings(cx))
             .into_any_element()
     }
@@ -5405,7 +5305,7 @@ mod tests {
     };
     use super::*;
     use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry};
-    use ggo_worldlib::sprites::hw::{TILE_BYTES, TILE_PX};
+    use ggo_worldlib::sprites::hw::TILE_PX;
     use ggo_worldlib::sprites::io::{open_sprite, save_tileset};
     use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
     use ggo_worldlib::sprites::timeline_ops::MIN_FRAME_MS;
@@ -5674,10 +5574,10 @@ mod tests {
         );
     }
 
-    /// Class B: the transport row is a single `h_flex` of buttons, a
-    /// dropdown and two steppers -- wider than a narrow pane, so its
-    /// tail (undo/redo/Save) used to leave the panel entirely. It wraps
-    /// onto a second row instead.
+    /// Class B: the transport row is a single `h_flex` of two steppers,
+    /// the document title and the undo/redo/Save buttons -- wider than a
+    /// narrow pane, so its tail used to leave the panel entirely. It
+    /// wraps onto a second row instead.
     #[gpui::test]
     async fn test_b_the_transport_row_wraps_when_the_panel_is_narrow(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -5704,8 +5604,8 @@ mod tests {
         );
     }
 
-    /// Class C: transport + onion + frame ops + the clips strip are
-    /// fixed-height chrome. In a short pane they used to eat the whole
+    /// Class C: the transport and the clips strip are fixed-height
+    /// chrome. In a short pane they used to eat the whole
     /// column, crushing the body to nothing and pushing the clips strip
     /// out of the panel. The body keeps a floor now and the root scrolls.
     #[gpui::test]
@@ -5976,7 +5876,7 @@ mod tests {
             assert_eq!(state.clips.len(), 1);
             assert_eq!(state.clips[0].entries[0].duration_ms, 100);
             assert_eq!(state.clips[0].entries[1].duration_ms, 200);
-            assert_eq!(open.shown_frame(), 0, "not playing => selected frame");
+            assert_eq!(open.shown().frame, 0, "not playing => selected frame");
             assert!(!open.store.dirty(), "freshly opened => clean");
 
             let px_count = TILE_PX * TILE_PX;
@@ -6008,7 +5908,7 @@ mod tests {
                 panic!("expected Ready");
             };
             assert_eq!(open.selected_frame, 1);
-            assert_eq!(open.shown_frame(), 1);
+            assert_eq!(open.shown().frame, 1);
 
             panel.select_frame(9, cx);
             let ViewerState::Ready(open) = &panel.state else {
@@ -6174,66 +6074,6 @@ mod tests {
             ViewerState::Ready(open) => open,
             _ => panic!("expected Ready"),
         }
-    }
-
-    /// The onion controls reach the open document's state, and the ghost
-    /// list the preview draws follows them. The frame SELECTION rule is
-    /// worldlib's and is tested in `onion`; this is the wiring.
-    #[gpui::test]
-    async fn test_onion_controls_drive_the_preview_ghosts(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-
-        panel.update(cx, |panel, cx| {
-            // Off by default: no ghosts, whatever the counts say.
-            assert!(!ready(panel).onion.on);
-            assert!(ready(panel).ghosts().is_empty());
-
-            panel.update_onion(onion::OnionState::toggle, cx);
-            assert!(ready(panel).onion.on);
-            // Fixture: 2 frames, selected 0 -> the one frame ahead ghosts.
-            let ghosts = ready(panel).ghosts();
-            assert_eq!(ghosts.len(), 1);
-            assert_eq!(ghosts[0].idx, 1);
-            assert!((ghosts[0].alpha - onion::DEFAULT_OPACITY).abs() < 1e-6);
-
-            // The opacity stepper moves the alpha the preview draws at.
-            panel.update_onion(|s| s.step_opacity(2), cx);
-            let ghosts = ready(panel).ghosts();
-            assert!(
-                (ghosts[0].alpha - (onion::DEFAULT_OPACITY + 2.0 * onion::OPACITY_STEP)).abs()
-                    < 1e-6
-            );
-
-            // Zeroing the forward count empties the list even while on.
-            panel.update_onion(|s| s.step_fwd(-1), cx);
-            assert_eq!(ready(panel).onion.fwd, 0);
-            assert!(ready(panel).ghosts().is_empty());
-
-            // Selecting frame 1 brings the BACK ghost in instead.
-            panel.update_onion(|s| s.step_back(1), cx);
-            panel.select_frame(1, cx);
-            let ghosts = ready(panel).ghosts();
-            assert_eq!(ghosts.iter().map(|g| g.idx).collect::<Vec<_>>(), vec![0]);
-
-            // An active clip confines the walk to its ENTRIES: clip 0 has
-            // two, and selecting its second leaves only the first behind.
-            panel.select_clip(Some(0), cx);
-            panel.select_entry(0, 1, cx);
-            let ghosts = ready(panel).ghosts();
-            assert_eq!(
-                ghosts.iter().map(|g| g.idx).collect::<Vec<_>>(),
-                vec![0],
-                "ghost indices are POSITIONS inside the active clip"
-            );
-
-            // Nothing precedes the head of a non-looping clip.
-            panel.select_entry(0, 0, cx);
-            assert!(
-                ready(panel).ghosts().is_empty(),
-                "a non-looping clip does not wrap onto its tail"
-            );
-        });
     }
 
     // ------------------------------------------- unsaved-document guard
@@ -6777,9 +6617,9 @@ mod tests {
                 open.selected_frame = 9;
                 open.selected_entry = Some((7, 3));
             }
-            panel.delete_selected_frame(cx);
-            panel.duplicate_selected_frame(cx);
-            panel.move_selected_frame(1, cx);
+            panel.delete_frame_now(9, cx);
+            panel.duplicate_frame(9, cx);
+            panel.move_frame_to(9, 1, cx);
             panel.commit_edit(EditTarget::Duration, "40".into(), cx);
             assert_eq!(ready(panel).store.state().frames.len(), 2, "all ignored");
             assert_eq!(
@@ -6812,8 +6652,7 @@ mod tests {
             // Duplicate the red frame 1: copy lands at 2, selected, and
             // its RECOMPOSED thumbnail carries the copied pixels (the M5
             // invalidation hook actually recomposing, not just resizing).
-            panel.select_frame(1, cx);
-            panel.duplicate_selected_frame(cx);
+            panel.duplicate_frame(1, cx);
             {
                 let open = ready(panel);
                 let state = open.store.state();
@@ -6828,7 +6667,7 @@ mod tests {
 
             // Move the copy left: neighbor swap, selection follows and the
             // red copy's thumbnail lands in the new slot.
-            panel.move_selected_frame(-1, cx);
+            panel.move_frame_to(2, 1, cx);
             {
                 let open = ready(panel);
                 assert_eq!(open.selected_frame, 1);
@@ -6838,9 +6677,9 @@ mod tests {
                     "the copied red frame moved into slot 1"
                 );
             }
-            // Move left at index 0 is a no-op.
+            // A frame dropped back on its own slot is a no-op.
             panel.select_frame(0, cx);
-            panel.move_selected_frame(-1, cx);
+            panel.move_frame_to(0, 0, cx);
             {
                 let open = ready(panel);
                 assert_eq!(open.selected_frame, 0);
@@ -6871,7 +6710,7 @@ mod tests {
             // Delete the selected last frame: selection clamps to the new
             // end (ggo-ide's rule).
             panel.select_frame(3, cx);
-            panel.delete_selected_frame(cx);
+            panel.delete_frame_now(3, cx);
             {
                 let open = ready(panel);
                 assert_eq!(open.store.state().frames.len(), 3);
@@ -6880,8 +6719,8 @@ mod tests {
             }
 
             // Delete down to one, then verify the last-frame guard.
-            panel.delete_selected_frame(cx);
-            panel.delete_selected_frame(cx);
+            panel.delete_frame_now(2, cx);
+            panel.delete_frame_now(1, cx);
             {
                 let open = ready(panel);
                 assert_eq!(open.store.state().frames.len(), 1);
@@ -6892,7 +6731,7 @@ mod tests {
                     "an emptied clip survives (store rule); only its entries go"
                 );
             }
-            panel.delete_selected_frame(cx);
+            panel.delete_frame_now(0, cx);
             assert_eq!(
                 ready(panel).store.state().frames.len(),
                 1,
@@ -7323,13 +7162,277 @@ mod tests {
         let panel = ready_panel(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
-            panel.select_frame(1, cx);
-            panel.delete_selected_frame(cx);
+            panel.delete_frame_now(1, cx);
             let state = ready(panel).store.state();
             assert_eq!(state.frames.len(), 1);
             assert_eq!(state.clips[0].entries.len(), 1);
             assert_eq!(state.clips[0].entries[0].frame, 0);
         });
+    }
+
+    /// Duplicate and delete are PER CELL: the column header's pair acted
+    /// on the SELECTED frame, so deleting frame 3 cost two gestures and
+    /// the buttons said nothing about which frame they meant. Each cell
+    /// carries its own pair, and they stay inside the cell even when the
+    /// library column is squeezed.
+    #[gpui::test]
+    async fn test_every_frame_cell_carries_its_own_dup_and_delete(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        panel.update(cx, |panel, cx| {
+            panel.frames_width = px(96.); // narrow enough to wrap the row
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let header = cx
+            .debug_bounds("ggo-sprite-frames-header")
+            .expect("the frames column header");
+        for (cell_selector, dup, delete) in [
+            (
+                "ggo-sprite-frame-0",
+                "ggo-sprite-frame-dup-0",
+                "ggo-sprite-frame-delete-0",
+            ),
+            (
+                "ggo-sprite-frame-1",
+                "ggo-sprite-frame-dup-1",
+                "ggo-sprite-frame-delete-1",
+            ),
+        ] {
+            let cell = cx
+                .debug_bounds(cell_selector)
+                .unwrap_or_else(|| panic!("{cell_selector} must render"));
+            for selector in [dup, delete] {
+                let button = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} must render"));
+                assert!(
+                    button.is_contained_within(&cell),
+                    "{selector} must sit inside its own frame cell: {button:?} in {cell:?}"
+                );
+                assert!(
+                    !button.intersects(&header),
+                    "{selector} must not be back in the column header: {button:?} vs {header:?}"
+                );
+            }
+        }
+
+        // Duplicate frame 0: the copy lands beside it, no confirmation.
+        let dup = cx
+            .debug_bounds("ggo-sprite-frame-dup-0")
+            .expect("frame 0's duplicate button");
+        cx.simulate_click(dup.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt(), "duplicating never confirms");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).store.state().frames.len(),
+                3,
+                "the duplicate grew the library"
+            );
+        });
+
+        // Frame 1 is now the fresh copy, which no clip entry references:
+        // deleting it takes no confirmation either.
+        let delete = cx
+            .debug_bounds("ggo-sprite-frame-delete-1")
+            .expect("frame 1's delete button");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "an unreferenced frame deletes without a prompt"
+        );
+        panel.read_with(cx, |panel, _| {
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 2, "the copy is gone");
+            assert_eq!(
+                state.clips[0].entries.len(),
+                2,
+                "and no clip entry went with it"
+            );
+        });
+    }
+
+    /// Deleting a frame a clip still plays takes every one of those
+    /// entries with it (`DocOp::FrameDelete`'s remap, one undo step), so
+    /// it confirms first and names the cascade per clip.
+    #[gpui::test]
+    async fn test_deleting_a_referenced_frame_confirms_the_entry_cascade(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        let delete = cx
+            .debug_bounds("ggo-sprite-frame-delete-1")
+            .expect("frame 1's delete button");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        assert!(
+            cx.has_pending_prompt(),
+            "a frame the clip still plays must confirm"
+        );
+        let (message, detail) = cx.pending_prompt().expect("the confirmation");
+        assert!(
+            message.contains("Delete frame"),
+            "the prompt names the frame: {message}"
+        );
+        assert!(
+            detail.contains("walk: 1 entry removed"),
+            "the prompt names the cascade per clip: {detail}"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 2, "Cancel keeps the frame");
+            assert_eq!(state.clips[0].entries.len(), 2, "and its entries");
+        });
+
+        let delete = cx
+            .debug_bounds("ggo-sprite-frame-delete-1")
+            .expect("frame 1's delete button after the cancel");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        assert!(cx.has_pending_prompt(), "the second attempt confirms too");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames.len(), 1, "confirming deletes the frame");
+            assert_eq!(
+                state.clips[0].entries.len(),
+                1,
+                "and every entry that referenced it"
+            );
+            assert_eq!(state.clips[0].entries[0].frame, 0);
+        });
+    }
+
+    /// Either sheet can be hidden so the other fills the column: the
+    /// header row (and its eye) stays put, the sheet and the reference
+    /// section's drag handle go, and the surviving sheet grows.
+    #[gpui::test]
+    async fn test_the_reference_and_tiles_sheets_can_be_hidden(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        reference_sheet::save(
+            dir.path(),
+            "sprites/hero.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 2,
+                rows: 1,
+                tiles: vec![0, 1],
+            },
+        )
+        .unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        let tiles_before = cx
+            .debug_bounds("ggo-sprite-tiles")
+            .expect("the tile picker sheet");
+        assert!(
+            cx.debug_bounds("ggo-sprite-reference").is_some(),
+            "both sheets start visible"
+        );
+
+        let eye = cx
+            .debug_bounds("ggo-sprite-reference-visible-on")
+            .expect("the reference section's eye");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-sprite-reference").is_none(),
+            "hiding the reference drops its sheet"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-divider-reference").is_none(),
+            "and the handle that would resize a hidden section"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-reference-visible-off").is_some(),
+            "the header row stays, showing the way back"
+        );
+        let tiles_hidden = cx
+            .debug_bounds("ggo-sprite-tiles")
+            .expect("the tile picker sheet with the reference hidden");
+        assert!(
+            tiles_hidden.size.height > tiles_before.size.height,
+            "the tile picker takes the freed space: {tiles_before:?} -> {tiles_hidden:?}"
+        );
+
+        let eye = cx
+            .debug_bounds("ggo-sprite-reference-visible-off")
+            .expect("the reference eye, crossed out");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let reference_before = cx
+            .debug_bounds("ggo-sprite-reference")
+            .expect("toggling back restores the reference sheet");
+
+        let eye = cx
+            .debug_bounds("ggo-sprite-tiles-visible-on")
+            .expect("the tiles section's eye");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-sprite-tiles").is_none(),
+            "hiding the tiles drops its sheet"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-tiles-visible-off").is_some(),
+            "its header row stays too"
+        );
+        let reference_after = cx
+            .debug_bounds("ggo-sprite-reference")
+            .expect("the reference sheet with the tiles hidden");
+        assert!(
+            reference_after.size.height > reference_before.size.height,
+            "the reference sheet takes the freed space: {reference_before:?} -> {reference_after:?}"
+        );
+    }
+
+    /// Play and the clip dropdown belong to the clips area, not the
+    /// transport: they drive the clip strip, and the transport is the
+    /// document row (size, title, undo/redo, save). The onion row, the
+    /// eraser and the frame-move buttons are gone entirely.
+    #[gpui::test]
+    async fn test_the_play_and_clip_controls_live_with_the_clips(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        let clips = cx
+            .debug_bounds("ggo-sprite-clips-section")
+            .expect("the clips section");
+        let transport = cx
+            .debug_bounds("ggo-sprite-transport")
+            .expect("the transport row");
+        for selector in ["ggo-sprite-play", "ggo-sprite-clip-picker"] {
+            let control = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must render"));
+            assert!(
+                control.is_contained_within(&clips),
+                "{selector} belongs to the clips area: {control:?} in {clips:?}"
+            );
+            assert!(
+                !control.intersects(&transport),
+                "{selector} must have left the transport: {control:?} vs {transport:?}"
+            );
+        }
+        for gone in [
+            "ggo-sprite-onion",
+            "ggo-sprite-eraser",
+            "ggo-sprite-frame-left",
+        ] {
+            assert!(cx.debug_bounds(gone).is_none(), "{gone} no longer exists");
+        }
     }
 
     /// The entry settings fields commit onto the SELECTED entry, and none
@@ -7487,52 +7590,6 @@ mod tests {
         });
     }
 
-    /// The Eraser tool: toggled on, a preview click blanks the cell
-    /// (one undoable `FrameCellsErase`, allocating the hidden blank tile
-    /// when the pool lacks one); Escape turns it off along with any
-    /// selection; toggling it back off restores stamp behavior.
-    #[gpui::test]
-    async fn test_eraser_blanks_cells_and_escape_clears_it(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let panel = ready_panel(cx, dir.path()).await;
-
-        panel.update(cx, |panel, cx| {
-            panel.select_frame(1, cx); // map [1]
-            panel.toggle_eraser(cx);
-            assert!(ready(panel).eraser);
-
-            *ready(panel).preview_bounds.borrow_mut() = Some(gpui::bounds(
-                gpui::point(px(0.), px(0.)),
-                gpui::size(px(240.), px(240.)),
-            ));
-            panel.on_preview_click(gpui::point(px(10.), px(10.)), cx);
-            {
-                let state = ready(panel).store.state();
-                let blanked = state.frames[1].map[0];
-                let off = blanked as usize * TILE_BYTES;
-                assert!(
-                    state.pool[off..off + TILE_BYTES].iter().all(|&b| b == 0),
-                    "the cell now points at a blank tile"
-                );
-            }
-            panel.undo_impl(cx);
-            assert_eq!(
-                ready(panel).store.state().frames[1].map,
-                vec![1],
-                "one undo reverts the erase"
-            );
-
-            panel.deselect_tile(cx);
-            assert!(!ready(panel).eraser, "Escape's path clears the eraser");
-
-            // Eraser off + a selection: clicks stamp again.
-            panel.select_tile(1, cx);
-            panel.select_frame(0, cx); // map [0]
-            panel.on_preview_click(gpui::point(px(10.), px(10.)), cx);
-            assert_eq!(ready(panel).store.state().frames[0].map, vec![1]);
-        });
-    }
-
     /// The picker's own click path -- the SOURCE half of "click a tile,
     /// then click a frame cell to place it" -- over manually stamped
     /// sheet bounds (the headless panel never paints). The 2-tile fixture
@@ -7633,11 +7690,10 @@ mod tests {
             panel.add_blank_frame(cx);
             assert_eq!(ready(panel).frame_names, vec!["a", "b", ""]);
 
-            panel.select_frame(0, cx);
-            panel.duplicate_selected_frame(cx);
+            panel.duplicate_frame(0, cx);
             assert_eq!(ready(panel).frame_names, vec!["a", "a", "b", ""]);
 
-            panel.delete_selected_frame(cx);
+            panel.delete_frame_now(1, cx);
             assert_eq!(ready(panel).frame_names, vec!["a", "b", ""]);
 
             panel.move_frame_to(0, 2, cx);
@@ -8374,28 +8430,25 @@ mod tests {
     }
 
     /// Escape through real keystroke dispatch clears the active tile
-    /// selection AND the eraser flag (the `DeselectTile` binding's
-    /// click-doesn't-mutate affordance).
+    /// selection (the `DeselectTile` binding's click-doesn't-mutate
+    /// affordance).
     #[gpui::test]
-    async fn test_escape_keystroke_clears_selection_and_eraser(cx: &mut TestAppContext) {
+    async fn test_escape_keystroke_clears_selection(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
 
         panel.update_in(cx, |panel, window, cx| {
             window.focus(&panel.focus_handle, cx);
             panel.select_tile(1, cx);
-            panel.toggle_eraser(cx);
         });
         panel.read_with(cx, |panel, _| {
             assert_eq!(selected_single(panel), Some(1));
-            assert!(ready(panel).eraser);
         });
 
         cx.simulate_keystrokes("escape");
         panel.read_with(cx, |panel, _| {
             let open = ready(panel);
             assert!(open.selection.is_none(), "escape drops the tile selection");
-            assert!(!open.eraser, "escape clears the eraser flag");
         });
     }
 
@@ -8425,7 +8478,7 @@ mod tests {
             };
             assert!(open.playing.is_some(), "toggle_play starts the transport");
             assert!(open._tick_task.is_some(), "the tick task is armed");
-            assert_eq!(open.shown_frame(), 0, "playback starts at position 0");
+            assert_eq!(open.shown().frame, 0, "playback starts at position 0");
             open.playing
                 .as_mut()
                 .expect("checked playing above")
@@ -8436,7 +8489,7 @@ mod tests {
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert_eq!(
-                ready(panel).shown_frame(),
+                ready(panel).shown().frame,
                 1,
                 "the tick recomputed the shown position from elapsed time"
             );
@@ -8448,7 +8501,7 @@ mod tests {
             assert!(open.playing.is_none(), "toggle_play again stops it");
             assert!(open._tick_task.is_none(), "the tick loop is dropped");
             assert_eq!(
-                open.shown_frame(),
+                open.shown().frame,
                 0,
                 "the preview falls back to the selection"
             );
@@ -8483,7 +8536,7 @@ mod tests {
             let open = ready(panel);
             assert!(open.playing.is_none(), "the run finished");
             assert_eq!(open.selected_entry, Some((0, 1)), "landed on the final entry");
-            assert_eq!(open.shown_frame(), 1, "the preview shows the final frame");
+            assert_eq!(open.shown().frame, 1, "the preview shows the final frame");
         });
     }
 
@@ -8708,7 +8761,7 @@ mod tests {
                     vec![1],
                     "the stale pre-playback selection is untouched"
                 );
-                assert_eq!(open.shown_frame(), 0, "preview stays on the edited frame");
+                assert_eq!(open.shown().frame, 0, "preview stays on the edited frame");
             }
 
             // Not playing: the same click path edits the selected frame
