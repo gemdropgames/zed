@@ -2276,8 +2276,20 @@ impl SpritePanel {
         let t_ms = playing.start_offset_ms + playing.started.elapsed().as_millis() as i64;
         // An emptied active clip (its last entry deleted mid-play) has
         // nothing left to walk.
-        if durations.is_empty() || (!loop_ && t_ms >= playback_total_ms(&durations)) {
+        if durations.is_empty() {
             open.playing = None;
+            cx.notify();
+            return true;
+        }
+        // A non-looping run ends ON its final entry: the selection lands
+        // there, so the preview stays on the last frame instead of
+        // snapping back to wherever it was when Play was pressed. Only
+        // a clip can be non-looping (the whole library always loops).
+        if !loop_ && t_ms >= playback_total_ms(&durations) {
+            open.playing = None;
+            if let Some(clip) = open.active_clip {
+                self.select_entry(clip, durations.len() - 1, cx);
+            }
             cx.notify();
             return true;
         }
@@ -8429,6 +8441,38 @@ mod tests {
                 0,
                 "the preview falls back to the selection"
             );
+        });
+    }
+
+    /// A non-looping run ENDS on the clip's final entry: the transport
+    /// lands the selection there rather than snapping the preview back
+    /// to wherever the selection was when Play was pressed.
+    #[gpui::test]
+    async fn test_a_non_looping_run_ends_on_the_final_frame(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            // Clip 0 = entries [frame 0 for 100ms, frame 1 for 200ms].
+            panel.set_clip_loop(0, false, cx);
+            panel.select_clip(Some(0), cx);
+            panel.select_entry(0, 0, cx);
+            panel.toggle_play(cx);
+        });
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.playing.as_mut().expect("playing").start_offset_ms += 400;
+        });
+        cx.executor().advance_clock(TICK);
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let open = ready(panel);
+            assert!(open.playing.is_none(), "the run finished");
+            assert_eq!(open.selected_entry, Some((0, 1)), "landed on the final entry");
+            assert_eq!(open.shown_frame(), 1, "the preview shows the final frame");
         });
     }
 
