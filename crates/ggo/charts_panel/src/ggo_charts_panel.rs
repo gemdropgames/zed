@@ -125,6 +125,10 @@ const INSPECT_CLOSE_SELECTOR: &str = "ggo-charts-inspect-close-button";
 const FAULT_BACK_SELECTOR: &str = "ggo-charts-fault-back";
 const FAULT_TILES_SELECTOR: &str = "ggo-charts-fault-tiles";
 const FAULT_RAW_TOGGLE_SELECTOR: &str = "ggo-charts-fault-raw-toggle";
+// The run detail's scroll region, which doubles as its body: the overflow
+// tests read its bounds both for how far it scrolls and for the floor
+// under its height.
+const DETAIL_LIST_SELECTOR: &str = "ggo-charts-list";
 
 /// The picker row for perf run at list index `ix` -- one selector per row,
 /// so a test can aim a real click at a specific run.
@@ -135,6 +139,13 @@ fn run_row_selector(ix: usize) -> String {
 /// The history rail row for the device run at list index `ix`.
 fn device_run_row_selector(ix: usize) -> String {
     format!("ggo-charts-device-run-{ix}")
+}
+
+/// One log line's selector -- a `uniform_list` row's bounds are the only
+/// way a test can see the list scroll sideways, since the list's own box
+/// does not move when it does.
+fn log_row_selector(kind: LogKind, ix: usize) -> String {
+    format!("{}-row-{ix}", kind.selector())
 }
 
 /// The historic overlay has nothing to draw.
@@ -159,6 +170,13 @@ const SELF_LEAF_LABEL: &str = "<self>";
 /// Height of a log/console scroll region -- ggo-ide's `UART_HEIGHT` (220),
 /// which is also what its history log viewer uses.
 const LOG_HEIGHT: Pixels = px(220.);
+
+/// The floor under a detail view's body. The body is the only `flex_1`
+/// child of its column, so without a floor the header above it -- which
+/// grows with a wrapped config line, a rerun note or a long run title --
+/// crushes it to nothing in a short pane instead of making the view
+/// scroll.
+const BODY_MIN_HEIGHT: Pixels = px(120.);
 
 /// A device run with no `run_log` rows. Like `report::NO_UART` this names
 /// a STATE, not a cause: a run can reach `runs` with no narration because
@@ -1353,7 +1371,13 @@ impl ChartsPanel {
                 .into_any_element(),
         };
 
+        // The header is fixed chrome that grows with the identity line
+        // it wraps. Past a short enough pane it leaves the body no room,
+        // so the body keeps a floor ([`BODY_MIN_HEIGHT`]) and the view
+        // scrolls rather than crushing it to nothing.
         v_flex()
+            .id("ggo-charts-device-detail")
+            .overflow_y_scroll()
             .size_full()
             .child(
                 v_flex()
@@ -1399,7 +1423,7 @@ impl ChartsPanel {
                         .color(Color::Muted),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h(BODY_MIN_HEIGHT).child(body))
             .into_any_element()
     }
 
@@ -1428,7 +1452,13 @@ impl ChartsPanel {
             _ => String::new(),
         };
 
+        // The header is fixed chrome that grows with the identity line
+        // it wraps. Past a short enough pane it leaves the body no room,
+        // so the body keeps a floor ([`BODY_MIN_HEIGHT`]) and the view
+        // scrolls rather than crushing it to nothing.
         v_flex()
+            .id("ggo-charts-fault-detail")
+            .overflow_y_scroll()
             .size_full()
             .child(
                 v_flex()
@@ -1488,7 +1518,7 @@ impl ChartsPanel {
                             ))
                     })),
             )
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h(BODY_MIN_HEIGHT).child(body))
             .into_any_element()
     }
 
@@ -1737,7 +1767,8 @@ impl ChartsPanel {
                 // console sits with them, above the same branch, for
                 // exactly the same reason.
                 v_flex()
-                    .id("ggo-charts-list")
+                    .id(DETAIL_LIST_SELECTOR)
+                    .debug_selector(|| DETAIL_LIST_SELECTOR.to_string())
                     .size_full()
                     .overflow_y_scroll()
                     .p_2()
@@ -1804,7 +1835,14 @@ impl ChartsPanel {
             _ => None,
         };
 
+        // The header above the body is fixed chrome that GROWS: a
+        // wrapped run-config line, a rerun note, a long title. Past a
+        // short enough pane it no longer leaves the body room, so the
+        // body keeps a floor ([`BODY_MIN_HEIGHT`]) and the view scrolls
+        // rather than crushing it to nothing.
         v_flex()
+            .id("ggo-charts-run-detail")
+            .overflow_y_scroll()
             .size_full()
             .child(
                 v_flex()
@@ -1856,7 +1894,7 @@ impl ChartsPanel {
                         }),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h(BODY_MIN_HEIGHT).child(body))
             .into_any_element()
     }
 
@@ -1993,13 +2031,26 @@ impl ChartsPanel {
                 uniform_list(selector, lines.len(), move |range, _window, cx| {
                     range
                         .map(|ix| {
-                            Label::new(lines[ix].clone())
-                                .size(LabelSize::XSmall)
-                                .buffer_font(cx)
+                            div()
+                                .debug_selector(move || log_row_selector(kind, ix))
+                                .child(
+                                    Label::new(lines[ix].clone())
+                                        .size(LabelSize::XSmall)
+                                        .buffer_font(cx),
+                                )
                         })
                         .collect::<Vec<_>>()
                 })
                 .when_some(scroll, |list, handle| list.track_scroll(handle))
+                // A log line is fixed-width text in the buffer font -- a
+                // hex dump row is ~75 columns, several times a dock's
+                // width. Fitted to the list (the default) those rows wrap
+                // instead, and a wrapped row is CLIPPED: `uniform_list`
+                // gives every row the one item height it measured
+                // unwrapped, so the second line is painted over the row
+                // below it. Unconstrained lays each row out at its full
+                // width and scrolls the list sideways to reach it.
+                .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::Unconstrained)
                 .h(LOG_HEIGHT)
                 .w_full()
                 .rounded_sm()
@@ -6623,5 +6674,194 @@ mod tests {
             listener(&true, window, cx);
         })
         .unwrap();
+    }
+
+    /// A wheel gesture at a window point, pumped: the shape every
+    /// overflow regression below needs.
+    fn wheel_at(
+        cx: &mut gpui::VisualTestContext,
+        position: gpui::Point<Pixels>,
+        delta: gpui::Point<Pixels>,
+    ) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(delta),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// A perf run's detail in a real window of `size`, with `uart` behind
+    /// it, reached through the same off-thread load the panel uses. The
+    /// window's ROOT is the panel, so a resize or a scroll redraws it and
+    /// the recorded bounds below are the live ones.
+    async fn detail_window<'a>(
+        cx: &'a mut TestAppContext,
+        uart: &[&str],
+        size: gpui::Size<Pixels>,
+    ) -> (
+        ggo_db::TestDb,
+        gpui::Entity<ChartsPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+        seed_uart(db.url(), uart);
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            let mut panel = ChartsPanel::new(None, cx);
+            panel.set_connect(loader::test_connect(db.url()));
+            panel
+        });
+        panel.update(cx, |panel, cx| {
+            panel.select_run(
+                RunListing {
+                    id: 1,
+                    started_at: "2026-08-01T00:00:00Z".to_string(),
+                    cart_name: "demo".to_string(),
+                    label: Some("arena".to_string()),
+                },
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        cx.simulate_resize(size);
+        cx.run_until_parked();
+        (db, panel, cx)
+    }
+
+    /// Class A: a log's rows are fixed-width text in the buffer font --
+    /// a hex dump line is ~75 columns, several times a 360px dock -- and
+    /// `uniform_list` fits its rows to the list by default, so every
+    /// line was cut at the list's edge with no way to reach its tail.
+    /// The list scrolls sideways now, and it is the LIST that moves: the
+    /// section around it stays put, so this cannot pass on the detail
+    /// column's own sideways scroll.
+    #[gpui::test]
+    async fn test_a_wide_log_rows_scroll_sideways(cx: &mut TestAppContext) {
+        let dump: Vec<String> = (0..40)
+            .map(|row| format!("{:08x}  {}|................|", row * 16, "de ad be ef ".repeat(4)))
+            .collect();
+        let lines: Vec<&str> = dump.iter().map(String::as_str).collect();
+        // Tall enough that the console below the hero chart and the two
+        // diagnostic tables is laid out rather than scrolled out of the
+        // window: a row the window never painted has no bounds.
+        let (_db, _panel, cx) =
+            detail_window(cx, &lines, gpui::size(DEFAULT_WIDTH, px(3000.))).await;
+
+        let section = cx
+            .debug_bounds(LogKind::Console.selector())
+            .expect("the detail paints the stored console");
+        assert_eq!(
+            log_row_selector(LogKind::Console, 0),
+            "ggo-charts-console-row-0"
+        );
+        let before = cx
+            .debug_bounds("ggo-charts-console-row-0")
+            .expect("the console paints a selector-bearing first row");
+
+        // Inside the list horizontally, over its first row vertically.
+        let over_list = gpui::point(section.center().x, before.center().y);
+        wheel_at(cx, over_list, gpui::point(px(-60.), px(0.)));
+
+        let after = cx
+            .debug_bounds("ggo-charts-console-row-0")
+            .expect("the first row after the scroll");
+        // The list has sideways range at all only when its measured rows
+        // are wider than it is, so this moving IS the overflow: a fitted
+        // list has nowhere to go.
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the log: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+        assert!(
+            after.size.width > before.size.width,
+            "and the scrolled row must lay out wider, showing more of the line: before {:?}, after {:?}",
+            before.size,
+            after.size
+        );
+        let section_after = cx
+            .debug_bounds(LogKind::Console.selector())
+            .expect("the console section after the scroll");
+        assert_eq!(
+            section_after.origin.x, section.origin.x,
+            "the LIST must be what scrolled, not the column under it"
+        );
+    }
+
+    /// The counterpart to the log above, and the reason the detail
+    /// column is left scrolling on y alone: text in this panel cannot
+    /// run out of it sideways. gpui wraps a label to its container and
+    /// force-breaks a token with no break candidate in it, and a column
+    /// flex container floors its children's width at nothing (the
+    /// content-based minimum is a MAIN-axis rule), so even a 128-char
+    /// content-hashed asset name comes back inside the column instead of
+    /// painting past its edge. A `truncate`/`text_ellipsis` on this cell
+    /// would be what makes the name unreadable, which is why there is
+    /// none.
+    #[gpui::test]
+    async fn test_a_a_wide_failures_row_wraps_inside_the_detail_column(cx: &mut TestAppContext) {
+        let miss = format!(
+            "asset: MISS \"{}.til\"",
+            "d41d8cd98f00b204e9800998ecf8427e".repeat(4)
+        );
+        let (_db, _panel, cx) =
+            detail_window(cx, &[&miss], gpui::size(DEFAULT_WIDTH, px(1200.))).await;
+
+        let column = cx
+            .debug_bounds(DETAIL_LIST_SELECTOR)
+            .expect("the detail column is painted for a loaded run");
+        let failures = cx
+            .debug_bounds(FAILURES_SELECTOR)
+            .expect("the failed-asset-loads table is painted");
+        assert!(
+            failures.right() <= column.right(),
+            "the hashed name must stay inside the column: {failures:?} in {column:?}"
+        );
+        assert!(
+            failures.size.height > px(40.),
+            "...by wrapping onto further lines, not by being cut: {failures:?}"
+        );
+    }
+
+    /// Class C: the detail header is fixed chrome that grows -- a
+    /// wrapped run-config line, a rerun note, a long title -- and in a
+    /// short pane it used to take the whole column, crushing the body to
+    /// nothing. The body keeps its floor now and the view scrolls.
+    #[gpui::test]
+    async fn test_c_a_short_detail_scrolls_instead_of_crushing_the_body(cx: &mut TestAppContext) {
+        let (_db, _panel, cx) =
+            detail_window(cx, &["asset: MISS \"a.til\""], gpui::size(DEFAULT_WIDTH, px(150.))).await;
+
+        let before = cx
+            .debug_bounds(DETAIL_LIST_SELECTOR)
+            .expect("the detail column is painted in a short window");
+        assert!(
+            before.size.height >= BODY_MIN_HEIGHT,
+            "the body must keep its floor in a short pane: {before:?}"
+        );
+
+        // Over the header's Back button: chrome, with no scroller
+        // between it and the root.
+        let header = cx
+            .debug_bounds(BACK_BUTTON_SELECTOR)
+            .expect("the detail header paints its Back button");
+        wheel_at(cx, header.center(), gpui::point(px(0.), px(-60.)));
+
+        let after = cx
+            .debug_bounds(DETAIL_LIST_SELECTOR)
+            .expect("the detail column after the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "wheeling down a short detail must bring its body up: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
     }
 }
