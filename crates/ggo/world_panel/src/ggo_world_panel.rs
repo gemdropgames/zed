@@ -7271,7 +7271,7 @@ impl WorldPanel {
             .w(LIST_WIDTH)
             .h_full()
             .flex_none()
-            .overflow_scroll()
+            .overflow_y_scroll()
             .child(v_flex().children(rows.into_iter().map(|(target, label)| {
                 let selected = open.selected.contains(&target);
                 let row = div()
