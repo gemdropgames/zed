@@ -130,6 +130,19 @@ const ORDER_ROLLBACK_NOTICE: &str = "Edit not applied — this is the saved run 
 /// is; the list is only what can be chosen.
 const CADENCES: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
 
+/// The shortest the manifest browser is allowed to get. A generate form
+/// with many field rows is taller than a short pane, and the browser is a
+/// scroll container, whose automatic minimum is zero -- without this floor
+/// the form would squeeze it out of existence instead of pushing the body
+/// into scrolling.
+const BROWSER_MIN_HEIGHT: Pixels = px(120.);
+
+/// The tallest the run state is allowed to get. `emd`'s transcript is
+/// unbounded (a failing `cargo check` is dozens of lines), and the run
+/// state sits below the browser in the same column: uncapped, one bad run
+/// takes the whole pane and the browser is left with its floor.
+const RUN_STATE_MAX_HEIGHT: Pixels = px(240.);
+
 /// Empty-state text -- shown when there is nothing to list and no form
 /// open, i.e. an unmanaged project (or one whose manifests are still
 /// empty), where work can only arrive by right-clicking a directory.
@@ -2093,6 +2106,7 @@ impl EmeraldPanel {
         }
         col.child(
             h_flex()
+                .debug_selector(|| "ggo-emerald-form-buttons".into())
                 .gap_1()
                 .child(
                     Button::new("ggo-emerald-create", "Create")
@@ -2140,8 +2154,11 @@ impl EmeraldPanel {
         Some(
             v_flex()
                 .id("ggo-emerald-run-state")
+                .debug_selector(|| "ggo-emerald-run-state".into())
                 .gap_0p5()
                 .p_1()
+                .max_h(RUN_STATE_MAX_HEIGHT)
+                .min_h_0()
                 .overflow_scroll()
                 .child(
                     ggo_common::CopyableText::new("ggo-emerald-run-message-copy", message)
@@ -2210,7 +2227,11 @@ impl EmeraldPanel {
 
     /// The three-way tab row.
     fn render_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let mut row = h_flex().gap_1().p_1();
+        let mut row = h_flex()
+            .debug_selector(|| "ggo-emerald-tabs".into())
+            .flex_wrap()
+            .gap_1()
+            .p_1();
         for tab in BrowseTab::ALL {
             row = row.child(
                 div()
@@ -2564,8 +2585,11 @@ impl EmeraldPanel {
         }
         let mut col = v_flex()
             .id("ggo-emerald-browser")
+            .debug_selector(|| "ggo-emerald-browser".into())
             .gap_0p5()
             .p_1()
+            .flex_1()
+            .min_h(BROWSER_MIN_HEIGHT)
             .overflow_scroll()
             .child(self.render_tabs(cx));
         // One counter across the whole tab so every row's element id is
@@ -2629,7 +2653,10 @@ impl EmeraldPanel {
                 .into_any_element();
         }
         v_flex()
+            .id("ggo-emerald-body")
+            .debug_selector(|| "ggo-emerald-body".into())
             .size_full()
+            .overflow_y_scroll()
             .children(banner)
             .children(form)
             .children(browser)
@@ -5836,5 +5863,189 @@ mod tests {
             );
         });
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    // ------------------------------------------- overflow in a small pane
+
+    /// [`rendered_panel`] with the manifests read off disk, as the layout
+    /// tests need them: the browser renders nothing until there is
+    /// something to list.
+    fn ready_panel_in_window<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+    ) -> (Entity<EmeraldPanel>, &'a mut gpui::VisualTestContext) {
+        let (panel, cx) = rendered_panel(cx, root, runner);
+        panel.update(cx, |panel, cx| panel.refresh_root(cx));
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// Resize the window and let the panel redraw at the new size.
+    fn resize(cx: &mut gpui::VisualTestContext, width: f32, height: f32) {
+        cx.simulate_resize(gpui::size(px(width), px(height)));
+        cx.run_until_parked();
+    }
+
+    /// A wheel over `at` with `dx`/`dy` pixels, pumped.
+    fn wheel(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>, dx: f32, dy: f32) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(dx), px(dy))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// [`emerald_project`] with `count` components in the shared module --
+    /// a manifest taller than any short pane.
+    fn crowded_project(count: usize) -> tempfile::TempDir {
+        let dir = emerald_project();
+        let mut manifest = String::from("version = 1\n");
+        for ix in 0..count {
+            manifest.push_str(&format!("[[component]]\nname = \"Comp{ix:02}\"\n"));
+        }
+        std::fs::write(dir.path().join("manifests/components.toml"), manifest).unwrap();
+        dir
+    }
+
+    /// Open a generate form with `fields` field rows.
+    fn form_with_fields(
+        panel: &Entity<EmeraldPanel>,
+        fields: usize,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_item(GenKind::Component, MANIFESTS_DIR, window, cx);
+            for _ in 0..fields {
+                panel.add_field(window, cx);
+            }
+        });
+        cx.run_until_parked();
+    }
+
+    /// Overflow class C: a form with twenty field rows is taller than a
+    /// short pane, and nothing between it and the panel root used to
+    /// scroll -- Create and Cancel simply sat below the bottom edge with
+    /// no way to reach them. The body scrolls now.
+    #[gpui::test]
+    async fn test_c_a_short_pane_scrolls_down_to_the_form_buttons(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        form_with_fields(&panel, 20, cx);
+        resize(cx, 320., 300.);
+
+        let pane = cx.debug_bounds("ggo-emerald-body").expect("the panel body");
+        let before = cx
+            .debug_bounds("ggo-emerald-form-buttons")
+            .expect("the form's Create/Cancel row");
+        assert!(
+            before.origin.y > pane.origin.y + pane.size.height,
+            "twenty field rows must push the buttons past a 300px pane for this to test \
+             anything: buttons {before:?} in {pane:?}"
+        );
+
+        wheel(cx, pane.center(), 0., -200.);
+
+        let after = cx
+            .debug_bounds("ggo-emerald-form-buttons")
+            .expect("the form's buttons survive the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "wheeling down a short pane must bring the form's buttons up into it: \
+             before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "scrolling a form must never spawn emd"
+        );
+    }
+
+    /// The browser is the flexible half of that column: with a form open
+    /// above it in a short pane it used to shrink away to nothing (a
+    /// scroll container's automatic minimum is zero). It keeps
+    /// [`BROWSER_MIN_HEIGHT`], stays inside the pane, and scrolls its own
+    /// rows once the body has been scrolled down to it.
+    #[gpui::test]
+    async fn test_c_the_browser_keeps_its_floor_under_an_open_form(cx: &mut TestAppContext) {
+        let dir = crowded_project(40);
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        form_with_fields(&panel, 6, cx);
+        resize(cx, 320., 300.);
+
+        let pane = cx.debug_bounds("ggo-emerald-body").expect("the panel body");
+        let browser = cx
+            .debug_bounds("ggo-emerald-browser")
+            .expect("the manifest browser");
+        assert!(
+            browser.size.height >= BROWSER_MIN_HEIGHT,
+            "an open form must not squeeze the browser below its floor: {browser:?}"
+        );
+        assert!(
+            browser.size.height <= pane.size.height,
+            "the browser must be bounded by the pane, not by its forty rows: \
+             {browser:?} in {pane:?}"
+        );
+
+        // Bring the browser fully into view before wheeling over it, so
+        // the wheel lands on the browser rather than on the form above it.
+        wheel(cx, pane.center(), 0., -400.);
+        let browser = cx
+            .debug_bounds("ggo-emerald-browser")
+            .expect("the browser after the body scrolled");
+        let tabs = cx
+            .debug_bounds("ggo-emerald-tabs")
+            .expect("the tab row is the browser's first child");
+        let before_offset = tabs.origin.y - browser.origin.y;
+
+        wheel(cx, browser.center(), 0., -120.);
+
+        let browser = cx
+            .debug_bounds("ggo-emerald-browser")
+            .expect("the browser survives the scroll");
+        let tabs = cx
+            .debug_bounds("ggo-emerald-tabs")
+            .expect("the tab row survives the scroll");
+        assert!(
+            tabs.origin.y - browser.origin.y < before_offset,
+            "a downward wheel must scroll the browser's own rows: before {before_offset:?}, \
+             after {:?}",
+            tabs.origin.y - browser.origin.y
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "browsing must never spawn emd"
+        );
+    }
+
+    /// Overflow class B: the three tab buttons are wider than a narrow
+    /// pane, so the row wraps rather than running Schedules off the edge.
+    #[gpui::test]
+    async fn test_b_the_browser_tabs_wrap_in_a_narrow_pane(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let (runner, _calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+
+        resize(cx, 900., 600.);
+        let wide = cx
+            .debug_bounds("ggo-emerald-tabs")
+            .expect("the tab row in a wide pane");
+
+        resize(cx, 140., 600.);
+        let narrow = cx
+            .debug_bounds("ggo-emerald-tabs")
+            .expect("the tab row in a narrow pane");
+
+        assert!(
+            narrow.size.height >= wide.size.height * 2.,
+            "a narrow pane must wrap the tabs onto at least two rows: wide {:?}, narrow {:?}",
+            wide.size,
+            narrow.size
+        );
     }
 }
