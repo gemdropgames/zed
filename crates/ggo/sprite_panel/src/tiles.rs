@@ -1,7 +1,16 @@
-//! Pure tile-editing helpers (F2 task M6): preview and picker cell hit
-//! math plus the stamp/marquee block rules -- the framework-free half of
-//! the tile palette / cell-set wiring, kept out of the gpui layer so the
-//! rules are directly unit-testable.
+//! Pure tile-editing helpers (F2 task M6): preview cell hit math and the
+//! hardware-budget meter line -- the framework-free half of the tile
+//! palette / cell-set wiring, kept out of the gpui layer so both rules are
+//! directly unit-testable. The meter FEED mirrors ggo-ide's
+//! `sprites/hw_meter.rs::rows` (same four value/cap pairs from
+//! `sprites::hw`'s pure calculators, same "only the cache row is
+//! frame-specific" split); the presentation is a single compact text line
+//! instead of iced's four dot-colored rows, sized for a 360px sidebar.
+
+use ggo_worldlib::sprites::cow::{Frame, SpriteState};
+use ggo_worldlib::sprites::hw::{
+    self, OAM_ENTRIES, SPRITE_CACHE_TILES, SPRITE_LINE_CAP, VRAM_TILE_CAP,
+};
 
 /// Which frame cell a click at `(local_x, local_y)` inside a preview
 /// rendered at `fit_w x fit_h` CSS px lands on. The composed frame image
@@ -137,9 +146,49 @@ pub fn stamp_sets(
     sets
 }
 
+/// The hardware's shared sprite affine parameter-set budget (ggo
+/// `docs/ppu-contract.md` §9: `pidx[4:0]` picks one of 32 sets). Not in
+/// worldlib's `hw` module yet, so pinned here where the meter needs it.
+pub const AFFINE_PARAM_SETS: usize = 32;
+
+/// The hardware-budget meter line for the open sprite: `Pool`
+/// (`tile_count` / `VRAM_TILE_CAP`), `OAM` (greedy [`hw::oam_split`]
+/// entry count / `OAM_ENTRIES`), `Scanline` (worst-case per-scanline OAM
+/// coverage / `SPRITE_LINE_CAP`), `Cache` (the shown frame's worst-row
+/// distinct-tile working set / `SPRITE_CACHE_TILES`; 0 without a frame),
+/// and `Sets` (distinct non-identity transform MATRICES across the
+/// sprite's CLIP ENTRIES / [`AFFINE_PARAM_SETS`] -- counted on the composed
+/// `matrix()`, the value the runtime's dedup allocator actually keys
+/// sets by, so two transforms that collapse to one matrix cost one
+/// set). Same inputs, same order as ggo-ide `hw_meter::rows` plus the
+/// affine budget.
+pub fn hw_meter_line(state: &SpriteState, frame: Option<&Frame>) -> String {
+    let w = state.w_tiles as usize;
+    let h = state.h_tiles as usize;
+    let oam = hw::oam_split(w, h).len();
+    let scanline = hw::scanline_coverage(w, h);
+    let cache = frame.map_or(0, |f| hw::cache_pressure(&f.map, w, h));
+    let mut matrices: Vec<(u32, u32)> = Vec::new();
+    for entry in state.clips.iter().flat_map(|c| c.entries.iter()) {
+        if entry.transform.is_identity() {
+            continue;
+        }
+        let matrix = entry.transform.matrix();
+        if !matrices.contains(&matrix) {
+            matrices.push(matrix);
+        }
+    }
+    format!(
+        "Pool {}/{VRAM_TILE_CAP} · OAM {oam}/{OAM_ENTRIES} · Scanline {scanline}/{SPRITE_LINE_CAP} · Cache {cache}/{SPRITE_CACHE_TILES} · Sets {}/{AFFINE_PARAM_SETS}",
+        state.tile_count,
+        matrices.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggo_worldlib::sprites::sprite_doc::blank_sprite_state;
 
     // ------------------------------------------------------------ cell_at
 
@@ -256,5 +305,78 @@ mod tests {
     fn stamp_sets_skips_pad_cells_and_empty_batches() {
         let block = marquee_block((2, 1), (3, 1), 4, &[0, 1, 2, 3, 4, 5]); // [None, None]
         assert!(stamp_sets(&block, 0, 2, 2, &[9, 9, 9, 9]).is_empty());
+    }
+
+    // ------------------------------------------------------ hw_meter_line
+
+    #[test]
+    fn hw_meter_line_matches_the_hw_calculators_for_a_4x4_sprite() {
+        let s = blank_sprite_state(4, 4).unwrap();
+        // 4x4 -> one 4x4 OAM square -> scanline coverage 1; the blank
+        // frame is a single tile everywhere -> cache pressure 1; every
+        // transform is identity -> no affine sets.
+        assert_eq!(
+            hw_meter_line(&s, s.frames.first()),
+            format!(
+                "Pool 1/{VRAM_TILE_CAP} · OAM 1/{OAM_ENTRIES} · Scanline 1/{SPRITE_LINE_CAP} · Cache 1/{SPRITE_CACHE_TILES} · Sets 0/{AFFINE_PARAM_SETS}"
+            )
+        );
+    }
+
+    #[test]
+    fn hw_meter_line_without_a_frame_reads_cache_0_like_hw_meter_rows() {
+        let s = blank_sprite_state(2, 2).unwrap();
+        let line = hw_meter_line(&s, None);
+        assert!(
+            line.contains(&format!("Cache 0/{SPRITE_CACHE_TILES}")),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn hw_meter_counts_distinct_non_identity_transforms() {
+        use ggo_worldlib::sprites::cow::{ClipEdit, ClipEntry, FrameTransform};
+        let mut s = blank_sprite_state(1, 1).unwrap();
+        let quarter = FrameTransform {
+            angle256: 64,
+            ..FrameTransform::IDENTITY
+        };
+        let doubled = FrameTransform {
+            sx: 0x0200,
+            ..FrameTransform::IDENTITY
+        };
+        s.clips = vec![ClipEdit {
+            name: "spin".to_string(),
+            loop_: true,
+            entries: vec![ClipEntry::of_frame(0); 4],
+        }];
+        // Entry 0 stays identity (not counted); 1 and 2 share a matrix
+        // (one set); 3 is distinct (a second set).
+        s.clips[0].entries[1].transform = quarter;
+        s.clips[0].entries[2].transform = quarter;
+        s.clips[0].entries[3].transform = doubled;
+        let line = hw_meter_line(&s, s.frames.first());
+        assert!(
+            line.ends_with(&format!("Sets 2/{AFFINE_PARAM_SETS}")),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn hw_meter_line_cache_counts_the_worst_rows_distinct_tiles() {
+        let mut s = blank_sprite_state(2, 1).unwrap();
+        // Two distinct tiles on the single row.
+        s.pool.extend(std::iter::repeat_n(0x11u8, 128));
+        s.tile_count = 2;
+        s.frames[0].map = vec![0, 1];
+        let line = hw_meter_line(&s, s.frames.first());
+        assert!(
+            line.contains(&format!("Cache 2/{SPRITE_CACHE_TILES}")),
+            "{line}"
+        );
+        assert!(
+            line.starts_with(&format!("Pool 2/{VRAM_TILE_CAP}")),
+            "{line}"
+        );
     }
 }

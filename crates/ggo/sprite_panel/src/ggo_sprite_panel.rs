@@ -3732,6 +3732,21 @@ impl SpritePanel {
                     .disabled(!dirty)
                     .on_click(cx.listener(|this, _, _, cx| this.save_impl(cx))),
             )
+            .child(
+                // The meter's cache row is the SHOWN frame's working set
+                // (`tiles::hw_meter_line`), which during playback is the
+                // transport's frame, not the selection's.
+                div()
+                    .debug_selector(|| "ggo-sprite-hw-meter".into())
+                    .child(
+                        Label::new(SharedString::from(tiles::hw_meter_line(
+                            &state,
+                            state.frames.get(open.shown().frame),
+                        )))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    ),
+            )
             .children(open.save_error.as_ref().map(|e| {
                 ggo_common::CopyableText::new(
                     "ggo-sprite-save-error-copy",
@@ -7400,6 +7415,24 @@ mod tests {
     /// transport: they drive the clip strip, and the transport is the
     /// document row (size, title, undo/redo, save). The onion row, the
     /// eraser and the frame-move buttons are gone entirely.
+    /// The hardware budget readout (tiles and cache use for the shown
+    /// frame) lives in the transport now that the frame-ops row is gone.
+    #[gpui::test]
+    async fn test_the_hardware_meter_reads_in_the_transport(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        let transport = cx
+            .debug_bounds("ggo-sprite-transport")
+            .expect("the transport row");
+        let meter = cx
+            .debug_bounds("ggo-sprite-hw-meter")
+            .expect("the hardware meter readout");
+        assert!(
+            transport.contains(&meter.center()),
+            "the meter sits in the transport: {meter:?} vs {transport:?}"
+        );
+    }
+
     #[gpui::test]
     async fn test_the_play_and_clip_controls_live_with_the_clips(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
