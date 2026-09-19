@@ -742,11 +742,6 @@ fn divider_size(
 /// dimension is editable afterwards (`DocOp::Resize`).
 const NEW_SPRITE_TILES: u8 = 2;
 
-/// How many frames a new METASPRITE seeds. Two is the minimum that makes
-/// a clip mean anything (a one-frame "animation" is a sprite), and the
-/// seeded clip spans exactly this range.
-const NEW_METASPRITE_FRAMES: usize = 2;
-
 /// The seeded clip's name on a new metasprite -- `edits::default_new_clip`'s
 /// own `clip{N}` scheme at N = 1, so the first clip a user adds by hand
 /// continues the same sequence.
@@ -972,15 +967,31 @@ fn create_sprite(
     state.pool = pack_indices_to_til(&tileset.indices, tileset.tile_count);
     state.tile_count = tileset.tile_count;
     state.palette = tileset.palette;
+    // The first frame starts as the reference sheet's top-left block of
+    // the frame's own size, so a fresh sprite shows the sheet's first
+    // cell group rather than blank tiles. A stale or missing sheet
+    // leaves it blank.
+    if let Some(sheet) = reference_sheet::load(&root, til_rel)
+        .filter(|sheet| sheet.is_valid_for(tileset.tile_count))
+        && let Some(frame) = state.frames.first_mut()
+    {
+        let (width, height) = (usize::from(state.w_tiles), usize::from(state.h_tiles));
+        for row in 0..height.min(sheet.rows) {
+            for column in 0..width.min(sheet.cols) {
+                if let (Some(cell), Some(tile)) = (
+                    frame.map.get_mut(row * width + column),
+                    sheet.tiles.get(row * sheet.cols + column),
+                ) {
+                    *cell = *tile;
+                }
+            }
+        }
+    }
     if kind == NewKind::Metasprite {
-        let first = state.frames[0].clone();
-        state.frames.resize(NEW_METASPRITE_FRAMES, first);
         state.clips.push(ClipEdit {
             name: NEW_METASPRITE_CLIP.to_string(),
             loop_: true,
-            entries: (0..NEW_METASPRITE_FRAMES)
-                .map(ClipEntry::of_frame)
-                .collect(),
+            entries: vec![ClipEntry::of_frame(0)],
         });
     }
     save_sprite(&root, &rel_path, &state, til_rel, &tileset.pal_path).map_err(|e| e.to_string())?;
@@ -9660,6 +9671,47 @@ mod tests {
         });
     }
 
+    /// A new sprite's first frame starts as the top-left `W x H` block of
+    /// the tileset's reference sheet (W and H being the frame's size in
+    /// tiles), so the frame shows the sheet's first cell group instead of
+    /// blank tiles. No sheet leaves it blank.
+    #[gpui::test]
+    async fn test_new_sprite_seeds_frame_0_from_the_reference_sheet(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        reference_sheet::save(
+            &assets,
+            "tiles/world.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 3,
+                rows: 3,
+                tiles: vec![1, 2, 0, 2, 1, 0, 0, 0, 0],
+            },
+        )
+        .unwrap();
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        new_via_menu(
+            &workspace,
+            NewKind::Metasprite,
+            "assets",
+            assets.clone(),
+            "walker",
+            cx,
+        );
+
+        let opened = open_sprite(&assets, "walker.spr").expect("round-trips");
+        assert_eq!(
+            (opened.state.w_tiles, opened.state.h_tiles),
+            (NEW_SPRITE_TILES, NEW_SPRITE_TILES)
+        );
+        assert_eq!(
+            opened.state.frames[0].map,
+            vec![1, 2, 2, 1],
+            "frame 0 is the sheet's top-left 2x2 block, row-major"
+        );
+    }
+
     /// "New Metasprite…" seeds the OTHER usage of the same format:
     /// several frames plus a first clip over them. Everything else --
     /// binding, sidecars, round trip -- is identical to a sprite's,
@@ -9680,15 +9732,13 @@ mod tests {
         );
 
         let opened = open_sprite(&assets, "walker.spr").expect("round-trips");
-        assert_eq!(opened.state.frames.len(), NEW_METASPRITE_FRAMES);
+        assert_eq!(opened.state.frames.len(), 1, "one frame by default");
         assert_eq!(
             opened.state.clips,
             vec![ClipEdit {
                 name: NEW_METASPRITE_CLIP.to_string(),
                 loop_: true,
-                entries: (0..NEW_METASPRITE_FRAMES)
-                    .map(ClipEntry::of_frame)
-                    .collect(),
+                entries: vec![ClipEntry::of_frame(0)],
             }],
             "a metasprite is clip definitions over its frames"
         );
