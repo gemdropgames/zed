@@ -687,6 +687,7 @@ pub fn render_terrain_editor<V: PaintHost>(
             .child(
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .items_start()
                     .child(v_flex().children(pad.iter().enumerate().map(|(row, bits)| {
                         h_flex().children(bits.iter().enumerate().map(|(col, bit)| {
