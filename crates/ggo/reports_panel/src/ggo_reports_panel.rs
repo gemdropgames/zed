@@ -55,6 +55,11 @@ const KEY_CONTEXT: &str = "GgoReportsPanel";
 const DEFAULT_WIDTH: Pixels = px(300.);
 const EMPTY_MESSAGE: &str = "no reports yet";
 const LOADING_MESSAGE: &str = "reading reports…";
+/// The shortest the list may get. It is the only `flex_1` child of the
+/// root, so without a floor a wrapped header over a multi-line note
+/// squeezes it to nothing in a short panel instead of making the panel
+/// scroll.
+const MIN_LIST_HEIGHT: Pixels = px(120.);
 /// The daemon appends to its faults directory while the panel is open, so
 /// a visible panel re-reads on a timer rather than only on activation.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -67,6 +72,19 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HISTORY_EVERY_TICKS: u64 = 6;
 /// How a row's time is shown, whatever shape its producer recorded it in.
 const WHEN_FORMAT: &str = "%Y-%m-%d %H:%M";
+
+// Handles for the regions whose overflow behaviour the layout tests
+// assert. `LIST_SELECTOR` is the list's element id as well; the rest are
+// `debug_selector`s, which gpui records only in test builds (the closure
+// is discarded unevaluated otherwise), so they cost nothing shipped.
+const HEADER_SELECTOR: &str = "ggo-reports-header";
+const LIST_SELECTOR: &str = "ggo-reports-list";
+
+/// The title cell of the row at list index `ix` -- the widest thing the
+/// list paints, and what a layout test measures against the panel.
+fn row_title_selector(ix: usize) -> String {
+    format!("ggo-reports-row-title-{ix}")
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -538,6 +556,12 @@ impl ReportsPanel {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            .debug_selector(|| HEADER_SELECTOR.to_string())
+            // The chips and the refresh button are the only way to unhide
+            // a kind or force a re-read, and a dock can be dragged
+            // narrower than the row they make: it wraps rather than
+            // pushing them past an edge nothing scrolls back from.
+            .flex_wrap()
             .gap_0p5()
             .px_1()
             .py_0p5()
@@ -590,7 +614,17 @@ impl ReportsPanel {
                                             .color(Color::Muted),
                                     ),
                             )
-                            .child(Label::new(row.title.clone()).size(LabelSize::Small))
+                            .child(
+                                // In a ROW the automatic minimum is the
+                                // child's content size, and gpui measures
+                                // a label's min-content UNWRAPPED: without
+                                // this the title painted its full width
+                                // out of the dock rather than wrapping.
+                                div()
+                                    .debug_selector(move || row_title_selector(ix))
+                                    .min_w_0()
+                                    .child(Label::new(row.title.clone()).size(LabelSize::Small)),
+                            )
                             .child(div().flex_1())
                             .child(
                                 Label::new(row.when.clone())
@@ -653,8 +687,14 @@ impl Render for ReportsPanel {
             .filter_map(|(ix, row_ix)| Some(self.render_row(ix, self.rows.get(*row_ix)?, cx)))
             .collect();
         v_flex()
+            .id("ggo-reports-root")
             .key_context(KEY_CONTEXT)
             .size_full()
+            // The header wraps onto more rows in a narrow dock and the
+            // note under it is an unbounded reason: past a short enough
+            // panel that chrome no longer fits, and the panel scrolls
+            // rather than eating the list's [`MIN_LIST_HEIGHT`].
+            .overflow_y_scroll()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
@@ -665,9 +705,10 @@ impl Render for ReportsPanel {
                 // (a trailer, a fault's "during run" line), and a uniform
                 // list would pin every row to row 0's measured height.
                 v_flex()
-                    .id("ggo-reports-list")
+                    .id(LIST_SELECTOR)
+                    .debug_selector(|| LIST_SELECTOR.to_string())
                     .flex_1()
-                    .min_h_0()
+                    .min_h(MIN_LIST_HEIGHT)
                     .overflow_y_scroll()
                     .children(rows),
             )
@@ -1120,5 +1161,173 @@ mod tests {
                 "the click landed on the fault it named"
             );
         });
+    }
+
+    // ------------------------------------------------ layout / overflow
+
+    /// The panel as the ROOT of a real window, so the layout tests below
+    /// read bounds a prepaint actually produced and a resize redraws the
+    /// panel at the new size. Nothing is loaded: the header and the empty
+    /// state are chrome the panel paints on its own.
+    fn ready_panel_in_window(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<ReportsPanel>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| ReportsPanel::new(None, cx));
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// Resize the window and let the panel redraw at the new size.
+    fn resize(cx: &mut gpui::VisualTestContext, width: f32, height: f32) {
+        cx.simulate_resize(gpui::size(px(width), px(height)));
+        cx.run_until_parked();
+    }
+
+    fn wheel(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>, dx: f32, dy: f32) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(dx), px(dy))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// A list holding one fault row whose title is a realistic length --
+    /// `ggo-uartd` writes "<kind>: <detail>", and a trap detail runs to
+    /// most of a line.
+    fn panel_with_one_long_titled_row(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<ReportsPanel>, &mut gpui::VisualTestContext) {
+        let (panel, cx) = ready_panel_in_window(cx);
+        panel.update(cx, |panel, cx| {
+            let mut row = fault("2026-09-02_08-49-33_marker", "2026-09-02_08-49-33");
+            row.detail = "trap: mcause=0x2 mepc=0x80000010 on /dev/ttyUSB1".to_string();
+            panel.rows = merge_rows(Vec::new(), Vec::new(), vec![row]);
+            panel.state = LoadState::Ready;
+            panel.rebuild_visible();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// A row's title sits in a ROW flex, where a child's automatic
+    /// minimum is its content size -- and gpui measures a label's
+    /// min-content UNWRAPPED (`elements/text.rs`: a wrap width comes only
+    /// from a DEFINITE available width). So a fault title painted
+    /// straight out of the dock, past an edge nothing scrolls back from.
+    /// The title cell can shrink now, which gives the text a width to
+    /// wrap to.
+    ///
+    /// Deliberately not a sideways scroller: the title is ordinary
+    /// wrapping text, so once it can shrink the list has no horizontal
+    /// range at all, and an `overflow_x_scroll` there would do nothing
+    /// but swallow horizontal trackpad deltas.
+    #[gpui::test]
+    async fn test_a_a_long_row_title_wraps_inside_the_dock(cx: &mut TestAppContext) {
+        let (_panel, cx) = panel_with_one_long_titled_row(cx);
+
+        resize(cx, 1600., 700.);
+        let wide = cx
+            .debug_bounds("ggo-reports-row-title-0")
+            .expect("row title bounds recorded at paint");
+
+        resize(cx, 300., 700.);
+        let list = cx
+            .debug_bounds(LIST_SELECTOR)
+            .expect("list bounds recorded at paint");
+        let narrow = cx
+            .debug_bounds("ggo-reports-row-title-0")
+            .expect("row title bounds recorded at paint");
+
+        assert!(
+            narrow.origin.x + narrow.size.width <= list.origin.x + list.size.width,
+            "the title must stay inside the list -- the dock's edge is \
+             where it would otherwise be cut, with nothing to scroll it \
+             back: list {list:?}, title {narrow:?}"
+        );
+        assert!(
+            narrow.size.height >= wide.size.height * 2.,
+            "and it must WRAP rather than be truncated: one line is \
+             {wide:?}, narrow is {narrow:?}"
+        );
+    }
+
+    /// Class C: the header wraps onto more rows in a narrow dock, and the
+    /// note beneath it is unbounded -- a failed load prints the reason
+    /// plus `ggo-db`'s install hint, several lines of it. In a short panel
+    /// that chrome outgrew the window while the list, the panel's only
+    /// scroller, shrank to nothing under it: the tail of the reason was
+    /// cut off with nothing left to scroll it back. The list keeps
+    /// [`MIN_LIST_HEIGHT`] now and the root column scrolls instead.
+    #[gpui::test]
+    async fn test_c_a_short_panel_keeps_the_list_and_scrolls_the_root(cx: &mut TestAppContext) {
+        let (panel, cx) = ready_panel_in_window(cx);
+        panel.update(cx, |panel, cx| {
+            panel.state = LoadState::Error(format!(
+                "reading reports failed: connection refused\n{}",
+                ggo_db::INSTALL_HINT
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        resize(cx, 150., 200.);
+
+        let before = cx
+            .debug_bounds(LIST_SELECTOR)
+            .expect("list bounds recorded at paint");
+        assert!(
+            before.size.height >= MIN_LIST_HEIGHT,
+            "a wrapped header over a multi-line note must not crush the \
+             list: {before:?}"
+        );
+
+        let header = cx
+            .debug_bounds(HEADER_SELECTOR)
+            .expect("header bounds recorded at paint");
+        wheel(cx, header.center(), 0., -80.);
+
+        let after = cx
+            .debug_bounds(LIST_SELECTOR)
+            .expect("list bounds after the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "a downward wheel over the chrome must scroll the root column, \
+             carrying the note's tail into view: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// Class B: the header is a title, three filter chips and the refresh
+    /// button. In a narrow dock one row pushed the chips -- the only way
+    /// to unhide a kind -- past the panel's edge with nothing to scroll
+    /// them back; it wraps onto more rows instead.
+    #[gpui::test]
+    async fn test_b_the_header_wraps_when_the_dock_is_narrow(cx: &mut TestAppContext) {
+        let (_panel, cx) = ready_panel_in_window(cx);
+
+        resize(cx, 1600., 700.);
+        let wide = cx
+            .debug_bounds(HEADER_SELECTOR)
+            .expect("header bounds recorded at paint");
+
+        resize(cx, 150., 700.);
+        let narrow = cx
+            .debug_bounds(HEADER_SELECTOR)
+            .expect("header bounds recorded at paint");
+
+        // Two rows of chips, not two headers: the row's own vertical
+        // padding is paid once either way, so a wrapped header comes in a
+        // little under twice a single row's height.
+        assert!(
+            narrow.size.height >= wide.size.height * 1.5,
+            "a 150px-wide header must wrap onto at least two rows: \
+             one row is {wide:?}, narrow is {narrow:?}"
+        );
     }
 }
