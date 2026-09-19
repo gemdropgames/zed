@@ -13,6 +13,8 @@ use ui::prelude::*;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
+use ggo_sprite_panel::SpriteEditorItem;
+
 use crate::world_canvas_item::WorldCanvasItem;
 use crate::{
     CanvasMode, DEFAULT_WIDTH, EMPTY_MESSAGE, GGO_WORLD_PANEL_KEY, ToggleFocus, WorldPanel,
@@ -133,6 +135,42 @@ impl WorldDock {
             }
             cx.notify();
         }
+        self.step_aside_for_a_sprite_view(&workspace, cx);
+    }
+
+    /// Close the dock when the tab that just became active is a sprite
+    /// view: the sprite editor fills the center pane with chrome of its
+    /// own, and the world dock beside it squeezes both. Only when THIS
+    /// dock is what the right dock is showing -- another panel there
+    /// belongs to whoever opened it.
+    fn step_aside_for_a_sprite_view(&self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        let workspace = workspace.read(cx);
+        let is_sprite_view = workspace
+            .active_item(cx)
+            .and_then(|item| item.downcast::<SpriteEditorItem>())
+            .is_some();
+        if !is_sprite_view {
+            return;
+        }
+        let right_dock = workspace.dock_at_position(self.position).clone();
+        let showing_us = right_dock.read(cx).is_open()
+            && right_dock
+                .read(cx)
+                .active_panel()
+                .is_some_and(|panel| panel.panel_id() == cx.entity_id());
+        if !showing_us {
+            return;
+        }
+        // Deferred, and through the dock's own window: `set_open` needs a
+        // `Window`, which the `ActiveItemChanged` path this runs behind
+        // has none of, and closing the dock while the workspace is being
+        // read here would be a re-entrant update of it.
+        let dock_entity_id = cx.entity_id();
+        cx.defer(move |cx| {
+            cx.with_window(dock_entity_id, |window, cx| {
+                right_dock.update(cx, |right_dock, cx| right_dock.set_open(false, window, cx));
+            });
+        });
     }
 
     /// Record the Live choices a new [`OpenMode::Sticky`] tab inherits.
@@ -929,5 +967,133 @@ pub(crate) mod tests {
                 .any(|stem| stem == "third"),
             "re-opening the existing tab re-enumerates the project's worlds"
         );
+    }
+
+    /// Open a world through the dock, leaving the right dock showing it --
+    /// the state every "what happens when the active tab changes" test
+    /// below starts from.
+    async fn dock_showing_a_world<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<WorldDock>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let (workspace, dock, cx) = dock_workspace(cx, root).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            ggo_common::open_in_panel(workspace, window, cx, |dock: &mut WorldDock, window, cx| {
+                dock.open_world("test.wrld.toml", window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let dock_id = dock.entity_id();
+        workspace.read_with(cx, |workspace, cx| {
+            let right = workspace.dock_at_position(DockPosition::Right).read(cx);
+            assert!(right.is_open(), "opening a world reveals the dock");
+            assert_eq!(
+                right.active_panel().map(|panel| panel.panel_id()),
+                Some(dock_id),
+                "and the world dock is what it shows"
+            );
+        });
+        (workspace, dock, cx)
+    }
+
+    /// A sprite tab brings its own full-width editor chrome, so the world
+    /// dock beside it is just a squeeze on both. Activating one closes the
+    /// dock.
+    #[gpui::test]
+    async fn test_activating_a_sprite_view_closes_the_world_dock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _dock, cx) = dock_showing_a_world(cx, dir.path()).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let weak_workspace = workspace.weak_handle();
+            let sprite =
+                cx.new(|cx| ggo_sprite_panel::SpriteEditorItem::new_empty(weak_workspace, cx));
+            workspace.add_item_to_active_pane(Box::new(sprite), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                !workspace
+                    .dock_at_position(DockPosition::Right)
+                    .read(cx)
+                    .is_open(),
+                "activating a sprite view must close the world dock"
+            );
+        });
+    }
+
+    /// Everything that is not a sprite view leaves the dock alone: the
+    /// user editing a world's toml beside its canvas still wants the world
+    /// in front of them.
+    #[gpui::test]
+    async fn test_activating_a_world_or_text_item_leaves_the_world_dock_open(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, dock, cx) = dock_showing_a_world(cx, dir.path()).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let text =
+                cx.new(|cx| workspace::item::test::TestItem::new(cx).with_label("test.wrld.toml"));
+            workspace.add_item_to_active_pane(Box::new(text), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .dock_at_position(DockPosition::Right)
+                    .read(cx)
+                    .is_open(),
+                "a text tab must leave the world dock open"
+            );
+        });
+        assert!(
+            dock.read_with(cx, |dock, _| dock.active().is_some()),
+            "and the dock keeps showing the world it had"
+        );
+    }
+
+    /// The close is the world dock closing ITSELF: with the right dock
+    /// showing somebody else's panel, a sprite view must not pull it shut.
+    #[gpui::test]
+    async fn test_a_sprite_view_leaves_another_right_dock_panel_open(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _dock, cx) = dock_showing_a_world(cx, dir.path()).await;
+
+        let other = workspace.update_in(cx, |workspace, window, cx| {
+            let other =
+                cx.new(|cx| workspace::dock::test::TestPanel::new(DockPosition::Right, 0, cx));
+            workspace.add_panel(other.clone(), window, cx);
+            workspace.focus_panel::<workspace::dock::test::TestPanel>(window, cx);
+            other
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let weak_workspace = workspace.weak_handle();
+            let sprite =
+                cx.new(|cx| ggo_sprite_panel::SpriteEditorItem::new_empty(weak_workspace, cx));
+            workspace.add_item_to_active_pane(Box::new(sprite), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let other_id = other.entity_id();
+        workspace.read_with(cx, |workspace, cx| {
+            let right = workspace.dock_at_position(DockPosition::Right).read(cx);
+            assert!(
+                right.is_open(),
+                "the right dock is showing another panel, which is not ours to close"
+            );
+            assert_eq!(
+                right.active_panel().map(|panel| panel.panel_id()),
+                Some(other_id)
+            );
+        });
     }
 }

@@ -49,6 +49,9 @@ emerald-core.workspace = true # GGO
 # `ggo_map_panel`'s own `PaintSession`/`MapTool` rather than growing a
 # second copy of the painting engine here.
 ggo_map_panel.workspace = true # GGO
+# GGO -- the dock steps aside for a sprite tab, which needs the center
+# editor's item type by name to recognize one.
+ggo_sprite_panel.workspace = true # GGO
 [dev-dependencies]
 # Test-only: decodes what the panel put on the viewer link back into APP
 # payloads, the same reader the emu panel runs over the cart's TX.
@@ -62,10 +65,6 @@ emerald-editor-runtime.workspace = true # GGO
 # exactly as this crate gates its own; the world panel's painting tests
 # will read cells back through them.
 ggo_map_panel = { workspace = true, features = ["test-support"] } # GGO
-# Test-only: the asset jump goes through the path-open interceptor
-# registry, so the sprite panel's `init` is what makes a `.spr` land in a
-# sprite tab in the jump test. The panel itself has no sprite-panel dep.
-ggo_sprite_panel.workspace = true # GGO
 # `project`'s test-support turns on `remote/test-support`, which adds a
 # `RemoteConnectionOptions` variant that `remote_connection`'s lib only
 # matches on under ITS `test-support` -- same dance `ggo_emu_panel`'s
