@@ -137,6 +137,17 @@ const MIN_SECTION: Pixels = px(80.);
 /// legitimate "show me the pool" gesture.
 const MIN_REFERENCE: Pixels = px(40.);
 
+/// The floor under the body row (preview + sheets + frames). The row is
+/// the only `flex_1` child of the panel's column, so without a floor the
+/// fixed chrome above and below it -- transport, onion, frame ops, the
+/// clips strip -- crushes it to nothing in a short pane instead of
+/// making the panel scroll.
+const BODY_MIN_HEIGHT: Pixels = px(120.);
+
+/// The cap on the anchored frame-settings popup, past which it scrolls:
+/// its ten transform rows outgrow a short window.
+const FRAME_SETTINGS_MAX_HEIGHT: Pixels = px(480.);
+
 /// Playback timer cadence. 16ms tracks a 60Hz frame; the ACTUAL frame
 /// shown each tick is recomputed from wall-clock elapsed time
 /// (`playback_frame_at`), so a late tick skips ahead rather than
@@ -3701,6 +3712,8 @@ impl SpritePanel {
             menu
         });
         h_flex()
+            .debug_selector(|| "ggo-sprite-transport".into())
+            .flex_wrap()
             .gap_1()
             .p_1()
             .border_b_1()
@@ -3809,6 +3822,7 @@ impl SpritePanel {
         };
         let o = open.onion;
         h_flex()
+            .flex_wrap()
             .gap_1()
             .px_1()
             .pb_1()
@@ -3877,13 +3891,20 @@ impl SpritePanel {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_preview is only called in the Ready state");
         };
+        // The frame is fitted to a fixed [`PREVIEW_PX`] box whatever the
+        // pane's width, so a squeezed region has to scroll on BOTH axes
+        // or the image is cut with no way to reach the rest of it.
+        // `min_w` (rather than the `min_w_0` this used to carry) is what
+        // lets the region shrink below its content while still refusing
+        // to be crushed to nothing by the fixed-width columns beside it
+        // -- the body row scrolls sideways instead.
         let mut preview = div()
+            .id("ggo-sprite-preview")
+            .debug_selector(|| "ggo-sprite-preview".into())
             .flex_1()
-            .min_w_0()
+            .min_w(MIN_SECTION)
             .h_full()
-            .flex()
-            .justify_center()
-            .items_center()
+            .overflow_scroll()
             .bg(cx.theme().colors().editor_background);
         // The shown frame with its transform applied (identity = the
         // strip's legacy image); a transformed frame's grid overlay is
@@ -3952,6 +3973,13 @@ impl SpritePanel {
             preview = preview.child(
                 div()
                     .relative()
+                    // Auto margins, not `justify_center`/`items_center` on
+                    // the scroller: they centre the image while it fits,
+                    // but collapse to zero once it does not, so an
+                    // oversized image starts at the region's top left
+                    // corner instead of being centred out of scroll range
+                    // (the range only ever runs `-overflow ..= 0`).
+                    .m_auto()
                     .w(px(fit_w))
                     .h(px(fit_h))
                     .children(ghosts)
@@ -4457,6 +4485,7 @@ impl SpritePanel {
         );
         div()
             .id("ggo-sprite-clips")
+            .debug_selector(|| "ggo-sprite-clips".into())
             .flex_none()
             .border_t_1()
             .border_color(cx.theme().colors().border)
@@ -4481,6 +4510,7 @@ impl SpritePanel {
         // the transport's, not the selection's.
         let meter = tiles::hw_meter_line(state, state.frames.get(open.shown_frame()));
         h_flex()
+            .flex_wrap()
             .gap_1()
             .p_1()
             .border_t_1()
@@ -4848,6 +4878,11 @@ impl SpritePanel {
             .id("ggo-sprite-frame-settings-popup")
             .debug_selector(|| "ggo-sprite-frame-settings-popup".into())
             .occlude()
+            // Ten rows of transform fields: taller than a short window,
+            // and an anchored popup is clipped by the window, not scrolled
+            // by anything above it.
+            .max_h(FRAME_SETTINGS_MAX_HEIGHT)
+            .overflow_y_scroll()
             .p_1()
             .gap_0p5()
             .rounded_sm()
@@ -4907,15 +4942,26 @@ impl SpritePanel {
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let bounds_cell = self.body_bounds.clone();
         v_flex()
+            .id("ggo-sprite-ready")
+            // The transport, onion, frame-op and clips rows are fixed
+            // chrome: past a short enough pane they no longer fit, and
+            // the panel scrolls rather than pushing the clips strip out
+            // of it.
+            .overflow_y_scroll()
             .size_full()
             .child(self.render_transport(window, cx))
             .child(self.render_onion(cx))
             .child(
                 h_flex()
+                    .id("ggo-sprite-body")
                     .relative()
                     .flex_1()
-                    .min_h_0()
+                    .min_h(BODY_MIN_HEIGHT)
                     .items_stretch()
+                    // The sheets and frames columns are fixed-width, so a
+                    // narrow pane has to scroll sideways to reach them
+                    // rather than crushing the preview between them.
+                    .overflow_x_scroll()
                     // The drag listener lives on the whole row, not on
                     // the handles: a fast drag outruns the 6px strip.
                     // `on_drag_move` fires in the CAPTURE phase for the
@@ -5393,6 +5439,202 @@ mod tests {
         assert!(
             after.origin.x < before.origin.x,
             "a sideways wheel must scroll the sheet: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// A wheel gesture at a window point, pumped: the shape every
+    /// overflow regression below needs.
+    fn wheel_at(
+        cx: &mut gpui::VisualTestContext,
+        position: gpui::Point<Pixels>,
+        delta: gpui::Point<Pixels>,
+    ) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(delta),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// Class A: the preview fits its frame into a [`PREVIEW_PX`] box
+    /// whatever the pane's width, so a squeezed preview region used to
+    /// cut the image on BOTH sides with no way to reach either. The
+    /// region scrolls now: at rest the image starts at the region's left
+    /// edge (nothing is cut off the unreachable side), and a sideways
+    /// wheel walks it to its right edge.
+    #[gpui::test]
+    async fn test_a_narrow_preview_scrolls_to_the_whole_image(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        // Oversized side columns clamp the preview down to MIN_SECTION,
+        // far below the fit box.
+        panel.update(cx, |panel, cx| {
+            panel.side_width = Some(px(2000.));
+            panel.frames_width = px(2000.);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let region = cx
+            .debug_bounds("ggo-sprite-preview")
+            .expect("preview region bounds recorded at paint");
+        let before = panel
+            .read_with(cx, |panel, _| *ready(panel).preview_bounds.borrow())
+            .expect("preview image bounds recorded at prepaint");
+        assert!(
+            before.size.width > region.size.width,
+            "the image must overflow its region for this to test anything: {before:?} in {region:?}"
+        );
+        assert!(
+            before.origin.x >= region.origin.x - px(1.),
+            "an overflowing image must start at the region's left edge, or its left side is unreachable: {before:?} in {region:?}"
+        );
+
+        wheel_at(cx, region.center(), gpui::point(px(-40.), px(0.)));
+        let after = panel
+            .read_with(cx, |panel, _| *ready(panel).preview_bounds.borrow())
+            .expect("preview image bounds after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the preview: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+
+        wheel_at(cx, region.center(), gpui::point(px(-2000.), px(0.)));
+        let end = panel
+            .read_with(cx, |panel, _| *ready(panel).preview_bounds.borrow())
+            .expect("preview image bounds at the scroll end");
+        assert!(
+            end.right() <= region.right() + px(1.),
+            "scrolling to the end must reach the image's right edge: {end:?} in {region:?}"
+        );
+
+        // The same trap on the other axis: a short region must not
+        // centre a taller image off its top.
+        cx.simulate_resize(gpui::size(px(900.), px(240.)));
+        cx.run_until_parked();
+        let region = cx
+            .debug_bounds("ggo-sprite-preview")
+            .expect("preview region bounds after the resize");
+        let short = panel
+            .read_with(cx, |panel, _| *ready(panel).preview_bounds.borrow())
+            .expect("preview image bounds in a short panel");
+        assert!(
+            short.size.height > region.size.height,
+            "the image must overflow the short region for this to test anything: {short:?} in {region:?}"
+        );
+        assert!(
+            short.origin.y >= region.origin.y - px(1.),
+            "an overflowing image must start at the region's top edge: {short:?} in {region:?}"
+        );
+    }
+
+    /// Class B: the transport row is a single `h_flex` of buttons, a
+    /// dropdown and two steppers -- wider than a narrow pane, so its
+    /// tail (undo/redo/Save) used to leave the panel entirely. It wraps
+    /// onto a second row instead.
+    #[gpui::test]
+    async fn test_b_the_transport_row_wraps_when_the_panel_is_narrow(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        let wide = cx
+            .debug_bounds("ggo-sprite-transport")
+            .expect("transport bounds recorded at paint");
+
+        cx.simulate_resize(gpui::size(px(320.), px(800.)));
+        cx.run_until_parked();
+        let narrow = cx
+            .debug_bounds("ggo-sprite-transport")
+            .expect("transport bounds after the resize");
+
+        // Two rows of the same controls, minus the row padding counted
+        // twice by doubling the one-row height.
+        assert!(
+            narrow.size.height >= wide.size.height * 2. - px(8.),
+            "a narrow transport row must wrap onto a second row: one row {:?}, narrow {:?}",
+            wide.size,
+            narrow.size
+        );
+    }
+
+    /// Class C: transport + onion + frame ops + the clips strip are
+    /// fixed-height chrome. In a short pane they used to eat the whole
+    /// column, crushing the body to nothing and pushing the clips strip
+    /// out of the panel. The body keeps a floor now and the root scrolls.
+    #[gpui::test]
+    async fn test_c_a_short_panel_scrolls_instead_of_crushing_the_body(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(220.)));
+        cx.run_until_parked();
+
+        let body = panel
+            .read_with(cx, |panel, _| *panel.body_bounds.borrow())
+            .expect("body bounds recorded at prepaint");
+        assert!(
+            body.size.height >= BODY_MIN_HEIGHT,
+            "the body must keep its floor in a short panel: {body:?}"
+        );
+
+        let transport = cx
+            .debug_bounds("ggo-sprite-transport")
+            .expect("transport bounds recorded at paint");
+        let before = cx
+            .debug_bounds("ggo-sprite-clips")
+            .expect("clips bounds recorded at paint");
+        // The transport row's `flex_1` spacer: empty space over the root,
+        // with no inner scroller to take the wheel first.
+        wheel_at(cx, transport.center(), gpui::point(px(0.), px(-60.)));
+        let after = cx
+            .debug_bounds("ggo-sprite-clips")
+            .expect("clips bounds after the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "wheeling down a short panel must bring the clips strip up: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// Class D: the sheets and frames columns are fixed-width. Below
+    /// three [`MIN_SECTION`]s of body there is no width left for all
+    /// three sections, and the preview used to be crushed to zero. The
+    /// preview holds its floor and the body row scrolls sideways.
+    #[gpui::test]
+    async fn test_d_a_narrow_body_scrolls_sideways_past_the_columns(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(200.), px(800.)));
+        cx.run_until_parked();
+
+        let preview = cx
+            .debug_bounds("ggo-sprite-preview")
+            .expect("preview region bounds recorded at paint");
+        assert!(
+            preview.size.width >= MIN_SECTION,
+            "the preview must keep its floor in a narrow body: {preview:?}"
+        );
+        let before = panel
+            .read_with(cx, |panel, _| *panel.sheets_bounds.borrow())
+            .expect("sheets column bounds recorded at prepaint");
+
+        // Over the sheets column's own header strip, clear of the
+        // divider handles that occlude the column edges.
+        let inside = gpui::point(before.center().x, before.origin.y + px(2.));
+        wheel_at(cx, inside, gpui::point(px(-60.), px(0.)));
+        let after = panel
+            .read_with(cx, |panel, _| *panel.sheets_bounds.borrow())
+            .expect("sheets column bounds after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the body row: before {:?}, after {:?}",
             before.origin,
             after.origin
         );
