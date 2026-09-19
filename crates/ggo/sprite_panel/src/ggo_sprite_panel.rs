@@ -4063,7 +4063,11 @@ impl SpritePanel {
             })
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .min_w_0()
+            // Both axes: a sheet wider than its column must scroll
+            // sideways, and a scroll container's automatic minimum size
+            // is zero, which is what stops the column growing to fit it.
+            .overflow_scroll()
             .p_1()
             .child(
                 div()
@@ -5331,6 +5335,67 @@ mod tests {
         });
         cx.run_until_parked();
         (panel, cx)
+    }
+
+    /// A sheet wider than its column scrolls sideways. The sheets used
+    /// to scroll on the y axis only, so a wide tile picker or reference
+    /// sheet was clipped at the column edge with no way to reach the
+    /// rest of it.
+    #[gpui::test]
+    async fn test_a_wide_sheet_scrolls_horizontally(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        // The tile picker caps its columns at the pool size, so the
+        // reference sheet (the same `render_sheet`) is the one that can
+        // be made wider than the column: 40 cells of the fixture's tiles.
+        write_sprite_fixture(dir.path());
+        reference_sheet::save(
+            dir.path(),
+            "sprites/hero.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 40,
+                rows: 1,
+                tiles: (0..40).map(|i| i % 2).collect(),
+            },
+        )
+        .unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        // The column auto-sizes to its widest sheet; a dragged width is
+        // what leaves a sheet wider than the column.
+        panel.update(cx, |panel, cx| {
+            panel.side_width = Some(px(200.));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let before = panel
+            .read_with(cx, |panel, _| *ready(panel).reference_bounds.borrow())
+            .expect("reference bounds recorded at prepaint");
+        let column = panel
+            .read_with(cx, |panel, _| *panel.sheets_bounds.borrow())
+            .expect("sheets column bounds recorded at prepaint");
+        assert!(
+            before.size.width > column.size.width,
+            "the sheet must overflow its column for this to test anything: {before:?} in {column:?}"
+        );
+
+        let inside = before.origin + gpui::point(px(PICKER_CELL_PX / 2.), px(PICKER_CELL_PX / 2.));
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: inside,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-100.), px(0.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+
+        let after = panel
+            .read_with(cx, |panel, _| *ready(panel).reference_bounds.borrow())
+            .expect("reference bounds after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the sheet: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
     }
 
     /// End-to-end viewer load against a real-fs temp project: opening the
