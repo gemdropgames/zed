@@ -63,6 +63,13 @@ const KEY_CONTEXT: &str = "GgoAudioPanel";
 const AUDIO_EXTS: [&str; 3] = ["wav", "ogg", "adp"];
 
 const WAVEFORM_HEIGHT_PX: f32 = 160.0;
+
+// `debug_selector` handles for the regions whose overflow behaviour the
+// layout tests assert. gpui records a selector's painted bounds only in
+// test builds (`div.rs` discards the closure unevaluated otherwise), so
+// these cost nothing shipped.
+const HEADER_SELECTOR: &str = "ggo-audio-header";
+const TRANSPORT_SELECTOR: &str = "ggo-audio-transport";
 /// The playhead redraw cadence while a preview runs.
 const PLAYHEAD_TICK: Duration = Duration::from_millis(33);
 
@@ -769,6 +776,8 @@ impl AudioPanel {
         let can_import = !is_adp && open.baked.is_some();
 
         let transport = h_flex()
+            .debug_selector(|| TRANSPORT_SELECTOR.to_string())
+            .flex_wrap()
             .gap_2()
             .p_1()
             .items_center()
@@ -833,10 +842,19 @@ impl AudioPanel {
             });
 
         v_flex()
+            .id("ggo-audio-ready")
             .size_full()
+            // Nothing here shrinks usefully: the waveform has a fixed
+            // height and the header, transport and readout wrap instead
+            // of getting shorter. Past a certain shortness that chrome no
+            // longer fits, and the tab scrolls rather than hiding the
+            // transport and the error line below the bottom edge.
+            .overflow_y_scroll()
             .bg(cx.theme().colors().panel_background)
             .child(
                 h_flex()
+                    .debug_selector(|| HEADER_SELECTOR.to_string())
+                    .flex_wrap()
                     .gap_2()
                     .p_1()
                     .border_b_1()
@@ -928,6 +946,10 @@ impl AudioPanel {
         )
         .w_full()
         .h(px(WAVEFORM_HEIGHT_PX))
+        // A canvas has no content to set a flex item's automatic minimum,
+        // so without this a short pane shrinks the waveform towards zero
+        // instead of overflowing the column into its scroll range.
+        .flex_none()
         .into_any_element()
     }
 }
@@ -1237,5 +1259,85 @@ mod tests {
             workspace.intercept_path_open(&project_path(worktree_id, "notes.txt"), window, cx)
         });
         assert!(!claimed, "everything else opens the normal way");
+    }
+
+    // ------------------------------------------------ layout / overflow
+
+    /// Resize the window and let the tab redraw at the new size.
+    fn resize(cx: &mut gpui::VisualTestContext, width: f32, height: f32) {
+        cx.simulate_resize(size(px(width), px(height)));
+        cx.run_until_parked();
+    }
+
+    fn wheel(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>, dx: f32, dy: f32) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// Class B: the transport is Play, Loop, two mode buttons, the rate
+    /// dropdown, the import-target editor and the Import button. In a
+    /// narrow tab a single row pushed Import off the edge with no way to
+    /// reach it; it must wrap instead.
+    #[gpui::test]
+    async fn test_b_the_transport_wraps_when_the_tab_is_narrow(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        let (_item, cx) = ready_item(cx, dir.path(), "audio-src/jump.wav").await;
+
+        resize(cx, 1600., 700.);
+        let wide = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds recorded at paint");
+
+        resize(cx, 360., 700.);
+        let narrow = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds recorded at paint");
+
+        assert!(
+            narrow.size.height >= wide.size.height * 2.,
+            "a 360px-wide transport must wrap onto at least two rows: \
+             one row is {wide:?}, narrow is {narrow:?}"
+        );
+    }
+
+    /// Class C: nothing in this tab scrolled, so in a short pane the
+    /// waveform was squeezed towards nothing and the transport, readout
+    /// and error line fell off the bottom unreachable. The waveform keeps
+    /// its height and the tab scrolls instead.
+    #[gpui::test]
+    async fn test_c_a_short_tab_scrolls_its_chrome_into_reach(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        let (_item, cx) = ready_item(cx, dir.path(), "audio-src/jump.wav").await;
+        resize(cx, 500., 140.);
+
+        let header = cx
+            .debug_bounds(HEADER_SELECTOR)
+            .expect("header bounds recorded at paint");
+        let before = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds recorded at paint");
+        assert!(
+            before.origin.y >= px(WAVEFORM_HEIGHT_PX),
+            "the waveform must keep its full height rather than being \
+             crushed by a short pane: transport at {before:?}"
+        );
+
+        wheel(cx, header.center(), 0., -80.);
+
+        let after = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds after the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "a downward wheel must bring the transport up into view: \
+             before {before:?}, after {after:?}"
+        );
     }
 }
