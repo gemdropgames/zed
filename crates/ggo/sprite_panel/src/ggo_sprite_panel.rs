@@ -124,6 +124,23 @@ const PICKER_WIDTH: Pixels = px(PICKER_CELL_PX * loader::PICKER_COLS as f32 + 12
 /// width before any divider drag.
 const CLIPS_WIDTH: Pixels = px(148.);
 
+/// One clip row's pitch in the clips strip: a [`THUMB_PX`] thumbnail,
+/// the duration/ops line under it, the cell's and row's padding and
+/// borders, and the gap to the next row.
+const CLIPS_ROW_PX: f32 = THUMB_PX + 40.;
+
+/// What the clips section costs around its rows: the "+ Clip" footer,
+/// the strip's own padding, and the section's top border.
+const CLIPS_CHROME_PX: f32 = 35.;
+
+/// The clips section's height before any [`Divider::Clips`] drag: three
+/// clip rows.
+const CLIPS_DEFAULT_HEIGHT: Pixels = px(CLIPS_ROW_PX * 3. + CLIPS_CHROME_PX);
+
+/// The smallest a [`Divider::Clips`] drag may leave the clips section:
+/// one row, so the "+ Clip" button and a whole clip stay on screen.
+const MIN_CLIPS_HEIGHT: Pixels = px(CLIPS_ROW_PX + CLIPS_CHROME_PX);
+
 /// A divider handle's grab width, straddling the border it sizes -- the
 /// same figure `workspace::dock`'s `RESIZE_HANDLE_SIZE` uses.
 const DIVIDER_SIZE: Pixels = px(6.);
@@ -649,7 +666,7 @@ enum PickerView {
     Reference,
 }
 
-/// Which of the viewer's three session-only dividers a drag is sizing.
+/// Which of the viewer's four session-only dividers a drag is sizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Divider {
     /// Between the preview and the sheets column: sizes the sheets.
@@ -658,6 +675,8 @@ enum Divider {
     SideFrames,
     /// Between the reference sheet and the tile picker below it.
     ReferencePicker,
+    /// Between the frame-op row and the clips strip: sizes the strip.
+    Clips,
 }
 
 /// A divider mid-drag. `workspace::DraggedDock`'s shape: the drag state
@@ -680,14 +699,16 @@ impl Render for DraggedDivider {
 
 /// Resolve a divider drag at window position `position` into the new
 /// size of the section that divider controls, clamped so no neighbour
-/// collapses. `body` is the three-column row's bounds and `column` the
-/// sheets column's; `side_width`/`frames_width` are the current widths
-/// of the sheets and frames columns.
+/// collapses. `panel` is the whole viewer column's bounds, `body` the
+/// three-column row's and `column` the sheets column's;
+/// `side_width`/`frames_width` are the current widths of the sheets and
+/// frames columns.
 ///
 /// Pure so the clamps are testable without a window.
 fn divider_size(
     divider: Divider,
     position: gpui::Point<Pixels>,
+    panel: Bounds<Pixels>,
     body: Bounds<Pixels>,
     column: Bounds<Pixels>,
     side_width: Pixels,
@@ -705,6 +726,13 @@ fn divider_size(
         Divider::ReferencePicker => {
             let max = (column.size.height - MIN_SECTION).max(MIN_REFERENCE);
             (position.y - column.top()).clamp(MIN_REFERENCE, max)
+        }
+        // Measured UP from the panel's bottom edge, which the strip sits
+        // against: the strip's own top follows the drag, so it cannot be
+        // the edge the height is measured from.
+        Divider::Clips => {
+            let max = (panel.size.height - BODY_MIN_HEIGHT).max(MIN_CLIPS_HEIGHT);
+            (panel.bottom() - position.y).clamp(MIN_CLIPS_HEIGHT, max)
         }
     }
 }
@@ -1509,6 +1537,15 @@ pub struct SpritePanel {
     /// [`Divider::ReferencePicker`] drag has set one; `None` splits the
     /// sheets column evenly between the two sheets.
     reference_height: Option<Pixels>,
+    /// The clips strip section's height once a [`Divider::Clips`] drag
+    /// has set one; `None` is [`CLIPS_DEFAULT_HEIGHT`].
+    clips_height: Option<Pixels>,
+    /// The whole viewer column's on-screen bounds, recorded at prepaint.
+    /// The clips divider measures up from its bottom edge and the clips
+    /// clamp divides its height with the body; [`Self::body_bounds`] can
+    /// do neither job, because the body row SHRINKS as the clips strip
+    /// grows -- a clamp against it would fight the drag it is clamping.
+    panel_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// The three-column body row's on-screen bounds, recorded at
     /// prepaint so a divider drag's window position becomes a width.
     body_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
@@ -1591,6 +1628,8 @@ impl SpritePanel {
             side_width: None,
             frames_width: CLIPS_WIDTH,
             reference_height: None,
+            clips_height: None,
+            panel_bounds: Rc::new(RefCell::new(None)),
             body_bounds: Rc::new(RefCell::new(None)),
             sheets_bounds: Rc::new(RefCell::new(None)),
             load_generation: 0,
@@ -3058,18 +3097,22 @@ impl SpritePanel {
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let (Some(body), Some(column)) = (*self.body_bounds.borrow(), *self.sheets_bounds.borrow())
-        else {
+        let (Some(panel), Some(body), Some(column)) = (
+            *self.panel_bounds.borrow(),
+            *self.body_bounds.borrow(),
+            *self.sheets_bounds.borrow(),
+        ) else {
             return;
         };
         // The RENDERED widths, not the stored ones: the neighbour a
         // clamp has to respect is the one on screen.
         let (side_width, frames_width) = self.column_widths();
-        let size = divider_size(divider, position, body, column, side_width, frames_width);
+        let size = divider_size(divider, position, panel, body, column, side_width, frames_width);
         let changed = match divider {
             Divider::PreviewSide => self.side_width.replace(size) != Some(size),
             Divider::SideFrames => std::mem::replace(&mut self.frames_width, size) != size,
             Divider::ReferencePicker => self.reference_height.replace(size) != Some(size),
+            Divider::Clips => self.clips_height.replace(size) != Some(size),
         };
         if changed {
             cx.notify();
@@ -3114,6 +3157,19 @@ impl SpritePanel {
             return Some(height);
         };
         Some(height.min((column.size.height - MIN_SECTION).max(MIN_REFERENCE)))
+    }
+
+    /// The clips section's height AS RENDERED: the dragged height (or
+    /// [`CLIPS_DEFAULT_HEIGHT`]) re-clamped against the panel's current
+    /// height for the same reason [`Self::column_widths`] re-clamps the
+    /// widths -- a pane shortened after the drag must still leave the
+    /// body row room, rather than handing the whole panel to the strip.
+    fn rendered_clips_height(&self) -> Pixels {
+        let height = self.clips_height.unwrap_or(CLIPS_DEFAULT_HEIGHT);
+        let Some(panel) = *self.panel_bounds.borrow() else {
+            return height;
+        };
+        height.min((panel.size.height - BODY_MIN_HEIGHT).max(MIN_CLIPS_HEIGHT))
     }
 
     fn deselect_tile(&mut self, cx: &mut Context<Self>) {
@@ -4146,12 +4202,15 @@ impl SpritePanel {
     /// strip straddles a border, and the section on the far side paints
     /// after it and would otherwise swallow half the grab area.
     fn divider_handle(divider: Divider, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let name = match divider {
+            Divider::PreviewSide => "ggo-sprite-divider-side",
+            Divider::SideFrames => "ggo-sprite-divider-frames",
+            Divider::ReferencePicker => "ggo-sprite-divider-reference",
+            Divider::Clips => "ggo-sprite-divider-clips",
+        };
         div()
-            .id(match divider {
-                Divider::PreviewSide => "ggo-sprite-divider-side",
-                Divider::SideFrames => "ggo-sprite-divider-frames",
-                Divider::ReferencePicker => "ggo-sprite-divider-reference",
-            })
+            .id(name)
+            .debug_selector(|| name.into())
             .on_drag(
                 DraggedDivider(divider, cx.entity_id()),
                 |dragged, _, _, cx| {
@@ -4412,12 +4471,16 @@ impl SpritePanel {
             .into_any_element()
     }
 
-    /// The clip-CRUD side column: per clip a name row (+ delete) and a
-    /// from/to/loop row, an inline range error under the offending clip,
-    /// and an add button.
-    /// The clips as a horizontal card row along the BOTTOM (where the
-    /// sequence has room to breathe); click a card to activate its clip,
-    /// whose sequence renders in the row beneath.
+    /// The clips strip along the BOTTOM: one ROW per clip -- a
+    /// fixed-width header column (name, loop, delete) and the clip's
+    /// sequence beside it -- stacked in a vertical scroller whose height
+    /// the [`Divider::Clips`] handle sizes, with "+ Clip" in a footer
+    /// under the scroller so it stays reachable however many clips there
+    /// are. Click a row to activate its clip.
+    ///
+    /// Each sequence gets its OWN sideways scroller: a long clip scrolls
+    /// under its header rather than dragging the whole strip sideways
+    /// and taking every clip's name off screen with it.
     fn render_clips(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_clips is only called in the Ready state");
@@ -4429,25 +4492,19 @@ impl SpritePanel {
                 .find(|e| e.target == target)
                 .map(|e| e.editor.clone())
         };
-        let mut cards = h_flex().p_1().gap_1().items_start();
+        let mut strip = v_flex()
+            .id("ggo-sprite-clips")
+            .debug_selector(|| "ggo-sprite-clips".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_1()
+            .gap_1();
         for (i, clip) in state.clips.iter().enumerate() {
-            let row = v_flex()
-                .id(("ggo-sprite-clip", i))
-                .min_w(CLIPS_WIDTH)
+            let header = v_flex()
                 .flex_none()
-                .gap_0p5()
-                .p_0p5()
-                .border_1()
-                .rounded_sm()
-                .border_color(if open.active_clip == Some(i) {
-                    cx.theme().colors().border_focused
-                } else {
-                    cx.theme().colors().border_variant
-                })
-                // Click anywhere on the card to make the clip active
-                // (clicks inside its editors bubble here too -- selecting
-                // the clip being edited is a no-op).
-                .on_click(cx.listener(move |this, _, _, cx| this.select_clip(Some(i), cx)))
+                .w(CLIPS_WIDTH)
+                .debug_selector(|| format!("ggo-sprite-clip-header-{i}"))
                 .child(
                     h_flex()
                         .gap_0p5()
@@ -4475,22 +4532,63 @@ impl SpritePanel {
                                     cx.listener(move |this, _, _, cx| this.delete_clip(i, cx)),
                                 ),
                         ),
-                )
-                .child(self.render_sequence_for(i, cx));
-            cards = cards.child(row);
+                );
+            let sequence = h_flex()
+                .id(("ggo-sprite-clip-seq", i))
+                .debug_selector(|| format!("ggo-sprite-clip-seq-{i}"))
+                .flex_1()
+                .min_w_0()
+                .overflow_x_scroll()
+                // The scroller's range comes from its DIRECT child's
+                // width, so the sequence may not be allowed to shrink to
+                // the scroller's own width.
+                .child(h_flex().flex_none().child(self.render_sequence_for(i, cx)));
+            strip = strip.child(
+                h_flex()
+                    .id(("ggo-sprite-clip", i))
+                    .debug_selector(|| format!("ggo-sprite-clip-row-{i}"))
+                    .flex_none()
+                    .items_start()
+                    .gap_1()
+                    .p_0p5()
+                    .border_1()
+                    .rounded_sm()
+                    .border_color(if open.active_clip == Some(i) {
+                        cx.theme().colors().border_focused
+                    } else {
+                        cx.theme().colors().border_variant
+                    })
+                    // Click anywhere on the row to make the clip active
+                    // (clicks inside its editors bubble here too --
+                    // selecting the clip being edited is a no-op).
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_clip(Some(i), cx)))
+                    .child(header)
+                    .child(sequence),
+            );
         }
-        cards = cards.child(
-            Button::new("ggo-sprite-clip-add", "+ Clip")
-                .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
-        );
-        div()
-            .id("ggo-sprite-clips")
-            .debug_selector(|| "ggo-sprite-clips".into())
+        v_flex()
+            .relative()
+            .debug_selector(|| "ggo-sprite-clips-section".into())
             .flex_none()
+            .h(self.rendered_clips_height())
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .overflow_x_scroll()
-            .child(cards)
+            .child(gpui::deferred(
+                Self::divider_handle(Divider::Clips, cx)
+                    .absolute()
+                    .top(-DIVIDER_SIZE / 2.)
+                    .left_0()
+                    .w_full()
+                    .h(DIVIDER_SIZE)
+                    .cursor_row_resize(),
+            ))
+            .child(strip)
+            .child(
+                h_flex().flex_none().px_1().pb_1().child(
+                    Button::new("ggo-sprite-clip-add", "+ Clip")
+                        .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
+                ),
+            )
             .into_any_element()
     }
 
@@ -5113,6 +5211,7 @@ impl Render for SpritePanel {
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
         let form = self.render_form(window, cx);
+        let panel_bounds = self.panel_bounds.clone();
         v_flex()
             .key_context(self.dispatch_context(window, cx))
             .size_full()
@@ -5133,7 +5232,25 @@ impl Render for SpritePanel {
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
             .children(form)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _window, _cx| {
+                                *panel_bounds.borrow_mut() = Some(bounds);
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .child(body),
+            )
     }
 }
 
@@ -5638,6 +5755,177 @@ mod tests {
             before.origin,
             after.origin
         );
+    }
+
+    /// The clips used to be cards side by side, so every clip past the
+    /// first two or three was off the panel's right edge behind a
+    /// sideways scroll. They stack as rows now in a strip of a fixed
+    /// height that the extra clips scroll within.
+    #[gpui::test]
+    async fn test_many_clips_stack_and_scroll_vertically(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        panel.update(cx, |panel, cx| {
+            while ready(panel).store.state().clips.len() < 8 {
+                panel.add_clip(cx);
+            }
+        });
+        cx.run_until_parked();
+
+        let section = cx
+            .debug_bounds("ggo-sprite-clips-section")
+            .expect("clips section bounds recorded at paint");
+        assert_eq!(
+            section.size.height, CLIPS_DEFAULT_HEIGHT,
+            "eight clips must not grow the strip past its divider height: {section:?}"
+        );
+        let strip = cx
+            .debug_bounds("ggo-sprite-clips")
+            .expect("clips strip bounds recorded at paint");
+        let before = cx
+            .debug_bounds("ggo-sprite-clip-row-7")
+            .expect("the eighth clip's row bounds recorded at paint");
+        assert!(
+            before.origin.y > strip.bottom(),
+            "the eighth clip must start below the strip for this to test anything: {before:?} in {strip:?}"
+        );
+
+        // Over the pinned header column: a vertical wheel over a
+        // sequence scroller would be turned into a SIDEWAYS one (gpui
+        // maps a delta onto whichever axis a scroller has).
+        let over_headers = gpui::point(strip.origin.x + CLIPS_WIDTH / 2., strip.center().y);
+        wheel_at(cx, over_headers, gpui::point(px(0.), px(-200.)));
+        let after = cx
+            .debug_bounds("ggo-sprite-clip-row-7")
+            .expect("the eighth clip's row bounds after the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "wheeling down the strip must bring the eighth clip up: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// A clip with more entries than the row is wide scrolls sideways in
+    /// its own scroller, leaving its name/loop/delete header column
+    /// pinned at the left where the clip stays identifiable.
+    #[gpui::test]
+    async fn test_a_long_clip_scrolls_sideways_under_its_header(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(700.), px(800.)));
+        panel.update(cx, |panel, cx| {
+            while ready(panel).store.state().clips[0].entries.len() < 30 {
+                panel.duplicate_entry_in_clip(0, 0, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("ggo-sprite-clip-row-0")
+            .expect("the clip's row bounds recorded at paint");
+        let header = cx
+            .debug_bounds("ggo-sprite-clip-header-0")
+            .expect("the clip's header column bounds recorded at paint");
+        let before = cx
+            .debug_bounds("ggo-sprite-seq-0-29")
+            .expect("the thirtieth entry's bounds recorded at paint");
+        assert!(
+            before.origin.x > row.right(),
+            "the sequence must overflow its row for this to test anything: {before:?} in {row:?}"
+        );
+
+        let sequence = cx
+            .debug_bounds("ggo-sprite-clip-seq-0")
+            .expect("the clip's sequence scroller bounds recorded at paint");
+        wheel_at(cx, sequence.center(), gpui::point(px(-300.), px(0.)));
+        let after = cx
+            .debug_bounds("ggo-sprite-seq-0-29")
+            .expect("the thirtieth entry's bounds after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the sequence: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+        assert_eq!(
+            cx.debug_bounds("ggo-sprite-clip-header-0"),
+            Some(header),
+            "the sequence must scroll UNDER its header column, not take it along"
+        );
+    }
+
+    /// The clips divider sizes the strip: dragging it up makes the strip
+    /// taller by what the pointer moved, and a pane shortened afterwards
+    /// re-clamps the dragged height so the rest of the panel keeps its
+    /// floor instead of the strip taking everything.
+    #[gpui::test]
+    async fn test_the_clips_divider_resizes_the_strip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds("ggo-sprite-clips-section")
+            .expect("clips section bounds recorded at paint");
+        let handle = cx
+            .debug_bounds("ggo-sprite-divider-clips")
+            .expect("the clips divider handle is painted");
+        assert!(
+            (handle.center().y - before.origin.y).abs() <= DIVIDER_SIZE,
+            "the handle must straddle the strip's top edge: {handle:?} over {before:?}"
+        );
+
+        // The whole rendered gesture: the handle starts the drag and the
+        // BODY row's `on_drag_move` (which fires window-wide, with no
+        // hitbox test) turns it into a height.
+        let target = gpui::point(before.center().x, before.origin.y - px(100.));
+        cx.simulate_mouse_move(handle.center(), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(
+            handle.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(target, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(target, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds("ggo-sprite-clips-section")
+            .expect("clips section bounds after the drag");
+        assert!(
+            (after.size.height - before.size.height - px(100.)).abs() < px(2.),
+            "dragging the divider 100px up must make the strip 100px taller: before {:?}, after {:?}",
+            before.size,
+            after.size
+        );
+
+        // Shortened afterwards: the dragged height is a render-time
+        // clamp away from swallowing the body's floor. The clamp reads
+        // the panel bounds the canvas hook recorded at the PREVIOUS
+        // prepaint, so like the reference divider's it bites on the
+        // next draw rather than within the resize's own frame.
+        cx.simulate_resize(gpui::size(px(900.), px(300.)));
+        cx.run_until_parked();
+        panel.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let short = cx
+            .debug_bounds("ggo-sprite-clips-section")
+            .expect("clips section bounds after the resize");
+        assert!(
+            short.size.height <= px(300.) - BODY_MIN_HEIGHT,
+            "a short pane must re-clamp the dragged strip: {short:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.clips_height,
+                Some(after.size.height),
+                "the clamp is a render concern -- the dragged height survives it"
+            );
+        });
     }
 
     /// End-to-end viewer load against a real-fs temp project: opening the
@@ -7626,7 +7914,12 @@ mod tests {
     #[test]
     fn test_divider_size_tracks_the_pointer_and_clamps_its_neighbours() {
         // A 1000x500 body at (100, 50), sheets column 300 wide sitting
-        // between a 148-wide frames column and the preview.
+        // between a 148-wide frames column and the preview, inside a
+        // 1000x700 viewer column at (100, 0).
+        let panel = Bounds::new(
+            gpui::point(px(100.), px(0.)),
+            gpui::size(px(1000.), px(700.)),
+        );
         let body = Bounds::new(
             gpui::point(px(100.), px(50.)),
             gpui::size(px(1000.), px(500.)),
@@ -7640,6 +7933,7 @@ mod tests {
             divider_size(
                 divider,
                 gpui::point(px(x), px(y)),
+                panel,
                 body,
                 column,
                 side,
@@ -7676,6 +7970,14 @@ mod tests {
             at(Divider::ReferencePicker, 800., 1000.),
             px(500.) - MIN_SECTION
         );
+
+        // Clips: the strip runs from the pointer DOWN to the panel's
+        // bottom edge (700), so dragging up makes it taller.
+        assert_eq!(at(Divider::Clips, 600., 500.), px(200.));
+        // Dragged past the bottom: the strip keeps one row.
+        assert_eq!(at(Divider::Clips, 600., 700.), MIN_CLIPS_HEIGHT);
+        // Dragged off the top: the rest of the panel keeps its floor.
+        assert_eq!(at(Divider::Clips, 600., 0.), px(700.) - BODY_MIN_HEIGHT);
     }
 
     /// The dragged sizes are re-clamped AT RENDER, not just at drag
