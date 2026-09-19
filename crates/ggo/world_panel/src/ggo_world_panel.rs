@@ -26,6 +26,7 @@
 mod audio_budget;
 mod bags;
 mod canvas;
+mod editor_meta;
 mod inspector;
 mod live;
 mod loader;
@@ -787,6 +788,11 @@ struct OpenWorld {
     /// task M7).
     root: PathBuf,
     store: WorldDocStore,
+    /// Editor-only entity names from the `.ggo-ide` sidecar, parallel to
+    /// `store.state().entities` and possibly shorter (missing tail =
+    /// unnamed). NEVER written into the world file, never part of dirty
+    /// tracking: renaming an entity is not an edit to the document.
+    entity_names: Vec<String>,
     sprite_loads: AssetLoads,
     map_loads: AssetLoads,
     meta_sprite_loads: AssetLoads,
@@ -837,6 +843,12 @@ struct OpenWorld {
     /// The open palette color picker, if any -- at most one, anchored to
     /// one Color565 field.
     color_picker: Option<ColorPicker>,
+    /// The entity-list row being renamed inline, if any: its index and
+    /// the single-line editor that row draws in place of its label.
+    rename: Option<(usize, Entity<Editor>)>,
+    /// Keeps [`Self::rename`]'s editor subscribed for as long as the
+    /// rename is open -- dropping it is what stops the blur-commit.
+    _rename_subscription: Option<Subscription>,
     /// The focused Asset field's completion feed, if any -- at most one.
     /// Recomputed only when focus moves onto a DIFFERENT asset field
     /// ([`WorldPanel::refresh_stem_completion`]), so the directory walk
@@ -952,11 +964,13 @@ impl OpenWorld {
             .map(|instance| instance.world.clone())
             .collect();
         let loaded_instance_counts = loaded.instance_counts;
+        let entity_names = editor_meta::load(&root, &listing.rel_path).entity_names;
         OpenWorld {
             listing,
             source_rel,
             root,
             store: loaded.store,
+            entity_names,
             sprite_loads: loaded.sprite_loads,
             map_loads: loaded.map_loads,
             meta_sprite_loads: loaded.meta_sprite_loads,
@@ -988,6 +1002,8 @@ impl OpenWorld {
             audio_size_generation: 0,
             _audio_size_task: None,
             color_picker: None,
+            rename: None,
+            _rename_subscription: None,
             stem_completion: None,
             mode: EditMode::default(),
             sessions: HashMap::new(),
@@ -1029,27 +1045,21 @@ fn retired_by_rebuild(
         .collect()
 }
 
-/// The list column's rows: every entity (`#i <first non-Transform
-/// component>[ · stem]` -- any component's `stem`, so Tilemap and Sfx
-/// rows read as usefully as sprites) then every instance (`⧉ <stem>`).
-fn entity_list_rows(state: &ggo_worldlib::world_doc::WorldState) -> Vec<(Selection, String)> {
+/// The list column's rows: every entity (its editor-only name from
+/// `names`, or `#i` when it has none) then every instance
+/// (`⧉ <stem>`). `names` is index-parallel to `state.entities` and may
+/// be shorter -- see [`editor_meta`].
+fn entity_list_rows(
+    state: &ggo_worldlib::world_doc::WorldState,
+    names: &[String],
+) -> Vec<(Selection, String)> {
     let mut rows = Vec::with_capacity(state.entities.len() + state.instances.len());
-    for (i, entity) in state.entities.iter().enumerate() {
-        let name = entity
-            .components
-            .keys()
-            .find(|k| k.as_str() != "Transform")
-            .cloned()
-            .unwrap_or_else(|| "Entity".to_string());
-        let stem = entity
-            .components
-            .get(&name)
-            .and_then(|c| c.get("stem"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|s| format!(" · {s}"))
-            .unwrap_or_default();
-        rows.push((Selection::Entity(i), format!("#{i} {name}{stem}")));
+    for i in 0..state.entities.len() {
+        let label = match names.get(i) {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => format!("#{i}"),
+        };
+        rows.push((Selection::Entity(i), label));
     }
     for (i, instance) in state.instances.iter().enumerate() {
         rows.push((
@@ -1150,6 +1160,20 @@ fn remove_selection_ops(
         )
         .collect();
     (!ops.is_empty()).then_some(WorldOp::Batch(ops))
+}
+
+/// The entity indices `op` removes, highest first -- the order
+/// [`OpenWorld::entity_names`] has to be pruned in, since every removal
+/// shifts the indices above it.
+fn removed_entity_indices(op: &WorldOp) -> Vec<usize> {
+    let mut indices = match op {
+        WorldOp::Batch(ops) => ops.iter().flat_map(removed_entity_indices).collect(),
+        WorldOp::RemoveEntity { index } => vec![*index],
+        _ => Vec::new(),
+    };
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    indices.dedup();
+    indices
 }
 
 /// The current paint-ordered draw list -- built fresh per use (render,
@@ -1346,6 +1370,22 @@ impl OpenWorld {
         let entities = self.store.state().entities.len();
         if let Some(live) = self.live.as_mut() {
             live.index_map = live::IndexMap::new(entities, &self.instance_counts);
+        }
+    }
+
+    /// Persist the editor-only entity names. Failures are logged, not
+    /// surfaced: a lost name must never block or noise up an edit, and
+    /// the names are not document state, so there is no dirty flag to
+    /// defer the write behind.
+    fn write_entity_names(&self) {
+        let meta = editor_meta::EditorMeta {
+            entity_names: self.entity_names.clone(),
+        };
+        if let Err(e) = editor_meta::save(&self.root, &self.listing.rel_path, &meta) {
+            log::error!(
+                "GGO: failed to write editor sidecar for {}: {e}",
+                self.listing.rel_path
+            );
         }
     }
 
@@ -4249,7 +4289,21 @@ impl WorldPanel {
         let Some(batch) = remove_selection_ops(&open.selected, &open.store.state()) else {
             return;
         };
+        let removed = removed_entity_indices(&batch);
         open.store.apply(batch);
+        // ponytail: the names are keyed by INDEX (the world file has no
+        // entity id), so an UNDONE delete brings the entity back
+        // unnamed -- the name was dropped here and undo only restores
+        // the document. The upgrade is a stable per-entity editor id in
+        // the sidecar, which undo would put back alongside the entity.
+        if !removed.is_empty() {
+            for index in removed {
+                if index < open.entity_names.len() {
+                    open.entity_names.remove(index);
+                }
+            }
+            open.write_entity_names();
+        }
         open.note_doc_changed();
         open.selected.clear();
         open.edit_drag = None;
@@ -6226,6 +6280,14 @@ impl WorldPanel {
         if !matches!(event, EditorEvent::Blurred) {
             return;
         }
+        // The rename editor is not an inspector field: it writes a name
+        // into the sidecar, not an op into the document.
+        if matches!(&self.state, ViewerState::Ready(open)
+            if open.rename.as_ref().is_some_and(|(_, e)| e.entity_id() == editor.entity_id()))
+        {
+            self.commit_rename(cx);
+            return;
+        }
         self.commit_editor(editor.entity_id(), cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -6300,6 +6362,16 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
+        // Enter inside the entity list's rename field commits the NAME,
+        // and must not fall through to the inspector's commit.
+        if open
+            .rename
+            .as_ref()
+            .is_some_and(|(_, editor)| editor.focus_handle(cx).is_focused(window))
+        {
+            self.commit_rename(cx);
+            return;
+        }
         let focused = open
             .inspector
             .iter()
@@ -7251,12 +7323,65 @@ impl WorldPanel {
         cx.notify();
     }
 
+    /// Open the inline name editor on entity row `index`, seeded with the
+    /// entity's current custom name. An unnamed entity opens on an EMPTY
+    /// field rather than on the `#i` the row is drawing: seeding the
+    /// fallback would commit the index as a literal name the moment the
+    /// user pressed Enter without typing.
+    fn begin_rename(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if index >= open.store.state().entities.len() {
+            return;
+        }
+        let seed = open.entity_names.get(index).cloned().unwrap_or_default();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(seed, window, cx);
+            editor
+        });
+        // Deferred: this runs from the row's own mouse-down handler, and
+        // the panel root's `track_focus` claims focus in the same
+        // dispatch AFTER this listener bubbles -- focusing inline would
+        // be undone by the very click that opened the field.
+        let handle = editor.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        open._rename_subscription =
+            Some(cx.subscribe_in(&editor, window, Self::handle_editor_event));
+        open.rename = Some((index, editor));
+        cx.notify();
+    }
+
+    /// Commit the inline rename: the trimmed text becomes the entity's
+    /// editor-only name (empty text clears it) and goes straight to the
+    /// sidecar -- names are not document state, so there is no dirty flag
+    /// or Save to defer the write behind.
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some((index, editor)) = open.rename.take() else {
+            return;
+        };
+        open._rename_subscription = None;
+        let name = editor.read(cx).text(cx).trim().to_string();
+        if open.entity_names.len() <= index {
+            open.entity_names.resize(index + 1, String::new());
+        }
+        if let Some(slot) = open.entity_names.get_mut(index) {
+            *slot = name;
+        }
+        open.write_entity_names();
+        cx.notify();
+    }
+
     fn render_entity_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             return div().into_any_element();
         };
         let state = open.store.state();
-        let rows = entity_list_rows(&state);
+        let rows = entity_list_rows(&state, &open.entity_names);
         // Collected once, not re-derived per row: `store.state()` clones
         // the whole document, so asking `paint_target_rel` per row would
         // make rendering the list quadratic in entity count.
@@ -7320,19 +7445,47 @@ impl WorldPanel {
                     .overflow_y_scroll()
                     .child(v_flex().children(rows.into_iter().map(|(target, label)| {
                         let selected = open.selected.contains(&target);
+                        let renaming = match (target, open.rename.as_ref()) {
+                            (Selection::Entity(row), Some((index, editor))) if *index == row => {
+                                Some(editor.clone())
+                            }
+                            _ => None,
+                        };
+                        let selector = match target {
+                            Selection::Entity(index) => format!("ggo-world-list-row-{index}"),
+                            Selection::Instance(index) => {
+                                format!("ggo-world-list-instance-{index}")
+                            }
+                        };
                         let row = div()
                             .id(SharedString::from(format!("ggo-world-list-{target:?}")))
+                            .debug_selector(move || selector)
                             .px_1()
                             .cursor_pointer()
                             .when(selected, |this| this.bg(selected_bg))
-                            .child(Label::new(label).size(LabelSize::Small).color(if selected {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            }))
+                            .map(|this| match renaming {
+                                Some(editor) => this.child(
+                                    div()
+                                        .debug_selector(|| "ggo-world-rename-editor".into())
+                                        .child(Self::editor_input(&editor, cx)),
+                                ),
+                                None => this.child(
+                                    Label::new(label).size(LabelSize::Small).color(if selected {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    }),
+                                ),
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    if event.click_count >= 2
+                                        && let Selection::Entity(index) = target
+                                    {
+                                        this.begin_rename(index, window, cx);
+                                        return;
+                                    }
                                     this.select_from_list(target, event.modifiers.shift, cx)
                                 }),
                             );
@@ -14229,14 +14382,79 @@ mod tests {
         let store = ggo_worldlib::world_doc::WorldDocStore::new(
             ggo_worldlib::world_doc::WorldDocWire::from(world),
         );
-        let rows = entity_list_rows(&store.state());
-        assert_eq!(
-            rows[0],
-            (Selection::Entity(0), "#0 Sprite · hero".to_string())
-        );
-        assert_eq!(rows[1], (Selection::Entity(1), "#1 Entity".to_string()));
+        let rows = entity_list_rows(&store.state(), &[]);
+        assert_eq!(rows[0], (Selection::Entity(0), "#0".to_string()));
+        assert_eq!(rows[1], (Selection::Entity(1), "#1".to_string()));
         assert_eq!(rows[2].0, Selection::Instance(0));
         assert!(rows[2].1.starts_with("⧉ "));
+
+        let named = entity_list_rows(&store.state(), &["boss".to_string()]);
+        assert_eq!(
+            named[0],
+            (Selection::Entity(0), "boss".to_string()),
+            "a custom name replaces the index label"
+        );
+        assert_eq!(
+            named[1],
+            (Selection::Entity(1), "#1".to_string()),
+            "an entity past the name list keeps its index label"
+        );
+        assert_eq!(named[2], rows[2], "instances are unchanged by names");
+    }
+
+    /// An entity's identity is its INDEX, so a delete shifts every name
+    /// above the removed one down -- and the sidecar has to record that,
+    /// or the next open would hand the names to the wrong entities.
+    #[gpui::test]
+    async fn test_delete_drops_the_removed_entity_name_and_saves(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let world = WorldFile {
+            entities: vec![
+                entity(json!({ "Transform": { "pos": [0.0, 0.0] } })),
+                entity(json!({ "Transform": { "pos": [8.0, 0.0] } })),
+            ],
+            instances: vec![],
+            backgrounds: vec![],
+        };
+        write_world(root, "two.wrld.toml", &world).unwrap();
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = WorldPanel::new(None, cx);
+                panel.root_override = Some(root.to_path_buf());
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_worlds(cx);
+            panel.load_rel_path("two.wrld.toml", None, cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.entity_names = vec!["a".to_string(), "b".to_string()];
+            open.selected = vec![Selection::Entity(0)];
+            panel.delete_selected_now(cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.entity_names,
+                vec!["b".to_string()],
+                "the surviving entity keeps its own name"
+            );
+        });
+        assert_eq!(
+            editor_meta::load(root, "two.wrld.toml").entity_names,
+            vec!["b".to_string()],
+            "the shift is persisted to the sidecar"
+        );
     }
 
     /// A rebuild keeps the RenderImage (and atlas identity) of every key
@@ -21704,13 +21922,130 @@ mod tests {
         );
     }
 
+    /// A press+release the platform reports as the second click of a
+    /// double click. `simulate_click` only ever sends `click_count: 1`.
+    fn simulate_double_click(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>) {
+        cx.simulate_event(MouseDownEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+        });
+    }
+
+    /// The label the entity column is drawing for row `index`.
+    fn list_row_label(
+        panel: &Entity<WorldPanel>,
+        cx: &mut gpui::VisualTestContext,
+        index: usize,
+    ) -> String {
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            entity_list_rows(&open.store.state(), &open.entity_names)[index]
+                .1
+                .clone()
+        })
+    }
+
+    /// Double-clicking an entity row opens an inline name editor in the
+    /// row; Enter commits the typed name into the row's label and into
+    /// the `.ggo-ide` sidecar, and the name survives a reload.
+    #[gpui::test]
+    async fn test_double_click_renames_an_entity_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        assert_eq!(list_row_label(&panel, cx, 0), "#0", "unnamed rows read #i");
+
+        let row = cx
+            .debug_bounds("ggo-world-list-row-0")
+            .expect("the first entity row");
+        simulate_double_click(cx, row.center());
+        cx.run_until_parked();
+
+        let rename_bounds = cx
+            .debug_bounds("ggo-world-rename-editor")
+            .expect("the double click puts a rename editor in the row");
+        let rows = cx
+            .debug_bounds("ggo-world-entity-rows")
+            .expect("the entity rows");
+        assert!(
+            rows.contains(&rename_bounds.center()),
+            "the editor renders inside the list: {rows:?}, {rename_bounds:?}"
+        );
+
+        let editor = panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let (index, editor) = open.rename.clone().expect("a rename is open");
+            assert_eq!(index, 0, "the double-clicked row is the one being renamed");
+            editor
+        });
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "",
+            "an unnamed entity opens on an EMPTY field -- seeding #0 would \
+             commit the index as a literal name"
+        );
+
+        editor.update_in(cx, |editor, window, cx| editor.set_text("boss", window, cx));
+        cx.run_until_parked();
+        assert!(
+            editor.update_in(cx, |editor, window, cx| editor
+                .focus_handle(cx)
+                .is_focused(window)),
+            "the rename field takes focus -- the row's own click must not \
+             leave focus on the panel root"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.rename.is_none(), "committing closes the rename");
+        });
+        assert!(
+            cx.debug_bounds("ggo-world-rename-editor").is_none(),
+            "the row goes back to drawing a label"
+        );
+        assert_eq!(list_row_label(&panel, cx, 0), "boss");
+        assert_eq!(
+            editor_meta::load(&root, "test.wrld.toml").entity_names,
+            vec!["boss".to_string()],
+            "the name is persisted to the sidecar"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.reload_from_disk("test.wrld.toml", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            list_row_label(&panel, cx, 0),
+            "boss",
+            "a reload reads the name back out of the sidecar"
+        );
+    }
+
     /// How many rows the entity column is listing.
     fn list_row_count(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) -> usize {
         panel.read_with(cx, |panel, _| {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
-            entity_list_rows(&open.store.state()).len()
+            entity_list_rows(&open.store.state(), &open.entity_names).len()
         })
     }
 }
