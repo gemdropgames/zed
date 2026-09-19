@@ -149,6 +149,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("font", &["otf", "ttf", "woff", "woff2"]),
     ("fsharp", &["fs"]),
     ("fsproj", &["fsproj"]),
+    ("ggo_world", &["wrld.toml"]), // GGO: Emerald world files
     ("gitlab", &["gitlab-ci.yml", "gitlab-ci.yaml"]),
     ("gleam", &["gleam"]),
     ("go", &["go", "mod", "work"]),
@@ -339,6 +340,7 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("font", "icons/file_icons/font.svg"),
     ("fsharp", "icons/file_icons/fsharp.svg"),
     ("fsproj", "icons/file_icons/file.svg"),
+    ("ggo_world", "icons/file_icons/ggo_world.svg"), // GGO
     ("gitlab", "icons/file_icons/gitlab.svg"),
     ("gleam", "icons/file_icons/gleam.svg"),
     ("go", "icons/file_icons/go.svg"),
@@ -452,4 +454,30 @@ static DEFAULT_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
 /// Returns the default icon theme.
 pub fn default_icon_theme() -> Arc<IconTheme> {
     DEFAULT_ICON_THEME.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_emerald_world_suffix_maps_to_the_ggo_world_icon() {
+        let icon_theme = default_icon_theme();
+
+        assert_eq!(
+            icon_theme.file_suffixes.get("wrld.toml").map(String::as_str),
+            Some("ggo_world"),
+        );
+        assert_eq!(
+            icon_theme
+                .file_icons
+                .get("ggo_world")
+                .map(|icon| icon.path.as_ref()),
+            Some("icons/file_icons/ggo_world.svg"),
+        );
+        assert_eq!(
+            icon_theme.file_suffixes.get("toml").map(String::as_str),
+            Some("toml"),
+        );
+    }
 }

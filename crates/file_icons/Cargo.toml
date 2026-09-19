@@ -17,3 +17,6 @@ gpui.workspace = true
 serde.workspace = true
 theme.workspace = true
 util.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

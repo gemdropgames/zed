@@ -164,3 +164,26 @@ impl FileIcons {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use theme::LoadThemes;
+
+    #[gpui::test]
+    fn test_emerald_world_file_uses_the_ggo_world_icon(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            theme::init(LoadThemes::JustBase, cx);
+
+            assert_eq!(
+                FileIcons::get_icon(Path::new("main.wrld.toml"), cx).as_deref(),
+                Some("icons/file_icons/ggo_world.svg"),
+            );
+            assert_eq!(
+                FileIcons::get_icon(Path::new("Cargo.toml"), cx).as_deref(),
+                Some("icons/file_icons/toml.svg"),
+            );
+        });
+    }
+}
