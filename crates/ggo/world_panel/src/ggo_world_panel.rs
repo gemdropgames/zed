@@ -7266,52 +7266,104 @@ impl WorldPanel {
             .map(|entity| tilemap_fields(entity).is_some())
             .collect();
         let selected_bg = cx.theme().colors().element_selected;
-        div()
+        // The add-entity button heads the column it adds to rather than
+        // sitting in the toolbar: the toolbar is world-wide chrome, and
+        // "+" next to "Entities" is what says WHAT gets added.
+        let playing = self.live_playing();
+        let header = h_flex()
+            .px_1()
+            .gap_1()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .debug_selector(|| "ggo-world-entities-title".into())
+                    .child(
+                        Label::new("Entities")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                // The wrapper carries the `debug_selector` because a
+                // DISABLED button records no bounds of its own; the
+                // suffix is what says which state is on screen.
+                div()
+                    .debug_selector(move || {
+                        format!("ggo-world-add-entity-{}", toggle_suffix(!playing))
+                    })
+                    .child(
+                        IconButton::new("ggo-world-add-entity", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Add entity"))
+                            .disabled(playing)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_entity_impl(cx))),
+                    ),
+            );
+        v_flex()
             .id("ggo-world-entity-list")
+            .debug_selector(|| "ggo-world-entity-list".into())
             .w(LIST_WIDTH)
             .h_full()
             .flex_none()
-            .overflow_y_scroll()
-            .child(v_flex().children(rows.into_iter().map(|(target, label)| {
-                let selected = open.selected.contains(&target);
-                let row = div()
-                    .id(SharedString::from(format!("ggo-world-list-{target:?}")))
-                    .px_1()
-                    .cursor_pointer()
-                    .when(selected, |this| this.bg(selected_bg))
-                    .child(Label::new(label).size(LabelSize::Small).color(if selected {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                            this.select_from_list(target, event.modifiers.shift, cx)
-                        }),
-                    );
-                let Selection::Entity(index) = target else {
-                    return row.into_any_element();
-                };
-                if !paintable.get(index).copied().unwrap_or(false) {
-                    return row.into_any_element();
-                }
-                let weak = cx.weak_entity();
-                ui::right_click_menu(SharedString::from(format!("ggo-world-list-menu-{index}")))
-                    .trigger(move |_menu_open, _window, _cx| row)
-                    .menu(move |window, cx| {
-                        let weak = weak.clone();
-                        ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                            menu.entry("Paint tiles", None, move |_window, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.enter_paint_mode(PaintTarget::TilemapEntity(index), cx);
+            .child(header)
+            .child(
+                div()
+                    .id("ggo-world-entity-rows")
+                    .debug_selector(|| "ggo-world-entity-rows".into())
+                    .flex_1()
+                    // A scroll container's automatic minimum is its
+                    // content, so without this floor the rows would push
+                    // the column taller than the body instead of
+                    // scrolling under the header.
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(v_flex().children(rows.into_iter().map(|(target, label)| {
+                        let selected = open.selected.contains(&target);
+                        let row = div()
+                            .id(SharedString::from(format!("ggo-world-list-{target:?}")))
+                            .px_1()
+                            .cursor_pointer()
+                            .when(selected, |this| this.bg(selected_bg))
+                            .child(Label::new(label).size(LabelSize::Small).color(if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                                    this.select_from_list(target, event.modifiers.shift, cx)
+                                }),
+                            );
+                        let Selection::Entity(index) = target else {
+                            return row.into_any_element();
+                        };
+                        if !paintable.get(index).copied().unwrap_or(false) {
+                            return row.into_any_element();
+                        }
+                        let weak = cx.weak_entity();
+                        ui::right_click_menu(SharedString::from(format!(
+                            "ggo-world-list-menu-{index}"
+                        )))
+                        .trigger(move |_menu_open, _window, _cx| row)
+                        .menu(move |window, cx| {
+                            let weak = weak.clone();
+                            ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                                menu.entry("Paint tiles", None, move |_window, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        this.enter_paint_mode(
+                                            PaintTarget::TilemapEntity(index),
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
                                 })
-                                .ok();
                             })
                         })
-                    })
-                    .into_any_element()
-            })))
+                        .into_any_element()
+                    }))),
+            )
             .into_any_element()
     }
 
@@ -7919,24 +7971,6 @@ impl WorldPanel {
                     ))
                     .on_click(cx.listener(|this, _, _, cx| this.emulate_popout_impl(cx))),
             )
-            // Each wrapper carries the `debug_selector` for the reason the
-            // Save button's does: a DISABLED button records no bounds of
-            // its own. The wrapper resolves either way, so the suffix is
-            // what says WHICH -- greyed out is a state a test has to be
-            // able to read, not infer from a click that does nothing.
-            .child(
-                div()
-                    .debug_selector(move || {
-                        format!("ggo-world-add-entity-{}", toggle_suffix(!playing))
-                    })
-                    .child(
-                        IconButton::new("ggo-world-add-entity", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(ui::Tooltip::text("Add entity"))
-                            .disabled(playing)
-                            .on_click(cx.listener(|this, _, _, cx| this.add_entity_impl(cx))),
-                    ),
-            )
             .child(DropdownMenu::new(
                 "ggo-world-add-instance",
                 "+ Instance",
@@ -7951,6 +7985,11 @@ impl WorldPanel {
                         cx.listener(|this, _, window, cx| this.delete_selected_impl(window, cx)),
                     ),
             )
+            // Each wrapper carries the `debug_selector` for the reason the
+            // Save button's does: a DISABLED button records no bounds of
+            // its own. The wrapper resolves either way, so the suffix is
+            // what says WHICH -- greyed out is a state a test has to be
+            // able to read, not infer from a click that does nothing.
             .child(
                 div()
                     .debug_selector(move || format!("ggo-world-undo-{}", toggle_suffix(!playing)))
@@ -8282,17 +8321,24 @@ impl WorldPanel {
         // selectors say so rather than leaving a test to infer it from a
         // click that does nothing.
         let playing = self.live_playing();
-        let mut rail = h_flex().gap_2().px_1().pb_1().flex_wrap().child(
+        // Stacked, not wrapped: a slot's row is a label plus up to two
+        // controls, and a wrapping ribbon breaks BETWEEN those -- a slot's
+        // "Add…" landing on the next line under someone else's `bg2`.
+        let mut rail = v_flex().px_1().pb_1().gap_0p5().child(
             Label::new("Layers")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         );
         for layer in 0..world_file::BACKGROUND_LAYER_COUNT as u8 {
-            let slot = h_flex().gap_1().child(
-                Label::new(format!("bg{layer}"))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
+            let slot = h_flex()
+                .gap_1()
+                .items_center()
+                .debug_selector(move || format!("ggo-world-bg-row-{layer}"))
+                .child(
+                    Label::new(format!("bg{layer}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
             rail = rail.child(match backgrounds.iter().find(|bg| bg.layer == layer) {
                 Some(background) => slot
                     .child(
@@ -21560,5 +21606,111 @@ mod tests {
             before.origin,
             after.origin
         );
+    }
+
+    /// The layers rail stacks one row per slot rather than wrapping them
+    /// into a ribbon: slot 1's row shares slot 0's left edge and sits
+    /// wholly below it, so the rail reads top to bottom at any width.
+    #[gpui::test]
+    async fn test_layers_stack_vertically(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        // Deliberately WIDE: a rail that wraps only when it must would
+        // still pass this test in a narrow dock.
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        write_test_tileset(dir.path(), "tiles/bg0.til");
+        write_test_tileset(dir.path(), "tiles/bg1.til");
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg0.til".into(), cx);
+            panel.add_background_impl(1, "tiles/bg1.til".into(), cx);
+        });
+        cx.run_until_parked();
+
+        let row0 = cx
+            .debug_bounds("ggo-world-bg-row-0")
+            .expect("the first layer's row");
+        let row1 = cx
+            .debug_bounds("ggo-world-bg-row-1")
+            .expect("the second layer's row");
+        assert_eq!(
+            row1.origin.x, row0.origin.x,
+            "stacked rows share a left edge: {row0:?}, {row1:?}"
+        );
+        assert!(
+            row1.origin.y > row0.origin.y,
+            "the second layer's row must sit below the first: {row0:?}, {row1:?}"
+        );
+        assert!(
+            row1.origin.y >= row0.origin.y + row0.size.height,
+            "and must not overlap it: {row0:?}, {row1:?}"
+        );
+    }
+
+    /// The entity column owns its own header: the "Entities" title and
+    /// the add-entity button head it, above the scrolling rows, and the
+    /// toolbar no longer carries the button.
+    #[gpui::test]
+    async fn test_entities_header_heads_the_list_and_holds_add_entity(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        let list = cx
+            .debug_bounds("ggo-world-entity-list")
+            .expect("the entity column");
+        let rows = cx
+            .debug_bounds("ggo-world-entity-rows")
+            .expect("the scrolling rows");
+        let title = cx
+            .debug_bounds("ggo-world-entities-title")
+            .expect("the Entities title");
+        let add = cx
+            .debug_bounds("ggo-world-add-entity-on")
+            .expect("the add-entity button, live in Edit");
+
+        for (what, bounds) in [("the title", title), ("the add button", add)] {
+            assert!(
+                list.contains(&bounds.center()),
+                "{what} belongs to the entity column: {bounds:?} in {list:?}"
+            );
+            assert!(
+                bounds.center().y < rows.origin.y,
+                "{what} heads the column, above the rows: {bounds:?}, rows {rows:?}"
+            );
+        }
+        assert!(
+            add.center().x > title.center().x,
+            "the add button sits to the right of the title: {title:?}, {add:?}"
+        );
+
+        let toolbar = cx.debug_bounds("ggo-world-toolbar").expect("the toolbar");
+        assert!(
+            !toolbar.contains(&add.center()),
+            "the toolbar must no longer carry the add-entity button: {toolbar:?}, {add:?}"
+        );
+
+        let rows_before = list_row_count(&panel, cx);
+        cx.simulate_click(add.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            list_row_count(&panel, cx),
+            rows_before + 1,
+            "the header's add button still adds an entity"
+        );
+    }
+
+    /// How many rows the entity column is listing.
+    fn list_row_count(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) -> usize {
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            entity_list_rows(&open.store.state()).len()
+        })
     }
 }
