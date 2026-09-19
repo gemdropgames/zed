@@ -9272,7 +9272,6 @@ impl WorldPanel {
             .id("ggo-world-body")
             .debug_selector(|| "ggo-world-body".into())
             .flex_1()
-            .min_h_0()
             // A scroll container's automatic minimum is zero, so without
             // this floor the chrome above would flatten the columns to
             // nothing instead of pushing the root into scrolling.
