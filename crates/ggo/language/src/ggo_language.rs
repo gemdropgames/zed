@@ -1,7 +1,7 @@
 //! The "GGO World" language: native (non-extension) Zed registration of the
 //! TOML dialect that `ggo-worldlib` reads and writes -- `[[entity]]`,
-//! `[[instance]]` and `[[background]]` scene files under a project's
-//! `worlds/` tree.
+//! `[[instance]]` and `[[background]]` scene files -- any
+//! `<stem>.wrld.toml` under a project's `assets/` tree.
 //!
 //! # Why this is native and not an extension
 //!
@@ -47,11 +47,15 @@ pub const LANGUAGE_NAME: &str = "GGO World";
 /// [`LANGUAGE_NAME`] under its `file_types` key. Declared here so the fork can
 /// test the exact string the repo ships rather than a paraphrase of it.
 ///
+/// A world is any `<stem>.wrld.toml` under the project's `assets/` tree; a
+/// bare `.toml` there (a `components.toml` manifest, a map) is not one, and
+/// neither is an old-layout `assets/worlds/<name>.toml`.
+///
 /// The leading `**/` is load-bearing: `AvailableLanguages::find_for_file` tests
 /// the globs against `File::full_path`, which is prefixed with the worktree's
-/// root directory name, so `worlds/**/*.toml` would never match. There is a
-/// test pinning that.
-pub const PROJECT_FILE_TYPE_GLOB: &str = "**/worlds/**/*.toml";
+/// root directory name, so `assets/**/*.wrld.toml` would never match. There is
+/// a test pinning that.
+pub const PROJECT_FILE_TYPE_GLOB: &str = "**/assets/**/*.wrld.toml";
 
 /// The name the grammar is registered under, and the value of `grammar` in
 /// `config.toml`. Namespaced so it cannot collide with a TOML grammar an

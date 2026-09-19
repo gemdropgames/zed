@@ -1007,7 +1007,7 @@ mod tests {
             root,
             serde_json::json!({
                 "emerald.toml": "",
-                "assets": { "worlds": { "main.toml": "" } },
+                "assets": { "main.wrld.toml": "" },
             }),
         )
         .await;
@@ -1038,10 +1038,10 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
         std::fs::write(
-            dir.path().join("assets/worlds/main.toml"),
+            dir.path().join("assets/main.wrld.toml"),
             "[[entity]]\nTransform = { pos = [4.0, 4.0], z = 0.0 }\n",
         )
         .unwrap();
@@ -1051,13 +1051,13 @@ mod tests {
         let opened = dispatch_inner(
             Cmd::WorldOpen {
                 workspace: None,
-                world: "worlds/main".to_string(),
+                world: "main".to_string(),
             },
             &mut async_cx,
         )
         .await
         .expect("world_open with no tab open");
-        assert_eq!(opened["opened"], "assets/worlds/main.toml");
+        assert_eq!(opened["opened"], "assets/main.wrld.toml");
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
@@ -1078,7 +1078,7 @@ mod tests {
         )
         .await
         .expect("world_read answers from the tab world_open left active");
-        assert_eq!(read["rel_path"], "assets/worlds/main.toml");
+        assert_eq!(read["rel_path"], "assets/main.wrld.toml");
         assert_eq!(read["entities"].as_array().map(Vec::len), Some(1));
     }
 
@@ -1089,9 +1089,9 @@ mod tests {
     #[gpui::test]
     async fn world_open_comes_up_in_design_and_boots_no_viewer(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/main.wrld.toml"), "").unwrap();
         let (workspace, cx) = remote_workspace(cx, dir.path()).await;
         // A fake `emd`, so a regression registers a run here instead of
         // shelling out to the real binary.
@@ -1109,7 +1109,7 @@ mod tests {
         dispatch_inner(
             Cmd::WorldOpen {
                 workspace: None,
-                world: "worlds/main".to_string(),
+                world: "main".to_string(),
             },
             &mut async_cx,
         )

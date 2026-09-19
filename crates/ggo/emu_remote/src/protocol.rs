@@ -119,8 +119,8 @@ pub enum Cmd {
         #[serde(default)]
         layer: usize,
     },
-    /// `emd pack-ggo` for `world` (a stem like `worlds/arena` or a rel
-    /// path like `assets/worlds/arena.toml`), into the project's
+    /// `emd pack-ggo` for `world` (a stem like `arena` or a rel path like
+    /// `assets/arena.wrld.toml`), into the project's
     /// `target/ggo-emulate/`. The reply names the cart for `Start`/`Run`.
     PackWorld {
         workspace: Option<String>,
@@ -174,7 +174,7 @@ pub enum DebugView {
 /// capture window.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FlashConfig {
-    /// World stem baked in as the boot world, e.g. "worlds/chase_cam".
+    /// World stem baked in as the boot world, e.g. "chase_cam".
     /// None = the project's `default_world` (or what the panel last
     /// remembered).
     #[serde(default)]

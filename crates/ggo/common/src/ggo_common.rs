@@ -468,7 +468,7 @@ pub fn run_cart(
 /// button cannot call it directly. The `bool` is `rebuild_gateware`:
 /// place-and-route a fresh bitstream instead of flashing the cached one.
 ///
-/// The `Option<&str>` is the world stem to boot (`worlds/arena`), which
+/// The `Option<&str>` is the world stem to boot (`arena`), which
 /// is the whole point of flashing from the IDE: without it the cart boots
 /// the project's `default_world` and the board shows a different world
 /// than the one being edited. `None` keeps that default -- the honest
@@ -487,7 +487,7 @@ pub fn register_board_flasher(cx: &mut App, flasher: BoardFlasher) {
 }
 
 /// Ask the registered flasher to put the open project on the board,
-/// booting `world` (a stem like `worlds/arena`) rather than the project's
+/// booting `world` (a stem like `arena`) rather than the project's
 /// `default_world`. `false` means no emulator pane exists in this build
 /// -- reported, not swallowed, exactly as [`run_cart`] explains.
 pub fn flash_to_board(
@@ -1560,8 +1560,8 @@ pub fn world_pack_args(out: &Path, world_stem: &str) -> Vec<String> {
 }
 
 /// The file name a world's cartridge is built under: the world's full
-/// assets-relative stem with `/` flattened to `-`, so `worlds/main` and
-/// `worlds/boss/main` cannot collide in one output directory.
+/// assets-relative stem with `/` flattened to `-`, so `main` and
+/// `boss/main` cannot collide in one output directory.
 pub fn pack_out_name(world_stem: &str) -> String {
     format!("{}.ggo", world_stem.replace('/', "-"))
 }
@@ -1575,8 +1575,8 @@ mod tests {
     #[test]
     fn a_flash_tooltip_names_the_world_when_there_is_one() {
         assert_eq!(
-            flash_tooltip("Flash this project to the board", Some("worlds/arena")),
-            "Flash this project to the board — boots worlds/arena"
+            flash_tooltip("Flash this project to the board", Some("arena")),
+            "Flash this project to the board — boots arena"
         );
         assert_eq!(
             flash_tooltip("Flash this project to the board", None),
@@ -2031,14 +2031,14 @@ mod tests {
         let detail = cascade_detail(
             &[
                 "Used by 2 schedules: tick, render.".to_string(),
-                "Placed in 1 world: worlds/arena.toml.".to_string(),
+                "Placed in 1 world: arena.wrld.toml.".to_string(),
             ],
             false,
         );
         assert_eq!(
             detail,
             "Used by 2 schedules: tick, render.\n\
-             Placed in 1 world: worlds/arena.toml.\n\n\
+             Placed in 1 world: arena.wrld.toml.\n\n\
              This cannot be undone."
         );
         assert!(cascade_detail(&["a".to_string()], true).ends_with(&destructive_detail(true)));
@@ -2076,8 +2076,8 @@ mod tests {
     #[test]
     fn dirty_message_names_the_document() {
         assert_eq!(
-            dirty_message("worlds/test.toml"),
-            "worlds/test.toml contains unsaved edits. Do you want to save it?"
+            dirty_message("test.wrld.toml"),
+            "test.wrld.toml contains unsaved edits. Do you want to save it?"
         );
     }
 
@@ -2132,10 +2132,10 @@ mod tests {
     #[gpui::test]
     async fn test_close_guard_cancel_vetoes_the_close(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
-        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        let (doc, close) = start_close(cx, Some("test.wrld.toml"), true);
         assert_eq!(
             cx.pending_prompt().map(|(message, _)| message),
-            Some(dirty_message("worlds/test.toml")),
+            Some(dirty_message("test.wrld.toml")),
         );
         cx.simulate_prompt_answer("Cancel");
         assert!(!close.await, "Cancel must veto the close");
@@ -2148,7 +2148,7 @@ mod tests {
     #[gpui::test]
     async fn test_close_guard_discard_closes_without_saving(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
-        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        let (doc, close) = start_close(cx, Some("test.wrld.toml"), true);
         cx.simulate_prompt_answer("Don't Save");
         assert!(close.await, "Don't Save must allow the close");
         doc.read_with(cx, |doc, _| {
@@ -2160,7 +2160,7 @@ mod tests {
     #[gpui::test]
     async fn test_close_guard_save_success_allows_the_close(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
-        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        let (doc, close) = start_close(cx, Some("test.wrld.toml"), true);
         cx.simulate_prompt_answer("Save");
         assert!(close.await, "a successful save must allow the close");
         doc.read_with(cx, |doc, _| assert_eq!(doc.save_calls, 1));
@@ -2172,7 +2172,7 @@ mod tests {
     #[gpui::test]
     async fn test_close_guard_failed_save_vetoes_the_close(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
-        let (doc, close) = start_close(cx, Some("worlds/test.toml"), false);
+        let (doc, close) = start_close(cx, Some("test.wrld.toml"), false);
         cx.simulate_prompt_answer("Save");
         assert!(
             !close.await,
@@ -2191,7 +2191,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let cx = cx.add_empty_window();
-        let (doc, close) = start_close(cx, Some("worlds/test.toml"), true);
+        let (doc, close) = start_close(cx, Some("test.wrld.toml"), true);
         drop(doc);
         cx.run_until_parked();
         cx.simulate_prompt_answer("Save");

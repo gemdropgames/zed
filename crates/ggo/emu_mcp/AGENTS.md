@@ -110,8 +110,8 @@ will actually sit through (~300) and re-call.
 
 ## The loop
 
-Pack a cart first (`cart_pack { world: "worlds/arena" }`, or `emd
-pack-ggo --world <stem>` in a shell), then:
+Pack a cart first (`cart_pack { world: "arena" }`, or
+`emd pack-ggo --world <stem>` in a shell), then:
 
 1. `emu_start { cart: "wilds.ggo" }` → `{ started, frame, world }`
 2. repeat `emu_next_frame { buttons: ["right"] }` → `{ frame, world }`

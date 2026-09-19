@@ -144,28 +144,28 @@ const BOX_B: u32 = 2;
 const BOX_A_POS: [f64; 2] = [40.0, 50.0];
 const BOX_B_POS: [f64; 2] = [100.0, 50.0];
 const INSTANCE_POS: [f64; 2] = [100.0, 120.0];
-/// The second member's offset inside `worlds/pair`.
+/// The second member's offset inside `pair`.
 const PAIR_SPREAD: f64 = 24.0;
-/// `worlds/grid`'s one box, authored on the 16 px grid.
+/// `grid`'s one box, authored on the 16 px grid.
 const GRID_BOX: u32 = 1;
 const GRID_BOX_POS: [f64; 2] = [32.0, 48.0];
-/// `worlds/stacked`'s two boxes: same place, `STACK_TOP` the higher `z`.
+/// `stacked`'s two boxes: same place, `STACK_TOP` the higher `z`.
 const STACK_POS: [f64; 2] = [152.0, 112.0];
 const STACK_TOP: u32 = 2;
-/// How many boxes `worlds/many` holds. With the camera that is more than
+/// How many boxes `many` holds. With the camera that is more than
 /// the 60 indices one `Selection` datagram carries.
 const MANY_BOXES: u32 = 70;
 
 /// The journey worlds, written over whatever `routed_project`'s own
 /// fixture left behind.
 ///
-/// * `worlds/journey` -- a camera at the origin and two 16x16 boxes.
-/// * `worlds/instanced` -- the same camera, one box, and an `[[instance]]`
-///   of `worlds/pair`, which is two boxes.
+/// * `journey` -- a camera at the origin and two 16x16 boxes.
+/// * `instanced` -- the same camera, one box, and an `[[instance]]`
+///   of `pair`, which is two boxes.
 fn write_journey_fixture(root: &std::path::Path) {
     write_world(
         root,
-        "worlds/pair.toml",
+        "pair.wrld.toml",
         &WorldFile {
             entities: vec![boxed_entity([0.0, 0.0]), boxed_entity([0.0, PAIR_SPREAD])],
             instances: vec![],
@@ -175,7 +175,7 @@ fn write_journey_fixture(root: &std::path::Path) {
     .expect("the sub-world writes");
     write_world(
         root,
-        "worlds/journey.toml",
+        "journey.wrld.toml",
         &WorldFile {
             entities: vec![
                 origin_camera(),
@@ -192,7 +192,7 @@ fn write_journey_fixture(root: &std::path::Path) {
     // `camera_pan` moves.
     write_world(
         root,
-        "worlds/nocam.toml",
+        "nocam.wrld.toml",
         &WorldFile {
             entities: vec![boxed_entity(BOX_A_POS), boxed_entity(BOX_B_POS)],
             instances: vec![],
@@ -202,11 +202,11 @@ fn write_journey_fixture(root: &std::path::Path) {
     .expect("the camera-less world writes");
     write_world(
         root,
-        "worlds/instanced.toml",
+        "instanced.wrld.toml",
         &WorldFile {
             entities: vec![origin_camera(), boxed_entity(BOX_A_POS)],
             instances: vec![WorldInstance {
-                world: "worlds/pair".to_string(),
+                world: "pair".to_string(),
                 pos: INSTANCE_POS,
                 background_priority: false,
             }],
@@ -217,7 +217,7 @@ fn write_journey_fixture(root: &std::path::Path) {
     // On the 16 px grid already, so a snapped drag lands on it exactly.
     write_world(
         root,
-        "worlds/grid.toml",
+        "grid.wrld.toml",
         &WorldFile {
             entities: vec![origin_camera(), boxed_entity(GRID_BOX_POS)],
             instances: vec![],
@@ -229,7 +229,7 @@ fn write_journey_fixture(root: &std::path::Path) {
     // the device screen so they stay on the canvas at a stepped-up scale.
     write_world(
         root,
-        "worlds/stacked.toml",
+        "stacked.wrld.toml",
         &WorldFile {
             entities: vec![
                 origin_camera(),
@@ -250,7 +250,7 @@ fn write_journey_fixture(root: &std::path::Path) {
     }));
     write_world(
         root,
-        "worlds/many.toml",
+        "many.wrld.toml",
         &WorldFile {
             entities: many,
             instances: vec![],
@@ -717,7 +717,7 @@ impl Journey<'_> {
     /// The world as it is ON DISK, re-read rather than derived from the
     /// document: a save journey has to prove the bytes landed.
     fn on_disk(&mut self) -> WorldFile {
-        world_file::read_world(self.root(), "worlds/journey.toml").expect("the world file")
+        world_file::read_world(self.root(), "journey.wrld.toml").expect("the world file")
     }
 
     /// Type `text` into the inspector's editor for one axis of a document
@@ -858,7 +858,7 @@ impl Journey<'_> {
 ///    the rect the cart published for it.
 #[gpui::test]
 async fn click_selects_and_outlines_the_sprite(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     assert!(
         journey.selected().is_empty(),
         "nothing is selected before the click"
@@ -884,7 +884,7 @@ async fn click_selects_and_outlines_the_sprite(cx: &mut TestAppContext) {
 ///    follow it every frame, and the whole drag lands as ONE undo entry.
 #[gpui::test]
 async fn drag_moves_the_entity_and_the_outline_follows(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let start = journey.on(BOX_A_POS);
     journey.press(start, Modifiers::none());
     journey.frames(2);
@@ -934,7 +934,7 @@ async fn drag_moves_the_entity_and_the_outline_follows(cx: &mut TestAppContext) 
 ///    round trip is a visible blink for an undone drag.
 #[gpui::test]
 async fn undo_after_a_drag_moves_it_back_on_the_cart(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let start = journey.on(BOX_A_POS);
     let end = journey.on([BOX_A_POS[0] + 30.0, BOX_A_POS[1]]);
     journey.press(start, Modifiers::none());
@@ -965,7 +965,7 @@ async fn undo_after_a_drag_moves_it_back_on_the_cart(cx: &mut TestAppContext) {
 ///    boxes selects the pair -- both decided by the cart, mirrored back.
 #[gpui::test]
 async fn shift_click_toggles_and_marquee_selects_two(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let box_a = journey.on(BOX_A_POS);
     let box_b = journey.on(BOX_B_POS);
     journey.click(box_a, Modifiers::none());
@@ -1021,10 +1021,10 @@ async fn shift_click_toggles_and_marquee_selects_two(cx: &mut TestAppContext) {
 ///    sprite: it moves in canvas space by exactly what the camera moved.
 #[gpui::test]
 async fn middle_drag_pans_and_the_outline_stays_on_the_sprite(cx: &mut TestAppContext) {
-    // `worlds/nocam` authors no camera entity, so `effective_camera` falls
+    // `nocam` authors no camera entity, so `effective_camera` falls
     // back to the engine camera RESOURCE -- the one the cart's
     // `camera_pan` moves. A scene-placed camera pins the view to itself.
-    let mut journey = journey(cx, "worlds/nocam.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "nocam.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     const NOCAM_BOX_A: u32 = 0;
     let from = journey.on(BOX_A_POS);
     journey.hover(from);
@@ -1067,7 +1067,7 @@ async fn middle_drag_pans_and_the_outline_stays_on_the_sprite(cx: &mut TestAppCo
 ///    out of the document together.
 #[gpui::test]
 async fn nudge_delete_select_all_through_the_keymap(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let at = journey.on(BOX_A_POS);
     journey.click(at, Modifiers::none());
 
@@ -1114,7 +1114,7 @@ async fn nudge_delete_select_all_through_the_keymap(cx: &mut TestAppContext) {
 ///    the document takes ONE `MoveInstance`, and one undo puts it back.
 #[gpui::test]
 async fn an_instance_drags_as_a_group_and_undoes_as_one(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/instanced.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "instanced.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let member_b = [INSTANCE_POS[0], INSTANCE_POS[1] + PAIR_SPREAD];
     let start = journey.on(INSTANCE_POS);
     journey.press(start, Modifiers::none());
@@ -1177,7 +1177,7 @@ async fn an_instance_drags_as_a_group_and_undoes_as_one(cx: &mut TestAppContext)
 ///    to Edit stops the game and clears the selection.
 #[gpui::test]
 async fn play_mode_ignores_clicks_and_runs_the_game(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, GAME_TABLE).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, GAME_TABLE).await;
     // The camera is authored first, so it is the entity the game system
     // slides -- which is exactly the row the panel must NOT fold back.
     let camera_before = journey.entity_pos(0);
@@ -1229,7 +1229,7 @@ async fn play_mode_ignores_clicks_and_runs_the_game(cx: &mut TestAppContext) {
 ///    the pointer off the built-ins is `SetTool`'s job.
 #[gpui::test]
 async fn a_cart_tool_claims_the_pointer_from_the_systems_behind_it(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", TWO_TOOL_TABLE, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", TWO_TOOL_TABLE, NO_SYSTEMS).await;
     journey.reset_tool_counters();
     journey.set_tool(1);
     journey.frames(2);
@@ -1257,7 +1257,7 @@ async fn a_cart_tool_claims_the_pointer_from_the_systems_behind_it(cx: &mut Test
 ///     and switching back turns them on again.
 #[gpui::test]
 async fn switching_the_tool_makes_the_builtins_inert(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", USER_TOOL_TABLE, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", USER_TOOL_TABLE, NO_SYSTEMS).await;
     journey.reset_tool_counters();
 
     journey.set_tool(1);
@@ -1290,7 +1290,7 @@ async fn closing_the_tab_stops_the_cart(cx: &mut TestAppContext) {
         cart,
         cx,
         dir: _dir,
-    } = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    } = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     assert!(
         !endpoint.stop_requested(),
         "a live tab wants its cart running"
@@ -1330,7 +1330,7 @@ async fn closing_the_tab_stops_the_cart(cx: &mut TestAppContext) {
 ///     the grid with it.
 #[gpui::test]
 async fn snap_on_drags_land_on_the_16px_grid(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/grid.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "grid.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     // Before the press: the toggle rides on every pointer sample, and the
     // cart reads it on the frame it moves.
     journey.set_snap(true);
@@ -1363,7 +1363,7 @@ async fn snap_on_drags_land_on_the_16px_grid(cx: &mut TestAppContext) {
 ///     not send a second edge.
 #[gpui::test]
 async fn releasing_outside_the_canvas_ends_the_drag_once(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let start = journey.on(BOX_A_POS);
     journey.press(start, Modifiers::none());
     journey.frames(2);
@@ -1408,7 +1408,7 @@ async fn releasing_outside_the_canvas_ends_the_drag_once(cx: &mut TestAppContext
 ///     selects nothing.
 #[gpui::test]
 async fn escape_mid_marquee_retires_the_band_on_both_sides(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let from = journey.pt([20.0, 30.0]);
     let to = journey.pt([140.0, 80.0]);
     journey.press(from, Modifiers::none());
@@ -1440,7 +1440,7 @@ async fn escape_mid_marquee_retires_the_band_on_both_sides(cx: &mut TestAppConte
 ///     rule, mirrored back into the document.
 #[gpui::test]
 async fn click_on_empty_space_clears_the_selection(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let at = journey.on(BOX_A_POS);
     journey.click(at, Modifiers::none());
     assert_eq!(journey.selected(), vec![Selection::Entity(BOX_A as usize)]);
@@ -1459,7 +1459,7 @@ async fn click_on_empty_space_clears_the_selection(cx: &mut TestAppContext) {
 ///     shifts every index above it, so this one goes out as a world.
 #[gpui::test]
 async fn undo_of_a_delete_brings_the_row_back_on_the_cart(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let at = journey.on(BOX_A_POS);
     journey.click(at, Modifiers::none());
     assert_eq!(journey.cart_rows(), 3);
@@ -1488,7 +1488,7 @@ async fn undo_of_a_delete_brings_the_row_back_on_the_cart(cx: &mut TestAppContex
 ///     and not one per cart frame.
 #[gpui::test]
 async fn two_nudges_coalesce_into_undo_entries_per_spec(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let at = journey.on(BOX_A_POS);
     journey.click(at, Modifiers::none());
 
@@ -1511,7 +1511,7 @@ async fn two_nudges_coalesce_into_undo_entries_per_spec(cx: &mut TestAppContext)
 /// 18. Two sprites in the same place: the click takes the topmost by `z`.
 #[gpui::test]
 async fn overlapping_sprites_select_the_topmost_by_z(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/stacked.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "stacked.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let at = journey.on(STACK_POS);
     journey.click(at, Modifiers::none());
     assert_eq!(
@@ -1526,7 +1526,7 @@ async fn overlapping_sprites_select_the_topmost_by_z(cx: &mut TestAppContext) {
 ///     where it is drawn.
 #[gpui::test]
 async fn wheel_zoom_keeps_the_outline_on_the_sprite(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/stacked.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "stacked.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     // Whatever the tab's own layout fits: the Live prepaint stamps the
     // canvas bounds, so the starting scale is not the test's to name.
     let scale_before = journey.scale();
@@ -1570,7 +1570,7 @@ async fn wheel_zoom_keeps_the_outline_on_the_sprite(cx: &mut TestAppContext) {
 ///     them back to the document.
 #[gpui::test]
 async fn a_selection_larger_than_one_datagram_arrives_whole(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/many.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "many.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let total = MANY_BOXES as usize + 1;
     assert_eq!(journey.cart_rows(), total, "the cart is drawing them all");
 
@@ -1596,7 +1596,7 @@ async fn a_selection_larger_than_one_datagram_arrives_whole(cx: &mut TestAppCont
 ///     the canvas takes the next click.
 #[gpui::test]
 async fn a_regreet_mid_drag_abandons_the_drag_cleanly(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let start = journey.on(BOX_A_POS);
     journey.press(start, Modifiers::none());
     journey.frames(2);
@@ -1660,7 +1660,7 @@ async fn a_regreet_mid_drag_abandons_the_drag_cleanly(cx: &mut TestAppContext) {
 ///     document holds what was typed.
 #[gpui::test]
 async fn an_inspector_edit_round_trips_through_the_cart(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let at = journey.on(BOX_A_POS);
     journey.click(at, Modifiers::none());
     assert_eq!(journey.selected(), vec![Selection::Entity(BOX_A as usize)]);
@@ -1695,7 +1695,7 @@ async fn an_inspector_edit_round_trips_through_the_cart(cx: &mut TestAppContext)
 ///     the save then puts that cell on disk.
 #[gpui::test]
 async fn a_cell_painted_in_live_reaches_the_cart_and_the_map(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     journey.add_background();
     journey.enter_paint();
     assert_eq!(
@@ -1734,7 +1734,7 @@ async fn a_cell_painted_in_live_reaches_the_cart_and_the_map(cx: &mut TestAppCon
 ///     the entities are the game's there, not the author's.
 #[gpui::test]
 async fn a_user_system_edit_survives_a_save(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NUDGE_TABLE, GAME_TABLE).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NUDGE_TABLE, GAME_TABLE).await;
 
     journey.set_mode(EditorMode::Play);
     journey.frames(2);
@@ -1771,7 +1771,7 @@ async fn a_user_system_edit_survives_a_save(cx: &mut TestAppContext) {
 ///     the delete puts the row back on the cart.
 #[gpui::test]
 async fn add_and_delete_entities_in_live(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     assert_eq!(journey.cart_rows(), 3);
 
     journey
@@ -1810,7 +1810,7 @@ async fn add_and_delete_entities_in_live(cx: &mut TestAppContext) {
 ///     tab stays dirty. A half-written world is worse than none.
 #[gpui::test]
 async fn a_snapshot_that_never_arrives_keeps_the_file(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let start = journey.on(BOX_A_POS);
     journey.press(start, Modifiers::none());
     journey.frames(2);
@@ -1820,7 +1820,7 @@ async fn a_snapshot_that_never_arrives_keeps_the_file(cx: &mut TestAppContext) {
     journey.release(to);
     journey.frames(2);
     assert!(journey.dirty(), "the drag left something to save");
-    let before = std::fs::read(journey.root().join("worlds/journey.toml")).expect("the world file");
+    let before = std::fs::read(journey.root().join("journey.wrld.toml")).expect("the world file");
 
     journey.cart.drop_cart_blobs(true);
     journey.save(live::SAVE_DEADLINE_FRAMES as usize + 8);
@@ -1831,7 +1831,7 @@ async fn a_snapshot_that_never_arrives_keeps_the_file(cx: &mut TestAppContext) {
     );
     assert!(journey.dirty(), "a failed save keeps the document dirty");
     assert_eq!(
-        std::fs::read(journey.root().join("worlds/journey.toml")).expect("the world file"),
+        std::fs::read(journey.root().join("journey.wrld.toml")).expect("the world file"),
         before,
         "and the file is byte for byte what it was"
     );
@@ -1842,7 +1842,7 @@ async fn a_snapshot_that_never_arrives_keeps_the_file(cx: &mut TestAppContext) {
 ///     cart numbered them with, and the undo despawns them again.
 #[gpui::test]
 async fn duplicate_copies_the_selection_on_the_cart_and_in_the_document(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let at = journey.on(BOX_A_POS);
     journey.click(at, Modifiers::none());
     assert_eq!(journey.cart_rows(), 3);
@@ -1890,7 +1890,7 @@ async fn a_bucket_fill_in_live_reaches_every_cell(cx: &mut TestAppContext) {
     /// The generated background is square and this many cells to a side.
     const MAP_DIM: usize = 16;
 
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     journey.add_background();
     journey.enter_paint();
     journey.set_paint_tool(ggo_map_panel::MapTool::RectFill);
@@ -1962,7 +1962,7 @@ async fn a_bucket_fill_in_live_reaches_every_cell(cx: &mut TestAppContext) {
 ///     that authors none.
 #[gpui::test]
 async fn pan_is_inert_in_a_world_that_authors_a_camera(cx: &mut TestAppContext) {
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     let from = journey.on(BOX_A_POS);
     journey.hover(from);
     journey.frames(2);
@@ -2007,7 +2007,7 @@ async fn a_world_resend_puts_the_carts_layers_back(cx: &mut TestAppContext) {
     const RECT: (usize, usize) = (4, 3);
     const MAP_DIM: usize = 16;
 
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     journey.add_background();
     journey.enter_paint();
     journey.set_paint_tool(ggo_map_panel::MapTool::RectFill);
@@ -2079,7 +2079,7 @@ async fn a_play_round_trip_puts_the_dropped_cells_back(cx: &mut TestAppContext) 
     const RECT: (usize, usize) = (4, 3);
     const MAP_DIM: usize = 16;
 
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     journey.add_background();
     journey.enter_paint();
     journey.set_paint_tool(ggo_map_panel::MapTool::RectFill);
@@ -2162,7 +2162,7 @@ async fn a_cell_painted_during_a_layer_push_still_reaches_the_cart(cx: &mut Test
     const CELL: usize = 2;
     const MAP_DIM: usize = 16;
 
-    let mut journey = journey(cx, "worlds/journey.toml", NO_SYSTEMS, NO_SYSTEMS).await;
+    let mut journey = journey(cx, "journey.wrld.toml", NO_SYSTEMS, NO_SYSTEMS).await;
     // Two linked slots, so the push cycle is still going after slot 0's
     // blob has left -- which is the window the brush has to survive.
     journey.add_background_slot(0);

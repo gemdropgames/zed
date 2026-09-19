@@ -206,7 +206,7 @@ fn is_assets_dir(dir: &Path) -> bool {
 /// `assets/hh.til` into `hh.spr` in the first place.
 ///
 /// This is the sprite analog of world_panel's `split_world_path`, but the
-/// rule differs in kind: a world announces its root with a literal `worlds/`
+/// rule differs in kind: a world announces its root with a literal `assets`
 /// path component, so that split is pure string work, whereas a sprite's
 /// root is only discoverable on disk.
 ///

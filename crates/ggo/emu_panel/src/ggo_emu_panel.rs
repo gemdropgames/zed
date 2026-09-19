@@ -561,7 +561,7 @@ pub struct EmuPanel {
     flash_charts_window: Option<AnyWindowHandle>,
     /// The last hardware probe. `None` re-probes on the next ask.
     hardware: Option<hardware::HardwareEnv>,
-    /// The world stem (`worlds/arena`) the next flash bakes in as the
+    /// The world stem (`arena`) the next flash bakes in as the
     /// cart's boot world.
     ///
     /// Remembered rather than passed per press because the flash surfaces
@@ -659,19 +659,22 @@ fn is_cartridge(rel: &str) -> bool {
 }
 
 /// A document the world view sends to a running viewer cart itself: a
-/// world `.toml` under a `worlds/` directory, or a `.map` under a `maps/`
-/// one, at any depth.
+/// world file (`<stem>.wrld.toml`, by `ggo_world_panel`'s one predicate --
+/// no second copy of it here), or a `.map` under a `maps/` directory at
+/// any depth.
 fn travels_over_the_link(rel: &str) -> bool {
+    if ggo_world_panel::world_stem(rel).is_some() {
+        return true;
+    }
     let mut components = rel.split('/').rev();
     let Some(name) = components.next() else {
         return false;
     };
-    let extension = std::path::Path::new(name).extension();
-    match extension.and_then(|ext| ext.to_str()) {
-        Some("toml") => components.any(|component| component == "worlds"),
-        Some("map") => components.any(|component| component == "maps"),
-        _ => false,
-    }
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        == Some("map")
+        && components.any(|component| component == "maps")
 }
 
 /// What the pane is currently running, which decides how a watch-mode
@@ -1553,7 +1556,7 @@ impl EmuPanel {
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
-        // A different project is a different `worlds/` tree, so a stem
+        // A different project is a different asset tree, so a stem
         // remembered from the old one would flash a world that no longer
         // exists (or, worse, a same-named world in another game). Only a
         // CHANGE clears it: the first discovery is `None -> Some`, which
@@ -2000,10 +2003,10 @@ impl EmuPanel {
 
     /// [`Self::prepare_world_build`] for the agent socket: the same plan,
     /// with the reason it could not be made RETURNED rather than shown.
-    /// `world` may be a stem (`worlds/arena`) or a rel path
-    /// (`assets/worlds/arena.toml`); a stem is resolved by probing
-    /// `assets/<stem>.toml` and then `<stem>.toml` under the project
-    /// root, first hit wins.
+    /// `world` may be a stem (`arena`) or a rel path
+    /// (`assets/arena.wrld.toml`); a stem is resolved by probing
+    /// `assets/<stem>.wrld.toml` and then `<stem>.wrld.toml` under the
+    /// project root, first hit wins.
     pub(crate) fn remote_pack_plan(
         &mut self,
         world: &str,
@@ -2016,19 +2019,20 @@ impl EmuPanel {
         let world_rel = if ggo_world_panel::world_stem(world).is_some() {
             world.to_string()
         } else {
-            // A bare stem: find the file. `assets/worlds/x.toml` first (real
-            // projects), then `worlds/x.toml` (fixtures).
+            // A bare stem: find the file. `assets/x.wrld.toml` first (real
+            // projects), then `x.wrld.toml` (fixtures).
             let root = self
                 .project_root
                 .clone()
                 .ok_or("no project folder is open")?;
+            let ext = ggo_worldlib::world_files::WORLD_EXT;
             ["assets/", ""]
                 .iter()
-                .map(|prefix| format!("{prefix}{world}.toml"))
+                .map(|prefix| format!("{prefix}{world}{ext}"))
                 .find(|rel| root.join(rel).is_file())
                 .ok_or_else(|| {
                     format!(
-                        "no world file for stem {world} (looked for assets/{world}.toml and {world}.toml)"
+                        "no world file for stem {world} (looked for assets/{world}{ext} and {world}{ext})"
                     )
                 })?
         };
@@ -5644,7 +5648,7 @@ mod tests {
             "/proj",
             serde_json::json!({
                 "emerald.toml": "",
-                "assets": { "worlds": { "main.toml": "" } },
+                "assets": { "main.wrld.toml": "" },
                 "green.cart": "",
                 "notes.txt": "",
             }),
@@ -5746,7 +5750,7 @@ mod tests {
             "a cart gets Re-run"
         );
         assert_eq!(
-            contributed("assets/worlds/main.toml", false, cx),
+            contributed("assets/main.wrld.toml", false, cx),
             2,
             "a world gets Emulate -- and `ggo_world_panel`'s own Delete World, \
              which this harness registers too, since contributions from every \
@@ -5755,7 +5759,7 @@ mod tests {
         assert_eq!(
             contributed("emerald.toml", false, cx),
             0,
-            "a .toml outside worlds/ is neither a world nor a cart"
+            "a bare .toml is neither a world nor a cart"
         );
         assert_eq!(
             contributed("notes.txt", false, cx),
@@ -5782,18 +5786,16 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/main.wrld.toml"), "").unwrap();
 
         let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
 
-        let handler = menu::emulate_world_handler(
-            workspace.downgrade(),
-            "assets/worlds/main.toml".to_string(),
-        );
+        let handler =
+            menu::emulate_world_handler(workspace.downgrade(), "assets/main.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
@@ -5819,11 +5821,11 @@ mod tests {
                 "pack-ggo",
                 "--out",
                 dir.path()
-                    .join("target/ggo-emulate/worlds-main.ggo")
+                    .join("target/ggo-emulate/main.ggo")
                     .to_str()
                     .unwrap(),
                 "--world",
-                "worlds/main",
+                "main",
                 "--json",
             ],
             "the clicked world must be baked in as the boot world"
@@ -5832,7 +5834,7 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             assert_eq!(
                 panel.selected.as_deref(),
-                Some("target/ggo-emulate/worlds-main.ggo"),
+                Some("target/ggo-emulate/main.ggo"),
                 "the built cartridge becomes the selection, through the SAME \
                  path a clicked cart takes"
             );
@@ -5853,16 +5855,16 @@ mod tests {
     async fn test_registered_world_emulator_routes_to_the_same_build(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/main.wrld.toml"), "").unwrap();
 
         let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::emulate_world(workspace, "assets/worlds/main.toml", window, cx)
+            ggo_common::emulate_world(workspace, "assets/main.wrld.toml", window, cx)
         });
         assert!(claimed, "init registers a world emulator");
         cx.run_until_parked();
@@ -5870,18 +5872,18 @@ mod tests {
         let packs = pack_ggo_calls(&calls);
         assert_eq!(packs.len(), 1, "exactly one build");
         assert!(
-            packs[0].args.iter().any(|a| a == "worlds/main"),
+            packs[0].args.iter().any(|a| a == "main"),
             "the viewed world must be baked in as the boot world"
         );
         panel.update(cx, |panel, cx| {
             assert_eq!(
                 panel.selected.as_deref(),
-                Some("target/ggo-emulate/worlds-main.ggo"),
+                Some("target/ggo-emulate/main.ggo"),
                 "the built cartridge becomes the selection"
             );
             assert_eq!(
                 panel.flash_world(cx).as_deref(),
-                Some("worlds/main"),
+                Some("main"),
                 "a flash pressed after an emulate puts THAT world on the board"
             );
         });
@@ -5892,27 +5894,25 @@ mod tests {
     #[gpui::test]
     async fn test_a_failed_world_build_reports_and_runs_nothing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
 
         let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, _calls) = fake_proc_runner(|_| ggo_common::ProcCapture {
             ok: false,
-            lines: vec!["error: no world named worlds/main".to_string()],
+            lines: vec!["error: no world named main".to_string()],
         });
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
 
-        let handler = menu::emulate_world_handler(
-            workspace.downgrade(),
-            "assets/worlds/main.toml".to_string(),
-        );
+        let handler =
+            menu::emulate_world_handler(workspace.downgrade(), "assets/main.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
         panel.update(cx, |panel, _cx| {
             assert_eq!(
                 panel.status.as_deref(),
-                Some("build failed: error: no world named worlds/main")
+                Some("build failed: error: no world named main")
             );
             assert!(panel.selected.is_none(), "nothing was selected");
             assert!(!panel.is_running());
@@ -5926,16 +5926,14 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
 
         let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
 
-        let handler = menu::emulate_world_handler(
-            workspace.downgrade(),
-            "assets/worlds/main.toml".to_string(),
-        );
+        let handler =
+            menu::emulate_world_handler(workspace.downgrade(), "assets/main.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
@@ -5960,9 +5958,9 @@ mod tests {
     async fn pressing_run_leaves_a_watched_world_run_watchable(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/main.wrld.toml"), "").unwrap();
 
         let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
@@ -5973,7 +5971,7 @@ mod tests {
         let fake_fs = fs.as_fake();
 
         workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::emulate_world(workspace, "assets/worlds/main.toml", window, cx)
+            ggo_common::emulate_world(workspace, "assets/main.wrld.toml", window, cx)
         });
         cx.run_until_parked();
         assert_eq!(pack_ggo_calls(&calls).len(), 1);
@@ -5985,7 +5983,7 @@ mod tests {
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert!(
-                matches!(&panel.run_kind, RunKind::World(world) if world == "assets/worlds/main.toml"),
+                matches!(&panel.run_kind, RunKind::World(world) if world == "assets/main.wrld.toml"),
                 "{:?}",
                 panel.run_kind
             );
@@ -6014,10 +6012,7 @@ mod tests {
                 "a save after Run must still re-pack the watched world"
             );
             assert!(
-                packs[packs.len() - 1]
-                    .args
-                    .iter()
-                    .any(|a| a == "worlds/main"),
+                packs[packs.len() - 1].args.iter().any(|a| a == "main"),
                 "and re-pack THAT world"
             );
         }
@@ -6047,7 +6042,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         let endpoint = workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+            ggo_common::boot_viewer(workspace, "assets/main.wrld.toml", window, cx)
         });
         assert!(endpoint.is_none(), "no booter claimed the world");
     }
@@ -6229,10 +6224,10 @@ mod tests {
     /// Transform, in the canonical shape `ggo_worldlib::write_world`
     /// emits.
     fn write_world_fixture(root: &std::path::Path) {
-        std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::write(root.join("emerald.toml"), "[project]\n").unwrap();
         std::fs::write(
-            root.join("assets/worlds/main.toml"),
+            root.join("assets/main.wrld.toml"),
             "[[entity]]\n\
              Transform = { pos = [4.0, 4.0], z = 0.0 }\n\
              Text = { content = \"hi\" }\n",
@@ -6240,7 +6235,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Load `assets/worlds/main.toml` into the workspace's world panel,
+    /// Load `assets/main.wrld.toml` into the workspace's world panel,
     /// off the REAL `root`, and dirty it. Returns the panel.
     fn dirty_world_panel(
         workspace: &Entity<Workspace>,
@@ -6257,7 +6252,7 @@ mod tests {
         // `open_panels`.
         let world_panel = dock
             .update_in(cx, |dock, window, cx| {
-                dock.open_world("assets/worlds/main.toml", window, cx)
+                dock.open_world("assets/main.wrld.toml", window, cx)
             })
             .expect("the dock opened a world tab");
         let root = root.to_path_buf();
@@ -6363,26 +6358,24 @@ mod tests {
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
         let _world_panel = dirty_world_panel(&workspace, cx, dir.path());
 
-        let worlds_dir = dir.path().join("assets/worlds");
-        let restore = std::fs::metadata(&worlds_dir).unwrap().permissions();
+        let assets_dir = dir.path().join("assets");
+        let restore = std::fs::metadata(&assets_dir).unwrap().permissions();
         let mut locked = restore.clone();
         locked.set_mode(0o555);
-        std::fs::set_permissions(&worlds_dir, locked).unwrap();
+        std::fs::set_permissions(&assets_dir, locked).unwrap();
         // Running as root would defeat the setup and the test would pass
         // for the wrong reason -- say so instead.
         assert!(
-            std::fs::write(worlds_dir.join("probe"), b"").is_err(),
+            std::fs::write(assets_dir.join("probe"), b"").is_err(),
             "the fixture directory is still writable, so this test cannot \
              provoke a failed save (running as root?)"
         );
 
-        let handler = menu::emulate_world_handler(
-            workspace.downgrade(),
-            "assets/worlds/main.toml".to_string(),
-        );
+        let handler =
+            menu::emulate_world_handler(workspace.downgrade(), "assets/main.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
-        std::fs::set_permissions(&worlds_dir, restore).unwrap();
+        std::fs::set_permissions(&assets_dir, restore).unwrap();
 
         assert!(
             pack_ggo_calls(&calls).is_empty(),
@@ -6404,7 +6397,7 @@ mod tests {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         write_world_fixture(dir.path());
-        let world_path = dir.path().join("assets/worlds/main.toml");
+        let world_path = dir.path().join("assets/main.wrld.toml");
         assert!(
             !std::fs::read_to_string(&world_path).unwrap().contains("50"),
             "the fixture must not already contain the edit"
@@ -6426,10 +6419,8 @@ mod tests {
         panel.update(cx, |panel, _cx| panel.proc_runner = runner);
         let _world_panel = dirty_world_panel(&workspace, cx, dir.path());
 
-        let handler = menu::emulate_world_handler(
-            workspace.downgrade(),
-            "assets/worlds/main.toml".to_string(),
-        );
+        let handler =
+            menu::emulate_world_handler(workspace.downgrade(), "assets/main.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
@@ -7300,12 +7291,12 @@ mod tests {
             false
         ));
         assert!(watch_triggers(
-            "assets/worlds/main.toml",
+            "assets/main.wrld.toml",
             &PathChange::AddedOrUpdated,
             false
         ));
         assert!(!watch_triggers(
-            "target/ggo-emulate/worlds-main.ggo",
+            "target/ggo-emulate/main.ggo",
             &PathChange::Added,
             false
         ));
@@ -7371,15 +7362,11 @@ mod tests {
     fn a_viewer_run_ignores_the_documents_that_travel_over_the_link() {
         use project::PathChange;
         assert!(
-            !watch_triggers("assets/worlds/main.toml", &PathChange::Updated, true),
+            !watch_triggers("assets/main.wrld.toml", &PathChange::Updated, true),
             "a world save goes over the link"
         );
         assert!(
-            !watch_triggers(
-                "game/assets/worlds/boss/main.toml",
-                &PathChange::Added,
-                true
-            ),
+            !watch_triggers("game/assets/boss/main.wrld.toml", &PathChange::Added, true),
             "at any depth"
         );
         assert!(
@@ -7395,7 +7382,7 @@ mod tests {
             "and so is the game's own code"
         );
         assert!(
-            watch_triggers("assets/worlds/notes.txt", &PathChange::Updated, true),
+            watch_triggers("assets/notes.txt", &PathChange::Updated, true),
             "only the world DOCUMENT travels over the link"
         );
     }
@@ -7427,9 +7414,9 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/main.wrld.toml"), "").unwrap();
 
         let (_db, workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
         let (runner, calls) = fake_proc_runner(|_| ok_capture());
@@ -7444,7 +7431,7 @@ mod tests {
             assert!(!panel.watch, "nothing to watch before a world was emulated");
         });
         workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::emulate_world(workspace, "assets/worlds/main.toml", window, cx)
+            ggo_common::emulate_world(workspace, "assets/main.wrld.toml", window, cx)
         });
         cx.run_until_parked();
         assert_eq!(pack_ggo_calls(&calls).len(), 1);
@@ -7478,7 +7465,7 @@ mod tests {
 
         // The pack's own output landing in the worktree must not loop.
         fake_fs
-            .insert_file("/proj/target/ggo-emulate/worlds-main.ggo", b"cart".to_vec())
+            .insert_file("/proj/target/ggo-emulate/main.ggo", b"cart".to_vec())
             .await;
         cx.run_until_parked();
         cx.executor().advance_clock(WATCH_DEBOUNCE * 2);
@@ -8168,7 +8155,7 @@ mod tests {
                 cx,
             );
             assert!(panel.is_flashing());
-            panel.flash_to_board_with(Some("worlds/arena"), false, window, cx);
+            panel.flash_to_board_with(Some("arena"), false, window, cx);
             assert!(!panel.is_flashing(), "the second press cancelled");
             assert_eq!(panel.status.as_deref(), Some("flash cancelled"));
             assert_eq!(
@@ -8274,7 +8261,7 @@ mod tests {
             let err = panel
                 .remote_flash(
                     hardware::FlashConfig {
-                        world: Some("worlds/arena".to_string()),
+                        world: Some("arena".to_string()),
                         ..Default::default()
                     },
                     window,
@@ -8409,22 +8396,21 @@ mod tests {
         panel.update(cx, |panel, cx| {
             // `unwrap_err` is unavailable: the Ok half holds a `ProcRunner`,
             // which is not `Debug`.
-            let Err(err) = panel.remote_pack_plan("worlds/nope", cx) else {
+            let Err(err) = panel.remote_pack_plan("nope", cx) else {
                 panic!("a stem with no world file cannot plan");
             };
-            assert!(err.contains("no world file for stem worlds/nope"), "{err}");
+            assert!(err.contains("no world file for stem nope"), "{err}");
         });
         // A real world under an emerald project packs.
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(
             dir.path().join("emerald.toml"),
-            "[project]\nname = \"g\"\ndefault_world = \"worlds/arena\"\n",
+            "[project]\nname = \"g\"\ndefault_world = \"arena\"\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join("assets/worlds/arena.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/arena.wrld.toml"), "").unwrap();
         panel.update(cx, |panel, cx| {
-            let (requests, _runner, cart) =
-                panel.remote_pack_plan("worlds/arena", cx).expect("plans");
+            let (requests, _runner, cart) = panel.remote_pack_plan("arena", cx).expect("plans");
             let verbs: Vec<&str> = requests
                 .iter()
                 .filter_map(|request| request.args.first().map(String::as_str))
@@ -8437,10 +8423,10 @@ mod tests {
             assert!(
                 requests
                     .last()
-                    .is_some_and(|request| request.args.iter().any(|a| a == "worlds/arena")),
+                    .is_some_and(|request| request.args.iter().any(|a| a == "arena")),
                 "{requests:?}"
             );
-            assert_eq!(cart, "target/ggo-emulate/worlds-arena.ggo");
+            assert_eq!(cart, "target/ggo-emulate/arena.ggo");
             assert!(
                 panel.status.is_none(),
                 "a planned pack leaves the row alone"
@@ -8631,7 +8617,7 @@ mod tests {
             panel.proc_streamer = streamer;
             panel.start_board_run(
                 vec![request],
-                "flashing worlds/arena".to_string(),
+                "flashing arena".to_string(),
                 hardware::FlashProgress::flash(),
                 cx,
             );
@@ -8641,7 +8627,7 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             let status = panel.remote_flash_status();
             assert!(!status.active);
-            assert_eq!(status.what.as_deref(), Some("flashing worlds/arena"));
+            assert_eq!(status.what.as_deref(), Some("flashing arena"));
             assert_eq!(status.verdict, Some(false));
             assert_eq!(
                 status.failure.as_deref(),
@@ -8815,7 +8801,7 @@ mod tests {
         let (_db, workspace, _panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
 
         workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::flash_to_board(workspace, Some("worlds/arena"), false, window, cx)
+            ggo_common::flash_to_board(workspace, Some("arena"), false, window, cx)
         });
         cx.run_until_parked();
 
@@ -8829,7 +8815,7 @@ mod tests {
                 .clone()
         });
         panel.update(cx, |panel, cx| {
-            assert_eq!(panel.flash_world(cx).as_deref(), Some("worlds/arena"));
+            assert_eq!(panel.flash_world(cx).as_deref(), Some("arena"));
             // The plan the hardware page's own buttons take -- they name
             // no world of their own, so this is the whole of what makes
             // them re-flash the same one.
@@ -8844,17 +8830,17 @@ mod tests {
                 request
                     .args
                     .windows(2)
-                    .any(|pair| pair == ["--world".to_string(), "worlds/arena".to_string()]),
+                    .any(|pair| pair == ["--world".to_string(), "arena".to_string()]),
                 "the page re-flashes the same world: {:?}",
                 request.args
             );
             assert_eq!(
-                what, "flashing worlds/arena",
+                what, "flashing arena",
                 "and the timeline says which world is on its way"
             );
         });
 
-        // A different project is a different `worlds/` tree: the stem must
+        // A different project is a different asset tree: the stem must
         // not survive into it.
         let other = tempfile::tempdir().unwrap();
         panel.update(cx, |panel, cx| {
@@ -8900,7 +8886,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             assert_eq!(
                 panel.flash_world(cx).as_deref(),
-                Some("worlds/main"),
+                Some("main"),
                 "the open document answers when this panel has been told nothing"
             );
             let (request, what, _progress) = panel
@@ -8914,16 +8900,16 @@ mod tests {
                 request
                     .args
                     .windows(2)
-                    .any(|pair| pair == ["--world".to_string(), "worlds/main".to_string()]),
+                    .any(|pair| pair == ["--world".to_string(), "main".to_string()]),
                 "{:?}",
                 request.args
             );
-            assert_eq!(what, "flashing worlds/main");
+            assert_eq!(what, "flashing main");
 
             // A world this panel WAS told about wins: it is the one the
             // user last aimed at hardware.
-            panel.remember_flash_world("worlds/arena");
-            assert_eq!(panel.flash_world(cx).as_deref(), Some("worlds/arena"));
+            panel.remember_flash_world("arena");
+            assert_eq!(panel.flash_world(cx).as_deref(), Some("arena"));
         });
     }
 

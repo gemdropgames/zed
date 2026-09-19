@@ -772,8 +772,8 @@ mod tests {
     fn the_flash_buttons_name_the_world_they_will_boot() {
         let base = "Flash this project to the board and run it";
         assert_eq!(
-            flash_button_tooltip(false, true, base, Some("worlds/arena")),
-            format!("{base} — boots worlds/arena")
+            flash_button_tooltip(false, true, base, Some("arena")),
+            format!("{base} — boots arena")
         );
         assert_eq!(
             flash_button_tooltip(false, true, base, None),
@@ -781,12 +781,12 @@ mod tests {
             "no world remembered leaves the project's default_world"
         );
         assert_eq!(
-            flash_button_tooltip(true, true, base, Some("worlds/arena")),
+            flash_button_tooltip(true, true, base, Some("arena")),
             "Stop the run and kill the child process",
             "the button cancels while a run is in flight"
         );
         assert_eq!(
-            flash_button_tooltip(false, false, base, Some("worlds/arena")),
+            flash_button_tooltip(false, false, base, Some("arena")),
             "Still missing something above",
             "naming a world a disabled button cannot flash is noise"
         );

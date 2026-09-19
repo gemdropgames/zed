@@ -331,7 +331,7 @@ pub fn confirm_for(op: &ManifestOp, cascade: &Cascade) -> Option<Confirm> {
                     cascade.worlds.join(", ")
                 ));
             } else {
-                lines.push("No world under assets/worlds places it.".to_string());
+                lines.push("No world under assets/ places it.".to_string());
             }
             lines.push(CODE_SCAN_NOTE.to_string());
             format!("Remove the component {}?", qualified(module, name))
@@ -696,7 +696,7 @@ mod tests {
         let confirm = confirm_for(
             &ManifestOp::remove(ManifestKind::Component, "HeroUnit", "gameplay"),
             &Cascade {
-                worlds: vec!["worlds/arena.toml".into(), "worlds/nested/deep.toml".into()],
+                worlds: vec!["arena.wrld.toml".into(), "nested/deep.wrld.toml".into()],
                 ..Cascade::default()
             },
         )
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(confirm.message, "Remove the component gameplay/HeroUnit?");
         assert_eq!(
             confirm.cascade[0],
-            "Still placed in 2 worlds: worlds/arena.toml, worlds/nested/deep.toml."
+            "Still placed in 2 worlds: arena.wrld.toml, nested/deep.wrld.toml."
         );
         assert!(confirm.cascade.contains(&CODE_SCAN_NOTE.to_string()));
         assert!(confirm.cascade.contains(&COMPILER_NOTE.to_string()));
@@ -714,10 +714,7 @@ mod tests {
             &Cascade::default(),
         )
         .unwrap();
-        assert_eq!(
-            unplaced.cascade[0],
-            "No world under assets/worlds places it."
-        );
+        assert_eq!(unplaced.cascade[0], "No world under assets/ places it.");
         assert!(
             unplaced.cascade.contains(&CODE_SCAN_NOTE.to_string()),
             "the limit is stated whether or not the scan found anything"

@@ -93,14 +93,14 @@ fn read_manifest(project_dir: &Path, file: &str) -> Option<serde_json::Value> {
 
 // ------------------------------------------------------------- blast radius
 
-/// Every world file under `<project_dir>/assets/worlds` that places an
-/// entity carrying `component`, as asset-root-relative paths (e.g.
-/// `worlds/arena.toml`).
+/// Every world file under `<project_dir>/assets` that places an entity
+/// carrying `component`, as asset-root-relative paths (e.g.
+/// `arena.wrld.toml`).
 ///
 /// **What this does NOT see, and why the confirm says so out loud.** A
 /// component is referenced in two places: world files place it on
 /// entities, and Rust sources name its type. This scan covers the first
-/// and only the first -- it reads `<assets>/worlds/**.toml` and matches
+/// and only the first -- it reads `<assets>/**/*.wrld.toml` and matches
 /// the manifest's stored (PascalCase) name against each `[[entity]]`
 /// table's component keys. Code references are deliberately out of scope:
 /// finding them properly means compiling, `emd rm` already does exactly
@@ -109,8 +109,8 @@ fn read_manifest(project_dir: &Path, file: &str) -> Option<serde_json::Value> {
 /// worse than admitting the limit. So the confirm quotes the worlds and
 /// then says the compiler has the last word.
 ///
-/// Worlds outside `<assets>/worlds` are not scanned either: that is the
-/// only place `emd generate world` writes, and it is the tree
+/// Worlds outside `<assets>` are not scanned either: that is the only
+/// place `emd generate world` writes, and it is the tree
 /// `ggo_world_panel` browses.
 pub fn worlds_using_component(project_dir: &Path, component: &str) -> Vec<String> {
     let assets = project_dir.join(ASSETS_DIR);
@@ -176,7 +176,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("emerald.toml"), "").unwrap();
         std::fs::create_dir_all(root.join("manifests")).unwrap();
-        std::fs::create_dir_all(root.join("assets/worlds/nested")).unwrap();
+        std::fs::create_dir_all(root.join("assets/nested")).unwrap();
         std::fs::write(
             root.join("manifests/components.toml"),
             "version = 1\n\
@@ -201,17 +201,17 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            root.join("assets/worlds/arena.toml"),
+            root.join("assets/arena.wrld.toml"),
             "[[entity]]\nHeroUnit = { hp = 3 }\n",
         )
         .unwrap();
         std::fs::write(
-            root.join("assets/worlds/nested/deep.toml"),
+            root.join("assets/nested/deep.wrld.toml"),
             "[[entity]]\nMarker = {}\n[[entity]]\nHeroUnit = { hp = 1 }\n",
         )
         .unwrap();
         std::fs::write(
-            root.join("assets/worlds/empty.toml"),
+            root.join("assets/empty.wrld.toml"),
             "[[entity]]\nTransform = { pos = [0, 0] }\n",
         )
         .unwrap();
@@ -270,11 +270,11 @@ mod tests {
         let dir = project();
         assert_eq!(
             worlds_using_component(dir.path(), "HeroUnit"),
-            ["worlds/arena.toml", "worlds/nested/deep.toml"]
+            ["arena.wrld.toml", "nested/deep.wrld.toml"]
         );
         assert_eq!(
             worlds_using_component(dir.path(), "Marker"),
-            ["worlds/nested/deep.toml"]
+            ["nested/deep.wrld.toml"]
         );
         assert!(worlds_using_component(dir.path(), "NotPlacedAnywhere").is_empty());
         // A project with no assets tree at all scans to nothing.
@@ -315,7 +315,7 @@ mod tests {
         );
         assert_eq!(
             component.worlds,
-            ["worlds/arena.toml", "worlds/nested/deep.toml"]
+            ["arena.wrld.toml", "nested/deep.wrld.toml"]
         );
         assert!(component.schedules.is_empty());
 

@@ -2420,7 +2420,7 @@ mod tests {
                     .clone(),
             }],
             instances: vec![WorldInstance {
-                world: "worlds/pair".to_string(),
+                world: "pair".to_string(),
                 pos: instance,
                 background_priority: false,
                 resolved: None,
@@ -2483,7 +2483,7 @@ mod tests {
         );
 
         let mut renamed = before.clone();
-        renamed.instances[0].world = "worlds/other".to_string();
+        renamed.instances[0].world = "other".to_string();
         assert_eq!(
             live.plan_replay(&before, &renamed),
             None,
@@ -2961,9 +2961,8 @@ mod tests {
     #[test]
     fn encode_world_produces_a_v5_blob_with_the_document_entities() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("worlds")).unwrap();
         std::fs::write(
-            dir.path().join("worlds/sub.toml"),
+            dir.path().join("sub.wrld.toml"),
             "[[entity]]\nTransform = { pos = [1, 1] }\n",
         )
         .unwrap();
@@ -2976,7 +2975,7 @@ mod tests {
                     .unwrap(),
                 }],
                 instances: vec![ggo_worldlib::world_doc::WorldInstance {
-                    world: "worlds/sub".into(),
+                    world: "sub".into(),
                     pos: [10.0, 0.0],
                     background_priority: false,
                     resolved: None,

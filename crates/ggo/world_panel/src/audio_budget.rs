@@ -227,7 +227,7 @@ mod tests {
         let mut store = WorldDocStore::new(WorldDocWire::from(WorldFile {
             entities: vec![],
             instances: vec![WorldInstance {
-                world: "worlds/arena".to_string(),
+                world: "arena".to_string(),
                 pos: [0.0, 0.0],
                 background_priority: false,
             }],
@@ -236,12 +236,12 @@ mod tests {
         let resolved = json!({
             "entities": [{ "components": { "Sfx": { "stem": "sfx/hit" } } }],
             "instances": [{
-                "world": "worlds/deeper",
+                "world": "deeper",
                 "pos": [0, 0],
                 "resolved": { "entities": [{ "components": { "Music": { "stem": "music/deep" } } }], "instances": [] }
             }]
         });
-        store.set_instances_resolved("worlds/arena", &Ok(resolved), true);
+        store.set_instances_resolved("arena", &Ok(resolved), true);
         assert_eq!(
             audio_stems(&store.state(), &builtin_schemas()),
             vec!["music/deep".to_string(), "sfx/hit".to_string()]

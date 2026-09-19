@@ -677,9 +677,9 @@ mod tests {
 
     fn project_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/main.wrld.toml"), "").unwrap();
         dir
     }
 
@@ -716,7 +716,7 @@ mod tests {
     fn a_viewer_build_bakes_before_it_packs() {
         let dir = project_dir();
         let (requests, root) =
-            viewer_build_request(dir.path(), "assets/worlds/main.toml").expect("an emerald project");
+            viewer_build_request(dir.path(), "assets/main.wrld.toml").expect("an emerald project");
 
         assert_eq!(
             requests
@@ -781,7 +781,7 @@ mod tests {
         let endpoint = ggo_common::LinkEndpoint::new();
         let run = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -840,7 +840,7 @@ mod tests {
         let endpoint = ggo_common::LinkEndpoint::new();
         let run = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -889,7 +889,7 @@ mod tests {
         let endpoint = ggo_common::LinkEndpoint::new();
         let run = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -928,7 +928,7 @@ mod tests {
         // `new` starts is still in flight for both rebuilds below.
         let run = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -958,7 +958,7 @@ mod tests {
         let endpoint = ggo_common::LinkEndpoint::new();
         let run = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -1004,7 +1004,7 @@ mod tests {
         let endpoint = ggo_common::LinkEndpoint::new();
         let _run = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -1024,13 +1024,12 @@ mod tests {
     #[gpui::test]
     async fn a_world_outside_an_emerald_project_is_refused(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("worlds")).unwrap();
-        std::fs::write(dir.path().join("worlds/x.toml"), "").unwrap();
+        std::fs::write(dir.path().join("x.wrld.toml"), "").unwrap();
         let (runner, calls) = fake_emd(dir.path(), false);
         let endpoint = ggo_common::LinkEndpoint::new();
         let _run = cx.new(|cx| {
             ViewerRun::new(
-                "worlds/x.toml".into(),
+                "x.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -1054,7 +1053,7 @@ mod tests {
         let b = ggo_common::LinkEndpoint::new();
         let run_a = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner.clone(),
                 a.clone(),
@@ -1064,7 +1063,7 @@ mod tests {
         });
         let run_b = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 b.clone(),
@@ -1113,7 +1112,7 @@ mod tests {
             })
             .expect("a centre tab is in front");
         let endpoint = workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+            ggo_common::boot_viewer(workspace, "assets/main.wrld.toml", window, cx)
         });
         cx.run_until_parked();
         let endpoint = endpoint.expect("the booter claimed the boot");
@@ -1158,7 +1157,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
 
         let endpoint = workspace.update_in(cx, |workspace, window, cx| {
-            ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+            ggo_common::boot_viewer(workspace, "assets/main.wrld.toml", window, cx)
         });
         let endpoint = endpoint.expect("the booter claims a boot it cannot start");
         assert_eq!(
@@ -1201,7 +1200,7 @@ mod tests {
         let endpoint = ggo_common::LinkEndpoint::new();
         let run = cx.new(|cx| {
             ViewerRun::new(
-                "assets/worlds/main.toml".into(),
+                "assets/main.wrld.toml".into(),
                 dir.path().to_path_buf(),
                 runner,
                 endpoint.clone(),
@@ -1280,10 +1279,10 @@ mod tests {
     async fn two_runs_of_one_project_share_a_single_build(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = project_dir();
-        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/other.wrld.toml"), "").unwrap();
         let (runner, calls) = fake_emd(dir.path(), true);
-        let (_run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
-        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        let (_run_a, a) = spawn_run(cx, dir.path(), "assets/main.wrld.toml", runner.clone());
+        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/other.wrld.toml", runner);
         cx.run_until_parked();
         assert_eq!(builds(&calls), 1, "one `emd editor-cart` for both viewers");
         assert_eq!(a.state(), ggo_common::ViewerState::Running);
@@ -1304,16 +1303,17 @@ mod tests {
     async fn a_build_every_waiter_dropped_is_joined_not_restarted(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = project_dir();
-        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/other.wrld.toml"), "").unwrap();
         let (runner, calls) = fake_emd(dir.path(), true);
-        let (run_a, endpoint_a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
+        let (run_a, endpoint_a) =
+            spawn_run(cx, dir.path(), "assets/main.wrld.toml", runner.clone());
         // Nothing has been pumped, so the build `new` registered is still
         // in flight when its only waiter goes.
         endpoint_a.request_stop();
         drop(run_a);
         cx.update(|_| {});
 
-        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/other.wrld.toml", runner);
         cx.run_until_parked();
         assert_eq!(builds(&calls), 1, "one `emd` over the project's one `.ggo`");
         assert_eq!(
@@ -1331,7 +1331,7 @@ mod tests {
         cx.executor().allow_parking();
         let dir = project_dir();
         let (runner, calls) = fake_emd(dir.path(), true);
-        let (run, endpoint) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
+        let (run, endpoint) = spawn_run(cx, dir.path(), "assets/main.wrld.toml", runner.clone());
         endpoint.request_stop();
         drop(run);
         cx.update(|_| {});
@@ -1343,7 +1343,7 @@ mod tests {
             );
         });
 
-        let (_run, endpoint) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner);
+        let (_run, endpoint) = spawn_run(cx, dir.path(), "assets/main.wrld.toml", runner);
         cx.run_until_parked();
         assert_eq!(
             builds(&calls),
@@ -1359,10 +1359,10 @@ mod tests {
     async fn a_save_rebuilds_every_run_of_a_project_with_one_build(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = project_dir();
-        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/other.wrld.toml"), "").unwrap();
         let (runner, calls) = fake_emd(dir.path(), true);
-        let (run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
-        let (run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        let (run_a, a) = spawn_run(cx, dir.path(), "assets/main.wrld.toml", runner.clone());
+        let (run_b, b) = spawn_run(cx, dir.path(), "assets/other.wrld.toml", runner);
         cx.run_until_parked();
         assert_eq!(builds(&calls), 1);
 
@@ -1406,9 +1406,8 @@ mod tests {
             }
         });
         let (_run_one, endpoint_one) =
-            spawn_run(cx, one.path(), "assets/worlds/main.toml", runner.clone());
-        let (_run_two, endpoint_two) =
-            spawn_run(cx, two.path(), "assets/worlds/main.toml", runner);
+            spawn_run(cx, one.path(), "assets/main.wrld.toml", runner.clone());
+        let (_run_two, endpoint_two) = spawn_run(cx, two.path(), "assets/main.wrld.toml", runner);
         cx.run_until_parked();
         assert_eq!(builds(&calls), 2, "each project builds its own cart");
         assert_eq!(endpoint_one.state(), ggo_common::ViewerState::Running);
@@ -1420,7 +1419,7 @@ mod tests {
     #[gpui::test]
     async fn a_shared_build_failure_stops_every_waiting_run(cx: &mut TestAppContext) {
         let dir = project_dir();
-        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/other.wrld.toml"), "").unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let attempts = calls.clone();
         let runner: ggo_common::ProcRunner = Arc::new(move |_request| {
@@ -1430,8 +1429,8 @@ mod tests {
                 lines: vec!["error: could not compile demo_editor".to_string()],
             }
         });
-        let (_run_a, a) = spawn_run(cx, dir.path(), "assets/worlds/main.toml", runner.clone());
-        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/worlds/other.toml", runner);
+        let (_run_a, a) = spawn_run(cx, dir.path(), "assets/main.wrld.toml", runner.clone());
+        let (_run_b, b) = spawn_run(cx, dir.path(), "assets/other.wrld.toml", runner);
         cx.run_until_parked();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one build for both");
         for state in [a.state(), b.state()] {
@@ -1451,7 +1450,7 @@ mod tests {
     async fn a_failed_run_survives_another_viewers_boot(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = project_dir();
-        std::fs::write(dir.path().join("assets/worlds/other.toml"), "").unwrap();
+        std::fs::write(dir.path().join("assets/other.wrld.toml"), "").unwrap();
         let ggo = dir.path().join("demo-editor.ggo");
         std::fs::write(&ggo, crate::drive::fixture::green_screen_cart()).unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -1476,7 +1475,7 @@ mod tests {
         });
         let failed = workspace
             .update_in(cx, |workspace, window, cx| {
-                ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+                ggo_common::boot_viewer(workspace, "assets/main.wrld.toml", window, cx)
             })
             .expect("the booter claimed the boot");
         cx.run_until_parked();
@@ -1488,7 +1487,7 @@ mod tests {
 
         workspace
             .update_in(cx, |workspace, window, cx| {
-                ggo_common::boot_viewer(workspace, "assets/worlds/other.toml", window, cx)
+                ggo_common::boot_viewer(workspace, "assets/other.wrld.toml", window, cx)
             })
             .expect("the second world view booted too");
         cx.run_until_parked();
@@ -1527,7 +1526,7 @@ mod tests {
         });
         let endpoint = workspace
             .update_in(cx, |workspace, window, cx| {
-                ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+                ggo_common::boot_viewer(workspace, "assets/main.wrld.toml", window, cx)
             })
             .expect("the booter claimed the boot");
         cx.update(|_, cx| {
@@ -1563,7 +1562,7 @@ mod tests {
         });
         workspace
             .update_in(cx, |workspace, window, cx| {
-                ggo_common::boot_viewer(workspace, "assets/worlds/main.toml", window, cx)
+                ggo_common::boot_viewer(workspace, "assets/main.wrld.toml", window, cx)
             })
             .expect("the booter claimed the boot");
         cx.run_until_parked();

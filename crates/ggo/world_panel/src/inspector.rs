@@ -391,7 +391,7 @@ mod tests {
         let file = WorldFile {
             entities: vec![],
             instances: vec![ggo_worldlib::world_file::WorldInstance {
-                world: "worlds/sub".to_string(),
+                world: "sub".to_string(),
                 pos,
                 background_priority: false,
             }],

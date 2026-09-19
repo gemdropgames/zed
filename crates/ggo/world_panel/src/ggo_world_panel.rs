@@ -1,9 +1,9 @@
-//! GGO World panel: a dock panel that renders the open `worlds/**.toml`
+//! GGO World panel: a dock panel that renders the open `**/*.wrld.toml`
 //! with real pixels (composed sprite/map images via `ggo-worldlib`) and
 //! edits it: click select, drag placement (live `WorldOp` moves coalesced
 //! per gesture), a schema-driven inspector, undo/redo, and save. Which
 //! world is open is driven ENTIRELY by the file explorer (F4 X1): clicking
-//! a `**/worlds/**/*.toml` there routes here through
+//! a `**/assets/**/*.wrld.toml` there routes here through
 //! [`intercept_world_open`]; the panel has no picker of its own. The ASSET
 //! ROOT the document (and every stem inside it) resolves against is derived
 //! from that clicked path -- see [`split_world_path`].
@@ -89,7 +89,7 @@ actions!(
         Undo,
         /// Redoes the last undone edit to the open world.
         Redo,
-        /// Saves the open world to its `worlds/*.toml` file.
+        /// Saves the open world to its `*.wrld.toml` file.
         Save,
         /// Commits the focused inspector field (bound to Enter inside the
         /// panel's field editors).
@@ -157,12 +157,12 @@ const PAINT_WIDTH: Pixels = px(280.);
 const PASTE_OFFSET_PX: f64 = 16.0;
 
 pub fn init(cx: &mut App) {
-    // Explorer-driven routing: clicking a `**/worlds/**/*.toml` in the project
+    // Explorer-driven routing: clicking a `**/assets/**/*.wrld.toml` in the project
     // panel loads it HERE instead of opening a TOML editor tab. This is the
     // panel's only way in -- there is no in-panel world picker.
     workspace::register_path_open_interceptor(cx, intercept_world_open);
 
-    // Right-clicking that same `**/worlds/**/*.toml` offers the file ops
+    // Right-clicking that same `**/assets/**/*.wrld.toml` offers the file ops
     // that need to know it IS a world -- currently just "Delete World".
     workspace::register_context_menu_contributor(cx, contribute_world_menu);
 
@@ -183,7 +183,7 @@ pub fn init(cx: &mut App) {
 }
 
 /// Empty-state text. The panel has no picker of its own by design (F4 X1):
-/// worlds arrive by clicking a `**/worlds/**/*.toml` in the project panel.
+/// worlds arrive by clicking a `**/assets/**/*.wrld.toml` in the project panel.
 const EMPTY_MESSAGE: &str = "Open a world file from the project panel";
 
 /// Why a save in Play is refused -- on the press, and again if Play
@@ -215,48 +215,52 @@ fn toggle_suffix(on: bool) -> &'static str {
 /// (Shift: 4x).
 const CAMERA_PAN_STEP_PX: f64 = 32.0;
 
-/// Byte index of the LAST `worlds/` path COMPONENT in `rel`, or `None` when
-/// `rel` has none. Component-anchored: `myworlds/x.toml` does not match,
-/// only a segment that IS `worlds`.
-fn last_worlds_dir_index(rel: &str) -> Option<usize> {
-    rel.rmatch_indices(world_files::WORLDS_DIR)
-        .map(|(i, _)| i)
-        .find(|i| *i == 0 || rel.as_bytes()[i - 1] == b'/')
-}
-
 /// Split a worktree-relative path into its ASSET ROOT (worktree-relative,
 /// `""` for the worktree root itself) and the asset-root-relative world
 /// listing -- or `None` when `rel` is not a world file.
 ///
-/// Worlds do NOT live at `<project>/worlds` in a real project: they live
-/// under an asset root, `<project>/assets/worlds/*.toml`, and that asset
-/// root is what EVERY stem in the engine's world format resolves against --
-/// `emerald.toml`'s `default_world = "worlds/boot"`, each
-/// `[[instance]] world = "worlds/arena"`, each `[[background]]` map path and
-/// each `Sprite`/`MetaSprite`/`Tilemap` asset stem. So the root can't be
-/// hardcoded; it is DERIVED here from the clicked path by splitting at the
-/// last `worlds/` component:
+/// A world file is any `<stem>.wrld.toml`, anywhere under the project's
+/// asset root; other `.toml` files under that root (a `components.toml`
+/// manifest, a map) are not worlds. The asset root is what EVERY stem in
+/// the engine's world format resolves against -- `emerald.toml`'s
+/// `default_world = "boot"`, each `[[instance]] world = "arena"`, each
+/// `[[background]]` map path and each `Sprite`/`MetaSprite`/`Tilemap` asset
+/// stem. So the root can't be hardcoded; it is DERIVED here from the
+/// clicked path by splitting after the last `assets` component:
 ///
-/// | clicked rel                     | asset root      | world rel         |
-/// |---------------------------------|-----------------|-------------------|
-/// | `assets/worlds/main.toml`       | `assets`        | `worlds/main.toml`|
-/// | `worlds/main.toml`              | `` (worktree)   | `worlds/main.toml`|
-/// | `assets/worlds/sub/worlds/x.toml` | `assets/worlds/sub` | `worlds/x.toml` |
+/// | clicked rel                       | asset root             | world rel / stem           |
+/// |-----------------------------------|------------------------|----------------------------|
+/// | `assets/main.wrld.toml`           | `assets`               | `main.wrld.toml` / `main`  |
+/// | `assets/levels/a.wrld.toml`       | `assets`               | `levels/a.wrld.toml` / `levels/a` |
+/// | `main.wrld.toml`                  | `` (worktree)          | `main.wrld.toml` / `main`  |
+/// | `game/assets/sub/assets/x.wrld.toml` | `game/assets/sub/assets` | `x.wrld.toml` / `x`   |
 ///
-/// The tail is validated by worldlib's own `world_files` rule, so the
-/// "what counts as a world file" half stays single-sourced. The result
-/// accepts exactly what the syntax-highlighting glob a GGO project's
-/// `.zed/settings.json` uses accepts (`**/worlds/**/*.toml`, see
-/// `ggo_language::PROJECT_FILE_TYPE_GLOB`); the two were divergent until F4
-/// and the glob was the one that was right. A bare `foo.toml`, a `.toml`
-/// outside any `worlds/` directory, or a FILE named `worlds.toml` is NOT a
-/// world and must not hijack this panel.
+/// The match is component-anchored: `myassets/x.wrld.toml` has no `assets`
+/// component, so its root is the worktree. The tail is validated by
+/// worldlib's own `world_files` rule, so the "what counts as a world file"
+/// half stays single-sourced. The result accepts exactly what the
+/// syntax-highlighting glob a GGO project's `.zed/settings.json` uses
+/// accepts (`**/assets/**/*.wrld.toml`, see
+/// `ggo_language::PROJECT_FILE_TYPE_GLOB`). A bare `Cargo.toml`, an
+/// `assets/manifests/components.toml` or an old-layout
+/// `assets/worlds/main.toml` is NOT a world and must not hijack this panel.
 fn split_world_path(rel: &str) -> Option<(String, WorldListing)> {
-    let cut = last_worlds_dir_index(rel)?;
+    let cut = asset_root_end(rel);
     let listing = world_files::world_files(std::slice::from_ref(&rel[cut..].to_string()))
         .into_iter()
         .next()?;
     Some((rel[..cut].trim_end_matches('/').to_string(), listing))
+}
+
+/// Byte index in `rel` just past the LAST path component that is exactly
+/// `assets` (including its trailing `/`), or `0` when `rel` has no such
+/// component. Component-anchored: `myassets/x` does not match.
+fn asset_root_end(rel: &str) -> usize {
+    const ASSETS: &str = "assets/";
+    rel.rmatch_indices(ASSETS)
+        .map(|(i, _)| i)
+        .find(|i| *i == 0 || rel.as_bytes()[i - 1] == b'/')
+        .map_or(0, |i| i + ASSETS.len())
 }
 
 /// Sprite stems are asset-root-relative and extensionless (`sprites/hero`).
@@ -314,8 +318,8 @@ fn asset_rel_for_stem(
 }
 
 /// The assets-root-relative world STEM a worktree-relative path names --
-/// `assets/worlds/main.toml` -> `worlds/main` -- or `None` when the path
-/// is not a world file at all.
+/// `assets/levels/main.wrld.toml` -> `levels/main` -- or `None` when the
+/// path is not a world file at all.
 ///
 /// This is the identity emerald itself uses for a world everywhere it
 /// names one: `emerald.toml`'s `default_world`, `[[instance]] world`, and
@@ -323,7 +327,7 @@ fn asset_rel_for_stem(
 /// `EMERALD_DEFAULT_WORLD`). Exported because `ggo_emu_panel`'s "Emulate
 /// this world" entry needs BOTH halves of what this module already knows
 /// -- the "is this a world?" predicate and the stem to bake in -- and a
-/// second copy of the `worlds/`-splitting rule over there is exactly the
+/// second copy of the asset-root-splitting rule over there is exactly the
 /// drift the fork's single-source rule exists to stop. It hands back a
 /// `String` rather than worldlib's `WorldListing` so the emu panel does
 /// not have to depend on worldlib for it.
@@ -331,9 +335,24 @@ pub fn world_stem(rel: &str) -> Option<String> {
     split_world_path(rel).map(|(_, listing)| listing.stem)
 }
 
+/// The label a world file gets in a tab or a boot screen: its file name
+/// minus [`world_files::WORLD_EXT`]. `Path::file_stem` alone leaves the
+/// `.wrld` half behind (`floor1.wrld`), since the extension is two dots
+/// deep.
+pub(crate) fn world_display_name(rel: &str) -> String {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    match name.strip_suffix(world_files::WORLD_EXT) {
+        Some(stem) if !stem.is_empty() => stem.to_string(),
+        _ => std::path::Path::new(name)
+            .file_stem()
+            .map_or_else(|| rel.to_string(), |s| s.to_string_lossy().into_owned()),
+    }
+}
+
 /// Where the add-layer flow puts a world's generated background map. The
-/// leading `worlds/` is dropped but nesting is kept, so two worlds with
-/// the same basename in different subdirectories cannot collide.
+/// stem's nesting is kept, so two worlds with the same basename in
+/// different subdirectories cannot collide. A leading `worlds/` (the old
+/// layout's stems) is dropped so those maps do not gain a needless level.
 fn background_map_rel(world_stem: &str, layer: u8) -> String {
     let stem = world_stem.strip_prefix("worlds/").unwrap_or(world_stem);
     format!("maps/{stem}.bg{layer}.map")
@@ -386,7 +405,7 @@ fn patch_map_on_disk(root: &Path, rel: &str, w: u16, h: u16, cells: &[u16]) -> R
     io::save_map(root, rel, &store.state()).map_err(|e| e.to_string())
 }
 
-/// `workspace::PathOpenInterceptor` for `**/worlds/**/*.toml`: claim the
+/// `workspace::PathOpenInterceptor` for `**/assets/**/*.wrld.toml`: claim the
 /// path, open the panel, and load it. Declines (so the normal open path
 /// runs) for any other file, for a path outside the primary worktree, and
 /// when no panel is docked.
@@ -497,7 +516,7 @@ fn intercept_world_open(
     )
 }
 
-/// `workspace::ContextMenuContributor` for `**/worlds/**/*.toml`: the world
+/// `workspace::ContextMenuContributor` for `**/assets/**/*.wrld.toml`: the world
 /// file ops the project panel's own menu can't offer, because upstream has
 /// no idea a world is anything but a `.toml`.
 ///
@@ -746,18 +765,18 @@ enum EditMode {
 /// A loaded world plus its render-side caches and editor state.
 struct OpenWorld {
     /// The world's listing RELATIVE TO [`Self::root`] (e.g. stem
-    /// `worlds/main`), which is the same frame every engine-side stem
+    /// `main`), which is the same frame every engine-side stem
     /// resolves in -- not the worktree-relative path that was clicked.
     listing: WorldListing,
     /// The worktree-relative path as CLICKED (e.g.
-    /// `assets/worlds/main.toml`). Kept alongside the listing because it,
+    /// `assets/main.wrld.toml`). Kept alongside the listing because it,
     /// not the asset-root-relative rel, is what identifies the file to the
     /// explorer and to the user: it answers "is this click the world that
     /// is already open?" and it is what the unsaved-edits prompt names.
     source_rel: String,
     /// The ASSET ROOT this world was LOADED from -- `<worktree>/assets`
-    /// for `assets/worlds/main.toml`, the worktree root for
-    /// `worlds/main.toml` (see [`split_world_path`]). Save writes under
+    /// for `assets/main.wrld.toml`, the worktree root for
+    /// `main.wrld.toml` (see [`split_world_path`]). Save writes under
     /// THIS root, not the panel's live `project_root` -- a refresh can
     /// repoint the panel at a different worktree while a world from the
     /// old root is still open, and saving the open doc under the new
@@ -2999,15 +3018,15 @@ impl WorldPanel {
     /// Re-discover the project root (the workspace's first visible
     /// worktree) and re-enumerate the worlds under the ACTIVE asset root.
     /// Runs on every panel activation -- the walk only touches
-    /// `<asset root>/worlds`, so it's cheap.
+    /// the asset root, so it's cheap.
     ///
     /// The listing is no longer a picker feed (F4 X1 removed the picker);
     /// it survives because `AddInstance` needs the set of OTHER worlds this
     /// one may instance -- see [`Self::instance_candidates`]. That set has
     /// to come from the OPEN document's asset root, not the worktree root:
     /// an `[[instance]]` stem resolves against the same root its parent
-    /// world did, so enumerating `<worktree>/worlds` while
-    /// `<worktree>/assets/worlds/main.toml` is open would offer stems that
+    /// world did, so enumerating the worktree root while
+    /// `<worktree>/assets/main.wrld.toml` is open would offer stems that
     /// resolve to nothing.
     ///
     /// MUST NOT run while the workspace itself is mid-update (it reads the
@@ -3096,12 +3115,12 @@ impl WorldPanel {
                 let project_root = self.project_root.clone()?;
                 // No clicked path has named a root yet, so apply the rule
                 // [`split_world_path`] would have applied to a click on
-                // `assets/worlds/x.toml`. Without it a project with the
+                // `assets/x.wrld.toml`. Without it a project with the
                 // usual asset-root layout enumerates NO worlds until a
                 // human opens one by hand -- which is exactly the state
                 // `remote_list` answers in.
                 let assets = project_root.join("assets");
-                Some(if assets.join("worlds").is_dir() {
+                Some(if assets.is_dir() {
                     assets
                 } else {
                     project_root
@@ -3171,7 +3190,7 @@ impl WorldPanel {
     /// the body of the project panel's "Delete World" entry
     /// ([`contribute_world_menu`]).
     ///
-    /// The prompt names the world by its STEM (`worlds/main`, the name
+    /// The prompt names the world by its STEM (`main`, the name
     /// every `[[instance]]` and `default_world` refers to it by) as well as
     /// by the file, because those differ under an asset root and only the
     /// stem tells you what will break elsewhere.
@@ -5027,8 +5046,8 @@ impl WorldPanel {
     }
 
     /// The worktree-relative form of an asset-root-relative world path.
-    /// The two frames differ under an asset root (`worlds/main.toml`
-    /// against `<worktree>/assets` is `assets/worlds/main.toml` to the
+    /// The two frames differ under an asset root (`main.wrld.toml`
+    /// against `<worktree>/assets` is `assets/main.wrld.toml` to the
     /// explorer), and every path that crosses this panel's edges -- what
     /// a click carries, what [`Self::load_rel_path`] splits the root back
     /// out of, what [`Self::open_rel_path_now`] reports -- is the
@@ -5055,7 +5074,7 @@ impl WorldPanel {
         }
     }
 
-    /// The listing entry `world` names -- a stem (`worlds/arena`), its
+    /// The listing entry `world` names -- a stem (`arena`), its
     /// asset-root-relative path, or its worktree-relative one -- as the
     /// worktree-relative path to open, or the reason there is none.
     ///
@@ -6484,12 +6503,7 @@ impl WorldPanel {
             return None;
         };
         let booting = || {
-            let stem = std::path::Path::new(open.source_rel.as_str())
-                .file_stem()
-                .map_or_else(
-                    || open.source_rel.clone(),
-                    |stem| stem.to_string_lossy().into_owned(),
-                );
+            let stem = world_display_name(open.source_rel.as_str());
             format!("Booting viewer for {stem}…")
         };
         let Some(live) = open.live.as_ref() else {
@@ -6860,9 +6874,9 @@ impl WorldPanel {
         });
     }
 
-    /// The open document's world stem (`worlds/arena`), by the same
+    /// The open document's world stem (`arena`), by the same
     /// [`world_stem`] rule the Emulate and popout builds use -- there is
-    /// exactly one `worlds/`-splitting rule in this fork and this is not a
+    /// exactly one asset-root-splitting rule in this fork and this is not a
     /// second one. `None` while no world is open.
     ///
     /// Public because the emulator panel's own flash surfaces fall back to
@@ -9566,7 +9580,7 @@ mod tests {
             instances: vec![],
             backgrounds: vec![],
         };
-        write_world(root, "worlds/sub.toml", &sub).unwrap();
+        write_world(root, "sub.wrld.toml", &sub).unwrap();
 
         let main = WorldFile {
             entities: vec![
@@ -9584,13 +9598,13 @@ mod tests {
                 })),
             ],
             instances: vec![WorldInstance {
-                world: "worlds/sub".to_string(),
+                world: "sub".to_string(),
                 pos: [32.0, 16.0],
                 background_priority: false,
             }],
             backgrounds: vec![],
         };
-        write_world(root, "worlds/test.toml", &main).unwrap();
+        write_world(root, "test.wrld.toml", &main).unwrap();
     }
 
     /// A `WorldPanel` bound to `workspace` and reading from `root`: what
@@ -9612,7 +9626,7 @@ mod tests {
         })
     }
 
-    /// Load `worlds/test` into a fresh panel and return it Ready, with the
+    /// Load `test` into a fresh panel and return it Ready, with the
     /// camera at identity (pan `[0, 0]`, zoom 1) so canvas-local px ==
     /// world px in the editor tests.
     async fn ready_panel(
@@ -9630,7 +9644,7 @@ mod tests {
         });
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", None, cx);
+            panel.load_rel_path("test.wrld.toml", None, cx);
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
@@ -9652,13 +9666,13 @@ mod tests {
         panel.update(cx, |panel, cx| {
             // No workspace and no root override: nothing to resolve a
             // project root from, which is what `load_rel_path` gives up on.
-            panel.mark_loading("worlds/test.toml", cx);
+            panel.mark_loading("test.wrld.toml", cx);
             assert!(matches!(panel.state, ViewerState::Loading { .. }));
-            panel.load_rel_path("worlds/test.toml", None, cx);
+            panel.load_rel_path("test.wrld.toml", None, cx);
             let ViewerState::Error(reason) = &panel.state else {
                 panic!("an abandoned load must not stay Loading");
             };
-            assert!(reason.contains("worlds/test.toml"), "{reason}");
+            assert!(reason.contains("test.wrld.toml"), "{reason}");
             let read = panel.remote_read().unwrap_err();
             assert!(
                 !read.contains(WORLD_STILL_LOADING),
@@ -9674,12 +9688,12 @@ mod tests {
         panel.update(cx, |panel, cx| {
             let listed = panel.remote_list(cx);
             let stems: Vec<&str> = listed.iter().map(|(stem, _)| stem.as_str()).collect();
-            assert_eq!(stems, ["worlds/sub", "worlds/test"]);
-            assert_eq!(listed[1].1, "worlds/test.toml");
+            assert_eq!(stems, ["sub", "test"]);
+            assert_eq!(listed[1].1, "test.wrld.toml");
 
             let read = panel.remote_read().expect("a Ready world reads");
-            assert_eq!(read["stem"], "worlds/test");
-            assert_eq!(read["rel_path"], "worlds/test.toml");
+            assert_eq!(read["stem"], "test");
+            assert_eq!(read["rel_path"], "test.wrld.toml");
             assert_eq!(read["dirty"], false);
             assert_eq!(read["entities"].as_array().unwrap().len(), 3);
             assert_eq!(read["entities"][1]["pos"], serde_json::json!([40.0, 8.0]));
@@ -9687,14 +9701,14 @@ mod tests {
                 read["entities"][1]["components"]["Text"]["content"],
                 "hello"
             );
-            assert_eq!(read["instances"][0]["world"], "worlds/sub");
+            assert_eq!(read["instances"][0]["world"], "sub");
             assert_eq!(read["selected"].as_array().unwrap().len(), 0);
 
             assert!(
                 panel
-                    .remote_resolve("worlds/nope", cx)
+                    .remote_resolve("nope", cx)
                     .unwrap_err()
-                    .contains("worlds/test")
+                    .contains("test")
             );
         });
     }
@@ -9827,25 +9841,19 @@ mod tests {
             assert_eq!(
                 listed,
                 vec![
-                    (
-                        "worlds/sub".to_string(),
-                        "assets/worlds/sub.toml".to_string()
-                    ),
-                    (
-                        "worlds/test".to_string(),
-                        "assets/worlds/test.toml".to_string()
-                    ),
+                    ("sub".to_string(), "assets/sub.wrld.toml".to_string()),
+                    ("test".to_string(), "assets/test.wrld.toml".to_string()),
                 ]
             );
-            let rel = panel.remote_resolve("worlds/test", cx).unwrap();
-            assert_eq!(rel, "assets/worlds/test.toml");
+            let rel = panel.remote_resolve("test", cx).unwrap();
+            assert_eq!(rel, "assets/test.wrld.toml");
             panel.load_rel_path(&rel, None, cx);
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, _cx| {
             let read = panel.remote_read().expect("the asset-rooted world reads");
-            assert_eq!(read["stem"], "worlds/test");
-            assert_eq!(read["rel_path"], "assets/worlds/test.toml");
+            assert_eq!(read["stem"], "test");
+            assert_eq!(read["rel_path"], "assets/test.wrld.toml");
         });
     }
 
@@ -9871,8 +9879,8 @@ mod tests {
     }
 
     /// End-to-end viewer load against a real-fs temp project: picker
-    /// enumerates both worlds, selecting `worlds/test` runs the off-thread
-    /// loader (including recursive instance resolution of `worlds/sub`),
+    /// enumerates both worlds, selecting `test` runs the off-thread
+    /// loader (including recursive instance resolution of `sub`),
     /// and the panel reaches Ready with a non-empty draw list containing
     /// both the top-level and the instance-resolved Text entities.
     #[gpui::test]
@@ -9891,8 +9899,8 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
             let stems: Vec<&str> = panel.worlds.iter().map(|w| w.stem.as_str()).collect();
-            assert_eq!(stems, ["worlds/sub", "worlds/test"]);
-            panel.load_rel_path("worlds/test.toml", None, cx);
+            assert_eq!(stems, ["sub", "test"]);
+            panel.load_rel_path("test.wrld.toml", None, cx);
             assert!(matches!(panel.state, ViewerState::Loading { .. }));
         });
 
@@ -9911,7 +9919,7 @@ mod tests {
                 .count();
             assert_eq!(
                 texts, 3,
-                "two top-level Texts + one from the resolved worlds/sub instance"
+                "two top-level Texts + one from the resolved sub instance"
             );
             assert!(
                 items
@@ -9929,16 +9937,16 @@ mod tests {
     }
 
     /// F4 regression (user-reported): real projects keep their worlds under
-    /// an ASSET ROOT -- `<project>/assets/worlds/*.toml` -- because that is
-    /// the root `emerald.toml`'s `default_world = "worlds/boot"` stem (and
-    /// every `[[instance]] world = "worlds/…"` stem, and every sprite/map
-    /// asset stem) resolves against. Clicking `assets/worlds/test.toml` must
+    /// an ASSET ROOT -- `<project>/assets/**/*.wrld.toml` -- because that is
+    /// the root `emerald.toml`'s `default_world = "boot"` stem (and
+    /// every `[[instance]] world = "…"` stem, and every sprite/map
+    /// asset stem) resolves against. Clicking `assets/test.wrld.toml` must
     /// load, with the asset root DERIVED from the clicked path.
     ///
     /// The rect count is the load-bearing assertion: it only reaches 2 if
     /// the derived root was threaded into instance resolution, not merely
     /// used to read the top-level file (a wrong root resolves the
-    /// `worlds/sub` instance to nothing and silently renders a placeholder).
+    /// `sub` instance to nothing and silently renders a placeholder).
     #[gpui::test]
     async fn test_asset_root_world_loads_and_resolves_its_instance_subtree(
         cx: &mut TestAppContext,
@@ -9958,7 +9966,7 @@ mod tests {
 
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path("assets/worlds/test.toml", None, cx);
+            panel.load_rel_path("assets/test.wrld.toml", None, cx);
         });
         cx.executor().run_until_parked();
 
@@ -9972,7 +9980,7 @@ mod tests {
                 "the asset root must be derived from the clicked path"
             );
             assert_eq!(
-                open.listing.stem, "worlds/test",
+                open.listing.stem, "test",
                 "the listing is asset-root-relative, matching engine-side stems"
             );
             let texts = draw_items(open)
@@ -9981,12 +9989,12 @@ mod tests {
                 .count();
             assert_eq!(
                 texts, 3,
-                "top-level Texts + the worlds/sub instance's, which only \
+                "top-level Texts + the sub instance's, which only \
                  resolves if the derived root reached instance resolution"
             );
             assert_eq!(
                 panel.instance_candidates(),
-                vec!["worlds/sub".to_string()],
+                vec!["sub".to_string()],
                 "+ Instance must enumerate from the SAME derived root"
             );
         });
@@ -10179,7 +10187,7 @@ mod tests {
             };
             assert!(open.save_error.is_none(), "save should succeed");
             assert!(!open.store.state().dirty, "mark_saved clears dirty");
-            let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+            let on_disk = read_world(dir.path(), "test.wrld.toml").unwrap();
             let doc = open.store.to_doc();
             assert!(
                 world_files_equal(&on_disk, &doc),
@@ -10320,43 +10328,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // Mutually-recursive pair on top of the standard fixture:
-        // worlds/a instances worlds/b, worlds/b instances worlds/a.
+        // a instances b, b instances a.
         let cyclic = |other: &str| WorldFile {
             entities: vec![],
             instances: vec![WorldInstance {
-                world: format!("worlds/{other}"),
+                world: other.to_string(),
                 pos: [0.0, 0.0],
                 background_priority: false,
             }],
             backgrounds: vec![],
         };
-        write_world(root, "worlds/a.toml", &cyclic("b")).unwrap();
-        write_world(root, "worlds/b.toml", &cyclic("a")).unwrap();
+        write_world(root, "a.wrld.toml", &cyclic("b")).unwrap();
+        write_world(root, "b.wrld.toml", &cyclic("a")).unwrap();
 
         let panel = ready_panel(cx, root).await;
         panel.update(cx, |panel, cx| {
-            panel.load_rel_path("worlds/a.toml", None, cx);
+            panel.load_rel_path("a.wrld.toml", None, cx);
         });
         cx.executor().run_until_parked();
 
         panel.update(cx, |panel, cx| {
             let candidates = panel.instance_candidates();
             assert!(
-                !candidates.contains(&"worlds/a".to_string()),
+                !candidates.contains(&"a".to_string()),
                 "the open world is never a candidate"
             );
             assert!(
-                !candidates.contains(&"worlds/b".to_string()),
+                !candidates.contains(&"b".to_string()),
                 "a stem the load proved cyclic is excluded"
             );
             assert!(
-                candidates.contains(&"worlds/sub".to_string()),
+                candidates.contains(&"sub".to_string()),
                 "unrelated worlds stay offered: {candidates:?}"
             );
 
             // A guarded pick (self or proven-cyclic) is dropped.
-            panel.add_instance_impl("worlds/a".to_string(), cx);
-            panel.add_instance_impl("worlds/b".to_string(), cx);
+            panel.add_instance_impl("a".to_string(), cx);
+            panel.add_instance_impl("b".to_string(), cx);
             {
                 let ViewerState::Ready(open) = &panel.state else {
                     panic!("expected Ready");
@@ -10370,7 +10378,7 @@ mod tests {
             }
 
             // A legal pick lands at the view center, selected.
-            panel.add_instance_impl("worlds/sub".to_string(), cx);
+            panel.add_instance_impl("sub".to_string(), cx);
             {
                 let ViewerState::Ready(open) = &panel.state else {
                     panic!("expected Ready");
@@ -10378,7 +10386,7 @@ mod tests {
                 let center = view_center_world(open);
                 let state = open.store.state();
                 assert_eq!(state.instances.len(), 2);
-                assert_eq!(state.instances[1].world, "worlds/sub");
+                assert_eq!(state.instances[1].world, "sub");
                 assert_eq!(state.instances[1].pos, center);
                 assert_eq!(open.selected, vec![Selection::Instance(1)]);
                 assert!(state.dirty);
@@ -10389,7 +10397,7 @@ mod tests {
     /// M7 fix round 1: a freshly added instance's subtree must render
     /// WITHOUT a reload -- add resolves the stem and composes its
     /// assets immediately (ggo-ide re-resolves after every message).
-    /// `worlds/sub` carries a Text child, so the draw list's text
+    /// `sub` carries a Text child, so the draw list's text
     /// count must grow right after the add.
     #[gpui::test]
     async fn test_add_instance_resolves_subtree_without_reload(cx: &mut TestAppContext) {
@@ -10414,7 +10422,7 @@ mod tests {
                 );
             }
 
-            panel.add_instance_impl("worlds/sub".to_string(), cx);
+            panel.add_instance_impl("sub".to_string(), cx);
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
@@ -10470,14 +10478,14 @@ mod tests {
             assert!(!open.store.state().dirty);
         });
 
-        let saved = read_world(dir1.path(), "worlds/test.toml").unwrap();
+        let saved = read_world(dir1.path(), "test.wrld.toml").unwrap();
         assert_eq!(
             saved.entities[0].components["Transform"]["pos"],
             json!([77.5, 88.25]),
             "the edit was saved under the LOAD root"
         );
         assert!(
-            !dir2.path().join("worlds").exists(),
+            !dir2.path().join("test.wrld.toml").exists(),
             "nothing may be written under the repointed root"
         );
     }
@@ -10489,7 +10497,7 @@ mod tests {
     async fn test_save_failure_sets_the_error_and_keeps_dirty(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
-        let before = std::fs::read_to_string(dir.path().join("worlds/test.toml")).unwrap();
+        let before = std::fs::read_to_string(dir.path().join("test.wrld.toml")).unwrap();
 
         // The save resolves against the OPEN document's captured root;
         // repointing that root at a regular file makes the write's
@@ -10524,7 +10532,7 @@ mod tests {
             );
         });
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("worlds/test.toml")).unwrap(),
+            std::fs::read_to_string(dir.path().join("test.wrld.toml")).unwrap(),
             before,
             "the real file must be untouched by the failed write"
         );
@@ -10705,7 +10713,7 @@ mod tests {
         });
     }
 
-    /// Load `worlds/test` into a panel that is the root view of a real
+    /// Load `test` into a panel that is the root view of a real
     /// test window, with Entity(0) selected so the inspector editors
     /// exist. Rendering in a window is what drives gpui's draw/focus
     /// cycle, which the blur-commit ordering tests below depend on.
@@ -10731,7 +10739,7 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", None, cx);
+            panel.load_rel_path("test.wrld.toml", None, cx);
         });
         cx.run_until_parked();
         panel.update(cx, |panel, cx| {
@@ -10925,7 +10933,7 @@ mod tests {
     async fn test_committing_a_stem_composes_the_named_asset(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         // A real decodable sprite trio at the fixture's asset root (the
-        // worktree root for `worlds/test.toml`), so the compose succeeds.
+        // worktree root for `test.wrld.toml`), so the compose succeeds.
         {
             use ggo_worldlib::sprites::cow::{Frame, SpriteState};
             use ggo_worldlib::sprites::hw::TILE_BYTES;
@@ -11924,7 +11932,7 @@ mod tests {
     async fn test_goto_sprite_hands_the_path_to_a_docked_sprite_panel(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
         std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
         std::fs::write(dir.path().join("sprites/hero.spr"), b"x").unwrap();
 
@@ -11989,12 +11997,12 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
-        let path = dir.path().join("worlds/test.toml");
+        let path = dir.path().join("test.wrld.toml");
         let before = std::fs::read_to_string(&path).unwrap();
 
         // Clean: nothing to do, and nothing written.
         panel.update(cx, |panel, cx| {
-            assert!(panel.save_if_open_and_dirty("worlds/test.toml", cx));
+            assert!(panel.save_if_open_and_dirty("test.wrld.toml", cx));
         });
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
@@ -12009,7 +12017,7 @@ mod tests {
             );
             assert!(panel.dirty_world_name().is_some());
             // A DIFFERENT world: not ours to write, even though we are dirty.
-            assert!(panel.save_if_open_and_dirty("worlds/sub.toml", cx));
+            assert!(panel.save_if_open_and_dirty("sub.wrld.toml", cx));
         });
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -12018,7 +12026,7 @@ mod tests {
         );
 
         panel.update(cx, |panel, cx| {
-            assert!(panel.save_if_open_and_dirty("worlds/test.toml", cx));
+            assert!(panel.save_if_open_and_dirty("test.wrld.toml", cx));
             assert!(
                 panel.dirty_world_name().is_none(),
                 "the write clears dirty, so a second build is a no-op"
@@ -12043,7 +12051,7 @@ mod tests {
         let (workspace, dock, cx) = world_dock::tests::dock_workspace(cx, dir.path()).await;
         workspace.update_in(cx, |workspace, window, cx| {
             ggo_common::open_in_panel(workspace, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -12068,34 +12076,30 @@ mod tests {
     // ------------------------------------------ explorer-driven routing
 
     /// The predicate that decides what the panel claims from the file
-    /// explorer: a `worlds/` directory ANYWHERE in the path with a `.toml`
-    /// leaf, NOT a bare `.toml` test -- a stray `Cargo.toml` click must
-    /// still open an editor.
+    /// explorer: a `<stem>.wrld.toml` leaf, NOT a bare `.toml` test -- a
+    /// stray `Cargo.toml` or a `components.toml` manifest click must still
+    /// open an editor.
     ///
     /// This is exactly `ggo_language::PROJECT_FILE_TYPE_GLOB`
-    /// (`**/worlds/**/*.toml`, which `ggo_language::tests` pins as matching
-    /// `assets/worlds/deep/nested/arena.toml`). The two used to diverge --
-    /// routing accepted only a TOP-LEVEL `worlds/` -- and the glob was the
-    /// one that was right: real projects keep worlds under an asset root,
-    /// so the narrow predicate silently declined every real world file.
+    /// (`**/assets/**/*.wrld.toml`). The old layout -- a `worlds/`
+    /// directory holding bare `.toml` files -- is NOT a world any more.
     #[gpui::test]
     fn test_world_predicate_matches_only_world_files(_cx: &mut gpui::App) {
         let stem = |rel: &str| split_world_path(rel).map(|(_, l)| l.stem);
-        assert_eq!(stem("worlds/test.toml"), Some("worlds/test".to_string()));
         assert_eq!(
-            stem("worlds/nested/arena.toml"),
-            Some("worlds/nested/arena".to_string()),
-            "nested worlds under a worlds/ dir count"
+            stem("assets/main.wrld.toml"),
+            Some("main".to_string()),
+            "the real-project layout: a world directly under the asset root"
         );
         assert_eq!(
-            stem("assets/worlds/main.toml"),
-            Some("worlds/main".to_string()),
-            "the real-project layout: worlds under an asset root"
+            stem("assets/levels/a.wrld.toml"),
+            Some("levels/a".to_string()),
+            "nesting under the asset root stays in the stem"
         );
         assert_eq!(
-            stem("deep/nested/worlds/x.toml"),
-            Some("worlds/x".to_string()),
-            "a worlds/ dir at ANY depth routes"
+            stem("main.wrld.toml"),
+            Some("main".to_string()),
+            "no assets/ component: the worktree root is the asset root"
         );
 
         assert!(
@@ -12103,22 +12107,26 @@ mod tests {
             "a bare .toml is not a world"
         );
         assert!(
-            split_world_path("assets/worlds.toml").is_none(),
-            "a FILE named worlds is not a worlds/ DIRECTORY"
+            split_world_path("assets/manifests/components.toml").is_none(),
+            "a manifest under assets/ is not a world"
         );
         assert!(
-            split_world_path("worlds/readme.md").is_none(),
-            "only .toml leaves count"
+            split_world_path("assets/maps/l.toml").is_none(),
+            "a map toml under assets/ is not a world"
         );
         assert!(
-            split_world_path("myworlds/x.toml").is_none(),
-            "the worlds/ match is anchored to a whole path component"
+            split_world_path("assets/worlds/main.toml").is_none(),
+            "the old worlds/ layout with a bare .toml leaf is not a world"
+        );
+        assert!(
+            split_world_path("assets/x.wrld.md").is_none(),
+            "only .wrld.toml leaves count"
         );
     }
 
-    /// Root derivation: the asset root is everything BEFORE the last
-    /// `worlds/` component, and the listing is asset-root-relative -- which
-    /// is the frame `[[instance]]`/sprite/map stems resolve in.
+    /// Root derivation: the asset root is everything up to and including
+    /// the last `assets` component, and the listing is asset-root-relative
+    /// -- which is the frame `[[instance]]`/sprite/map stems resolve in.
     #[gpui::test]
     fn test_split_world_path_derives_the_asset_root(_cx: &mut gpui::App) {
         let split = |rel: &str| {
@@ -12126,49 +12134,44 @@ mod tests {
             (root, listing.rel_path, listing.stem)
         };
         assert_eq!(
-            split("assets/worlds/main.toml"),
+            split("assets/main.wrld.toml"),
             (
                 "assets".to_string(),
-                "worlds/main.toml".to_string(),
-                "worlds/main".to_string()
+                "main.wrld.toml".to_string(),
+                "main".to_string()
             )
         );
         assert_eq!(
-            split("worlds/main.toml"),
+            split("assets/levels/a.wrld.toml"),
             (
-                // Empty root == the worktree root itself: the pre-F4
-                // behaviour, preserved exactly.
+                "assets".to_string(),
+                "levels/a.wrld.toml".to_string(),
+                "levels/a".to_string()
+            )
+        );
+        assert_eq!(
+            split("main.wrld.toml"),
+            (
+                // Empty root == the worktree root itself: no `assets`
+                // component to anchor on.
                 String::new(),
-                "worlds/main.toml".to_string(),
-                "worlds/main".to_string()
+                "main.wrld.toml".to_string(),
+                "main".to_string()
             )
         );
         assert_eq!(
-            split("deep/nested/worlds/x.toml"),
+            split("game/assets/sub/assets/x.wrld.toml"),
             (
-                "deep/nested".to_string(),
-                "worlds/x.toml".to_string(),
-                "worlds/x".to_string()
-            )
-        );
-        assert_eq!(
-            split("assets/worlds/sub/worlds/x.toml"),
-            (
-                // LAST worlds/ wins: the inner one is the world directory,
-                // everything left of it is the root.
-                "assets/worlds/sub".to_string(),
-                "worlds/x.toml".to_string(),
-                "worlds/x".to_string()
+                // LAST `assets` wins: everything up to and including it is
+                // the root.
+                "game/assets/sub/assets".to_string(),
+                "x.wrld.toml".to_string(),
+                "x".to_string()
             ),
         );
-        assert_eq!(
-            split("assets/worlds/nested/arena.toml"),
-            (
-                // A nested dir INSIDE worlds/ stays part of the stem.
-                "assets".to_string(),
-                "worlds/nested/arena.toml".to_string(),
-                "worlds/nested/arena".to_string()
-            )
+        assert!(
+            split_world_path("myassets/x.wrld.toml").is_some_and(|(root, _)| root.is_empty()),
+            "the assets match is anchored to a whole path component"
         );
     }
 
@@ -12198,7 +12201,8 @@ mod tests {
         fs.insert_tree(
             "/proj",
             json!({
-                "worlds": { "test.toml": "", "sub.toml": "" },
+                "test.wrld.toml": "",
+                "sub.wrld.toml": "",
                 "Cargo.toml": "",
                 "hero.til": "",
             }),
@@ -12253,7 +12257,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let panel = workspace_panel(&workspace, dir.path(), cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_rel_path("worlds/test.toml", window, cx)
+            panel.open_rel_path("test.wrld.toml", window, cx)
         });
         cx.run_until_parked();
 
@@ -12263,7 +12267,7 @@ mod tests {
         EMULATED.with(|e| {
             assert_eq!(
                 e.borrow().as_slice(),
-                ["worlds/test.toml"],
+                ["test.wrld.toml"],
                 "the open world's rel path reaches the registered emulator"
             );
         });
@@ -12318,7 +12322,7 @@ mod tests {
         });
         cx.executor().run_until_parked();
 
-        let out = dir.path().join("target/ggo-emulate/worlds-test.ggo");
+        let out = dir.path().join("target/ggo-emulate/test.ggo");
         {
             let packs = packs.lock().unwrap();
             assert_eq!(
@@ -12339,7 +12343,7 @@ mod tests {
                     "--out".to_string(),
                     out.to_string_lossy().into_owned(),
                     "--world".to_string(),
-                    "worlds/test".to_string(),
+                    "test".to_string(),
                     "--json".to_string(),
                 ],
                 "the pack argv names the out path and the boot world"
@@ -12515,11 +12519,7 @@ mod tests {
         let worktree_id = worktree_id(&project, cx);
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
-            workspace.intercept_path_open(
-                &project_path(worktree_id, "worlds/test.toml"),
-                window,
-                cx,
-            )
+            workspace.intercept_path_open(&project_path(worktree_id, "test.wrld.toml"), window, cx)
         });
         assert!(
             !claimed,
@@ -12527,7 +12527,7 @@ mod tests {
         );
     }
 
-    /// The registered world predicate claims `**/worlds/**/*.toml` (so the
+    /// The registered world predicate claims `**/assets/**/*.wrld.toml` (so the
     /// project panel opens NO pane item for it), opens the dock, and loads
     /// the world -- while a root-level `Cargo.toml` is declined.
     #[gpui::test]
@@ -12548,11 +12548,7 @@ mod tests {
         });
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
-            workspace.intercept_path_open(
-                &project_path(worktree_id, "worlds/test.toml"),
-                window,
-                cx,
-            )
+            workspace.intercept_path_open(&project_path(worktree_id, "test.wrld.toml"), window, cx)
         });
         assert!(
             claimed,
@@ -12565,7 +12561,7 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready after routing");
             };
-            assert_eq!(open.listing.rel_path, "worlds/test.toml");
+            assert_eq!(open.listing.rel_path, "test.wrld.toml");
         });
         workspace.read_with(cx, |workspace, cx| {
             assert!(
@@ -12595,11 +12591,7 @@ mod tests {
         // A SECOND claim on the already-open, active world splits its
         // toml out to a right pane (world view left, toml text right).
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.intercept_path_open(
-                &project_path(worktree_id, "worlds/test.toml"),
-                window,
-                cx,
-            );
+            workspace.intercept_path_open(&project_path(worktree_id, "test.wrld.toml"), window, cx);
         });
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
@@ -12614,7 +12606,7 @@ mod tests {
             let toml_in_a_pane = workspace.panes().iter().any(|pane| {
                 pane.read(cx).items().any(|item| {
                     item.project_path(cx)
-                        .is_some_and(|p| p == project_path(worktree_id, "worlds/test.toml"))
+                        .is_some_and(|p| p == project_path(worktree_id, "test.wrld.toml"))
                 })
             });
             assert!(toml_in_a_pane, "the toml editor lives in the new pane");
@@ -12630,11 +12622,7 @@ mod tests {
                 .next()
                 .expect("canvas item");
             workspace.activate_item(&canvas, true, true, window, cx);
-            workspace.intercept_path_open(
-                &project_path(worktree_id, "worlds/test.toml"),
-                window,
-                cx,
-            );
+            workspace.intercept_path_open(&project_path(worktree_id, "test.wrld.toml"), window, cx);
         });
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, _cx| {
@@ -12660,7 +12648,7 @@ mod tests {
                 })
                 .cloned()
                 .expect("canvas pane");
-            let toml_path = project_path(worktree_id, "worlds/test.toml");
+            let toml_path = project_path(worktree_id, "test.wrld.toml");
             let (toml_pane, toml_id) = panes
                 .iter()
                 .find_map(|pane| {
@@ -12684,16 +12672,12 @@ mod tests {
                 .next()
                 .expect("canvas item");
             workspace.activate_item(&canvas, true, true, window, cx);
-            workspace.intercept_path_open(
-                &project_path(worktree_id, "worlds/test.toml"),
-                window,
-                cx,
-            );
+            workspace.intercept_path_open(&project_path(worktree_id, "test.wrld.toml"), window, cx);
         });
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(workspace.panes().len(), 2, "the toml split back out");
-            let toml_path = project_path(worktree_id, "worlds/test.toml");
+            let toml_path = project_path(worktree_id, "test.wrld.toml");
             let canvas = workspace
                 .items_of_type::<world_canvas_item::WorldCanvasItem>(cx)
                 .next()
@@ -12727,10 +12711,7 @@ mod tests {
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(&project_path(worktree_id, "Cargo.toml"), window, cx)
         });
-        assert!(
-            !claimed,
-            "a .toml outside worlds/ must still open in the editor"
-        );
+        assert!(!claimed, "a bare .toml must still open in the editor");
     }
 
     /// Each world the interceptor claims gets its OWN tab and panel: the
@@ -12742,7 +12723,7 @@ mod tests {
         let (workspace, dock, cx) = crate::world_dock::tests::dock_workspace(cx, dir.path()).await;
         let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
         let worktree_id = worktree_id(&project, cx);
-        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+        for rel in ["test.wrld.toml", "other.wrld.toml"] {
             let claimed = workspace.update_in(cx, |workspace, window, cx| {
                 intercept_world_open(workspace, &project_path(worktree_id, rel), window, cx)
             });
@@ -12771,19 +12752,19 @@ mod tests {
         let (workspace, _dock, cx) = crate::world_dock::tests::dock_workspace(cx, dir.path()).await;
         let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
         let worktree_id = worktree_id(&project, cx);
-        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+        for rel in ["test.wrld.toml", "other.wrld.toml"] {
             workspace.update_in(cx, |workspace, window, cx| {
                 intercept_world_open(workspace, &project_path(worktree_id, rel), window, cx)
             });
             cx.run_until_parked();
         }
 
-        // `worlds/other.toml`'s tab is the active one: clicking it again
+        // `other.wrld.toml`'s tab is the active one: clicking it again
         // is the second click on THAT world.
         workspace.update_in(cx, |workspace, window, cx| {
             intercept_world_open(
                 workspace,
-                &project_path(worktree_id, "worlds/other.toml"),
+                &project_path(worktree_id, "other.wrld.toml"),
                 window,
                 cx,
             )
@@ -12792,7 +12773,7 @@ mod tests {
 
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(workspace.panes().len(), 2, "the toml split opened");
-            let toml_path = project_path(worktree_id, "worlds/other.toml");
+            let toml_path = project_path(worktree_id, "other.wrld.toml");
             assert!(
                 workspace.panes().iter().any(|pane| {
                     pane.read(cx)
@@ -12820,7 +12801,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.open_rel_path("worlds/sub.toml", window, cx)
+                panel.open_rel_path("sub.wrld.toml", window, cx)
             })
         });
         assert!(
@@ -12832,7 +12813,7 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready after the switch");
             };
-            assert_eq!(open.listing.rel_path, "worlds/sub.toml");
+            assert_eq!(open.listing.rel_path, "sub.wrld.toml");
         });
     }
 
@@ -12851,7 +12832,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.open_rel_path("worlds/test.toml", window, cx)
+                panel.open_rel_path("test.wrld.toml", window, cx)
             })
         });
         assert!(
@@ -12896,12 +12877,12 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.open_rel_path("worlds/sub.toml", window, cx)
+                panel.open_rel_path("sub.wrld.toml", window, cx)
             })
         });
         assert_eq!(
             cx.pending_prompt().map(|(msg, _)| msg),
-            Some("worlds/test.toml contains unsaved edits. Do you want to save it?".to_string()),
+            Some("test.wrld.toml contains unsaved edits. Do you want to save it?".to_string()),
             "switching away from a dirty world must prompt first"
         );
         cx.simulate_prompt_answer("Cancel");
@@ -12912,12 +12893,12 @@ mod tests {
                 panic!("Cancel must leave the panel Ready");
             };
             assert_eq!(
-                open.listing.rel_path, "worlds/test.toml",
+                open.listing.rel_path, "test.wrld.toml",
                 "Cancel must abort the open and leave the current world loaded"
             );
             assert!(open.store.state().dirty, "and leave its edits in place");
         });
-        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        let on_disk = read_world(dir.path(), "test.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([4, 4]),
@@ -12937,7 +12918,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.open_rel_path("worlds/sub.toml", window, cx)
+                panel.open_rel_path("sub.wrld.toml", window, cx)
             })
         });
         cx.simulate_prompt_answer("Save");
@@ -12947,10 +12928,10 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready after the switch");
             };
-            assert_eq!(open.listing.rel_path, "worlds/sub.toml", "Save then switch");
+            assert_eq!(open.listing.rel_path, "sub.wrld.toml", "Save then switch");
             assert!(!open.store.state().dirty, "the new document starts clean");
         });
-        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        let on_disk = read_world(dir.path(), "test.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([50, 60]),
@@ -12961,7 +12942,7 @@ mod tests {
         dirty_the_world(&panel, cx);
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.open_rel_path("worlds/test.toml", window, cx)
+                panel.open_rel_path("test.wrld.toml", window, cx)
             })
         });
         cx.simulate_prompt_answer("Don't Save");
@@ -12971,9 +12952,9 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready after the switch");
             };
-            assert_eq!(open.listing.rel_path, "worlds/test.toml");
+            assert_eq!(open.listing.rel_path, "test.wrld.toml");
         });
-        let on_disk = read_world(dir.path(), "worlds/sub.toml").unwrap();
+        let on_disk = read_world(dir.path(), "sub.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([0, 0]),
@@ -13011,7 +12992,7 @@ mod tests {
         // The menu entries act on the ACTIVE world tab, so open one.
         workspace.update_in(cx, |workspace, window, cx| {
             ggo_common::open_in_panel(workspace, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -13029,7 +13010,7 @@ mod tests {
     }
 
     /// The menu entry is offered for a world file and for NOTHING else --
-    /// the same `**/worlds/**/*.toml` rule the open interceptor uses, so a
+    /// the same `**/assets/**/*.wrld.toml` rule the open interceptor uses, so a
     /// root `Cargo.toml`, a `.til`, and the `worlds` DIRECTORY itself all
     /// leave upstream's menu exactly as it was.
     #[gpui::test]
@@ -13046,14 +13027,14 @@ mod tests {
         };
 
         assert_eq!(
-            contributed("worlds/test.toml", false, cx),
+            contributed("test.wrld.toml", false, cx),
             1,
             "a world file must get its Delete World entry"
         );
         assert_eq!(
             contributed("Cargo.toml", false, cx),
             0,
-            "a .toml outside worlds/ is not a world"
+            "a bare .toml is not a world"
         );
         assert_eq!(
             contributed("hero.til", false, cx),
@@ -13061,9 +13042,9 @@ mod tests {
             "another panel's file type is not a world"
         );
         assert_eq!(
-            contributed("worlds", true, cx),
+            contributed("assets", true, cx),
             0,
-            "the worlds DIRECTORY is not a world file"
+            "a DIRECTORY is not a world file"
         );
     }
 
@@ -13076,14 +13057,14 @@ mod tests {
     async fn test_delete_world_cancel_keeps_the_file_and_the_panel(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
 
-        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        let handler = delete_world_handler(workspace.downgrade(), "test.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         assert_eq!(
             cx.pending_prompt(),
             Some((
-                "Delete the world \"worlds/test\" (worlds/test.toml)?".to_string(),
+                "Delete the world \"test\" (test.wrld.toml)?".to_string(),
                 "This cannot be undone.".to_string(),
             )),
             "the prompt must name the world AND the file it will unlink"
@@ -13092,14 +13073,14 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            dir.path().join("worlds/test.toml").is_file(),
+            dir.path().join("test.wrld.toml").is_file(),
             "Cancel must leave the file on disk"
         );
         panel.update(cx, |panel, _cx| {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("Cancel must leave the panel Ready");
             };
-            assert_eq!(open.source_rel, "worlds/test.toml");
+            assert_eq!(open.source_rel, "test.wrld.toml");
         });
     }
 
@@ -13112,15 +13093,15 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
 
-        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        let handler = delete_world_handler(workspace.downgrade(), "test.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
 
         assert!(
-            !dir.path().join("worlds/test.toml").exists(),
+            !dir.path().join("test.wrld.toml").exists(),
             "Delete must unlink the file"
         );
         panel.update(cx, |panel, _cx| {
@@ -13129,11 +13110,7 @@ mod tests {
                 "the open document's file is gone, so the panel must clear"
             );
             let stems: Vec<&str> = panel.worlds.iter().map(|w| w.stem.as_str()).collect();
-            assert_eq!(
-                stems,
-                ["worlds/sub"],
-                "the listing must lose the deleted world"
-            );
+            assert_eq!(stems, ["sub"], "the listing must lose the deleted world");
         });
     }
 
@@ -13147,12 +13124,12 @@ mod tests {
     async fn test_delete_world_prompt_names_unsaved_edits(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
         dirty_the_world(&panel, cx);
 
         // A different world, while the OPEN one is dirty: those edits are
         // not at stake, so the detail must not claim they are.
-        let other = delete_world_handler(workspace.downgrade(), "worlds/sub.toml".to_string());
+        let other = delete_world_handler(workspace.downgrade(), "sub.wrld.toml".to_string());
         cx.update(|window, cx| other(window, cx));
         assert_eq!(
             cx.pending_prompt().map(|(_, detail)| detail),
@@ -13162,7 +13139,7 @@ mod tests {
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
 
-        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        let handler = delete_world_handler(workspace.downgrade(), "test.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         assert_eq!(
             cx.pending_prompt().map(|(_, detail)| detail),
@@ -13175,7 +13152,7 @@ mod tests {
         );
         cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
-        assert!(!dir.path().join("worlds/test.toml").exists());
+        assert!(!dir.path().join("test.wrld.toml").exists());
     }
 
     /// Deleting a DIFFERENT world leaves the open document alone but still
@@ -13186,17 +13163,15 @@ mod tests {
     async fn test_delete_world_refreshes_instance_candidates(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
         panel.update(cx, |panel, _cx| {
             assert!(
-                panel
-                    .instance_candidates()
-                    .contains(&"worlds/sub".to_string()),
-                "worlds/sub starts out offered"
+                panel.instance_candidates().contains(&"sub".to_string()),
+                "sub starts out offered"
             );
         });
 
-        let handler = delete_world_handler(workspace.downgrade(), "worlds/sub.toml".to_string());
+        let handler = delete_world_handler(workspace.downgrade(), "sub.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
@@ -13205,11 +13180,9 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("deleting another world must not disturb the open one");
             };
-            assert_eq!(open.source_rel, "worlds/test.toml");
+            assert_eq!(open.source_rel, "test.wrld.toml");
             assert!(
-                !panel
-                    .instance_candidates()
-                    .contains(&"worlds/sub".to_string()),
+                !panel.instance_candidates().contains(&"sub".to_string()),
                 "a deleted world must stop being an + Instance candidate"
             );
         });
@@ -13223,7 +13196,7 @@ mod tests {
     async fn test_delete_world_clears_the_tab_that_has_it_open(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, dock, cx) = crate::world_dock::tests::dock_workspace(cx, dir.path()).await;
-        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+        for rel in ["test.wrld.toml", "other.wrld.toml"] {
             workspace.update_in(cx, |workspace, window, cx| {
                 ggo_common::open_in_panel(
                     workspace,
@@ -13241,13 +13214,13 @@ mod tests {
             panic!("a panel per world");
         };
 
-        let handler = delete_world_handler(workspace.downgrade(), "worlds/test.toml".to_string());
+        let handler = delete_world_handler(workspace.downgrade(), "test.wrld.toml".to_string());
         cx.update(|window, cx| handler(window, cx));
         cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
 
         assert!(
-            !dir.path().join("worlds/test.toml").exists(),
+            !dir.path().join("test.wrld.toml").exists(),
             "Delete must unlink the file"
         );
         test_panel.read_with(cx, |panel, _| {
@@ -13259,7 +13232,7 @@ mod tests {
         other_panel.read_with(cx, |panel, _| {
             assert_eq!(
                 panel.open_rel_path_now(),
-                Some("worlds/other.toml"),
+                Some("other.wrld.toml"),
                 "and the active tab keeps its own document"
             );
         });
@@ -13321,7 +13294,7 @@ mod tests {
         cx.simulate_keystrokes("ctrl-s");
         cx.run_until_parked();
 
-        let on_disk = read_world(dir.path(), "worlds/test.toml").unwrap();
+        let on_disk = read_world(dir.path(), "test.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([50, 60]),
@@ -13664,7 +13637,7 @@ mod tests {
             instances: vec![],
             backgrounds: vec![],
         };
-        write_world(dir.path(), "worlds/audio.toml", &world).unwrap();
+        write_world(dir.path(), "audio.wrld.toml", &world).unwrap();
         let decoded = ggo_audio::Decoded {
             samples: vec![500; 16_000],
             rate_hz: 16_000,
@@ -13678,7 +13651,7 @@ mod tests {
         .unwrap();
 
         panel.update(cx, |panel, cx| {
-            panel.load_rel_path("worlds/audio.toml", None, cx)
+            panel.load_rel_path("audio.wrld.toml", None, cx)
         });
         cx.executor().run_until_parked();
         panel.update(cx, |panel, cx| {
@@ -13800,7 +13773,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (_workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
-        open_in_menu_panel(&panel, cx, "worlds/test.toml");
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
         cx.update(|_, cx| {
             workspace::register_path_open_interceptor(cx, recording_til);
             workspace::register_path_open_interceptor(cx, nesting_map);
@@ -14135,7 +14108,7 @@ mod tests {
     async fn test_paste_refuses_cycling_instances_and_resolves_legal_ones(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
-        let fragment = "[[instance]]\nworld = \"worlds/test\"\npos = [1, 2]\n[[instance]]\nworld = \"worlds/sub\"\npos = [3, 4]\n";
+        let fragment = "[[instance]]\nworld = \"test\"\npos = [1, 2]\n[[instance]]\nworld = \"sub\"\npos = [3, 4]\n";
         cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(fragment.to_string())));
         panel.update(cx, |panel, cx| {
             let before = open_of(panel).store.state().instances.len();
@@ -14148,14 +14121,14 @@ mod tests {
                 "the self-instance is refused"
             );
             let pasted = &state.instances[before];
-            assert_eq!(pasted.world, "worlds/sub");
+            assert_eq!(pasted.world, "sub");
             assert_eq!(pasted.pos, [3.0 + 16.0, 4.0 + 16.0]);
             assert!(pasted.resolved.is_some(), "resolved so it renders");
             assert!(
                 open.clipboard_error
                     .as_deref()
                     .unwrap_or("")
-                    .contains("worlds/test"),
+                    .contains("test"),
                 "{:?}",
                 open.clipboard_error
             );
@@ -14182,7 +14155,7 @@ mod tests {
                 entity(json!({ "Transform": { "pos": [0, 0] } })),
             ],
             instances: vec![ggo_worldlib::world_file::WorldInstance {
-                world: "worlds/arena".into(),
+                world: "arena".into(),
                 pos: [0.0, 0.0],
                 background_priority: false,
             }],
@@ -14315,7 +14288,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
-            panel.add_instance_impl("worlds/sub".to_string(), cx);
+            panel.add_instance_impl("sub".to_string(), cx);
             let state = open_of(panel).store.state();
             let added = state.instances.len() - 1;
             assert!(state.instances[added].resolved.is_some(), "resolved on add");
@@ -14382,14 +14355,14 @@ mod tests {
         // worktree is a fake fs, so the load reads through the override.
         panel.update(cx, |panel, cx| {
             panel.refresh_worlds(cx);
-            panel.load_rel_path("worlds/test.toml", None, cx);
+            panel.load_rel_path("test.wrld.toml", None, cx);
         });
         cx.run_until_parked();
         panel.update_in(cx, |panel, window, cx| panel.flash_impl(false, window, cx));
         cx.run_until_parked();
         assert_eq!(
             FLASHED_WORLD.with(|w| w.borrow().clone()),
-            Some("worlds/test".to_string()),
+            Some("test".to_string()),
             "the open document's stem is what the board boots"
         );
     }
@@ -14415,9 +14388,9 @@ mod tests {
 
     #[test]
     fn background_map_rel_strips_worlds_prefix_and_keeps_nesting() {
-        assert_eq!(background_map_rel("worlds/main", 0), "maps/main.bg0.map");
+        assert_eq!(background_map_rel("main", 0), "maps/main.bg0.map");
         assert_eq!(
-            background_map_rel("worlds/nested/arena", 3),
+            background_map_rel("nested/arena", 3),
             "maps/nested/arena.bg3.map"
         );
         assert_eq!(background_map_rel("main", 1), "maps/main.bg1.map");
@@ -14598,7 +14571,7 @@ mod tests {
         // triggers) -- so both arms of the rail are exercised for real.
         cx.run_until_parked();
         assert_eq!(
-            read_world(dir.path(), "worlds/test.toml")
+            read_world(dir.path(), "test.wrld.toml")
                 .unwrap()
                 .backgrounds,
             vec![Background {
@@ -14617,7 +14590,7 @@ mod tests {
             panel.save_impl(cx);
         });
         assert!(
-            read_world(dir.path(), "worlds/test.toml")
+            read_world(dir.path(), "test.wrld.toml")
                 .unwrap()
                 .backgrounds
                 .is_empty()
@@ -15299,7 +15272,7 @@ mod tests {
         io::save_new_bound_map(dir.path(), "maps/deco.map", 16, 16, "tiles/bg.til").unwrap();
         write_world(
             dir.path(),
-            "worlds/deco.toml",
+            "deco.wrld.toml",
             &WorldFile {
                 entities: vec![
                     entity(json!({
@@ -15317,7 +15290,7 @@ mod tests {
         )
         .unwrap();
         panel.update(cx, |panel, cx| {
-            panel.load_rel_path("worlds/deco.toml", None, cx)
+            panel.load_rel_path("deco.wrld.toml", None, cx)
         });
         cx.run_until_parked();
         panel.update(cx, |panel, _cx| {
@@ -15445,7 +15418,7 @@ mod tests {
             );
             assert_eq!(
                 panel.dirty_world_name().as_deref(),
-                Some("worlds/test.toml"),
+                Some("test.wrld.toml"),
                 "paint dirt alone must mark the tab"
             );
         });
@@ -15479,11 +15452,11 @@ mod tests {
             panel.canvas_primary_up(cx);
             assert_eq!(
                 panel.dirty_world_name().as_deref(),
-                Some("worlds/test.toml"),
+                Some("test.wrld.toml"),
                 "the second stroke re-dirties the document"
             );
             assert!(
-                panel.save_if_open_and_dirty("worlds/test.toml", cx),
+                panel.save_if_open_and_dirty("test.wrld.toml", cx),
                 "the flush must report success"
             );
         });
@@ -15558,7 +15531,7 @@ mod tests {
             panel.canvas_primary_down_with([10., 10.], false, cx);
             panel.canvas_primary_up(cx);
             assert!(panel.dirty_world_name().is_some(), "edited");
-            panel.reload_from_disk("worlds/test.toml", cx);
+            panel.reload_from_disk("test.wrld.toml", cx);
         });
         cx.run_until_parked();
 
@@ -15629,13 +15602,12 @@ mod tests {
             );
             assert_eq!(
                 panel.dirty_world_name().as_deref(),
-                Some("worlds/test.toml"),
+                Some("test.wrld.toml"),
                 "the document stays dirty until the map actually lands"
             );
         });
         assert_eq!(
-            read_world(dir.path(), "worlds/test.toml").unwrap().entities[0].components["Transform"]
-                ["pos"],
+            read_world(dir.path(), "test.wrld.toml").unwrap().entities[0].components["Transform"]["pos"],
             serde_json::json!([70, 80]),
             "the world half of the save still landed"
         );
@@ -15699,7 +15671,7 @@ mod tests {
             .collect()
     }
 
-    /// A panel in a real window with `worlds/test.toml` open in Live mode,
+    /// A panel in a real window with `test.wrld.toml` open in Live mode,
     /// plus the endpoint the (fake) booter was handed.
     async fn live_panel<'a>(
         cx: &'a mut TestAppContext,
@@ -15709,7 +15681,7 @@ mod tests {
         Arc<ggo_common::LinkEndpoint>,
         &'a mut gpui::VisualTestContext,
     ) {
-        live_panel_rel(cx, dir, "worlds/test.toml").await
+        live_panel_rel(cx, dir, "test.wrld.toml").await
     }
 
     /// [`live_panel`] for a world other than the fixture's own.
@@ -16157,7 +16129,7 @@ mod tests {
     const GESTURE_END: u8 = 1;
 
     /// The fixture as the cart first publishes it: three direct entities
-    /// then the one entity `worlds/sub` contributes, each where the
+    /// then the one entity `sub` contributes, each where the
     /// document authored it. The mirror needs this baseline before it can
     /// tell a cart-side move from a first sighting.
     fn cart_fixture_rows(endpoint: &ggo_common::LinkEndpoint) {
@@ -16294,7 +16266,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_world(
             dir.path(),
-            "worlds/flat.toml",
+            "flat.wrld.toml",
             &WorldFile {
                 entities: vec![entity(
                     json!({ "Transform": { "pos": [4.0, 4.0], "z": 0 } }),
@@ -16304,7 +16276,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (panel, endpoint, cx) = live_panel_rel(cx, &dir, "worlds/flat.toml").await;
+        let (panel, endpoint, cx) = live_panel_rel(cx, &dir, "flat.wrld.toml").await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
         cart_says(
@@ -16328,7 +16300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_world(
             dir.path(),
-            "worlds/affine.toml",
+            "affine.wrld.toml",
             &WorldFile {
                 entities: vec![entity(json!({
                     "Transform": { "pos": [40.0, 40.0], "z": 0 },
@@ -16339,7 +16311,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (panel, endpoint, cx) = live_panel_rel(cx, &dir, "worlds/affine.toml").await;
+        let (panel, endpoint, cx) = live_panel_rel(cx, &dir, "affine.wrld.toml").await;
         endpoint.set_state(ggo_common::ViewerState::Running);
         cx.run_until_parked();
         cart_says(
@@ -16386,7 +16358,7 @@ mod tests {
         BOOTED.with(|booted| {
             assert_eq!(
                 booted.borrow().last().map(|(rel, _)| rel.clone()),
-                Some("worlds/test.toml".to_string()),
+                Some("test.wrld.toml".to_string()),
                 "the booter is asked for the world the panel opened"
             );
         });
@@ -16502,7 +16474,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let panel = workspace_panel(&workspace, dir.path(), cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_rel_path("worlds/test.toml", window, cx)
+            panel.open_rel_path("test.wrld.toml", window, cx)
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
@@ -16632,7 +16604,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let panel = workspace_panel(&workspace, dir.path(), cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_rel_path("worlds/test.toml", window, cx)
+            panel.open_rel_path("test.wrld.toml", window, cx)
         });
         cx.run_until_parked();
 
@@ -16789,9 +16761,9 @@ mod tests {
             assert_eq!(
                 open.instance_counts,
                 vec![1],
-                "the load counted worlds/sub's one entity"
+                "the load counted sub's one entity"
             );
-            assert_eq!(open.counted_instances, vec!["worlds/sub".to_string()]);
+            assert_eq!(open.counted_instances, vec!["sub".to_string()]);
             assert_eq!(open.live.as_ref().map(|live| live.index_map.len()), Some(4));
         });
 
@@ -16829,7 +16801,7 @@ mod tests {
         cx.run_until_parked();
 
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_rel_path("worlds/sub.toml", window, cx)
+            panel.open_rel_path("sub.wrld.toml", window, cx)
         });
         cx.run_until_parked();
 
@@ -16843,7 +16815,7 @@ mod tests {
             "and the run the first world was greeting ended"
         );
         panel.read_with(cx, |panel, _| {
-            assert_eq!(open_of(panel).listing.rel_path, "worlds/sub.toml");
+            assert_eq!(open_of(panel).listing.rel_path, "sub.wrld.toml");
             assert!(open_of(panel).live.is_some(), "still live after the switch");
         });
     }
@@ -17073,7 +17045,7 @@ mod tests {
         cx.run_until_parked();
         let before = panel.read_with(cx, |panel, _| open_of(panel).store.state());
 
-        // Index 3 is the one entity `worlds/sub` contributes.
+        // Index 3 is the one entity `sub` contributes.
         cart_component_changed(&endpoint, 3, &transform_bag([99.0, 99.0], 7));
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
@@ -17479,7 +17451,7 @@ mod tests {
         // The encoder walks the instanced world to flatten this document;
         // without it every re-send fails, which is how the test holds the
         // window open instead of racing the next tick's blob.
-        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+        std::fs::remove_file(dir.path().join("sub.wrld.toml")).unwrap();
 
         cart_removed(&endpoint, 0);
         cx.run_until_parked();
@@ -17513,7 +17485,7 @@ mod tests {
     #[gpui::test]
     async fn both_members_of_an_instance_move_it_once(cx: &mut TestAppContext) {
         let (panel, endpoint, _dir, cx) = connected_live_panel(cx).await;
-        // The fixture's `worlds/sub` contributes one entity; this is the
+        // The fixture's `sub` contributes one entity; this is the
         // map the same document would have if it contributed two. Nothing
         // recomputes it here -- the map is rebuilt by a world push or a
         // recount, and the document has not moved.
@@ -18063,7 +18035,7 @@ mod tests {
         clear_world_dirty(&panel, cx);
 
         panel.update(cx, |panel, cx| {
-            panel.add_instance_impl("worlds/sub".to_string(), cx)
+            panel.add_instance_impl("sub".to_string(), cx)
         });
         panel.read_with(cx, |panel, _| {
             assert!(live_of(panel).world_dirty, "add instance");
@@ -19351,7 +19323,7 @@ mod tests {
             assert!(!open_of(panel).save_pending());
         });
 
-        let on_disk = read_world(dir.path(), "worlds/affine.toml").expect("the saved world");
+        let on_disk = read_world(dir.path(), "affine.wrld.toml").expect("the saved world");
         assert_eq!(
             on_disk.entities[0].components[SPRITE_COMPONENT]["scale_x"],
             json!(2)
@@ -19362,7 +19334,7 @@ mod tests {
         );
 
         panel.update(cx, |panel, cx| {
-            panel.reload_from_disk("worlds/affine.toml", cx)
+            panel.reload_from_disk("affine.wrld.toml", cx)
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
@@ -19436,7 +19408,7 @@ mod tests {
             cx.debug_bounds("ggo-world-saving").is_none(),
             "and the row goes with it"
         );
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([40, 12]),
@@ -19488,7 +19460,7 @@ mod tests {
                 "the document gained the cart's entity"
             );
         });
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(on_disk.entities.len(), 2, "and so did the file");
         assert_eq!(
             on_disk.entities[1].components["Transform"]["pos"],
@@ -19569,7 +19541,7 @@ mod tests {
                 "a failed save keeps the document dirty"
             );
         });
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([4, 4]),
@@ -19607,7 +19579,7 @@ mod tests {
             );
             assert!(panel.dirty_world_name().is_some());
         });
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([4, 4])
@@ -19651,8 +19623,8 @@ mod tests {
             "no snapshot or readback goes out"
         );
         assert!(
-            !dir.path().join("worlds/flat.toml").exists()
-                || world_file::read_world(dir.path(), "worlds/flat.toml")
+            !dir.path().join("flat.wrld.toml").exists()
+                || world_file::read_world(dir.path(), "flat.wrld.toml")
                     .unwrap()
                     .entities[0]
                     .components["Transform"]["pos"]
@@ -19708,7 +19680,7 @@ mod tests {
             &[(0, vec![transform_bag([99.0, 99.0], 0)])],
             &[],
         );
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([4, 4]),
@@ -19773,7 +19745,7 @@ mod tests {
             );
             assert_eq!(open_of(panel).save_error, None);
         });
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(on_disk.entities.len(), 2);
         assert_eq!(
             on_disk.entities[1].components["Transform"]["pos"],
@@ -19836,7 +19808,7 @@ mod tests {
             assert!(!open_of(panel).save_pending(), "the save settled");
             assert_eq!(open_of(panel).save_error, None);
         });
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([4, 4]),
@@ -20201,7 +20173,7 @@ mod tests {
         );
         save.await.expect("the save landed");
 
-        let on_disk = world_file::read_world(dir.path(), "worlds/flat.toml").unwrap();
+        let on_disk = world_file::read_world(dir.path(), "flat.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             json!([40, 12]),
@@ -20396,9 +20368,9 @@ mod tests {
     async fn a_failed_encode_keeps_the_world_dirty_and_retries(cx: &mut TestAppContext) {
         let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
         host_sent(&endpoint);
-        // The open document instances `worlds/sub`; the encoder reads it
+        // The open document instances `sub`; the encoder reads it
         // to flatten the world, so removing it makes every encode fail.
-        let sub = dir.path().join("worlds/sub.toml");
+        let sub = dir.path().join("sub.wrld.toml");
         let saved = std::fs::read(&sub).unwrap();
         std::fs::remove_file(&sub).unwrap();
 
@@ -20457,9 +20429,9 @@ mod tests {
     async fn a_failed_encode_is_not_re_attempted_every_tick(cx: &mut TestAppContext) {
         let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
         host_sent(&endpoint);
-        // The open document instances `worlds/sub`; the encoder reads it
+        // The open document instances `sub`; the encoder reads it
         // to flatten the world, so removing it makes every encode fail.
-        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+        std::fs::remove_file(dir.path().join("sub.wrld.toml")).unwrap();
 
         panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
         endpoint.tick();
@@ -20546,7 +20518,7 @@ mod tests {
     ) {
         let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
         host_sent(&endpoint);
-        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+        std::fs::remove_file(dir.path().join("sub.wrld.toml")).unwrap();
 
         panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
         endpoint.tick();
@@ -20590,7 +20562,7 @@ mod tests {
         host_sent(&endpoint);
         // Every re-send will now fail to encode, so nothing can quietly
         // repair the handshake behind the assertion.
-        std::fs::remove_file(dir.path().join("worlds/sub.toml")).unwrap();
+        std::fs::remove_file(dir.path().join("sub.wrld.toml")).unwrap();
 
         // What a stale session leaves behind: the panel re-greeted (which
         // resets the mailbox's mirror, frame counter included) and is
@@ -20892,7 +20864,7 @@ mod tests {
         cx.run_until_parked();
         panel.update(cx, |panel, cx| panel.add_entity_impl(cx));
         panel.update(cx, |panel, cx| {
-            panel.add_instance_impl("worlds/sub".to_string(), cx)
+            panel.add_instance_impl("sub".to_string(), cx)
         });
         // The layers rail and the clipboard reach the store through
         // `apply_op` like everything else, and neither may move a document

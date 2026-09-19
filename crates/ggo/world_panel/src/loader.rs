@@ -1,5 +1,6 @@
-//! Off-thread world loading: enumerate `worlds/**.toml`, read + resolve a
-//! world, and compose every referenced asset into `render::AssetLoads`.
+//! Off-thread world loading: enumerate `**/*.wrld.toml` under the asset
+//! root, read + resolve a world, and compose every referenced asset into
+//! `render::AssetLoads`.
 //!
 //! The compose functions (`compose_sprite_rgba`/`compose_meta_sprite_rgba`
 //! here, `ggo_worldlib::sprites::io::compose_map_rgba` for maps) and
@@ -16,7 +17,7 @@
 //! -- `ggo_map_panel` (M2) shares the exact same fn.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ggo_worldlib::backgrounds::{MergedBackground, merge_backgrounds};
 use ggo_worldlib::render::{self, AssetLoads, Loadable, collect_load_targets};
@@ -54,41 +55,15 @@ pub struct LoadedWorld {
 
 // ------------------------------------------------------------ worlds list
 
-/// Recursively collect the project-relative paths (forward-slash
-/// separated) of every file under `<root>/worlds`, sorted, then filter
-/// through `world_files::world_files`. Feeds the panel's `AddInstance`
-/// candidate set (F4 X1 removed the picker this also used to feed).
+/// Every world file under the asset root `root` -- `<stem>.wrld.toml` at
+/// any depth -- as asset-root-relative listings, path-sorted. Feeds the
+/// panel's `AddInstance` candidate set (F4 X1 removed the picker this also
+/// used to feed).
 pub fn list_worlds(root: &Path) -> Vec<WorldListing> {
-    let mut rels = Vec::new();
-    walk_files(&root.join("worlds"), &PathBuf::from("worlds"), &mut rels);
-    rels.sort();
-    world_files::world_files(&rels)
-}
-
-fn walk_files(dir: &Path, rel: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let child_rel = rel.join(&name);
-        let path = entry.path();
-        if path.is_dir() {
-            walk_files(&path, &child_rel, out);
-        } else {
-            // Rel paths are built with `/` regardless of platform -- that's
-            // the shape `world_files` (and every worldlib rel-path API)
-            // expects.
-            let mut s = String::new();
-            for comp in child_rel.components() {
-                if !s.is_empty() {
-                    s.push('/');
-                }
-                s.push_str(&comp.as_os_str().to_string_lossy());
-            }
-            out.push(s);
-        }
-    }
+    // worldlib's walker, not a private one: it skips dotdirs, `target`,
+    // `node_modules` and `dist` and caps depth, and this now walks a whole
+    // asset root rather than one `worlds/` subtree.
+    world_files::world_files(&io::list_all_files(root))
 }
 
 // ---------------------------------------------------------- one-shot load
@@ -357,14 +332,14 @@ fn manifest_schemas(project_dir: &Path) -> Vec<ComponentSchema> {
 /// no such ancestor.
 ///
 /// This exists because the panel loads a world against its DERIVED asset
-/// root -- `<worktree>/assets` for `assets/worlds/main.toml`, see
+/// root -- `<worktree>/assets` for `assets/main.wrld.toml`, see
 /// `split_world_path` -- and `manifests/` is NOT under that root, it is
 /// its sibling. Calling `manifest_schemas` with the asset root looked for
 /// `<worktree>/assets/manifests/components.toml`, which no emerald project
 /// has, so an asset-rooted world silently got builtins only. Found while
 /// wiring F5.2/S3's "a component created in the emerald panel becomes
 /// available here without a restart"; the fallback is what keeps the
-/// worktree-rooted `worlds/main.toml` layout (and this module's own tests)
+/// worktree-rooted `main.wrld.toml` layout (and this module's own tests)
 /// working unchanged.
 pub fn schemas_near(dir: &Path) -> Vec<ComponentSchema> {
     match ggo_common::emerald_project_root(dir) {
@@ -510,30 +485,29 @@ mod tests {
     #[test]
     fn instance_entity_counts_recurse_in_file_order() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("worlds")).unwrap();
         std::fs::write(
-            dir.path().join("worlds/leaf.toml"),
+            dir.path().join("leaf.wrld.toml"),
             "[[entity]]\nTransform = { pos = [0, 0] }\n[[entity]]\nTransform = { pos = [1, 1] }\n",
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("worlds/mid.toml"),
-            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"worlds/leaf\"\npos = [0, 0]\n",
+            dir.path().join("mid.wrld.toml"),
+            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"leaf\"\npos = [0, 0]\n",
         )
         .unwrap();
         let instances = vec![
             WorldInstance {
-                world: "worlds/mid".into(),
+                world: "mid".into(),
                 pos: [0.0, 0.0],
                 background_priority: false,
             },
             WorldInstance {
-                world: "worlds/missing".into(),
+                world: "missing".into(),
                 pos: [0.0, 0.0],
                 background_priority: false,
             },
             WorldInstance {
-                world: "worlds/leaf".into(),
+                world: "leaf".into(),
                 pos: [0.0, 0.0],
                 background_priority: false,
             },
@@ -547,19 +521,18 @@ mod tests {
     #[test]
     fn instance_entity_counts_stop_at_a_cycle() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("worlds")).unwrap();
         std::fs::write(
-            dir.path().join("worlds/a.toml"),
-            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"worlds/b\"\npos = [0, 0]\n",
+            dir.path().join("a.wrld.toml"),
+            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"b\"\npos = [0, 0]\n",
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("worlds/b.toml"),
-            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"worlds/a\"\npos = [0, 0]\n",
+            dir.path().join("b.wrld.toml"),
+            "[[entity]]\nTransform = { pos = [0, 0] }\n\n[[instance]]\nworld = \"a\"\npos = [0, 0]\n",
         )
         .unwrap();
         let instances = vec![WorldInstance {
-            world: "worlds/a".into(),
+            world: "a".into(),
             pos: [0.0, 0.0],
             background_priority: false,
         }];
@@ -596,30 +569,31 @@ mod tests {
         assert_eq!(payloads[0].slot, 3);
     }
 
-    /// Picker filter: only `worlds/**.toml` files survive, nested dirs
-    /// included, and listings come back path-sorted.
+    /// Picker filter: only `**/*.wrld.toml` files survive, anywhere under
+    /// the asset root, and listings come back path-sorted. A bare `.toml`
+    /// (a manifest, a map) is not a world wherever it sits.
     #[test]
     fn list_worlds_filters_to_world_toml_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::create_dir_all(root.join("worlds/nested")).unwrap();
-        std::fs::create_dir_all(root.join("sprites")).unwrap();
-        std::fs::write(root.join("worlds/b.toml"), "").unwrap();
-        std::fs::write(root.join("worlds/a.toml"), "").unwrap();
-        std::fs::write(root.join("worlds/nested/c.toml"), "").unwrap();
-        std::fs::write(root.join("worlds/notes.txt"), "").unwrap();
-        std::fs::write(root.join("sprites/d.toml"), "").unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(root.join("manifests")).unwrap();
+        std::fs::write(root.join("b.wrld.toml"), "").unwrap();
+        std::fs::write(root.join("a.wrld.toml"), "").unwrap();
+        std::fs::write(root.join("nested/c.wrld.toml"), "").unwrap();
+        std::fs::write(root.join("notes.txt"), "").unwrap();
+        std::fs::write(root.join("manifests/components.toml"), "").unwrap();
 
         let listings = list_worlds(root);
         let stems: Vec<&str> = listings.iter().map(|l| l.stem.as_str()).collect();
-        assert_eq!(stems, ["worlds/a", "worlds/b", "worlds/nested/c"]);
-        assert_eq!(listings[0].rel_path, "worlds/a.toml");
+        assert_eq!(stems, ["a", "b", "nested/c"]);
+        assert_eq!(listings[0].rel_path, "a.wrld.toml");
     }
 
     #[test]
     fn list_worlds_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(list_worlds(dir.path()).is_empty());
+        assert!(list_worlds(&dir.path().join("nope")).is_empty());
     }
 
     #[test]
@@ -664,7 +638,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "").unwrap();
         std::fs::create_dir_all(root.join("manifests")).unwrap();
-        std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::write(
             root.join("manifests/components.toml"),
             "version = 1\n\n[[component]]\nname = \"Health\"\n\n[[component.field]]\nname = \"hp\"\nkind = \"int\"\n",
@@ -695,15 +669,15 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "").unwrap();
         std::fs::create_dir_all(root.join("manifests")).unwrap();
-        std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::write(
             root.join("manifests/components.toml"),
             "version = 1\n\n[[component]]\nname = \"Health\"\n\n[[component.field]]\nname = \"hp\"\nkind = \"int\"\n",
         )
         .unwrap();
-        std::fs::write(root.join("assets/worlds/main.toml"), "version = 1\n").unwrap();
+        std::fs::write(root.join("assets/main.wrld.toml"), "version = 1\n").unwrap();
 
-        let loaded = load_world(&root.join("assets"), "worlds/main.toml").unwrap();
+        let loaded = load_world(&root.join("assets"), "main.wrld.toml").unwrap();
         assert!(
             loaded.schemas.iter().any(|s| s.name == "Health"),
             "an asset-rooted load must see <project>/manifests, not <project>/assets/manifests"
@@ -712,7 +686,7 @@ mod tests {
 
     /// No `emerald.toml` anywhere: `schemas_near` is exactly
     /// `manifest_schemas` of the directory it was handed, which is what
-    /// keeps the worktree-rooted `worlds/main.toml` layout working.
+    /// keeps the worktree-rooted `main.wrld.toml` layout working.
     #[test]
     fn schemas_near_falls_back_to_the_directory_itself() {
         let dir = tempfile::tempdir().unwrap();

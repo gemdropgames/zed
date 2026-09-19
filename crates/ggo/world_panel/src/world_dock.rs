@@ -404,16 +404,12 @@ pub(crate) mod tests {
             ggo_common::bind_default_keymap(cx);
         });
         crate::tests::write_fixture(root);
-        // A second world beside the fixture's `worlds/test.toml`.
-        std::fs::copy(
-            root.join("worlds/test.toml"),
-            root.join("worlds/other.toml"),
-        )
-        .unwrap();
+        // A second world beside the fixture's `test.wrld.toml`.
+        std::fs::copy(root.join("test.wrld.toml"), root.join("other.wrld.toml")).unwrap();
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             "/proj",
-            serde_json::json!({ "worlds": { "test.toml": "", "other.toml": "" } }),
+            serde_json::json!({ "test.wrld.toml": "", "other.wrld.toml": "" }),
         )
         .await;
         let project = Project::test(fs, ["/proj".as_ref()], cx).await;
@@ -431,13 +427,13 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         let first = workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/other.toml", window, cx);
+                dock.open_world("other.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -461,8 +457,8 @@ pub(crate) mod tests {
         assert_eq!(
             rels,
             [
-                Some("worlds/test.toml".into()),
-                Some("worlds/other.toml".into())
+                Some("test.wrld.toml".into()),
+                Some("other.wrld.toml".into())
             ]
         );
         assert!(
@@ -476,13 +472,13 @@ pub(crate) mod tests {
         let active = dock.read_with(cx, |dock, _| dock.active().expect("an active world"));
         assert_eq!(
             active.read_with(cx, |p, _| p.open_rel_path_now().map(str::to_string)),
-            Some("worlds/other.toml".into())
+            Some("other.wrld.toml".into())
         );
 
         // Re-opening the first world activates its tab instead of a third.
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -495,7 +491,7 @@ pub(crate) mod tests {
         let active = dock.read_with(cx, |dock, _| dock.active().expect("an active world"));
         assert_eq!(
             active.read_with(cx, |p, _| p.open_rel_path_now().map(str::to_string)),
-            Some("worlds/test.toml".into())
+            Some("test.wrld.toml".into())
         );
     }
 
@@ -505,7 +501,7 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -549,7 +545,7 @@ pub(crate) mod tests {
     async fn the_dock_follows_whichever_world_tab_is_active(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
-        for rel in ["worlds/test.toml", "worlds/other.toml"] {
+        for rel in ["test.wrld.toml", "other.wrld.toml"] {
             workspace.update_in(cx, |ws, window, cx| {
                 ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
                     dock.open_world(rel, window, cx);
@@ -559,7 +555,7 @@ pub(crate) mod tests {
         }
         let pane = workspace.read_with(cx, |ws, _| ws.active_pane().clone());
 
-        for (index, rel) in ["worlds/test.toml", "worlds/other.toml"]
+        for (index, rel) in ["test.wrld.toml", "other.wrld.toml"]
             .into_iter()
             .enumerate()
         {
@@ -586,7 +582,7 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -660,11 +656,11 @@ pub(crate) mod tests {
             });
             cx.run_until_parked();
         };
-        open("worlds/test.toml", cx);
+        open("test.wrld.toml", cx);
         let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
         crate::tests::dirty_the_world(&panel, cx);
 
-        open("worlds/test.toml", cx);
+        open("test.wrld.toml", cx);
         assert_eq!(
             dock.read_with(cx, |dock, _| dock.active().expect("still open")),
             panel,
@@ -675,7 +671,7 @@ pub(crate) mod tests {
             "re-opening the open world must not reload it"
         );
 
-        open("worlds/other.toml", cx);
+        open("other.wrld.toml", cx);
         assert!(
             panel.read_with(cx, |panel, _| panel.test_is_dirty()),
             "and another world opens in its own tab, leaving the dirty one be"
@@ -693,7 +689,7 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         let panel = workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             });
             ws.panel::<WorldDock>(cx)
                 .and_then(|dock| dock.read(cx).active())
@@ -708,7 +704,7 @@ pub(crate) mod tests {
         let read = panel
             .read_with(cx, |panel, _| panel.remote_read())
             .expect("the deferred load lands");
-        assert_eq!(read["rel_path"], "worlds/test.toml");
+        assert_eq!(read["rel_path"], "test.wrld.toml");
         assert!(dock.read_with(cx, |dock, _| dock.active().is_some()));
     }
 
@@ -746,7 +742,7 @@ pub(crate) mod tests {
             });
             cx.run_until_parked();
         };
-        open("worlds/test.toml", cx);
+        open("test.wrld.toml", cx);
         let panel = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
         panel.update_in(cx, |panel, window, cx| {
             panel.set_canvas_mode(crate::CanvasMode::Design, window, cx)
@@ -754,7 +750,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         // A second tab remains Live while the first is still open.
-        open("worlds/other.toml", cx);
+        open("other.wrld.toml", cx);
         let second = dock.read_with(cx, |dock, _| dock.active().expect("a second tab"));
         assert_eq!(
             second.read_with(cx, |panel, _| panel.canvas_mode()),
@@ -783,7 +779,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         assert!(dock.read_with(cx, |dock, _| dock.open_panels().is_empty()));
 
-        open("worlds/test.toml", cx);
+        open("test.wrld.toml", cx);
         let reopened = dock.read_with(cx, |dock, _| dock.active().expect("a fresh tab"));
         assert_eq!(
             reopened.read_with(cx, |panel, _| panel.canvas_mode()),
@@ -803,7 +799,7 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world_in("worlds/test.toml", OpenMode::Design, window, cx);
+                dock.open_world_in("test.wrld.toml", OpenMode::Design, window, cx);
             })
         });
         cx.run_until_parked();
@@ -829,7 +825,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world_in("worlds/test.toml", OpenMode::Design, window, cx);
+                dock.open_world_in("test.wrld.toml", OpenMode::Design, window, cx);
             })
         });
         cx.run_until_parked();
@@ -853,7 +849,7 @@ pub(crate) mod tests {
         let (workspace, dock, cx) = dock_workspace(cx, dir.path()).await;
         workspace.update_in(cx, |ws, window, cx| {
             ggo_common::open_in_panel(ws, window, cx, |dock: &mut WorldDock, window, cx| {
-                dock.open_world("worlds/test.toml", window, cx);
+                dock.open_world("test.wrld.toml", window, cx);
             })
         });
         cx.run_until_parked();
@@ -873,7 +869,7 @@ pub(crate) mod tests {
         // too, and the mode it OPENS in is what the sticky choice decides.
         let second = dock
             .update_in(cx, |dock, window, cx| {
-                dock.open_world("worlds/other.toml", window, cx)
+                dock.open_world("other.wrld.toml", window, cx)
             })
             .expect("a second tab");
         assert_eq!(
@@ -907,30 +903,30 @@ pub(crate) mod tests {
             });
             cx.run_until_parked();
         };
-        open("worlds/test.toml", cx);
+        open("test.wrld.toml", cx);
         let first = dock.read_with(cx, |dock, _| dock.active().expect("a world tab"));
-        open("worlds/other.toml", cx);
+        open("other.wrld.toml", cx);
 
         std::fs::copy(
-            dir.path().join("worlds/test.toml"),
-            dir.path().join("worlds/third.toml"),
+            dir.path().join("test.wrld.toml"),
+            dir.path().join("third.wrld.toml"),
         )
         .unwrap();
         assert!(
             !first
                 .read_with(cx, |panel, _| panel.test_world_stems())
                 .iter()
-                .any(|stem| stem == "worlds/third"),
+                .any(|stem| stem == "third"),
             "the world added on disk is not in the older tab's listing yet: {:?}",
             first.read_with(cx, |panel, _| panel.test_world_stems())
         );
 
-        open("worlds/test.toml", cx);
+        open("test.wrld.toml", cx);
         assert!(
             first
                 .read_with(cx, |panel, _| panel.test_world_stems())
                 .iter()
-                .any(|stem| stem == "worlds/third"),
+                .any(|stem| stem == "third"),
             "re-opening the existing tab re-enumerates the project's worlds"
         );
     }

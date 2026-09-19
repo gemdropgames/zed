@@ -326,10 +326,9 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
 /// selector, so they are one click away inside any of the three, and a
 /// six-entry directory menu appended to upstream's own Duplicate/Rename/
 /// Delete would be worse than a selector. `New World…` sits with the
-/// assets entries because a world is an asset file -- though note `emd`
-/// writes it to `<root>/assets/worlds/` regardless of WHICH assets
-/// directory was clicked (`emd generate world --help` says so), so the
-/// click chooses the project, not the destination.
+/// assets entries because a world is an asset file -- the clicked
+/// directory inside `assets/` becomes `emd generate world`'s `--dir`, so
+/// the click chooses both the project and the destination.
 ///
 /// MUST NOT touch the project panel or any GGO panel: contributors run
 /// while `ProjectPanel` is leased (see
@@ -408,40 +407,37 @@ fn contribute_emerald_menu(
     items
 }
 
-/// The directory `assets/worlds/` files live under, inside [`ASSETS_DIR`].
-const WORLDS_DIR: &str = "worlds";
-
 /// Everything the inline "New World…" edit needs, computed while the
 /// contributor runs (path math plus the same kind of fs stats the menu
 /// predicates already make -- no panel is touched).
 #[derive(Clone)]
 struct WorldSeed {
     /// Worktree-relative dir the inline editor is seeded under: the
-    /// clicked dir when it is `assets/worlds` or below it, else the
-    /// project's `assets/worlds`.
+    /// clicked dir when it is `assets` or below it, else the project's
+    /// `assets`.
     seed_rel: String,
     /// The clicked dir, as the seed when `seed_rel` does not exist on
-    /// disk yet -- `emd` creates `assets/worlds/` on the first world.
+    /// disk yet -- `emd` creates `assets/` on the first world.
     fallback_rel: String,
-    /// `--dir` prefix `seed_rel` sits at below `assets/worlds` (empty at
-    /// the worlds root or for the fallback).
+    /// `--dir` prefix `seed_rel` sits at below `assets` (empty at the
+    /// asset root or for the fallback).
     base_sub: String,
-    /// Absolute `assets/worlds`, for the collision pre-check.
-    worlds_abs: PathBuf,
+    /// Absolute `assets`, for the collision pre-check.
+    assets_abs: PathBuf,
     /// Absolute emerald project root the run executes in.
     project_dir: PathBuf,
 }
 
 fn world_seed(dir: &Path, worktree_root: &Path, rel: &str) -> Option<WorldSeed> {
     let project_dir = emerald_project_root(dir)?;
-    let worlds_abs = project_dir.join(ASSETS_DIR).join(WORLDS_DIR);
-    let (seed_abs, base_sub) = match dir.strip_prefix(&worlds_abs) {
+    let assets_abs = project_dir.join(ASSETS_DIR);
+    let (seed_abs, base_sub) = match dir.strip_prefix(&assets_abs) {
         Ok(sub) => (
             dir.to_path_buf(),
             sub.to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/"),
         ),
-        Err(_) => (worlds_abs.clone(), String::new()),
+        Err(_) => (assets_abs.clone(), String::new()),
     };
     let seed_rel = seed_abs
         .strip_prefix(worktree_root)
@@ -452,7 +448,7 @@ fn world_seed(dir: &Path, worktree_root: &Path, rel: &str) -> Option<WorldSeed> 
         seed_rel,
         fallback_rel: rel.to_string(),
         base_sub,
-        worlds_abs,
+        assets_abs,
         project_dir,
     })
 }
@@ -517,9 +513,9 @@ fn new_world_inline_handler(
                     cx,
                 );
                 if !seeded {
-                    // `assets/worlds/` may not exist yet -- seed at the
-                    // clicked dir instead; `emd` creates the worlds dir on the
-                    // first generate and the file appears there.
+                    // `assets/` may not exist yet -- seed at the clicked
+                    // dir instead; `emd` creates the asset dir on the first
+                    // generate and the file appears there.
                     let Some(path) = inline_project_path(worktree_id, &seed.fallback_rel) else {
                         return;
                     };
@@ -541,24 +537,25 @@ fn new_world_inline_handler(
 /// so Enter never spawns a run the CLI would reject and the collision
 /// message appears while typing rather than as a failed run.
 fn world_validate(seed: &WorldSeed) -> impl Fn(&str) -> Option<String> + 'static {
-    let worlds_abs = seed.worlds_abs.clone();
+    let assets_abs = seed.assets_abs.clone();
     let base_sub = seed.base_sub.clone();
     move |typed| {
         if let Some(error) = forms::world_name_error(typed) {
             return Some(error);
         }
         let (dirs, name) = forms::split_world_name(typed);
-        let mut target = worlds_abs.clone();
+        let mut target = assets_abs.clone();
         if !base_sub.is_empty() {
             target = target.join(&base_sub);
         }
         for level in dirs {
             target = target.join(level);
         }
+        let file = format!("{name}{}", ggo_worldlib::world_files::WORLD_EXT);
         target
-            .join(format!("{name}.toml"))
+            .join(&file)
             .exists()
-            .then(|| format!("{name}.toml already exists here."))
+            .then(|| format!("{file} already exists here."))
     }
 }
 
@@ -1101,7 +1098,7 @@ impl EmeraldPanel {
     /// gate, Running/Done/Failed states, and `after_success`'s open in the
     /// world panel), so the panel the commit reveals shows the same
     /// feedback the form flow showed. `dir` is the `--dir` value for a
-    /// target below `assets/worlds/`, already segment-validated by
+    /// target below `assets/`, already segment-validated by
     /// [`forms::world_name_error`].
     pub fn generate_world_inline(
         &mut self,
@@ -1837,8 +1834,8 @@ impl EmeraldPanel {
     /// - **World**: `emd` wrote a file a panel owns, so it is opened
     ///   there. The path comes from the run's own JSON trailer
     ///   (`result.path`, absolute), NOT from re-deriving
-    ///   `assets/worlds/<name>.toml` here -- `emd generate world` owns
-    ///   that convention and this side must not keep a second copy of it.
+    ///   `assets/<name>.wrld.toml` here -- `emd generate world` owns that
+    ///   convention and this side must not keep a second copy of it.
     /// - The other four kinds write Rust sources under `crates/`, which
     ///   no GGO panel owns; upstream's editor opens them normally.
     ///
@@ -2908,7 +2905,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("emerald.toml"), "").unwrap();
         std::fs::create_dir_all(root.join("manifests")).unwrap();
-        std::fs::create_dir_all(root.join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::create_dir_all(root.join("assets/tiles")).unwrap();
         std::fs::create_dir_all(root.join("crates/game-core/src")).unwrap();
         std::fs::write(root.join("manifests/components.toml"), "version = 1\n").unwrap();
@@ -2944,12 +2941,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            root.join("assets/worlds/arena.toml"),
+            root.join("assets/arena.wrld.toml"),
             "[[entity]]\nHeroUnit = { hp = 3 }\n",
         )
         .unwrap();
         std::fs::write(
-            root.join("assets/worlds/empty.toml"),
+            root.join("assets/empty.wrld.toml"),
             "[[entity]]\nMarker = {}\n",
         )
         .unwrap();
@@ -3492,7 +3489,7 @@ mod tests {
         let (message, detail) = cx.pending_prompt().unwrap();
         assert_eq!(message, "Remove the component gameplay/HeroUnit?");
         assert!(
-            detail.contains("Still placed in 1 world: worlds/arena.toml."),
+            detail.contains("Still placed in 1 world: arena.wrld.toml."),
             "{detail}"
         );
         assert!(
@@ -4364,33 +4361,29 @@ mod tests {
     }
 
     /// Where the inline editor lands for each click: at the clicked dir
-    /// when it is `assets/worlds` or below (with the depth as `base_sub`),
-    /// else redirected to `assets/worlds`; and `None` entirely outside an
-    /// emerald project or worktree.
+    /// when it is `assets` or below (with the depth as `base_sub`), else
+    /// redirected to the project's `assets`; and `None` entirely outside
+    /// an emerald project or worktree.
     #[test]
     fn world_seed_resolves_the_click_to_a_target() {
         let dir = emerald_project();
         let root = dir.path();
-        std::fs::create_dir_all(root.join("assets/worlds/dungeon/floors")).unwrap();
+        std::fs::create_dir_all(root.join("assets/dungeon/floors")).unwrap();
 
         let seed = world_seed(&root.join("assets"), root, "assets").unwrap();
-        assert_eq!(seed.seed_rel, "assets/worlds");
+        assert_eq!(seed.seed_rel, "assets");
         assert_eq!(seed.base_sub, "");
         assert_eq!(seed.fallback_rel, "assets");
-        assert_eq!(seed.worlds_abs, root.join("assets/worlds"));
+        assert_eq!(seed.assets_abs, root.join("assets"));
         assert_eq!(seed.project_dir, root);
 
-        let seed = world_seed(&root.join("assets/worlds"), root, "assets/worlds").unwrap();
-        assert_eq!(seed.seed_rel, "assets/worlds");
-        assert_eq!(seed.base_sub, "");
-
         let seed = world_seed(
-            &root.join("assets/worlds/dungeon/floors"),
+            &root.join("assets/dungeon/floors"),
             root,
-            "assets/worlds/dungeon/floors",
+            "assets/dungeon/floors",
         )
         .unwrap();
-        assert_eq!(seed.seed_rel, "assets/worlds/dungeon/floors");
+        assert_eq!(seed.seed_rel, "assets/dungeon/floors");
         assert_eq!(seed.base_sub, "dungeon/floors");
 
         let outside = tempfile::tempdir().unwrap();
@@ -4435,12 +4428,12 @@ mod tests {
     }
 
     /// "New World…" seeds the project panel's inline editor (New File's
-    /// UX) instead of opening a form -- at `assets/worlds/` when the
-    /// click was elsewhere in `assets/`.
+    /// UX) instead of opening a form -- at the clicked directory inside
+    /// `assets/`.
     #[gpui::test]
     async fn test_new_world_seeds_the_inline_editor(cx: &mut TestAppContext) {
         let dir = emerald_project();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
         let seed = world_seed(&dir.path().join("assets"), dir.path(), "assets")
@@ -4470,10 +4463,10 @@ mod tests {
     #[gpui::test]
     async fn test_inline_world_commit_runs_emd_and_opens_the_world(cx: &mut TestAppContext) {
         let dir = emerald_project();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let written = dir.path().join("assets/worlds/arena.toml");
+        let written = dir.path().join("assets/arena.wrld.toml");
         let reported = written.to_string_lossy().to_string();
         let (runner, calls) = fake_runner(move |_| {
             std::fs::write(&written, "version = 1\n").unwrap();
@@ -4513,18 +4506,18 @@ mod tests {
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
-            Some("assets/worlds/arena.toml".to_string()),
+            Some("assets/arena.wrld.toml".to_string()),
             "the generated world opens in the world panel"
         );
     }
 
-    /// A click below `assets/worlds/`, or a typed `sub/name`, becomes
-    /// `--dir`: the click chooses the base, typed slashes go deeper, and
-    /// the two compose.
+    /// A click below `assets/`, or a typed `sub/name`, becomes `--dir`:
+    /// the click chooses the base, typed slashes go deeper, and the two
+    /// compose.
     #[gpui::test]
     async fn test_inline_world_commit_passes_dir_for_subdir_targets(cx: &mut TestAppContext) {
         let dir = emerald_project();
-        std::fs::create_dir_all(dir.path().join("assets/worlds/dungeon")).unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/dungeon")).unwrap();
         let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/whatever"));
@@ -4535,16 +4528,16 @@ mod tests {
         fake_fs
             .as_fake()
             .insert_tree(
-                dir.path().join("assets/worlds"),
+                dir.path().join("assets"),
                 serde_json::json!({ "dungeon": {} }),
             )
             .await;
         cx.run_until_parked();
 
         let seed = world_seed(
-            &dir.path().join("assets/worlds/dungeon"),
+            &dir.path().join("assets/dungeon"),
             dir.path(),
-            "assets/worlds/dungeon",
+            "assets/dungeon",
         )
         .unwrap();
         assert_eq!(seed.base_sub, "dungeon");
@@ -4577,8 +4570,8 @@ mod tests {
     #[gpui::test]
     async fn test_inline_world_names_are_gated_before_any_spawn(cx: &mut TestAppContext) {
         let dir = emerald_project();
-        std::fs::create_dir_all(dir.path().join("assets/worlds")).unwrap();
-        std::fs::write(dir.path().join("assets/worlds/taken.toml"), "version = 1\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/taken.wrld.toml"), "version = 1\n").unwrap();
         let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
@@ -5194,12 +5187,12 @@ mod tests {
     #[gpui::test]
     async fn test_a_new_component_refreshes_the_world_panels_schemas(cx: &mut TestAppContext) {
         let dir = emerald_project();
-        std::fs::write(dir.path().join("assets/worlds/main.toml"), "version = 1\n").unwrap();
+        std::fs::write(dir.path().join("assets/main.wrld.toml"), "version = 1\n").unwrap();
         let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
         let claimed = workspace.update_in(cx, |workspace, window, cx| {
             workspace.intercept_path_open(
-                &project_path(worktree_id, "assets/worlds/main.toml"),
+                &project_path(worktree_id, "assets/main.wrld.toml"),
                 window,
                 cx,
             )
@@ -5216,7 +5209,7 @@ mod tests {
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
-            Some("assets/worlds/main.toml".to_string())
+            Some("assets/main.wrld.toml".to_string())
         );
         assert!(
             !world_panel
@@ -5256,13 +5249,13 @@ mod tests {
 
     /// A generated world is OPENED in the panel that owns it, at the path
     /// the run's own trailer reported -- this side never re-derives
-    /// `assets/worlds/<name>.toml`.
+    /// `assets/<name>.wrld.toml`.
     #[gpui::test]
     async fn test_a_generated_world_opens_in_the_world_panel(cx: &mut TestAppContext) {
         let dir = emerald_project();
         let (_workspace, panel, _worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let written = dir.path().join("assets/worlds/arena.toml");
+        let written = dir.path().join("assets/arena.wrld.toml");
         let reported = written.to_string_lossy().to_string();
         let (runner, _) = fake_runner(move |_| {
             std::fs::write(&written, "version = 1\n").unwrap();
@@ -5291,7 +5284,7 @@ mod tests {
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
-            Some("assets/worlds/arena.toml".to_string()),
+            Some("assets/arena.wrld.toml".to_string()),
             "the generated world opens where a panel owns it"
         );
     }
@@ -5310,7 +5303,7 @@ mod tests {
         let dir = emerald_project();
         let (workspace, panel, _worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let written = dir.path().join("assets/worlds/arena.toml");
+        let written = dir.path().join("assets/arena.wrld.toml");
         let reported = written.to_string_lossy().to_string();
         let (runner, _) = fake_runner(move |_| {
             std::fs::write(&written, "version = 1\n").unwrap();
@@ -5338,7 +5331,7 @@ mod tests {
         });
         assert_eq!(
             world_panel.read_with(cx, |panel, _| panel.open_rel_path_now().map(str::to_string)),
-            Some("assets/worlds/arena.toml".to_string()),
+            Some("assets/arena.wrld.toml".to_string()),
             "the generated world still opens in the world panel"
         );
     }

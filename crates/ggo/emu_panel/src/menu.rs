@@ -511,8 +511,8 @@ mod tests {
     fn the_cart_predicate_matches_only_runnable_extensions() {
         assert!(is_runnable_cart("carts/green.cart"));
         assert!(is_runnable_cart("build/GAME.GGO"), "case-insensitive");
-        assert!(is_runnable_cart("target/ggo-emulate/worlds-main.ggo"));
-        assert!(!is_runnable_cart("assets/worlds/main.toml"));
+        assert!(is_runnable_cart("target/ggo-emulate/main.ggo"));
+        assert!(!is_runnable_cart("assets/main.wrld.toml"));
         assert!(!is_runnable_cart("notes.txt"));
         assert!(!is_runnable_cart("cart"), "no extension at all");
     }
@@ -523,16 +523,13 @@ mod tests {
     #[test]
     fn the_pack_argv_names_the_out_path_and_the_boot_world() {
         assert_eq!(
-            world_pack_args(
-                Path::new("/proj/target/ggo-emulate/worlds-main.ggo"),
-                "worlds/main"
-            ),
+            world_pack_args(Path::new("/proj/target/ggo-emulate/main.ggo"), "main"),
             [
                 "pack-ggo",
                 "--out",
-                "/proj/target/ggo-emulate/worlds-main.ggo",
+                "/proj/target/ggo-emulate/main.ggo",
                 "--world",
-                "worlds/main",
+                "main",
             ]
         );
     }
@@ -541,19 +538,17 @@ mod tests {
     /// binary, cwd and argv -- is what a panel actually hands the runner.
     #[test]
     fn the_pack_request_runs_in_the_project_root_with_json() {
-        let request = ProcRequest::emd(
-            "/proj",
-            world_pack_args(Path::new("/proj/out.ggo"), "worlds/main"),
-        );
+        let request =
+            ProcRequest::emd("/proj", world_pack_args(Path::new("/proj/out.ggo"), "main"));
         assert_eq!(request.cwd, Path::new("/proj"));
         assert_eq!(request.args.last().unwrap(), "--json");
-        assert!(request.command_line().contains("--world worlds/main"));
+        assert!(request.command_line().contains("--world main"));
     }
 
     #[test]
     fn the_pack_output_name_flattens_a_nested_stem() {
-        assert_eq!(pack_out_name("worlds/main"), "worlds-main.ggo");
-        assert_eq!(pack_out_name("worlds/boss/main"), "worlds-boss-main.ggo");
+        assert_eq!(pack_out_name("main"), "main.ggo");
+        assert_eq!(pack_out_name("boss/main"), "boss-main.ggo");
     }
 
     /// A built cart inside the worktree is shown (and stored) relative to

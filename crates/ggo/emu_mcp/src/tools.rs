@@ -100,12 +100,12 @@ pub fn tool_list() -> Value {
               "layer": { "type": "number", "description": "map: layer 0–3 (default 0)" }
           })) },
         { "name": "cart_pack",
-          "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (worlds/arena) or file (assets/worlds/arena.toml). Returns {cart, world, lines}: hand `cart` to emu_start. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call) — and while it runs, every other tool against this Zed waits, because the host serves one request at a time. Errors carry emd's own failure line.",
-          "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem, e.g. worlds/arena" } })) },
+          "description": "Build one world into a runnable cart: `emd pack-ggo --world <stem>` into the project's target/ggo-emulate/. Takes a world stem (arena) or file (assets/arena.wrld.toml). Returns {cart, world, lines}: hand `cart` to emu_start. Blocks until the pack finishes (a cold build can take minutes; the 15s socket timeout is raised for this call) — and while it runs, every other tool against this Zed waits, because the host serves one request at a time. Errors carry emd's own failure line.",
+          "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem, e.g. arena" } })) },
         { "name": "hw_flash",
-          "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. worlds/chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=460800, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
+          "description": "Flash a world to the GemdropGo board and run it (build, program, boot-verify over UART, then a timed gameplay telemetry capture). Flashing is intensive (occupies the board; ~20 min with rebuild_gateware). Confirm with the user before invoking. Always pass an explicit `world` stem (e.g. chase_cam): omitting it flashes whichever world the panel last remembered or has open, which is often not the one you mean. Every other knob has a default (the default set: rebuild_gateware=false, tty=first serial port found, baud=460800, collect_seconds=120, telemetry=false); pass only what you mean to change. Returns as soon as the flash STARTS, with `config` = the effective configuration, defaults filled in — poll hw_flash_status, or block on hw_flash_wait. Even a start that errors opens the hardware tab in the user's Zed.",
           "inputSchema": with(json!({
-              "world": { "type": "string", "description": "World stem to bake in as the boot world, e.g. worlds/chase_cam" },
+              "world": { "type": "string", "description": "World stem to bake in as the boot world, e.g. chase_cam" },
               "rebuild_gateware": { "type": "boolean", "description": "Re-run place-and-route (~20 min) instead of reusing the cached bitstream; only needed after a gateware change (default false)" },
               "tty": { "type": "string", "description": "Serial device, e.g. /dev/ttyUSB0 (default: the first port the panel's scan found)" },
               "baud": { "type": "number", "description": "UART baud (default 460800)" },
@@ -151,11 +151,11 @@ pub fn tool_list() -> Value {
           "description": "Close the Reports tab in the user's Zed. With `run`, only if that is the run it shows. Returns {closed: false} when no tab is open.",
           "inputSchema": with(json!({ "run": { "type": "number", "description": "Only close if the tab shows this run (optional)" } })) },
         { "name": "world_list",
-          "description": "Every world file in the open project: {worlds: [{stem, rel_path}]}. Stems are what emd, cart_pack and hw_flash take (worlds/arena).",
+          "description": "Every world file in the open project: {worlds: [{stem, rel_path}]}. Stems are what emd, cart_pack and hw_flash take (arena).",
           "inputSchema": with(json!({})) },
         { "name": "world_open",
           "description": "Open a world in Zed's World panel, as clicking its file would: it gets its own editor tab. Returns {opened: rel_path}. A world that already has a tab is brought to the front, never reloaded, so unsaved edits, undo history and camera survive — and opening one world never disturbs another.",
-          "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem (worlds/arena) or rel path" } })) },
+          "inputSchema": with(json!({ "world": { "type": "string", "description": "World stem (arena) or rel path" } })) },
         { "name": "world_read",
           "description": "The world as the designer authored it, from the World panel: {stem, rel_path, dirty, entities[{index, pos, components}], instances[{index, world, pos, background_priority, error}], backgrounds[{layer, map}], selected[]}. Pass `world` to open one first. This is the level layout — what world_screenshot draws and what the cart boots — not the running game (that is emu_next_frame's world JSON).",
           "inputSchema": with(json!({ "world": { "type": "string", "description": "Open this world first (stem or rel path); omit to read the one already open" } })) },
@@ -394,8 +394,13 @@ fn call_tool_inner(
         }
         "cart_pack" => {
             let world = arg_str(args, "world")
-                .ok_or("missing required argument: world (a stem like worlds/arena)")?;
-            let data = send(&session.socket, Cmd::PackWorld { workspace, world }, PACK_TIMEOUT, connect)?;
+                .ok_or("missing required argument: world (a stem like arena)")?;
+            let data = send(
+                &session.socket,
+                Cmd::PackWorld { workspace, world },
+                PACK_TIMEOUT,
+                connect,
+            )?;
             Ok(vec![json!({ "type": "text", "text": data.to_string() })])
         }
         "hw_flash" => {
@@ -967,16 +972,21 @@ mod tests {
         fake_session(dir.path(), std::process::id());
         let connect = |_: &Path, line: &str, timeout: Duration| -> std::io::Result<String> {
             assert!(
-                line.contains(r#""cmd":"pack_world""#) && line.contains(r#""world":"worlds/arena""#),
+                line.contains(r#""cmd":"pack_world""#) && line.contains(r#""world":"arena""#),
                 "{line}"
             );
             assert_eq!(timeout, PACK_TIMEOUT);
-            Ok(r#"{"id":1,"ok":true,"data":{"cart":"target/ggo-emulate/worlds-arena.ggo","world":"worlds/arena","lines":[]}}"#.to_string())
+            Ok(r#"{"id":1,"ok":true,"data":{"cart":"target/ggo-emulate/arena.ggo","world":"arena","lines":[]}}"#.to_string())
         };
-        let (content, is_err) =
-            call_tool("cart_pack", &json!({"world": "worlds/arena"}), dir.path(), &no_daemon(), &connect);
+        let (content, is_err) = call_tool(
+            "cart_pack",
+            &json!({"world": "arena"}),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
         assert!(!is_err, "{content:?}");
-        assert!(content[0]["text"].as_str().unwrap().contains("worlds-arena.ggo"));
+        assert!(content[0]["text"].as_str().unwrap().contains("arena.ggo"));
     }
 
     #[test]
@@ -1126,16 +1136,39 @@ mod tests {
         fake_session(dir.path(), std::process::id());
         let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
             if line.contains(r#""cmd":"world_list""#) {
-                Ok(r#"{"id":1,"ok":true,"data":{"worlds":[{"stem":"worlds/arena","rel_path":"worlds/arena.toml"}]}}"#.to_string())
+                Ok(r#"{"id":1,"ok":true,"data":{"worlds":[{"stem":"arena","rel_path":"arena.wrld.toml"}]}}"#.to_string())
             } else {
-                assert!(line.contains(r#""cmd":"world_read""#) && line.contains(r#""world":"worlds/arena""#), "{line}");
-                Ok(r#"{"id":1,"ok":true,"data":{"stem":"worlds/arena","dirty":false,"entities":[]}}"#.to_string())
+                assert!(
+                    line.contains(r#""cmd":"world_read""#) && line.contains(r#""world":"arena""#),
+                    "{line}"
+                );
+                Ok(
+                    r#"{"id":1,"ok":true,"data":{"stem":"arena","dirty":false,"entities":[]}}"#
+                        .to_string(),
+                )
             }
         };
-        let (content, is_err) = call_tool("world_list", &json!({}), dir.path(), &no_daemon(), &connect);
-        assert!(!is_err && content[0]["text"].as_str().unwrap().contains("worlds/arena"), "{content:?}");
-        let (content, is_err) = call_tool("world_read", &json!({"world": "worlds/arena"}), dir.path(), &no_daemon(), &connect);
-        assert!(!is_err && content[0]["text"].as_str().unwrap().contains(r#""dirty":false"#), "{content:?}");
+        let (content, is_err) =
+            call_tool("world_list", &json!({}), dir.path(), &no_daemon(), &connect);
+        assert!(
+            !is_err && content[0]["text"].as_str().unwrap().contains("arena"),
+            "{content:?}"
+        );
+        let (content, is_err) = call_tool(
+            "world_read",
+            &json!({"world": "arena"}),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
+        assert!(
+            !is_err
+                && content[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(r#""dirty":false"#),
+            "{content:?}"
+        );
     }
 
     #[test]
@@ -1244,15 +1277,18 @@ mod tests {
         fake_session(dir.path(), std::process::id());
         let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
             assert!(line.contains(r#""cmd":"flash_world""#), "{line}");
-            assert!(line.contains(r#""world":"worlds/chase_cam""#), "{line}");
+            assert!(line.contains(r#""world":"chase_cam""#), "{line}");
             assert!(line.contains(r#""rebuild_gateware":true"#), "{line}");
             assert!(line.contains(r#""collect_seconds":30"#), "{line}");
-            assert!(line.contains(r#""tty":null"#), "an unset knob travels as null: {line}");
-            Ok(r#"{"id":1,"ok":true,"data":{"started":true,"config":{"world":"worlds/chase_cam","rebuild_gateware":true,"tty":"/dev/ttyUSB0","baud":460800,"collect_seconds":30,"telemetry":false}}}"#.to_string())
+            assert!(
+                line.contains(r#""tty":null"#),
+                "an unset knob travels as null: {line}"
+            );
+            Ok(r#"{"id":1,"ok":true,"data":{"started":true,"config":{"world":"chase_cam","rebuild_gateware":true,"tty":"/dev/ttyUSB0","baud":460800,"collect_seconds":30,"telemetry":false}}}"#.to_string())
         };
         let (content, is_err) = call_tool(
             "hw_flash",
-            &json!({"world": "worlds/chase_cam", "rebuild_gateware": true, "collect_seconds": 30}),
+            &json!({"world": "chase_cam", "rebuild_gateware": true, "collect_seconds": 30}),
             dir.path(),
             &no_daemon(),
             &connect,
@@ -1271,12 +1307,19 @@ mod tests {
             panic!("a bad knob never reaches the socket")
         };
         for (args, word) in [
-            (json!({"world": "worlds/a", "baud": -1}), "baud"),
-            (json!({"world": "worlds/a", "collect_seconds": 0}), "collect_seconds"),
+            (json!({"world": "a", "baud": -1}), "baud"),
+            (
+                json!({"world": "a", "collect_seconds": 0}),
+                "collect_seconds",
+            ),
         ] {
-            let (content, is_err) = call_tool("hw_flash", &args, dir.path(), &no_daemon(), &connect);
+            let (content, is_err) =
+                call_tool("hw_flash", &args, dir.path(), &no_daemon(), &connect);
             assert!(is_err, "{content:?}");
-            assert!(content[0]["text"].as_str().unwrap().contains(word), "{content:?}");
+            assert!(
+                content[0]["text"].as_str().unwrap().contains(word),
+                "{content:?}"
+            );
         }
     }
 

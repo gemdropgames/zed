@@ -27,7 +27,7 @@ Enemy = { hp = 5, speed = 1.5 }
 Transform = { pos = [10, -2], z = 0 }
 
 [[instance]]
-world = "worlds/nested/arena"
+world = "levels/nested/arena"
 pos = [64, 128]
 
 [[background]]
@@ -372,9 +372,9 @@ fn a_worlds_toml_matches_through_the_projects_file_types(cx: &mut App) {
     };
 
     for path in [
-        "worlds/arena.toml",
-        "worlds/nested/arena.toml",
-        "assets/worlds/deep/nested/arena.toml",
+        "assets/main.wrld.toml",
+        "assets/levels/deep/a.wrld.toml",
+        "game/assets/x.wrld.toml",
     ] {
         assert_eq!(
             name(test_file(path)).as_ref().map(|n| n.as_ref()),
@@ -383,7 +383,12 @@ fn a_worlds_toml_matches_through_the_projects_file_types(cx: &mut App) {
         );
     }
 
-    for path in ["Cargo.toml", "assets/sprites/hero.toml", "worlds/README.md"] {
+    for path in [
+        "Cargo.toml",
+        "assets/manifests/components.toml",
+        "assets/worlds/arena.toml",
+        "worlds/arena.toml",
+    ] {
         assert_eq!(name(test_file(path)), None, "{path} should not match");
     }
 }
@@ -401,26 +406,34 @@ fn the_default_settings_activate_the_language_without_a_project_setting(cx: &mut
             .and_then(|id| languages.language_name_for_id(id))
     };
 
-    for path in ["worlds/arena.toml", "assets/worlds/nested/boss.toml"] {
+    for path in ["assets/arena.wrld.toml", "assets/nested/boss.wrld.toml"] {
         assert_eq!(
             name(test_file(path)).map(|n| n.to_string()),
             Some(LANGUAGE_NAME.to_string()),
             "{path} should be a GGO World"
         );
     }
-    for path in ["Cargo.toml", "assets/sprites/hero.toml", "worlds/README.md"] {
+    for path in [
+        "Cargo.toml",
+        "assets/manifests/components.toml",
+        "assets/worlds/arena.toml",
+        "assets/x.wrld.md",
+    ] {
         assert_eq!(name(test_file(path)), None, "{path} should not match");
     }
 }
 
 /// The shipped glob must start with `**/`: `find_for_file` matches
 /// against `File::full_path`, which is prefixed with the worktree's root
-/// name ("ggo/worlds/arena.toml"), so an unanchored `worlds/**/*.toml`
-/// never matches. Pinned on the constant since the default settings now
-/// carry it everywhere.
+/// name ("ggo/assets/arena.wrld.toml"), so an unanchored
+/// `assets/**/*.wrld.toml` never matches. Pinned on the constant since the
+/// default settings now carry it everywhere.
 #[test]
 fn the_project_glob_is_anchored_with_a_leading_globstar() {
-    assert!(PROJECT_FILE_TYPE_GLOB.starts_with("**/"), "{PROJECT_FILE_TYPE_GLOB}");
+    assert!(
+        PROJECT_FILE_TYPE_GLOB.starts_with("**/"),
+        "{PROJECT_FILE_TYPE_GLOB}"
+    );
 }
 
 /// The fork ships the project glob in its DEFAULT settings, so the

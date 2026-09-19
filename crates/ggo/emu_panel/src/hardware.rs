@@ -531,7 +531,7 @@ impl HardwareEnv {
 /// `--provision`, so the card image is rewritten with the freshly packed
 /// game every run.
 ///
-/// `world` is the stem (`worlds/arena`) the packed cart should boot,
+/// `world` is the stem (`arena`) the packed cart should boot,
 /// overriding the project's `default_world`. Without it the board boots
 /// whatever world the manifest names -- which is never the one the IDE
 /// was just editing, and reads on hardware as "my world is broken".
@@ -811,7 +811,7 @@ pub struct FlashProgress {
     /// Report phase, or a `ggo-diag` too old to print the line -- and that
     /// is what the page's post-PASS hop to the run's report keys off.
     pub diag_run_id: Option<String>,
-    /// What is being run ("flashing worlds/chase_cam"), for the agent
+    /// What is being run ("flashing chase_cam"), for the agent
     /// socket, which has no timeline header to read it off.
     pub what: Option<String>,
     /// The run's transcript on disk, once [`create_run_log`] made one.
@@ -1720,7 +1720,7 @@ mod tests {
     #[test]
     fn a_named_world_is_what_the_board_boots() {
         let arena = FlashConfig {
-            world: Some("worlds/arena".into()),
+            world: Some("arena".into()),
             ..Default::default()
         };
         assert_eq!(
@@ -1734,7 +1734,7 @@ mod tests {
                 "--tty",
                 "/dev/ttyUSB0",
                 "--world",
-                "worlds/arena",
+                "arena",
                 "--skip-pnr"
             ],
         );
@@ -1753,7 +1753,7 @@ mod tests {
                 "--tty",
                 "/dev/ttyUSB0",
                 "--world",
-                "worlds/arena"
+                "arena"
             ],
         );
     }
@@ -1780,7 +1780,7 @@ mod tests {
     #[test]
     fn flash_request_carries_the_world_through() {
         let arena = FlashConfig {
-            world: Some("worlds/arena".into()),
+            world: Some("arena".into()),
             ..Default::default()
         };
         let request = flash_request(&ready_env(), &arena).expect("a ready machine flashes");

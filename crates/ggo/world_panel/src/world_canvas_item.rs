@@ -169,12 +169,11 @@ impl Item for WorldCanvasItem {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        let stem = self.panel.read(cx).open_rel_path_now().map(|rel| {
-            std::path::Path::new(rel)
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| rel.to_string())
-        });
+        let stem = self
+            .panel
+            .read(cx)
+            .open_rel_path_now()
+            .map(crate::world_display_name);
         match stem {
             Some(stem) => format!("World: {stem}").into(),
             None => "World".into(),
@@ -310,7 +309,7 @@ mod tests {
             })
         });
         save.await.expect("a healthy save must succeed");
-        let on_disk = ggo_worldlib::world_file::read_world(dir.path(), "worlds/test.toml").unwrap();
+        let on_disk = ggo_worldlib::world_file::read_world(dir.path(), "test.wrld.toml").unwrap();
         assert_eq!(
             on_disk.entities[0].components["Transform"]["pos"],
             serde_json::json!([50, 60]),

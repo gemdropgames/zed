@@ -2555,7 +2555,7 @@ mod tests {
     // --------------------------------------------------------- pure rules
 
     /// **The `ggo-sprfix` contract.** The asset root is derived ON DISK (a
-    /// `.png` has no `worlds/`-style anchor in its path), and the import's
+    /// `.png` has no `assets`-component anchor to split on), and the import's
     /// rel is relative to THAT -- so a `.til` written from it can never carry
     /// an `assets/` segment. Outside an emerald project's `assets/` tree, the
     /// worktree root stands in and the rel passes through unchanged.

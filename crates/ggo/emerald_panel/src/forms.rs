@@ -274,8 +274,7 @@ impl GenDraft {
 }
 
 /// The `emd` argv for an inline "New World…" commit: `generate world
-/// <name>`, plus `--dir <sub>` when the target sits below
-/// `assets/worlds/`. Only valid to call after [`world_name_error`]
+/// <name>`, plus `--dir <sub>` when the target sits below `assets/`. Only valid to call after [`world_name_error`]
 /// returned `None` for the typed input the pieces came from.
 pub fn build_generate_world_args(name: &str, dir: Option<&str>) -> Vec<String> {
     let mut args = vec![

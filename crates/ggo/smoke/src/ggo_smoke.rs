@@ -639,13 +639,12 @@ mod tests {
         ggo_worldlib::sprites::io::save_new_map(root, "assets/maps/lvl.map", 8, 8).unwrap();
         std::fs::create_dir_all(root.join("assets/audio")).unwrap();
         std::fs::write(root.join("assets/audio/hit.wav"), b"RIFF").unwrap();
-        std::fs::create_dir_all(root.join("worlds")).unwrap();
-        std::fs::write(root.join("worlds/overworld.toml"), "").unwrap();
+        std::fs::write(root.join("overworld.wrld.toml"), "").unwrap();
         std::fs::write(root.join("game.cart"), b"").unwrap();
 
         assert!(offer_open(&workspace, cx, "assets/art/fx.til"), "tileset");
         assert!(offer_open(&workspace, cx, "assets/audio/hit.wav"), "audio");
-        assert!(offer_open(&workspace, cx, "worlds/overworld.toml"), "world");
+        assert!(offer_open(&workspace, cx, "overworld.wrld.toml"), "world");
         assert!(offer_open(&workspace, cx, "game.cart"), "cart");
         assert!(
             !offer_open(&workspace, cx, "assets/notes.txt"),
@@ -1316,7 +1315,7 @@ mod tests {
     /// `drag_ops::nudge_delta` uses for the Shift case.
     const WORLD_NUDGE_TILE: f64 = 16.0;
 
-    /// A ONE-entity world at `worlds/test.toml`, written through
+    /// A ONE-entity world at `test.wrld.toml`, written through
     /// worldlib's own `write_world` so the panel's loader reads exactly
     /// what the format's round-trip tests produce.
     ///
@@ -1339,12 +1338,12 @@ mod tests {
             instances: vec![],
             backgrounds: vec![],
         };
-        ggo_worldlib::world_file::write_world(root, "worlds/test.toml", &doc)
+        ggo_worldlib::world_file::write_world(root, "test.wrld.toml", &doc)
             .expect("worldlib writes the world fixture");
     }
 
     /// Write the fixture and open it the way a user does: the project
-    /// panel's click funnel offers `worlds/test.toml` to the fork's
+    /// panel's click funnel offers `test.wrld.toml` to the fork's
     /// interceptors, the world interceptor claims it, loads it into the
     /// dock panel and opens the center-pane canvas tab FOCUSED -- the tab
     /// shares the panel's focus handle, which is what puts the
@@ -1356,11 +1355,11 @@ mod tests {
     ) -> Entity<ggo_world_panel::WorldPanel> {
         write_world_fixture(root);
         assert!(
-            offer_open(workspace, cx, "worlds/test.toml"),
+            offer_open(workspace, cx, "test.wrld.toml"),
             "the world interceptor claimed the fixture"
         );
         cx.run_until_parked();
-        let panel = world_tab_panel(workspace, cx, "worlds/test.toml");
+        let panel = world_tab_panel(workspace, cx, "test.wrld.toml");
         panel.read_with(cx, |panel, _| {
             assert!(panel.test_is_ready(), "the world loaded");
             assert_eq!(panel.test_entity_count(), 1, "the fixture's one entity");
@@ -1435,7 +1434,7 @@ mod tests {
             assert!(!panel.test_is_dirty(), "ctrl-s cleared the dirty flag");
         });
 
-        let on_disk = ggo_worldlib::world_file::read_world(dir.path(), "worlds/test.toml")
+        let on_disk = ggo_worldlib::world_file::read_world(dir.path(), "test.wrld.toml")
             .expect("worldlib reopens what ctrl-s wrote");
         assert_eq!(on_disk.entities.len(), 1, "still one entity on disk");
         let pos = on_disk.entities[0]
@@ -1555,22 +1554,22 @@ mod tests {
         .expect("worldlib writes the fixture tileset");
     }
 
-    /// A world under `assets/worlds/`, with whatever `[[background]]`
-    /// slots the journey needs, written through worldlib's own
-    /// `write_world`.
+    /// A world under `assets/`, with whatever `[[background]]` slots the
+    /// journey needs, written through worldlib's own `write_world`.
     ///
     /// Under `assets/` on purpose, unlike [`write_world_fixture`]'s
     /// project-root world: the panel derives its ASSET ROOT by splitting
-    /// the clicked path at its `worlds/` segment, so this fixture's root
-    /// is `<project>/assets` and every path inside the documents
-    /// (`maps/...`, `art/mapfx.til`) is one segment shorter than its place
-    /// on disk. A world at the project root would make the two frames
-    /// identical and the asset-root-relative assertions below vacuous.
+    /// the clicked path after its last `assets` component, so this
+    /// fixture's root is `<project>/assets` and every path inside the
+    /// documents (`maps/...`, `art/mapfx.til`) is one segment shorter than
+    /// its place on disk. A world at the project root would make the two
+    /// frames identical and the asset-root-relative assertions below
+    /// vacuous.
     fn write_paint_world(root: &Path, stem: &str, backgrounds: Vec<world_file::Background>) {
         write_paint_tileset(root);
         world_file::write_world(
             root,
-            &format!("assets/worlds/{stem}.toml"),
+            &format!("assets/{stem}.wrld.toml"),
             &world_file::WorldFile {
                 entities: vec![],
                 instances: vec![],
@@ -1580,7 +1579,7 @@ mod tests {
         .expect("worldlib writes the world fixture");
     }
 
-    /// The paint round-trip's world: `assets/worlds/edit.toml`, its `bg0`
+    /// The paint round-trip's world: `assets/edit.wrld.toml`, its `bg0`
     /// slot linked to an 8x8 all-blank map at `assets/maps/edit.bg0.map`
     /// that is born BOUND to the fixture tileset.
     ///
@@ -1765,7 +1764,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, cx) = boot_all(cx, dir.path()).await;
         write_paint_fixture(dir.path());
-        let panel = open_world_tab(&workspace, cx, "assets/worlds/edit.toml").await;
+        let panel = open_world_tab(&workspace, cx, "assets/edit.wrld.toml").await;
 
         const MAP_REL: &str = "maps/edit.bg0.map";
         click_bg_slot(cx, "ggo-world-bg-paint-0-on");
@@ -1876,7 +1875,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, cx) = boot_all(cx, dir.path()).await;
         write_paint_fixture(dir.path());
-        let panel = open_world_tab(&workspace, cx, "assets/worlds/edit.toml").await;
+        let panel = open_world_tab(&workspace, cx, "assets/edit.wrld.toml").await;
 
         const MAP_REL: &str = "maps/edit.bg0.map";
         click_bg_slot(cx, "ggo-world-bg-paint-0-on");
@@ -2002,7 +2001,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (workspace, cx) = boot_all(cx, dir.path()).await;
         write_paint_world(dir.path(), "blank", vec![]);
-        let panel = open_world_tab(&workspace, cx, "assets/worlds/blank.toml").await;
+        let panel = open_world_tab(&workspace, cx, "assets/blank.wrld.toml").await;
         panel.read_with(cx, |panel, _| {
             assert!(
                 panel.test_backgrounds().is_empty(),
@@ -2075,7 +2074,7 @@ mod tests {
             );
         });
 
-        let world = world_file::read_world(&dir.path().join("assets"), "worlds/blank.toml")
+        let world = world_file::read_world(&dir.path().join("assets"), "blank.wrld.toml")
             .expect("worldlib reopens the saved world");
         assert_eq!(
             world.backgrounds,
@@ -2874,7 +2873,7 @@ mod tests {
         // that assertion would pass because nothing was ever watching.
         let _run = cx.new(|cx| {
             ggo_emu_panel::viewer_run::ViewerRun::new(
-                "assets/worlds/main.toml".to_string(),
+                "assets/main.wrld.toml".to_string(),
                 root.clone(),
                 runner,
                 endpoint.clone(),
@@ -3074,7 +3073,7 @@ mod tests {
     /// The live journey's world, and its background map -- the first
     /// worktree-relative (what a click carries), the second
     /// asset-root-relative (what the document and the sessions name).
-    const LIVE_WORLD_REL: &str = "assets/worlds/live.toml";
+    const LIVE_WORLD_REL: &str = "assets/live.wrld.toml";
     const LIVE_MAP_REL: &str = "maps/live.bg0.map";
 
     /// How long the panel's own Live boot may take once the cart is
