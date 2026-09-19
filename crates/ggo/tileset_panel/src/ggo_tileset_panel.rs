@@ -163,6 +163,26 @@ const DEFAULT_ZOOM: usize = 4;
 /// The tooling column's width.
 const TOOLS_COL_PX: f32 = 280.0;
 
+/// The narrowest the sheet region is allowed to get. The tooling column
+/// beside it is a fixed [`TOOLS_COL_PX`], so in a narrow dock the flex
+/// row would otherwise hand the canvas zero width; at this floor the row
+/// overflows and scrolls sideways instead of crushing the canvas.
+const MIN_SHEET_PX: Pixels = px(80.);
+
+/// The shortest the editor body is allowed to get. A wrapped toolbar in a
+/// short dock would otherwise squeeze the body to nothing; at this floor
+/// the root column overflows and scrolls instead.
+const MIN_BODY_PX: Pixels = px(120.);
+
+// `debug_selector` handles for the regions whose overflow behaviour the
+// layout tests assert. gpui records a selector's painted bounds only in
+// test builds (`div.rs:845-856` -- the release impl discards the closure
+// unevaluated), so these cost nothing shipped.
+const TOOLBAR_SELECTOR: &str = "ggo-tileset-toolbar";
+const TOOLING_SELECTOR: &str = "ggo-tileset-tooling";
+const INFO_SELECTOR: &str = "ggo-tileset-info";
+const BODY_SELECTOR: &str = "ggo-tileset-body";
+
 /// The edge "+" bars' thickness.
 const EDGE_BAR_PX: f32 = 18.0;
 
@@ -2615,7 +2635,7 @@ impl TilesetPanel {
         div()
             .id("ggo-tileset-sheet")
             .flex_1()
-            .min_w_0()
+            .min_w(MIN_SHEET_PX)
             .min_h_0()
             .overflow_scroll()
             .track_scroll(&open.scroll)
@@ -2893,6 +2913,7 @@ impl TilesetPanel {
             summary.push_str(note);
         }
         v_flex()
+            .debug_selector(|| INFO_SELECTOR.to_string())
             .gap_0p5()
             .p_1()
             .border_b_1()
@@ -2942,6 +2963,8 @@ impl TilesetPanel {
             }};
         }
         h_flex()
+            .debug_selector(|| TOOLBAR_SELECTOR.to_string())
+            .flex_wrap()
             .gap_1()
             .items_center()
             .p_1()
@@ -3242,8 +3265,14 @@ impl TilesetPanel {
         };
         let save_error = open.save_error.clone();
         v_flex()
+            .id(TOOLING_SELECTOR)
+            .debug_selector(|| TOOLING_SELECTOR.to_string())
             .w(px(TOOLS_COL_PX))
+            // Shrinking the column instead would eat into the sheet's
+            // own floor; the body row scrolls sideways instead.
+            .flex_shrink_0()
             .h_full()
+            .overflow_y_scroll()
             .border_l_1()
             .border_color(cx.theme().colors().border)
             .child(self.render_info(cx))
@@ -3272,6 +3301,7 @@ impl TilesetPanel {
         };
         Some(
             h_flex()
+                .flex_wrap()
                 .gap_1()
                 .px_1()
                 .items_center()
@@ -3310,13 +3340,18 @@ impl TilesetPanel {
 
     fn render_ready(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         v_flex()
+            .id("ggo-tileset-ready")
             .size_full()
+            .overflow_y_scroll()
             .child(self.render_toolbar(cx))
             .children(self.render_import_alert(cx))
             .child(
                 h_flex()
+                    .id(BODY_SELECTOR)
+                    .debug_selector(|| BODY_SELECTOR.to_string())
                     .flex_1()
-                    .min_h_0()
+                    .min_h(MIN_BODY_PX)
+                    .overflow_x_scroll()
                     .items_stretch()
                     .child(self.render_sheet(cx))
                     .child(self.render_tooling(cx)),
@@ -7115,5 +7150,182 @@ mod tests {
                 "nothing moved"
             );
         });
+    }
+    // ------------------------------------------------ layout / overflow
+
+    /// The fixture tileset opened in a REAL window, so the layout tests
+    /// below read bounds that a prepaint actually produced.
+    async fn ready_panel_in_window<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (Entity<TilesetPanel>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+            ggo_common::bind_default_keymap(cx);
+        });
+        write_tileset_fixture(root, "world");
+        let root = root.to_path_buf();
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = TilesetPanel::new(None, cx);
+            panel.root_override = Some(root);
+            panel
+        });
+        cx.update(|window, _| window.activate_window());
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("tiles/world.til", cx);
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// Resize the window and let the panel redraw at the new size.
+    fn resize(cx: &mut gpui::VisualTestContext, width: f32, height: f32) {
+        cx.simulate_resize(size(px(width), px(height)));
+        cx.run_until_parked();
+    }
+
+    fn wheel(cx: &mut gpui::VisualTestContext, at: Point<Pixels>, dx: f32, dy: f32) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// Class B: the toolbar is ~25 fixed-size controls. In a narrow dock a
+    /// single row pushed Save (and the whole right-hand group) off the
+    /// edge with no way to reach it; it must wrap onto more rows instead.
+    #[gpui::test]
+    async fn test_b_the_toolbar_wraps_when_the_panel_is_narrow(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        resize(cx, 1600., 700.);
+        let wide = cx
+            .debug_bounds(TOOLBAR_SELECTOR)
+            .expect("toolbar bounds recorded at paint");
+
+        resize(cx, 320., 700.);
+        let narrow = cx
+            .debug_bounds(TOOLBAR_SELECTOR)
+            .expect("toolbar bounds recorded at paint");
+
+        assert!(
+            narrow.size.height >= wide.size.height * 2.,
+            "a 320px-wide toolbar must wrap onto at least two rows: \
+             one row is {wide:?}, narrow is {narrow:?}"
+        );
+    }
+
+    /// Class A: the tooling column (file info plus the 16-swatch palette
+    /// editor and its three channel rows) is taller than a short dock
+    /// gives it, and had no scroller -- the channel steppers were simply
+    /// cut off. It scrolls vertically now.
+    ///
+    /// The assertion is RELATIVE to the column so that the root column's
+    /// own scrolling (class C, which the same wheel event also drives)
+    /// cannot make it pass on its own.
+    #[gpui::test]
+    async fn test_a_the_tooling_column_scrolls_vertically(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        resize(cx, 700., 150.);
+
+        let column = cx
+            .debug_bounds(TOOLING_SELECTOR)
+            .expect("tooling bounds recorded at paint");
+        let before = cx
+            .debug_bounds(INFO_SELECTOR)
+            .expect("info bounds recorded at paint");
+        let before_offset = before.origin.y - column.origin.y;
+
+        wheel(cx, column.origin + point(px(20.), px(20.)), 0., -80.);
+
+        let column = cx
+            .debug_bounds(TOOLING_SELECTOR)
+            .expect("tooling bounds after the scroll");
+        let after = cx
+            .debug_bounds(INFO_SELECTOR)
+            .expect("info bounds after the scroll");
+        assert!(
+            after.origin.y - column.origin.y < before_offset,
+            "a downward wheel must scroll the tooling column's own content: \
+             before {before_offset:?}, after {:?}",
+            after.origin.y - column.origin.y
+        );
+    }
+
+    /// Class C: a short dock must not squeeze the editor body to nothing.
+    /// The body keeps [`MIN_BODY_PX`] and the root column scrolls instead,
+    /// so the body stays reachable under a wrapped toolbar.
+    #[gpui::test]
+    async fn test_c_a_short_panel_keeps_the_body_and_scrolls_the_root(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        resize(cx, 320., 160.);
+
+        let before = cx
+            .debug_bounds(BODY_SELECTOR)
+            .expect("body bounds recorded at paint");
+        assert!(
+            before.size.height >= MIN_BODY_PX,
+            "the wrapped toolbar must not collapse the body: {before:?}"
+        );
+
+        let toolbar = cx
+            .debug_bounds(TOOLBAR_SELECTOR)
+            .expect("toolbar bounds recorded at paint");
+        wheel(cx, toolbar.center(), 0., -80.);
+
+        let after = cx
+            .debug_bounds(BODY_SELECTOR)
+            .expect("body bounds after the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "a downward wheel over the chrome must scroll the root column: \
+             before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// Class D: the 280px tooling column beside the sheet used to crush
+    /// the canvas to a sliver in a narrow dock. The sheet keeps
+    /// [`MIN_SHEET_PX`] and the body row scrolls sideways instead.
+    #[gpui::test]
+    async fn test_d_a_narrow_panel_scrolls_the_body_instead_of_crushing_the_sheet(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        resize(cx, 320., 700.);
+
+        let body = cx
+            .debug_bounds(BODY_SELECTOR)
+            .expect("body bounds recorded at paint");
+        let before = cx
+            .debug_bounds(TOOLING_SELECTOR)
+            .expect("tooling bounds recorded at paint");
+        assert!(
+            before.origin.x - body.origin.x >= MIN_SHEET_PX,
+            "the sheet must keep its floor beside the tooling column: \
+             body {body:?}, tooling {before:?}"
+        );
+
+        wheel(cx, body.origin + point(px(20.), px(20.)), -200., 0.);
+
+        let after = cx
+            .debug_bounds(TOOLING_SELECTOR)
+            .expect("tooling bounds after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the body row: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
     }
 }
