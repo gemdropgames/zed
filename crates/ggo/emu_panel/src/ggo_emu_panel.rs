@@ -159,6 +159,28 @@ const DEBUG_COLUMN_PX: f32 = 360.0;
 /// Palette grid swatch size.
 const DEBUG_SWATCH_PX: f32 = 12.0;
 
+/// The narrowest the screen region may get beside the debug column. That
+/// column is a fixed [`DEBUG_COLUMN_PX`], so in a narrow dock the flex row
+/// would otherwise hand the screen zero width; at this floor the row
+/// overflows and scrolls sideways instead of crushing the screen.
+const MIN_SCREEN_PX: Pixels = px(80.);
+
+/// The shortest the body row may get. A wrapped transport plus the stats,
+/// status and console rows would otherwise squeeze it to nothing; at this
+/// floor the root column overflows and scrolls instead.
+const MIN_BODY_PX: Pixels = px(120.);
+
+// `debug_selector` handles for the regions whose overflow behaviour the
+// layout tests assert. gpui records a selector's painted bounds only in
+// test builds (`div.rs` discards the closure unevaluated otherwise), so
+// these cost nothing shipped.
+const TRANSPORT_SELECTOR: &str = "ggo-emu-transport";
+const BODY_SELECTOR: &str = "ggo-emu-body";
+const SCREEN_SELECTOR: &str = "ggo-emu-screen";
+const SCREEN_MESSAGE_SELECTOR: &str = "ggo-emu-screen-message";
+const DEBUG_COLUMN_SELECTOR: &str = "ggo-emu-debug-column";
+const DEBUG_HOVER_SELECTOR: &str = "ggo-emu-debug-hover";
+
 pub fn init(cx: &mut App) {
     // Agent remote-control host (unix socket + on-disk advertisement) --
     // see `agent_remote`'s module doc.
@@ -1396,6 +1418,13 @@ impl EmuPanel {
         }
     }
 
+    /// Put a line in the console without a run -- what lets the setup
+    /// page's output pane be rendered in a test.
+    #[cfg(test)]
+    pub(crate) fn push_console_line(&mut self, line: &str) {
+        self.console.get_or_insert_with(UartLog::new).push_line(line);
+    }
+
     /// The console's lines, for the setup page's output pane.
     pub(crate) fn console_lines(&self) -> Vec<String> {
         self.console
@@ -2512,6 +2541,7 @@ impl EmuPanel {
 
     fn render_debug_column(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tabs = h_flex()
+            .flex_wrap()
             .gap_1()
             .p_1()
             .children(debug::DebugTab::ALL.into_iter().map(|tab| {
@@ -2544,6 +2574,7 @@ impl EmuPanel {
             },
         };
         v_flex()
+            .debug_selector(|| DEBUG_COLUMN_SELECTOR.to_string())
             .w(px(DEBUG_COLUMN_PX))
             .flex_none()
             .h_full()
@@ -2556,13 +2587,22 @@ impl EmuPanel {
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
-                    .child(body),
+                    .child(
+                        // The hover readout belongs INSIDE this scroller:
+                        // below it, at the bottom of a fixed-height
+                        // column, a short pane cut it off with nothing
+                        // left to scroll it back into view.
+                        v_flex().child(body).children(self.debug.hover.as_ref().map(
+                            |hover| {
+                                div().debug_selector(|| DEBUG_HOVER_SELECTOR.to_string()).child(
+                                    Label::new(hover.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            },
+                        )),
+                    ),
             )
-            .children(self.debug.hover.as_ref().map(|hover| {
-                Label::new(hover.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-            }))
             .into_any_element()
     }
 
@@ -2929,6 +2969,8 @@ impl EmuPanel {
         };
 
         h_flex()
+            .debug_selector(|| TRANSPORT_SELECTOR.to_string())
+            .flex_wrap()
             .gap_1()
             .p_1()
             .border_b_1()
@@ -3215,9 +3257,18 @@ impl EmuPanel {
         div()
             .size_full()
             .flex()
-            .justify_center()
-            .items_center()
-            .child(Label::new(message).color(Color::Muted))
+            .child(
+                // Auto margins, not `justify_center`/`items_center`: the
+                // body row scrolls sideways, and its range is
+                // `-overflow..=0`, so a centred child that starts at a
+                // negative offset can never be scrolled back to. Auto
+                // margins centre it while it fits and collapse once it
+                // does not.
+                div()
+                    .debug_selector(|| SCREEN_MESSAGE_SELECTOR.to_string())
+                    .m_auto()
+                    .child(Label::new(message).color(Color::Muted)),
+            )
             .bg(cx.theme().colors().panel_background)
             .into_any_element()
     }
@@ -3356,8 +3407,14 @@ impl Render for EmuPanel {
         self.debug_tick(cx);
 
         v_flex()
+            .id("ggo-emu-root")
             .key_context(KEY_CONTEXT)
             .size_full()
+            // The transport wraps and the stats / status / console rows
+            // stack under it; past a certain shortness that chrome no
+            // longer fits, and the pane scrolls rather than eating the
+            // screen's [`MIN_BODY_PX`] floor.
+            .overflow_y_scroll()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(|this, _: &Run, window, cx| this.run(window, cx)))
@@ -3388,12 +3445,16 @@ impl Render for EmuPanel {
             .child(self.render_transport(cx))
             .child(
                 h_flex()
+                    .id(BODY_SELECTOR)
+                    .debug_selector(|| BODY_SELECTOR.to_string())
                     .flex_1()
-                    .min_h_0()
+                    .min_h(MIN_BODY_PX)
+                    .overflow_x_scroll()
                     .child(
                         div()
+                            .debug_selector(|| SCREEN_SELECTOR.to_string())
                             .flex_1()
-                            .min_w_0()
+                            .min_w(MIN_SCREEN_PX)
                             .size_full()
                             .child(self.render_screen(cx)),
                     )
@@ -8969,6 +9030,194 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             1,
             "cancelling dropped the run future -- that is what kills the child"
+        );
+    }
+
+    // ------------------------------------------------ layout / overflow
+
+    /// Resize the window and let the panel redraw at the new size.
+    fn resize(cx: &mut gpui::VisualTestContext, width: f32, height: f32) {
+        cx.simulate_resize(size(px(width), px(height)));
+        cx.run_until_parked();
+    }
+
+    fn wheel(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>, dx: f32, dy: f32) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+    }
+
+    /// The debug column open over a decoded snapshot, which is what makes
+    /// its body taller than a short pane gives it.
+    fn debug_column_panel(
+        cx: &mut TestAppContext,
+    ) -> (Entity<EmuPanel>, &mut gpui::VisualTestContext) {
+        let (panel, cx) = windowed_panel(cx);
+        panel.update_in(cx, |panel, window, cx| panel.toggle_debug(window, cx));
+        let mut ppu = ggo_emu_core::ppu::Ppu::new();
+        ppu.set_layer(2, true, 1);
+        panel.update(cx, |panel, _cx| {
+            panel.debug_decode_now(Arc::new(ppu.snapshot()));
+        });
+        cx.run_until_parked();
+        (panel, cx)
+    }
+
+    /// Class A: the PPU hover readout -- "sprite pal 3 slot 9 = #1f2a3b"
+    /// and friends -- sat BELOW the debug body's scroller, so in a short
+    /// pane it was simply cut off with nothing left to scroll. It lives
+    /// inside that scroller now.
+    ///
+    /// The assertion is RELATIVE to the column, so the root's own
+    /// scrolling (class C, which the same wheel also drives) cannot make
+    /// it pass on its own.
+    #[gpui::test]
+    async fn test_a_the_debug_hover_readout_scrolls_into_reach(cx: &mut TestAppContext) {
+        let (panel, cx) = debug_column_panel(cx);
+        resize(cx, 900., 300.);
+        panel.update(cx, |panel, cx| {
+            panel.set_debug_hover(
+                "sprite pal 3 slot 9 = #1f2a3b (bank 1, tile 231)".to_string(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let column = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("debug column bounds recorded at paint");
+        let before = cx
+            .debug_bounds(DEBUG_HOVER_SELECTOR)
+            .expect("hover readout bounds recorded at paint");
+        let before_offset = before.origin.y - column.origin.y;
+
+        wheel(cx, column.origin + point(px(20.), px(40.)), 0., -120.);
+
+        let column = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("debug column bounds after the scroll");
+        let after = cx
+            .debug_bounds(DEBUG_HOVER_SELECTOR)
+            .expect("hover readout bounds after the scroll");
+        assert!(
+            after.origin.y - column.origin.y < before_offset,
+            "a downward wheel must scroll the hover readout with the debug \
+             body's own content: before {before_offset:?}, after {:?}",
+            after.origin.y - column.origin.y
+        );
+    }
+
+    /// Class B: the transport is a dozen fixed-size controls. In a narrow
+    /// pane a single row pushed the cart label and the frame readout past
+    /// the edge with no way to reach them; it must wrap instead.
+    #[gpui::test]
+    async fn test_b_the_transport_wraps_when_the_pane_is_narrow(cx: &mut TestAppContext) {
+        let (_panel, cx) = windowed_panel(cx);
+
+        resize(cx, 1600., 700.);
+        let wide = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds recorded at paint");
+
+        resize(cx, 320., 700.);
+        let narrow = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds recorded at paint");
+
+        assert!(
+            narrow.size.height >= wide.size.height * 2.,
+            "a 320px-wide transport must wrap onto at least two rows: \
+             one row is {wide:?}, narrow is {narrow:?}"
+        );
+    }
+
+    /// Class C: a short pane must not squeeze the screen to nothing. The
+    /// body keeps [`MIN_BODY_PX`] and the root column scrolls instead, so
+    /// the console and the status line under a wrapped transport stay
+    /// reachable.
+    #[gpui::test]
+    async fn test_c_a_short_pane_keeps_the_body_and_scrolls_the_root(cx: &mut TestAppContext) {
+        let (_panel, cx) = windowed_panel(cx);
+        resize(cx, 320., 160.);
+
+        let before = cx
+            .debug_bounds(BODY_SELECTOR)
+            .expect("body bounds recorded at paint");
+        assert!(
+            before.size.height >= MIN_BODY_PX,
+            "the wrapped transport must not collapse the body: {before:?}"
+        );
+
+        let transport = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds recorded at paint");
+        wheel(cx, transport.center(), 0., -80.);
+
+        let after = cx
+            .debug_bounds(BODY_SELECTOR)
+            .expect("body bounds after the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "a downward wheel over the chrome must scroll the root column: \
+             before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// Class D: the 360px debug column beside the screen used to crush it
+    /// to a sliver in a narrow pane. The screen keeps [`MIN_SCREEN_PX`]
+    /// and the body row scrolls sideways instead.
+    ///
+    /// Also the centring trap: the screen's message state centres its
+    /// child, and a centred child that overflows starts at a negative
+    /// offset the scroll range (`-overflow..=0`) can never reach. At rest
+    /// the message must therefore start at or inside the screen's origin.
+    #[gpui::test]
+    async fn test_d_a_narrow_pane_scrolls_the_body_instead_of_crushing_the_screen(
+        cx: &mut TestAppContext,
+    ) {
+        let (_panel, cx) = debug_column_panel(cx);
+        resize(cx, 320., 700.);
+
+        let body = cx
+            .debug_bounds(BODY_SELECTOR)
+            .expect("body bounds recorded at paint");
+        let screen = cx
+            .debug_bounds(SCREEN_SELECTOR)
+            .expect("screen bounds recorded at paint");
+        let before = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("debug column bounds recorded at paint");
+        assert!(
+            before.origin.x - body.origin.x >= MIN_SCREEN_PX,
+            "the screen must keep its floor beside the debug column: \
+             body {body:?}, column {before:?}"
+        );
+
+        let message = cx
+            .debug_bounds(SCREEN_MESSAGE_SELECTOR)
+            .expect("screen message bounds recorded at paint");
+        assert!(
+            message.origin.x >= screen.origin.x,
+            "a centred message that starts left of the region is \
+             unreachable by scrolling: screen {screen:?}, message {message:?}"
+        );
+
+        wheel(cx, body.origin + point(px(20.), px(20.)), -200., 0.);
+
+        let after = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("debug column bounds after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the body row: before {:?}, after {:?}",
+            before.origin,
+            after.origin
         );
     }
 }

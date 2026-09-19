@@ -20,6 +20,13 @@ use std::time::Duration;
 use crate::hardware::{FlashProgress, PhaseRow, PhaseState, Remedy, Requirement};
 use crate::{EmuPanel, open_emu_item};
 
+// `debug_selector` handles for the regions whose overflow behaviour the
+// layout test asserts. gpui records a selector's painted bounds only in
+// test builds, so these cost nothing shipped.
+const PAGE_SELECTOR: &str = "ggo-hardware-setup";
+const LOG_SELECTOR: &str = "ggo-hardware-log-box";
+const ACTIONS_SELECTOR: &str = "ggo-hardware-actions";
+
 pub enum HardwareItemEvent {
     UpdateTab,
 }
@@ -215,12 +222,21 @@ impl HardwareSetupItem {
                     .filter(|_| row.state == PhaseState::Running),
                 |el, detail| {
                     el.child(
-                        div().pl_6().child(
-                            Label::new(detail)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line(),
-                        ),
+                        // `single_line`, so the detail does not wrap and a
+                        // long one runs off the page. The page masks both
+                        // axes; this is where that overflow is reachable.
+                        h_flex()
+                            .id("ggo-hardware-phase-detail")
+                            .pl_6()
+                            .overflow_x_scroll()
+                            .child(
+                                div().flex_shrink_0().child(
+                                    Label::new(detail)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .single_line(),
+                                ),
+                            ),
                     )
                 },
             )
@@ -436,10 +452,14 @@ impl Render for HardwareSetupItem {
 
         v_flex()
             .id("ggo-hardware-setup")
+            .debug_selector(|| PAGE_SELECTOR.to_string())
             .size_full()
             .p_4()
             .gap_3()
-            .overflow_y_scroll()
+            // Both axes: the output tail below is `.single_line()`, and a
+            // y-only scroller masks only y, so a long install line paints
+            // off the page with no way to scroll back to it.
+            .overflow_scroll()
             .track_focus(&self.focus_handle)
             .bg(colors.editor_background)
             .child(
@@ -537,6 +557,8 @@ impl Render for HardwareSetupItem {
             )
             .child(
                 h_flex()
+                    .debug_selector(|| ACTIONS_SELECTOR.to_string())
+                    .flex_wrap()
                     .gap_2()
                     .items_center()
                     .when(!ready, |el| {
@@ -701,12 +723,35 @@ impl Render for HardwareSetupItem {
                         // Newest last, the way a terminal reads; the
                         // tail is what a running install is doing now.
                         .when(layout.log_open, |el| {
-                            el.children(log.iter().rev().take(200).rev().map(|line| {
-                                Label::new(line.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .single_line()
-                            }))
+                            el.child(
+                                // The lines are `single_line`, so they do
+                                // not wrap. gpui measures a scroller's
+                                // range from its DIRECT children only, and
+                                // a column stretches those to its own
+                                // width -- hence the row here, whose one
+                                // child sizes to the widest line and so
+                                // gives the range the tail needs.
+                                h_flex()
+                                    .id("ggo-hardware-log-lines")
+                                    .items_start()
+                                    .overflow_x_scroll()
+                                    .child(
+                                        v_flex()
+                                            .debug_selector(|| LOG_SELECTOR.to_string())
+                                            // Without this the row shrinks
+                                            // it back to the page width and
+                                            // there is nothing to scroll.
+                                            .flex_shrink_0()
+                                            .children(log.iter().rev().take(200).rev().map(
+                                                |line| {
+                                                    Label::new(line.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted)
+                                                        .single_line()
+                                                },
+                                            )),
+                                    ),
+                            )
                         }),
                 )
             })
@@ -1042,5 +1087,98 @@ mod tests {
                 "GGO Hardware"
             );
         });
+    }
+
+    /// Class A: the output tail is `.single_line()`, so one long
+    /// place-and-route or cargo line runs off the page's right edge. The
+    /// page was a y-only scroller, which masks only y -- the rest of the
+    /// line painted out of the tab and could not be scrolled back to.
+    #[gpui::test]
+    async fn test_a_the_output_tail_scrolls_sideways(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, workspace, panel, _worktree_id, cx) =
+            crate::tests::run_menu_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, _cx| {
+            panel.push_console_line(&format!("error: {}", "unbroken-token-".repeat(40)));
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_hardware_item(workspace, window, cx);
+        });
+        cx.run_until_parked();
+        let item = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<HardwareSetupItem>(cx)
+                .next()
+                .expect("the page")
+        });
+        item.update(cx, |item, cx| {
+            item.log_expanded = Some(true);
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(gpui::px(600.), gpui::px(700.)));
+        cx.run_until_parked();
+
+        let page = cx
+            .debug_bounds(PAGE_SELECTOR)
+            .expect("the setup page's bounds recorded at paint");
+        let before = cx
+            .debug_bounds(LOG_SELECTOR)
+            .expect("the output lines' bounds recorded at paint");
+        assert!(
+            before.size.width > page.size.width,
+            "the fixture line must be wider than the page: \
+             page {page:?}, lines {before:?}"
+        );
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: before.origin + gpui::point(gpui::px(20.), gpui::px(5.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(-200.), gpui::px(0.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::default(),
+        });
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds(LOG_SELECTOR)
+            .expect("the output box's bounds after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the page to the rest of the line: \
+             before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// Class B: the action row is up to five controls plus a status. In a
+    /// narrow tab a single row pushed Re-check and the status past the
+    /// edge with no way to reach them; it must wrap instead.
+    #[gpui::test]
+    async fn test_b_the_action_row_wraps_when_the_tab_is_narrow(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, workspace, _panel, _worktree_id, cx) =
+            crate::tests::run_menu_workspace(cx, dir.path()).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_hardware_item(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(700.)));
+        cx.run_until_parked();
+        let wide = cx
+            .debug_bounds(ACTIONS_SELECTOR)
+            .expect("the action row's bounds recorded at paint");
+
+        cx.simulate_resize(gpui::size(gpui::px(340.), gpui::px(700.)));
+        cx.run_until_parked();
+        let narrow = cx
+            .debug_bounds(ACTIONS_SELECTOR)
+            .expect("the action row's bounds recorded at paint");
+
+        assert!(
+            narrow.size.height >= wide.size.height * 2.,
+            "a narrow tab must wrap the action row onto at least two rows: \
+             one row is {wide:?}, narrow is {narrow:?}"
+        );
     }
 }
