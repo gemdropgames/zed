@@ -3,11 +3,14 @@
 //! schedules -- by running `emd` and reporting what it did.
 //!
 //! **Why the panel exists at this point in the migration.** The spec's
-//! rule is that forms live in the panel that owns the domain and the
+//! rule is that forms live with the panel that owns the domain and the
 //! context menu only routes to them, and the project panel's only prompt
 //! primitive (`window.prompt`) is button-choice: it cannot collect a name,
 //! let alone a module and a repeatable list of `name:kind` fields. So
-//! "New Component…" needs a real form, and a form needs a panel (F5.2/S3).
+//! "New Component…" needs a real form, and a form needs a panel to own it
+//! (F5.2/S3). The form itself is drawn in a workspace modal over the
+//! window ([`generate_modal`]) -- the panel still owns every piece of its
+//! state, but asking for a name no longer costs the user their dock.
 //! The directory menu offers New Component…/System…/Schedule…/Module… at
 //! the project root and `manifests/`, and the first three again inside
 //! `src/modules/<name>/` with that module prefilled.
@@ -47,6 +50,7 @@
 //! rather than delegating to `emd`. This module is the gpui glue.
 
 mod forms;
+mod generate_modal;
 mod lock;
 mod manifests;
 mod ops;
@@ -76,6 +80,7 @@ use ggo_worldlib::emerald::{
 };
 
 use forms::{ASSET_KIND, FIELD_KINDS, FieldDraft, GenDraft, GenKind};
+pub use generate_modal::GenerateModal;
 use lock::{BinProbe, EMD_LOCK_POLL_INTERVAL, LockCheck, LockProbe};
 use manifests::{ASSETS_DIR, Manifests};
 use ops::ManifestOp;
@@ -146,9 +151,11 @@ const BROWSER_MIN_HEIGHT: Pixels = px(120.);
 /// takes the whole pane and the browser is left with its floor.
 const RUN_STATE_MAX_HEIGHT: Pixels = px(240.);
 
-/// Empty-state text -- shown when there is nothing to list and no form
-/// open, i.e. an unmanaged project (or one whose manifests are still
+/// Empty-state text -- shown when there is nothing to list and no run to
+/// report, i.e. an unmanaged project (or one whose manifests are still
 /// empty), where work can only arrive by right-clicking a directory.
+/// (An open generate form is not part of that test: it is drawn in a
+/// modal over the window, never here.)
 const EMPTY_MESSAGE: &str = "Right-click a project directory → New Component…/New Module…, a module directory → New Component… in it, or an assets directory → New World…";
 
 pub fn init(cx: &mut App) {
@@ -511,22 +518,34 @@ use ggo_common::inline_project_path;
 /// [`contribute_emerald_menu`] so a test can invoke exactly what the menu
 /// invokes -- `ContextMenuEntry` keeps its handler private, so a
 /// contributed entry cannot be fired from a test any other way.
+///
+/// **Deliberately NOT [`ggo_common::panel_entry_handler`]**, which the
+/// sibling entries still use: that helper focuses and reveals the panel's
+/// dock, which was the right thing when the form was drawn there and is
+/// now pure collateral damage -- the form opens as a modal over the
+/// window ([`GenerateModal`]), so revealing the emerald dock would only
+/// evict whatever panel the user had in front. Everything else about the
+/// shape is the same: the entry runs after the project panel's lease is
+/// released, so reaching the panel directly here is legal.
 fn new_item_handler(
     workspace: WeakEntity<Workspace>,
     kind: GenKind,
     dir_rel: String,
     module: Option<String>,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    ggo_common::panel_entry_handler(
-        workspace,
-        move |panel: &Entity<EmeraldPanel>, window, cx| {
-            let dir_rel = dir_rel.clone();
-            let module = module.clone();
-            panel.update(cx, |panel, cx| {
-                panel.new_item(kind, &dir_rel, module, window, cx)
-            });
-        },
-    )
+    move |window, cx| {
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+        let Some(panel) = workspace.read(cx).panel::<EmeraldPanel>(cx) else {
+            return;
+        };
+        let dir_rel = dir_rel.clone();
+        let module = module.clone();
+        panel.update(cx, |panel, cx| {
+            panel.new_item(kind, &dir_rel, module, window, cx)
+        });
+    }
 }
 
 /// The "New World…" entry's handler: seed the project panel's inline
@@ -781,6 +800,15 @@ struct GenerateForm {
 
 enum PanelForm {
     Generate(GenerateForm),
+}
+
+/// What the panel tells whoever is HOSTING its form.
+///
+/// The form is panel state but it is drawn by [`GenerateModal`], which
+/// has no other way to learn that the form it is drawing has gone --
+/// cancelled, or consumed by a run that succeeded.
+pub enum EmeraldPanelEvent {
+    FormClosed,
 }
 
 /// What the panel is showing about the most recent `emd` run.
@@ -1116,8 +1144,9 @@ impl EmeraldPanel {
     // ------------------------------------------------------------- forms
 
     /// Open the generate form for `kind`, aimed at the emerald project
-    /// that owns the worktree-relative directory `dir_rel`. The body of
-    /// the "New Component…"/"New System…"/"New Schedule…"/"New Module…"/
+    /// that owns the worktree-relative directory `dir_rel`, and put
+    /// [`GenerateModal`] over the window to draw it. The body of the
+    /// "New Component…"/"New System…"/"New Schedule…"/"New Module…"/
     /// "New World…" entries. `module` prefills the form's module editor --
     /// `Some` when the click landed inside `src/modules/<name>/`
     /// ([`module_under`]), so the run is scoped the way the clicked
@@ -1167,6 +1196,35 @@ impl EmeraldPanel {
         }));
         self.run_state = RunState::Idle;
         cx.notify();
+        self.show_form_modal(window, cx);
+    }
+
+    /// Put [`GenerateModal`] over the window for the form just opened.
+    ///
+    /// **Deferred, and it has to be.** This runs inside the panel's own
+    /// update, and the modal layer READS the modal the instant it is
+    /// shown (for the focus handle to focus), which reads this panel --
+    /// a read of an entity that is still leased, i.e. the same panic the
+    /// fork's other deferrals exist to avoid. `window.defer`, not
+    /// `cx.defer_in`: the latter re-takes this entity's update for its
+    /// callback, which is the identical panic one frame later.
+    fn show_form_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        let panel = cx.entity();
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                // `toggle_modal` would CLOSE an open card rather than
+                // reopen it, taking the form that was just set with it
+                // (its dismissal cancels the form). A second right-click
+                // just refreshes the one already up.
+                if workspace.active_modal::<GenerateModal>(cx).is_some() {
+                    return;
+                }
+                workspace.toggle_modal(window, cx, |_, cx| GenerateModal::new(panel, cx));
+            });
+        });
     }
 
     /// Run `emd generate world` for an inline-named commit -- no form.
@@ -1190,7 +1248,7 @@ impl EmeraldPanel {
         self.refresh_root(cx);
         self.emerald_dir = Some(project_dir.clone());
         self.refresh_manifests(cx);
-        self.form = None;
+        self.cancel_form(cx);
         self.start_run(
             project_dir,
             forms::build_generate_world_args(name, dir),
@@ -1236,9 +1294,30 @@ impl EmeraldPanel {
         cx.notify();
     }
 
+    /// The ONE form exit: cancelling, and every other path that drops the
+    /// open form (a generate that landed, a form-less world run taking
+    /// over). Everything that clears `self.form` goes through here so
+    /// that [`EmeraldPanelEvent::FormClosed`] cannot be missed.
+    ///
+    /// **A no-op when nothing is open, deliberately.** Closing is a loop:
+    /// the modal's `on_before_dismiss` cancels the form, cancelling emits
+    /// `FormClosed`, and `FormClosed` dismisses the modal again. The
+    /// guard is what makes the second lap do nothing.
     fn cancel_form(&mut self, cx: &mut Context<Self>) {
+        if self.form.is_none() {
+            return;
+        }
         self.form = None;
+        cx.emit(EmeraldPanelEvent::FormClosed);
         cx.notify();
+    }
+
+    /// The open form's kind, for the modal's headline.
+    fn form_kind(&self) -> Option<GenKind> {
+        match &self.form {
+            Some(PanelForm::Generate(form)) => Some(form.kind),
+            None => None,
+        }
     }
 
     /// Switch the open generate form to another kind, keeping whatever is
@@ -1869,7 +1948,7 @@ impl EmeraldPanel {
         }
         match pending {
             PendingRun::Generate { kind, name } => {
-                self.form = None;
+                self.cancel_form(cx);
                 self.run_state = RunState::Done {
                     message: format!("Created {} {name}", kind.noun().to_lowercase()),
                     transcript: outcome.output,
@@ -2698,17 +2777,17 @@ impl EmeraldPanel {
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let banner = self.render_lock_banner();
-        let form = match &self.form {
-            Some(PanelForm::Generate(_)) => Some(self.render_generate_form(window, cx)),
-            None => None,
-        };
         let browser = self.render_browser(window, cx);
-        let run_state = self.render_run_state();
+        // An open form draws the run it started inside its own modal, so
+        // the dock stays out of it -- two copies of the same transcript
+        // in two places is worse than one, and the copy behind the modal
+        // is the one nobody can read.
+        let run_state = self.form.is_none().then(|| self.render_run_state()).flatten();
         // The banner is deliberately NOT part of this emptiness test: an
         // unmanaged project still needs the "right-click a directory" text,
         // and a lock banner is never a substitute for it -- they answer
         // different questions and both can be true at once.
-        if form.is_none() && browser.is_none() && run_state.is_none() {
+        if browser.is_none() && run_state.is_none() {
             return v_flex()
                 .size_full()
                 .children(banner)
@@ -2721,7 +2800,6 @@ impl EmeraldPanel {
             .size_full()
             .overflow_y_scroll()
             .children(banner)
-            .children(form)
             .children(browser)
             .children(run_state)
             .into_any_element()
@@ -2764,6 +2842,8 @@ impl Focusable for EmeraldPanel {
 }
 
 impl EventEmitter<PanelEvent> for EmeraldPanel {}
+
+impl EventEmitter<EmeraldPanelEvent> for EmeraldPanel {}
 
 impl Panel for EmeraldPanel {
     fn persistent_name() -> &'static str {
@@ -3323,15 +3403,10 @@ mod tests {
     #[gpui::test]
     async fn test_a_failing_run_keeps_the_form_open_with_emds_message(cx: &mut TestAppContext) {
         let dir = emerald_project();
-        let cx = empty_window(cx);
         let (runner, calls) = fake_runner(|_| err_outcome("file already exists: hero_unit.rs"));
-        let panel = lone_panel(cx, dir.path(), runner);
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
 
-        cx.update(|window, cx| {
-            panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", None, window, cx)
-            })
-        });
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
         let (name, _) = generate_form(&panel, cx);
         type_into(&name, "hero_unit", cx);
         cx.update(|window, cx| panel.update(cx, |panel, cx| panel.submit(window, cx)));
@@ -3345,6 +3420,19 @@ mod tests {
         assert!(
             panel.read_with(cx, |panel, _| panel.form.is_some()),
             "a failed run keeps the form"
+        );
+        assert!(
+            open_modal(&workspace, cx).is_some(),
+            "and the modal it is typed into"
+        );
+        let card = cx.debug_bounds("ggo-emerald-modal").expect("the modal card");
+        let message = cx
+            .debug_bounds("ggo-emerald-run-state")
+            .expect("emd's message");
+        assert!(
+            card.contains(&message.origin),
+            "the failure must be readable in the card, not behind it in a dock: \
+             {message:?} in {card:?}"
         );
     }
 
@@ -4841,56 +4929,6 @@ mod tests {
         });
     }
 
-    /// The menu handler must REVEAL the panel: a form opened in a dock
-    /// that is closed, or showing another panel, is invisible -- the
-    /// user-visible symptom is "the menu entry does nothing". (The right
-    /// dock starts open here because the fork docks the project panel on
-    /// the right and it `starts_open`, so the reveal shows as EmeraldPanel
-    /// becoming the dock's ACTIVE panel.)
-    #[gpui::test]
-    async fn test_the_menu_handlers_reveal_the_panel(cx: &mut TestAppContext) {
-        let dir = emerald_project();
-        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
-
-        workspace.read_with(cx, |workspace, cx| {
-            let dock = workspace.right_dock().read(cx);
-            assert!(
-                dock.active_panel()
-                    .is_none_or(|active| active.panel_id() != panel.entity_id()),
-                "the emerald panel does not start active"
-            );
-        });
-
-        let handler = new_item_handler(
-            workspace.downgrade(),
-            GenKind::Component,
-            "manifests".to_string(),
-            None,
-        );
-        cx.update(|window, cx| handler(window, cx));
-        cx.run_until_parked();
-
-        workspace.update_in(cx, |workspace, window, cx| {
-            let dock = workspace.right_dock().read(cx);
-            assert!(dock.is_open(), "the dock is open");
-            assert_eq!(
-                dock.active_panel().map(|active| active.panel_id()),
-                Some(panel.entity_id()),
-                "the handler must bring the emerald panel forward"
-            );
-            assert!(
-                panel.read(cx).focus_handle.contains_focused(window, cx),
-                "and focus the panel"
-            );
-        });
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                matches!(panel.form, Some(PanelForm::Generate(_))),
-                "the form still opens"
-            );
-        });
-    }
-
     // -------------------------------------------------------- new tileset
 
     /// `create_tileset_inline` writes a real blank pair, asset-root
@@ -5750,21 +5788,203 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// `cancel_form` drops the open form -- typed text and all -- and
-    /// spawns nothing: cancelling is the one form exit that must never
-    /// reach the runner.
+    // -------------------------------- the form's modal, as the user sees it
+
+    /// [`emerald_workspace`] with the panel's `emd` seam faked, the
+    /// default keymap bound and the window activated -- the harness every
+    /// form test needs now that the form renders in the workspace's modal
+    /// layer rather than in the dock. (The keymap is what turns Enter in
+    /// the name editor into `ggo_emerald::Submit` and Escape into the
+    /// `editor::Cancel` the modal dismisses on.)
+    async fn modal_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+    ) -> (
+        Entity<Workspace>,
+        Entity<EmeraldPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let (workspace, panel, _worktree_id, cx) = emerald_workspace(cx, root).await;
+        panel.update(cx, |panel, _| panel.runner = runner);
+        cx.update(|_, cx| ggo_common::bind_default_keymap(cx));
+        cx.update(|window, _| window.activate_window());
+        (workspace, panel, cx)
+    }
+
+    /// Fire the context menu's "New {kind}…" entry for `dir_rel` -- the
+    /// only way a form is opened in production.
+    fn new_via_menu(
+        workspace: &Entity<Workspace>,
+        kind: GenKind,
+        dir_rel: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let handler = new_item_handler(workspace.downgrade(), kind, dir_rel.to_string(), None);
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+    }
+
+    fn open_modal(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<Entity<GenerateModal>> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<GenerateModal>(cx)
+        })
+    }
+
+    /// The right dock's state, as the "opening a form leaves the dock
+    /// alone" assertion reads it.
+    fn dock_state(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (bool, Option<gpui::EntityId>) {
+        workspace.read_with(cx, |workspace, cx| {
+            let dock = workspace.right_dock().read(cx);
+            (
+                dock.is_open(),
+                dock.active_panel().map(|active| active.panel_id()),
+            )
+        })
+    }
+
+    /// A menu entry opens the form as a modal over the window, with the
+    /// name editor already focused -- and does NOT touch the dock.
+    /// Revealing the emerald panel used to be part of the entry's job;
+    /// it stole the active-panel slot and the focus from whatever the
+    /// user was looking at to ask for a name.
+    #[gpui::test]
+    async fn test_new_item_opens_a_centered_modal_with_the_name_focused(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
+        let before = dock_state(&workspace, cx);
+
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
+
+        assert!(
+            open_modal(&workspace, cx).is_some(),
+            "the menu entry must open the generate modal"
+        );
+        let (name, _module) = generate_form(&panel, cx);
+        assert!(
+            cx.update(|window, cx| name.read(cx).focus_handle(cx).is_focused(window)),
+            "the modal opens with the name editor focused, ready to type into"
+        );
+
+        let card = cx.debug_bounds("ggo-emerald-modal").expect("the modal card");
+        let buttons = cx
+            .debug_bounds("ggo-emerald-form-buttons")
+            .expect("the form's Create/Cancel row");
+        assert!(
+            card.contains(&buttons.origin) && card.contains(&buttons.bottom_right()),
+            "the form's buttons must resolve inside the card: {buttons:?} in {card:?}"
+        );
+
+        assert_eq!(
+            dock_state(&workspace, cx),
+            before,
+            "opening a form must leave the dock exactly as it was"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "opening a form spawns nothing"
+        );
+    }
+
+    /// The whole happy path through the real widgets: type a name into
+    /// the focused editor, press Enter, and the run goes out with
+    /// worldlib's argv while the modal -- and the form behind it -- go
+    /// away.
+    #[gpui::test]
+    async fn test_typing_then_enter_creates_and_dismisses(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/hero_unit.rs"));
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
+
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
+        cx.simulate_input("hero_unit");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one spawn");
+        let mut expected = build_generate_component_args("hero_unit", "", &[]);
+        expected.push("--json".to_string());
+        assert_eq!(recorded[0].args, expected);
+        assert_eq!(recorded[0].cwd, dir.path());
+        drop(recorded);
+
+        assert!(
+            open_modal(&workspace, cx).is_none(),
+            "a successful run must dismiss the modal"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.form.is_none(), "and close the form behind it");
+        });
+    }
+
+    /// A form taller than the window keeps its card on screen and
+    /// scrolls: twenty field rows used to push Create and Cancel below
+    /// the bottom edge with nothing between them and the window root
+    /// that scrolled.
+    #[gpui::test]
+    async fn test_a_tall_card_stays_in_the_window_and_scrolls(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
+        resize(cx, 600., 400.);
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
+        panel.update_in(cx, |panel, window, cx| {
+            for _ in 0..20 {
+                panel.add_field(window, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        let card = cx.debug_bounds("ggo-emerald-modal").expect("the modal card");
+        assert!(
+            card.origin.y >= px(0.) && card.bottom_right().y <= px(400.),
+            "twenty field rows must not push the card off a 400px window: {card:?}"
+        );
+        let before = cx
+            .debug_bounds("ggo-emerald-form-buttons")
+            .expect("the form's Create/Cancel row");
+        assert!(
+            before.origin.y > card.bottom_right().y,
+            "the rows must actually overflow the card for this to test anything: \
+             buttons {before:?} in {card:?}"
+        );
+
+        wheel(cx, card.center(), 0., -200.);
+
+        let after = cx
+            .debug_bounds("ggo-emerald-form-buttons")
+            .expect("the form's buttons survive the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "a downward wheel over the card must bring the buttons up into it: \
+             before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "scrolling a form must never spawn emd"
+        );
+    }
+
+    /// `cancel_form` drops the open form -- typed text and all -- takes
+    /// the modal with it, and spawns nothing: cancelling is the one form
+    /// exit that must never reach the runner.
     #[gpui::test]
     async fn test_cancel_form_closes_the_form_and_spawns_nothing(cx: &mut TestAppContext) {
         let dir = emerald_project();
-        let cx = empty_window(cx);
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
-        let panel = lone_panel(cx, dir.path(), runner);
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
 
-        cx.update(|window, cx| {
-            panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", None, window, cx)
-            })
-        });
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
         let (name, _module) = generate_form(&panel, cx);
         type_into(&name, "hero_unit", cx);
 
@@ -5779,39 +5999,61 @@ mod tests {
             );
         });
         assert!(
+            open_modal(&workspace, cx).is_none(),
+            "the panel closing its form must dismiss the modal drawing it"
+        );
+        assert!(
             calls.lock().unwrap().is_empty(),
             "a cancelled form must never reach the runner"
         );
     }
 
-    /// The same exit through the RENDERED Cancel button: the click lands
-    /// on the real element, routes through the button's `on_click`, and
-    /// ends in the same place -- form gone, nothing spawned.
+    /// The two exits the user actually has -- the rendered Cancel button
+    /// and Escape -- both end in the same place: modal gone, form gone,
+    /// nothing spawned. Escape matters on its own because it is handled
+    /// by the modal layer rather than by the form, so it is the path that
+    /// can leave the panel believing a form is still open.
     #[gpui::test]
     async fn test_the_rendered_cancel_button_closes_the_form_and_spawns_nothing(
         cx: &mut TestAppContext,
     ) {
         let dir = emerald_project();
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
-        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
 
-        panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", None, window, cx)
-        });
-        cx.run_until_parked();
-
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
         click(cx, "ggo-emerald-cancel");
 
         panel.read_with(cx, |panel, _| {
             assert!(panel.form.is_none(), "the Cancel click must close the form");
         });
         assert!(
+            open_modal(&workspace, cx).is_none(),
+            "and dismiss the modal with it"
+        );
+        assert!(
             cx.debug_bounds("ggo-emerald-cancel").is_none(),
             "the closed form's buttons must leave the screen"
         );
+
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
+        assert!(open_modal(&workspace, cx).is_some(), "reopened");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        assert!(
+            open_modal(&workspace, cx).is_none(),
+            "escape must dismiss the modal"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.form.is_none(),
+                "and the dismissal must clear the panel's form, not just the card"
+            );
+        });
         assert!(
             calls.lock().unwrap().is_empty(),
-            "cancelling by click must never reach the runner"
+            "cancelling must never reach the runner"
         );
     }
 
@@ -5823,12 +6065,10 @@ mod tests {
     async fn test_select_kind_switches_the_draft_kind_and_its_field_rows(cx: &mut TestAppContext) {
         let dir = emerald_project();
         let (runner, _calls) = fake_runner(|_| ok_outcome("/x/never"));
-        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
 
-        panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", None, window, cx);
-            panel.add_field(window, cx);
-        });
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
+        panel.update_in(cx, |panel, window, cx| panel.add_field(window, cx));
         cx.run_until_parked();
         let field_name = panel.read_with(cx, |panel, _| match &panel.form {
             Some(PanelForm::Generate(form)) => form.fields[0].name.clone(),
@@ -5928,12 +6168,10 @@ mod tests {
     async fn test_the_rendered_field_trash_button_removes_its_row(cx: &mut TestAppContext) {
         let dir = emerald_project();
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
-        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
 
-        panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", None, window, cx);
-            panel.add_field(window, cx);
-        });
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
+        panel.update_in(cx, |panel, window, cx| panel.add_field(window, cx));
         cx.run_until_parked();
 
         click(cx, "ICON-Trash");
@@ -6006,12 +6244,9 @@ mod tests {
     async fn test_the_rendered_add_field_button_appends_a_row(cx: &mut TestAppContext) {
         let dir = emerald_project();
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
-        let (panel, cx) = rendered_panel(cx, dir.path(), runner);
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
 
-        panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", None, window, cx)
-        });
-        cx.run_until_parked();
+        new_via_menu(&workspace, GenKind::Component, "manifests", cx);
         panel.read_with(cx, |panel, cx| {
             assert!(
                 panel.draft(cx).expect("form open").fields.is_empty(),
@@ -6066,131 +6301,6 @@ mod tests {
             touch_phase: gpui::TouchPhase::default(),
         });
         cx.run_until_parked();
-    }
-
-    /// [`emerald_project`] with `count` components in the shared module --
-    /// a manifest taller than any short pane.
-    fn crowded_project(count: usize) -> tempfile::TempDir {
-        let dir = emerald_project();
-        let mut manifest = String::from("version = 1\n");
-        for ix in 0..count {
-            manifest.push_str(&format!("[[component]]\nname = \"Comp{ix:02}\"\n"));
-        }
-        std::fs::write(dir.path().join("manifests/components.toml"), manifest).unwrap();
-        dir
-    }
-
-    /// Open a generate form with `fields` field rows.
-    fn form_with_fields(
-        panel: &Entity<EmeraldPanel>,
-        fields: usize,
-        cx: &mut gpui::VisualTestContext,
-    ) {
-        panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, manifests::MANIFESTS_DIR, None, window, cx);
-            for _ in 0..fields {
-                panel.add_field(window, cx);
-            }
-        });
-        cx.run_until_parked();
-    }
-
-    /// Overflow class C: a form with twenty field rows is taller than a
-    /// short pane, and nothing between it and the panel root used to
-    /// scroll -- Create and Cancel simply sat below the bottom edge with
-    /// no way to reach them. The body scrolls now.
-    #[gpui::test]
-    async fn test_c_a_short_pane_scrolls_down_to_the_form_buttons(cx: &mut TestAppContext) {
-        let dir = emerald_project();
-        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
-        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
-        form_with_fields(&panel, 20, cx);
-        resize(cx, 320., 300.);
-
-        let pane = cx.debug_bounds("ggo-emerald-body").expect("the panel body");
-        let before = cx
-            .debug_bounds("ggo-emerald-form-buttons")
-            .expect("the form's Create/Cancel row");
-        assert!(
-            before.origin.y > pane.origin.y + pane.size.height,
-            "twenty field rows must push the buttons past a 300px pane for this to test \
-             anything: buttons {before:?} in {pane:?}"
-        );
-
-        wheel(cx, pane.center(), 0., -200.);
-
-        let after = cx
-            .debug_bounds("ggo-emerald-form-buttons")
-            .expect("the form's buttons survive the scroll");
-        assert!(
-            after.origin.y < before.origin.y,
-            "wheeling down a short pane must bring the form's buttons up into it: \
-             before {:?}, after {:?}",
-            before.origin,
-            after.origin
-        );
-        assert!(
-            calls.lock().unwrap().is_empty(),
-            "scrolling a form must never spawn emd"
-        );
-    }
-
-    /// The browser is the flexible half of that column: with a form open
-    /// above it in a short pane it used to shrink away to nothing (a
-    /// scroll container's automatic minimum is zero). It keeps
-    /// [`BROWSER_MIN_HEIGHT`], stays inside the pane, and scrolls its own
-    /// rows once the body has been scrolled down to it.
-    #[gpui::test]
-    async fn test_c_the_browser_keeps_its_floor_under_an_open_form(cx: &mut TestAppContext) {
-        let dir = crowded_project(40);
-        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
-        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
-        form_with_fields(&panel, 6, cx);
-        resize(cx, 320., 300.);
-
-        let pane = cx.debug_bounds("ggo-emerald-body").expect("the panel body");
-        let browser = cx
-            .debug_bounds("ggo-emerald-browser")
-            .expect("the manifest browser");
-        assert!(
-            browser.size.height >= BROWSER_MIN_HEIGHT,
-            "an open form must not squeeze the browser below its floor: {browser:?}"
-        );
-        assert!(
-            browser.size.height <= pane.size.height,
-            "the browser must be bounded by the pane, not by its forty rows: \
-             {browser:?} in {pane:?}"
-        );
-
-        // Bring the browser fully into view before wheeling over it, so
-        // the wheel lands on the browser rather than on the form above it.
-        wheel(cx, pane.center(), 0., -400.);
-        let browser = cx
-            .debug_bounds("ggo-emerald-browser")
-            .expect("the browser after the body scrolled");
-        let tabs = cx
-            .debug_bounds("ggo-emerald-tabs")
-            .expect("the tab row is the browser's first child");
-        let before_offset = tabs.origin.y - browser.origin.y;
-
-        wheel(cx, browser.center(), 0., -120.);
-
-        let browser = cx
-            .debug_bounds("ggo-emerald-browser")
-            .expect("the browser survives the scroll");
-        let tabs = cx
-            .debug_bounds("ggo-emerald-tabs")
-            .expect("the tab row survives the scroll");
-        assert!(
-            tabs.origin.y - browser.origin.y < before_offset,
-            "a downward wheel must scroll the browser's own rows: before {before_offset:?}, \
-             after {:?}",
-            tabs.origin.y - browser.origin.y
-        );
-        assert!(
-            calls.lock().unwrap().is_empty(),
-            "browsing must never spawn emd"
-        );
     }
 
     /// Overflow class B: the three tab buttons are wider than a narrow
