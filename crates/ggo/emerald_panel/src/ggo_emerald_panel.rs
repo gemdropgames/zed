@@ -943,6 +943,9 @@ enum RunState {
     },
     Done {
         message: String,
+        /// Lines from the run's trailer worth reading without the
+        /// transcript (`ops::rm_details`); empty for most ops.
+        details: Vec<String>,
         transcript: String,
     },
     Failed {
@@ -1408,6 +1411,7 @@ impl EmeraldPanel {
         self.run_state = match result {
             Ok(rel) => RunState::Done {
                 message: format!("Created tileset {rel}"),
+                details: Vec::new(),
                 transcript: String::new(),
             },
             Err(message) => RunState::Failed {
@@ -2075,6 +2079,7 @@ impl EmeraldPanel {
                 self.cancel_form(cx);
                 self.run_state = RunState::Done {
                     message: format!("Created {} {name}", kind.noun().to_lowercase()),
+                    details: Vec::new(),
                     transcript: outcome.output,
                 };
                 self.refresh_manifests(cx);
@@ -2083,6 +2088,11 @@ impl EmeraldPanel {
             PendingRun::Manifest(op) => {
                 self.run_state = RunState::Done {
                     message: op.done_message(),
+                    details: outcome
+                        .result
+                        .as_ref()
+                        .map(|trailer| ops::rm_details(&op, trailer))
+                        .unwrap_or_default(),
                     transcript: outcome.output,
                 };
                 if matches!(op, ManifestOp::Remove { .. }) {
@@ -2397,12 +2407,17 @@ impl EmeraldPanel {
     /// the change was rolled back, nothing is half-applied, and what
     /// follows is the compiler's complaint, not `emd`'s.
     fn render_run_state(&self) -> Option<gpui::AnyElement> {
+        let details: &[String] = match &self.run_state {
+            RunState::Done { details, .. } => details,
+            _ => &[],
+        };
         let (message, color, transcript) = match &self.run_state {
             RunState::Idle => return None,
             RunState::Running { command } => (format!("Running {command}…"), Color::Muted, ""),
             RunState::Done {
                 message,
                 transcript,
+                ..
             } => (message.clone(), Color::Success, transcript.as_str()),
             RunState::Failed {
                 message,
@@ -2431,6 +2446,15 @@ impl EmeraldPanel {
                         .size(LabelSize::Small)
                         .color(color),
                 )
+                .children(details.iter().enumerate().map(|(ix, line)| {
+                    div()
+                        .debug_selector(move || format!("ggo-emerald-run-detail-{ix}"))
+                        .child(
+                            Label::new(line.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                }))
                 .children((!transcript.is_empty()).then(|| {
                     ggo_common::CopyableText::new(
                         "ggo-emerald-run-transcript-copy",
@@ -4758,6 +4782,7 @@ mod tests {
     ) -> (
         Entity<Project>,
         WorktreeId,
+        Entity<EmeraldPanel>,
         &'a mut gpui::VisualTestContext,
     ) {
         cx.update(|cx| {
@@ -4810,7 +4835,7 @@ mod tests {
             panel.runner = runner;
         });
         cx.run_until_parked();
-        (project, worktree_id, cx)
+        (project, worktree_id, panel, cx)
     }
 
     /// Select `rel` in the project panel and fire the stock delete action
@@ -4880,7 +4905,7 @@ mod tests {
     async fn test_deleting_a_component_file_runs_emd_rm(cx: &mut TestAppContext) {
         let dir = pathed_project();
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
-        let (project, worktree_id, cx) = delete_workspace(cx, dir.path(), runner).await;
+        let (project, worktree_id, _panel, cx) = delete_workspace(cx, dir.path(), runner).await;
 
         delete_from_project_panel(
             &project,
@@ -4930,7 +4955,7 @@ mod tests {
     async fn test_deleting_a_module_directory_runs_emd_rm_module(cx: &mut TestAppContext) {
         let dir = pathed_project();
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
-        let (project, worktree_id, cx) = delete_workspace(cx, dir.path(), runner).await;
+        let (project, worktree_id, _panel, cx) = delete_workspace(cx, dir.path(), runner).await;
 
         delete_from_project_panel(
             &project,
@@ -4961,13 +4986,76 @@ mod tests {
         assert_eq!(calls[0].cwd, dir.path());
     }
 
+    /// The `emd rm module` trailer's fields show under the done message.
+    #[gpui::test]
+    async fn test_a_module_removal_surfaces_the_trailer_details(cx: &mut TestAppContext) {
+        let dir = pathed_project();
+        let (runner, _calls) = fake_runner(|_| {
+            emd_run_outcome(
+                true,
+                &[concat!(
+                    "emd-json: {\"emd\":\"0.2.0\",\"ok\":true,\"module\":\"gameplay\",",
+                    "\"path\":\"crates/game-core/src/modules/gameplay\",",
+                    "\"removed\":{\"schedules\":[\"boot\"],\"systems\":[\"spawn_enemies\"],\"components\":[\"HeroUnit\"]},",
+                    "\"cascaded_schedules\":[\"core/tick\"],",
+                    "\"stripped_files\":[\"crates/game-core/src/modules/mod.rs\"],\"missing_lines\":[]}"
+                )
+                .to_string()],
+            )
+        });
+        let (project, worktree_id, panel, cx) = delete_workspace(cx, dir.path(), runner).await;
+
+        delete_from_project_panel(
+            &project,
+            worktree_id,
+            "crates/game-core/src/modules/gameplay",
+            cx,
+        )
+        .await;
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        let details = panel.read_with(cx, |panel, _| match &panel.run_state {
+            RunState::Done { details, .. } => details.clone(),
+            other => panic!("expected Done, got {}", match other {
+                RunState::Failed { message, .. } => message.clone(),
+                _ => "another state".to_string(),
+            }),
+        });
+        assert_eq!(
+            details,
+            vec![
+                "removed 1 schedule: boot".to_string(),
+                "removed 1 system: spawn_enemies".to_string(),
+                "removed 1 component: HeroUnit".to_string(),
+                "schedule core/tick lost a system".to_string(),
+                "deleted crates/game-core/src/modules/gameplay".to_string(),
+                "stripped 1 file: crates/game-core/src/modules/mod.rs".to_string(),
+            ]
+        );
+        // The dock is not revealed by a delete; show it to check the lines
+        // actually render under the message.
+        let workspace = panel
+            .read_with(cx, |panel, _| panel.workspace.clone())
+            .and_then(|workspace| workspace.upgrade())
+            .expect("the panel's workspace");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<EmeraldPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-emerald-run-detail-0").is_some(),
+            "the detail lines render under the done message"
+        );
+    }
+
     /// An unmanaged file is NOT ours: the stock prompt appears, word for
     /// word, and no `emd` is spawned whichever way the user answers.
     #[gpui::test]
     async fn test_deleting_an_unmanaged_file_keeps_the_stock_prompt(cx: &mut TestAppContext) {
         let dir = pathed_project();
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
-        let (project, worktree_id, cx) = delete_workspace(cx, dir.path(), runner).await;
+        let (project, worktree_id, _panel, cx) = delete_workspace(cx, dir.path(), runner).await;
 
         delete_from_project_panel(&project, worktree_id, "crates/game-core/src/main.rs", cx).await;
 

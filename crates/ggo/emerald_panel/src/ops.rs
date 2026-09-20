@@ -534,6 +534,62 @@ fn kind_noun(kind: ManifestKind) -> &'static str {
     }
 }
 
+/// The detail lines an `emd rm` trailer earns under the done message:
+/// what was removed and deleted, which files lost a spliced line, which
+/// expected line was not there to strip, and which schedules elsewhere
+/// lost a system. Empty arrays say nothing; a non-removal op has none.
+pub fn rm_details(op: &ManifestOp, trailer: &serde_json::Value) -> Vec<String> {
+    if !matches!(op, ManifestOp::Remove { .. } | ManifestOp::RemoveModule { .. }) {
+        return Vec::new();
+    }
+    let strings = |key: &str, from: &serde_json::Value| -> Vec<String> {
+        from.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let counted = |verb: &str, noun: &str, items: &[String]| -> Option<String> {
+        (!items.is_empty()).then(|| {
+            format!("{verb} {} {}: {}", items.len(), plural(noun, items.len()), items.join(", "))
+        })
+    };
+    let mut lines = Vec::new();
+    if let Some(removed) = trailer.get("removed") {
+        for noun in ["schedule", "system", "component"] {
+            lines.extend(counted("removed", noun, &strings(&format!("{noun}s"), removed)));
+        }
+    }
+    for schedule in strings("cascaded_schedules", trailer) {
+        lines.push(format!("schedule {schedule} lost a system"));
+    }
+    if let Some(path) = trailer
+        .get("removed_path")
+        .or_else(|| trailer.get("path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        lines.push(format!("deleted {path}"));
+    }
+    lines.extend(counted("stripped", "file", &strings("stripped_files", trailer)));
+    for line in strings("missing_lines", trailer) {
+        lines.push(format!("no line to strip in: {line}"));
+    }
+    lines
+}
+
+fn plural(noun: &str, count: usize) -> String {
+    if count == 1 {
+        noun.to_string()
+    } else {
+        format!("{noun}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,6 +979,49 @@ mod tests {
         assert_eq!(
             confirm.cascade,
             ["The module has no manifest entries.", COMPILER_NOTE]
+        );
+    }
+
+    /// The `emd rm` trailer's fields become detail lines under the done
+    /// message; an empty array says nothing.
+    #[test]
+    fn rm_details_read_the_trailer() {
+        let component = serde_json::json!({
+            "ok": true,
+            "removed_path": "crates/game-core/src/modules/gameplay/components/hero.rs",
+            "stripped_files": ["crates/game-core/src/modules/gameplay/components/mod.rs", "crates/game-core/src/lib.rs"],
+            "missing_lines": [],
+        });
+        assert_eq!(
+            rm_details(&ManifestOp::remove(ManifestKind::Component, "Hero", "gameplay"), &component),
+            vec![
+                "deleted crates/game-core/src/modules/gameplay/components/hero.rs".to_string(),
+                "stripped 2 files: crates/game-core/src/modules/gameplay/components/mod.rs, crates/game-core/src/lib.rs".to_string(),
+            ]
+        );
+        let module = serde_json::json!({
+            "ok": true,
+            "module": "gameplay",
+            "path": "crates/game-core/src/modules/gameplay",
+            "removed": { "schedules": ["main"], "systems": ["tick"], "components": [] },
+            "cascaded_schedules": ["core/boot"],
+            "stripped_files": ["crates/game-core/src/modules/mod.rs"],
+            "missing_lines": ["crates/game-core/src/lib.rs: reg.register::<Enemy>();"],
+        });
+        assert_eq!(
+            rm_details(&ManifestOp::remove_module("gameplay"), &module),
+            vec![
+                "removed 1 schedule: main".to_string(),
+                "removed 1 system: tick".to_string(),
+                "schedule core/boot lost a system".to_string(),
+                "deleted crates/game-core/src/modules/gameplay".to_string(),
+                "stripped 1 file: crates/game-core/src/modules/mod.rs".to_string(),
+                "no line to strip in: crates/game-core/src/lib.rs: reg.register::<Enemy>();".to_string(),
+            ]
+        );
+        assert!(
+            rm_details(&ManifestOp::field_add("Hero", "gameplay", "hp:u8"), &component).is_empty(),
+            "only removals carry rm details"
         );
     }
 
