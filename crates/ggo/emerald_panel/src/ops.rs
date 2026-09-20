@@ -81,6 +81,15 @@ pub enum ManifestOp {
         systems: Vec<String>,
         edit: ScheduleEdit,
     },
+    /// `emd rm module <name>` -- the whole module, and every component,
+    /// system and schedule declared in it.
+    ///
+    /// Built here rather than by a worldlib builder because
+    /// [`ManifestKind`] has no module arm and should not grow one: a
+    /// module is not a manifest entry, it is the bucket the three kinds
+    /// of entry sit in, and `emd rm module` takes no `--module` flag to
+    /// disambiguate.
+    RemoveModule { name: String },
 }
 
 /// What a [`ManifestOp::ScheduleSet`] is doing to the run list.
@@ -129,6 +138,12 @@ impl ManifestOp {
             kind,
             name: name.to_string(),
             module: module.to_string(),
+        }
+    }
+
+    pub fn remove_module(name: &str) -> Self {
+        ManifestOp::RemoveModule {
+            name: name.to_string(),
         }
     }
 
@@ -186,6 +201,9 @@ impl ManifestOp {
                 systems,
                 ..
             } => build_schedule_set_args(schedule, module, systems),
+            ManifestOp::RemoveModule { name } => {
+                vec!["rm".to_string(), "module".to_string(), name.clone()]
+            }
         }
     }
 
@@ -206,7 +224,9 @@ impl ManifestOp {
             ManifestOp::ScheduleSet { edit, .. } => {
                 matches!(edit, ScheduleEdit::Remove { .. })
             }
-            ManifestOp::Remove { .. } | ManifestOp::FieldRemove { .. } => true,
+            ManifestOp::Remove { .. }
+            | ManifestOp::FieldRemove { .. }
+            | ManifestOp::RemoveModule { .. } => true,
         }
     }
 
@@ -216,6 +236,7 @@ impl ManifestOp {
             ManifestOp::Remove { kind, name, module } => {
                 format!("Removed {} {}", kind_noun(*kind), qualified(module, name))
             }
+            ManifestOp::RemoveModule { name } => format!("Removed module {name}"),
             ManifestOp::FieldAdd {
                 component, spec, ..
             } => format!("Added field {spec} to {component}"),
@@ -268,6 +289,48 @@ pub struct Cascade {
     /// Asset-root-relative world files placing the component being removed
     /// (`crate::manifests::worlds_using_component`).
     pub worlds: Vec<String>,
+    /// Present only for [`ManifestOp::RemoveModule`].
+    pub module: Option<ModuleCascade>,
+}
+
+/// The [`ManifestOp::RemoveModule`] half of a [`Cascade`]: what the
+/// module owns (all of which goes with it) and what outside the module
+/// breaks.
+///
+/// Separate from `Cascade`'s flat fields rather than folded into them
+/// because a module removal is the one op whose blast radius is PLURAL
+/// in two directions at once -- several components, each with its own
+/// list of worlds -- and flattening that would lose which world placed
+/// which component, which is the only thing that makes the line
+/// actionable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleCascade {
+    /// Components declared in the module, by name.
+    pub components: Vec<String>,
+    /// Systems declared in the module, by name.
+    pub systems: Vec<String>,
+    /// Schedules declared in the module, by name.
+    pub schedules: Vec<String>,
+    /// Run-list references that break: a schedule OUTSIDE the module
+    /// naming one of its systems.
+    pub lost_references: Vec<LostReference>,
+    /// `(component, worlds)` for each of the module's components still
+    /// placed in at least one world
+    /// ([`crate::manifests::worlds_using_component`]).
+    pub placed: Vec<(String, Vec<String>)>,
+}
+
+/// One schedule outside a module that loses a system when the module
+/// goes. The schedule's own module is carried separately from its name
+/// so the prompt can say where it lives -- which is what tells the user
+/// where they will have to go and fix it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LostReference {
+    pub schedule: String,
+    /// The schedule's module; empty for a shared schedule.
+    pub schedule_module: String,
+    /// The system ref as the run list spells it (`<module>/<name>`).
+    pub system: String,
 }
 
 /// A confirmation to raise before a [`ManifestOp`] runs.
@@ -383,6 +446,49 @@ pub fn confirm_for(op: &ManifestOp, cascade: &Cascade) -> Option<Confirm> {
                 ),
                 cascade: lines,
                 label: "Remove",
+            });
+        }
+        ManifestOp::RemoveModule { name } => {
+            let module = cascade.module.clone().unwrap_or_default();
+            let owned = [
+                (&module.components, "component"),
+                (&module.systems, "system"),
+                (&module.schedules, "schedule"),
+            ];
+            if owned.iter().all(|(items, _)| items.is_empty()) {
+                lines.push("The module has no manifest entries.".to_string());
+            } else {
+                for (items, noun) in owned {
+                    if !items.is_empty() {
+                        lines.push(format!("{}: {}", count(items.len(), noun), items.join(", ")));
+                    }
+                }
+            }
+            for lost in &module.lost_references {
+                lines.push(if lost.schedule_module.is_empty() {
+                    format!("schedule {} loses system {}", lost.schedule, lost.system)
+                } else {
+                    format!(
+                        "schedule {} in module {} loses system {}",
+                        lost.schedule, lost.schedule_module, lost.system
+                    )
+                });
+            }
+            for (component, worlds) in &module.placed {
+                lines.push(format!(
+                    "{component} is still placed in {}: {}.",
+                    count(worlds.len(), "world"),
+                    worlds.join(", ")
+                ));
+            }
+            if !module.components.is_empty() {
+                lines.push(CODE_SCAN_NOTE.to_string());
+            }
+            lines.push(COMPILER_NOTE.to_string());
+            return Some(Confirm {
+                message: format!("Delete module {name}?"),
+                cascade: lines,
+                label: "Delete",
             });
         }
         // `destructive()` already returned early for these two.
@@ -745,6 +851,79 @@ mod tests {
         let add = ManifestOp::field_add("HeroUnit", "gameplay", "hp:int");
         assert!(!add.destructive());
         assert_eq!(confirm_for(&add, &Cascade::default()), None);
+    }
+
+    /// **The module op**: `emd rm module <name>`, built here rather than
+    /// by a worldlib builder because `ManifestKind` has no module arm --
+    /// a module is not a manifest entry, it is the bucket three kinds of
+    /// entry sit in.
+    #[test]
+    fn a_module_removal_is_rm_module() {
+        let op = ManifestOp::remove_module("gameplay");
+        assert_eq!(op.args(), ["rm", "module", "gameplay"]);
+        assert!(op.destructive());
+        assert_eq!(op.done_message(), "Removed module gameplay");
+    }
+
+    /// The module confirm names everything that goes WITH the module, then
+    /// everything outside it that breaks, then the two standing limits.
+    #[test]
+    fn a_module_confirm_names_what_goes_and_what_breaks() {
+        let cascade = Cascade {
+            module: Some(ModuleCascade {
+                components: vec!["HeroUnit".into(), "Marker".into()],
+                systems: vec!["spawn_enemies".into()],
+                schedules: vec!["boot".into()],
+                lost_references: vec![
+                    LostReference {
+                        schedule: "update".into(),
+                        schedule_module: "core".into(),
+                        system: "gameplay/spawn_enemies".into(),
+                    },
+                    LostReference {
+                        schedule: "render".into(),
+                        schedule_module: String::new(),
+                        system: "gameplay/spawn_enemies".into(),
+                    },
+                ],
+                placed: vec![(
+                    "HeroUnit".into(),
+                    vec!["arena.wrld.toml".into(), "nested/deep.wrld.toml".into()],
+                )],
+            }),
+            ..Cascade::default()
+        };
+        let confirm = confirm_for(&ManifestOp::remove_module("gameplay"), &cascade)
+            .expect("removing a module is destructive");
+        assert_eq!(confirm.message, "Delete module gameplay?");
+        assert_eq!(confirm.label, "Delete");
+        assert_eq!(
+            confirm.cascade,
+            [
+                "2 components: HeroUnit, Marker",
+                "1 system: spawn_enemies",
+                "1 schedule: boot",
+                "schedule update in module core loses system gameplay/spawn_enemies",
+                "schedule render loses system gameplay/spawn_enemies",
+                "HeroUnit is still placed in 2 worlds: arena.wrld.toml, nested/deep.wrld.toml.",
+                CODE_SCAN_NOTE,
+                COMPILER_NOTE,
+            ]
+        );
+    }
+
+    /// An empty module still confirms, and says it is empty rather than
+    /// listing nothing at all -- and with no components there is no world
+    /// scan to admit the limit of.
+    #[test]
+    fn an_empty_module_still_confirms_and_says_it_is_empty() {
+        let confirm = confirm_for(&ManifestOp::remove_module("scratch"), &Cascade::default())
+            .expect("removing a module is destructive");
+        assert_eq!(confirm.message, "Delete module scratch?");
+        assert_eq!(
+            confirm.cascade,
+            ["The module has no manifest entries.", COMPILER_NOTE]
+        );
     }
 
     #[test]

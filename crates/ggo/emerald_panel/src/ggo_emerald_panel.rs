@@ -165,6 +165,10 @@ pub fn init(cx: &mut App) {
     // writes are Rust sources and TOML that upstream's editor opens
     // perfectly well.
     workspace::register_context_menu_contributor(cx, contribute_emerald_menu);
+    // GGO: deleting a manifest-managed file or a module directory from the
+    // project panel runs `emd rm` instead of unlinking it -- see
+    // [`intercept_emerald_delete`].
+    workspace::register_delete_interceptor(cx, intercept_emerald_delete);
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -723,6 +727,126 @@ fn new_tileset_commit(
             },
         ))(window, cx);
     }
+}
+
+// GGO: the delete interceptor. `ProjectPanel::remove` offers every
+// selection here BEFORE it builds its own "Delete x?" prompt, and a
+// `true` means "this panel took it" -- no stock prompt, no `unlink`.
+//
+// DECIDE HERE, ACT LATER, exactly as the context-menu contributor above:
+// the interceptor runs with `ProjectPanel` leased, so the claim is decided
+// from path inspection (plus the manifest read the menu predicates'
+// `is_dir` stats already set the precedent for) and everything
+// panel-shaped is pushed into `cx.defer_in(window, ..)`.
+//
+// **Why a claim rather than an extra prompt.** Deleting
+// `.../modules/gameplay/systems/spawn_enemies.rs` off disk leaves the
+// manifest still declaring the system, the module's `mod.rs` still
+// naming it, and the project not compiling -- the stock delete produces a
+// broken project silently. `emd rm` is the operation the user meant, and
+// `request_op`'s cascade confirm is the prompt that tells them what it
+// costs before it runs.
+fn intercept_emerald_delete(
+    workspace: &mut Workspace,
+    paths: &[ProjectPath],
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    // A multi-selection falls through whole: `emd` takes one item per run,
+    // and a half-claimed selection -- two files through `emd`, three
+    // through `unlink`, from one keystroke -- is worse than either.
+    let [path] = paths else {
+        return false;
+    };
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return false;
+    };
+    let Some(worktree_root) = workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    else {
+        return false;
+    };
+    let Some((project_dir, op)) = delete_op_for(&worktree_root.join(&rel)) else {
+        return false;
+    };
+    cx.defer_in(window, move |workspace, window, cx| {
+        // No reveal: the confirm is a window-level prompt, so the dock does
+        // not have to be in front for the user to answer it, and evicting
+        // whatever panel they were using to delete a file would be pure
+        // collateral damage.
+        let Some(panel) = workspace.panel::<EmeraldPanel>(cx) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            if panel.emerald_dir.as_deref() != Some(project_dir.as_path()) {
+                panel.emerald_dir = Some(project_dir);
+                panel.refresh_manifests(cx);
+            }
+            panel.request_op(op, window, cx);
+        });
+    });
+    true
+}
+
+/// The `emd` op a delete of `abs_path` should become, with the project
+/// root to run it in -- or `None` when the path is not manifest-managed
+/// and upstream's delete should handle it.
+///
+/// Pure path inspection plus a manifest read, so it is provable without a
+/// workspace; [`intercept_emerald_delete`] is the only caller.
+///
+/// A DIRECTORY is claimed only when it is exactly `<...>/src/modules/<m>`
+/// -- the three ancestors are checked rather than trusting
+/// [`module_under`] alone, which also answers "gameplay" for
+/// `.../modules/gameplay/gameplay`.
+///
+/// A FILE is claimed only when its project-root-relative path is one a
+/// manifest entry names as its own source. A module's `mod.rs`, a
+/// hand-written `.rs`, and anything under `assets/` are all unmanaged and
+/// fall through.
+fn delete_op_for(abs_path: &Path) -> Option<(PathBuf, ManifestOp)> {
+    let project_dir = emerald_project_root(abs_path)?;
+    if abs_path.is_dir() {
+        let module = module_under(abs_path)?;
+        let named = |dir: Option<&Path>, name: &str| {
+            dir.and_then(Path::file_name).and_then(std::ffi::OsStr::to_str) == Some(name)
+        };
+        let parent = abs_path.parent();
+        return (named(Some(abs_path), &module)
+            && named(parent, "modules")
+            && named(parent.and_then(Path::parent), "src"))
+        .then(|| (project_dir, ManifestOp::remove_module(&module)));
+    }
+    let rel = abs_path
+        .strip_prefix(&project_dir)
+        .ok()?
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let manifests = manifests::read_manifests(&project_dir);
+    let component = manifests
+        .components
+        .iter()
+        .find(|entry| entry.path == rel)
+        .map(|entry| ManifestOp::remove(ManifestKind::Component, &entry.name, &entry.module));
+    let system = || {
+        manifests
+            .systems
+            .iter()
+            .find(|entry| entry.path == rel)
+            .map(|entry| ManifestOp::remove(ManifestKind::System, &entry.name, &entry.module))
+    };
+    let schedule = || {
+        manifests
+            .schedules
+            .iter()
+            .find(|entry| entry.path == rel)
+            .map(|entry| ManifestOp::remove(ManifestKind::Schedule, &entry.name, &entry.module))
+    };
+    Some((project_dir, component.or_else(system).or_else(schedule)?))
 }
 
 /// Is `dir` a directory the manifest-backed generate entries belong on --
@@ -2817,6 +2941,11 @@ fn component_shaped(op: &ManifestOp) -> bool {
     match op {
         ManifestOp::Remove { kind, .. } => *kind == ManifestKind::Component,
         ManifestOp::FieldAdd { .. } | ManifestOp::FieldRemove { .. } => true,
+        // Always, not "only when the module declared components": the op
+        // carries nothing but the module's name, and a refresh that finds
+        // the same schema set costs a manifest re-read, where a missed one
+        // leaves the world inspector offering a component that is gone.
+        ManifestOp::RemoveModule { .. } => true,
         // A run list says nothing about what components exist.
         ManifestOp::ScheduleSet { .. } => false,
     }
@@ -4447,6 +4576,117 @@ mod tests {
         (workspace, panel, worktree_id, cx)
     }
 
+    /// A project whose manifests carry real, project-root-relative
+    /// `path`s pointing at files that exist -- the shape `emd generate`
+    /// leaves behind, and the only shape a delete can be mapped from.
+    fn pathed_project() -> tempfile::TempDir {
+        let dir = emerald_project();
+        let root = dir.path();
+        let module = root.join("crates/game-core/src/modules/gameplay");
+        std::fs::create_dir_all(module.join("systems")).unwrap();
+        std::fs::create_dir_all(module.join("schedules")).unwrap();
+        for rel in [
+            "crates/game-core/src/modules/gameplay/components/hero_unit.rs",
+            "crates/game-core/src/modules/gameplay/systems/spawn_enemies.rs",
+            "crates/game-core/src/modules/gameplay/schedules/boot.rs",
+            "crates/game-core/src/modules/gameplay/mod.rs",
+            "crates/game-core/src/main.rs",
+        ] {
+            std::fs::write(root.join(rel), "").unwrap();
+        }
+        std::fs::write(root.join("assets/arena.wrld.toml"), "[[entity]]\n").unwrap();
+        std::fs::write(
+            root.join("manifests/components.toml"),
+            "version = 1\n\
+             [[component]]\nname = \"HeroUnit\"\nmodule = \"gameplay\"\n\
+             path = \"crates/game-core/src/modules/gameplay/components/hero_unit.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("manifests/systems.toml"),
+            "version = 1\n\
+             [[system]]\nname = \"spawn_enemies\"\nmodule = \"gameplay\"\n\
+             path = \"crates/game-core/src/modules/gameplay/systems/spawn_enemies.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("manifests/schedules.toml"),
+            "version = 1\n\
+             [[schedule]]\nname = \"boot\"\nmodule = \"gameplay\"\n\
+             path = \"crates/game-core/src/modules/gameplay/schedules/boot.rs\"\n\
+             systems = [\"gameplay/spawn_enemies\"]\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// **The delete claim, decided from the path alone.** A manifest
+    /// entry's own source file maps to the `emd rm` for that entry; the
+    /// module directory maps to `emd rm module`; everything else -- the
+    /// `src/modules` bucket, a subdirectory of a module, an unmanaged
+    /// `.rs`, an asset -- is not ours and falls through to the stock
+    /// delete.
+    #[test]
+    fn delete_op_for_claims_only_manifest_managed_paths() {
+        let dir = pathed_project();
+        let root = dir.path();
+        let op = |rel: &str| {
+            delete_op_for(&root.join(rel)).map(|(project_dir, op)| {
+                assert_eq!(project_dir, root, "{rel}");
+                op
+            })
+        };
+
+        assert_eq!(
+            op("crates/game-core/src/modules/gameplay/components/hero_unit.rs"),
+            Some(ManifestOp::remove(
+                ManifestKind::Component,
+                "HeroUnit",
+                "gameplay"
+            ))
+        );
+        assert_eq!(
+            op("crates/game-core/src/modules/gameplay/systems/spawn_enemies.rs"),
+            Some(ManifestOp::remove(
+                ManifestKind::System,
+                "spawn_enemies",
+                "gameplay"
+            ))
+        );
+        assert_eq!(
+            op("crates/game-core/src/modules/gameplay/schedules/boot.rs"),
+            Some(ManifestOp::remove(
+                ManifestKind::Schedule,
+                "boot",
+                "gameplay"
+            ))
+        );
+        assert_eq!(
+            op("crates/game-core/src/modules/gameplay"),
+            Some(ManifestOp::remove_module("gameplay"))
+        );
+
+        for rel in [
+            "crates/game-core/src/modules",
+            "crates/game-core/src/modules/gameplay/components",
+            "crates/game-core/src/modules/gameplay/mod.rs",
+            "crates/game-core/src/main.rs",
+            "assets/arena.wrld.toml",
+            "assets",
+            "",
+        ] {
+            assert_eq!(op(rel), None, "{rel:?} is not manifest-managed");
+        }
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("src/modules/gameplay")).unwrap();
+        assert_eq!(
+            delete_op_for(&outside.path().join("src/modules/gameplay")),
+            None,
+            "no emerald.toml above it, so there is no project to run emd in"
+        );
+    }
+
     /// The generate entries appear on the project root and `manifests/`,
     /// their module-scoped three inside `src/modules/<name>/`, the asset
     /// entries on `assets/` and below, and NOTHING appears anywhere else
@@ -4504,6 +4744,243 @@ mod tests {
             contributed("emerald.toml", false, cx),
             0,
             "this panel claims no files"
+        );
+    }
+
+    /// [`pathed_project`] behind a real workspace with a real
+    /// [`ProjectPanel`] -- the fake fs mirrors the temp tree so the
+    /// worktree scans and the panel has entries to select, while
+    /// [`delete_op_for`] reads the actual manifests through `std::fs`.
+    async fn delete_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+    ) -> (
+        Entity<Project>,
+        WorktreeId,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            project_panel::init(cx);
+            ggo_world_panel::init(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            root,
+            serde_json::json!({
+                "emerald.toml": "",
+                "manifests": {
+                    "components.toml": "",
+                    "systems.toml": "",
+                    "schedules.toml": "",
+                },
+                "assets": { "arena.wrld.toml": "" },
+                "crates": { "game-core": { "src": {
+                    "main.rs": "",
+                    "modules": { "gameplay": {
+                        "mod.rs": "",
+                        "components": { "hero_unit.rs": "" },
+                        "systems": { "spawn_enemies.rs": "" },
+                        "schedules": { "boot.rs": "" },
+                    } },
+                } } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = worktree_id(&project, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_panel = ProjectPanel::ggo_test_new(workspace, window, cx);
+            workspace.add_panel(project_panel, window, cx);
+        });
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<EmeraldPanel>(cx)
+                .expect("init() adds the panel")
+        });
+        panel.update(cx, |panel, _| {
+            panel.lock = LockCheck::Reached(EXPECTED_EMD_VERSION.to_string());
+            panel.emd_probe = settled_probe();
+            panel.probe = Arc::new(settled_probe);
+            panel.runner = runner;
+        });
+        cx.run_until_parked();
+        (project, worktree_id, cx)
+    }
+
+    /// Select `rel` in the project panel and fire the stock delete action
+    /// -- exactly what a user pressing Delete on that row does.
+    ///
+    /// The selection travels as `project::Event::RevealInProjectPanel`
+    /// (the panel's own subscription sets `selection` and
+    /// `marked_entries` from it), and the action is built by name because
+    /// `project_panel::Delete` is private to that crate -- which is also
+    /// proof the dispatch goes through the real registered handler.
+    async fn delete_from_project_panel(
+        project: &Entity<Project>,
+        worktree_id: WorktreeId,
+        rel: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        // The fake worktree scans lazily, so every ancestor directory of
+        // `rel` has to be expanded before the entry exists to be selected
+        // -- production gets that from the user having clicked their way
+        // down to the row.
+        let mut ancestor = String::new();
+        for segment in rel.split('/') {
+            let expanded = project.update(cx, |project, cx| {
+                let entry = project.entry_for_path(&project_path(worktree_id, &ancestor), cx)?;
+                project.expand_entry(worktree_id, entry.id, cx)
+            });
+            if let Some(expanded) = expanded {
+                expanded.await.expect("expanding a directory");
+            }
+            cx.run_until_parked();
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(segment);
+        }
+        let entry_id = project
+            .read_with(cx, |project, cx| {
+                Some(
+                    project
+                        .entry_for_path(&project_path(worktree_id, rel), cx)?
+                        .id,
+                )
+            })
+            .unwrap_or_else(|| panic!("{rel} is in the worktree"));
+        project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(entry_id));
+        });
+        cx.run_until_parked();
+        let action = cx
+            .update(|_, cx| {
+                cx.build_action(
+                    "project_panel::Delete",
+                    Some(serde_json::json!({ "skip_prompt": false })),
+                )
+            })
+            .expect("project_panel::Delete is a registered action");
+        cx.update(|window, cx| window.dispatch_action(action, cx));
+        cx.run_until_parked();
+    }
+
+    /// **The whole feature, end to end.** Deleting a component's source
+    /// file from the project panel raises the EMERALD confirm -- the one
+    /// that names the worlds still placing it -- not the stock
+    /// "permanently delete `hero_unit.rs`?", and confirming spawns
+    /// `emd rm component` rather than unlinking the file.
+    #[gpui::test]
+    async fn test_deleting_a_component_file_runs_emd_rm(cx: &mut TestAppContext) {
+        let dir = pathed_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let (project, worktree_id, cx) = delete_workspace(cx, dir.path(), runner).await;
+
+        delete_from_project_panel(
+            &project,
+            worktree_id,
+            "crates/game-core/src/modules/gameplay/components/hero_unit.rs",
+            cx,
+        )
+        .await;
+
+        let (message, detail) = cx.pending_prompt().expect("the emerald confirm goes up");
+        assert_eq!(message, "Remove the component gameplay/HeroUnit?");
+        assert!(
+            !message.contains("hero_unit.rs"),
+            "the stock file prompt must not be what the user sees: {message}"
+        );
+        assert!(
+            detail.contains(ops::COMPILER_NOTE),
+            "the emd wording, not the file one: {detail}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "nothing runs while the prompt is up"
+        );
+
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one spawn");
+        assert_eq!(
+            calls[0].args,
+            [
+                "rm",
+                "component",
+                "HeroUnit",
+                "--module",
+                "gameplay",
+                "--json"
+            ]
+        );
+        assert_eq!(calls[0].cwd, dir.path());
+    }
+
+    /// The module directory is the other claim: one `emd rm module`, and
+    /// the confirm names what goes with it.
+    #[gpui::test]
+    async fn test_deleting_a_module_directory_runs_emd_rm_module(cx: &mut TestAppContext) {
+        let dir = pathed_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let (project, worktree_id, cx) = delete_workspace(cx, dir.path(), runner).await;
+
+        delete_from_project_panel(
+            &project,
+            worktree_id,
+            "crates/game-core/src/modules/gameplay",
+            cx,
+        )
+        .await;
+
+        let (message, detail) = cx.pending_prompt().expect("the emerald confirm goes up");
+        assert_eq!(message, "Delete module gameplay?");
+        assert!(
+            detail.contains("1 component: HeroUnit"),
+            "the module's own entries are named: {detail}"
+        );
+        assert!(
+            detail.contains("1 system: spawn_enemies"),
+            "{detail}"
+        );
+        assert!(detail.contains("1 schedule: boot"), "{detail}");
+
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one spawn");
+        assert_eq!(calls[0].args, ["rm", "module", "gameplay", "--json"]);
+        assert_eq!(calls[0].cwd, dir.path());
+    }
+
+    /// An unmanaged file is NOT ours: the stock prompt appears, word for
+    /// word, and no `emd` is spawned whichever way the user answers.
+    #[gpui::test]
+    async fn test_deleting_an_unmanaged_file_keeps_the_stock_prompt(cx: &mut TestAppContext) {
+        let dir = pathed_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let (project, worktree_id, cx) = delete_workspace(cx, dir.path(), runner).await;
+
+        delete_from_project_panel(&project, worktree_id, "crates/game-core/src/main.rs", cx).await;
+
+        let (message, _) = cx.pending_prompt().expect("upstream still prompts");
+        assert!(
+            message.contains("permanently delete") && message.contains("main.rs"),
+            "the stock delete prompt, untouched: {message}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "an unclaimed path never reaches emd"
         );
     }
 

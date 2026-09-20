@@ -19,12 +19,12 @@ use std::path::Path;
 
 use ggo_worldlib::emerald::{
     ComponentEntry, ManifestKind, ScheduleEntry, SystemEntry, components_of, schedules_of,
-    schedules_using_system, systems_of,
+    schedules_using_system, system_ref, systems_of,
 };
 use ggo_worldlib::world_file::read_world;
 use ggo_worldlib::world_files::world_files;
 
-use crate::ops::{Cascade, ManifestOp};
+use crate::ops::{Cascade, LostReference, ManifestOp, ModuleCascade};
 
 /// The directory `emd` keeps the manifests in, under the project root.
 pub const MANIFESTS_DIR: &str = "manifests";
@@ -162,7 +162,71 @@ pub fn cascade_for(op: &ManifestOp, manifests: &Manifests, project_dir: &Path) -
             worlds: worlds_using_component(project_dir, name),
             ..Cascade::default()
         },
+        ManifestOp::RemoveModule { name } => Cascade {
+            module: Some(module_cascade(name, manifests, project_dir)),
+            ..Cascade::default()
+        },
         _ => Cascade::default(),
+    }
+}
+
+/// Everything a module owns, plus what outside it breaks.
+///
+/// The `lost_references` half deliberately excludes the module's OWN
+/// schedules: they go away with the module, so listing them as
+/// "loses a system" would name the same loss twice and imply something
+/// is left behind to fix.
+fn module_cascade(module: &str, manifests: &Manifests, project_dir: &Path) -> ModuleCascade {
+    let components: Vec<String> = manifests
+        .components
+        .iter()
+        .filter(|component| component.module == module)
+        .map(|component| component.name.clone())
+        .collect();
+    let systems: Vec<String> = manifests
+        .systems
+        .iter()
+        .filter(|system| system.module == module)
+        .map(|system| system.name.clone())
+        .collect();
+    let schedules: Vec<String> = manifests
+        .schedules
+        .iter()
+        .filter(|schedule| schedule.module == module)
+        .map(|schedule| schedule.name.clone())
+        .collect();
+
+    let mut lost_references = Vec::new();
+    for system in &systems {
+        for referencing in schedules_using_system(&manifests.schedules, module, system) {
+            for entry in manifests
+                .schedules
+                .iter()
+                .filter(|entry| entry.name == referencing && entry.module != module)
+            {
+                lost_references.push(LostReference {
+                    schedule: entry.name.clone(),
+                    schedule_module: entry.module.clone(),
+                    system: system_ref(module, system),
+                });
+            }
+        }
+    }
+
+    let placed = components
+        .iter()
+        .filter_map(|component| {
+            let worlds = worlds_using_component(project_dir, component);
+            (!worlds.is_empty()).then(|| (component.clone(), worlds))
+        })
+        .collect();
+
+    ModuleCascade {
+        components,
+        systems,
+        schedules,
+        lost_references,
+        placed,
     }
 }
 
@@ -197,7 +261,8 @@ mod tests {
             "version = 1\n\
              [[schedule]]\nname = \"update\"\nsystems = [\"gameplay/spawn_enemies\", \"tick_clock\"]\n\
              [[schedule]]\nname = \"render\"\nsystems = [\"gameplay/spawn_enemies@4\"]\n\
-             [[schedule]]\nname = \"idle\"\nsystems = []\n",
+             [[schedule]]\nname = \"idle\"\nsystems = []\n\
+             [[schedule]]\nname = \"boot\"\nmodule = \"gameplay\"\nsystems = []\n",
         )
         .unwrap();
         std::fs::write(
@@ -302,6 +367,53 @@ mod tests {
             dir.path(),
         );
         assert_eq!(unused.schedules, ["update"]);
+    }
+
+    /// **The module cascade**: everything the module owns, plus the
+    /// schedules OUTSIDE it that lose a reference, plus the worlds still
+    /// placing each of its components.
+    #[test]
+    fn cascade_for_a_module_names_what_it_owns_and_what_loses_a_reference() {
+        let dir = project();
+        let m = read_manifests(dir.path());
+        let cascade = cascade_for(&ManifestOp::remove_module("gameplay"), &m, dir.path());
+        let module = cascade.module.expect("a module op carries a module cascade");
+        assert_eq!(module.components, ["HeroUnit"]);
+        assert_eq!(module.systems, ["spawn_enemies"]);
+        assert_eq!(module.schedules, ["boot"]);
+        assert_eq!(
+            module.lost_references,
+            [
+                LostReference {
+                    schedule: "update".into(),
+                    schedule_module: String::new(),
+                    system: "gameplay/spawn_enemies".into(),
+                },
+                LostReference {
+                    schedule: "render".into(),
+                    schedule_module: String::new(),
+                    system: "gameplay/spawn_enemies".into(),
+                },
+            ],
+            "`boot` is the module's own schedule, so it is not a LOST reference"
+        );
+        assert_eq!(
+            module.placed,
+            [(
+                "HeroUnit".to_string(),
+                vec![
+                    "arena.wrld.toml".to_string(),
+                    "nested/deep.wrld.toml".to_string()
+                ]
+            )]
+        );
+
+        let unknown = cascade_for(&ManifestOp::remove_module("nope"), &m, dir.path());
+        assert_eq!(
+            unknown.module,
+            Some(ModuleCascade::default()),
+            "a module with no manifest entries still reports a cascade, an empty one"
+        );
     }
 
     #[test]

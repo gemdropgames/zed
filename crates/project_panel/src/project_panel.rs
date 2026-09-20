@@ -2870,6 +2870,26 @@ impl ProjectPanel {
             if file_paths.is_empty() {
                 return None;
             }
+            // GGO: a fork panel may own these paths -- the emerald panel
+            // turns a delete of a manifest-managed source file, or of a
+            // module directory, into `emd rm` so the manifests and the
+            // generated module index stay consistent with the tree. It
+            // raises its own cascade confirm, so a claim returns before
+            // this prompt is built and before anything is unlinked;
+            // `skip_prompt` is untouched for everything unclaimed.
+            let claimed_paths = items_to_delete
+                .iter()
+                .filter_map(|selection| project.path_for_entry(selection.entry_id, cx))
+                .collect::<Vec<_>>();
+            if self
+                .workspace
+                .update(cx, |workspace, cx| {
+                    workspace.intercept_delete(&claimed_paths, window, cx)
+                })
+                .unwrap_or(false)
+            {
+                return None;
+            }
             let answer = if !skip_prompt {
                 let names = file_paths
                     .iter()

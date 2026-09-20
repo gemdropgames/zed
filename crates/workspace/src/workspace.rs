@@ -1063,6 +1063,58 @@ impl Workspace {
 }
 // GGO: end of the external-drop interceptor block.
 
+// GGO: fork-local delete interceptors. A registered fn is offered the
+// project paths the project panel is about to delete and returns `true`
+// when it took them -- the emerald panel claims a manifest-managed source
+// file or a module directory and runs `emd rm` instead, so the manifests
+// and the generated `mod.rs` stay consistent with the tree. `false`
+// (always, with an empty registry) falls through to upstream's prompt and
+// `delete_entry`/`trash_entry`.
+//
+// DECIDE HERE, ACT LATER, same as the two blocks above. The only caller is
+// `ProjectPanel::remove`, which runs inside `panel.update(..)`, so the
+// panel is LEASED for the whole call: an interceptor that reaches back for
+// `workspace.panel::<ProjectPanel>(cx)`, or for any pane, panics with
+// "cannot read/update ... while it is already being updated". The `bool`
+// has to be returned synchronously (the panel needs it to know whether to
+// prompt), so only path inspection belongs in the body; push the panel
+// work into `cx.defer_in(window, ..)`.
+pub type DeleteInterceptor =
+    fn(&mut Workspace, &[ProjectPath], &mut Window, &mut Context<Workspace>) -> bool;
+
+#[derive(Default)]
+struct DeleteInterceptors(Vec<DeleteInterceptor>);
+
+impl Global for DeleteInterceptors {}
+
+/// Registers a [`DeleteInterceptor`] for the app. GGO.
+pub fn register_delete_interceptor(cx: &mut App, interceptor: DeleteInterceptor) {
+    cx.default_global::<DeleteInterceptors>().0.push(interceptor);
+}
+
+impl Workspace {
+    /// Offers `paths` to every registered [`DeleteInterceptor`], returning
+    /// `true` as soon as one claims them. `false` (always, with an empty
+    /// registry) means "delete them the normal way". GGO.
+    pub fn intercept_delete(
+        &mut self,
+        paths: &[ProjectPath],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Copy out first: the interceptors take `&mut self`, which cannot be
+        // held across a borrow of the global.
+        let interceptors = match cx.try_global::<DeleteInterceptors>() {
+            Some(registry) if !registry.0.is_empty() => registry.0.clone(),
+            _ => return false,
+        };
+        interceptors
+            .iter()
+            .any(|intercept| intercept(self, paths, window, cx))
+    }
+}
+// GGO: end of the delete-interceptor block.
+
 // GGO: fork-local project-panel context-menu contributors. A registered fn is
 // offered the right-clicked path and returns the entries it wants appended to
 // the menu -- "Delete World" on a world `.toml`, "Import as tileset…" on a
