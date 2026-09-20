@@ -77,7 +77,7 @@ use ggo_worldlib::emerald::{
 
 use forms::{ASSET_KIND, FIELD_KINDS, FieldDraft, GenDraft, GenKind};
 use lock::{BinProbe, EMD_LOCK_POLL_INTERVAL, LockCheck, LockProbe};
-use manifests::{ASSETS_DIR, MANIFESTS_DIR, Manifests};
+use manifests::{ASSETS_DIR, Manifests};
 use ops::ManifestOp;
 use runner::{
     EMD_TIMEOUT, EMERALD_MANIFEST, EmdRequest, EmdRunner, emerald_project_root, system_runner,
@@ -149,7 +149,7 @@ const RUN_STATE_MAX_HEIGHT: Pixels = px(240.);
 /// Empty-state text -- shown when there is nothing to list and no form
 /// open, i.e. an unmanaged project (or one whose manifests are still
 /// empty), where work can only arrive by right-clicking a directory.
-const EMPTY_MESSAGE: &str = "Right-click the project root or manifests/ → New Component…/New Module…, a module directory → New Component… in it, or an assets directory → New World…";
+const EMPTY_MESSAGE: &str = "Right-click a project directory → New Component…/New Module…, a module directory → New Component… in it, or an assets directory → New World…";
 
 pub fn init(cx: &mut App) {
     // Right-clicking a directory offers the generate entries that belong
@@ -333,7 +333,7 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
 ///
 /// | right-clicked directory        | entries |
 /// |--------------------------------|---------|
-/// | the emerald project root, or its `manifests/` | New Component… / New System… / New Schedule… / New Module… |
+/// | any project directory outside `assets/` and modules | New Component… / New System… / New Schedule… / New Module… |
 /// | inside a module -- `src/modules/<name>/` or below | New Component… / New System… / New Schedule…, with `<name>` prefilled as the module |
 /// | the project's `assets/`, or anything under it | New World… / New Tileset… |
 /// | anything else                  | none |
@@ -714,7 +714,7 @@ fn new_tileset_commit(
 /// opened `manifests/` right-clicks. Nothing deeper qualifies, so a
 /// right-click anywhere in `crates/` stays clean.
 fn is_generate_dir(dir: &Path) -> bool {
-    emerald_project_root(dir).is_some_and(|root| dir == root || dir == root.join(MANIFESTS_DIR))
+    emerald_project_root(dir).is_some() && !is_assets_dir(dir) && module_under(dir).is_none()
 }
 
 /// The emerald module a directory belongs to: the path component right
@@ -4397,16 +4397,20 @@ mod tests {
             "the asset root: New World + New Tileset"
         );
         assert_eq!(contributed("assets/tiles", true, cx), 2, "and below it");
-        assert_eq!(contributed("crates", true, cx), 0, "not just any directory");
+        assert_eq!(
+            contributed("crates", true, cx),
+            4,
+            "any directory in the project outside assets/ and modules"
+        );
         assert_eq!(
             contributed("crates/game-core/src", true, cx),
-            0,
-            "not deep inside the crate tree either"
+            4,
+            "the core crate too"
         );
         assert_eq!(
             contributed("crates/game-core/src/modules", true, cx),
-            0,
-            "and not the modules directory itself -- it names no module"
+            4,
+            "the modules directory itself names no module, so the unscoped four"
         );
         assert_eq!(
             contributed("emerald.toml", false, cx),
@@ -6083,7 +6087,7 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
     ) {
         panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, MANIFESTS_DIR, None, window, cx);
+            panel.new_item(GenKind::Component, manifests::MANIFESTS_DIR, None, window, cx);
             for _ in 0..fields {
                 panel.add_field(window, cx);
             }
