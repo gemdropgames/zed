@@ -8,6 +8,9 @@
 //! primitive (`window.prompt`) is button-choice: it cannot collect a name,
 //! let alone a module and a repeatable list of `name:kind` fields. So
 //! "New Component…" needs a real form, and a form needs a panel (F5.2/S3).
+//! The directory menu offers New Component…/System…/Schedule…/Module… at
+//! the project root and `manifests/`, and the first three again inside
+//! `src/modules/<name>/` with that module prefilled.
 //! **F5.3/E2** adds the other half: a browser over the three manifests and
 //! the remove/field ops against them, each behind a confirm that names
 //! what it breaks. **F5.3/E3** makes the schedules tab's run list
@@ -146,7 +149,7 @@ const RUN_STATE_MAX_HEIGHT: Pixels = px(240.);
 /// Empty-state text -- shown when there is nothing to list and no form
 /// open, i.e. an unmanaged project (or one whose manifests are still
 /// empty), where work can only arrive by right-clicking a directory.
-const EMPTY_MESSAGE: &str = "Right-click the project root or manifests/ → New Component…, or an assets directory → New World…";
+const EMPTY_MESSAGE: &str = "Right-click the project root or manifests/ → New Component…/New Module…, a module directory → New Component… in it, or an assets directory → New World…";
 
 pub fn init(cx: &mut App) {
     // Right-clicking a directory offers the generate entries that belong
@@ -330,15 +333,19 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
 ///
 /// | right-clicked directory        | entries |
 /// |--------------------------------|---------|
-/// | the emerald project root, or its `manifests/` | New Component… / New System… / New Schedule… |
+/// | the emerald project root, or its `manifests/` | New Component… / New System… / New Schedule… / New Module… |
+/// | inside a module -- `src/modules/<name>/` or below | New Component… / New System… / New Schedule…, with `<name>` prefilled as the module |
 /// | the project's `assets/`, or anything under it | New World… / New Tileset… |
 /// | anything else                  | none |
 ///
-/// The three named entries are the spec's list. **Resource and Module
-/// have forms but no entry of their own**: the form carries a kind
-/// selector, so they are one click away inside any of the three, and a
+/// **Resource has a form but no entry of its own**: the form carries a
+/// kind selector, so it is one click away inside any of the others, and a
 /// six-entry directory menu appended to upstream's own Duplicate/Rename/
-/// Delete would be worse than a selector. `New World…` sits with the
+/// Delete would be worse than a selector. Module earns its entry because
+/// it is the one artifact that has to exist before the module-scoped
+/// entries above can name it. It is offered only where a module can be
+/// created from nothing -- not inside a module, where the three scoped
+/// entries belong instead. `New World…` sits with the
 /// assets entries because a world is an asset file -- the clicked
 /// directory inside `assets/` becomes `emd generate world`'s `--dir`, so
 /// the click chooses both the project and the destination.
@@ -380,11 +387,30 @@ fn contribute_emerald_menu(
 
     let mut items: Vec<ui::ContextMenuItem> = Vec::new();
     if is_generate_dir(&dir) {
+        for kind in [
+            GenKind::Component,
+            GenKind::System,
+            GenKind::Schedule,
+            GenKind::Module,
+        ] {
+            items.push(
+                ui::ContextMenuEntry::new(format!("New {}…", kind.noun()))
+                    .icon(ui::IconName::Plus)
+                    .handler(new_item_handler(cx.weak_entity(), kind, rel.clone(), None))
+                    .into(),
+            );
+        }
+    } else if let Some(module) = module_under(&dir) {
         for kind in [GenKind::Component, GenKind::System, GenKind::Schedule] {
             items.push(
                 ui::ContextMenuEntry::new(format!("New {}…", kind.noun()))
                     .icon(ui::IconName::Plus)
-                    .handler(new_item_handler(cx.weak_entity(), kind, rel.clone()))
+                    .handler(new_item_handler(
+                        cx.weak_entity(),
+                        kind,
+                        rel.clone(),
+                        Some(module.clone()),
+                    ))
                     .into(),
             );
         }
@@ -489,12 +515,16 @@ fn new_item_handler(
     workspace: WeakEntity<Workspace>,
     kind: GenKind,
     dir_rel: String,
+    module: Option<String>,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     ggo_common::panel_entry_handler(
         workspace,
         move |panel: &Entity<EmeraldPanel>, window, cx| {
             let dir_rel = dir_rel.clone();
-            panel.update(cx, |panel, cx| panel.new_item(kind, &dir_rel, window, cx));
+            let module = module.clone();
+            panel.update(cx, |panel, cx| {
+                panel.new_item(kind, &dir_rel, module, window, cx)
+            });
         },
     )
 }
@@ -685,6 +715,31 @@ fn new_tileset_commit(
 /// right-click anywhere in `crates/` stays clean.
 fn is_generate_dir(dir: &Path) -> bool {
     emerald_project_root(dir).is_some_and(|root| dir == root || dir == root.join(MANIFESTS_DIR))
+}
+
+/// The emerald module a directory belongs to: the path component right
+/// after the project's first `src/modules` pair, at any depth below it
+/// (`<project>/crates/<crate>/src/modules/gameplay/components` is still
+/// `gameplay`). `None` outside an emerald project, and `None` for
+/// `src/modules` itself, which names no module.
+///
+/// Mirrors `emd`'s own scope rule -- the CLI resolves an unqualified
+/// generate against its cwd when that cwd is inside `src/modules/<X>/` --
+/// so a right-click in a module produces the same `--module` the CLI
+/// would have inferred from a shell sitting there.
+fn module_under(dir: &Path) -> Option<String> {
+    let root = emerald_project_root(dir)?;
+    let parts = dir
+        .strip_prefix(&root)
+        .ok()?
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let pair = parts
+        .windows(2)
+        .position(|pair| pair == ["src", "modules"])?;
+    let name = parts.get(pair + 2)?;
+    (!name.is_empty()).then(|| (*name).to_string())
 }
 
 /// Walk up from `dir` (inclusive) to the nearest emerald project root,
@@ -1062,8 +1117,11 @@ impl EmeraldPanel {
 
     /// Open the generate form for `kind`, aimed at the emerald project
     /// that owns the worktree-relative directory `dir_rel`. The body of
-    /// the "New Component…"/"New System…"/"New Schedule…"/"New World…"
-    /// entries.
+    /// the "New Component…"/"New System…"/"New Schedule…"/"New Module…"/
+    /// "New World…" entries. `module` prefills the form's module editor --
+    /// `Some` when the click landed inside `src/modules/<name>/`
+    /// ([`module_under`]), so the run is scoped the way the clicked
+    /// directory reads.
     ///
     /// Refreshes the root FIRST because `project_root` is only
     /// re-discovered on panel activation and a right-click can reach a
@@ -1074,6 +1132,7 @@ impl EmeraldPanel {
         &mut self,
         kind: GenKind,
         dir_rel: &str,
+        module: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1095,11 +1154,15 @@ impl EmeraldPanel {
         // at it while the lists below still showed the worktree's.
         self.emerald_dir = Some(project_dir.clone());
         self.refresh_manifests(cx);
+        let module_editor = single_line(window, cx);
+        if let Some(module) = module {
+            module_editor.update(cx, |editor, cx| editor.set_text(module, window, cx));
+        }
         self.form = Some(PanelForm::Generate(GenerateForm {
             kind,
             project_dir,
             name: single_line(window, cx),
-            module: single_line(window, cx),
+            module: module_editor,
             fields: Vec::new(),
         }));
         self.run_state = RunState::Idle;
@@ -2925,8 +2988,8 @@ mod tests {
     // -------------------------------------------------------- the fixture
 
     /// A real-fs emerald project: `emerald.toml`, an empty `manifests/`,
-    /// an `assets/` tree, and a `crates/` directory that must NOT get any
-    /// menu entries.
+    /// an `assets/` tree, a `crates/` directory that must NOT get any menu
+    /// entries, and one emerald module inside it that must.
     fn emerald_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2935,6 +2998,8 @@ mod tests {
         std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::create_dir_all(root.join("assets/tiles")).unwrap();
         std::fs::create_dir_all(root.join("crates/game-core/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/game-core/src/modules/gameplay/components"))
+            .unwrap();
         std::fs::write(root.join("manifests/components.toml"), "version = 1\n").unwrap();
         dir
     }
@@ -3080,7 +3145,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", window, cx);
+                panel.new_item(GenKind::Component, "manifests", None, window, cx);
                 panel.add_field(window, cx);
                 panel.add_field(window, cx);
                 panel.select_field_kind(1, ASSET_KIND, cx);
@@ -3174,7 +3239,7 @@ mod tests {
         ] {
             cx.update(|window, cx| {
                 panel.update(cx, |panel, cx| {
-                    panel.new_item(kind, "manifests", window, cx)
+                    panel.new_item(kind, "manifests", None, window, cx)
                 })
             });
             let (name, module) = generate_form(&panel, cx);
@@ -3205,7 +3270,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", window, cx)
+                panel.new_item(GenKind::Component, "manifests", None, window, cx)
             })
         });
         let (name, module) = generate_form(&panel, cx);
@@ -3264,7 +3329,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", window, cx)
+                panel.new_item(GenKind::Component, "manifests", None, window, cx)
             })
         });
         let (name, _) = generate_form(&panel, cx);
@@ -3304,7 +3369,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::System, "manifests", window, cx)
+                panel.new_item(GenKind::System, "manifests", None, window, cx)
             })
         });
         let (name, _) = generate_form(&panel, cx);
@@ -3338,7 +3403,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Module, "manifests", window, cx)
+                panel.new_item(GenKind::Module, "manifests", None, window, cx)
             })
         });
         let (name, _) = generate_form(&panel, cx);
@@ -4295,8 +4360,9 @@ mod tests {
     }
 
     /// The generate entries appear on the project root and `manifests/`,
-    /// the asset entries on `assets/` and below, and NOTHING appears
-    /// anywhere else -- not on `crates/`, not on a file.
+    /// their module-scoped three inside `src/modules/<name>/`, the asset
+    /// entries on `assets/` and below, and NOTHING appears anywhere else
+    /// -- not on `crates/`, not on `src/modules/` itself, not on a file.
     #[gpui::test]
     async fn test_context_menu_offers_entries_only_on_the_right_dirs(cx: &mut TestAppContext) {
         let dir = emerald_project();
@@ -4311,10 +4377,20 @@ mod tests {
         };
         assert_eq!(
             contributed("", true, cx),
-            3,
-            "the project root: New Component/System/Schedule"
+            4,
+            "the project root: New Component/System/Schedule + New Module"
         );
-        assert_eq!(contributed("manifests", true, cx), 3, "and manifests/");
+        assert_eq!(contributed("manifests", true, cx), 4, "and manifests/");
+        assert_eq!(
+            contributed("crates/game-core/src/modules/gameplay", true, cx),
+            3,
+            "a module directory: New Component/System/Schedule, no New Module"
+        );
+        assert_eq!(
+            contributed("crates/game-core/src/modules/gameplay/components", true, cx),
+            3,
+            "and anything below it"
+        );
         assert_eq!(
             contributed("assets", true, cx),
             2,
@@ -4326,6 +4402,11 @@ mod tests {
             contributed("crates/game-core/src", true, cx),
             0,
             "not deep inside the crate tree either"
+        );
+        assert_eq!(
+            contributed("crates/game-core/src/modules", true, cx),
+            0,
+            "and not the modules directory itself -- it names no module"
         );
         assert_eq!(
             contributed("emerald.toml", false, cx),
@@ -4375,6 +4456,7 @@ mod tests {
             workspace.downgrade(),
             GenKind::Schedule,
             "manifests".to_string(),
+            None,
         );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
@@ -4385,6 +4467,84 @@ mod tests {
             }
             _ => panic!("expected a generate form"),
         });
+
+        let handler = new_item_handler(workspace.downgrade(), GenKind::Module, String::new(), None);
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| match &panel.form {
+            Some(PanelForm::Generate(form)) => assert_eq!(form.kind, GenKind::Module),
+            _ => panic!("expected a generate form"),
+        });
+    }
+
+    /// The module the click landed in is prefilled into the form's module
+    /// editor, so a "New Component…" inside `src/modules/gameplay/` runs
+    /// `--module gameplay` without the user retyping it. A click at the
+    /// project root leaves it blank -- the shared module.
+    #[gpui::test]
+    async fn test_a_module_directory_prefills_the_module(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (workspace, panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let module_rel = "crates/game-core/src/modules/gameplay";
+        let handler = new_item_handler(
+            workspace.downgrade(),
+            GenKind::Component,
+            module_rel.to_string(),
+            module_under(&dir.path().join(module_rel)),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let (_, module) = generate_form(&panel, cx);
+        assert_eq!(
+            module.read_with(cx, |module, cx| module.text(cx)),
+            "gameplay"
+        );
+
+        let handler = new_item_handler(
+            workspace.downgrade(),
+            GenKind::Component,
+            String::new(),
+            module_under(dir.path()),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let (_, module) = generate_form(&panel, cx);
+        assert_eq!(
+            module.read_with(cx, |module, cx| module.text(cx)),
+            "",
+            "the project root names no module"
+        );
+    }
+
+    /// The module a clicked directory sits in: the component right after
+    /// the project's first `src/modules` pair, at any depth below it.
+    #[test]
+    fn module_under_names_the_enclosing_module() {
+        let dir = emerald_project();
+        let root = dir.path();
+        assert_eq!(
+            module_under(&root.join("crates/game-core/src/modules/gameplay")).as_deref(),
+            Some("gameplay")
+        );
+        assert_eq!(
+            module_under(&root.join("crates/game-core/src/modules/gameplay/components")).as_deref(),
+            Some("gameplay"),
+            "any depth below the module counts"
+        );
+        assert_eq!(module_under(&root.join("crates/game-core/src")), None);
+        assert_eq!(
+            module_under(&root.join("crates/game-core/src/modules")),
+            None,
+            "the modules directory names no module"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            module_under(&outside.path().join("crates/game-core/src/modules/gameplay")),
+            None,
+            "no emerald.toml, no module"
+        );
     }
 
     /// Where the inline editor lands for each click: at the clicked dir
@@ -4701,6 +4861,7 @@ mod tests {
             workspace.downgrade(),
             GenKind::Component,
             "manifests".to_string(),
+            None,
         );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
@@ -4866,7 +5027,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", window, cx)
+                panel.new_item(GenKind::Component, "manifests", None, window, cx)
             })
         });
         if let Some(name) = panel.read_with(cx, |panel, _| match &panel.form {
@@ -5258,7 +5419,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", window, cx)
+                panel.new_item(GenKind::Component, "manifests", None, window, cx)
             })
         });
         let (name, _) = generate_form(&panel, cx);
@@ -5292,7 +5453,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::World, "assets", window, cx)
+                panel.new_item(GenKind::World, "assets", None, window, cx)
             })
         });
         let (name, _) = generate_form(&panel, cx);
@@ -5338,7 +5499,12 @@ mod tests {
         });
         panel.update(cx, |panel, _| panel.runner = runner);
 
-        let handler = new_item_handler(workspace.downgrade(), GenKind::World, "assets".to_string());
+        let handler = new_item_handler(
+            workspace.downgrade(),
+            GenKind::World,
+            "assets".to_string(),
+            None,
+        );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
 
@@ -5592,7 +5758,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", window, cx)
+                panel.new_item(GenKind::Component, "manifests", None, window, cx)
             })
         });
         let (name, _module) = generate_form(&panel, cx);
@@ -5626,7 +5792,7 @@ mod tests {
         let (panel, cx) = rendered_panel(cx, dir.path(), runner);
 
         panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", window, cx)
+            panel.new_item(GenKind::Component, "manifests", None, window, cx)
         });
         cx.run_until_parked();
 
@@ -5656,7 +5822,7 @@ mod tests {
         let (panel, cx) = rendered_panel(cx, dir.path(), runner);
 
         panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", window, cx);
+            panel.new_item(GenKind::Component, "manifests", None, window, cx);
             panel.add_field(window, cx);
         });
         cx.run_until_parked();
@@ -5714,7 +5880,7 @@ mod tests {
 
         cx.update(|window, cx| {
             panel.update(cx, |panel, cx| {
-                panel.new_item(GenKind::Component, "manifests", window, cx);
+                panel.new_item(GenKind::Component, "manifests", None, window, cx);
                 panel.add_field(window, cx);
                 panel.add_field(window, cx);
             })
@@ -5761,7 +5927,7 @@ mod tests {
         let (panel, cx) = rendered_panel(cx, dir.path(), runner);
 
         panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", window, cx);
+            panel.new_item(GenKind::Component, "manifests", None, window, cx);
             panel.add_field(window, cx);
         });
         cx.run_until_parked();
@@ -5839,7 +6005,7 @@ mod tests {
         let (panel, cx) = rendered_panel(cx, dir.path(), runner);
 
         panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, "manifests", window, cx)
+            panel.new_item(GenKind::Component, "manifests", None, window, cx)
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, cx| {
@@ -5917,7 +6083,7 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
     ) {
         panel.update_in(cx, |panel, window, cx| {
-            panel.new_item(GenKind::Component, MANIFESTS_DIR, window, cx);
+            panel.new_item(GenKind::Component, MANIFESTS_DIR, None, window, cx);
             for _ in 0..fields {
                 panel.add_field(window, cx);
             }
