@@ -62,7 +62,8 @@ use std::path::{Path, PathBuf};
 use editor::Editor;
 use gpui::{
     Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window, actions, div, px,
+    IntoElement, Pixels, PromptLevel, Render, SharedString, Styled, Task, WeakEntity, Window,
+    actions, div, px,
 };
 
 use project::ProjectPath;
@@ -746,21 +747,19 @@ fn new_tileset_commit(
 // broken project silently. `emd rm` is the operation the user meant, and
 // `request_op`'s cascade confirm is the prompt that tells them what it
 // costs before it runs.
+//
+// **And a claim always answers.** Suppressing the stock prompt makes this
+// panel responsible for saying SOMETHING: every path that gets here ends
+// in a confirm, a run, or an explanation -- see
+// `EmeraldPanel::request_op_when_ready` and `DeleteRoute::Explain`. A
+// claim that quietly did nothing would be indistinguishable from a broken
+// keystroke.
 fn intercept_emerald_delete(
     workspace: &mut Workspace,
     paths: &[ProjectPath],
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
-    // A multi-selection falls through whole: `emd` takes one item per run,
-    // and a half-claimed selection -- two files through `emd`, three
-    // through `unlink`, from one keystroke -- is worse than either.
-    let [path] = paths else {
-        return false;
-    };
-    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
-        return false;
-    };
     let Some(worktree_root) = workspace
         .project()
         .read(cx)
@@ -770,8 +769,52 @@ fn intercept_emerald_delete(
     else {
         return false;
     };
-    let Some((project_dir, op)) = delete_op_for(&worktree_root.join(&rel)) else {
+    let routes = paths
+        .iter()
+        .filter_map(|path| ggo_common::rel_in_primary_worktree(workspace, path, cx))
+        .filter_map(|rel| delete_route_for(&worktree_root.join(&rel)))
+        .collect::<Vec<_>>();
+
+    // A multi-selection is never SPLIT: `emd` takes one item per run, and
+    // half a selection through `emd` and half through `unlink`, from one
+    // keystroke, is worse than either whole. It is claimed anyway when
+    // anything in it is managed or structural -- letting the stock delete
+    // unlink a manifest-managed file or a module's folder because it had
+    // company is the silent breakage this interceptor exists to stop --
+    // and answered with the names.
+    if paths.len() > 1 {
+        let managed = routes
+            .iter()
+            .map(|(_, route)| match route {
+                DeleteRoute::Op(op) => route_label(op),
+                DeleteRoute::Explain { title, .. } => (*title).to_string(),
+            })
+            .collect::<Vec<_>>();
+        if managed.is_empty() {
+            return false;
+        }
+        let detail = format!(
+            "emd removes one item per run, and this selection includes:\n\n{}\n\n\
+             Delete them one at a time.",
+            managed.join("\n")
+        );
+        cx.defer_in(window, move |_workspace, window, cx| {
+            explain(PromptLevel::Info, CANT_DELETE_TITLE, &detail, window, cx);
+        });
+        return true;
+    }
+
+    let Some((project_dir, route)) = routes.into_iter().next() else {
         return false;
+    };
+    let op = match route {
+        DeleteRoute::Op(op) => op,
+        DeleteRoute::Explain { title, detail } => {
+            cx.defer_in(window, move |_workspace, window, cx| {
+                explain(PromptLevel::Info, title, &detail, window, cx);
+            });
+            return true;
+        }
     };
     cx.defer_in(window, move |workspace, window, cx| {
         // No reveal: the confirm is a window-level prompt, so the dock does
@@ -782,44 +825,116 @@ fn intercept_emerald_delete(
             return;
         };
         panel.update(cx, |panel, cx| {
+            // `adopt_root`, not `refresh_root`: this body runs inside the
+            // workspace's own update (`defer_in` re-enters
+            // `workspace.update`), so reading the workspace entity for its
+            // worktree would panic. The root was resolved synchronously
+            // above, off the same first visible worktree.
+            panel.adopt_root(Some(worktree_root), cx);
+            // And then the CLICKED project, which for a nested emerald
+            // project is not the one the worktree root resolves to.
             if panel.emerald_dir.as_deref() != Some(project_dir.as_path()) {
                 panel.emerald_dir = Some(project_dir);
                 panel.refresh_manifests(cx);
             }
-            panel.request_op(op, window, cx);
+            panel.request_op_when_ready(op, window, cx);
         });
     });
     true
 }
 
-/// The `emd` op a delete of `abs_path` should become, with the project
-/// root to run it in -- or `None` when the path is not manifest-managed
-/// and upstream's delete should handle it.
+/// What a claimed delete turns into.
+///
+/// Two outcomes rather than one, because "this panel owns the path" and
+/// "`emd` has a command for it" are different questions. `src/modules` and
+/// a module's `components/` bucket are as manifest-managed as anything
+/// under them -- unlinking either guts three manifests -- but `emd` removes
+/// entries and modules, not buckets, so the only honest claim is to stop
+/// the stock delete and say what to do instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeleteRoute {
+    /// Run this through `emd`, with [`EmeraldPanel::request_op`]'s confirm.
+    Op(ManifestOp),
+    /// Refuse the delete and say why. One button: there is nothing to
+    /// choose between.
+    Explain { title: &'static str, detail: String },
+}
+
+/// The title over every "we stopped this delete and here is why" prompt.
+const CANT_DELETE_TITLE: &str = "Can't delete this through emd";
+
+/// The three generated buckets inside a module, each named for what it
+/// holds.
+const MODULE_BUCKETS: [&str; 3] = ["components", "systems", "schedules"];
+
+/// The route a delete of `abs_path` should take, with the project root to
+/// run it in -- or `None` when the path is not manifest-managed and
+/// upstream's delete should handle it.
 ///
 /// Pure path inspection plus a manifest read, so it is provable without a
 /// workspace; [`intercept_emerald_delete`] is the only caller.
 ///
-/// A DIRECTORY is claimed only when it is exactly `<...>/src/modules/<m>`
+/// A DIRECTORY becomes an op only when it is exactly `<...>/src/modules/<m>`
 /// -- the three ancestors are checked rather than trusting
 /// [`module_under`] alone, which also answers "gameplay" for
-/// `.../modules/gameplay/gameplay`.
+/// `.../modules/gameplay/gameplay`. That check runs BEFORE the bucket
+/// names are looked at, so a module actually named `components` is still a
+/// module. `src/modules` itself and a module's buckets are explained.
 ///
-/// A FILE is claimed only when its project-root-relative path is one a
-/// manifest entry names as its own source. A module's `mod.rs`, a
-/// hand-written `.rs`, and anything under `assets/` are all unmanaged and
-/// fall through.
-fn delete_op_for(abs_path: &Path) -> Option<(PathBuf, ManifestOp)> {
+/// A FILE becomes an op only when its project-root-relative path is one a
+/// manifest entry names as its own source. A hand-written `.rs` and
+/// anything under `assets/` are unmanaged and fall through -- and so does a
+/// module index (`mod.rs`/`lib.rs`) even if a hand-edited manifest points
+/// at one: `emd` splices those files, it does not `rm` them.
+fn delete_route_for(abs_path: &Path) -> Option<(PathBuf, DeleteRoute)> {
     let project_dir = emerald_project_root(abs_path)?;
+    let named = |dir: Option<&Path>, name: &str| {
+        dir.and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            == Some(name)
+    };
+    let parent = abs_path.parent();
     if abs_path.is_dir() {
+        if named(Some(abs_path), "modules") && named(parent, "src") {
+            return Some((
+                project_dir,
+                DeleteRoute::Explain {
+                    title: CANT_DELETE_TITLE,
+                    detail: "modules/ holds every module of this crate. Delete a module by \
+                             right-clicking it → Delete."
+                        .to_string(),
+                },
+            ));
+        }
         let module = module_under(abs_path)?;
-        let named = |dir: Option<&Path>, name: &str| {
-            dir.and_then(Path::file_name).and_then(std::ffi::OsStr::to_str) == Some(name)
-        };
-        let parent = abs_path.parent();
-        return (named(Some(abs_path), &module)
+        if named(Some(abs_path), &module)
             && named(parent, "modules")
-            && named(parent.and_then(Path::parent), "src"))
-        .then(|| (project_dir, ManifestOp::remove_module(&module)));
+            && named(parent.and_then(Path::parent), "src")
+        {
+            return Some((
+                project_dir,
+                DeleteRoute::Op(ManifestOp::remove_module(&module)),
+            ));
+        }
+        let bucket = MODULE_BUCKETS.iter().find(|bucket| {
+            named(Some(abs_path), bucket)
+                && named(parent, &module)
+                && named(parent.and_then(Path::parent), "modules")
+                && named(parent.and_then(Path::parent).and_then(Path::parent), "src")
+        })?;
+        return Some((
+            project_dir,
+            DeleteRoute::Explain {
+                title: CANT_DELETE_TITLE,
+                detail: format!(
+                    "{bucket}/ holds the module's {bucket}; delete them one at a time from the \
+                     manifest browser or by deleting each file."
+                ),
+            },
+        ));
+    }
+    if named(Some(abs_path), "mod.rs") || named(Some(abs_path), "lib.rs") {
+        return None;
     }
     let rel = abs_path
         .strip_prefix(&project_dir)
@@ -846,7 +961,53 @@ fn delete_op_for(abs_path: &Path) -> Option<(PathBuf, ManifestOp)> {
             .find(|entry| entry.path == rel)
             .map(|entry| ManifestOp::remove(ManifestKind::Schedule, &entry.name, &entry.module))
     };
-    Some((project_dir, component.or_else(system).or_else(schedule)?))
+    Some((
+        project_dir,
+        DeleteRoute::Op(component.or_else(system).or_else(schedule)?),
+    ))
+}
+
+/// How a managed entry is named in a prompt that lists several of them --
+/// `component gameplay/HeroUnit`, `module gameplay`.
+/// Total, and with no `_` arm on purpose: a route that produced no label
+/// would drop out of the list the multi-selection prompt is built from, and
+/// an op that is deleted from the prompt is an op the user is never told
+/// about.
+fn route_label(op: &ManifestOp) -> String {
+    match op {
+        ManifestOp::Remove { kind, name, module } => {
+            let noun = match kind {
+                ManifestKind::Component => "component",
+                ManifestKind::System => "system",
+                ManifestKind::Schedule => "schedule",
+            };
+            format!("{noun} {}", ops::qualified(module, name))
+        }
+        ManifestOp::RemoveModule { name } => format!("module {name}"),
+        ManifestOp::FieldAdd {
+            component, module, ..
+        }
+        | ManifestOp::FieldRemove {
+            component, module, ..
+        } => format!("component {}", ops::qualified(module, component)),
+        ManifestOp::ScheduleSet {
+            schedule, module, ..
+        } => format!("schedule {}", ops::qualified(module, schedule)),
+    }
+}
+
+/// Raise a one-button explanation over the window.
+///
+/// The answer channel is awaited by a detached task rather than dropped on
+/// the spot: nothing acts on the choice (there is only one), but a
+/// receiver that is gone the instant the prompt goes up is a dialog whose
+/// answer has nowhere to be delivered.
+fn explain(level: PromptLevel, title: &str, detail: &str, window: &mut Window, cx: &mut App) {
+    let answer = window.prompt(level, title, Some(detail), &["OK"], cx);
+    cx.background_spawn(async move {
+        answer.await.ok();
+    })
+    .detach();
 }
 
 /// Is `dir` a directory the manifest-backed generate entries belong on --
@@ -964,6 +1125,31 @@ enum RunState {
     },
 }
 
+/// Whether a mutation may start, and what to say when it may not.
+enum OpReadiness {
+    Ready,
+    /// The version lock has not landed yet. Not a refusal -- the answer is
+    /// one `emd version` away.
+    Waiting,
+    /// It will not run: a run is already in flight, or the installed `emd`
+    /// is the wrong one. The payload is what to tell the user.
+    Blocked(String),
+}
+
+/// How often a queued delete re-reads the lock while it waits.
+const LOCK_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long it waits before giving up and saying so. Generous: what it is
+/// waiting on is one `emd version` child process, and the only cost of
+/// waiting is that the confirm appears late.
+const LOCK_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a delete says when the version check never came back.
+const LOCK_WAIT_TIMED_OUT: &str = concat!(
+    "emd has not reported its version yet, so nothing was deleted. ",
+    "Open the Emerald panel to see what the version check is doing, then delete again."
+);
+
 /// Which manifest the browser is listing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowseTab {
@@ -1066,6 +1252,12 @@ pub struct EmeraldPanel {
     _run_task: Option<Task<()>>,
     _confirm_task: Option<Task<()>>,
     _lock_task: Option<Task<()>>,
+    /// A delete that is waiting for the version lock to land
+    /// ([`EmeraldPanel::request_op_when_ready`]). Held so it is not dropped
+    /// the moment the deferred body that spawned it returns -- a dropped
+    /// `Task` is a cancelled one, which is the silence this whole path
+    /// exists to remove.
+    _wait_task: Option<Task<()>>,
 }
 
 impl EmeraldPanel {
@@ -1100,6 +1292,7 @@ impl EmeraldPanel {
             _run_task: None,
             _confirm_task: None,
             _lock_task: None,
+            _wait_task: None,
         }
     }
 
@@ -1107,12 +1300,26 @@ impl EmeraldPanel {
     /// worktree). MUST NOT run while the workspace itself is mid-update
     /// (it reads the workspace entity) -- see the deferral in `set_active`.
     fn refresh_root(&mut self, cx: &mut Context<Self>) {
-        self.project_root = self.root_override.clone().or_else(|| {
-            let workspace = self.workspace.as_ref()?.upgrade()?;
+        let discovered = self.workspace.as_ref().and_then(|workspace| {
+            let workspace = workspace.upgrade()?;
             let project = workspace.read(cx).project().clone();
             let worktree = project.read(cx).visible_worktrees(cx).next()?;
             Some(worktree.read(cx).abs_path().to_path_buf())
         });
+        self.adopt_root(discovered, cx);
+    }
+
+    /// The half of [`EmeraldPanel::refresh_root`] that never reads the
+    /// workspace entity, for a caller that has already resolved the
+    /// worktree root itself.
+    ///
+    /// **That caller is the delete interceptor's deferred body**, which
+    /// runs inside `workspace.update` (`Context::defer_in` re-enters it),
+    /// so a `refresh_root` from there would read a leased entity and take
+    /// the window down. `root_override` still wins, so the test hook means
+    /// the same thing whichever way the root arrived.
+    fn adopt_root(&mut self, project_root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.project_root = self.root_override.clone().or(project_root);
         // The worktree root is not necessarily the emerald project root;
         // walk up (inclusively) the way emerald's own `Project::discover`
         // does, and fall back to the worktree itself so a checkout with no
@@ -1211,6 +1418,93 @@ impl EmeraldPanel {
     /// clickable and an action that actually runs cannot disagree.
     fn mutations_blocked(&self) -> bool {
         self.running() || !lock::mutations_enabled(&self.lock)
+    }
+
+    /// [`EmeraldPanel::mutations_blocked`], but with the REASON attached --
+    /// what a caller needs when refusing silently is not an option.
+    ///
+    /// The controls in the dock can be `disabled(mutations_blocked())` and
+    /// leave it there: the banner above them is already explaining. A
+    /// delete arriving from the project panel has no banner in front of the
+    /// user, so it needs the words.
+    fn op_readiness(&self) -> OpReadiness {
+        if self.running() {
+            return OpReadiness::Blocked(
+                "Wait for the current emd run to finish, then delete again.".to_string(),
+            );
+        }
+        if self.lock == LockCheck::Unchecked {
+            return OpReadiness::Waiting;
+        }
+        match lock::lock_blocker(&self.lock) {
+            Some(detail) => OpReadiness::Blocked(detail),
+            None => OpReadiness::Ready,
+        }
+    }
+
+    /// [`EmeraldPanel::request_op`], for a caller that has just SUPPRESSED
+    /// something else -- the delete interceptor, whose claim already took
+    /// the stock prompt and the stock unlink away.
+    ///
+    /// **A silent return is not available here.** `request_op` has one for
+    /// a blocked mutation, and it is right for a dock whose buttons are
+    /// visibly disabled under a banner saying why; reached from a Delete
+    /// keystroke in the project panel it is a file that does not get
+    /// deleted, no prompt, no message, and no way to tell that from a bug.
+    ///
+    /// So the three answers are all spoken. The interesting one is
+    /// `Unchecked`: the lock only lands once the panel is USED, and this
+    /// delete may be the first use in the session ([`start_lock_poll`] was
+    /// started moments ago by the same deferred body), so the op waits for
+    /// the poll rather than being refused for a mismatch nobody has
+    /// established yet.
+    ///
+    /// [`start_lock_poll`]: EmeraldPanel::start_lock_poll
+    fn request_op_when_ready(
+        &mut self,
+        op: ManifestOp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.op_readiness() {
+            OpReadiness::Ready => self.request_op(op, window, cx),
+            OpReadiness::Blocked(detail) => {
+                explain(PromptLevel::Warning, CANT_DELETE_TITLE, &detail, window, cx)
+            }
+            OpReadiness::Waiting => {
+                self._wait_task = Some(cx.spawn_in(window, async move |this, cx| {
+                    let mut waited = std::time::Duration::ZERO;
+                    loop {
+                        match this.read_with(cx, |this, _| this.lock == LockCheck::Unchecked) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            // The panel is gone, and so is the window this
+                            // would have explained itself in.
+                            Err(_) => return,
+                        }
+                        if waited >= LOCK_WAIT_LIMIT {
+                            break;
+                        }
+                        cx.background_executor().timer(LOCK_WAIT_POLL).await;
+                        waited += LOCK_WAIT_POLL;
+                    }
+                    this.update_in(cx, |this, window, cx| match this.op_readiness() {
+                        OpReadiness::Ready => this.request_op(op, window, cx),
+                        OpReadiness::Blocked(detail) => {
+                            explain(PromptLevel::Warning, CANT_DELETE_TITLE, &detail, window, cx)
+                        }
+                        OpReadiness::Waiting => explain(
+                            PromptLevel::Warning,
+                            CANT_DELETE_TITLE,
+                            LOCK_WAIT_TIMED_OUT,
+                            window,
+                            cx,
+                        ),
+                    })
+                    .ok();
+                }));
+            }
+        }
     }
 
     /// Re-read the three manifests, and drop a selection that no longer
@@ -4645,19 +4939,25 @@ mod tests {
     }
 
     /// **The delete claim, decided from the path alone.** A manifest
-    /// entry's own source file maps to the `emd rm` for that entry; the
-    /// module directory maps to `emd rm module`; everything else -- the
-    /// `src/modules` bucket, a subdirectory of a module, an unmanaged
-    /// `.rs`, an asset -- is not ours and falls through to the stock
-    /// delete.
+    /// entry's own source file maps to the `emd rm` for that entry, and the
+    /// module directory to `emd rm module`. An unmanaged `.rs`, a module
+    /// index and anything under `assets/` are not ours and fall through to
+    /// the stock delete; the structural directories in between are claimed
+    /// but explained rather than run
+    /// ([`delete_route_for_explains_the_structural_directories`]).
     #[test]
-    fn delete_op_for_claims_only_manifest_managed_paths() {
+    fn delete_route_for_claims_only_manifest_managed_paths() {
         let dir = pathed_project();
         let root = dir.path();
         let op = |rel: &str| {
-            delete_op_for(&root.join(rel)).map(|(project_dir, op)| {
+            delete_route_for(&root.join(rel)).map(|(project_dir, route)| {
                 assert_eq!(project_dir, root, "{rel}");
-                op
+                match route {
+                    DeleteRoute::Op(op) => op,
+                    DeleteRoute::Explain { title, .. } => {
+                        panic!("{rel} routed to an explanation: {title}")
+                    }
+                }
             })
         };
 
@@ -4691,8 +4991,6 @@ mod tests {
         );
 
         for rel in [
-            "crates/game-core/src/modules",
-            "crates/game-core/src/modules/gameplay/components",
             "crates/game-core/src/modules/gameplay/mod.rs",
             "crates/game-core/src/main.rs",
             "assets/arena.wrld.toml",
@@ -4704,11 +5002,78 @@ mod tests {
 
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(outside.path().join("src/modules/gameplay")).unwrap();
-        assert_eq!(
-            delete_op_for(&outside.path().join("src/modules/gameplay")),
-            None,
+        assert!(
+            delete_route_for(&outside.path().join("src/modules/gameplay")).is_none(),
             "no emerald.toml above it, so there is no project to run emd in"
         );
+    }
+
+    /// **The structural directories.** `src/modules` and a module's
+    /// `components/`/`systems/`/`schedules/` buckets are not manifest
+    /// entries and `emd` has no command that removes one -- but deleting
+    /// them off disk guts the manifests just the same, so they are claimed
+    /// and explained rather than left to the stock delete.
+    ///
+    /// A module NAMED `components` is still a module: the module claim is
+    /// decided first, off the same three ancestors it always was.
+    #[test]
+    fn delete_route_for_explains_the_structural_directories() {
+        let dir = pathed_project();
+        let root = dir.path();
+        let explanation = |rel: &str| match delete_route_for(&root.join(rel)) {
+            Some((project_dir, DeleteRoute::Explain { title, detail })) => {
+                assert_eq!(project_dir, root, "{rel}");
+                format!("{title}\n{detail}")
+            }
+            other => panic!("{rel} should be explained, got {other:?}"),
+        };
+
+        assert!(
+            explanation("crates/game-core/src/modules").contains("holds every module"),
+            "the modules bucket names what it is"
+        );
+        for bucket in ["components", "systems", "schedules"] {
+            let said = explanation(&format!("crates/game-core/src/modules/gameplay/{bucket}"));
+            assert!(said.contains(bucket), "{bucket}: {said}");
+            assert!(said.contains("one at a time"), "{bucket}: {said}");
+        }
+
+        let module = root.join("crates/game-core/src/modules/components");
+        std::fs::create_dir_all(&module).unwrap();
+        assert_eq!(
+            delete_route_for(&module).map(|(_, route)| route),
+            Some(DeleteRoute::Op(ManifestOp::remove_module("components"))),
+            "a module named `components` is a module, not a bucket"
+        );
+    }
+
+    /// A module's generated index is never an `emd rm` target, even if a
+    /// manifest names it: `emd` strips those lines itself as part of
+    /// removing the entry, and `rm`-ing the index is not an operation it
+    /// has. Hand-edited manifests exist, so this is a guard, not a
+    /// restatement of what the fixtures happen to contain.
+    #[test]
+    fn delete_route_for_never_claims_a_module_index() {
+        let dir = pathed_project();
+        let root = dir.path();
+        let module = root.join("crates/game-core/src/modules/gameplay");
+        std::fs::write(module.join("lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("manifests/systems.toml"),
+            "version = 1\n\
+             [[system]]\nname = \"spawn_enemies\"\nmodule = \"gameplay\"\n\
+             path = \"crates/game-core/src/modules/gameplay/mod.rs\"\n\
+             [[system]]\nname = \"tick\"\nmodule = \"gameplay\"\n\
+             path = \"crates/game-core/src/modules/gameplay/lib.rs\"\n",
+        )
+        .unwrap();
+
+        for index in ["mod.rs", "lib.rs"] {
+            assert!(
+                delete_route_for(&module.join(index)).is_none(),
+                "{index} falls through to the stock delete"
+            );
+        }
     }
 
     /// The generate entries appear on the project root and `manifests/`,
@@ -4774,11 +5139,44 @@ mod tests {
     /// [`pathed_project`] behind a real workspace with a real
     /// [`ProjectPanel`] -- the fake fs mirrors the temp tree so the
     /// worktree scans and the panel has entries to select, while
-    /// [`delete_op_for`] reads the actual manifests through `std::fs`.
+    /// [`delete_route_for`] reads the actual manifests through `std::fs`.
     async fn delete_workspace<'a>(
         cx: &'a mut TestAppContext,
         root: &std::path::Path,
         runner: EmdRunner,
+    ) -> (
+        Entity<Project>,
+        WorktreeId,
+        Entity<EmeraldPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        delete_workspace_with_lock(
+            cx,
+            root,
+            runner,
+            LockCheck::Reached(EXPECTED_EMD_VERSION.to_string()),
+            settled_probe(),
+        )
+        .await
+    }
+
+    /// [`delete_workspace`] with the version lock -- and the binary probe
+    /// behind it -- in a chosen state.
+    ///
+    /// **The seeded lock is what the plain fixture hides.** A session where
+    /// the emerald dock was never shown has never run `emd version`, so its
+    /// lock is `Unchecked` and every mutation is gated; seeding
+    /// `Reached(EXPECTED)` everywhere would make "a delete from a cold
+    /// session" untestable. `probe` is the panel's REMEMBERED probe:
+    /// `settled_probe()` matches what `panel.probe` reports and so spends
+    /// no `emd version`, while `BinProbe::Unprobed` makes the poll's first
+    /// tick a real query the fake runner answers.
+    async fn delete_workspace_with_lock<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+        runner: EmdRunner,
+        lock: LockCheck,
+        probe: BinProbe,
     ) -> (
         Entity<Project>,
         WorktreeId,
@@ -4829,8 +5227,8 @@ mod tests {
                 .expect("init() adds the panel")
         });
         panel.update(cx, |panel, _| {
-            panel.lock = LockCheck::Reached(EXPECTED_EMD_VERSION.to_string());
-            panel.emd_probe = settled_probe();
+            panel.lock = lock;
+            panel.emd_probe = probe;
             panel.probe = Arc::new(settled_probe);
             panel.runner = runner;
         });
@@ -5069,6 +5467,269 @@ mod tests {
         assert!(
             calls.lock().unwrap().is_empty(),
             "an unclaimed path never reaches emd"
+        );
+    }
+
+    /// **The cold-session delete.** The lock only lands once something
+    /// USES the panel, and a user who has never opened the emerald dock has
+    /// never used it -- so this delete arrives with `lock ==
+    /// Unchecked`, which gates every mutation. The claim must not eat the
+    /// delete and then do nothing: the poll is started, the confirm waits
+    /// for it, and the run happens once the version is known.
+    #[gpui::test]
+    async fn test_deleting_with_an_unchecked_lock_still_asks_once_the_lock_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = pathed_project();
+        let (runner, calls, _reported, _trailer) = version_runner(EXPECTED_EMD_VERSION);
+        let (project, worktree_id, _panel, cx) = delete_workspace_with_lock(
+            cx,
+            dir.path(),
+            runner,
+            LockCheck::Unchecked,
+            BinProbe::Unprobed,
+        )
+        .await;
+
+        delete_from_project_panel(
+            &project,
+            worktree_id,
+            "crates/game-core/src/modules/gameplay/components/hero_unit.rs",
+            cx,
+        )
+        .await;
+        // The poll's first tick lands the version; the queued delete picks
+        // it up on its next check.
+        cx.executor().advance_clock(LOCK_WAIT_POLL * 2);
+        cx.run_until_parked();
+
+        let (message, _) = cx
+            .pending_prompt()
+            .expect("the emerald confirm goes up once the lock lands");
+        assert_eq!(message, "Remove the component gameplay/HeroUnit?");
+
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+
+        let calls = calls.lock().unwrap();
+        let rm = calls
+            .iter()
+            .find(|request| request.args.first().is_some_and(|arg| arg == "rm"))
+            .expect("the delete reached emd");
+        assert_eq!(
+            rm.args,
+            [
+                "rm",
+                "component",
+                "HeroUnit",
+                "--module",
+                "gameplay",
+                "--json"
+            ]
+        );
+        assert_eq!(rm.cwd, dir.path());
+    }
+
+    /// The other half of "never silent": a lock that will never allow the
+    /// run says so, in the banner's own words, and nothing is deleted --
+    /// not through `emd`, and not through the stock unlink the claim
+    /// suppressed.
+    #[gpui::test]
+    async fn test_deleting_with_an_unreachable_emd_explains_and_deletes_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = pathed_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let (project, worktree_id, _panel, cx) = delete_workspace_with_lock(
+            cx,
+            dir.path(),
+            runner,
+            LockCheck::Unreachable("emd: command not found".to_string()),
+            settled_probe(),
+        )
+        .await;
+
+        let file = dir
+            .path()
+            .join("crates/game-core/src/modules/gameplay/components/hero_unit.rs");
+        delete_from_project_panel(
+            &project,
+            worktree_id,
+            "crates/game-core/src/modules/gameplay/components/hero_unit.rs",
+            cx,
+        )
+        .await;
+
+        let (message, detail) = cx
+            .pending_prompt()
+            .expect("a refused delete explains itself");
+        assert!(message.contains("emd"), "{message}");
+        assert!(
+            detail.contains("emd: command not found"),
+            "the banner's own detail line: {detail}"
+        );
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a gated delete never reaches emd"
+        );
+        assert!(file.exists(), "and never unlinks the file either");
+    }
+
+    /// `src/modules` is not a module: `emd` has no command for it, and
+    /// unlinking it would take every module in the crate with it. It is
+    /// claimed so the stock delete cannot run, and answered with what to
+    /// do instead.
+    #[gpui::test]
+    async fn test_deleting_the_modules_folder_explains(cx: &mut TestAppContext) {
+        let dir = pathed_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let (project, worktree_id, _panel, cx) = delete_workspace(cx, dir.path(), runner).await;
+
+        let modules = dir.path().join("crates/game-core/src/modules");
+        delete_from_project_panel(&project, worktree_id, "crates/game-core/src/modules", cx).await;
+
+        let (message, detail) = cx.pending_prompt().expect("an explanation, not a delete");
+        assert!(
+            !message.contains("permanently delete"),
+            "the stock delete must not be what the user sees: {message}"
+        );
+        assert!(
+            detail.contains("holds every module"),
+            "it says what the folder is: {detail}"
+        );
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+
+        assert!(calls.lock().unwrap().is_empty(), "nothing is spawned");
+        assert!(modules.is_dir(), "and nothing is deleted");
+    }
+
+    /// Same for a module's `components/` bucket -- there is no `emd rm` for
+    /// "every component in this module", so the answer is the one-at-a-time
+    /// route rather than a silent unlink of files three manifests name.
+    #[gpui::test]
+    async fn test_deleting_a_modules_components_folder_explains(cx: &mut TestAppContext) {
+        let dir = pathed_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let (project, worktree_id, _panel, cx) = delete_workspace(cx, dir.path(), runner).await;
+
+        let components = dir
+            .path()
+            .join("crates/game-core/src/modules/gameplay/components");
+        delete_from_project_panel(
+            &project,
+            worktree_id,
+            "crates/game-core/src/modules/gameplay/components",
+            cx,
+        )
+        .await;
+
+        let (message, detail) = cx.pending_prompt().expect("an explanation, not a delete");
+        assert!(
+            !message.contains("permanently delete"),
+            "the stock delete must not be what the user sees: {message}"
+        );
+        assert!(
+            detail.contains("one at a time"),
+            "it says how to remove them instead: {detail}"
+        );
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+
+        assert!(calls.lock().unwrap().is_empty(), "nothing is spawned");
+        assert!(components.is_dir(), "and nothing is deleted");
+    }
+
+    /// **The interceptor's own seam, with a whole selection at once.**
+    ///
+    /// Not driven through the project panel: marking a SECOND row there
+    /// goes through upstream's `marked_entries`, which is private to that
+    /// crate and only grows under a shift-held `select_*` keystroke. What
+    /// `ProjectPanel::remove` hands the interceptor is exactly this vector
+    /// of paths, so this is the same call with the same argument.
+    async fn intercept_delete_of(
+        panel: &Entity<EmeraldPanel>,
+        worktree_id: WorktreeId,
+        rels: &[&str],
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool {
+        let workspace = panel
+            .read_with(cx, |panel, _| panel.workspace.clone())
+            .and_then(|workspace| workspace.upgrade())
+            .expect("the panel's workspace");
+        let paths = rels
+            .iter()
+            .map(|rel| project_path(worktree_id, rel))
+            .collect::<Vec<_>>();
+        let claimed = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.intercept_delete(&paths, window, cx)
+        });
+        cx.run_until_parked();
+        claimed
+    }
+
+    /// `emd` takes one item per run, so a selection holding two managed
+    /// entries is claimed whole and answered with both names -- a
+    /// half-claimed selection (two through `emd`, three through `unlink`,
+    /// from one keystroke) is the outcome this prevents. A selection with
+    /// nothing managed in it is still upstream's.
+    #[gpui::test]
+    async fn test_deleting_two_managed_files_explains_one_at_a_time(cx: &mut TestAppContext) {
+        let dir = pathed_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/gone"));
+        let (_project, worktree_id, panel, cx) = delete_workspace(cx, dir.path(), runner).await;
+
+        let component = dir
+            .path()
+            .join("crates/game-core/src/modules/gameplay/components/hero_unit.rs");
+        let system = dir
+            .path()
+            .join("crates/game-core/src/modules/gameplay/systems/spawn_enemies.rs");
+        let claimed = intercept_delete_of(
+            &panel,
+            worktree_id,
+            &[
+                "crates/game-core/src/modules/gameplay/components/hero_unit.rs",
+                "crates/game-core/src/modules/gameplay/systems/spawn_enemies.rs",
+            ],
+            cx,
+        )
+        .await;
+        assert!(claimed, "a selection with managed entries in it is ours");
+
+        let (_message, detail) = cx
+            .pending_prompt()
+            .expect("one explanation for the whole selection");
+        assert!(
+            detail.contains("component gameplay/HeroUnit"),
+            "both entries are named: {detail}"
+        );
+        assert!(
+            detail.contains("system gameplay/spawn_enemies"),
+            "both entries are named: {detail}"
+        );
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+
+        assert!(calls.lock().unwrap().is_empty(), "nothing is spawned");
+        assert!(component.exists() && system.exists(), "nothing is deleted");
+
+        assert!(
+            !intercept_delete_of(
+                &panel,
+                worktree_id,
+                &["crates/game-core/src/main.rs", "assets/arena.wrld.toml"],
+                cx,
+            )
+            .await,
+            "a selection with nothing managed in it falls through whole"
+        );
+        assert!(
+            cx.pending_prompt().is_none(),
+            "and this panel says nothing about it"
         );
     }
 

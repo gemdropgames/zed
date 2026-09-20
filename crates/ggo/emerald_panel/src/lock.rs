@@ -210,6 +210,26 @@ pub fn lock_message(check: &LockCheck) -> Option<String> {
     }
 }
 
+/// The whole banner as one block of prose, for a caller that has to say
+/// it somewhere there is no banner -- a prompt.
+///
+/// `None` exactly when [`mutations_enabled`] is true, so "is this delete
+/// allowed" and "what do we tell the user it isn't" are one question asked
+/// once. The lines are [`lock_message`], [`lock_detail`] and [`lock_hint`]
+/// in the order the banner stacks them: nothing is re-worded here, because
+/// a prompt that explained the drift differently from the panel showing it
+/// would read as two different problems.
+pub fn lock_blocker(check: &LockCheck) -> Option<String> {
+    if mutations_enabled(check) {
+        return None;
+    }
+    let lines = [lock_message(check), lock_detail(check), lock_hint(check)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// The banner's muted second line: the raw error behind an `Unreachable`,
 /// and nothing for any other state.
 pub fn lock_detail(check: &LockCheck) -> Option<String> {
