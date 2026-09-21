@@ -20,13 +20,17 @@ path = "src/ggo_map_panel.rs"
 # This crate is a LIBRARY, not a panel (the standalone map editor was
 # retired -- see the lib doc), so its dependency list is the paint
 # surface's own: gpui + ui + editor for the shared widgets, worldlib for
-# the document. Nothing here touches `workspace`, `project` or
-# `project_panel` any more -- a host owns the tab, the worktree and the
-# context menu.
+# the document, plus the three below that a CENTRED CARD needs
+# (`bind_modal`) -- `workspace` for the modal layer itself, `picker` +
+# `fuzzy` for its searchable list. Still nothing on `project` or
+# `project_panel`: a host owns the tab, the worktree and the context menu.
 [dependencies]
 editor.workspace = true
+fuzzy.workspace = true
 gpui.workspace = true
+picker.workspace = true
 ui.workspace = true
+workspace.workspace = true
 ggo-asset-formats.workspace = true # GGO
 ggo-worldlib.workspace = true # GGO
 ggo_common.workspace = true

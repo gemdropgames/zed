@@ -13,10 +13,19 @@
 //! **How a host plugs in.** Everything here is generic over a
 //! [`PaintHost`] -- a view that can hand out the session under the brush,
 //! recompose when the document moves, and own the two gpui entities a
-//! session cannot (the resize inputs and the terrain-name input, which are
-//! `Entity<Editor>` and so belong to a view). Nothing here reaches into a
-//! host's own state, which is what lets the standalone panel and the world
-//! panel mount the identical elements.
+//! session cannot (the resize inputs and the terrain rename input, which
+//! are `Entity<Editor>` and so belong to a view). Nothing here reaches
+//! into a host's own state, which is what lets the standalone panel and
+//! the world panel mount the identical elements.
+//!
+//! **What a host still has to route.** An inline terrain rename finishes
+//! on Enter or Escape by itself (the chip handles both on the focus path),
+//! but BLUR cannot be seen from here -- only the view that owns the editor
+//! entity can subscribe to it. A host should call
+//! [`PaintHost::commit_paint_terrain_rename`] from the terrain rename
+//! editor's `EditorEvent::Blurred`, the way `ggo_world_panel` already
+//! routes blur to its own `commit_rename`; until it does, clicking away
+//! from a half-typed rename abandons it rather than committing it.
 //!
 //! What is NOT here: the map canvas and the camera. Zoom, pan and
 //! hit-testing are the two hosts' genuinely different problems -- the
@@ -36,20 +45,27 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
     RenderImage, Styled, Window, bounds, div, fill, outline, point, px, size,
 };
+use ui::Tooltip;
 use ui::prelude::*;
-use ui::{ContextMenu, PopoverMenu, Tooltip};
+use workspace::{MultiWorkspace, Workspace};
 
 use ggo_worldlib::sprites::io;
 use ggo_worldlib::sprites::map_doc::palette_sel_rect;
 use ggo_worldlib::sprites::terrain;
 use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 
+use crate::bind_modal::BindTilesetModal;
 use crate::geom;
 use crate::paint_session::{MapTool, PaintSession};
 
 /// The tileset strip's height. Two rows of 16px tiles at
 /// [`geom::STRIP_ZOOM`] plus room to scroll a taller sheet.
 const STRIP_HEIGHT: Pixels = px(104.);
+
+/// How tall the terrain chip column gets before it scrolls -- about six
+/// chips, which leaves the sections under it on screen in the narrow paint
+/// column both hosts mount this in.
+const TERRAIN_LIST_MAX_HEIGHT: Pixels = px(168.);
 
 /// A view that hosts a [`PaintSession`] and can mount the shared paint
 /// widgets over it.
@@ -75,7 +91,9 @@ pub trait PaintHost: Render + Sized {
     fn paint_project_root(&self) -> Option<PathBuf>;
     /// The resize inputs, once the host has created them.
     fn paint_resize_fields(&self) -> Option<&ResizeFields>;
-    /// The terrain editor's name input, once the host has created it.
+    /// The editor the terrain chips' inline rename types into, once the
+    /// host has created it. One editor for the whole list: at most one
+    /// rename is ever in flight.
     fn paint_terrain_name(&self) -> Option<&Entity<Editor>>;
 
     /// Mutate the session, recompose if the closure reports the DOCUMENT
@@ -116,6 +134,98 @@ pub trait PaintHost: Render + Sized {
             edit(session, project_root.as_deref());
         }
         cx.notify();
+    }
+
+    /// Start the inline rename on terrain chip `index`: seed the name
+    /// editor from that chip and focus it.
+    ///
+    /// The editor is the one [`Self::paint_terrain_name`] already owns --
+    /// there is at most one rename in flight, so a second entity would buy
+    /// nothing. Focus goes through `window.defer` for
+    /// `ggo_world_panel::begin_rename`'s reason: this runs from the chip's
+    /// own mouse-down, and the host's root reclaims focus later in the
+    /// same dispatch, which would undo an inline focus.
+    fn begin_paint_terrain_rename(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self
+            .paint_session_mut()
+            .and_then(|session| session.begin_terrain_rename(index))
+        else {
+            return;
+        };
+        let Some(editor) = self.paint_terrain_name().cloned() else {
+            return;
+        };
+        editor.update(cx, |editor, cx| editor.set_text(name, window, cx));
+        let handle = editor.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        cx.notify();
+    }
+
+    /// Close an in-flight inline rename, writing the name editor's text
+    /// into the chip it was opened on.
+    ///
+    /// **A host must route both its commit action and the name editor's
+    /// `EditorEvent::Blurred` here** -- those are the two ways a rename
+    /// ends, and neither is visible from inside this crate. Calling it
+    /// with no rename in flight is a no-op, so routing both is safe.
+    fn commit_paint_terrain_rename(&mut self, cx: &mut Context<Self>) {
+        let name = terrain_name_text(self, cx);
+        self.edit_paint_terrains(cx, |session, root| {
+            session.commit_terrain_rename(name, root);
+        });
+    }
+
+    /// Ask before removing the selected terrain, naming the tile
+    /// assignments the removal takes with it (the fork's destructive
+    /// route), and remove only on confirm.
+    ///
+    /// [`PaintSession::remove_terrain`] stays the unguarded core, and an
+    /// inert removal never raises a prompt: `remove_terrain_prompt`
+    /// answers `None` when nothing is selected.
+    ///
+    /// `unsaved` is false because a terrain lives in the tileset's
+    /// sidecar, not in the map under the brush -- the open document is not
+    /// what is being destroyed.
+    fn request_remove_terrain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((message, cascade)) = self
+            .paint_session()
+            .and_then(PaintSession::remove_terrain_prompt)
+        else {
+            return;
+        };
+        let confirmed =
+            ggo_common::confirm_destructive_cascade(&message, &cascade, "Remove", false, window, cx);
+        cx.spawn(async move |this, cx| {
+            if !confirmed.await {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.edit_paint_terrains(cx, PaintSession::remove_terrain);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Raise the bind card, or -- with no workspace to raise it on -- say
+    /// so where the binding's other failures are already shown, rather
+    /// than leaving the button inert.
+    fn open_bind_tileset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match hosting_workspace(window, cx) {
+            Some(workspace) => open_bind_tileset_card(self, workspace, window, cx),
+            None => {
+                if let Some(session) = self.paint_session_mut() {
+                    session.tileset_error =
+                        Some("no workspace to open the tileset picker in".to_string());
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Apply the resize fields to the document. Explicit (the button, or
@@ -383,14 +493,70 @@ pub fn render_strip<V: PaintHost>(
 
 // ----------------------------------------------------------- bind picker
 
-/// The tileset picker: every `.til` under the session's asset root, one
-/// pick away from `MapOp::BindTileset`.
+/// The workspace the paint surface is drawn in, found through the window
+/// rather than asked of the host: the paint widgets are generic over
+/// [`PaintHost`] and a workspace handle is not one of the things a host
+/// has to supply, so taking it from the window keeps the trait as it was.
 ///
-/// The candidate walk is LAZY (inside the popover's menu builder) rather
-/// than a rendered-in list, for the same reason the world panel's layers
-/// rail makes it lazy: it is a recursive walk of the asset root and this
-/// element redraws on every notify. It also means a tileset created while
-/// the editor is open shows up on the next open of the picker.
+/// `None` only outside a real editor window (a bare test window whose root
+/// is not the workspace shell), which is the case
+/// [`PaintHost::open_bind_tileset`] reports rather than swallows.
+fn hosting_workspace(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
+    let multi = window.root::<MultiWorkspace>()??;
+    Some(multi.read(cx).workspace().clone())
+}
+
+/// Raise the bind card ([`BindTilesetModal`]) over `workspace`, opened on
+/// the tileset this map is bound to now.
+///
+/// The candidate walk stays LAZY in the sense that mattered for the
+/// popover it replaces -- it runs when the card opens, not on every
+/// repaint of this element -- so a tileset created while the editor is up
+/// shows on the next open.
+///
+/// **The card is raised from a `window.defer`, not inline.** `toggle_modal`
+/// reads the new modal back for its focus handle, and this runs from the
+/// trigger's own click listener with the host leased; raising it inline is
+/// the fork's usual re-entrancy panic (`GenerateModal`'s deferred toggle,
+/// for the same reason). Everything the card needs is gathered here, where
+/// the host IS readable, and handed in.
+pub fn open_bind_tileset_card<V: PaintHost>(
+    host: &mut V,
+    workspace: Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) {
+    let Some(session) = host.paint_session() else {
+        return;
+    };
+    let root = session.root.clone();
+    let bound = session.store.state().til_path;
+    let choices = io::list_tilesets(&root);
+    // Open on the current binding when it is still in the list, so the
+    // preview starts on the sheet the cells actually mean.
+    let selected = choices.iter().position(|rel| *rel == bound).unwrap_or(0);
+    let weak = cx.weak_entity();
+    let bind: crate::bind_modal::BindCallback = Rc::new(move |til_rel, cx| {
+        weak.update(cx, |this: &mut V, cx| this.bind_paint_tileset(til_rel, cx))
+            .ok();
+    });
+    window.defer(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            // `toggle_modal` CLOSES an open card of the same type rather
+            // than replacing it, which would leave the click looking like
+            // it did nothing.
+            if workspace.active_modal::<BindTilesetModal>(cx).is_some() {
+                workspace.hide_modal(window, cx);
+            }
+            workspace.toggle_modal(window, cx, |window, cx| {
+                BindTilesetModal::new(root, choices, selected, bind, window, cx)
+            });
+        });
+    });
+}
+
+/// The bind control: the bound tileset's rel as a button that opens the
+/// bind card ([`open_bind_tileset_card`]).
 ///
 /// Carries [`PaintSession::tileset_error`] beside it, but only while a
 /// tileset IS bound -- that state is a REFUSED REBIND, whose reason has
@@ -406,44 +572,24 @@ pub fn render_bind_picker<V: PaintHost>(
     } else {
         bound
     };
-    let root = session.root.clone();
     let rebind_error = session
         .tileset
         .is_some()
         .then_some(session.tileset_error.as_ref())
         .flatten();
-    let weak = cx.weak_entity();
-    let picker = PopoverMenu::new("ggo-map-bind-menu")
-        .trigger(Button::new("ggo-map-bind", label).label_size(LabelSize::XSmall))
-        .menu(move |window, cx| {
-            let tilesets = io::list_tilesets(&root);
-            let weak = weak.clone();
-            Some(ContextMenu::build(
-                window,
-                cx,
-                move |mut menu, _window, _cx| {
-                    for til in tilesets {
-                        let weak = weak.clone();
-                        menu = menu.entry(
-                            SharedString::from(til.clone()),
-                            None,
-                            move |_window, cx| {
-                                let til = til.clone();
-                                weak.update(cx, |this: &mut V, cx| {
-                                    this.bind_paint_tileset(til, cx)
-                                })
-                                .ok();
-                            },
-                        );
-                    }
-                    menu
-                },
-            ))
-        });
     h_flex()
         .gap_1()
         .flex_wrap()
-        .child(picker)
+        .child(
+            div().debug_selector(|| "ggo-map-bind".into()).child(
+                Button::new("ggo-map-bind", label)
+                    .label_size(LabelSize::XSmall)
+                    .tooltip(Tooltip::text("Pick the tileset this map's cells index"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_bind_tileset(window, cx)),
+                    ),
+            ),
+        )
         .children(rebind_error.map(|e| {
             ggo_common::CopyableText::new("ggo-map-tileset-error-copy", e.clone())
                 .size(LabelSize::XSmall)
@@ -591,8 +737,9 @@ fn size_field<V: 'static>(
 // -------------------------------------------------------- terrain editor
 
 /// The autotile terrain editor, shown while the Terrain tool is active:
-/// the terrain list with add/rename/remove, the 3x3 neighbour pad that
-/// drafts a mask, and the selected terrain's labelled tiles.
+/// Add over a scrolling list of terrain chips that each carry their own
+/// rename and remove, the 3x3 neighbour pad that drafts a mask, and the
+/// selected terrain's labelled tiles.
 ///
 /// `None` under any other tool -- it is a lot of surface to keep on screen
 /// for a brush that will not use it.
@@ -600,7 +747,9 @@ fn size_field<V: 'static>(
 /// `name_editor` is passed rather than read back off the host because the
 /// host is LEASED for the duration of its own render; the value comes off
 /// [`PaintHost::paint_terrain_name`] at the call site, where it is still
-/// reachable.
+/// reachable. It is drawn in place of ONE chip's label -- the one being
+/// renamed -- rather than as a shared field above the list, so the field
+/// says which terrain it is about.
 pub fn render_terrain_editor<V: PaintHost>(
     session: &PaintSession,
     name_editor: Option<&Entity<Editor>>,
@@ -612,15 +761,6 @@ pub fn render_terrain_editor<V: PaintHost>(
     let selected = session.terrain.and_then(|i| session.terrains.get(i));
     let anchor = session.anchor_tile();
     let mask = session.mask_draft;
-    let name_field = name_editor.map(|editor| {
-        div()
-            .w(px(120.))
-            .px_1()
-            .border_1()
-            .border_color(cx.theme().colors().border_variant)
-            .rounded_sm()
-            .child(editor.clone())
-    });
     // Rows of the 3x3 neighbour pad; the centre is the anchor tile.
     let pad = [
         [
@@ -642,48 +782,35 @@ pub fn render_terrain_editor<V: PaintHost>(
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                h_flex()
-                    .gap_1()
-                    .flex_wrap()
-                    .children(name_field)
-                    .child(
-                        Button::new("ggo-map-terrain-add", "Add")
-                            .disabled(session.tileset.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let name = terrain_name_text(this, cx);
-                                this.edit_paint_terrains(cx, |session, root| {
-                                    session.add_terrain(name, root)
-                                });
-                            })),
-                    )
-                    .child(
-                        Button::new("ggo-map-terrain-rename", "Rename")
-                            .disabled(selected.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let name = terrain_name_text(this, cx);
-                                this.edit_paint_terrains(cx, |session, root| {
-                                    session.rename_terrain(name, root)
-                                });
-                            })),
-                    )
-                    .child(
-                        Button::new("ggo-map-terrain-remove", "Remove")
-                            .disabled(selected.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.edit_paint_terrains(cx, PaintSession::remove_terrain);
-                            })),
-                    )
-                    .children(session.terrains.iter().enumerate().map(|(i, t)| {
-                        Button::new(("ggo-map-terrain", i), t.name.clone())
-                            .toggle_state(session.terrain == Some(i))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_paint_session(cx, |session| {
-                                    session.select_terrain(i);
-                                    false
-                                });
-                            }))
-                    })),
+                h_flex().child(
+                    Button::new("ggo-map-terrain-add", "Add")
+                        .disabled(session.tileset.is_none())
+                        .tooltip(Tooltip::text("Add a terrain and name it"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let Some(session) = this.paint_session() else {
+                                return;
+                            };
+                            let (name, before) =
+                                (session.new_terrain_name(), session.terrains.len());
+                            this.edit_paint_terrains(cx, |session, root| {
+                                session.add_terrain(name, root)
+                            });
+                            // Only when the add actually landed -- a
+                            // refused one would otherwise open the rename
+                            // on the LAST existing chip.
+                            let Some(index) = this
+                                .paint_session()
+                                .map(|session| session.terrains.len())
+                                .filter(|after| *after > before)
+                                .and_then(|after| after.checked_sub(1))
+                            else {
+                                return;
+                            };
+                            this.begin_paint_terrain_rename(index, window, cx);
+                        })),
+                ),
             )
+            .child(render_terrain_chips(session, name_editor, cx))
             .child(
                 h_flex()
                     .gap_2()
@@ -771,6 +898,130 @@ pub fn render_terrain_editor<V: PaintHost>(
             }))
             .into_any_element(),
     )
+}
+
+/// The terrain list, one chip per terrain with its own Rename and Remove
+/// (the header above it keeps only Add): a per-item action belongs on the
+/// item, not on a header that has to be told which item it means.
+///
+/// Stacks and SCROLLS rather than wrapping. The paint column is one narrow
+/// strip with the neighbour pad, the assignment list, the strip picker and
+/// the resize fields below this, and a wrapped row of chips grows without
+/// limit -- enough terrains and it pushes all of them off the bottom.
+fn render_terrain_chips<V: PaintHost>(
+    session: &PaintSession,
+    name_editor: Option<&Entity<Editor>>,
+    cx: &mut Context<V>,
+) -> gpui::AnyElement {
+    let selected_background = cx.theme().colors().element_selected;
+    let field_border = cx.theme().colors().border_variant;
+    let renaming = session.terrain_rename;
+    v_flex()
+        .id("ggo-map-terrain-list")
+        .gap_0p5()
+        .min_h_0()
+        .max_h(TERRAIN_LIST_MAX_HEIGHT)
+        .overflow_y_scroll()
+        .children(session.terrains.iter().enumerate().map(|(index, terrain)| {
+            let label = match (renaming == Some(index), name_editor) {
+                (true, Some(editor)) => div()
+                    .debug_selector(|| "ggo-map-terrain-rename-editor".into())
+                    .w_full()
+                    .px_1()
+                    .border_1()
+                    .border_color(field_border)
+                    .rounded_sm()
+                    // Enter and Escape are handled HERE rather than left
+                    // to the host: the rename editor is a descendant of
+                    // this div, so unhandled keys reach it on the focus
+                    // path, and that makes the rename finishable without
+                    // every host having to bind an action for it. Blur
+                    // still needs the host
+                    // ([`PaintHost::commit_paint_terrain_rename`]) --
+                    // only the owner of the entity can subscribe to it.
+                    .on_key_down(cx.listener(
+                        |this, event: &gpui::KeyDownEvent, _window, cx| {
+                            match event.keystroke.key.as_str() {
+                                "enter" => this.commit_paint_terrain_rename(cx),
+                                "escape" => this.update_paint_session(cx, |session| {
+                                    session.cancel_terrain_rename();
+                                    false
+                                }),
+                                _ => {}
+                            }
+                        },
+                    ))
+                    .child(editor.clone())
+                    .into_any_element(),
+                _ => Label::new(terrain.name.clone())
+                    .size(LabelSize::Small)
+                    .into_any_element(),
+            };
+            h_flex()
+                .gap_0p5()
+                .items_center()
+                .child(
+                    h_flex()
+                        .id(("ggo-map-terrain", index))
+                        .debug_selector(move || format!("ggo-map-terrain-{index}"))
+                        .flex_1()
+                        .min_w_0()
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(session.terrain == Some(index), |this| {
+                            this.bg(selected_background)
+                        })
+                        .child(label)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                if event.click_count >= 2 {
+                                    this.begin_paint_terrain_rename(index, window, cx);
+                                    return;
+                                }
+                                this.update_paint_session(cx, |session| {
+                                    session.select_terrain(index);
+                                    false
+                                });
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || format!("ggo-map-terrain-rename-{index}"))
+                        .child(
+                            IconButton::new(("ggo-map-terrain-rename", index), IconName::Pencil)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Rename terrain"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_paint_terrain_rename(index, window, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || format!("ggo-map-terrain-remove-{index}"))
+                        .child(
+                            IconButton::new(("ggo-map-terrain-remove", index), IconName::Trash)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Remove terrain"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    // Select first: the prompt and the
+                                    // removal both read the SELECTED
+                                    // terrain, so the chip that was
+                                    // clicked has to become it before
+                                    // either of them looks.
+                                    this.update_paint_session(cx, |session| {
+                                        session.select_terrain(index);
+                                        false
+                                    });
+                                    this.request_remove_terrain(window, cx);
+                                })),
+                        ),
+                )
+        }))
+        .into_any_element()
 }
 
 /// The terrain name input's trimmed text -- what Add and Rename name a

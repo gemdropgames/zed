@@ -150,6 +150,12 @@ pub struct PaintSession {
     pub terrains: Vec<Terrain>,
     /// Index into `terrains` the Terrain tool paints with.
     pub terrain: Option<usize>,
+    /// The chip whose label is currently an inline rename editor, if any.
+    /// Held as an INDEX rather than riding on `terrain` because the chip
+    /// being renamed and the chip being painted with are separate choices
+    /// -- selecting another terrain mid-rename must not redirect the
+    /// commit (`commit_terrain_rename`).
+    pub terrain_rename: Option<usize>,
     /// The sidecar key for saving terrains; `None` outside the worktree.
     pub til_meta_rel: Option<String>,
     /// The 8-neighbour mask the terrain editor assigns next.
@@ -181,6 +187,7 @@ impl PaintSession {
             paint_erase: false,
             terrains: loaded.tileset_meta.terrains,
             terrain: None,
+            terrain_rename: None,
             til_meta_rel: loaded.til_meta_rel,
             mask_draft: 0,
             terrain_error: None,
@@ -681,6 +688,7 @@ impl PaintSession {
         self.terrains = meta.terrains;
         self.til_meta_rel = meta_rel;
         self.terrain = None;
+        self.terrain_rename = None;
         self.terrain_error = None;
     }
 
@@ -691,6 +699,18 @@ impl PaintSession {
     pub fn anchor_tile(&self) -> Option<u16> {
         let cell = self.fill_cell();
         (self.tileset.is_some() && cell != CELL_BLANK).then(|| unpack_cell(cell).tile)
+    }
+
+    /// The name Add gives a terrain, now that there is no name field in
+    /// front of it: the first `terrain N` no existing chip is using. The
+    /// user renames it inline straight afterwards
+    /// ([`Self::begin_terrain_rename`]); this only has to be unique,
+    /// because the sidecar keys terrains by name.
+    pub fn new_terrain_name(&self) -> String {
+        (1..)
+            .map(|n| format!("terrain {n}"))
+            .find(|candidate| !self.terrains.iter().any(|t| &t.name == candidate))
+            .unwrap_or_else(|| "terrain".to_string())
     }
 
     /// Add a terrain and select it. An empty name is refused (the sidecar
@@ -707,23 +727,69 @@ impl PaintSession {
         self.save_terrains(project_root);
     }
 
-    pub fn rename_terrain(&mut self, name: String, project_root: Option<&Path>) {
-        if name.is_empty() {
-            return;
-        }
-        let Some(terrain) = self.terrain.and_then(|i| self.terrains.get_mut(i)) else {
-            return;
-        };
-        terrain.name = name;
-        self.save_terrains(project_root);
-    }
-
     pub fn remove_terrain(&mut self, project_root: Option<&Path>) {
         let Some(index) = self.terrain.take().filter(|i| *i < self.terrains.len()) else {
             return;
         };
+        self.terrain_rename = None;
         self.terrains.remove(index);
         self.save_terrains(project_root);
+    }
+
+    /// What the destructive prompt in front of [`Self::remove_terrain`]
+    /// asks, and what it has to warn the removal takes with it: the tile
+    /// assignments, which live only in this terrain and are the work a
+    /// user would not want to redo. `None` when nothing is selected, i.e.
+    /// when the removal would be inert anyway.
+    pub fn remove_terrain_prompt(&self) -> Option<(String, Vec<String>)> {
+        let index = self.terrain?;
+        let terrain = self.terrains.get(index)?;
+        let message = format!("Remove terrain {}?", terrain.name);
+        let cascade = match terrain.tiles.len() {
+            0 => vec![],
+            1 => vec!["1 tile assignment".to_string()],
+            n => vec![format!("{n} tile assignments")],
+        };
+        Some((message, cascade))
+    }
+
+    /// Open the inline rename on chip `index`, returning the name to seed
+    /// the editor with. `None` (and no rename opened) when the index has
+    /// no terrain.
+    pub fn begin_terrain_rename(&mut self, index: usize) -> Option<String> {
+        let name = self.terrains.get(index)?.name.clone();
+        self.terrain_rename = Some(index);
+        Some(name)
+    }
+
+    pub fn cancel_terrain_rename(&mut self) {
+        self.terrain_rename = None;
+    }
+
+    /// Close the inline rename, writing `name` into the chip it was opened
+    /// on. Returns whether a name actually changed hands, so a host can
+    /// skip the sidecar write an abandoned rename would otherwise cost.
+    ///
+    /// An empty (or all-whitespace) name CANCELS rather than clearing:
+    /// the sidecar keys terrains by name, so `""` is not a name a terrain
+    /// can have -- the same refusal [`Self::add_terrain`] makes.
+    pub fn commit_terrain_rename(&mut self, name: String, project_root: Option<&Path>) -> bool {
+        let Some(index) = self.terrain_rename.take() else {
+            return false;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(terrain) = self.terrains.get_mut(index) else {
+            return false;
+        };
+        if terrain.name == name {
+            return false;
+        }
+        terrain.name = name;
+        self.save_terrains(project_root);
+        true
     }
 
     /// Select terrain `index`, or deselect when it is out of range.
@@ -1495,5 +1561,116 @@ mod tests {
             "fx.til has no sidecar, so it is back to the default layout"
         );
         assert!(session.terrains.is_empty());
+    }
+
+    /// The remove-terrain prompt's own text and cascade line, and that the
+    /// removal itself is still the unguarded core the prompt calls.
+    #[test]
+    fn a_terrain_removal_names_its_tile_assignments_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        assert_eq!(
+            session.remove_terrain_prompt(),
+            None,
+            "nothing selected, nothing to ask about"
+        );
+
+        session.add_terrain("grass".to_string(), Some(root));
+        assert_eq!(
+            session.remove_terrain_prompt(),
+            Some(("Remove terrain grass?".to_string(), vec![])),
+            "a terrain with no tiles cascades to nothing"
+        );
+
+        session.terrains[0].assign(0, 0);
+        assert_eq!(
+            session.remove_terrain_prompt(),
+            Some((
+                "Remove terrain grass?".to_string(),
+                vec!["1 tile assignment".to_string()]
+            ))
+        );
+        session.terrains[0].assign(1, terrain::EAST);
+        assert_eq!(
+            session.remove_terrain_prompt(),
+            Some((
+                "Remove terrain grass?".to_string(),
+                vec!["2 tile assignments".to_string()]
+            ))
+        );
+
+        session.remove_terrain(Some(root));
+        assert!(session.terrains.is_empty(), "the core still removes");
+        assert_eq!(session.terrain, None);
+    }
+
+    /// The inline rename: begin seeds from the chip that was clicked,
+    /// commit writes that INDEX (not whatever is selected), and an empty
+    /// name cancels rather than clearing the name.
+    #[test]
+    fn an_inline_terrain_rename_commits_by_index_and_empty_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        session.add_terrain("grass".to_string(), Some(root));
+        session.add_terrain("stone".to_string(), Some(root));
+
+        assert_eq!(session.begin_terrain_rename(5), None, "out of range");
+        assert_eq!(session.terrain_rename, None);
+
+        assert_eq!(session.begin_terrain_rename(0), Some("grass".to_string()));
+        assert_eq!(session.terrain_rename, Some(0));
+        session.select_terrain(1);
+        assert!(session.commit_terrain_rename("dirt".to_string(), Some(root)));
+        assert_eq!(session.terrains[0].name, "dirt", "the RENAMED chip, not the selected one");
+        assert_eq!(session.terrains[1].name, "stone");
+        assert_eq!(session.terrain_rename, None);
+
+        assert!(
+            !session.commit_terrain_rename("x".to_string(), Some(root)),
+            "no rename in flight"
+        );
+
+        session.begin_terrain_rename(1);
+        assert!(!session.commit_terrain_rename("   ".to_string(), Some(root)));
+        assert_eq!(session.terrains[1].name, "stone", "empty cancels");
+        assert_eq!(session.terrain_rename, None);
+
+        session.begin_terrain_rename(1);
+        session.cancel_terrain_rename();
+        assert_eq!(session.terrain_rename, None);
+
+        // The sidecar carries the committed name, not the seeded one.
+        let meta = load_tileset_meta(root, "tiles/fx.til");
+        assert_eq!(
+            meta.terrains.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["dirt", "stone"]
+        );
+    }
+
+    /// Add has no name field in front of it any more, so the session has
+    /// to supply one that does not collide with a chip already there.
+    #[test]
+    fn a_new_terrain_gets_the_first_unused_default_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        bound_fixture(root);
+
+        let mut session = PaintSession::load(root, "maps/m.map", root).unwrap();
+        assert_eq!(session.new_terrain_name(), "terrain 1");
+        session.add_terrain(session.new_terrain_name(), Some(root));
+        assert_eq!(session.new_terrain_name(), "terrain 2");
+        session.add_terrain("terrain 2".to_string(), Some(root));
+        session.add_terrain("terrain 4".to_string(), Some(root));
+        assert_eq!(
+            session.new_terrain_name(),
+            "terrain 3",
+            "the first unused number, not one past the end"
+        );
     }
 }

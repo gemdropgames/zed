@@ -34,7 +34,11 @@
 //! * [`paint_ui`] -- the shared gpui widgets (tool rail, stamp controls,
 //!   strip picker, terrain editor, resize fields), generic over a
 //!   [`paint_ui::PaintHost`].
+//! * [`bind_modal`] -- the one piece that is not a widget in a host's
+//!   column: the "Bind tileset…" card, raised on the window's own modal
+//!   layer by [`paint_ui::open_bind_tileset_card`].
 
+pub mod bind_modal;
 mod geom;
 pub mod loader;
 pub mod paint_session;

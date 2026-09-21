@@ -189,6 +189,17 @@ pub fn load_tileset(
     })
 }
 
+/// The bind card's preview of `til_rel`: the tileset's own strip, at the
+/// layout [`load_tileset`] resolves for it.
+///
+/// `None` for everything that is not a readable tileset -- an unbound rel,
+/// a missing file, a sheet that will not decode -- because the card's job
+/// there is to say "no preview", not to explain the failure of a binding
+/// the user has not made yet.
+pub fn compose_preview(root: &Path, til_rel: &str) -> Option<Arc<RenderImage>> {
+    compose_strip(&load_tileset(root, til_rel, None).ok()?)
+}
+
 /// The asset-root-relative stem `io::compose_map_rgba` keys on: `rel`
 /// minus its (case-insensitive) `.map` suffix. Every OTHER worldlib map
 /// entry point takes the full rel; only the shared compose takes a stem
@@ -262,7 +273,7 @@ mod tests {
     }
     use ggo_worldlib::sprites::map_doc::{CELL_BLANK, MapDocStore, pack_cell};
     use ggo_worldlib::sprites::palette565::PAL_SLOTS;
-    use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+    use ggo_worldlib::sprites::tileset_doc::{TILE_PIXELS, TILE_PX};
 
     fn write_tileset(root: &Path, stem: &str, tiles: usize) {
         let mut indices = vec![0u8; tiles * TILE_PIXELS];
@@ -351,6 +362,28 @@ mod tests {
             io::compose_map_rgba(root, "level").unwrap().rgba.to_vec(),
             before,
             "the disk compose still shows the SAVED document"
+        );
+    }
+
+    #[test]
+    fn a_bind_card_preview_composes_a_real_tileset_and_declines_anything_else() {
+        use ggo_worldlib::sprites::palette565::PAL_SLOTS;
+        use ggo_worldlib::sprites::tileset_doc::TILE_PIXELS;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let indices = vec![1u8; 2 * TILE_PIXELS];
+        let mut palette = [0u16; PAL_SLOTS];
+        palette[1] = 0xF800;
+        io::save_tileset(root, "tiles/fx.til", &indices, 2, &palette).unwrap();
+
+        let composed = compose_preview(root, "tiles/fx.til").expect("the fixture composes");
+        assert_eq!(composed.size(0).width.0 as usize, 2 * TILE_PX);
+
+        assert!(compose_preview(root, "").is_none(), "unbound");
+        assert!(
+            compose_preview(root, "tiles/missing.til").is_none(),
+            "a rel with no file behind it"
         );
     }
 }

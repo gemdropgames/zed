@@ -7605,12 +7605,15 @@ name = "ggo_map_panel"
 version = "0.1.0"
 dependencies = [
  "editor",
+ "fuzzy",
  "ggo-asset-formats",
  "ggo-worldlib",
  "ggo_common",
  "gpui",
+ "picker",
  "tempfile",
  "ui",
+ "workspace",
 ]
 
 [[package]]
@@ -7725,6 +7728,7 @@ dependencies = [
  "log",
  "path",
  "project",
+ "project_panel",
  "remote_connection",
  "serde",
  "serde_json",
