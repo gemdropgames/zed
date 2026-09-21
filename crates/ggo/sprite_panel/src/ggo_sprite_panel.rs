@@ -31,14 +31,17 @@
 //! clicking a `.spr` there routes here through [`intercept_sprite_open`],
 //! and the project panel's context menu routes the file ops and the two
 //! "New …" entries here as well ([`contribute_sprite_menu`]); the panel
-//! has no picker of its own. The two entries that need input a
-//! `window.prompt` cannot collect -- which tileset to bind, and the typed
-//! new name -- raise a [`PanelForm`] here rather than a dialog, per the
-//! spec's rule that forms live in the panel that owns the domain.
+//! has no picker of its own. The input a `window.prompt` cannot collect
+//! is raised in-process rather than as a dialog: a typed new name
+//! becomes a [`PanelForm`] bar in the panel, and the tileset a new
+//! sprite binds to becomes a [`NewSpriteModal`] card over the window --
+//! that one needs room for the art the choice is actually made by.
 
 mod editor_meta;
 mod edits;
 mod loader;
+mod new_sprite_modal;
+pub use new_sprite_modal::NewSpriteModal;
 mod sprite_item;
 pub use sprite_item::SpriteEditorItem;
 mod playback;
@@ -449,7 +452,7 @@ fn contribute_sprite_menu(
 
 /// The "New Sprite…"/"New Metasprite…" entries' handler: seed the project
 /// panel's inline name editor (New File's UX) in the clicked directory;
-/// the commit reveals the sprite panel with the tileset-binding form,
+/// the commit opens a sprite tab and raises the tileset-binding card,
 /// name already fixed. Named for the same reason as
 /// [`duplicate_sprite_handler`].
 fn new_sprite_handler(
@@ -493,8 +496,8 @@ fn new_sprite_validate(dir_abs: PathBuf) -> impl Fn(&str) -> Option<String> + 's
     }
 }
 
-/// The inline sprite commit: reveal + focus the sprite panel and open its
-/// tileset-binding form with the typed name fixed -- the binding still
+/// The inline sprite commit: open a fresh sprite tab and raise its
+/// tileset-binding card with the typed name fixed -- the binding still
 /// needs choosing, see [`create_sprite`] on why.
 fn new_sprite_commit(
     workspace: WeakEntity<Workspace>,
@@ -516,7 +519,7 @@ fn new_sprite_commit(
 /// run `f` on its inner panel -- the item-era replacement for
 /// `ggo_common::panel_entry_handler` (which reveals a dock panel that no
 /// longer exists). `target_rel: None` always creates a fresh EMPTY item
-/// (the "New Sprite…" form's host -- its document doesn't exist yet).
+/// (the "New Sprite…" card's host -- its document doesn't exist yet).
 fn sprite_item_entry_handler(
     workspace: WeakEntity<Workspace>,
     target_rel: Option<String>,
@@ -746,7 +749,7 @@ const NEW_SPRITE_TILES: u8 = 2;
 /// continues the same sequence.
 const NEW_METASPRITE_CLIP: &str = "clip1";
 
-/// One row of the new-sprite form's tileset dropdown: a `.til` under the
+/// One row of [`NewSpriteModal`]'s tileset picker: a `.til` under the
 /// asset root, plus **the other sprites that already bind it**
 /// (`io::scan_til_sharers`).
 ///
@@ -773,17 +776,6 @@ struct TilesetChoice {
 }
 
 impl TilesetChoice {
-    /// The dropdown row's text: the rel, plus who already uses it.
-    fn label(&self) -> String {
-        match self.sharers.split_first() {
-            None => self.rel.clone(),
-            Some((first, [])) => format!("{} (used by {first})", self.rel),
-            Some((first, rest)) => {
-                format!("{} (used by {first} +{} more)", self.rel, rest.len())
-            }
-        }
-    }
-
     /// The inline warning shown while this row is the selection, or `None`
     /// when binding it shares nothing.
     fn share_warning(&self) -> Option<String> {
@@ -820,7 +812,7 @@ impl TilesetChoice {
 /// skipped rather than failing the whole listing. `til_path` comes back
 /// RESOLVED, so it is directly comparable to `io::list_tilesets`' rels.
 ///
-/// Cost: one `io::open_sprite` per sprite, run ONCE when the form opens (a
+/// Cost: one `io::open_sprite` per sprite, run ONCE when the card opens (a
 /// menu action), never per render.
 fn tileset_owners(root: &Path) -> HashMap<String, Vec<String>> {
     let mut owners: HashMap<String, Vec<String>> = HashMap::new();
@@ -844,7 +836,7 @@ fn tileset_choices(root: &Path) -> Vec<TilesetChoice> {
         .collect()
 }
 
-/// Which row a freshly opened form starts on: **the first tileset nobody
+/// Which row a freshly opened card starts on: **the first tileset nobody
 /// is using yet**, falling back to the first row when every tileset is
 /// already bound by some sprite (or there are none).
 ///
@@ -884,9 +876,8 @@ fn default_tileset_choice(choices: &[TilesetChoice]) -> usize {
 /// more, which is exactly the ggo-ide dependency this task exists to end.
 ///
 /// So: nothing is guessed, and nothing is written until a tileset has
-/// been chosen -- the choice is made in the panel's form (spec: forms
-/// live in the panel, the menu only routes), and this function is only
-/// reached once it has been.
+/// been chosen -- the choice is made in [`NewSpriteModal`] (the menu only
+/// routes), and this function is only reached once it has been.
 ///
 /// **Divergence from ggo-ide**, worth stating rather than leaving silent:
 /// its own New Sprite (`pages/assets/sprite.rs:125-171`) wrote a PRIVATE
@@ -937,6 +928,41 @@ fn new_sprite_rel(dir_rel: &str, typed: &str) -> Result<String, String> {
     } else {
         format!("{}/{file}", dir_rel.trim_end_matches('/'))
     })
+}
+
+/// What a [`SpritePanel::confirm_new_binding`] run ended as -- three
+/// outcomes rather than a `Result`, because the card treats a cancelled
+/// unsaved-edits prompt (stay up, say nothing) differently from a failed
+/// write (stay up, show why).
+pub(crate) enum NewSpriteOutcome {
+    Created,
+    Cancelled,
+    Failed(String),
+}
+
+/// The binding card's preview for `til_rel`: its saved reference sheet
+/// composed over the pool a new sprite would adopt -- the layout the art
+/// was imported in -- or, when there is no usable sheet, the
+/// deduplicated pool strip the tile picker shows.
+///
+/// The `SpriteState` is built exactly the way [`create_sprite`] builds
+/// it, so what the card shows is what binding would actually produce.
+/// Blocking (two file reads plus a compose), so callers run it off the UI
+/// thread.
+pub(crate) fn compose_tileset_preview(root: &Path, til_rel: &str) -> Option<Arc<RenderImage>> {
+    let tileset = io::open_tileset(root, til_rel).ok()?;
+    if tileset.tile_count == 0 {
+        return None;
+    }
+    let mut state = blank_sprite_state(NEW_SPRITE_TILES, NEW_SPRITE_TILES).ok()?;
+    state.pool = pack_indices_to_til(&tileset.indices, tileset.tile_count);
+    state.tile_count = tileset.tile_count;
+    state.palette = tileset.palette;
+    let strip = reference_sheet::load(root, til_rel)
+        .filter(|sheet| sheet.is_valid_for(state.tile_count))
+        .and_then(|sheet| loader::compose_reference_strip(&state, &sheet))
+        .or_else(|| loader::compose_pool_strip(&state, loader::PICKER_COLS))?;
+    Some(strip.image)
 }
 
 fn create_sprite(
@@ -1409,32 +1435,16 @@ enum ViewerState {
     Error(String),
 }
 
-/// A modal-ish form rendered as a bar above the viewer. Both entries the
-/// spec routes here need typed or picked input that a `window.prompt`
-/// (button-choice only) cannot collect, which is why they are panel forms
-/// rather than menu prompts.
+/// A modal-ish form rendered as a bar above the viewer. Both entries
+/// here need typed input that a `window.prompt` (button-choice only)
+/// cannot collect, which is why they are panel forms rather than menu
+/// prompts. The tileset binding a new sprite needs is picked in
+/// [`NewSpriteModal`] instead -- it has art to show, which does not fit
+/// in a bar.
 ///
-/// Only one can be open at a time: they are both started from the project
-/// panel's context menu, one click at a time, and a second start replaces
-/// the first rather than stacking.
+/// Only one can be open at a time: a second start replaces the first
+/// rather than stacking.
 enum PanelForm {
-    /// "New Sprite…"/"New Metasprite…": pick the tileset to bind, then
-    /// create. Nothing is on disk until [`SpritePanel::confirm_new`] runs
-    /// -- see [`create_sprite`] for why a binding must be chosen at all.
-    New {
-        kind: NewKind,
-        /// The clicked directory, worktree-relative.
-        dir_rel: String,
-        /// The stem typed into the project panel's inline editor -- the
-        /// new document's name, already validated by the editor's gate.
-        name: String,
-        /// Every `.til` under the asset root with its existing sharers
-        /// ([`tileset_choices`]). Empty means the project has no tileset
-        /// yet and the form can only be cancelled.
-        tilesets: Vec<TilesetChoice>,
-        selected: usize,
-        error: Option<String>,
-    },
     /// "Rename Sprite…": the typed name, committed by the button or
     /// Enter.
     Rename {
@@ -1457,7 +1467,7 @@ pub struct SpritePanel {
     root_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
     state: ViewerState,
-    /// The open "New …"/"Rename …" form, if any.
+    /// The open "Rename …"/"Name frame …" form, if any.
     form: Option<PanelForm>,
     /// The sheets column's width once a [`Divider::PreviewSide`] drag
     /// has set one; `None` means the auto width
@@ -1757,18 +1767,18 @@ impl SpritePanel {
 
     // ------------------------------------------------------- new / rename
 
-    /// Open the "New Sprite…"/"New Metasprite…" form for the
-    /// worktree-relative directory `dir_rel` -- the body of those two
-    /// project-panel entries.
+    /// Raise the "New Sprite…"/"New Metasprite…" binding card
+    /// ([`NewSpriteModal`]) for the worktree-relative directory `dir_rel`
+    /// -- the body of those two project-panel entries.
     ///
-    /// **The unsaved-edits guard runs BEFORE the form opens, and the form
+    /// **The unsaved-edits guard runs BEFORE the card opens, and the card
     /// is the only thing that writes** -- so a Cancel at either step
     /// leaves the disk untouched. `ggo_map_panel`'s "New Map…" originally
     /// created the file first and prompted afterwards, which orphaned a
     /// `map.map` on Cancel and pushed the next attempt onto `map-2.map`
     /// (M2 fix round 1, BLOCKING 2); guarding first is that lesson, and
-    /// deferring the write to [`Self::confirm_new`] makes it structural
-    /// here rather than a matter of statement order.
+    /// deferring the write to [`Self::confirm_new_binding`] makes it
+    /// structural here rather than a matter of statement order.
     ///
     /// Refreshes the root first for the same reason `duplicate_sprite`
     /// does: a right-click can reach a panel that was never activated.
@@ -1791,82 +1801,81 @@ impl SpritePanel {
             cx,
             Self::save_for_close,
         );
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if !proceed.await {
                 return;
             }
-            this.update(cx, |this, cx| {
+            // Everything the card needs is gathered under the panel's
+            // update, but the card is RAISED outside it: `toggle_modal`
+            // reads the new modal (for the focus handle to focus), and
+            // that view holds this panel -- reading it while this update
+            // is still on the stack is the fork's usual re-entrancy
+            // panic. Gathering first and raising after needs no
+            // `window.defer` the way `GenerateModal` does, because
+            // nothing here has to survive into a later frame.
+            let gathered = this.update(cx, |this, cx| {
                 this.refresh_root(cx);
-                let Some(project_root) = this.project_root.clone() else {
-                    return;
-                };
+                let project_root = this.project_root.clone()?;
                 // The tileset list is asset-root-relative because that is
                 // the frame a `.spr` stores its `til_path` in.
                 let root = asset_root_of_dir(&project_root.join(&dir_rel))
                     .unwrap_or_else(|| project_root.clone());
                 let tilesets = tileset_choices(&root);
-                this.form = Some(PanelForm::New {
-                    kind,
-                    dir_rel,
-                    name,
-                    selected: default_tileset_choice(&tilesets),
-                    tilesets,
-                    error: None,
+                let workspace = this.workspace.clone()?.upgrade()?;
+                Some((workspace, root, tilesets, cx.entity().downgrade()))
+            });
+            let Ok(Some((workspace, root, tilesets, panel))) = gathered else {
+                return;
+            };
+            let selected = default_tileset_choice(&tilesets);
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    // `toggle_modal` CLOSES an open card of the same type
+                    // rather than replacing it, which would drop the name
+                    // that was just typed on the floor.
+                    if workspace.active_modal::<NewSpriteModal>(cx).is_some() {
+                        workspace.hide_modal(window, cx);
+                    }
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        NewSpriteModal::new(
+                            panel, kind, dir_rel, name, root, tilesets, selected, window, cx,
+                        )
+                    });
                 });
-                cx.notify();
             })
             .ok();
         })
         .detach();
     }
 
-    /// Pick which tileset the pending new sprite binds to.
-    fn select_new_tileset(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(PanelForm::New {
-            tilesets, selected, ..
-        }) = &mut self.form
-            && ix < tilesets.len()
-        {
-            *selected = ix;
-            cx.notify();
-        }
-    }
-
-    /// Create the pending new sprite and open it.
+    /// Create the new sprite [`NewSpriteModal`] collected a binding for,
+    /// and open it. Returns the task so the card can report a failure --
+    /// it stays up until the write lands.
     ///
     /// **The unsaved-edits guard is RE-RUN here** (fix round 1, BLOCKING
-    /// 2), not just at [`Self::new_sprite`]. The form bar renders ABOVE a
-    /// fully live viewer, so the open document stays editable the whole
-    /// time it is up -- an edit made after the form opened sat between the
-    /// old guard and this replacement and was discarded without a prompt.
-    /// Deferring the write out of the menu handler bought structure but
-    /// also separated the guard from the thing it guards; the guard has to
-    /// sit where the document is actually replaced, which is here.
+    /// 2), not just at [`Self::new_sprite_named`]. The card is a modal
+    /// over a fully live viewer, so the open document stays editable the
+    /// whole time it is up -- an edit made after the card opened sat
+    /// between the old guard and this replacement and was discarded
+    /// without a prompt. Deferring the write out of the menu handler
+    /// bought structure but also separated the guard from the thing it
+    /// guards; the guard has to sit where the document is actually
+    /// replaced, which is here.
     ///
     /// It costs a second prompt only when the answer to the first one was
     /// "Don't Save" -- that leaves the document dirty by design, so
     /// `dirty_sprite_name` is still `Some` and the question is genuinely
     /// live again. A "Save" answer leaves it clean and
     /// `prepare_to_close_dirty` returns ready-true without prompting.
-    ///
-    /// Cancel leaves the form open (nothing was written, so the user can
-    /// still pick a tileset or dismiss it).
-    fn confirm_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PanelForm::New {
-            kind,
-            dir_rel,
-            name,
-            tilesets,
-            selected,
-            ..
-        }) = &self.form
-        else {
-            return;
-        };
-        let (kind, dir_rel, name) = (*kind, dir_rel.clone(), name.clone());
-        let Some(til_rel) = tilesets.get(*selected).map(|choice| choice.rel.clone()) else {
-            return; // no tileset in the project: the form only cancels
-        };
+    pub(crate) fn confirm_new_binding(
+        &mut self,
+        kind: NewKind,
+        dir_rel: String,
+        name: String,
+        til_rel: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<NewSpriteOutcome> {
         let proceed = ggo_common::prepare_to_close_dirty(
             self.dirty_sprite_name(),
             window,
@@ -1875,18 +1884,19 @@ impl SpritePanel {
         );
         cx.spawn(async move |this, cx| {
             if !proceed.await {
-                return;
+                return NewSpriteOutcome::Cancelled;
             }
-            this.update(cx, |this, cx| {
+            match this.update(cx, |this, cx| {
                 this.create_and_open(kind, &dir_rel, &til_rel, &name, cx)
-            })
-            .ok();
+            }) {
+                Ok(outcome) => outcome,
+                Err(error) => NewSpriteOutcome::Failed(error.to_string()),
+            }
         })
-        .detach();
     }
 
-    /// [`Self::confirm_new`]'s body, once the unsaved-edits guard has
-    /// resolved: the one place a new `.spr` is written.
+    /// [`Self::confirm_new_binding`]'s body, once the unsaved-edits guard
+    /// has resolved: the one place a new `.spr` is written.
     fn create_and_open(
         &mut self,
         kind: NewKind,
@@ -1894,21 +1904,18 @@ impl SpritePanel {
         til_rel: &str,
         name: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> NewSpriteOutcome {
         let Some(project_root) = self.project_root.clone() else {
-            return;
+            return NewSpriteOutcome::Failed("no project root".to_string());
         };
         match create_sprite(&project_root, dir_rel, kind, til_rel, name) {
             Ok(source_rel) => {
-                self.form = None;
                 self.load_rel_path(&source_rel, cx);
+                NewSpriteOutcome::Created
             }
             Err(message) => {
                 log::error!("GGO: failed to create sprite in {dir_rel}: {message}");
-                if let Some(PanelForm::New { error, .. }) = &mut self.form {
-                    *error = Some(message);
-                }
-                cx.notify();
+                NewSpriteOutcome::Failed(message)
             }
         }
     }
@@ -4234,86 +4241,14 @@ impl SpritePanel {
             )
     }
 
-    /// The open "New …"/"Rename …" form, as a bar above the viewer.
-    fn render_form(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The open "Rename …"/"Name frame …" form, as a bar above the viewer.
+    fn render_form(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let row = h_flex()
             .gap_1()
             .p_1()
             .border_b_1()
             .border_color(cx.theme().colors().border);
         match self.form.as_ref()? {
-            PanelForm::New {
-                kind,
-                dir_rel,
-                name,
-                tilesets,
-                selected,
-                error,
-            } => {
-                let label = format!("{} \"{name}\" in {}", kind.label(), dir_rel);
-                let has_tilesets = !tilesets.is_empty();
-                let choice = tilesets.get(*selected);
-                let picked: SharedString = choice
-                    .map(TilesetChoice::label)
-                    .unwrap_or_else(|| "no tilesets".to_string())
-                    .into();
-                let weak = cx.weak_entity();
-                let rows: Vec<String> = tilesets.iter().map(TilesetChoice::label).collect();
-                let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-                    for (ix, name) in rows.into_iter().enumerate() {
-                        let weak = weak.clone();
-                        menu = menu.entry(SharedString::from(name), None, move |_window, cx| {
-                            weak.update(cx, |this, cx| this.select_new_tileset(ix, cx))
-                                .ok();
-                        });
-                    }
-                    menu
-                });
-                Some(
-                    row.child(
-                        Label::new(SharedString::from(label))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(DropdownMenu::new("ggo-sprite-new-tileset", picked, menu))
-                    .child(
-                        Button::new("ggo-sprite-new-create", "Create")
-                            .disabled(!has_tilesets)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.confirm_new(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("ggo-sprite-new-cancel", "Cancel").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.cancel_form(cx);
-                            },
-                        )),
-                    )
-                    // The sharing warning is a WARNING, not an error: the
-                    // binding is legal and sometimes wanted, it just has
-                    // consequences for a file the user did not open.
-                    .children(
-                        choice
-                            .and_then(TilesetChoice::share_warning)
-                            .map(|w| Label::new(w).size(LabelSize::Small).color(Color::Warning)),
-                    )
-                    .children(
-                        error
-                            .clone()
-                            .or_else(|| {
-                                (!has_tilesets).then(|| {
-                                    "no .til in this project -- import a tileset first".to_string()
-                                })
-                            })
-                            .map(|e| {
-                                ggo_common::CopyableText::new("ggo-sprite-form-error-copy", e)
-                                    .size(LabelSize::Small)
-                            }),
-                    )
-                    .into_any_element(),
-                )
-            }
             PanelForm::Rename {
                 source_rel,
                 editor,
@@ -5148,7 +5083,7 @@ impl Render for SpritePanel {
             ViewerState::Error(e) => self.render_load_error(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
-        let form = self.render_form(window, cx);
+        let form = self.render_form(cx);
         let panel_bounds = self.panel_bounds.clone();
         v_flex()
             .key_context(self.dispatch_context(window, cx))
@@ -9511,6 +9446,10 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             project_panel::init(cx);
+            // The New Sprite card's picker builds its query field through
+            // `ui_input::ERASED_EDITOR_FACTORY`, which only `editor::init`
+            // installs -- without it the picker panics on construction.
+            editor::init(cx);
             init(cx);
             ggo_common::bind_default_keymap(cx);
         });
@@ -9627,13 +9566,59 @@ mod tests {
         );
     }
 
+    /// The New Sprite card the inline commit raised.
+    fn new_card(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<NewSpriteModal> {
+        workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<NewSpriteModal>(cx)
+            })
+            .expect("naming a new sprite raises the binding card")
+    }
+
+    /// The card's tileset picker.
+    fn card_picker(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<picker::Picker<new_sprite_modal::TilesetPickerDelegate>> {
+        new_card(workspace, cx).read_with(cx, |modal, _| modal.picker().clone())
+    }
+
+    /// Accept the card's current binding -- what Enter on the picker does.
+    fn confirm_card(workspace: &Entity<Workspace>, cx: &mut gpui::VisualTestContext) {
+        card_picker(workspace, cx).update_in(cx, |picker, window, cx| {
+            picker::PickerDelegate::confirm(&mut picker.delegate, false, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// Move the card's highlight onto the row whose tileset rel is `rel`.
+    fn highlight_tileset(
+        workspace: &Entity<Workspace>,
+        rel: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let picker = card_picker(workspace, cx);
+        let ix = picker
+            .read_with(cx, |picker, _| picker.delegate.match_rels())
+            .iter()
+            .position(|candidate| candidate == rel)
+            .unwrap_or_else(|| panic!("{rel} is not offered by the card"));
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_selected_index(ix, None, true, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
     /// Fire the real menu handler, type `name` inline, and accept the
-    /// form's DEFAULT binding with Create -- i.e. exactly the path a user
-    /// who never touches the dropdown takes. Deliberate: that default is
-    /// the thing fix round 1 BLOCKING 1 was about, so every caller of
-    /// this helper is asserting what an untouched dropdown binds to.
-    /// Returns the ITEM panel that hosted the form and now holds the
-    /// created document (the handler opens a fresh empty item per "New").
+    /// card's DEFAULT binding -- i.e. exactly the path a user who never
+    /// touches the picker takes. Deliberate: that default is the thing
+    /// fix round 1 BLOCKING 1 was about, so every caller of this helper
+    /// is asserting what an untouched picker binds to. Returns the ITEM
+    /// panel that raised the card and now holds the created document (the
+    /// handler opens a fresh empty item per "New").
     fn new_via_menu(
         workspace: &Entity<Workspace>,
         kind: NewKind,
@@ -9644,8 +9629,7 @@ mod tests {
     ) -> Entity<SpritePanel> {
         name_inline(workspace, kind, dir_rel, dir_abs, name, cx);
         let panel = newest_item_panel(workspace, cx);
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
-        cx.run_until_parked();
+        confirm_card(workspace, cx);
         panel
     }
 
@@ -9673,36 +9657,28 @@ mod tests {
             cx,
         );
         let panel = newest_item_panel(&workspace, cx);
-        panel.update(cx, |panel, _| {
-            let Some(PanelForm::New {
-                kind,
-                name,
-                tilesets,
-                selected,
-                ..
-            }) = &panel.form
-            else {
-                panic!("New Sprite… must open the binding form");
-            };
-            assert_eq!(*kind, NewKind::Sprite);
-            assert_eq!(name, "hero_idle", "the typed name is fixed in the form");
+        new_card(&workspace, cx).read_with(cx, |modal, _| {
+            assert_eq!(modal.kind(), NewKind::Sprite);
+            assert_eq!(modal.name(), "hero_idle", "the typed name is fixed");
+        });
+        card_picker(&workspace, cx).read_with(cx, |picker, _| {
             assert_eq!(
-                tilesets.iter().map(|c| c.rel.as_str()).collect::<Vec<_>>(),
+                picker.delegate.match_rels(),
                 vec!["sprites/hero.til", "tiles/world.til"],
                 "every .til under the asset root, asset-root-relative"
             );
             assert_eq!(
-                *selected, 1,
+                picker.delegate.selected_rel().as_deref(),
+                Some("tiles/world.til"),
                 "the default skips the sprite-owned tileset (BLOCKING 1)"
             );
         });
         assert!(
             !assets.join("sprites/hero_idle.spr").exists(),
-            "opening the form must not write anything yet"
+            "opening the card must not write anything yet"
         );
 
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
-        cx.run_until_parked();
+        confirm_card(&workspace, cx);
 
         let opened = open_sprite(&assets, "sprites/hero_idle.spr").expect("round-trips");
         assert_eq!(opened.til_path, "tiles/world.til");
@@ -9738,8 +9714,14 @@ mod tests {
                 "the picker offers the bound tileset's non-blank tiles \
                  (fixture tile 0 is all index 0 -> hidden)"
             );
-            assert!(panel.form.is_none(), "the form closes on Create");
         });
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<NewSpriteModal>(cx))
+                .is_none(),
+            "the card closes on Create"
+        );
 
         // A second sprite with its own name lands beside the first, in its
         // own item.
@@ -9914,11 +9896,9 @@ mod tests {
         );
         assert!(
             !cx.has_pending_prompt(),
-            "the form opens in its own tab; the dirty sprite is not displaced"
+            "the card opens over its own fresh tab; the dirty sprite is not displaced"
         );
-        let form_panel = newest_item_panel(&workspace, cx);
-        cx.update(|window, cx| form_panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
-        cx.run_until_parked();
+        confirm_card(&workspace, cx);
 
         assert!(assets.join("sprites/fresh.spr").is_file());
         hero.update(cx, |panel, _| {
@@ -9968,12 +9948,6 @@ mod tests {
         );
         assert_eq!(default_tileset_choice(&[]), 0);
 
-        assert_eq!(free.label(), "tiles/world.til");
-        assert_eq!(owned.label(), "sprites/hero.til (used by sprites/hero.spr)");
-        assert_eq!(
-            choice("a.til", &["x.spr", "y.spr"]).label(),
-            "a.til (used by x.spr +1 more)"
-        );
         assert_eq!(free.share_warning(), None);
         let warning = owned.share_warning().expect("an owned tileset warns");
         assert!(warning.contains("sprites/hero.spr"), "{warning}");
@@ -9981,7 +9955,7 @@ mod tests {
         assert!(warning.contains("Dedup"), "{warning}");
     }
 
-    /// **Fix round 1, BLOCKING 1.** The form's default must not silently
+    /// **Fix round 1, BLOCKING 1.** The card's default must not silently
     /// pool-share an unrelated sprite's tileset -- and when the user picks
     /// one deliberately, the sharers are known so the UI can say so.
     #[gpui::test]
@@ -9998,48 +9972,243 @@ mod tests {
             "fresh",
             cx,
         );
-        let panel = newest_item_panel(&workspace, cx);
-        panel.update(cx, |panel, _| {
-            let Some(PanelForm::New {
-                tilesets, selected, ..
-            }) = &panel.form
-            else {
-                panic!("expected the binding form");
-            };
+        card_picker(&workspace, cx).read_with(cx, |picker, _| {
             assert_eq!(
-                tilesets[0],
-                choice("sprites/hero.til", &["sprites/hero.spr"]),
+                picker.delegate.choice_at(0),
+                Some(choice("sprites/hero.til", &["sprites/hero.spr"])),
                 "a sprite-owned tileset stays OFFERED -- deliberate sharing is legal"
             );
-            assert_eq!(tilesets[1], choice("tiles/world.til", &[]));
-            assert_eq!(*selected, 1, "but it is never the default");
             assert_eq!(
-                tilesets[*selected].share_warning(),
+                picker.delegate.choice_at(1),
+                Some(choice("tiles/world.til", &[]))
+            );
+            assert_eq!(
+                picker.delegate.selected_rel().as_deref(),
+                Some("tiles/world.til"),
+                "but the owned one is never the default"
+            );
+            assert_eq!(
+                picker.delegate.selected_choice().and_then(|c| c.share_warning()),
                 None,
                 "so the default raises no warning"
             );
         });
 
         // Deliberately choosing the shared one warns, then binds.
-        panel.update(cx, |panel, cx| panel.select_new_tileset(0, cx));
-        panel.update(cx, |panel, _| {
-            let Some(PanelForm::New {
-                tilesets, selected, ..
-            }) = &panel.form
-            else {
-                unreachable!()
-            };
+        highlight_tileset(&workspace, "sprites/hero.til", cx);
+        card_picker(&workspace, cx).read_with(cx, |picker, _| {
             assert!(
-                tilesets[*selected].share_warning().is_some(),
+                picker
+                    .delegate
+                    .selected_choice()
+                    .and_then(|c| c.share_warning())
+                    .is_some(),
                 "picking a sprite-owned tileset must warn before Create"
             );
         });
-        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.confirm_new(window, cx)));
-        cx.run_until_parked();
+        confirm_card(&workspace, cx);
         assert_eq!(
             open_sprite(&assets, "sprites/fresh.spr").unwrap().til_path,
             "sprites/hero.til",
             "the deliberate choice is honoured"
+        );
+    }
+
+    /// The card's query filters the offered tilesets the way every other
+    /// Zed picker does -- three `.til` under the asset root, a few
+    /// characters of one rel, one row left.
+    #[gpui::test]
+    async fn test_the_tileset_picker_filters_by_fuzzy_query(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        // A third tileset, so a filter that leaves one row is meaningful.
+        let indices = vec![1u8; TILE_PIXELS];
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800;
+        save_tileset(&assets, "tiles/clouds.til", &indices, 1, &palette).unwrap();
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        name_inline(
+            &workspace,
+            NewKind::Sprite,
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
+        );
+        card_picker(&workspace, cx).read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.match_rels(),
+                vec!["sprites/hero.til", "tiles/clouds.til", "tiles/world.til"],
+                "an empty query offers every tileset, in listing order"
+            );
+        });
+
+        cx.simulate_input("cloud");
+        cx.run_until_parked();
+        card_picker(&workspace, cx).read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.match_rels(),
+                vec!["tiles/clouds.til"],
+                "the query narrows the rows"
+            );
+            assert_eq!(
+                picker.delegate.selected_rel().as_deref(),
+                Some("tiles/clouds.til"),
+                "and the highlight follows the surviving row"
+            );
+        });
+
+        confirm_card(&workspace, cx);
+        assert_eq!(
+            open_sprite(&assets, "sprites/fresh.spr").unwrap().til_path,
+            "tiles/clouds.til",
+            "Enter binds the row the query left highlighted"
+        );
+    }
+
+    /// The card previews the highlighted tileset: its saved reference
+    /// sheet when it has one (the layout the art was imported in), the
+    /// deduplicated pool strip when it does not. Moving the highlight
+    /// recomposes.
+    #[gpui::test]
+    async fn test_the_preview_shows_the_highlighted_tilesets_sheet(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        reference_sheet::save(
+            &assets,
+            "tiles/world.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 3,
+                rows: 1,
+                tiles: vec![1, 2, 1],
+            },
+        )
+        .unwrap();
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        name_inline(
+            &workspace,
+            NewKind::Sprite,
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
+        );
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-sprite-new-preview").is_some(),
+            "the highlighted tileset's sheet is on the card"
+        );
+        let sheet = new_card(&workspace, cx)
+            .read_with(cx, |modal, _| modal.preview_image())
+            .expect("the default binding composes a preview");
+        assert_eq!(
+            image_px_size(&sheet),
+            (3 * TILE_PX as u32, TILE_PX as u32),
+            "the saved 3x1 reference sheet, not the 2-tile pool strip"
+        );
+
+        // `sprites/hero.til` has no sheet, so its preview is the pool
+        // strip: one non-blank tile.
+        highlight_tileset(&workspace, "sprites/hero.til", cx);
+        let pool = new_card(&workspace, cx)
+            .read_with(cx, |modal, _| modal.preview_image())
+            .expect("a sheet-less tileset still previews, as its pool strip");
+        assert_eq!(
+            image_px_size(&pool),
+            (TILE_PX as u32, TILE_PX as u32),
+            "hero.til's pool is one blank tile plus one real one; blanks are hidden"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-new-preview").is_some(),
+            "and the preview region is still drawn"
+        );
+    }
+
+    /// Escape is a full cancel: the card closes and NOTHING is written --
+    /// not the `.spr`, not the sidecars the binding would have rewritten.
+    #[gpui::test]
+    async fn test_escape_cancels_the_new_sprite_and_writes_nothing(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let assets = dir.path().join("assets");
+        let before_til = std::fs::read(assets.join("tiles/world.til")).unwrap();
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        name_inline(
+            &workspace,
+            NewKind::Sprite,
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
+        );
+        new_card(&workspace, cx);
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<NewSpriteModal>(cx))
+                .is_none(),
+            "escape closes the card"
+        );
+        assert!(
+            !assets.join("sprites/fresh.spr").exists(),
+            "and writes no sprite"
+        );
+        assert_eq!(
+            std::fs::read(assets.join("tiles/world.til")).unwrap(),
+            before_til,
+            "nor touches the tileset it would have bound"
+        );
+    }
+
+    /// A project with no `.til` at all cannot bind anything, so the card
+    /// says what is missing instead of offering an empty picker, and
+    /// confirming it writes nothing.
+    #[gpui::test]
+    async fn test_a_project_without_tilesets_explains(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("emerald.toml"),
+            "[project]\nname='t'\ntitle='t'\n",
+        )
+        .unwrap();
+        let assets = dir.path().join("assets");
+        std::fs::create_dir_all(assets.join("sprites")).unwrap();
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        name_inline(
+            &workspace,
+            NewKind::Sprite,
+            "assets/sprites",
+            assets.join("sprites"),
+            "fresh",
+            cx,
+        );
+        cx.run_until_parked();
+
+        card_picker(&workspace, cx).read_with(cx, |picker, _| {
+            assert!(picker.delegate.match_rels().is_empty(), "nothing to bind");
+            assert_eq!(picker.delegate.selected_rel(), None);
+        });
+        assert!(
+            cx.debug_bounds("ggo-sprite-new-empty").is_some(),
+            "the card explains that a tileset has to be imported first"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-new-create").is_none(),
+            "and offers no Create to press"
+        );
+
+        confirm_card(&workspace, cx);
+        assert!(
+            !assets.join("sprites/fresh.spr").exists(),
+            "confirming an empty card is a no-op"
         );
     }
 

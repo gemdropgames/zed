@@ -7667,11 +7667,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "editor",
+ "fuzzy",
  "ggo-worldlib",
  "ggo_common",
  "gpui",
  "log",
  "path",
+ "picker",
  "project",
  "project_panel",
  "remote_connection",
