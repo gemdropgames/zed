@@ -2,8 +2,10 @@
 //! panel that the `.wrld.toml` has no field for. A `WorldEntity` is just
 //! a component map -- the file carries no entity id -- so an entity's
 //! identity here is its INDEX, and the names are parallel to
-//! `WorldState::entities`. Written whenever a name changes, read once at
-//! open; a missing or corrupt file is simply the defaults.
+//! `WorldState::entities` -- and an `[[instance]]` row is named the same
+//! way, parallel to `WorldState::instances`. Written whenever a name
+//! changes, read once at open; a missing or corrupt file is simply the
+//! defaults.
 //! Lives at `<asset root>/.ggo-ide/<rel>.editor.json` -- the same hidden
 //! dir the sprite panel's sidecars use, so editor droppings stay out of
 //! the asset tree.
@@ -21,6 +23,10 @@ pub struct EditorMeta {
     /// May be shorter than the entity list (missing tail = unnamed).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entity_names: Vec<String>,
+    /// The same, for the world's `[[instance]]` rows -- an instance has
+    /// no id in the file either, so its identity here is its index too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_names: Vec<String>,
 }
 
 /// `<rel>.editor.json` under the hidden `.ggo-ide/` dir, preserving the
@@ -66,6 +72,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let meta = EditorMeta {
             entity_names: vec!["boss".to_string(), String::new(), "door".to_string()],
+            instance_names: vec!["east gate".to_string()],
         };
         save(dir.path(), "worlds/main.wrld.toml", &meta).unwrap();
         assert_eq!(load(dir.path(), "worlds/main.wrld.toml"), meta);

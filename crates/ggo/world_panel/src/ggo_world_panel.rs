@@ -170,6 +170,10 @@ pub fn init(cx: &mut App) {
     // that need to know it IS a world -- currently just "Delete World".
     workspace::register_context_menu_contributor(cx, contribute_world_menu);
 
+    // And pressing Delete on one goes the same way: the world prompt,
+    // which names what still instances it, not upstream's file prompt.
+    workspace::register_delete_interceptor(cx, intercept_world_delete);
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -201,6 +205,13 @@ const SAVE_IN_PLAY: &str = "stop the game to save";
 /// (and only on it) -- a substring match across crates that would rot
 /// silently if either side reworded independently.
 pub const WORLD_STILL_LOADING: &str = "still loading";
+
+/// What the toolbar says when the running game refuses an edit. The
+/// canvas has no disabled state to wear -- it is the document's picture,
+/// not a control -- so the refusal has to arrive as text, and these two
+/// are the only paint-row messages that are not a failure.
+const PLAY_REFUSES_PAINT: &str = "Stop the game to paint";
+const PLAY_REFUSES_EDIT: &str = "Stop the game to edit";
 
 /// The status line's text while the canvas is set to Live but no session
 /// exists -- a windowless load (the close prompt's reload, the MCP
@@ -351,6 +362,37 @@ pub(crate) fn world_display_name(rel: &str) -> String {
             .file_stem()
             .map_or_else(|| rel.to_string(), |s| s.to_string_lossy().into_owned()),
     }
+}
+
+/// The worlds under the asset root `root` whose `[[instance]]` list names
+/// `stem`, one prompt line each -- what a delete of `stem` leaves behind.
+///
+/// Reads every world file under the root, which is why this runs once, on
+/// the way to a prompt, and never per frame. An unreadable world simply
+/// contributes nothing: a delete must not be blocked by a file that was
+/// already broken.
+fn worlds_instancing(root: &Path, stem: &str) -> Vec<String> {
+    loader::list_worlds(root)
+        .into_iter()
+        .filter(|listing| listing.stem != stem)
+        .filter(|listing| {
+            world_file::read_world(root, &listing.rel_path).is_ok_and(|world| {
+                world
+                    .instances
+                    .iter()
+                    // An `[[instance]] world` is a stem, but a
+                    // hand-written file may spell out the extension.
+                    .any(|instance| {
+                        instance
+                            .world
+                            .strip_suffix(world_files::WORLD_EXT)
+                            .unwrap_or(&instance.world)
+                            == stem
+                    })
+            })
+        })
+        .map(|listing| format!("{} instances this world", listing.stem))
+        .collect()
 }
 
 /// Where the add-layer flow puts a world's generated background map. The
@@ -559,6 +601,43 @@ fn contribute_world_menu(
             .handler(delete_world_handler(cx.weak_entity(), rel))
             .into(),
     ]
+}
+
+/// `workspace::DeleteInterceptor` for a `**/assets/**/*.wrld.toml`:
+/// pressing Delete on a world row raises the SAME prompt (and runs the
+/// same delete) the menu's "Delete World" does, rather than upstream's
+/// "permanently delete `sub.wrld.toml`?" -- which says nothing about the
+/// worlds that still instance it.
+///
+/// DECIDE HERE, ACT LATER, exactly as the contributor above: this runs
+/// with `ProjectPanel` leased, so the claim is decided from path
+/// inspection alone and everything panel-shaped goes into a
+/// `window.defer`. That is a WINDOW defer rather than `cx.defer_in`
+/// because the work is [`delete_world_handler`], which focuses the dock
+/// through `workspace.update` -- a `Context<Workspace>` defer re-enters
+/// that update and would panic.
+///
+/// A multi-selection is declined outright: this panel deletes one world
+/// at a time, and half a selection through the world prompt and half
+/// through upstream's is worse than either whole.
+fn intercept_world_delete(
+    workspace: &mut Workspace,
+    paths: &[ProjectPath],
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let [path] = paths else {
+        return false;
+    };
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return false;
+    };
+    if split_world_path(&rel).is_none() {
+        return false;
+    }
+    let handler = delete_world_handler(cx.weak_entity(), rel);
+    window.defer(cx, move |window, cx| handler(window, cx));
+    true
 }
 
 /// The "Delete World" entry's handler: reach the panel, hand it the
@@ -793,6 +872,9 @@ struct OpenWorld {
     /// unnamed). NEVER written into the world file, never part of dirty
     /// tracking: renaming an entity is not an edit to the document.
     entity_names: Vec<String>,
+    /// The same, for `store.state().instances` -- an `[[instance]]` row
+    /// has no id in the file either.
+    instance_names: Vec<String>,
     sprite_loads: AssetLoads,
     map_loads: AssetLoads,
     meta_sprite_loads: AssetLoads,
@@ -843,9 +925,10 @@ struct OpenWorld {
     /// The open palette color picker, if any -- at most one, anchored to
     /// one Color565 field.
     color_picker: Option<ColorPicker>,
-    /// The entity-list row being renamed inline, if any: its index and
-    /// the single-line editor that row draws in place of its label.
-    rename: Option<(usize, Entity<Editor>)>,
+    /// The list row being renamed inline, if any: which row (entity or
+    /// instance -- both name the same way) and the single-line editor
+    /// that row draws in place of its label.
+    rename: Option<(Selection, Entity<Editor>)>,
     /// Keeps [`Self::rename`]'s editor subscribed for as long as the
     /// rename is open -- dropping it is what stops the blur-commit.
     _rename_subscription: Option<Subscription>,
@@ -887,6 +970,10 @@ struct OpenWorld {
     /// draw them are the paint library's; both are created lazily on the
     /// first paint-mode render.
     terrain_name: Option<Entity<Editor>>,
+    /// Keeps [`Self::terrain_name`] subscribed, so a blur can commit the
+    /// inline terrain rename the way the entity rename's does -- Enter
+    /// and Escape are the chip's, the blur is only the host's to see.
+    _terrain_name_subscription: Option<Subscription>,
     resize: Option<paint_ui::ResizeFields>,
     /// The live session mirroring this document into the viewer cart, if
     /// Live mode got one. Kept (with `LiveStatus::Failed`) after a
@@ -964,13 +1051,14 @@ impl OpenWorld {
             .map(|instance| instance.world.clone())
             .collect();
         let loaded_instance_counts = loaded.instance_counts;
-        let entity_names = editor_meta::load(&root, &listing.rel_path).entity_names;
+        let names = editor_meta::load(&root, &listing.rel_path);
         OpenWorld {
             listing,
             source_rel,
             root,
             store: loaded.store,
-            entity_names,
+            entity_names: names.entity_names,
+            instance_names: names.instance_names,
             sprite_loads: loaded.sprite_loads,
             map_loads: loaded.map_loads,
             meta_sprite_loads: loaded.meta_sprite_loads,
@@ -1012,6 +1100,7 @@ impl OpenWorld {
             paint_gesture: false,
             strip_bounds: Rc::new(RefCell::new(None)),
             terrain_name: None,
+            _terrain_name_subscription: None,
             resize: None,
             live: None,
             instance_counts: loaded_instance_counts,
@@ -1052,6 +1141,7 @@ fn retired_by_rebuild(
 fn entity_list_rows(
     state: &ggo_worldlib::world_doc::WorldState,
     names: &[String],
+    instance_names: &[String],
 ) -> Vec<(Selection, String)> {
     let mut rows = Vec::with_capacity(state.entities.len() + state.instances.len());
     for i in 0..state.entities.len() {
@@ -1062,10 +1152,11 @@ fn entity_list_rows(
         rows.push((Selection::Entity(i), label));
     }
     for (i, instance) in state.instances.iter().enumerate() {
-        rows.push((
-            Selection::Instance(i),
-            format!("⧉ {}", world_label(&instance.world)),
-        ));
+        let label = match instance_names.get(i) {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => format!("⧉ {}", world_label(&instance.world)),
+        };
+        rows.push((Selection::Instance(i), label));
     }
     rows
 }
@@ -1125,6 +1216,51 @@ fn removable_instances(
         .count()
 }
 
+/// The prompt lines naming the selected ENTITIES a delete takes with the
+/// instances: the count, then one line per entity -- its row label and
+/// the components it carries, which is the only description a world
+/// entity has (the file gives it no name and no id).
+///
+/// Empty when nothing removable is selected, so a selection of instances
+/// alone reduces to exactly the detail it had before.
+fn entity_delete_lines(
+    selected: &[Selection],
+    names: &[String],
+    state: &ggo_worldlib::world_doc::WorldState,
+) -> Vec<String> {
+    let mut indices: Vec<usize> = selected
+        .iter()
+        .filter_map(|s| match s {
+            Selection::Entity(i) if *i < state.entities.len() => Some(*i),
+            _ => None,
+        })
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "{} entit{} deleted too:",
+        indices.len(),
+        if indices.len() == 1 { "y is" } else { "ies are" }
+    )];
+    lines.extend(indices.into_iter().filter_map(|index| {
+        let entity = state.entities.get(index)?;
+        let components: Vec<&str> = entity.components.keys().map(String::as_str).collect();
+        let label = match names.get(index) {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => format!("#{index}"),
+        };
+        Some(if components.is_empty() {
+            format!("{label}: no components")
+        } else {
+            format!("{label}: {}", components.join(", "))
+        })
+    }));
+    lines
+}
+
 /// One batch removing every selected item that still exists, entities
 /// and instances each in descending index order so earlier removals
 /// never shift a later index. `None` when nothing removable is selected.
@@ -1169,6 +1305,19 @@ fn removed_entity_indices(op: &WorldOp) -> Vec<usize> {
     let mut indices = match op {
         WorldOp::Batch(ops) => ops.iter().flat_map(removed_entity_indices).collect(),
         WorldOp::RemoveEntity { index } => vec![*index],
+        _ => Vec::new(),
+    };
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    indices.dedup();
+    indices
+}
+
+/// [`removed_entity_indices`] for `[[instance]]` rows, which
+/// [`OpenWorld::instance_names`] is pruned by for the same reason.
+fn removed_instance_indices(op: &WorldOp) -> Vec<usize> {
+    let mut indices = match op {
+        WorldOp::Batch(ops) => ops.iter().flat_map(removed_instance_indices).collect(),
+        WorldOp::RemoveInstance { index } => vec![*index],
         _ => Vec::new(),
     };
     indices.sort_unstable_by(|a, b| b.cmp(a));
@@ -1373,13 +1522,14 @@ impl OpenWorld {
         }
     }
 
-    /// Persist the editor-only entity names. Failures are logged, not
+    /// Persist the editor-only row names. Failures are logged, not
     /// surfaced: a lost name must never block or noise up an edit, and
     /// the names are not document state, so there is no dirty flag to
     /// defer the write behind.
-    fn write_entity_names(&self) {
+    fn write_editor_names(&self) {
         let meta = editor_meta::EditorMeta {
             entity_names: self.entity_names.clone(),
+            instance_names: self.instance_names.clone(),
         };
         if let Err(e) = editor_meta::save(&self.root, &self.listing.rel_path, &meta) {
             log::error!(
@@ -1758,7 +1908,7 @@ impl OpenWorld {
                         // the save's fold leaves that slot to the paint
                         // session's own write.
                         live.set_layer_synced(poke.slot, false);
-                        self.paint_error = Some(format!("live cell: {error}"));
+                        self.paint_error = Some(format!("cannot paint: live cell: {error}"));
                         changed = true;
                     }
                 }
@@ -3246,9 +3396,10 @@ impl WorldPanel {
     /// [`ggo_common::panel_entry_handler`]).
     ///
     /// Deliberately scoped to one file: a world referenced by another
-    /// world's `[[instance]]` is NOT chased down and unlinked, and a failed
-    /// unlink leaves the panel exactly as it was rather than half-clearing
-    /// it. Returns the `Task` so tests can await the whole prompt->delete
+    /// world's `[[instance]]` is NAMED in the prompt's cascade
+    /// ([`worlds_instancing`]) but never chased down and unlinked, and a
+    /// failed unlink leaves the panel exactly as it was rather than
+    /// half-clearing it. Returns the `Task` so tests can await the whole prompt->delete
     /// round trip; the menu handler detaches it.
     fn delete_world(
         &mut self,
@@ -3260,7 +3411,7 @@ impl WorldPanel {
         let Some(project_root) = self.project_root.clone() else {
             return Task::ready(());
         };
-        let Some((_, listing)) = split_world_path(&rel) else {
+        let Some((asset_root_rel, listing)) = split_world_path(&rel) else {
             return Task::ready(());
         };
         // Named, not offered a save: deleting the file makes an unsaved edit
@@ -3268,8 +3419,18 @@ impl WorldPanel {
         // `prepare_to_close_dirty` (which would offer to write bytes that
         // are about to be unlinked). ggo-ide's delete made the same call.
         let unsaved = self.dirty_world_name().is_some_and(|name| name == rel);
-        let confirm = ggo_common::confirm_destructive(
+        // Against the asset root this world resolves against, not the
+        // project root: an `[[instance]] world` stem is asset-root
+        // relative, and the two differ for `assets/<world>.wrld.toml`.
+        let asset_root = if asset_root_rel.is_empty() {
+            project_root.clone()
+        } else {
+            project_root.join(&asset_root_rel)
+        };
+        let cascade = worlds_instancing(&asset_root, &listing.stem);
+        let confirm = ggo_common::confirm_destructive_cascade(
             &format!("Delete the world \"{}\" ({rel})?", listing.stem),
+            &cascade,
             "Delete",
             unsaved,
             window,
@@ -3425,6 +3586,24 @@ impl WorldPanel {
 
     // ------------------------------------------------------------ editing
 
+    /// Put the running game's refusal on the toolbar's paint row -- the
+    /// only row the canvas has, and a canvas cannot wear a disabled
+    /// state the way a button can.
+    ///
+    /// Idempotent on purpose: `paint_at_local` runs once per pointer
+    /// move, so a drag would otherwise re-notify the panel for every
+    /// sample of a stroke that is going nowhere.
+    fn refuse_in_play(&mut self, reason: &'static str, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        if open.paint_error.as_deref() == Some(reason) {
+            return;
+        }
+        open.paint_error = Some(reason.to_string());
+        cx.notify();
+    }
+
     /// Apply one op to the open world's store and repaint. Every editor
     /// mutation funnels through here (or the drag/undo/redo paths, which
     /// notify themselves), so the draw list -- rebuilt per render --
@@ -3439,6 +3618,7 @@ impl WorldPanel {
         // (`apply_mirror_op`, which is the cart reporting its own edit)
         // and Delete (forwarded to the cart, which ignores it in Play).
         if self.live_playing() {
+            self.refuse_in_play(PLAY_REFUSES_EDIT, cx);
             return;
         }
         if let ViewerState::Ready(open) = &mut self.state {
@@ -3621,10 +3801,35 @@ impl WorldPanel {
         // As in `add_background_impl`: the refresh below is not an op and
         // would push the layer again on its own.
         if self.live_playing() {
+            self.refuse_in_play(PLAY_REFUSES_EDIT, cx);
             return;
         }
+        // Read before the op: afterwards the slot is gone, and the whole
+        // point of the message is the file the slot used to name.
+        let orphan = match &self.state {
+            ViewerState::Ready(open) => open
+                .store
+                .state()
+                .backgrounds
+                .iter()
+                .find(|background| background.layer == layer)
+                .map(ggo_worldlib::world_doc::Background::stem)
+                .filter(|stem| !stem.is_empty())
+                .map(|stem| format!("{stem}.map")),
+            _ => None,
+        };
         self.apply_op(WorldOp::SetBackground { layer, map: None }, cx);
         self.refresh_backgrounds(cx);
+        // The `.map` is deliberately NOT deleted (other worlds may share
+        // it, and the unlink is undoable where a delete would not be), so
+        // it is now a file nothing references -- which the user cannot
+        // know unless the panel says it.
+        if let Some(orphan) = orphan
+            && let ViewerState::Ready(open) = &mut self.state
+        {
+            open.paint_error = Some(format!("Unlinked bg{layer}; {orphan} stays on disk"));
+            cx.notify();
+        }
     }
 
     /// Re-run the background merge and refresh what the canvas paints
@@ -3750,7 +3955,7 @@ impl WorldPanel {
             // Same discipline as a failed load: a refusal the user cannot
             // see is a refusal they will retry forever.
             if let ViewerState::Ready(open) = &mut self.state {
-                open.paint_error = Some("no project folder is open".to_string());
+                open.paint_error = Some("cannot paint: no project folder is open".to_string());
                 cx.notify();
             }
             return false;
@@ -3808,7 +4013,7 @@ impl WorldPanel {
                         still_wanted
                     }
                     Err(e) => {
-                        open.paint_error = Some(e);
+                        open.paint_error = Some(format!("cannot paint: {e}"));
                         false
                     }
                 };
@@ -3887,6 +4092,7 @@ impl WorldPanel {
         // game's, and a stroke that reached the session here would poke
         // them into a running world and be folded back by the next save.
         if self.live_playing() {
+            self.refuse_in_play(PLAY_REFUSES_PAINT, cx);
             return;
         }
         let Some((rel, anchor)) = self.active_paint_target() else {
@@ -4051,7 +4257,7 @@ impl WorldPanel {
         // in the picture the cart is drawing.
         if overflowed {
             open.paint_error =
-                Some("live cell: too many cells owed the cart; its picture is behind".to_string());
+                Some("cannot paint: live cell: too many cells owed the cart; its picture is behind".to_string());
             cx.notify();
         }
     }
@@ -4204,12 +4410,17 @@ impl WorldPanel {
             _ => false,
         }
         .then(|| cx.new(|cx| Editor::single_line(window, cx)));
+        let name = name.map(|editor| {
+            let subscription = cx.subscribe_in(&editor, window, Self::handle_editor_event);
+            (editor, subscription)
+        });
         if let ViewerState::Ready(open) = &mut self.state {
             if let Some(made) = made {
                 open.resize = Some(made);
             }
-            if let Some(name) = name {
-                open.terrain_name = Some(name);
+            if let Some((editor, subscription)) = name {
+                open.terrain_name = Some(editor);
+                open._terrain_name_subscription = Some(subscription);
             }
         }
     }
@@ -4263,11 +4474,13 @@ impl WorldPanel {
             self.delete_selected_now(cx);
             return;
         }
-        let confirm = ggo_common::confirm_destructive(
+        let lines = entity_delete_lines(&open.selected, &open.entity_names, &open.store.state());
+        let confirm = ggo_common::confirm_destructive_cascade(
             &format!(
                 "Remove {instances} instance{}?",
                 if instances == 1 { "" } else { "s" }
             ),
+            &lines,
             "Remove",
             false,
             window,
@@ -4290,19 +4503,25 @@ impl WorldPanel {
             return;
         };
         let removed = removed_entity_indices(&batch);
+        let removed_instances = removed_instance_indices(&batch);
         open.store.apply(batch);
         // ponytail: the names are keyed by INDEX (the world file has no
         // entity id), so an UNDONE delete brings the entity back
         // unnamed -- the name was dropped here and undo only restores
         // the document. The upgrade is a stable per-entity editor id in
         // the sidecar, which undo would put back alongside the entity.
-        if !removed.is_empty() {
+        if !removed.is_empty() || !removed_instances.is_empty() {
             for index in removed {
                 if index < open.entity_names.len() {
                     open.entity_names.remove(index);
                 }
             }
-            open.write_entity_names();
+            for index in removed_instances {
+                if index < open.instance_names.len() {
+                    open.instance_names.remove(index);
+                }
+            }
+            open.write_editor_names();
         }
         open.note_doc_changed();
         open.selected.clear();
@@ -6288,6 +6507,16 @@ impl WorldPanel {
             self.commit_rename(cx);
             return;
         }
+        // Nor is the paint column's terrain chip rename: it writes a name
+        // into the TILESET's sidecar, and `commit_paint_terrain_rename` is
+        // a no-op when no rename is in flight, so routing every blur of
+        // that editor here is safe.
+        if matches!(&self.state, ViewerState::Ready(open)
+            if open.terrain_name.as_ref().is_some_and(|e| e.entity_id() == editor.entity_id()))
+        {
+            self.commit_paint_terrain_rename(cx);
+            return;
+        }
         self.commit_editor(editor.entity_id(), cx);
         let ViewerState::Ready(open) = &mut self.state else {
             return;
@@ -6758,6 +6987,15 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
+        // A refusal only the run made is over with the run; a real paint
+        // failure (a map that would not load, a cell the cart refused)
+        // is not this function's to clear.
+        let refusal = open.paint_error.as_deref();
+        if mode == EditorMode::Edit
+            && (refusal == Some(PLAY_REFUSES_PAINT) || refusal == Some(PLAY_REFUSES_EDIT))
+        {
+            open.paint_error = None;
+        }
         let Some(live) = open.live.as_mut() else {
             return;
         };
@@ -7323,19 +7561,25 @@ impl WorldPanel {
         cx.notify();
     }
 
-    /// Open the inline name editor on entity row `index`, seeded with the
-    /// entity's current custom name. An unnamed entity opens on an EMPTY
-    /// field rather than on the `#i` the row is drawing: seeding the
-    /// fallback would commit the index as a literal name the moment the
-    /// user pressed Enter without typing.
-    fn begin_rename(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the inline name editor on list row `target`, seeded with that
+    /// row's current custom name. An unnamed row opens on an EMPTY field
+    /// rather than on the `#i`/`⧉ stem` it is drawing: seeding the
+    /// fallback would commit that fallback as a literal name the moment
+    /// the user pressed Enter without typing.
+    fn begin_rename(&mut self, target: Selection, window: &mut Window, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        if index >= open.store.state().entities.len() {
-            return;
-        }
-        let seed = open.entity_names.get(index).cloned().unwrap_or_default();
+        let state = open.store.state();
+        let seed = match target {
+            Selection::Entity(index) if index < state.entities.len() => {
+                open.entity_names.get(index).cloned().unwrap_or_default()
+            }
+            Selection::Instance(index) if index < state.instances.len() => {
+                open.instance_names.get(index).cloned().unwrap_or_default()
+            }
+            _ => return,
+        };
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_text(seed, window, cx);
@@ -7349,11 +7593,11 @@ impl WorldPanel {
         window.defer(cx, move |window, cx| window.focus(&handle, cx));
         open._rename_subscription =
             Some(cx.subscribe_in(&editor, window, Self::handle_editor_event));
-        open.rename = Some((index, editor));
+        open.rename = Some((target, editor));
         cx.notify();
     }
 
-    /// Commit the inline rename: the trimmed text becomes the entity's
+    /// Commit the inline rename: the trimmed text becomes that row's
     /// editor-only name (empty text clears it) and goes straight to the
     /// sidecar -- names are not document state, so there is no dirty flag
     /// or Save to defer the write behind.
@@ -7361,19 +7605,42 @@ impl WorldPanel {
         let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let Some((index, editor)) = open.rename.take() else {
+        let Some((target, editor)) = open.rename.take() else {
             return;
         };
         open._rename_subscription = None;
         let name = editor.read(cx).text(cx).trim().to_string();
-        if open.entity_names.len() <= index {
-            open.entity_names.resize(index + 1, String::new());
+        let (names, index) = match target {
+            Selection::Entity(index) => (&mut open.entity_names, index),
+            Selection::Instance(index) => (&mut open.instance_names, index),
+        };
+        if names.len() <= index {
+            names.resize(index + 1, String::new());
         }
-        if let Some(slot) = open.entity_names.get_mut(index) {
+        if let Some(slot) = names.get_mut(index) {
             *slot = name;
         }
-        open.write_entity_names();
+        open.write_editor_names();
         cx.notify();
+    }
+
+    /// A row's own Duplicate: select that row, then run the toolbar's
+    /// duplicate over the selection of one.
+    ///
+    /// Through the selection rather than around it because the paste path
+    /// the duplicate ends in is defined over the SELECTED fragment, and a
+    /// second copy of it that took a target directly would be a second
+    /// definition of what "duplicate" means.
+    fn duplicate_row(&mut self, target: Selection, cx: &mut Context<Self>) {
+        self.select_from_list(target, false, cx);
+        self.duplicate_impl(cx);
+    }
+
+    /// A row's own Delete: the same, so the row goes through exactly the
+    /// prompt (and the cascade lines) the toolbar's delete raises.
+    fn delete_row(&mut self, target: Selection, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_from_list(target, false, cx);
+        self.delete_selected_impl(window, cx);
     }
 
     fn render_entity_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -7381,7 +7648,7 @@ impl WorldPanel {
             return div().into_any_element();
         };
         let state = open.store.state();
-        let rows = entity_list_rows(&state, &open.entity_names);
+        let rows = entity_list_rows(&state, &open.entity_names, &open.instance_names);
         // Collected once, not re-derived per row: `store.state()` clones
         // the whole document, so asking `paint_target_rel` per row would
         // make rendering the list quadratic in entity count.
@@ -7443,12 +7710,11 @@ impl WorldPanel {
                     // scrolling under the header.
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().children(rows.into_iter().map(|(target, label)| {
+                    .child(v_flex().children(rows.into_iter().enumerate().map(
+                        |(row_index, (target, label))| {
                         let selected = open.selected.contains(&target);
-                        let renaming = match (target, open.rename.as_ref()) {
-                            (Selection::Entity(row), Some((index, editor))) if *index == row => {
-                                Some(editor.clone())
-                            }
+                        let renaming = match open.rename.as_ref() {
+                            Some((renamed, editor)) if *renamed == target => Some(editor.clone()),
                             _ => None,
                         };
                         let selector = match target {
@@ -7457,33 +7723,78 @@ impl WorldPanel {
                                 format!("ggo-world-list-instance-{index}")
                             }
                         };
-                        let row = div()
-                            .id(SharedString::from(format!("ggo-world-list-{target:?}")))
-                            .debug_selector(move || selector)
-                            .px_1()
-                            .cursor_pointer()
-                            .when(selected, |this| this.bg(selected_bg))
-                            .map(|this| match renaming {
-                                Some(editor) => this.child(
-                                    div()
-                                        .debug_selector(|| "ggo-world-rename-editor".into())
-                                        .child(Self::editor_input(&editor, cx)),
-                                ),
-                                None => this.child(
+                        // Each action's wrapper carries the
+                        // `debug_selector`, the Save button's reason: a
+                        // DISABLED button records no bounds of its own,
+                        // and greyed-out is a state a test has to be able
+                        // to read. Keyed by ROW index rather than by the
+                        // target's, so an entity and an instance that
+                        // share an index do not share a selector.
+                        let duplicate = matches!(target, Selection::Entity(_)).then(|| {
+                            div()
+                                .debug_selector(move || format!("ggo-world-row-dup-{row_index}"))
+                                .child(
+                                    IconButton::new(
+                                        ("ggo-world-row-dup", row_index),
+                                        IconName::Copy,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(ui::Tooltip::text("Duplicate entity"))
+                                    .disabled(playing)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.duplicate_row(target, cx)
+                                    })),
+                                )
+                        });
+                        let delete = div()
+                            .debug_selector(move || format!("ggo-world-row-delete-{row_index}"))
+                            .child(
+                                IconButton::new(
+                                    ("ggo-world-row-delete", row_index),
+                                    IconName::Trash,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(ui::Tooltip::text("Delete"))
+                                .disabled(playing)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.delete_row(target, window, cx)
+                                })),
+                            );
+                        let body = match renaming {
+                            Some(editor) => div()
+                                .flex_1()
+                                .min_w_0()
+                                .debug_selector(|| "ggo-world-rename-editor".into())
+                                .child(Self::editor_input(&editor, cx))
+                                .into_any_element(),
+                            None => div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
                                     Label::new(label).size(LabelSize::Small).color(if selected {
                                         Color::Default
                                     } else {
                                         Color::Muted
                                     }),
-                                ),
-                            })
+                                )
+                                .into_any_element(),
+                        };
+                        let row = h_flex()
+                            .id(SharedString::from(format!("ggo-world-list-{target:?}")))
+                            .debug_selector(move || selector)
+                            .px_1()
+                            .gap_0p5()
+                            .items_center()
+                            .cursor_pointer()
+                            .when(selected, |this| this.bg(selected_bg))
+                            .child(body)
+                            .children(duplicate)
+                            .child(delete)
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    if event.click_count >= 2
-                                        && let Selection::Entity(index) = target
-                                    {
-                                        this.begin_rename(index, window, cx);
+                                    if event.click_count >= 2 {
+                                        this.begin_rename(target, window, cx);
                                         return;
                                     }
                                     this.select_from_list(target, event.modifiers.shift, cx)
@@ -7515,7 +7826,8 @@ impl WorldPanel {
                             })
                         })
                         .into_any_element()
-                    }))),
+                        },
+                    ))),
             )
             .into_any_element()
     }
@@ -8232,7 +8544,7 @@ impl WorldPanel {
                     .child(
                         ggo_common::CopyableText::new(
                             "ggo-world-paint-error-copy",
-                            format!("cannot paint: {e}"),
+                            e.clone(),
                         )
                         .size(LabelSize::Small),
                     )
@@ -13351,7 +13663,9 @@ mod tests {
         cx.update(|window, cx| other(window, cx));
         assert_eq!(
             cx.pending_prompt().map(|(_, detail)| detail),
-            Some("This cannot be undone.".to_string()),
+            // The cascade line is the open world INSTANCING `sub`, which
+            // is a different claim from "its edits are at stake".
+            Some("test instances this world\n\nThis cannot be undone.".to_string()),
             "another world's deletion must not warn about THIS one's edits"
         );
         cx.simulate_prompt_answer("Cancel");
@@ -13371,6 +13685,163 @@ mod tests {
         cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
         assert!(!dir.path().join("test.wrld.toml").exists());
+    }
+
+    /// [`menu_workspace`] with the REAL project panel added, and its
+    /// worktree scanned down to the files the delete tests act on: the
+    /// delete interceptor only exists to change what pressing Delete on
+    /// a project-panel row does, so nothing short of the real panel
+    /// firing the real action tests it.
+    async fn delete_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Project>,
+        Entity<WorldPanel>,
+        WorktreeId,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let (workspace, panel, worktree_id, cx) = menu_workspace(cx, root).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_panel = project_panel::ProjectPanel::ggo_test_new(workspace, window, cx);
+            workspace.add_panel(project_panel, window, cx);
+        });
+        cx.run_until_parked();
+        (project, panel, worktree_id, cx)
+    }
+
+    /// Select `rel` in the project panel and fire the stock delete action
+    /// -- exactly what a user pressing Delete on that row does. The
+    /// selection travels as `project::Event::RevealInProjectPanel`, and
+    /// the action is built BY NAME because `project_panel::Delete` is
+    /// private to that crate, which is also proof the dispatch goes
+    /// through the real registered handler.
+    async fn delete_from_project_panel(
+        project: &Entity<Project>,
+        worktree_id: WorktreeId,
+        rel: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let entry_id = project
+            .read_with(cx, |project, cx| {
+                Some(project.entry_for_path(&project_path(worktree_id, rel), cx)?.id)
+            })
+            .unwrap_or_else(|| panic!("{rel} is in the worktree"));
+        project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(entry_id));
+        });
+        cx.run_until_parked();
+        let action = cx
+            .update(|_, cx| {
+                cx.build_action(
+                    "project_panel::Delete",
+                    Some(serde_json::json!({ "skip_prompt": false })),
+                )
+            })
+            .expect("project_panel::Delete is a registered action");
+        cx.update(|window, cx| window.dispatch_action(action, cx));
+        cx.run_until_parked();
+    }
+
+    /// **The whole feature, end to end.** Pressing Delete on a
+    /// `.wrld.toml` row raises the WORLD confirm -- the one that names
+    /// the worlds still instancing it -- not the stock "delete
+    /// sub.wrld.toml?", and confirming unlinks the file.
+    #[gpui::test]
+    async fn test_project_panel_delete_of_a_world_runs_the_world_delete(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, panel, worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
+
+        delete_from_project_panel(&project, worktree_id, "sub.wrld.toml", cx).await;
+
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Delete the world \"sub\" (sub.wrld.toml)?".to_string(),
+                "test instances this world\n\nThis cannot be undone.".to_string(),
+            )),
+            "the stock file prompt must not be what the user sees"
+        );
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(
+            !dir.path().join("sub.wrld.toml").exists(),
+            "confirming unlinks the world file"
+        );
+    }
+
+    /// And nothing else is claimed: a file this panel knows nothing about
+    /// keeps upstream's own prompt, so the interceptor cannot swallow a
+    /// delete it has no delete for.
+    #[gpui::test]
+    async fn test_project_panel_delete_of_another_file_keeps_the_stock_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, panel, worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
+
+        delete_from_project_panel(&project, worktree_id, "Cargo.toml", cx).await;
+
+        let (message, _) = cx.pending_prompt().expect("upstream still prompts");
+        assert!(
+            message.contains("Cargo.toml"),
+            "the stock prompt names the file: {message}"
+        );
+        assert!(
+            !message.contains("world"),
+            "and is not this panel's world prompt: {message}"
+        );
+    }
+
+    /// The prompt names every world that `[[instance]]`s the one being
+    /// deleted: the file goes, but the references do not, and an
+    /// instance whose stem resolves to nothing renders as a silent
+    /// placeholder -- so the cost has to be stated before the unlink,
+    /// not discovered afterwards.
+    #[gpui::test]
+    async fn test_delete_world_prompt_names_the_worlds_that_instance_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+        open_in_menu_panel(&panel, cx, "test.wrld.toml");
+
+        // A second referrer, so the list is a LIST and its order is
+        // pinned to the enumeration rather than to luck.
+        write_world(
+            dir.path(),
+            "arena.wrld.toml",
+            &WorldFile {
+                entities: vec![],
+                instances: vec![WorldInstance {
+                    world: "sub".to_string(),
+                    pos: [0.0, 0.0],
+                    background_priority: false,
+                }],
+                backgrounds: vec![],
+            },
+        )
+        .unwrap();
+
+        let handler = delete_world_handler(workspace.downgrade(), "sub.wrld.toml".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Delete the world \"sub\" (sub.wrld.toml)?".to_string(),
+                "arena instances this world\ntest instances this world\n\n\
+                 This cannot be undone."
+                    .to_string(),
+            )),
+            "every referring world is named, and only the referring ones"
+        );
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(
+            !dir.path().join("sub.wrld.toml").exists(),
+            "the unlink still happens -- the cascade informs, it does not block"
+        );
     }
 
     /// Deleting a DIFFERENT world leaves the open document alone but still
@@ -14382,13 +14853,13 @@ mod tests {
         let store = ggo_worldlib::world_doc::WorldDocStore::new(
             ggo_worldlib::world_doc::WorldDocWire::from(world),
         );
-        let rows = entity_list_rows(&store.state(), &[]);
+        let rows = entity_list_rows(&store.state(), &[], &[]);
         assert_eq!(rows[0], (Selection::Entity(0), "#0".to_string()));
         assert_eq!(rows[1], (Selection::Entity(1), "#1".to_string()));
         assert_eq!(rows[2].0, Selection::Instance(0));
         assert!(rows[2].1.starts_with("⧉ "));
 
-        let named = entity_list_rows(&store.state(), &["boss".to_string()]);
+        let named = entity_list_rows(&store.state(), &["boss".to_string()], &[]);
         assert_eq!(
             named[0],
             (Selection::Entity(0), "boss".to_string()),
@@ -14399,7 +14870,15 @@ mod tests {
             (Selection::Entity(1), "#1".to_string()),
             "an entity past the name list keeps its index label"
         );
-        assert_eq!(named[2], rows[2], "instances are unchanged by names");
+        assert_eq!(named[2], rows[2], "instances are unchanged by ENTITY names");
+
+        let named = entity_list_rows(&store.state(), &[], &["east gate".to_string()]);
+        assert_eq!(
+            named[2],
+            (Selection::Instance(0), "east gate".to_string()),
+            "a custom name replaces the instance's own ⧉ label"
+        );
+        assert_eq!(&named[..2], &rows[..2], "entities are unchanged by those");
     }
 
     /// An entity's identity is its INDEX, so a delete shifts every name
@@ -14535,6 +15014,54 @@ mod tests {
         });
     }
 
+    /// The delete confirm says what ELSE is in the set: an instance is
+    /// one row on screen but a whole subtree in the document, and the
+    /// entities going with it are named with what they carry -- a
+    /// selection is easy to lose track of, and "Remove 1 instance?" on
+    /// its own hides two entities.
+    #[gpui::test]
+    async fn test_delete_prompt_names_the_entities_going_with_the_instance(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.selected = vec![
+                Selection::Entity(0),
+                Selection::Entity(2),
+                Selection::Instance(0),
+            ];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.delete_selected_impl(window, cx);
+        });
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Remove 1 instance?".to_string(),
+                // The component map is sorted on the way through the
+                // document store, so the names come out alphabetical.
+                "2 entities are deleted too:\n#0: Text, Transform\n#2: Camera, Transform\n\n\
+                 This cannot be undone."
+                    .to_string(),
+            )),
+            "the prompt names each entity by row label and by what it carries"
+        );
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            assert_eq!(state.entities.len(), 1, "both entities went");
+            assert!(state.instances.is_empty(), "and so did the instance");
+        });
+    }
+
     /// Undo/redo prune selection entries that no longer index anything.
     #[gpui::test]
     async fn test_undo_prunes_a_selection_that_outlived_its_entity(cx: &mut TestAppContext) {
@@ -14667,6 +15194,123 @@ mod tests {
         let mut palette = [0u16; PAL_SLOTS];
         palette[1] = 0xF800; // pure 565 red
         io::save_tileset(root, til_rel, &indices, TILES, &palette).unwrap();
+    }
+
+    /// Clearing a layer UNLINKS it and leaves the `.map` on disk -- other
+    /// worlds may share it, and the unlink is undoable where a delete
+    /// would not be. Which makes the file an orphan the user has no way
+    /// of knowing about unless the panel says so.
+    #[gpui::test]
+    async fn test_clearing_a_layer_names_the_map_it_leaves_behind(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(1, "tiles/bg.til".into(), cx)
+        });
+        cx.run_until_parked();
+        let map = dir.path().join("maps/test.bg1.map");
+        assert!(map.is_file(), "the add wrote the map it linked");
+        assert_eq!(
+            panel.read_with(cx, |panel, _| open_of(panel).paint_error.clone()),
+            None,
+            "an add has nothing to report"
+        );
+
+        panel.update(cx, |panel, cx| panel.clear_background_impl(1, cx));
+        cx.run_until_parked();
+
+        assert!(
+            panel.read_with(cx, |panel, _| open_of(panel)
+                .store
+                .state()
+                .backgrounds
+                .iter()
+                .all(|bg| bg.layer != 1)),
+            "the slot is unlinked"
+        );
+        assert!(map.is_file(), "and the map is still on disk");
+        assert_eq!(
+            panel.read_with(cx, |panel, _| open_of(panel).paint_error.clone()),
+            Some("Unlinked bg1; maps/test.bg1.map stays on disk".to_string()),
+            "the orphan is named rather than left to be discovered"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-paint-error").is_some(),
+            "and the toolbar is where it is read"
+        );
+    }
+
+    /// Clicking away from the paint column's inline terrain rename
+    /// COMMITS it. Enter and Escape are handled inside the chip, but a
+    /// blur is only visible to the host that owns the editor -- and a
+    /// rename that vanished because the user clicked elsewhere would be
+    /// work quietly thrown away (`PaintHost::commit_paint_terrain_rename`
+    /// asks every host to route it).
+    #[gpui::test]
+    async fn test_blurring_the_terrain_rename_commits_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.in_paint_mode()));
+
+        panel.update(cx, |panel, cx| {
+            // The terrain editor is the Terrain tool's own column; on any
+            // other tool it is not on screen to rename from.
+            paint_session_mut_of(panel).set_tool(ggo_map_panel::MapTool::Terrain);
+            panel.edit_paint_terrains(cx, |session, root| {
+                session.add_terrain("grass".to_string(), root)
+            });
+        });
+        cx.run_until_parked();
+
+        let chip = cx
+            .debug_bounds("ggo-map-terrain-0")
+            .expect("the paint column lists the terrain");
+        simulate_double_click(cx, chip.center());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-map-terrain-rename-editor").is_some(),
+            "the double click opened the inline rename"
+        );
+
+        let name_editor = panel
+            .read_with(cx, |panel, _| panel.paint_terrain_name().cloned())
+            .expect("the paint column owns a terrain name editor");
+        name_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("meadow", window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            name_editor.update_in(cx, |editor, window, cx| editor
+                .focus_handle(cx)
+                .is_focused(window)),
+            "the rename field has focus, so there is a blur to route"
+        );
+
+        // Focus somewhere else entirely -- the blur is the whole point.
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&panel.focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let session = paint_session_of(panel);
+            assert_eq!(
+                session.terrains.first().map(|t| t.name.as_str()),
+                Some("meadow"),
+                "the blur committed the typed name"
+            );
+            assert_eq!(
+                session.terrain_rename, None,
+                "and closed the rename rather than leaving it open"
+            );
+        });
     }
 
     #[test]
@@ -15044,8 +15688,12 @@ mod tests {
                 panel.test_paint_session("maps/test.bg0.map").is_some(),
                 "the loaded session still installs, ready for a re-entry"
             );
-            assert!(
-                open_of(panel).paint_error.is_none(),
+            assert_eq!(
+                open_of(panel).paint_error.as_deref(),
+                // The clear's own unlink note, not a failure: the mode
+                // the user's own edit withdrew is reported as nothing at
+                // all.
+                Some("Unlinked bg0; maps/test.bg0.map stays on disk"),
                 "a mode the user's own edit withdrew is not a failure"
             );
         });
@@ -19209,6 +19857,87 @@ mod tests {
         );
     }
 
+    /// A refused stroke the user cannot see is a refused stroke they
+    /// retry forever: the brush and the document op both leave the reason
+    /// on the toolbar while the game runs, and the row goes away when the
+    /// cart comes back out of Play.
+    #[gpui::test]
+    async fn play_says_why_it_refuses_the_brush_and_the_op(cx: &mut TestAppContext) {
+        let (panel, endpoint, _dir, cx) = connected_live_panel_with_background(cx).await;
+        // Entered in Edit, where the session behind the brush loads; Play
+        // then takes the mode away, which is what leaves the paint path
+        // to be driven by hand below.
+        panel.update(cx, |panel, cx| {
+            panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Play, cx));
+        cx.run_until_parked();
+        show_panel(cx);
+        assert!(
+            cx.debug_bounds("ggo-world-paint-error").is_none(),
+            "nothing has been refused yet"
+        );
+
+        // The mode is put back BY HAND, exactly as
+        // `play_leaves_paint_mode_and_refuses_the_brush` does: what is
+        // under test is the gate on the paint path, not the mode switch.
+        let cells_before = panel.update(cx, |panel, _| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.mode = EditMode::Paint(PaintTarget::BgSlot(0));
+            }
+            paint_session_of(panel).store.state().cells
+        });
+        host_sent(&endpoint);
+        panel.update(cx, |panel, cx| {
+            let at = live_screen_of(panel, [1.0, 1.0]);
+            panel.canvas_primary_down_with(at, false, cx);
+            panel.canvas_drag_to(at, cx);
+            panel.canvas_primary_up(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            panel.read_with(cx, |panel, _| paint_session_of(panel).store.state().cells),
+            cells_before,
+            "the stroke changed nothing"
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, _| open_of(panel).paint_error.clone()),
+            Some(PLAY_REFUSES_PAINT.to_string()),
+            "and said so, once, rather than refusing in silence"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-paint-error").is_some(),
+            "the toolbar is where the user reads it"
+        );
+
+        let entities_before =
+            panel.read_with(cx, |panel, _| open_of(panel).store.state().entities.len());
+        panel.update(cx, |panel, cx| {
+            panel.apply_op(WorldOp::RemoveEntity { index: 0 }, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| open_of(panel).store.state().entities.len()),
+            entities_before,
+            "a document op is refused too"
+        );
+        assert_eq!(
+            panel.read_with(cx, |panel, _| open_of(panel).paint_error.clone()),
+            Some(PLAY_REFUSES_EDIT.to_string()),
+            "with the reason worded for an edit, not a stroke"
+        );
+
+        panel.update(cx, |panel, cx| panel.set_live_mode(EditorMode::Edit, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| open_of(panel).paint_error.clone()),
+            None,
+            "leaving Play retires a refusal that no longer applies"
+        );
+    }
+
     /// A resize in Live takes the slot out of step and re-arms its push:
     /// the cart's shadow keeps the dimensions it was LOADED with, so a
     /// save folding it back would write the pre-resize map over the
@@ -21950,7 +22679,11 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
-            entity_list_rows(&open.store.state(), &open.entity_names)[index]
+            entity_list_rows(
+                &open.store.state(),
+                &open.entity_names,
+                &open.instance_names,
+            )[index]
                 .1
                 .clone()
         })
@@ -21988,8 +22721,12 @@ mod tests {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
-            let (index, editor) = open.rename.clone().expect("a rename is open");
-            assert_eq!(index, 0, "the double-clicked row is the one being renamed");
+            let (target, editor) = open.rename.clone().expect("a rename is open");
+            assert_eq!(
+                target,
+                Selection::Entity(0),
+                "the double-clicked row is the one being renamed"
+            );
             editor
         });
         assert_eq!(
@@ -22039,13 +22776,208 @@ mod tests {
         );
     }
 
+    /// An instance row renames exactly the way an entity row does: an
+    /// `[[instance]]` is a whole subtree under one row, and "⧉ sub" three
+    /// times over says nothing about which is which.
+    #[gpui::test]
+    async fn test_double_click_renames_an_instance_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        // The fixture's rows: three entities, then its one instance.
+        assert_eq!(list_row_label(&panel, cx, 3), "⧉ sub");
+
+        let row = cx
+            .debug_bounds("ggo-world-list-instance-0")
+            .expect("the instance row");
+        simulate_double_click(cx, row.center());
+        cx.run_until_parked();
+
+        let editor = panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let (target, editor) = open.rename.clone().expect("a rename is open");
+            assert_eq!(
+                target,
+                Selection::Instance(0),
+                "the double-clicked row is the one being renamed"
+            );
+            editor
+        });
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "",
+            "an unnamed instance opens on an EMPTY field, the way an entity does"
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("east gate", window, cx)
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert_eq!(list_row_label(&panel, cx, 3), "east gate");
+        assert_eq!(
+            editor_meta::load(&root, "test.wrld.toml").instance_names,
+            vec!["east gate".to_string()],
+            "the name is persisted to the sidecar"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.reload_from_disk("test.wrld.toml", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            list_row_label(&panel, cx, 3),
+            "east gate",
+            "a reload reads the name back out of the sidecar"
+        );
+    }
+
+    /// An instance's identity is its INDEX too, so removing one has to
+    /// drop its name and shift the rest down -- or the next open hands
+    /// the names to the wrong rows.
+    #[gpui::test]
+    async fn test_removing_an_instance_drops_its_name(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.instance_names = vec!["east gate".to_string()];
+            open.selected = vec![Selection::Instance(0)];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| panel.delete_selected_now(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let open = open_of(panel);
+            assert!(open.store.state().instances.is_empty(), "the row went");
+            assert!(
+                open.instance_names.is_empty(),
+                "and so did its name: {:?}",
+                open.instance_names
+            );
+        });
+        assert!(
+            editor_meta::load(&root, "test.wrld.toml")
+                .instance_names
+                .is_empty(),
+            "the sidecar records the removal"
+        );
+    }
+
+    /// Every list row carries its own actions, the way a sprite frame
+    /// cell does: an entity duplicates and deletes from the row itself,
+    /// so acting on ONE row never means "select it, then find the
+    /// toolbar" -- which is also the gesture most likely to act on the
+    /// wrong selection.
+    #[gpui::test]
+    async fn test_each_row_carries_its_own_duplicate_and_delete(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        let row = cx
+            .debug_bounds("ggo-world-list-row-0")
+            .expect("the first entity row");
+        for selector in ["ggo-world-row-dup-0", "ggo-world-row-delete-0"] {
+            let button = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must render"));
+            assert!(
+                row.contains(&button.center()),
+                "{selector} must sit inside its own row: {button:?} in {row:?}"
+            );
+        }
+        assert!(
+            cx.debug_bounds("ggo-world-row-dup-3").is_none(),
+            "an instance is a reference to another world, not a thing to copy"
+        );
+
+        let entities_before =
+            panel.read_with(cx, |panel, _| open_of(panel).store.state().entities.len());
+        let dup = cx.debug_bounds("ggo-world-row-dup-0").expect("row 0's dup");
+        cx.simulate_click(dup.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt(), "duplicating never confirms");
+        assert_eq!(
+            panel.read_with(cx, |panel, _| open_of(panel).store.state().entities.len()),
+            entities_before + 1,
+            "the row's duplicate appended a copy"
+        );
+
+        panel.update(cx, |panel, cx| panel.undo_impl(cx));
+        cx.run_until_parked();
+    }
+
+    /// A row's delete takes THAT row and nothing else -- including when
+    /// the row is an instance, where the confirm in front of it is the
+    /// same one the toolbar raises.
+    #[gpui::test]
+    async fn test_a_row_delete_prompts_and_removes_only_that_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        // Row 3 is the fixture's one instance, behind its three entities.
+        let delete = cx
+            .debug_bounds("ggo-world-row-delete-3")
+            .expect("the instance row's delete");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message),
+            Some("Remove 1 instance?".to_string()),
+            "an instance row still asks before it goes"
+        );
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            assert!(state.instances.is_empty(), "the clicked row went");
+            assert_eq!(
+                state.entities.len(),
+                3,
+                "and the selection the panel happened to have did not"
+            );
+        });
+
+        let delete = cx
+            .debug_bounds("ggo-world-row-delete-1")
+            .expect("entity row 1's delete");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = open_of(panel).store.state();
+            assert_eq!(state.entities.len(), 2, "exactly one entity went");
+            assert_eq!(
+                state.entities[1].components.contains_key("Camera"),
+                true,
+                "and it was row 1, not the row that was selected"
+            );
+        });
+    }
+
     /// How many rows the entity column is listing.
     fn list_row_count(panel: &Entity<WorldPanel>, cx: &mut gpui::VisualTestContext) -> usize {
         panel.read_with(cx, |panel, _| {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
-            entity_list_rows(&open.store.state(), &open.entity_names).len()
+            entity_list_rows(
+                &open.store.state(),
+                &open.entity_names,
+                &open.instance_names,
+            )
+            .len()
         })
     }
 }

@@ -65,6 +65,9 @@ emerald-editor-runtime.workspace = true # GGO
 # exactly as this crate gates its own; the world panel's painting tests
 # will read cells back through them.
 ggo_map_panel = { workspace = true, features = ["test-support"] } # GGO
+# The delete interceptor is only real when the REAL project panel fires
+# the real `project_panel::Delete` at it.
+project_panel = { workspace = true, features = ["test-support"] }
 # `project`'s test-support turns on `remote/test-support`, which adds a
 # `RemoteConnectionOptions` variant that `remote_connection`'s lib only
 # matches on under ITS `test-support` -- same dance `ggo_emu_panel`'s
