@@ -32,10 +32,11 @@
 //! and the project panel's context menu routes the file ops and the two
 //! "New …" entries here as well ([`contribute_sprite_menu`]); the panel
 //! has no picker of its own. The input a `window.prompt` cannot collect
-//! is raised in-process rather than as a dialog: a typed new name
-//! becomes a [`PanelForm`] bar in the panel, and the tileset a new
-//! sprite binds to becomes a [`NewSpriteModal`] card over the window --
-//! that one needs room for the art the choice is actually made by.
+//! is raised where the file lives rather than as a dialog: a typed name
+//! (new or renamed) goes into the project panel's own inline editor
+//! (`ProjectPanel::ggo_new_entry_inline`), and the tileset a new sprite
+//! binds to becomes a [`NewSpriteModal`] card over the window -- that
+//! one needs room for the art the choice is actually made by.
 
 mod editor_meta;
 mod edits;
@@ -131,9 +132,10 @@ const CLIPS_WIDTH: Pixels = px(148.);
 /// borders, and the gap to the next row.
 const CLIPS_ROW_PX: f32 = THUMB_PX + 40.;
 
-/// What the clips section costs around its rows: the "+ Clip" footer,
-/// the strip's own padding, and the section's top border.
-const CLIPS_CHROME_PX: f32 = 35.;
+/// What the clips section costs around its rows: the "Clips" title row
+/// (which carries the section's eye), the "+ Clip" footer, the strip's
+/// own padding, and the section's top border.
+const CLIPS_CHROME_PX: f32 = 55.;
 
 /// The clips section's height before any [`Divider::Clips`] drag: three
 /// clip rows.
@@ -183,6 +185,10 @@ pub fn init(cx: &mut App) {
     // menu can't: Duplicate (which has to rewrite the copy's sidecar rels,
     // not just copy bytes) and Delete.
     workspace::register_context_menu_contributor(cx, contribute_sprite_menu);
+
+    // And pressing Delete on that `.spr` row routes into the same confirm
+    // the menu's Delete raises -- see [`intercept_sprite_delete`].
+    workspace::register_delete_interceptor(cx, intercept_sprite_delete);
 }
 
 /// The sprite extension this panel claims from the file explorer.
@@ -285,6 +291,127 @@ fn intercept_sprite_open(
     true
 }
 
+/// `workspace::DeleteInterceptor` for a single `.spr` inside an emerald
+/// project's asset tree.
+///
+/// **Why a claim rather than upstream's prompt.** A `.spr` is not a
+/// self-contained file: its pixels live in the `.til`/`.pal` beside it,
+/// which this panel deliberately leaves on disk because they are
+/// shareable. Upstream's "permanently delete `hero.spr`?" says nothing
+/// about either half of that, so the user cannot tell whether they are
+/// about to orphan the art or leave another sprite's art alone. The
+/// panel's own confirm ([`sprite_delete_cascade`]) says which, and a
+/// claim is what stops the stock prompt from asking first.
+///
+/// **And a claim always answers**: every path claimed here ends in a
+/// confirm and then either an unlink or nothing, never silence.
+///
+/// Claims EXACTLY one path, and only one that lives under an emerald
+/// project's `assets/` tree -- the frame a `.spr`'s sidecar rels resolve
+/// in ([`split_sprite_path`]). A multi-selection, a `.spr` outside that
+/// tree, and every other file fall through to upstream untouched.
+///
+/// DECIDE HERE, ACT LATER (the fork's leased-hook rule): this runs with
+/// `ProjectPanel` leased, so the body is path inspection plus the
+/// worktree/item lookups the `&mut Workspace` already allows, and the
+/// prompt is pushed into `cx.defer_in`. The worktree root and the open
+/// tab's panel are resolved HERE and handed in, because the deferred body
+/// re-enters the workspace's own update and so may not read it.
+fn intercept_sprite_delete(
+    workspace: &mut Workspace,
+    paths: &[ProjectPath],
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let [path] = paths else {
+        return false;
+    };
+    if !is_sprite_path(path) {
+        return false;
+    }
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return false;
+    };
+    let Some(worktree_root) = workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    else {
+        return false;
+    };
+    let abs = worktree_root.join(&rel);
+    if !emerald_asset_root(&abs).is_some_and(|assets| abs.starts_with(&assets)) {
+        return false;
+    }
+    let open_panel = workspace
+        .items_of_type::<sprite_item::SpriteEditorItem>(cx)
+        .find(|item| item.read(cx).rel() == rel)
+        .map(|item| item.read(cx).panel().clone());
+    let unsaved = open_panel
+        .as_ref()
+        .is_some_and(|panel| panel.read(cx).dirty_sprite_name().is_some_and(|n| n == rel));
+    let open_panel = open_panel.map(|panel| panel.downgrade());
+    cx.defer_in(window, move |_workspace, window, cx| {
+        confirm_sprite_delete(worktree_root, rel, unsaved, open_panel, window, cx).detach();
+    });
+    true
+}
+
+/// Confirm, then unlink the sprite at worktree-relative `rel` under
+/// `project_root`, clearing `panel` (the tab showing it, if one is open)
+/// once the file is gone.
+///
+/// Workspace-free on purpose: both callers reach it with the workspace
+/// either leased ([`intercept_sprite_delete`]'s deferred body) or about to
+/// be ([`SpritePanel::delete_sprite`]), so everything it needs -- the
+/// root, the dirty flag, the tab's panel -- is resolved by the caller and
+/// handed in.
+///
+/// Deletes the `.spr` ONLY; see [`sprite_delete_cascade`] for why the
+/// sidecars stay and what the prompt says about them. A failed unlink
+/// leaves the panel exactly as it was rather than half-clearing it.
+fn confirm_sprite_delete(
+    project_root: PathBuf,
+    rel: String,
+    unsaved: bool,
+    panel: Option<WeakEntity<SpritePanel>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<()> {
+    let (root, rel_in_root) = split_sprite_path(&project_root, &rel);
+    // Named, not offered a save: deleting the file makes an unsaved edit
+    // to it moot, so this warns instead of routing through
+    // `prepare_to_close_dirty` (which would offer to write bytes that are
+    // about to be unlinked). ggo-ide's delete made the same call.
+    let confirm = ggo_common::confirm_destructive_cascade(
+        &format!("Delete the sprite {rel}?"),
+        &sprite_delete_cascade(&root, &rel_in_root),
+        "Delete",
+        unsaved,
+        window,
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        if !confirm.await {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(project_root.join(&rel)) {
+            // No toast yet (F5.2 owns the notification surface), but a
+            // silent no-op would be indistinguishable from a bug.
+            // Upstream logs AND toasts at the same point.
+            log::error!("GGO: failed to delete sprite {rel}: {e}");
+            return;
+        }
+        if let Some(panel) = panel {
+            panel
+                .update(cx, |panel, cx| panel.clear_if_deleted(&rel, cx))
+                .ok();
+        }
+    })
+}
+
 /// Open (or focus) the center-pane sprite tab for worktree-relative `rel`
 /// -- one item per file, activate on re-open. Public: the world panel's
 /// Sprite-goto and the import panel's post-import handoff land here.
@@ -370,9 +497,10 @@ pub fn refresh_open_sprite(
 ///
 /// **Rename** routes to the panel rather than doing the work here: it
 /// needs text entry and `window.prompt` has no text field, so the typed
-/// name is collected by [`SpritePanel::begin_rename`]'s form (the spec's
-/// rule -- forms live in panels, the menu only routes). It was deferred
-/// out of F5.0/G2 for exactly that missing surface.
+/// name is collected by the project panel's inline name editor
+/// ([`rename_sprite_handler`]) and applied by
+/// [`SpritePanel::rename_sprite`]. It was deferred out of F5.0/G2 for
+/// exactly that missing surface.
 ///
 /// On an assets DIRECTORY the menu instead offers **New Sprite…** and
 /// **New Metasprite…** -- the same one-format-two-usages split the spec's
@@ -394,16 +522,16 @@ fn contribute_sprite_menu(
     let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
         return Vec::new();
     };
+    let Some(worktree_root) = workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    else {
+        return Vec::new();
+    };
     if is_dir {
-        let Some(worktree_root) = workspace
-            .project()
-            .read(cx)
-            .visible_worktrees(cx)
-            .next()
-            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-        else {
-            return Vec::new();
-        };
         let dir_abs = worktree_root.join(&rel);
         if !is_assets_dir(&dir_abs) {
             return Vec::new();
@@ -441,7 +569,12 @@ fn contribute_sprite_menu(
             .into(),
         ui::ContextMenuEntry::new("Rename Sprite…")
             .icon(ui::IconName::Pencil)
-            .handler(rename_sprite_handler(cx.weak_entity(), rel.clone()))
+            .handler(rename_sprite_handler(
+                cx.weak_entity(),
+                path.worktree_id,
+                rel.clone(),
+                worktree_root,
+            ))
             .into(),
         ui::ContextMenuEntry::new("Delete Sprite")
             .icon(ui::IconName::Trash)
@@ -570,16 +703,79 @@ fn sprite_item_entry_handler(
     }
 }
 
-/// The "Rename Sprite…" entry's handler -- see [`duplicate_sprite_handler`].
+/// The "Rename Sprite…" entry's handler: seed the project panel's inline
+/// name editor (New File's UX) in the sprite's own directory, exactly as
+/// the "New …" entries do. The typed name goes through the same
+/// [`rename_target`] rules either way -- they just run while it is being
+/// typed now instead of after the fact.
+///
+/// The field opens EMPTY rather than on the current stem: the inline
+/// editor is `ProjectPanel`'s, and it clears itself when it opens
+/// (`add_entry`), with no seam for a caller to seed text through.
 fn rename_sprite_handler(
     workspace: WeakEntity<Workspace>,
+    worktree_id: project::WorktreeId,
     rel: String,
+    worktree_root: PathBuf,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
-    let target = rel.clone();
-    sprite_item_entry_handler(workspace, Some(target), move |panel, window, cx| {
-        let rel = rel.clone();
-        panel.update(cx, |panel, cx| panel.begin_rename(rel, window, cx));
-    })
+    ggo_common::panel_entry_handler(
+        workspace.clone(),
+        move |panel: &Entity<project_panel::ProjectPanel>, window, cx| {
+            let workspace = workspace.clone();
+            let rel = rel.clone();
+            let worktree_root = worktree_root.clone();
+            panel.update(cx, |panel, cx| {
+                let dir_rel = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                let Some(path) = ggo_common::inline_project_path(worktree_id, dir_rel) else {
+                    return;
+                };
+                panel.ggo_new_entry_inline(
+                    &path,
+                    rename_sprite_validate(worktree_root, rel.clone()),
+                    rename_sprite_commit(workspace, rel.clone()),
+                    window,
+                    cx,
+                );
+            });
+        },
+    )
+}
+
+/// The inline rename gate: [`rename_target`]'s refusals (empty, a
+/// directory separator, a `..`) plus the already-taken check, surfaced
+/// while typing instead of after the commit.
+fn rename_sprite_validate(
+    worktree_root: PathBuf,
+    source_rel: String,
+) -> impl Fn(&str) -> Option<String> + 'static {
+    move |typed| match rename_target(&source_rel, typed) {
+        Err(error) => Some(error),
+        // Committing the name it already has is a dismissal, not a
+        // collision -- the same exemption `rename_target`'s caller made.
+        Ok(target) if target == source_rel => None,
+        Ok(target) => worktree_root
+            .join(&target)
+            .exists()
+            .then(|| format!("{target} already exists.")),
+    }
+}
+
+/// The inline rename commit: move the `.spr` and repoint the open
+/// document, through the panel that owns it.
+fn rename_sprite_commit(
+    workspace: WeakEntity<Workspace>,
+    source_rel: String,
+) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
+    move |typed, window, cx| {
+        let target = source_rel.clone();
+        (sprite_item_entry_handler(workspace, Some(target), move |panel, _window, cx| {
+            let source_rel = source_rel.clone();
+            let typed = typed.clone();
+            panel.update(cx, |panel, cx| {
+                panel.rename_sprite(&source_rel, &typed, cx);
+            });
+        }))(window, cx);
+    }
 }
 
 /// The "Duplicate Sprite" entry's handler. Split out from
@@ -610,6 +806,42 @@ fn delete_sprite_handler(
             .update(cx, |panel, cx| panel.delete_sprite(rel, window, cx))
             .detach();
     })
+}
+
+/// What deleting the sprite at `rel_in_root` (under the asset root
+/// `root`) costs beyond the `.spr` itself, as prompt cascade lines.
+///
+/// The delete leaves the `.til`/`.pal` on disk deliberately (they are
+/// shareable -- see [`SpritePanel::delete_sprite`]), so the honest thing
+/// to say is which of the two situations the user is in: the art lives on
+/// because somebody else still binds it, or it lives on as a pair of
+/// orphans nothing reads any more.
+///
+/// `scan_til_sharers` gates on two or more binders and returns empty
+/// below that, so filtering the sprite itself out of a non-empty result
+/// yields exactly "the sprites that survive this delete still bound to
+/// it". A `.spr` that won't open contributes no line rather than blocking
+/// the prompt -- the file is being deleted either way.
+fn sprite_delete_cascade(root: &Path, rel_in_root: &str) -> Vec<String> {
+    let Ok(opened) = open_sprite(root, rel_in_root) else {
+        return Vec::new();
+    };
+    let others = io::scan_til_sharers(root, &opened.til_path)
+        .into_iter()
+        .filter(|sharer| sharer != rel_in_root)
+        .count();
+    if others == 0 {
+        return vec![format!(
+            "{} and {} become orphans",
+            opened.til_path, opened.pal_path
+        )];
+    }
+    vec![format!(
+        "{others} other sprite{} share{} {}",
+        if others == 1 { "" } else { "s" },
+        if others == 1 { "s" } else { "" },
+        opened.til_path
+    )]
 }
 
 /// The extensions a duplicated sprite claims: the `.spr` itself and the two
@@ -1061,14 +1293,6 @@ fn rename_target(source_rel: &str, text: &str) -> Result<String, String> {
     })
 }
 
-/// The name a rename field is prefilled with: `source_rel`'s file stem.
-fn rename_seed(source_rel: &str) -> String {
-    let file = source_rel.rsplit('/').next().unwrap_or(source_rel);
-    file.strip_suffix(&format!(".{SPRITE_EXT}"))
-        .unwrap_or(file)
-        .to_string()
-}
-
 // ------------------------------------------------------------- view state
 
 /// What one panel text input edits. `Duration` deliberately carries no
@@ -1216,6 +1440,18 @@ struct OpenSprite {
     /// Clip/duration field editors, rebuilt by `ensure_editors` when the
     /// target set changes.
     editors: Vec<EditorEntry>,
+    /// The frame whose strip cell has swapped its label for an inline
+    /// name editor, and that editor. Not one of [`Self::editors`]: it
+    /// writes a sidecar name, not a `DocOp`, and it exists only while
+    /// the rename is open.
+    frame_rename: Option<(usize, Entity<Editor>)>,
+    /// Blur-commits [`Self::frame_rename`]; dropped with the rename.
+    _frame_rename_subscription: Option<Subscription>,
+    /// The clip whose header row has swapped its name label for its
+    /// [`EditTarget::ClipName`] editor. That editor is one of
+    /// [`Self::editors`] and always exists -- this only says whether the
+    /// row is currently showing it instead of the label.
+    clip_rename: Option<usize>,
     /// A store-level op rejection (shouldn't happen -- ops are
     /// bounds-guarded before apply -- but surfaced instead of swallowed).
     op_error: Option<String>,
@@ -1269,6 +1505,9 @@ impl OpenSprite {
             playing: None,
             _tick_task: None,
             editors: Vec::new(),
+            frame_rename: None,
+            _frame_rename_subscription: None,
+            clip_rename: None,
             op_error: None,
             save_error: None,
         }
@@ -1422,7 +1661,6 @@ impl OpenSprite {
         let shown = self.shown();
         shown.transform.is_identity() && shown.flip == (false, false)
     }
-
 }
 
 enum ViewerState {
@@ -1435,31 +1673,6 @@ enum ViewerState {
     Error(String),
 }
 
-/// A modal-ish form rendered as a bar above the viewer. Both entries
-/// here need typed input that a `window.prompt` (button-choice only)
-/// cannot collect, which is why they are panel forms rather than menu
-/// prompts. The tileset binding a new sprite needs is picked in
-/// [`NewSpriteModal`] instead -- it has art to show, which does not fit
-/// in a bar.
-///
-/// Only one can be open at a time: a second start replaces the first
-/// rather than stacking.
-enum PanelForm {
-    /// "Rename Sprite…": the typed name, committed by the button or
-    /// Enter.
-    Rename {
-        /// The sprite being renamed, worktree-relative.
-        source_rel: String,
-        editor: Entity<Editor>,
-        error: Option<String>,
-    },
-    /// Name a frame (editor-only metadata; double-click a strip cell).
-    NameFrame {
-        index: usize,
-        editor: Entity<Editor>,
-    },
-}
-
 pub struct SpritePanel {
     focus_handle: FocusHandle,
     workspace: Option<WeakEntity<Workspace>>,
@@ -1467,8 +1680,6 @@ pub struct SpritePanel {
     root_override: Option<PathBuf>,
     project_root: Option<PathBuf>,
     state: ViewerState,
-    /// The open "Rename …"/"Name frame …" form, if any.
-    form: Option<PanelForm>,
     /// The sheets column's width once a [`Divider::PreviewSide`] drag
     /// has set one; `None` means the auto width
     /// ([`OpenSprite::auto_side_width`]). Never persisted, and PANEL
@@ -1504,6 +1715,12 @@ pub struct SpritePanel {
     /// way back) and hands its space to the other one.
     reference_visible: bool,
     tiles_visible: bool,
+    /// Whether the frames library column shows its strip, and whether
+    /// the clips section shows its rows and footer. Same contract as the
+    /// two sheet flags above: session-only, panel-lifetime, and a hidden
+    /// section keeps its header row (the way back).
+    frames_visible: bool,
+    clips_visible: bool,
     load_generation: u64,
     _load_task: Option<Task<()>>,
     /// The in-flight delete confirmation, if one is up -- dropping the
@@ -1579,7 +1796,6 @@ impl SpritePanel {
             root_override: None,
             project_root: None,
             state: ViewerState::Empty,
-            form: None,
             side_width: None,
             frames_width: CLIPS_WIDTH,
             reference_height: None,
@@ -1589,6 +1805,8 @@ impl SpritePanel {
             sheets_bounds: Rc::new(RefCell::new(None)),
             reference_visible: true,
             tiles_visible: true,
+            frames_visible: true,
+            clips_visible: true,
             load_generation: 0,
             _load_task: None,
             _confirm_task: None,
@@ -1709,14 +1927,10 @@ impl SpritePanel {
 
     /// Confirm, then delete the sprite at worktree-relative `rel` -- the
     /// body of the project panel's "Delete Sprite" entry
-    /// ([`contribute_sprite_menu`]).
-    ///
-    /// Deletes the `.spr` ONLY. Its `.til`/`.pal` are shareable by design
-    /// (worldlib's `scan_til_sharers`/`pool_shared` exist for exactly
-    /// that), so removing them on the strength of one sprite's deletion
-    /// could break sprites the user never touched; an orphaned sidecar is
-    /// the recoverable half of that trade. A failed unlink leaves the panel
-    /// exactly as it was rather than half-clearing it.
+    /// ([`contribute_sprite_menu`]). The work itself is
+    /// [`confirm_sprite_delete`], shared with the Delete-key route
+    /// ([`intercept_sprite_delete`]) so both ask the same question and
+    /// unlink the same file.
     ///
     /// Returns the `Task` so tests can await the whole prompt->delete round
     /// trip; the menu handler detaches it.
@@ -1730,39 +1944,25 @@ impl SpritePanel {
         let Some(project_root) = self.project_root.clone() else {
             return Task::ready(());
         };
-        // Named, not offered a save: deleting the file makes an unsaved edit
-        // to it moot, so this warns instead of routing through
-        // `prepare_to_close_dirty` (which would offer to write bytes that
-        // are about to be unlinked). ggo-ide's delete made the same call.
         let unsaved = self.dirty_sprite_name().is_some_and(|name| name == rel);
-        let confirm = ggo_common::confirm_destructive(
-            &format!("Delete the sprite {rel}?"),
-            "Delete",
+        confirm_sprite_delete(
+            project_root,
+            rel,
             unsaved,
+            Some(cx.weak_entity()),
             window,
             cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if !confirm.await {
-                return;
-            }
-            if let Err(e) = std::fs::remove_file(project_root.join(&rel)) {
-                // No toast yet (F5.2 owns the notification surface), but a
-                // silent no-op would be indistinguishable from a bug.
-                // Upstream logs AND toasts at the same point.
-                log::error!("GGO: failed to delete sprite {rel}: {e}");
-                return;
-            }
-            this.update(cx, |this, cx| {
-                // The open document's file is gone: keeping it on screen
-                // would offer edits, undo and a save that target nothing.
-                if matches!(&this.state, ViewerState::Ready(open) if open.source_rel == rel) {
-                    this.state = ViewerState::Empty;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
+        )
+    }
+
+    /// Drop the open document when its file is the one just deleted:
+    /// keeping it on screen would offer edits, undo and a save that
+    /// target nothing.
+    fn clear_if_deleted(&mut self, rel: &str, cx: &mut Context<Self>) {
+        if matches!(&self.state, ViewerState::Ready(open) if open.source_rel == rel) {
+            self.state = ViewerState::Empty;
+            cx.notify();
+        }
     }
 
     // ------------------------------------------------------- new / rename
@@ -1920,28 +2120,8 @@ impl SpritePanel {
         }
     }
 
-    /// Open the rename form for the sprite at worktree-relative `rel` --
-    /// the body of the project panel's "Rename Sprite…" entry, prefilled
-    /// with the current stem and focused so it can be typed into
-    /// immediately.
-    fn begin_rename(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_root(cx);
-        let seed = rename_seed(&rel);
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_text(seed, window, cx);
-            editor
-        });
-        window.focus(&editor.focus_handle(cx), cx);
-        self.form = Some(PanelForm::Rename {
-            source_rel: rel,
-            editor,
-            error: None,
-        });
-        cx.notify();
-    }
-
-    /// Rename the `.spr` to the typed name.
+    /// Rename the `.spr` at worktree-relative `source_rel` to the name
+    /// typed in the project panel's inline editor.
     ///
     /// **Only the `.spr` moves.** Its `.til`/`.pal` keep both their names
     /// and their stored rels, which is what keeps a renamed sprite
@@ -1960,19 +2140,20 @@ impl SpritePanel {
     /// title and the "already open?" check compare) and `rel_path` (what
     /// a save writes to) are both repointed, so a dirty document stays
     /// dirty and saves to the new name.
-    fn confirm_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(PanelForm::Rename {
-            source_rel, editor, ..
-        }) = &self.form
-        else {
-            return;
-        };
-        let source_rel = source_rel.clone();
-        let text = editor.read(cx).text(cx);
+    ///
+    /// The name rules ran in the inline editor's validation before this
+    /// is ever reached ([`rename_sprite_validate`]); re-running them here
+    /// is the guard against a file that appeared between the last
+    /// keystroke and Enter, and a failure at THIS point is a filesystem
+    /// failure, which surfaces on the document's own error line rather
+    /// than in an editor that has already closed.
+    fn rename_sprite(&mut self, source_rel: &str, text: &str, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        let source_rel = source_rel.to_string();
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        let target = rename_target(&source_rel, &text).and_then(|target| {
+        let target = rename_target(&source_rel, text).and_then(|target| {
             if target == source_rel {
                 // Committing the name it already has is a dismissal, not
                 // an error -- and must not trip the exists check below.
@@ -1994,22 +2175,24 @@ impl SpritePanel {
                     open.source_rel = target;
                     open.rel_path = rel_in_root;
                 }
-                self.form = None;
             }
             Err(message) => {
                 log::error!("GGO: failed to rename sprite {source_rel}: {message}");
-                if let Some(PanelForm::Rename { error, .. }) = &mut self.form {
-                    *error = Some(message);
+                if let ViewerState::Ready(open) = &mut self.state {
+                    open.op_error = Some(format!("Rename failed: {message}"));
                 }
             }
         }
         cx.notify();
     }
 
-    /// Open the name-frame form for strip cell `index`, prefilled with
-    /// the stored name (empty when unnamed -- seeding the "Frame N"
-    /// fallback would commit it as a literal name).
-    fn begin_name_frame(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Swap strip cell `index`'s label for an inline name editor,
+    /// prefilled with the stored name (empty when unnamed -- seeding the
+    /// "Frame N" fallback would commit it as a literal name).
+    ///
+    /// The name is edited where it is READ, in the cell, rather than in a
+    /// bar at the top of the panel (world_panel's entity-list rename).
+    fn begin_frame_rename(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -2022,27 +2205,72 @@ impl SpritePanel {
             editor.set_text(seed, window, cx);
             editor
         });
-        window.focus(&editor.focus_handle(cx), cx);
-        self.form = Some(PanelForm::NameFrame { index, editor });
+        // Deferred: this runs from the cell's own click handler, and the
+        // panel root's `track_focus` claims focus in the same dispatch
+        // AFTER the listener bubbles -- focusing inline would be undone
+        // by the very click that opened the field.
+        let handle = editor.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        let commit = cx.subscribe(&editor, Self::handle_editor_event);
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        open._frame_rename_subscription = Some(commit);
+        open.frame_rename = Some((index, editor));
         cx.notify();
     }
 
-    /// Commit the name-frame form into the sidecar-backed name list.
-    fn confirm_name_frame(&mut self, cx: &mut Context<Self>) {
-        let Some(PanelForm::NameFrame { index, editor }) = &self.form else {
+    /// Swap clip `i`'s header label for its name editor and focus it --
+    /// the clips strip's half of the same double-click rename the frame
+    /// cells use. The editor itself is the doc-backed
+    /// [`EditTarget::ClipName`] one, so the commit path is unchanged.
+    fn begin_clip_rename(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
             return;
         };
-        let index = *index;
+        if i >= open.store.state().clips.len() {
+            return;
+        }
+        open.clip_rename = Some(i);
+        let editor = open
+            .editors
+            .iter()
+            .find(|entry| entry.target == EditTarget::ClipName(i))
+            .map(|entry| entry.editor.clone());
+        // Deferred for the same reason `begin_frame_rename` defers: the
+        // panel root reclaims focus later in this same dispatch.
+        if let Some(editor) = editor {
+            let handle = editor.focus_handle(cx);
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
+        cx.notify();
+    }
+
+    /// Commit the inline frame rename into the sidecar-backed name list;
+    /// empty text clears the name (the cell falls back to "Frame N").
+    fn commit_frame_rename(&mut self, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let Some((index, editor)) = open.frame_rename.take() else {
+            return;
+        };
+        open._frame_rename_subscription = None;
         let name = editor.read(cx).text(cx).trim().to_string();
-        self.form = None;
         self.set_frame_name(index, name, cx);
         cx.notify();
     }
 
-    /// Dismiss whichever form is open, writing nothing.
-    fn cancel_form(&mut self, cx: &mut Context<Self>) -> bool {
-        let had = self.form.take().is_some();
+    /// Abandon an open inline rename without committing it -- Escape's
+    /// first job, and the reason Escape does not simply fall through to
+    /// clearing the tile selection while a field is open.
+    fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) -> bool {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return false;
+        };
+        let had = open.frame_rename.take().is_some() | open.clip_rename.take().is_some();
         if had {
+            open._frame_rename_subscription = None;
             cx.notify();
         }
         had
@@ -3303,11 +3531,52 @@ impl SpritePanel {
         self.apply_doc(DocOp::ClipAdd { clip }, cx);
     }
 
+    /// Confirm, then delete clip `i`. The clip's whole sequence goes with
+    /// it in one undo step -- the same "bigger edit than the button says"
+    /// [`Self::delete_frame`] confirms for -- so the prompt names how
+    /// many entries are in it.
+    fn delete_clip(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let ViewerState::Ready(open) = &self.state else {
+            return;
+        };
+        let Some(clip) = open.store.state().clips.get(i) else {
+            return;
+        };
+        let name = clip.name.clone();
+        let count = clip.entries.len();
+        let cascade: Vec<String> = (count > 0)
+            .then(|| {
+                format!(
+                    "{count} {}",
+                    if count == 1 { "entry" } else { "entries" }
+                )
+            })
+            .into_iter()
+            .collect();
+        let answer = ggo_common::confirm_destructive_cascade(
+            &format!("Delete clip {name}?"),
+            &cascade,
+            "Delete",
+            false,
+            window,
+            cx,
+        );
+        self._confirm_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if !answer.await {
+                return;
+            }
+            // Re-checked on the far side of the await by `delete_clip_now`:
+            // an undo or a reload may have taken the clip out from under
+            // the dialog while it was up.
+            this.update(cx, |this, cx| this.delete_clip_now(i, cx)).ok();
+        }));
+    }
+
     /// Delete clip `i` -- ggo-ide `Msg::DeleteClip`, including its
     /// active-selection shift rule. Bounds-checked: a stale index (clip
     /// removed by an undo between render and click) should vanish as a
     /// no-op, not surface as the store's `ClipOutOfRange` error.
-    fn delete_clip(&mut self, i: usize, cx: &mut Context<Self>) {
+    fn delete_clip_now(&mut self, i: usize, cx: &mut Context<Self>) {
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
@@ -3577,10 +3846,20 @@ impl SpritePanel {
         event: &EditorEvent,
         cx: &mut Context<Self>,
     ) {
-        if matches!(event, EditorEvent::Blurred) {
-            self.commit_editor(editor.entity_id(), cx);
-            cx.notify();
+        if !matches!(event, EditorEvent::Blurred) {
+            return;
         }
+        // The inline rename editors write a sidecar name, not a `DocOp`,
+        // so they are not in `editors` and must be checked first.
+        if matches!(&self.state, ViewerState::Ready(open)
+            if open.frame_rename.as_ref().is_some_and(|(_, e)| e.entity_id() == editor.entity_id()))
+        {
+            self.commit_frame_rename(cx);
+            cx.notify();
+            return;
+        }
+        self.commit_editor(editor.entity_id(), cx);
+        cx.notify();
     }
 
     fn commit_editor(&mut self, editor_id: EntityId, cx: &mut Context<Self>) {
@@ -3595,28 +3874,32 @@ impl SpritePanel {
         else {
             return;
         };
+        // A committed clip name closes the rename, whether the commit
+        // came from Enter or from the editor losing focus -- the row goes
+        // back to reading as a label.
+        if let EditTarget::ClipName(i) = target
+            && let ViewerState::Ready(open) = &mut self.state
+            && open.clip_rename == Some(i)
+        {
+            open.clip_rename = None;
+        }
         self.commit_edit(target, text, cx);
     }
 
     fn on_commit_field(&mut self, _: &CommitField, window: &mut Window, cx: &mut Context<Self>) {
-        // Enter in the rename field commits the rename -- the form's own
-        // editor is not one of the doc's `EditTarget` editors, so it has
-        // to be checked before the loop below.
-        if let Some(PanelForm::Rename { editor, .. }) = &self.form
-            && editor.focus_handle(cx).is_focused(window)
-        {
-            self.confirm_rename(cx);
-            return;
-        }
-        if let Some(PanelForm::NameFrame { editor, .. }) = &self.form
-            && editor.focus_handle(cx).is_focused(window)
-        {
-            self.confirm_name_frame(cx);
-            return;
-        }
         let ViewerState::Ready(open) = &self.state else {
             return;
         };
+        // Enter inside a cell's inline rename commits the NAME, and must
+        // not fall through to the doc-field commit below.
+        if open
+            .frame_rename
+            .as_ref()
+            .is_some_and(|(_, editor)| editor.focus_handle(cx).is_focused(window))
+        {
+            self.commit_frame_rename(cx);
+            return;
+        }
         let focused = open
             .editors
             .iter()
@@ -3634,17 +3917,16 @@ impl SpritePanel {
     fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add(KEY_CONTEXT);
-        let form_editing = matches!(
-            &self.form,
-            Some(PanelForm::Rename { editor, .. } | PanelForm::NameFrame { editor, .. })
-                if editor.focus_handle(cx).is_focused(window)
-        );
-        let editing = form_editing
-            || match &self.state {
-                ViewerState::Ready(open) => open
-                    .editors
-                    .iter()
-                    .any(|e| e.editor.focus_handle(cx).is_focused(window)),
+        let editing = match &self.state {
+                ViewerState::Ready(open) => {
+                    open.editors
+                        .iter()
+                        .any(|e| e.editor.focus_handle(cx).is_focused(window))
+                        || open
+                            .frame_rename
+                            .as_ref()
+                            .is_some_and(|(_, e)| e.focus_handle(cx).is_focused(window))
+                }
                 _ => false,
             };
         key_context.add(if editing { "editing" } else { "not_editing" });
@@ -4241,65 +4523,6 @@ impl SpritePanel {
             )
     }
 
-    /// The open "Rename …"/"Name frame …" form, as a bar above the viewer.
-    fn render_form(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let row = h_flex()
-            .gap_1()
-            .p_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border);
-        match self.form.as_ref()? {
-            PanelForm::Rename {
-                source_rel,
-                editor,
-                error,
-            } => Some(
-                row.child(
-                    Label::new(format!("Rename {source_rel} to"))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(Self::editor_input(editor.clone(), cx))
-                .child(
-                    Button::new("ggo-sprite-rename-apply", "Rename")
-                        .on_click(cx.listener(|this, _, _, cx| this.confirm_rename(cx))),
-                )
-                .child(
-                    Button::new("ggo-sprite-rename-cancel", "Cancel").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.cancel_form(cx);
-                        },
-                    )),
-                )
-                .children(error.clone().map(|e| {
-                    ggo_common::CopyableText::new("ggo-sprite-rename-error-copy", e)
-                        .size(LabelSize::Small)
-                }))
-                .into_any_element(),
-            ),
-            PanelForm::NameFrame { index, editor } => Some(
-                row.child(
-                    Label::new(format!("Name frame {}", index + 1))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(Self::editor_input(editor.clone(), cx))
-                .child(
-                    Button::new("ggo-sprite-name-frame-apply", "Set")
-                        .on_click(cx.listener(|this, _, _, cx| this.confirm_name_frame(cx))),
-                )
-                .child(
-                    Button::new("ggo-sprite-name-frame-cancel", "Cancel").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.cancel_form(cx);
-                        },
-                    )),
-                )
-                .into_any_element(),
-            ),
-        }
-    }
-
     /// One field text input, in world_panel's minimal bordered box.
     fn editor_input(editor: Entity<Editor>, cx: &Context<Self>) -> gpui::AnyElement {
         div()
@@ -4332,6 +4555,7 @@ impl SpritePanel {
         };
         let state = open.store.state();
         let playing = open.playing.is_some();
+        let visible = self.clips_visible;
         let clip_label: SharedString = match open.active_clip.and_then(|i| state.clips.get(i)) {
             Some(c) => c.name.clone().into(),
             None => "All frames".into(),
@@ -4376,9 +4600,34 @@ impl SpritePanel {
                 .child(
                     h_flex()
                         .gap_0p5()
-                        .children(
-                            editor_for(EditTarget::ClipName(i)).map(|e| Self::editor_input(e, cx)),
-                        )
+                        .map(|this| match open.clip_rename == Some(i) {
+                            true => this.children(
+                                editor_for(EditTarget::ClipName(i)).map(|editor| {
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .debug_selector(move || {
+                                            format!("ggo-sprite-clip-name-editor-{i}")
+                                        })
+                                        .child(Self::editor_input(editor, cx))
+                                }),
+                            ),
+                            false => this.child(
+                                div()
+                                    .id(("ggo-sprite-clip-name", i))
+                                    .debug_selector(move || format!("ggo-sprite-clip-name-{i}"))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Label::new(clip.name.clone()).size(LabelSize::Small))
+                                    .on_click(cx.listener(
+                                        move |this, event: &gpui::ClickEvent, window, cx| {
+                                            if event.click_count() > 1 {
+                                                this.begin_clip_rename(i, window, cx);
+                                            }
+                                        },
+                                    )),
+                            ),
+                        })
                         .child({
                             let weak = cx.weak_entity();
                             Checkbox::new(
@@ -4393,11 +4642,15 @@ impl SpritePanel {
                             })
                         })
                         .child(
-                            IconButton::new(("ggo-sprite-clip-delete", i), IconName::Trash)
-                                .icon_size(IconSize::Small)
-                                .tooltip(ui::Tooltip::text("Delete clip"))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.delete_clip(i, cx)),
+                            div()
+                                .debug_selector(move || format!("ggo-sprite-clip-delete-{i}"))
+                                .child(
+                                    IconButton::new(("ggo-sprite-clip-delete", i), IconName::Trash)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(ui::Tooltip::text("Delete clip"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.delete_clip(i, window, cx)
+                                        })),
                                 ),
                         ),
                 );
@@ -4438,20 +4691,51 @@ impl SpritePanel {
             .relative()
             .debug_selector(|| "ggo-sprite-clips-section".into())
             .flex_none()
-            .h(self.rendered_clips_height())
+            // A hidden section is its title row and nothing else, so the
+            // body row above it takes the space it was holding.
+            .when(visible, |this| this.h(self.rendered_clips_height()))
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .child(gpui::deferred(
-                Self::divider_handle(Divider::Clips, cx)
-                    .absolute()
-                    .top(-DIVIDER_SIZE / 2.)
-                    .left_0()
-                    .w_full()
-                    .h(DIVIDER_SIZE)
-                    .cursor_row_resize(),
-            ))
-            .child(strip)
             .child(
+                h_flex()
+                    .debug_selector(|| "ggo-sprite-clips-header".into())
+                    .flex_none()
+                    .px_1()
+                    .pt_1()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Label::new("Clips")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::visibility_toggle(
+                        "ggo-sprite-clips-visible",
+                        visible,
+                        |this, cx| {
+                            this.clips_visible = !this.clips_visible;
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            )
+            // The handle drags the boundary between the body and this
+            // section: with the section hidden there is no boundary to
+            // drag, and the footer's controls all act on rows that are
+            // not on screen.
+            .children(visible.then(|| {
+                gpui::deferred(
+                    Self::divider_handle(Divider::Clips, cx)
+                        .absolute()
+                        .top(-DIVIDER_SIZE / 2.)
+                        .left_0()
+                        .w_full()
+                        .h(DIVIDER_SIZE)
+                        .cursor_row_resize(),
+                )
+            }))
+            .children(visible.then_some(strip))
+            .children(visible.then(|| {
                 h_flex()
                     .flex_none()
                     .flex_wrap()
@@ -4475,10 +4759,14 @@ impl SpritePanel {
                             .child(DropdownMenu::new("ggo-sprite-clip", clip_label, menu)),
                     )
                     .child(
-                        Button::new("ggo-sprite-clip-add", "+ Clip")
-                            .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
-                    ),
-            )
+                        div()
+                            .debug_selector(|| "ggo-sprite-clip-add".into())
+                            .child(
+                                Button::new("ggo-sprite-clip-add", "+ Clip")
+                                    .on_click(cx.listener(|this, _, _, cx| this.add_clip(cx))),
+                            ),
+                    )
+            }))
             .into_any_element()
     }
 
@@ -4673,6 +4961,15 @@ impl SpritePanel {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+            .child(Self::visibility_toggle(
+                "ggo-sprite-frames-visible",
+                self.frames_visible,
+                |this, cx| {
+                    this.frames_visible = !this.frames_visible;
+                    cx.notify();
+                },
+                cx,
+            ))
             .child(
                 div()
                     .debug_selector(|| "ggo-sprite-frame-add".into())
@@ -4696,6 +4993,10 @@ impl SpritePanel {
                     img(image.clone()).nearest(true).w(px(fit_w)).h(px(fit_h))
                 });
                 let label = editor_meta::frame_label(names, ix);
+                let renaming = match open.frame_rename.as_ref() {
+                    Some((index, editor)) if *index == ix => Some(editor.clone()),
+                    _ => None,
+                };
                 v_flex()
                     .id(("ggo-sprite-frame", ix))
                     // Test-only bounds hook (a no-op in release
@@ -4726,13 +5027,22 @@ impl SpritePanel {
                             .justify_center()
                             .gap_0p5()
                             .items_center()
-                            .child(Label::new(label.clone()).size(LabelSize::XSmall).color(
-                                if names.get(ix).is_some_and(|n| !n.is_empty()) {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                },
-                            ))
+                            .map(|this| match renaming {
+                                Some(editor) => this.child(
+                                    div()
+                                        .debug_selector(|| "ggo-sprite-frame-rename".into())
+                                        .child(Self::editor_input(editor, cx)),
+                                ),
+                                None => this.child(
+                                    Label::new(label.clone()).size(LabelSize::XSmall).color(
+                                        if names.get(ix).is_some_and(|n| !n.is_empty()) {
+                                            Color::Default
+                                        } else {
+                                            Color::Muted
+                                        },
+                                    ),
+                                ),
+                            })
                             .child(
                                 div()
                                     .debug_selector(move || format!("ggo-sprite-frame-dup-{ix}"))
@@ -4764,11 +5074,11 @@ impl SpritePanel {
                                     ),
                             ),
                     )
-                    // Single click selects; double click names.
+                    // Single click selects; double click names in place.
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                             if event.click_count() > 1 {
-                                this.begin_name_frame(ix, window, cx);
+                                this.begin_frame_rename(ix, window, cx);
                             } else {
                                 this.select_frame(ix, cx);
                             }
@@ -4803,7 +5113,10 @@ impl SpritePanel {
                     .cursor_col_resize(),
             ))
             .child(header)
-            .child(strip)
+            // A hidden library is its header row and nothing else -- the
+            // eye stays reachable, the column keeps its width, and the
+            // preview has the rest of the row to itself.
+            .children(self.frames_visible.then_some(strip))
             .into_any_element()
     }
 
@@ -5083,7 +5396,6 @@ impl Render for SpritePanel {
             ViewerState::Error(e) => self.render_load_error(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
-        let form = self.render_form(cx);
         let panel_bounds = self.panel_bounds.clone();
         v_flex()
             .key_context(self.dispatch_context(window, cx))
@@ -5094,17 +5406,16 @@ impl Render for SpritePanel {
             .on_action(cx.listener(|this, _: &Redo, _window, cx| this.redo_impl(cx)))
             .on_action(cx.listener(|this, _: &Save, _window, cx| this.save_impl(cx)))
             .on_action(cx.listener(|this, _: &DeselectTile, _window, cx| {
-                // Escape dismisses an open form first: while one is up it
-                // is the thing the user is looking at, and a form that
-                // could only be closed by its Cancel button would be a
-                // trap the rest of the panel's Escape handling isn't.
-                if !this.cancel_form(cx) {
+                // Escape abandons an open inline rename first: while one
+                // is up it is the thing the user is looking at, and a
+                // field that could only be closed by committing it would
+                // be a trap the rest of the panel's Escape handling isn't.
+                if !this.cancel_inline_rename(cx) {
                     this.deselect_tile(cx);
                 }
             }))
             .on_action(cx.listener(Self::on_commit_field))
             .bg(cx.theme().colors().panel_background)
-            .children(form)
             .child(
                 div()
                     .relative()
@@ -6505,7 +6816,7 @@ mod tests {
             assert!(ready(panel).store.state().clips[1].loop_);
 
             panel.select_clip(Some(1), cx);
-            panel.delete_clip(1, cx);
+            panel.delete_clip_now(1, cx);
             {
                 let open = ready(panel);
                 assert_eq!(open.store.state().clips.len(), 1);
@@ -6557,7 +6868,7 @@ mod tests {
             );
 
             // Stale indices: no panic, no change.
-            panel.delete_clip(7, cx);
+            panel.delete_clip_now(7, cx);
             panel.set_clip_loop(7, true, cx);
             panel.commit_edit(EditTarget::ClipName(7), "x".into(), cx);
             assert_eq!(ready(panel).store.state().clips.len(), 1);
@@ -7261,6 +7572,274 @@ mod tests {
         });
     }
 
+    /// A press+release the platform reports as the second click of a
+    /// double click. `simulate_click` only ever sends `click_count: 1`.
+    fn simulate_double_click(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>) {
+        cx.simulate_event(MouseDownEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+        });
+    }
+
+    /// Naming a frame happens IN THE CELL: a double-click swaps that
+    /// cell's label for an editor sitting inside the cell's own bounds
+    /// (world_panel's entity-list rename), Enter commits, and the name
+    /// lands in the sidecar -- the only persistence frame names have
+    /// (the `.spr` has no name field). It used to open a bar across the
+    /// top of the panel, nowhere near the frame it was naming.
+    #[gpui::test]
+    async fn test_double_click_renames_a_frame_in_its_cell(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-sprite-frame-rename").is_none(),
+            "a cell shows its label at rest"
+        );
+        let cell = cx
+            .debug_bounds("ggo-sprite-frame-0")
+            .expect("frame 0's cell");
+        simulate_double_click(cx, cell.center());
+        cx.run_until_parked();
+
+        let editor = cx
+            .debug_bounds("ggo-sprite-frame-rename")
+            .expect("the double-click opens the cell's editor");
+        assert!(
+            cell.contains(&editor.center()),
+            "the editor belongs to the cell, not to a bar above the viewer: \
+             {editor:?} outside {cell:?}"
+        );
+
+        cx.simulate_input("idle");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).frame_names.first().map(String::as_str),
+                Some("idle"),
+                "Enter commits the typed name"
+            );
+        });
+        assert!(
+            cx.debug_bounds("ggo-sprite-frame-rename").is_none(),
+            "and closes the editor"
+        );
+        assert_eq!(
+            editor_meta::load(dir.path(), "sprites/hero.spr")
+                .frame_names
+                .first()
+                .map(String::as_str),
+            Some("idle"),
+            "the name landed in the sidecar"
+        );
+    }
+
+    /// A clip's name READS as a label and only becomes an editor when
+    /// the user asks to rename it, the same double-click gesture the
+    /// frame cells use. The row used to carry a permanently open text
+    /// box per clip, so a strip of five clips was five live text fields
+    /// nobody was typing in.
+    #[gpui::test]
+    async fn test_clip_name_swaps_to_an_editor_on_double_click(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        let label = cx
+            .debug_bounds("ggo-sprite-clip-name-0")
+            .expect("clip 0's name reads as a label at rest");
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-name-editor-0").is_none(),
+            "and nothing is editable until asked"
+        );
+
+        simulate_double_click(cx, label.center());
+        cx.run_until_parked();
+        let editor_bounds = cx
+            .debug_bounds("ggo-sprite-clip-name-editor-0")
+            .expect("the double-click opens the clip's name editor");
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-name-0").is_none(),
+            "the label gives way to it"
+        );
+        let editor = clip_name_editor(&panel, cx);
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "walk",
+            "seeded with the clip's current name"
+        );
+        assert!(
+            editor_bounds.size.width > px(0.),
+            "the editor is laid out in the row: {editor_bounds:?}"
+        );
+
+        editor.update_in(cx, |editor, window, cx| editor.set_text("", window, cx));
+        cx.simulate_input("run");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).store.state().clips[0].name,
+                "run",
+                "Enter commits through the clip-name path"
+            );
+        });
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-name-editor-0").is_none(),
+            "and closes the editor"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-name-0").is_some(),
+            "leaving the label behind"
+        );
+    }
+
+    /// Deleting a CLIP is as much of a cascade as deleting a frame: the
+    /// clip's whole sequence goes with it, so the button confirms and
+    /// names what is in it. Cancel leaves the clip alone.
+    #[gpui::test]
+    async fn test_deleting_a_clip_confirms_its_entry_cascade(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        let delete = cx
+            .debug_bounds("ggo-sprite-clip-delete-0")
+            .expect("clip 0's delete button");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        assert!(cx.has_pending_prompt(), "deleting a clip must confirm");
+        let (message, detail) = cx.pending_prompt().expect("the confirmation");
+        assert!(
+            message.contains("Delete clip walk?"),
+            "the prompt names the clip: {message}"
+        );
+        assert!(
+            detail.contains("2 entries"),
+            "the prompt names what goes with it: {detail}"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                ready(panel).store.state().clips.len(),
+                1,
+                "Cancel keeps the clip"
+            );
+        });
+
+        let delete = cx
+            .debug_bounds("ggo-sprite-clip-delete-0")
+            .expect("clip 0's delete button after the cancel");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        assert!(cx.has_pending_prompt(), "the second attempt confirms too");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                ready(panel).store.state().clips.is_empty(),
+                "confirming deletes the clip"
+            );
+        });
+    }
+
+    /// The frames library and the clips strip hide the way the two
+    /// sheets already do: the eye leaves the section's header row (and
+    /// itself) on screen and takes everything below it away -- the frame
+    /// cells, the clip rows, the handle that would resize a hidden
+    /// section, and the footer whose controls act on it.
+    #[gpui::test]
+    async fn test_the_frames_and_clips_sections_can_be_hidden(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-sprite-frame-0").is_some(),
+            "the frame strip starts visible"
+        );
+        let eye = cx
+            .debug_bounds("ggo-sprite-frames-visible-on")
+            .expect("the frames section's eye");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-sprite-frame-0").is_none(),
+            "hiding the frames drops the strip"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-frames-header").is_some()
+                && cx.debug_bounds("ggo-sprite-frames-visible-off").is_some(),
+            "the header row stays, showing the way back"
+        );
+
+        let eye = cx
+            .debug_bounds("ggo-sprite-frames-visible-off")
+            .expect("the frames eye, crossed out");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-sprite-frame-0").is_some(),
+            "toggling back restores the strip"
+        );
+
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-row-0").is_some(),
+            "the clips strip starts visible"
+        );
+        let eye = cx
+            .debug_bounds("ggo-sprite-clips-visible-on")
+            .expect("the clips section's eye");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-row-0").is_none(),
+            "hiding the clips drops the rows"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-add").is_none()
+                && cx.debug_bounds("ggo-sprite-play").is_none(),
+            "and the footer whose controls act on them"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-divider-clips").is_none(),
+            "and the handle that would resize a hidden section"
+        );
+        assert!(
+            cx.debug_bounds("ggo-sprite-clips-header").is_some()
+                && cx.debug_bounds("ggo-sprite-clips-visible-off").is_some(),
+            "the title row stays, showing the way back"
+        );
+
+        let eye = cx
+            .debug_bounds("ggo-sprite-clips-visible-off")
+            .expect("the clips eye, crossed out");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-sprite-clip-row-0").is_some()
+                && cx.debug_bounds("ggo-sprite-clip-add").is_some(),
+            "toggling back restores the rows and the footer"
+        );
+    }
+
     /// Either sheet can be hidden so the other fills the column: the
     /// header row (and its eye) stays put, the sheet and the reference
     /// section's drag handle go, and the surviving sheet grows.
@@ -7468,7 +8047,7 @@ mod tests {
         // A vanished owning clip closes it on the next doc refresh.
         panel.update(cx, |panel, cx| {
             panel.open_frame_settings(0, 0, gpui::point(px(50.), px(50.)), cx);
-            panel.delete_clip(0, cx);
+            panel.delete_clip_now(0, cx);
             assert!(
                 ready(panel).frame_settings.is_none(),
                 "stale clip index cannot survive the refresh"
@@ -7674,14 +8253,15 @@ mod tests {
         });
     }
 
-    /// The name-frame form's UI path end to end: `begin_name_frame` opens
-    /// the form with an EMPTY editor for an unnamed frame (seeding the
-    /// "Frame N" fallback would commit it as a literal name), and
-    /// `confirm_name_frame` lands the typed name in `frame_names`, closes
-    /// the form, and writes the sidecar -- the only persistence frame
-    /// names have (the `.spr` has no name field).
+    /// The inline frame rename's own rules, past the rendered
+    /// double-click: an UNNAMED frame opens on an EMPTY field (seeding
+    /// the "Frame N" fallback would commit the fallback as a literal
+    /// name), a named one opens on its name, and committing empty text
+    /// CLEARS the name back to the fallback. Every commit writes the
+    /// sidecar -- the only persistence frame names have (the `.spr` has
+    /// no name field).
     #[gpui::test]
-    async fn test_name_frame_form_commits_through_the_ui_path(cx: &mut TestAppContext) {
+    async fn test_inline_frame_rename_seeds_and_clears(cx: &mut TestAppContext) {
         cx.update(|cx| {
             AppState::test(cx);
             init(cx);
@@ -7702,26 +8282,49 @@ mod tests {
         cx.run_until_parked();
 
         panel.update_in(cx, |panel, window, cx| {
-            panel.begin_name_frame(0, window, cx);
-            let Some(PanelForm::NameFrame { index, editor }) = &panel.form else {
-                panic!("begin_name_frame must open the name form");
+            panel.begin_frame_rename(0, window, cx);
+            let Some((index, editor)) = ready(panel).frame_rename.clone() else {
+                panic!("begin_frame_rename must open the cell's editor");
             };
-            assert_eq!(*index, 0);
+            assert_eq!(index, 0);
             assert_eq!(editor.read(cx).text(cx), "", "an unnamed frame seeds empty");
-            editor
-                .clone()
-                .update(cx, |editor, cx| editor.set_text("idle", window, cx));
-            panel.confirm_name_frame(cx);
+            editor.update(cx, |editor, cx| editor.set_text("idle", window, cx));
+            panel.commit_frame_rename(cx);
         });
 
-        panel.update(cx, |panel, _cx| {
+        panel.read_with(cx, |panel, _| {
             assert_eq!(ready(panel).frame_names[0], "idle");
-            assert!(panel.form.is_none(), "the commit closes the form");
+            assert!(
+                ready(panel).frame_rename.is_none(),
+                "the commit closes the editor"
+            );
         });
         assert_eq!(
             editor_meta::load(dir.path(), "sprites/hero.spr").frame_names,
             vec!["idle"],
             "the name landed in the sidecar"
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.begin_frame_rename(0, window, cx);
+            let Some((_, editor)) = ready(panel).frame_rename.clone() else {
+                panic!("the second rename must open too");
+            };
+            assert_eq!(
+                editor.read(cx).text(cx),
+                "idle",
+                "a named frame seeds its name"
+            );
+            editor.update(cx, |editor, cx| editor.set_text("  ", window, cx));
+            panel.commit_frame_rename(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(ready(panel).frame_names[0], "", "empty text clears the name");
+        });
+        assert_eq!(
+            editor_meta::load(dir.path(), "sprites/hero.spr").frame_names,
+            vec![""],
+            "and the cleared name is persisted"
         );
     }
 
@@ -8305,13 +8908,13 @@ mod tests {
             );
         });
 
-        let editor = clip_name_editor(&panel, cx);
-        editor.update_in(cx, |editor, window, cx| {
-            window.focus(&editor.focus_handle(cx), cx);
-        });
-        // The focus subscription notifies; the re-render re-reads
-        // `dispatch_context` and stamps `editing`.
+        // A clip name is only editable while its inline rename is open,
+        // so open one -- that is the state the `editing` stamp is for.
+        panel.update_in(cx, |panel, window, cx| panel.begin_clip_rename(0, window, cx));
+        // The deferred focus, then the focus subscription's notify: the
+        // re-render re-reads `dispatch_context` and stamps `editing`.
         cx.run_until_parked();
+        let editor = clip_name_editor(&panel, cx);
 
         cx.simulate_keystrokes("space");
         panel.read_with(cx, |panel, _| {
@@ -8657,11 +9260,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
 
+        panel.update_in(cx, |panel, window, cx| panel.begin_clip_rename(0, window, cx));
+        cx.run_until_parked();
         let editor = clip_name_editor(&panel, cx);
-        editor.update_in(cx, |editor, window, cx| {
-            window.focus(&editor.focus_handle(cx), cx);
-            editor.set_text("", window, cx);
-        });
+        editor.update_in(cx, |editor, window, cx| editor.set_text("", window, cx));
         cx.run_until_parked();
 
         cx.simulate_keystrokes("r u n enter");
@@ -9241,12 +9843,11 @@ mod tests {
 
         let handler = delete_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
         cx.update(|window, cx| handler(window, cx));
-        assert_eq!(
-            cx.pending_prompt(),
-            Some((
-                "Delete the sprite sprites/hero.spr?".to_string(),
-                "This cannot be undone.".to_string(),
-            ))
+        let (message, detail) = cx.pending_prompt().expect("the confirmation");
+        assert_eq!(message, "Delete the sprite sprites/hero.spr?");
+        assert!(
+            detail.ends_with("This cannot be undone."),
+            "the cascade never replaces the undone warning: {detail}"
         );
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
@@ -9297,6 +9898,56 @@ mod tests {
         });
     }
 
+    /// The delete prompt names what happens to the SIDECARS, which the
+    /// delete deliberately leaves on disk: with another sprite still
+    /// bound to the `.til` that is a warning about shared art, and with
+    /// nobody left it is a warning about orphans.
+    #[gpui::test]
+    async fn test_delete_sprite_prompt_names_the_sidecar_cascade(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        // Two sprites bound to ONE tileset, beside the fixture pair that
+        // each own theirs.
+        save_fixture(
+            dir.path(),
+            "sprites/twin-a.spr",
+            "sprites/shared.til",
+            "sprites/shared.pal",
+        );
+        save_fixture(
+            dir.path(),
+            "sprites/twin-b.spr",
+            "sprites/shared.til",
+            "sprites/shared.pal",
+        );
+        let (workspace, _panel, _worktree_id, cx) = menu_workspace(cx, dir.path()).await;
+
+        let shared = delete_sprite_handler(workspace.downgrade(), "sprites/twin-a.spr".to_string());
+        cx.update(|window, cx| shared(window, cx));
+        let detail = cx
+            .pending_prompt()
+            .map(|(_, detail)| detail)
+            .expect("the confirmation");
+        assert!(
+            detail.contains("1 other sprite shares sprites/shared.til"),
+            "a still-bound tileset is named: {detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        let sole = delete_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
+        cx.update(|window, cx| sole(window, cx));
+        let detail = cx
+            .pending_prompt()
+            .map(|(_, detail)| detail)
+            .expect("the confirmation");
+        assert!(
+            detail.contains("sprites/hero.til and sprites/hero.pal become orphans"),
+            "the last binder's sidecars are named as orphans: {detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+    }
+
     /// The prompt must SAY when the file being deleted is the open
     /// document and it has unsaved edits -- and only then. It deliberately
     /// does NOT offer to save: deleting the file makes the edit moot, and a
@@ -9313,19 +9964,26 @@ mod tests {
         // not at stake, so the detail must not claim they are.
         let other = delete_sprite_handler(workspace.downgrade(), "sprites/other.spr".to_string());
         cx.update(|window, cx| other(window, cx));
-        assert_eq!(
-            cx.pending_prompt().map(|(_, detail)| detail),
-            Some("This cannot be undone.".to_string()),
-            "another sprite's deletion must not warn about THIS one's edits"
+        let detail = cx
+            .pending_prompt()
+            .map(|(_, detail)| detail)
+            .expect("the confirmation");
+        assert!(
+            detail.ends_with("This cannot be undone."),
+            "another sprite's deletion must not warn about THIS one's edits: {detail}"
         );
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
 
         let handler = delete_sprite_handler(workspace.downgrade(), "sprites/hero.spr".to_string());
         cx.update(|window, cx| handler(window, cx));
-        assert_eq!(
-            cx.pending_prompt().map(|(_, detail)| detail),
-            Some("This cannot be undone. Unsaved edits to it will be lost.".to_string()),
+        let detail = cx
+            .pending_prompt()
+            .map(|(_, detail)| detail)
+            .expect("the confirmation");
+        assert!(
+            detail.ends_with("This cannot be undone. Unsaved edits to it will be lost."),
+            "the open document's unsaved edits are named: {detail}"
         );
         cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
@@ -9484,6 +10142,163 @@ mod tests {
             workspace.add_panel(project_panel, window, cx);
         });
         (workspace, panel, worktree_id, cx)
+    }
+
+    /// Select `rel` in the project panel and fire the stock delete action
+    /// -- exactly what a user pressing Delete on that row does
+    /// (`ggo_emerald_panel`'s helper of the same name, same reasons: the
+    /// fake worktree scans lazily, so every ancestor has to be expanded
+    /// before the row exists, and `project_panel::Delete` is built by
+    /// name because it is private to that crate).
+    async fn delete_from_project_panel(
+        project: &Entity<Project>,
+        worktree_id: WorktreeId,
+        rel: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let mut ancestor = String::new();
+        for segment in rel.split('/') {
+            let expanded = project.update(cx, |project, cx| {
+                let entry = project.entry_for_path(&project_path(worktree_id, &ancestor), cx)?;
+                project.expand_entry(worktree_id, entry.id, cx)
+            });
+            if let Some(expanded) = expanded {
+                expanded.await.expect("expanding a directory");
+            }
+            cx.run_until_parked();
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(segment);
+        }
+        let entry_id = project
+            .read_with(cx, |project, cx| {
+                Some(
+                    project
+                        .entry_for_path(&project_path(worktree_id, rel), cx)?
+                        .id,
+                )
+            })
+            .unwrap_or_else(|| panic!("{rel} is in the worktree"));
+        project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(entry_id));
+        });
+        cx.run_until_parked();
+        let action = cx
+            .update(|_, cx| {
+                cx.build_action(
+                    "project_panel::Delete",
+                    Some(serde_json::json!({ "skip_prompt": false })),
+                )
+            })
+            .expect("project_panel::Delete is a registered action");
+        cx.update(|window, cx| window.dispatch_action(action, cx));
+        cx.run_until_parked();
+    }
+
+    /// Delete on a `.spr` row in the project panel is THIS panel's
+    /// business: the sprite is the thing being deleted and its
+    /// `.til`/`.pal` deliberately survive, so the user gets the sprite
+    /// cascade confirm rather than upstream's "permanently delete
+    /// `hero.spr`?" -- which would say nothing about the sidecars.
+    /// Nothing else in the tree is claimed.
+    #[gpui::test]
+    async fn test_project_panel_delete_of_a_sprite_routes_through_the_cascade(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = emerald_with_tileset();
+        let (workspace, _panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+
+        delete_from_project_panel(&project, worktree_id, "assets/sprites/hero.spr", cx).await;
+        let (message, detail) = cx
+            .pending_prompt()
+            .expect("deleting a .spr from the project panel must confirm");
+        assert_eq!(message, "Delete the sprite assets/sprites/hero.spr?");
+        assert!(
+            detail.contains("become orphans"),
+            "the sprite cascade, not the stock prompt: {detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(
+            dir.path().join("assets/sprites/hero.spr").is_file(),
+            "Cancel keeps the sprite"
+        );
+
+        delete_from_project_panel(&project, worktree_id, "assets/sprites/hero.spr", cx).await;
+        assert!(cx.has_pending_prompt(), "the second attempt confirms too");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(
+            !dir.path().join("assets/sprites/hero.spr").exists(),
+            "confirming unlinks the .spr"
+        );
+        assert!(
+            dir.path().join("assets/sprites/hero.til").is_file(),
+            "and leaves the shareable sidecar alone"
+        );
+
+        delete_from_project_panel(&project, worktree_id, "scratch/notes.txt", cx).await;
+        let (message, _) = cx
+            .pending_prompt()
+            .expect("an unrelated file still gets a prompt");
+        assert!(
+            message.contains("permanently delete"),
+            "nothing but a sprite is claimed: {message}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+    }
+
+    /// The project panel the workspace has docked -- where both inline
+    /// flows (New Sprite…, Rename Sprite…) collect their names.
+    fn docked_project_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<project_panel::ProjectPanel> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<project_panel::ProjectPanel>(cx)
+                .expect("docked")
+        })
+    }
+
+    /// Fire the real "Rename Sprite…" handler, type `name` into the
+    /// project panel's inline editor, and press Enter.
+    fn rename_inline(
+        workspace: &Entity<Workspace>,
+        rel: &str,
+        name: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let (worktree_id, worktree_root) = workspace.read_with(cx, |workspace, cx| {
+            let worktree = workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .expect("a visible worktree");
+            let worktree = worktree.read(cx);
+            (worktree.id(), worktree.abs_path().to_path_buf())
+        });
+        let handler = rename_sprite_handler(
+            workspace.downgrade(),
+            worktree_id,
+            rel.to_string(),
+            worktree_root,
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let project_panel = docked_project_panel(workspace, cx);
+        project_panel.update_in(cx, |panel, window, cx| {
+            panel
+                .ggo_test_filename_editor()
+                .clone()
+                .update(cx, |editor, cx| editor.set_text(name, window, cx));
+            panel.ggo_test_confirm_edit(window, cx);
+        });
+        cx.run_until_parked();
     }
 
     /// Fire the real "New …" handler, type `name` into the project
@@ -10272,8 +11087,6 @@ mod tests {
             "a rename may not move the file: it would strand a sibling sidecar"
         );
         assert!(rename_target("a/hero.spr", "..").is_err());
-        assert_eq!(rename_seed("assets/sprites/hero.spr"), "hero");
-        assert_eq!(rename_seed("hero.spr"), "hero");
     }
 
     /// Rename end to end: the file moves, **its sidecars do not** -- and
@@ -10292,25 +11105,7 @@ mod tests {
         let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
         let panel = item_panel_for(&workspace, cx, "assets/sprites/hero.spr");
 
-        let handler =
-            rename_sprite_handler(workspace.downgrade(), "assets/sprites/hero.spr".to_string());
-        cx.update(|window, cx| handler(window, cx));
-        panel.update(cx, |panel, cx| {
-            let Some(PanelForm::Rename { editor, .. }) = &panel.form else {
-                panic!("Rename Sprite… must open the rename form");
-            };
-            assert_eq!(editor.read(cx).text(cx), "hero", "prefilled with the stem");
-        });
-        cx.update(|window, cx| {
-            panel.update(cx, |panel, cx| {
-                let Some(PanelForm::Rename { editor, .. }) = &panel.form else {
-                    unreachable!()
-                };
-                editor.update(cx, |editor, cx| editor.set_text("villain", window, cx));
-                panel.confirm_rename(cx);
-            })
-        });
-        cx.run_until_parked();
+        rename_inline(&workspace, "assets/sprites/hero.spr", "villain", cx);
 
         assert!(
             !assets.join("sprites/hero.spr").exists(),
@@ -10333,7 +11128,6 @@ mod tests {
         panel.update(cx, |panel, cx| {
             {
                 let open = ready(panel);
-                assert!(panel.form.is_none());
                 assert_eq!(open.source_rel, "assets/sprites/villain.spr");
                 assert_eq!(open.rel_path, "sprites/villain.spr");
             }
@@ -10353,8 +11147,11 @@ mod tests {
         );
     }
 
-    /// A rename onto a name that is already taken is refused inline: the
-    /// form stays open with the message, and neither file moves.
+    /// A rename onto a name that is already taken is refused by the
+    /// inline editor's own validation: the editor stays open carrying the
+    /// message (the `ValidationState` strip New File uses), and neither
+    /// file moves. The refusal is the same rule the panel used to apply
+    /// after the fact, moved to where the name is typed.
     #[gpui::test]
     async fn test_rename_refuses_a_name_that_already_exists(cx: &mut TestAppContext) {
         let dir = emerald_with_tileset();
@@ -10362,31 +11159,30 @@ mod tests {
         write_sprite_fixture_at(&assets, "sprites/other");
         let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let handler =
-            rename_sprite_handler(workspace.downgrade(), "assets/sprites/hero.spr".to_string());
-        cx.update(|window, cx| handler(window, cx));
-        cx.run_until_parked();
-        let panel = newest_item_panel(&workspace, cx);
-        cx.update(|window, cx| {
-            panel.update(cx, |panel, cx| {
-                let Some(PanelForm::Rename { editor, .. }) = &panel.form else {
-                    unreachable!()
-                };
-                editor.update(cx, |editor, cx| editor.set_text("other", window, cx));
-                panel.confirm_rename(cx);
-            })
-        });
+        rename_inline(&workspace, "assets/sprites/hero.spr", "other", cx);
 
         assert!(assets.join("sprites/hero.spr").is_file(), "nothing moved");
-        panel.update(cx, |panel, _| {
-            let Some(PanelForm::Rename { error, .. }) = &panel.form else {
-                panic!("the form must stay open on a refused name");
-            };
+        let project_panel = docked_project_panel(&workspace, cx);
+        project_panel.read_with(cx, |panel, _| {
             assert_eq!(
-                error.as_deref(),
-                Some("assets/sprites/other.spr already exists")
+                panel.ggo_test_validation_error().as_deref(),
+                Some("assets/sprites/other.spr already exists."),
+                "the taken name is refused where it is typed"
             );
+            let (editing, armed) = panel.ggo_test_inline_state();
+            assert!(editing && armed, "and the editor stays open to fix it");
         });
+
+        // A legal name from the same open editor still lands.
+        project_panel.update_in(cx, |panel, window, cx| {
+            panel
+                .ggo_test_filename_editor()
+                .clone()
+                .update(cx, |editor, cx| editor.set_text("villain", window, cx));
+            panel.ggo_test_confirm_edit(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(assets.join("sprites/villain.spr").is_file());
     }
 
     // ------------------------------------ closing a dirty tab (regression)
