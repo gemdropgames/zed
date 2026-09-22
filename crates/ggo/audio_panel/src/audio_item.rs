@@ -41,8 +41,22 @@ impl AudioItem {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_for_test_in(rel, root, None, window, cx)
+    }
+
+    /// [`Self::new_for_test`] wired to a real workspace, which is what
+    /// the import card needs: the modal layer it goes up in belongs to
+    /// the workspace, not to this tab.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_in(
+        rel: String,
+        root: std::path::PathBuf,
+        workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let panel = cx.new(|cx| {
-            let mut panel = AudioPanel::new(None, window, cx);
+            let mut panel = AudioPanel::new(workspace, window, cx);
             panel.root_override = Some(root);
             // Never the machine's own daemon: a test must not depend on
             // one being installed and running, and an older `ggo` on
@@ -76,6 +90,12 @@ impl AudioItem {
 
     pub fn rel(&self) -> &str {
         &self.rel
+    }
+
+    /// The wrapped panel. The context-menu entries reach it this way:
+    /// the tab is the only handle a workspace has on a file's panel.
+    pub(crate) fn panel_entity(&self) -> &Entity<AudioPanel> {
+        &self.panel
     }
 
     #[cfg(test)]

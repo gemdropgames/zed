@@ -21,17 +21,23 @@
 //! the rate picker.
 
 mod audio_item;
+mod editor_meta;
+mod import_modal;
 mod load;
 mod preview;
+mod world_refs;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use editor::Editor;
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Task,
-    WeakEntity, Window, actions, div, point, px, size,
+    App, Bounds, Context, Entity, EntityId, FocusHandle, Focusable, IntoElement, MouseButton,
+    MouseDownEvent, Pixels, Render, Styled, Task, WeakEntity, Window, actions, div, point, px,
+    size,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -43,6 +49,7 @@ use ggo_daemon_client::{AudioBudget, AudioProbe, Connect};
 use ggo_emu_panel::audio::AudioStatus;
 
 pub use audio_item::AudioItem;
+use import_modal::ImportModal;
 use load::Loaded;
 use preview::{Preview, Spec, BLOCK_BYTES, SAMPLES_PER_BLOCK};
 
@@ -62,7 +69,20 @@ const KEY_CONTEXT: &str = "GgoAudioPanel";
 /// containers emerald bakes, and the baked form itself.
 const AUDIO_EXTS: [&str; 3] = ["wav", "ogg", "adp"];
 
+/// The baked form's extension -- what Import writes and what the delete
+/// interceptor claims.
+const BAKED_EXT: &str = "adp";
+
+/// The waveform's height before any [`Divider::Waveform`] drag.
 const WAVEFORM_HEIGHT_PX: f32 = 160.0;
+
+/// The smallest a waveform drag may leave the canvas: below this the
+/// outline is a smear rather than a shape, and the handle would end up
+/// on top of the header row it was dragged past.
+const MIN_WAVEFORM_HEIGHT: Pixels = px(48.);
+
+/// The grab strip's thickness, `workspace::dock`'s resize-handle figure.
+const DIVIDER_SIZE: Pixels = px(6.);
 
 // `debug_selector` handles for the regions whose overflow behaviour the
 // layout tests assert. gpui records a selector's painted bounds only in
@@ -70,11 +90,295 @@ const WAVEFORM_HEIGHT_PX: f32 = 160.0;
 // these cost nothing shipped.
 const HEADER_SELECTOR: &str = "ggo-audio-header";
 const TRANSPORT_SELECTOR: &str = "ggo-audio-transport";
+/// The transport's Import button -- the card's only entry point from the
+/// tab, and what a rendered test clicks.
+const IMPORT_SELECTOR: &str = "ggo-audio-import";
+/// The waveform canvas itself -- present only while the section is shown.
+const WAVEFORM_SELECTOR: &str = "ggo-audio-waveform";
+/// The grab strip under the waveform.
+const WAVEFORM_DIVIDER_SELECTOR: &str = "ggo-audio-divider-waveform";
+/// The centred one-line message that stands in for the viewer when there
+/// is nothing to show -- empty, loading, failed, or deleted.
+const MESSAGE_SELECTOR: &str = "ggo-audio-message";
 /// The playhead redraw cadence while a preview runs.
 const PLAYHEAD_TICK: Duration = Duration::from_millis(33);
 
 pub fn init(cx: &mut App) {
     workspace::register_path_open_interceptor(cx, intercept_audio_open);
+    // Upstream's delete would unlink a `.adp` silently, leaving every
+    // world that names its stem playing nothing -- see
+    // [`intercept_audio_delete`].
+    workspace::register_delete_interceptor(cx, intercept_audio_delete);
+    workspace::register_context_menu_contributor(cx, contribute_audio_menu);
+}
+
+/// `workspace::ContextMenuContributor` for audio files: Import on one of
+/// the two source containers, Delete on the baked form.
+///
+/// MUST NOT touch the project panel or any GGO panel: contributors run
+/// while `ProjectPanel` is leased (see
+/// `Workspace::context_menu_contributions`). Everything panel-shaped is
+/// deferred into the entries' handlers, which run after the lease is
+/// released. The `is_dir` stat the asset-root check makes is not panel
+/// work and is legal here, same as in the sibling panels.
+fn contribute_audio_menu(
+    workspace: &mut Workspace,
+    path: &ProjectPath,
+    is_dir: bool,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Vec<ui::ContextMenuItem> {
+    if is_dir {
+        return Vec::new();
+    }
+    let Some(rel) = ggo_common::rel_in_primary_worktree(workspace, path, cx) else {
+        return Vec::new();
+    };
+    let Some(worktree_root) = primary_worktree_root(workspace, cx) else {
+        return Vec::new();
+    };
+    let extension = Path::new(&rel)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "wav" | "ogg" => vec![
+            ui::ContextMenuEntry::new("Import as .adp…")
+                .icon(ui::IconName::Plus)
+                .handler(import_entry_handler(cx.weak_entity(), rel))
+                .into(),
+        ],
+        // Only inside an asset root: a stray `.adp` elsewhere is no
+        // world's audio, so this crate has nothing to say about it that
+        // upstream's own delete does not.
+        ext if ext == BAKED_EXT
+            && world_refs::split_asset_path(&worktree_root.join(&rel)).is_some() =>
+        {
+            vec![
+            ui::ContextMenuEntry::new("Delete Audio")
+                .icon(ui::IconName::Trash)
+                .handler(delete_entry_handler(cx.weak_entity(), worktree_root, rel))
+                .into(),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The Import entry's handler: open the clicked source's tab and raise
+/// the card over it. Split out from [`contribute_audio_menu`] so a test
+/// can invoke exactly what the menu invokes -- `ContextMenuEntry` keeps
+/// its handler private, so a contributed entry cannot be fired any other
+/// way.
+///
+/// **Deliberately NOT `ggo_common::panel_entry_handler`**: this tab is a
+/// center-pane item, not a dock panel, so there is no dock to reveal --
+/// and revealing one would evict whatever the user was looking at. The
+/// entry runs after the project panel's lease is released, so reaching
+/// the workspace directly here is legal.
+fn import_entry_handler(
+    workspace: WeakEntity<Workspace>,
+    rel: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    move |window, cx| {
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+        let rel = rel.clone();
+        workspace.update(cx, |workspace, cx| {
+            open_audio_item(workspace, rel.clone(), window, cx);
+            let Some(panel) = workspace
+                .items_of_type::<AudioItem>(cx)
+                .find(|item| item.read(cx).rel() == rel)
+                .map(|item| item.read(cx).panel_entity().clone())
+            else {
+                return;
+            };
+            // The card itself goes up on `window.defer` from in here --
+            // see `AudioPanel::show_import_card` for why it has to.
+            panel.update(cx, |panel, cx| panel.show_import_card(window, cx));
+        });
+    }
+}
+
+/// The Delete entry's handler -- the same confirm-and-unlink route
+/// [`intercept_audio_delete`] takes, so the two cannot answer the same
+/// question differently. Split out for the same testability reason as
+/// [`import_entry_handler`].
+fn delete_entry_handler(
+    workspace: WeakEntity<Workspace>,
+    worktree_root: PathBuf,
+    rel: String,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    move |window, cx| {
+        // Legal here: the entry runs after the project panel's lease is
+        // released, so the workspace may be read for the tabs to clear.
+        let showing = workspace
+            .read_with(cx, |workspace, cx| panels_showing(workspace, &rel, cx))
+            .unwrap_or_default();
+        confirm_audio_delete(worktree_root.clone(), rel.clone(), showing, window, cx).detach();
+    }
+}
+
+/// The title over the "we stopped this delete and here is why" prompt.
+const CANT_DELETE_TITLE: &str = "Can't delete these together";
+
+/// A one-button prompt. The answer is dropped deliberately: there is
+/// nothing to decide.
+fn explain(title: &str, detail: &str, window: &mut Window, cx: &mut App) {
+    let _answer = window.prompt(gpui::PromptLevel::Info, title, Some(detail), &["OK"], cx);
+}
+
+/// The workspace's first visible worktree's absolute path -- the one root
+/// every GGO panel resolves against.
+fn primary_worktree_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+}
+
+/// `workspace::DeleteInterceptor` for a `.adp` inside an emerald
+/// project's asset tree.
+///
+/// **Why a claim rather than upstream's prompt.** A `.adp` is named by
+/// STEM from worlds that never mention the file, so "permanently delete
+/// `jump.adp`?" tells the user nothing about the three levels that go
+/// silent when they say yes. [`world_refs::worlds_playing`] names them.
+///
+/// **And a claim always answers**: every path claimed here ends in a
+/// confirm, an unlink, or an explanation -- never silence.
+///
+/// A multi-selection holding a claimed path is claimed WHOLE and
+/// explained rather than split: half the selection through this cascade
+/// and half through upstream's unlink, from one keystroke, is worse than
+/// either (the emerald interceptor's rule).
+///
+/// MUST decide synchronously from path inspection: this runs while
+/// `ProjectPanel` is leased, so everything panel- or prompt-shaped is
+/// pushed into `cx.defer_in(window, ..)` with the root resolved here and
+/// handed in -- the deferred body re-enters the workspace's own update
+/// and so may not read the workspace entity either.
+fn intercept_audio_delete(
+    workspace: &mut Workspace,
+    paths: &[ProjectPath],
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let Some(worktree_root) = primary_worktree_root(workspace, cx) else {
+        return false;
+    };
+    let claimed = paths
+        .iter()
+        .filter(|path| {
+            path.path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(BAKED_EXT))
+        })
+        .filter_map(|path| ggo_common::rel_in_primary_worktree(workspace, path, cx))
+        .filter(|rel| world_refs::split_asset_path(&worktree_root.join(rel)).is_some())
+        .collect::<Vec<_>>();
+    let Some(rel) = claimed.first().cloned() else {
+        return false;
+    };
+    if paths.len() > 1 {
+        let detail = format!(
+            "An audio delete names every world that plays the stem, one \
+             file at a time, and this selection includes:\n\n{}\n\n\
+             Delete them one at a time.",
+            claimed.join("\n")
+        );
+        cx.defer_in(window, move |_workspace, window, cx| {
+            explain(CANT_DELETE_TITLE, &detail, window, cx);
+        });
+        return true;
+    }
+    // Resolved HERE and handed in: the deferred body re-enters the
+    // workspace's own update and so may not read the workspace entity.
+    let showing = panels_showing(workspace, &rel, cx);
+    cx.defer_in(window, move |_workspace, window, cx| {
+        confirm_audio_delete(worktree_root, rel, showing, window, cx).detach();
+    });
+    true
+}
+
+/// The panels of every open tab showing worktree-relative `rel`.
+fn panels_showing(
+    workspace: &Workspace,
+    rel: &str,
+    cx: &App,
+) -> Vec<WeakEntity<AudioPanel>> {
+    workspace
+        .items_of_type::<AudioItem>(cx)
+        .filter(|item| item.read(cx).rel() == rel)
+        .map(|item| item.read(cx).panel_entity().downgrade())
+        .collect()
+}
+
+/// Confirm, then unlink the worktree-relative `rel` under `worktree_root`.
+///
+/// Workspace-free on purpose: the interceptor reaches it with the
+/// workspace leased, so the root -- and the panels of the tabs showing
+/// this file, which must stop painting it once it is gone -- are
+/// resolved by the caller and handed in.
+fn confirm_audio_delete(
+    worktree_root: PathBuf,
+    rel: String,
+    showing: Vec<WeakEntity<AudioPanel>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<()> {
+    let cascade = audio_delete_cascade(&worktree_root, &rel);
+    let confirm = ggo_common::confirm_destructive_cascade(
+        &format!("Delete the audio {rel}?"),
+        &cascade,
+        "Delete",
+        false,
+        window,
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        if !confirm.await {
+            return;
+        }
+        let Err(e) = std::fs::remove_file(worktree_root.join(&rel)) else {
+            // The tabs still painting the decoded file it no longer is.
+            for panel in showing {
+                panel
+                    .update(cx, |panel, cx| panel.clear_if_deleted(&rel, cx))
+                    .ok();
+            }
+            return;
+        };
+        log::error!("GGO: failed to delete {rel}: {e}");
+        let detail = format!("{rel} could not be deleted: {e}");
+        cx.update(|cx| {
+            let Some(window) = cx.active_window() else {
+                return;
+            };
+            if let Err(e) = window.update(cx, |_, window, cx| {
+                explain("Delete failed", &detail, window, cx);
+            }) {
+                log::error!("GGO: no window for the delete failure prompt: {e}");
+            }
+        });
+    })
+}
+
+/// The worlds that go silent if the `.adp` at worktree-relative `rel` is
+/// removed or replaced.
+fn audio_delete_cascade(worktree_root: &Path, rel: &str) -> Vec<String> {
+    let Some((asset_root, asset_rel)) = world_refs::split_asset_path(&worktree_root.join(rel))
+    else {
+        return Vec::new();
+    };
+    let Some(stem) = world_refs::adp_stem(&asset_rel) else {
+        return Vec::new();
+    };
+    world_refs::worlds_playing(&asset_root, stem)
 }
 
 /// Whether `path` is a file this tab opens (extension only, case-insensitive).
@@ -158,6 +462,10 @@ pub(crate) enum ViewerState {
     Empty,
     Loading(String),
     Error { rel: String, message: String },
+    /// The open file was deleted out from under the tab. Its own state
+    /// rather than an `Error`: nothing failed, and the difference is
+    /// what the tab says to the user.
+    Deleted(String),
     Ready(Open),
 }
 
@@ -188,6 +496,69 @@ pub(crate) struct Open {
     pub(crate) error: Option<String>,
 }
 
+impl Open {
+    /// What the bake costs, in one line: the readout under the transport
+    /// AND the import card's preview, so the two can never disagree
+    /// about what is about to be written.
+    fn readout(&self) -> String {
+        match (&self.baked, self.baking) {
+            (Some(_), _) => {
+                let bytes = self.budget.region_bytes;
+                let region = self.budget.sample_region_bytes;
+                let blocks = bytes / BLOCK_BYTES;
+                let pct = u64::from(bytes) * 100 / u64::from(region.max(1));
+                let baked_secs =
+                    blocks as f32 * SAMPLES_PER_BLOCK as f32 / self.rate.max(1) as f32;
+                format!(
+                    "baked {} Hz · {blocks} blocks · {bytes} B · {pct}% of {} KiB · {baked_secs:.2} s",
+                    self.rate,
+                    region / 1024
+                )
+            }
+            (None, true) => format!("baking at {} Hz…", self.rate),
+            (None, false) => String::new(),
+        }
+    }
+}
+
+/// The viewer's one session-only divider: between the waveform and the
+/// chrome under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Divider {
+    Waveform,
+}
+
+/// A divider mid-drag. `workspace::DraggedDock`'s shape: the drag state
+/// rides on the drag itself and the ghost renders nothing, because the
+/// visible feedback is the resized layout, not a floating chip.
+///
+/// The [`EntityId`] is the panel the handle belongs to, and it is load
+/// bearing: `on_drag_move` fires in the CAPTURE phase on every mounted
+/// listener whose drag type matches, with no hitbox test, so with two
+/// audio tabs open in split panes a drag in one would resize both.
+#[derive(Clone, Copy)]
+struct DraggedDivider(Divider, EntityId);
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a waveform-divider drag at window position `position` into the
+/// canvas's new height, given the canvas's current bounds.
+///
+/// Measured DOWN from the canvas's own top, which the header above it
+/// pins: the bottom edge is the one following the drag, so it cannot be
+/// the edge the height is measured from. No upper clamp -- the tab's
+/// column scrolls (`test_c_a_short_tab_scrolls_its_chrome_into_reach`),
+/// so a waveform taller than the pane is reachable rather than lost.
+///
+/// Pure so the floor is testable without a window.
+fn divider_size(position: gpui::Point<Pixels>, canvas: Bounds<Pixels>) -> Pixels {
+    (position.y - canvas.top()).max(MIN_WAVEFORM_HEIGHT)
+}
+
 pub struct AudioPanel {
     focus_handle: FocusHandle,
     workspace: Option<WeakEntity<Workspace>>,
@@ -208,6 +579,13 @@ pub struct AudioPanel {
     _playhead_task: Option<Task<()>>,
     /// The Import target path, editable.
     import_target: Entity<Editor>,
+    /// Session-only: the eye in the waveform's title row.
+    waveform_visible: bool,
+    /// Session-only: the dragged canvas height, `None` until dragged.
+    waveform_height: Option<Pixels>,
+    /// The canvas's painted bounds, recorded by its own prepaint hook --
+    /// what a drag measures its new height from.
+    waveform_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// How this panel reaches the daemon: every decode, bake, size and
     /// write goes over that socket. Injectable so a test can script one
     /// instead of needing `ggo serve` running.
@@ -235,6 +613,9 @@ impl AudioPanel {
             preview: None,
             _playhead_task: None,
             import_target: cx.new(|cx| Editor::single_line(window, cx)),
+            waveform_visible: true,
+            waveform_height: None,
+            waveform_bounds: Rc::new(RefCell::new(None)),
             connect: ggo_daemon_client::system_connect(),
         }
     }
@@ -262,6 +643,12 @@ impl AudioPanel {
         cx.spawn(async move |this, cx| {
             this.update(cx, |this, cx| {
                 this.refresh_root(cx);
+                // Before the load, not after it: a context-menu Import
+                // raises the card the moment the tab opens, and a target
+                // that only appeared once the decode landed would leave
+                // the field empty under the user's cursor -- or stay
+                // empty for good on a file that failed to decode.
+                this.seed_import_target(&rel, cx);
                 this.load_rel_path(&rel, cx);
             })
             .ok();
@@ -317,7 +704,6 @@ impl AudioPanel {
             true => loaded.probe.rate_hz,
             false => loaded.probe.default_rate_hz,
         };
-        let target = default_import_target(&rel);
         // Taken, not cloned: the probe carries the outline across the
         // socket once, and the canvas wants it behind an `Arc` rather
         // than re-cloned on every paint.
@@ -343,9 +729,25 @@ impl AudioPanel {
         if !is_adp {
             self.start_bake(cx);
         }
-        // Through the buffer rather than `Editor::set_text`: this runs from
-        // the load task, which has no window, and the target is plain
-        // text with no selection to preserve.
+    }
+
+    /// Fill the Import target field for `rel`.
+    ///
+    /// Through the buffer rather than `Editor::set_text`: this runs from
+    /// the open task, which has no window, and the target is plain text
+    /// with no selection to preserve.
+    ///
+    /// The sidecar wins over the computed default: a studio that imports
+    /// `jump.wav` into `assets/sfx/` once means it every time, and
+    /// retyping the directory on each re-import is how a stray
+    /// `assets/jump.adp` ends up shipping beside the real one.
+    fn seed_import_target(&mut self, rel: &str, cx: &mut Context<Self>) {
+        let remembered = self
+            .project_root
+            .as_ref()
+            .and_then(|root| editor_meta::load(root, rel).import_target)
+            .filter(|target| !target.trim().is_empty());
+        let target = remembered.unwrap_or_else(|| default_import_target(rel));
         let buffer = self.import_target.read(cx).buffer().read(cx).as_singleton();
         if let Some(buffer) = buffer {
             buffer.update(cx, |buffer, cx| {
@@ -578,6 +980,63 @@ impl AudioPanel {
         self.import_target.read(cx).text(cx).trim().to_string()
     }
 
+    /// The open file's worktree-relative path, for the card's header.
+    fn open_rel(&self) -> Option<String> {
+        match &self.state {
+            ViewerState::Ready(open) => Some(open.rel.clone()),
+            _ => None,
+        }
+    }
+
+    /// The bake readout the card previews -- see [`Open::readout`].
+    fn readout(&self) -> String {
+        match &self.state {
+            ViewerState::Ready(open) => open.readout(),
+            _ => String::new(),
+        }
+    }
+
+    /// Whether Import has something to write: a source file whose bake
+    /// has landed. Drives the button's `disabled`, in both places it is
+    /// offered, so the guard is always visible rather than silent.
+    fn can_import(&self) -> bool {
+        matches!(&self.state, ViewerState::Ready(open) if !open.is_adp && open.baked.is_some())
+    }
+
+    /// The bake / import problem the card repeats under its field.
+    fn import_error(&self) -> Option<String> {
+        match &self.state {
+            ViewerState::Ready(open) => open.error.clone(),
+            _ => None,
+        }
+    }
+
+    /// Put [`ImportModal`] over the window.
+    ///
+    /// **Deferred, and it has to be.** This runs inside the panel's own
+    /// update, and the modal layer READS the new modal the instant it is
+    /// shown (for the focus handle to focus), which reads this panel --
+    /// a read of an entity that is still leased. `window.defer`, not
+    /// `cx.defer_in`, which would re-take this entity's update one frame
+    /// later for the identical panic.
+    pub(crate) fn show_import_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        let panel = cx.entity();
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                // `toggle_modal` would CLOSE an open card rather than
+                // reopen it, taking the target that was just typed with
+                // it. A second click just leaves the one already up.
+                if workspace.active_modal::<ImportModal>(cx).is_some() {
+                    return;
+                }
+                workspace.toggle_modal(window, cx, |_, cx| ImportModal::new(panel, cx));
+            });
+        });
+    }
+
     /// Whether Import would replace an existing file.
     pub(crate) fn import_would_overwrite(&self, cx: &App) -> bool {
         let target = self.import_target(cx);
@@ -617,11 +1076,62 @@ impl AudioPanel {
         Ok(target)
     }
 
-    fn import_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Stop showing worktree-relative `rel` because it is no longer on
+    /// disk. A no-op for any other file, so a caller may hand this to
+    /// every open tab without checking which one it was.
+    ///
+    /// The preview goes with it: a run already in flight is playing
+    /// samples decoded from bytes nothing owns any more.
+    pub(crate) fn clear_if_deleted(&mut self, rel: &str, cx: &mut Context<Self>) {
+        let showing = match &self.state {
+            ViewerState::Ready(open) => open.rel == rel,
+            ViewerState::Loading(loading) => loading == rel,
+            ViewerState::Error { rel: failed, .. } => failed == rel,
+            _ => false,
+        };
+        if !showing {
+            return;
+        }
+        self.stop_preview(cx);
+        // A load still in flight would otherwise land on top of this.
+        self.load_generation += 1;
+        self.bake_generation += 1;
+        self.state = ViewerState::Deleted(rel.to_string());
+        cx.notify();
+    }
+
+    /// Record where this source's import went, so the next one opens on
+    /// the same directory. A sidecar that cannot be written is logged
+    /// and dropped: the `.adp` is already on disk and re-typing a path
+    /// is not worth failing a successful import over.
+    fn remember_import_target(&self, target: &str) {
+        let (Some(root), Some(source)) = (self.project_root.as_ref(), self.open_rel()) else {
+            return;
+        };
+        let meta = editor_meta::EditorMeta {
+            import_target: Some(target.to_string()),
+        };
+        if let Err(e) = editor_meta::save(root, &source, &meta) {
+            log::error!("GGO: could not remember the import target for {source}: {e}");
+        }
+    }
+
+    /// The worlds an overwrite of worktree-relative `target` changes the
+    /// sound of. Empty for a target outside an emerald asset root, which
+    /// no world can name a stem in.
+    fn overwrite_cascade(&self, target: &str) -> Vec<String> {
+        match self.project_root.as_ref() {
+            Some(root) => audio_delete_cascade(root, target),
+            None => Vec::new(),
+        }
+    }
+
+    pub(crate) fn import_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let target = self.import_target(cx);
         let confirm = if self.import_would_overwrite(cx) {
-            ggo_common::confirm_destructive(
+            ggo_common::confirm_destructive_cascade(
                 &format!("Overwrite {target}?"),
+                &self.overwrite_cascade(&target),
                 "Overwrite",
                 false,
                 window,
@@ -637,6 +1147,7 @@ impl AudioPanel {
             this.update_in(cx, |this, window, cx| {
                 match this.write_import(cx) {
                     Ok(rel) => {
+                        this.remember_import_target(&rel);
                         if let Some(open) = this.open_mut() {
                             open.error = None;
                         }
@@ -710,6 +1221,7 @@ impl AudioPanel {
 
     fn render_message(&self, message: String, cx: &Context<Self>) -> gpui::AnyElement {
         div()
+            .debug_selector(|| MESSAGE_SELECTOR.to_string())
             .size_full()
             .flex()
             .justify_center()
@@ -733,23 +1245,7 @@ impl AudioPanel {
             if open.is_adp { " · baked" } else { "" }
         );
 
-        let readout = match (&open.baked, open.baking) {
-            (Some(_), _) => {
-                let bytes = open.budget.region_bytes;
-                let region = open.budget.sample_region_bytes;
-                let blocks = bytes / BLOCK_BYTES;
-                let pct = u64::from(bytes) * 100 / u64::from(region.max(1));
-                let baked_secs =
-                    blocks as f32 * SAMPLES_PER_BLOCK as f32 / open.rate.max(1) as f32;
-                format!(
-                    "baked {} Hz · {blocks} blocks · {bytes} B · {pct}% of {} KiB · {baked_secs:.2} s",
-                    open.rate,
-                    region / 1024
-                )
-            }
-            (None, true) => format!("baking at {} Hz…", open.rate),
-            (None, false) => String::new(),
-        };
+        let readout = open.readout();
         let audio_label = self.status.state().label(playing);
 
         let weak = cx.weak_entity();
@@ -778,7 +1274,12 @@ impl AudioPanel {
         let transport = h_flex()
             .debug_selector(|| TRANSPORT_SELECTOR.to_string())
             .flex_wrap()
-            .gap_2()
+            // A wrapped row is a different row, not a wider gap between
+            // siblings: the vertical gap is bigger than the horizontal
+            // one so a two-row transport reads as two rows rather than
+            // one tall smear of controls.
+            .gap_x_2()
+            .gap_y_3()
             .p_1()
             .items_center()
             .child(
@@ -829,16 +1330,27 @@ impl AudioPanel {
                 )
                 .into_any_element()
             })
-            .child(div().flex_1())
+            // `min_w_0` so the spacer is the child that gives way in a
+            // narrow row: nothing else in here can shrink, and a spacer
+            // that refuses to would push Import off the edge.
+            .child(div().flex_1().min_w_0())
             .when(!is_adp, |this| {
-                this.child(div().w(px(280.)).child(self.import_target.clone()))
-                    .child(
-                        Button::new("ggo-audio-import", "Import as .adp")
-                            .disabled(!can_import)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.import_impl(window, cx)),
-                            ),
-                    )
+                this.child(
+                    div()
+                        .debug_selector(|| IMPORT_SELECTOR.to_string())
+                        .child(
+                            Button::new("ggo-audio-import", "Import…")
+                                .disabled(!can_import)
+                                .tooltip(ui::Tooltip::text(if can_import {
+                                    "Choose where the .adp lands"
+                                } else {
+                                    "The bake has not landed yet"
+                                }))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_import_card(window, cx)
+                                })),
+                        ),
+                )
             });
 
         v_flex()
@@ -866,7 +1378,7 @@ impl AudioPanel {
                             .color(Color::Muted),
                     ),
             )
-            .child(self.render_waveform(open.waveform.clone(), progress, cx))
+            .child(self.render_waveform_section(open.waveform.clone(), progress, cx))
             .child(transport)
             .child(
                 h_flex()
@@ -892,6 +1404,131 @@ impl AudioPanel {
             .into_any_element()
     }
 
+    /// The waveform's height AS RENDERED: the dragged height, else the
+    /// default, never below the floor.
+    fn rendered_waveform_height(&self) -> Pixels {
+        self.waveform_height
+            .unwrap_or(px(WAVEFORM_HEIGHT_PX))
+            .max(MIN_WAVEFORM_HEIGHT)
+    }
+
+    /// Apply one step of a divider drag. Drops out before `notify` when
+    /// the clamped height is the one already in force -- a drag emits a
+    /// move event per mouse position, most of which land in the same
+    /// pixel row once the floor is biting.
+    fn drag_divider(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(canvas) = *self.waveform_bounds.borrow() else {
+            return;
+        };
+        let height = divider_size(position, canvas);
+        if self.waveform_height.replace(height) != Some(height) {
+            cx.notify();
+        }
+    }
+
+    /// The eye that collapses the waveform to its title row. The
+    /// `-on`/`-off` debug selector is what a rendered test toggles and
+    /// reads back (an `IconButton`'s id is not a selector).
+    fn visibility_toggle(id: &'static str, visible: bool, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .debug_selector(move || format!("{id}-{}", if visible { "on" } else { "off" }))
+            .child(
+                IconButton::new(id, if visible { IconName::Eye } else { IconName::EyeOff })
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Show/hide the waveform"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.waveform_visible = !this.waveform_visible;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// The grab handle under the waveform. `workspace::dock`'s
+    /// resize-handle shape: an occluding strip that starts a
+    /// [`DraggedDivider`] drag, which the section's `on_drag_move` turns
+    /// into a height. Wrapped in `deferred` by the caller for the same
+    /// reason the dock does -- the strip straddles a border, and what
+    /// paints after it would otherwise swallow half the grab area.
+    fn divider_handle(cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(WAVEFORM_DIVIDER_SELECTOR)
+            .debug_selector(|| WAVEFORM_DIVIDER_SELECTOR.to_string())
+            .on_drag(
+                DraggedDivider(Divider::Waveform, cx.entity_id()),
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *dragged)
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .occlude()
+    }
+
+    /// The waveform, under a title row whose eye hides it. Hidden, the
+    /// section is that row and nothing else, so everything below moves
+    /// up into the space rather than the tab keeping a gap.
+    fn render_waveform_section(
+        &self,
+        waveform: Arc<Vec<(i16, i16)>>,
+        progress: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let visible = self.waveform_visible;
+        v_flex()
+            .relative()
+            .flex_none()
+            // The drag listener lives on the whole section, not on the
+            // handle: a fast drag outruns the 6px strip. `on_drag_move`
+            // fires in the CAPTURE phase for the whole window with no
+            // hitbox test, so this section sees drags from OTHER audio
+            // tabs in other split panes too -- hence the owner filter.
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedDivider>, _, cx| {
+                    let &DraggedDivider(_, owner) = event.drag(cx);
+                    if owner != cx.entity_id() {
+                        return;
+                    }
+                    this.drag_divider(event.event.position, cx);
+                },
+            ))
+            .child(
+                h_flex()
+                    .debug_selector(|| "ggo-audio-waveform-title".to_string())
+                    .flex_none()
+                    .px_1()
+                    .pt_1()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Label::new("Waveform")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::visibility_toggle(
+                        "ggo-audio-waveform-visible",
+                        visible,
+                        cx,
+                    )),
+            )
+            .children(visible.then(|| self.render_waveform(waveform, progress, cx)))
+            // With the section hidden there is no boundary to drag.
+            .children(visible.then(|| {
+                gpui::deferred(
+                    Self::divider_handle(cx)
+                        .absolute()
+                        .bottom(-DIVIDER_SIZE / 2.)
+                        .left_0()
+                        .w_full()
+                        .h(DIVIDER_SIZE)
+                        .cursor_row_resize(),
+                )
+            }))
+            .into_any_element()
+    }
+
     fn render_waveform(
         &self,
         waveform: Arc<Vec<(i16, i16)>>,
@@ -903,8 +1540,11 @@ impl AudioPanel {
         let wave = colors.text_accent;
         let midline = colors.border;
         let playhead = colors.border_focused;
-        gpui::canvas(
-            |_, _, _| {},
+        let recorded = self.waveform_bounds.clone();
+        let canvas = gpui::canvas(
+            move |bounds, _window, _cx| {
+                *recorded.borrow_mut() = Some(bounds);
+            },
             move |bounds: Bounds<Pixels>, (), window, _cx| {
                 window.paint_quad(gpui::fill(bounds, background));
                 let width: f32 = bounds.size.width.into();
@@ -944,13 +1584,18 @@ impl AudioPanel {
                 }
             },
         )
-        .w_full()
-        .h(px(WAVEFORM_HEIGHT_PX))
-        // A canvas has no content to set a flex item's automatic minimum,
-        // so without this a short pane shrinks the waveform towards zero
-        // instead of overflowing the column into its scroll range.
-        .flex_none()
-        .into_any_element()
+        .size_full();
+        div()
+            .debug_selector(|| WAVEFORM_SELECTOR.to_string())
+            .w_full()
+            .h(self.rendered_waveform_height())
+            // A canvas has no content to set a flex item's automatic
+            // minimum, so without this a short pane shrinks the waveform
+            // towards zero instead of overflowing the column into its
+            // scroll range.
+            .flex_none()
+            .child(canvas)
+            .into_any_element()
     }
 }
 
@@ -971,6 +1616,9 @@ impl Render for AudioPanel {
             ViewerState::Error { rel, message } => {
                 self.render_message(format!("{rel}: {message}"), cx)
             }
+            ViewerState::Deleted(rel) => {
+                self.render_message(format!("{rel} was deleted"), cx)
+            }
             ViewerState::Ready(_) => self.render_ready(window, cx),
         };
         div()
@@ -989,6 +1637,7 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use project::{FakeFs, Project, WorktreeId};
+    use project_panel::ProjectPanel;
     use workspace::item::Item;
     use workspace::{AppState, MultiWorkspace};
 
@@ -1077,6 +1726,179 @@ mod tests {
             cx.add_window_view(|window, cx| AudioItem::new_for_test(rel, root, window, cx));
         cx.run_until_parked();
         (item, cx)
+    }
+
+    /// [`ready_item`] inside a real workspace, so the modal layer the
+    /// import card lives in has a host. The `FakeFs` tree mirrors the
+    /// real temp dir the panel reads through `root_override`.
+    async fn workspace_item<'a>(
+        cx: &'a mut TestAppContext,
+        root: &Path,
+        rel: &str,
+    ) -> (
+        Entity<Workspace>,
+        Entity<AudioItem>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            editor::init(cx);
+            init(cx);
+            ggo_common::bind_default_keymap(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(root, serde_json::json!({ "emerald.toml": "" }))
+            .await;
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let root = root.to_path_buf();
+        let rel = rel.to_string();
+        let item = workspace.update_in(cx, |workspace, window, cx| {
+            let weak = workspace.weak_handle();
+            let item =
+                cx.new(|cx| AudioItem::new_for_test_in(rel, root, Some(weak), window, cx));
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        });
+        cx.run_until_parked();
+        (workspace, item, cx)
+    }
+
+    /// The Import card: the transport's button raises it, the target
+    /// field opens focused and seeded, and Enter writes the `.adp` at
+    /// whatever was typed there.
+    #[gpui::test]
+    async fn test_the_import_card_opens_focused_and_enter_writes_the_typed_target(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        let (workspace, item, cx) = workspace_item(cx, dir.path(), "audio-src/jump.wav").await;
+        let panel = item.read_with(cx, |item, _| item.panel().clone());
+
+        let button = cx
+            .debug_bounds("ggo-audio-import")
+            .expect("the transport's Import button");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<ImportModal>(cx)
+                    .is_some()),
+            "the Import button raises the card"
+        );
+        let (seeded, focused) = cx.update(|window, cx| {
+            let panel = panel.read(cx);
+            (
+                panel.import_target(cx),
+                panel.import_target.focus_handle(cx).is_focused(window),
+            )
+        });
+        assert_eq!(seeded, "assets/jump.adp", "the target field opens seeded");
+        assert!(focused, "and focused, ready to be typed over");
+
+        cx.simulate_keystrokes("ctrl-a");
+        cx.simulate_input("assets/typed.adp");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(
+            dir.path().join("assets/typed.adp").is_file(),
+            "Enter imports at the typed target"
+        );
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<ImportModal>(cx)
+                    .is_none()),
+            "and the card closes behind it"
+        );
+    }
+
+    /// Escape on the card writes nothing.
+    #[gpui::test]
+    async fn test_escape_on_the_import_card_writes_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        let (workspace, _item, cx) = workspace_item(cx, dir.path(), "audio-src/jump.wav").await;
+
+        let button = cx
+            .debug_bounds("ggo-audio-import")
+            .expect("the transport's Import button");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<ImportModal>(cx)
+                    .is_some()),
+            "the card is up"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<ImportModal>(cx)
+                    .is_none()),
+            "Escape dismisses the card"
+        );
+        assert!(
+            !dir.path().join("assets/jump.adp").exists(),
+            "and writes nothing"
+        );
+    }
+
+    /// The overwrite confirm names the worlds that play the stem being
+    /// replaced: a re-import is silent about the worlds it changes the
+    /// sound of, and those are exactly the files the user cannot see
+    /// from the audio tab.
+    #[gpui::test]
+    async fn test_the_overwrite_confirm_names_the_worlds_that_play_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ggo_common::EMERALD_MANIFEST), "").unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/jump.adp"), b"stale").unwrap();
+        std::fs::write(
+            dir.path().join("assets/arena.wrld.toml"),
+            "[[entity]]\nSfx = { stem = \"jump\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("assets/quiet.wrld.toml"),
+            "[[entity]]\nSprite = { stem = \"hero\" }\n",
+        )
+        .unwrap();
+
+        let (_workspace, item, cx) = workspace_item(cx, dir.path(), "audio-src/jump.wav").await;
+        let panel = item.read_with(cx, |item, _| item.panel().clone());
+        panel.update_in(cx, |panel, window, cx| panel.import_impl(window, cx));
+        cx.run_until_parked();
+
+        let (message, detail) = cx.pending_prompt().expect("the overwrite confirm");
+        assert_eq!(message, "Overwrite assets/jump.adp?");
+        assert!(
+            detail.contains("arena plays this audio"),
+            "the cascade must name the world that plays the stem: {detail}"
+        );
+        assert!(
+            !detail.contains("quiet"),
+            "and only that world: {detail}"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(dir.path().join("assets/jump.adp")).unwrap(),
+            b"stale",
+            "Cancel writes nothing"
+        );
     }
 
     fn ready(panel: &AudioPanel) -> &Open {
@@ -1261,6 +2083,421 @@ mod tests {
         assert!(!claimed, "everything else opens the normal way");
     }
 
+    /// The last import target is remembered per SOURCE file: a second
+    /// import of the same `.wav` opens on where the first one went, not
+    /// back on the flat `assets/` default.
+    #[gpui::test]
+    async fn test_the_import_target_is_remembered_per_source(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        let (_workspace, item, cx) = workspace_item(cx, dir.path(), "audio-src/jump.wav").await;
+        let panel = item.read_with(cx, |item, _| item.panel().clone());
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| panel.import_target(cx)),
+            "assets/jump.adp",
+            "a source nothing has been imported from opens on the default"
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .import_target
+                .update(cx, |editor, cx| editor.set_text("assets/sfx/jump.adp", window, cx));
+            panel.import_impl(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            dir.path().join("assets/sfx/jump.adp").is_file(),
+            "the import lands where it was told to"
+        );
+        assert_eq!(
+            editor_meta::load(dir.path(), "audio-src/jump.wav")
+                .import_target
+                .as_deref(),
+            Some("assets/sfx/jump.adp"),
+            "and the sidecar records it"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.seed_import_target("audio-src/jump.wav", cx);
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| panel.import_target(cx)),
+            "assets/sfx/jump.adp",
+            "the seed prefers the sidecar over the default"
+        );
+    }
+
+    // ------------------------------------------------- project-panel delete
+
+    /// A real emerald project on the real filesystem behind a real
+    /// workspace with a real [`ProjectPanel`]: the `FakeFs` tree mirrors
+    /// the temp dir so the worktree has entries to select, while the
+    /// interceptor reads the actual world files through `std::fs`.
+    async fn delete_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<Project>,
+        WorktreeId,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        std::fs::write(root.join(ggo_common::EMERALD_MANIFEST), "").unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("assets/jump.adp"), b"blob").unwrap();
+        std::fs::write(root.join("assets/lonely.adp"), b"blob").unwrap();
+        std::fs::write(
+            root.join("assets/arena.wrld.toml"),
+            "[[entity]]\nSfx = { stem = \"jump\" }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("notes.txt"), "").unwrap();
+        write_wav(root, "audio-src/jump.wav", 16_000, 1);
+        std::fs::write(root.join("audio-src/theme.ogg"), b"").unwrap();
+
+        cx.update(|cx| {
+            AppState::test(cx);
+            project_panel::init(cx);
+            editor::init(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            root,
+            serde_json::json!({
+                "emerald.toml": "",
+                "assets": {
+                    "jump.adp": "",
+                    "lonely.adp": "",
+                    "arena.wrld.toml": "",
+                },
+                "notes.txt": "",
+                "audio-src": { "jump.wav": "", "theme.ogg": "" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_panel = ProjectPanel::ggo_test_new(workspace, window, cx);
+            workspace.add_panel(project_panel, window, cx);
+        });
+        let worktree_id = worktree_id(&project, cx);
+        cx.run_until_parked();
+        (workspace, project, worktree_id, cx)
+    }
+
+    /// Select `rel` in the project panel and fire the stock delete action
+    /// -- exactly what a user pressing Delete on that row does.
+    ///
+    /// The selection travels as `project::Event::RevealInProjectPanel`,
+    /// and the action is built by name because `project_panel::Delete` is
+    /// private to that crate -- which is also proof the dispatch goes
+    /// through the real registered handler.
+    async fn delete_from_project_panel(
+        project: &Entity<Project>,
+        worktree_id: WorktreeId,
+        rel: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        // The fake worktree scans lazily, so every ancestor directory of
+        // `rel` has to be expanded before the entry exists to be selected.
+        let mut ancestor = String::new();
+        for segment in rel.split('/') {
+            let expanded = project.update(cx, |project, cx| {
+                let entry = project.entry_for_path(&project_path(worktree_id, &ancestor), cx)?;
+                project.expand_entry(worktree_id, entry.id, cx)
+            });
+            if let Some(expanded) = expanded {
+                expanded.await.expect("expanding a directory");
+            }
+            cx.run_until_parked();
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(segment);
+        }
+        let entry_id = project
+            .read_with(cx, |project, cx| {
+                Some(project.entry_for_path(&project_path(worktree_id, rel), cx)?.id)
+            })
+            .unwrap_or_else(|| panic!("{rel} is in the worktree"));
+        project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(entry_id));
+        });
+        cx.run_until_parked();
+        let action = cx
+            .update(|_, cx| {
+                cx.build_action(
+                    "project_panel::Delete",
+                    Some(serde_json::json!({ "skip_prompt": false })),
+                )
+            })
+            .expect("project_panel::Delete is a registered action");
+        cx.update(|window, cx| window.dispatch_action(action, cx));
+        cx.run_until_parked();
+    }
+
+    /// Deleting a `.adp` from the project panel raises THIS crate's
+    /// confirm -- the one naming the worlds that play it -- and
+    /// confirming unlinks the file.
+    #[gpui::test]
+    async fn test_deleting_an_adp_names_the_worlds_that_play_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, project, worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+
+        delete_from_project_panel(&project, worktree_id, "assets/jump.adp", cx).await;
+        let (message, detail) = cx.pending_prompt().expect("the delete confirm");
+        assert_eq!(message, "Delete the audio assets/jump.adp?");
+        assert!(
+            detail.contains("arena plays this audio"),
+            "the cascade must name the world that plays it: {detail}"
+        );
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(
+            !dir.path().join("assets/jump.adp").exists(),
+            "confirming unlinks the file"
+        );
+    }
+
+    /// A `.adp` nothing plays still gets this crate's confirm (never the
+    /// stock one), and Cancel leaves the file alone.
+    #[gpui::test]
+    async fn test_cancelling_an_adp_delete_leaves_it_alone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_workspace, project, worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+
+        delete_from_project_panel(&project, worktree_id, "assets/lonely.adp", cx).await;
+        let (message, detail) = cx.pending_prompt().expect("the delete confirm");
+        assert_eq!(message, "Delete the audio assets/lonely.adp?");
+        assert!(!detail.contains("plays this audio"), "{detail}");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(
+            dir.path().join("assets/lonely.adp").exists(),
+            "Cancel leaves the file alone"
+        );
+    }
+
+    /// A delete that goes through clears the tab showing the file: a
+    /// viewer still painting the waveform of a `.adp` that is no longer
+    /// on disk is a tab the user can play, re-import and re-bake from
+    /// bytes nothing owns any more.
+    #[gpui::test]
+    async fn test_deleting_an_adp_clears_the_tab_showing_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, project, worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+        // The fixture's placeholder bytes would not decode; the tab has
+        // to be showing a REAL bake for "stops showing it" to mean
+        // anything.
+        let decoded = ggo_audio::Decoded {
+            samples: vec![1_000; 16_000],
+            rate_hz: 16_000,
+            source_channels: 1,
+        };
+        std::fs::write(
+            dir.path().join("assets/jump.adp"),
+            ggo_audio::bake(&decoded, 16_000),
+        )
+        .unwrap();
+
+        let root = dir.path().to_path_buf();
+        let item = workspace.update_in(cx, |workspace, window, cx| {
+            let weak = workspace.weak_handle();
+            let item = cx.new(|cx| {
+                AudioItem::new_for_test_in(
+                    "assets/jump.adp".to_string(),
+                    root,
+                    Some(weak),
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(WAVEFORM_SELECTOR).is_some(),
+            "the tab is showing the file before the delete"
+        );
+
+        delete_from_project_panel(&project, worktree_id, "assets/jump.adp", cx).await;
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(
+            !dir.path().join("assets/jump.adp").exists(),
+            "the file is gone"
+        );
+        assert!(
+            cx.debug_bounds(WAVEFORM_SELECTOR).is_none(),
+            "and the tab stops rendering its decoded data"
+        );
+        assert!(
+            cx.debug_bounds(MESSAGE_SELECTOR).is_some(),
+            "the tab says so where the viewer was"
+        );
+        item.read_with(cx, |item, cx| {
+            match &item.panel_entity().read(cx).state {
+                ViewerState::Deleted(rel) => assert_eq!(rel, "assets/jump.adp"),
+                _ => panic!("expected the Deleted state"),
+            }
+        });
+    }
+
+    /// Only a single `.adp` under an asset root is claimed: anything else
+    /// falls through to upstream's own delete, and a multi-selection
+    /// holding one is claimed WHOLE and explained rather than split.
+    #[gpui::test]
+    async fn test_the_delete_interceptor_claims_only_a_single_adp(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _project, worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+
+        let intercept = |rels: &[&str], cx: &mut gpui::VisualTestContext| {
+            let paths: Vec<ProjectPath> = rels
+                .iter()
+                .map(|rel| project_path(worktree_id, rel))
+                .collect();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.intercept_delete(&paths, window, cx)
+            })
+        };
+
+        assert!(
+            !intercept(&["notes.txt"], cx),
+            "a non-audio file is upstream's"
+        );
+        assert!(
+            !intercept(&["assets/arena.wrld.toml"], cx),
+            "and so is a world"
+        );
+        assert!(
+            intercept(&["assets/jump.adp", "assets/lonely.adp"], cx),
+            "a multi-selection holding a .adp is claimed whole"
+        );
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().expect("the explanation");
+        assert_eq!(message, "Can't delete these together");
+        assert!(
+            detail.contains("assets/jump.adp") && detail.contains("assets/lonely.adp"),
+            "the explanation names them: {detail}"
+        );
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+        assert!(
+            dir.path().join("assets/jump.adp").exists(),
+            "and nothing is unlinked"
+        );
+    }
+
+    // ------------------------------------------------------ context menu
+
+    /// The entries the project panel offers, by extension: Import on a
+    /// source container, Delete on the baked file, nothing anywhere else.
+    #[gpui::test]
+    async fn test_the_context_menu_offers_import_on_sources_and_delete_on_the_baked(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _project, worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+
+        let contributed = |rel: &str, is_dir: bool, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace
+                    .context_menu_contributions(&project_path(worktree_id, rel), is_dir, window, cx)
+                    .len()
+            })
+        };
+        assert_eq!(contributed("audio-src/jump.wav", false, cx), 1, "Import…");
+        assert_eq!(contributed("audio-src/theme.ogg", false, cx), 1, "Import…");
+        assert_eq!(contributed("assets/jump.adp", false, cx), 1, "Delete Audio");
+        assert_eq!(contributed("notes.txt", false, cx), 0, "nothing else");
+        assert_eq!(
+            contributed("assets/arena.wrld.toml", false, cx),
+            0,
+            "and not a world"
+        );
+        assert_eq!(contributed("assets", true, cx), 0, "and not a directory");
+    }
+
+    /// The Import entry opens the tab for the clicked source and raises
+    /// the card over it, target already filled in.
+    #[gpui::test]
+    async fn test_the_import_entry_opens_the_tab_and_raises_the_card(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _project, _worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+
+        let handler = import_entry_handler(workspace.downgrade(), "audio-src/jump.wav".to_string());
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+
+        let opened = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<AudioItem>(cx)
+                .map(|item| item.read(cx).rel().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            opened,
+            vec!["audio-src/jump.wav".to_string()],
+            "the entry opens the clicked source's tab"
+        );
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<ImportModal>(cx)
+                    .is_some()),
+            "and raises the import card over it"
+        );
+        let panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<AudioItem>(cx)
+                .next()
+                .expect("the tab")
+                .read(cx)
+                .panel_entity()
+                .clone()
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| panel.import_target(cx)),
+            "assets/jump.adp",
+            "with the target prefilled, whatever the decode did"
+        );
+        assert!(
+            cx.update(|window, cx| panel
+                .read(cx)
+                .import_target
+                .focus_handle(cx)
+                .is_focused(window)),
+            "and the field focused, the same as the transport route"
+        );
+    }
+
+    /// The Delete entry takes the same cascade route the interceptor does.
+    #[gpui::test]
+    async fn test_the_delete_entry_confirms_with_the_cascade(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, _project, _worktree_id, cx) = delete_workspace(cx, dir.path()).await;
+
+        let handler = delete_entry_handler(
+            workspace.downgrade(),
+            dir.path().to_path_buf(),
+            "assets/jump.adp".to_string(),
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().expect("the delete confirm");
+        assert_eq!(message, "Delete the audio assets/jump.adp?");
+        assert!(detail.contains("arena plays this audio"), "{detail}");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(!dir.path().join("assets/jump.adp").exists());
+    }
+
     // ------------------------------------------------ layout / overflow
 
     /// Resize the window and let the tab redraw at the new size.
@@ -1277,6 +2514,123 @@ mod tests {
             touch_phase: gpui::TouchPhase::default(),
         });
         cx.run_until_parked();
+    }
+
+    /// The waveform section collapses to its title row, freeing the
+    /// space for the chrome below it, and the eye is the way back.
+    #[gpui::test]
+    async fn test_the_waveform_can_be_hidden_to_its_title(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        let (_item, cx) = ready_item(cx, dir.path(), "audio-src/jump.wav").await;
+        resize(cx, 900., 800.);
+
+        assert!(
+            cx.debug_bounds("ggo-audio-waveform").is_some(),
+            "the waveform starts visible"
+        );
+        let transport_before = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds recorded at paint");
+
+        let eye = cx
+            .debug_bounds("ggo-audio-waveform-visible-on")
+            .expect("the waveform section's eye");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-audio-waveform").is_none(),
+            "hiding drops the canvas"
+        );
+        assert!(
+            cx.debug_bounds("ggo-audio-divider-waveform").is_none(),
+            "and the handle that would resize a hidden section"
+        );
+        assert!(
+            cx.debug_bounds("ggo-audio-waveform-visible-off").is_some(),
+            "the title row stays, showing the way back"
+        );
+        let transport_hidden = cx
+            .debug_bounds(TRANSPORT_SELECTOR)
+            .expect("transport bounds with the waveform hidden");
+        assert!(
+            transport_hidden.origin.y < transport_before.origin.y - px(100.),
+            "the chrome below takes the freed space: {transport_before:?} -> \
+             {transport_hidden:?}"
+        );
+
+        let eye = cx
+            .debug_bounds("ggo-audio-waveform-visible-off")
+            .expect("the waveform eye, crossed out");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-audio-waveform").is_some(),
+            "toggling back restores the waveform"
+        );
+    }
+
+    /// The divider under the waveform sizes it: dragging down makes it
+    /// taller by what the pointer moved, and it cannot be dragged below
+    /// the floor that keeps an outline readable.
+    #[gpui::test]
+    async fn test_the_waveform_divider_resizes_it_down_to_a_floor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        write_wav(dir.path(), "audio-src/jump.wav", 16_000, 1);
+        let (_item, cx) = ready_item(cx, dir.path(), "audio-src/jump.wav").await;
+        resize(cx, 900., 800.);
+
+        let before = cx
+            .debug_bounds("ggo-audio-waveform")
+            .expect("waveform bounds recorded at paint");
+        assert_eq!(
+            before.size.height,
+            px(WAVEFORM_HEIGHT_PX),
+            "the default height is unchanged"
+        );
+        let handle = cx
+            .debug_bounds("ggo-audio-divider-waveform")
+            .expect("the waveform divider handle is painted");
+        assert!(
+            (handle.center().y - before.bottom()).abs() <= DIVIDER_SIZE,
+            "the handle must straddle the waveform's bottom edge: {handle:?} \
+             under {before:?}"
+        );
+
+        let drag_to = |cx: &mut gpui::VisualTestContext, from: gpui::Point<Pixels>, y: Pixels| {
+            let target = point(from.x, y);
+            cx.simulate_mouse_move(from, None, gpui::Modifiers::default());
+            cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.run_until_parked();
+        };
+
+        drag_to(cx, handle.center(), before.bottom() + px(80.));
+        let taller = cx
+            .debug_bounds("ggo-audio-waveform")
+            .expect("waveform bounds after the drag");
+        assert!(
+            (taller.size.height - before.size.height - px(80.)).abs() < px(2.),
+            "dragging the divider 80px down must make the waveform 80px \
+             taller: before {:?}, after {:?}",
+            before.size,
+            taller.size
+        );
+
+        let handle = cx
+            .debug_bounds("ggo-audio-divider-waveform")
+            .expect("the handle follows the edge it drags");
+        drag_to(cx, handle.center(), before.origin.y - px(400.));
+        let floored = cx
+            .debug_bounds("ggo-audio-waveform")
+            .expect("waveform bounds after the upward drag");
+        assert_eq!(
+            floored.size.height, MIN_WAVEFORM_HEIGHT,
+            "a drag past the top clamps to the floor, not to nothing"
+        );
     }
 
     /// Class B: the transport is Play, Loop, two mode buttons, the rate
