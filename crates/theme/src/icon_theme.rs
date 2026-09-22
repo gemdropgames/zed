@@ -149,6 +149,11 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("font", &["otf", "ttf", "woff", "woff2"]),
     ("fsharp", &["fs"]),
     ("fsproj", &["fsproj"]),
+    ("ggo_audio", &["adp"]),       // GGO: Emerald ADPCM audio
+    ("ggo_cart", &["cart"]),       // GGO: built cartridges
+    ("ggo_map", &["map"]),         // GGO: Emerald tilemaps
+    ("ggo_pal", &["pal"]),         // GGO: Emerald palettes
+    ("ggo_project", &["ggo"]),     // GGO: project manifests
     ("ggo_world", &["wrld.toml"]), // GGO: Emerald world files
     ("gitlab", &["gitlab-ci.yml", "gitlab-ci.yaml"]),
     ("gleam", &["gleam"]),
@@ -340,6 +345,11 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("font", "icons/file_icons/font.svg"),
     ("fsharp", "icons/file_icons/fsharp.svg"),
     ("fsproj", "icons/file_icons/file.svg"),
+    ("ggo_audio", "icons/file_icons/ggo_audio.svg"), // GGO
+    ("ggo_cart", "icons/file_icons/ggo_cart.svg"),   // GGO
+    ("ggo_map", "icons/file_icons/ggo_map.svg"),     // GGO
+    ("ggo_pal", "icons/file_icons/ggo_pal.svg"),     // GGO
+    ("ggo_project", "icons/file_icons/ggo_project.svg"), // GGO
     ("ggo_world", "icons/file_icons/ggo_world.svg"), // GGO
     ("gitlab", "icons/file_icons/gitlab.svg"),
     ("gleam", "icons/file_icons/gleam.svg"),
@@ -465,7 +475,10 @@ mod tests {
         let icon_theme = default_icon_theme();
 
         assert_eq!(
-            icon_theme.file_suffixes.get("wrld.toml").map(String::as_str),
+            icon_theme
+                .file_suffixes
+                .get("wrld.toml")
+                .map(String::as_str),
             Some("ggo_world"),
         );
         assert_eq!(
@@ -478,6 +491,39 @@ mod tests {
         assert_eq!(
             icon_theme.file_suffixes.get("toml").map(String::as_str),
             Some("toml"),
+        );
+    }
+
+    #[test]
+    fn test_emerald_asset_suffixes_map_to_their_ggo_icons() {
+        let icon_theme = default_icon_theme();
+
+        for (suffix, key) in [
+            ("map", "ggo_map"),
+            ("pal", "ggo_pal"),
+            ("adp", "ggo_audio"),
+            ("cart", "ggo_cart"),
+            ("ggo", "ggo_project"),
+        ] {
+            assert_eq!(
+                icon_theme.file_suffixes.get(suffix).map(String::as_str),
+                Some(key),
+                "suffix {suffix}",
+            );
+            assert_eq!(
+                icon_theme
+                    .file_icons
+                    .get(key)
+                    .map(|icon| icon.path.as_ref()),
+                Some(format!("icons/file_icons/{key}.svg").as_str()),
+                "icon {key}",
+            );
+        }
+
+        assert_ne!(
+            icon_theme.file_suffixes.get("adp").map(String::as_str),
+            icon_theme.file_suffixes.get("wav").map(String::as_str),
+            "emerald audio keeps its own icon, not upstream's",
         );
     }
 }

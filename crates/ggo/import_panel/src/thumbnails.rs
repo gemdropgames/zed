@@ -1,7 +1,8 @@
 //! The project panel's thumbnail decoder for GGO assets (registered with
 //! `workspace::ggo_thumbnails` from `init`): a `.til` shows its first
-//! tiles, a `.spr` its first frame, a `.png` itself -- each fitted into a
-//! [`THUMB_PX`] square off the UI thread.
+//! tiles, a `.spr` its first frame, a `.pal` its sixteen swatches, a
+//! `.png` itself -- each fitted into a [`THUMB_PX`] square off the UI
+//! thread.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,16 +10,18 @@ use std::sync::Arc;
 use ggo_common::{thumbnail_rgba, to_render_image};
 use ggo_worldlib::sprites::import::decode_png;
 use ggo_worldlib::sprites::io;
-use ggo_worldlib::sprites::palette565::indices_to_rgba;
+use ggo_worldlib::sprites::palette565::{PAL_SLOTS, indices_to_rgba};
 use ggo_worldlib::sprites::preview::compose_frame_rgba;
 use ggo_worldlib::sprites::tileset_doc::{TILE_PX, compose_tile_grid, tile_grid_layout};
 use gpui::RenderImage;
 
-pub const EXTENSIONS: &[&str] = &["til", "spr", "png"];
+pub const EXTENSIONS: &[&str] = &["til", "spr", "pal", "png"];
 pub const THUMB_PX: usize = 16;
 /// A `.til` thumbnail shows its first `THUMB_COLS x THUMB_ROWS` tiles.
 const THUMB_COLS: usize = 4;
 const THUMB_ROWS: usize = 2;
+/// A `.pal` thumbnail lays its [`PAL_SLOTS`] swatches out `PAL_COLS` wide.
+const PAL_COLS: usize = 4;
 
 pub fn decode_thumbnail(path: &Path) -> Option<Arc<RenderImage>> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -40,6 +43,16 @@ pub fn decode_thumbnail(path: &Path) -> Option<Arc<RenderImage>> {
                 indices_to_rgba(&indices, &tileset.palette),
                 cols * TILE_PX,
                 rows.max(1) * TILE_PX,
+            )
+        }
+        "pal" => {
+            let bytes = std::fs::read(path).ok()?;
+            let palette = ggo_asset_formats::decode_pal(&bytes)?;
+            let slots: Vec<u8> = (0..PAL_SLOTS as u8).collect();
+            (
+                indices_to_rgba(&slots, &palette),
+                PAL_COLS,
+                PAL_SLOTS / PAL_COLS,
             )
         }
         "spr" => {
@@ -76,7 +89,45 @@ fn split_for_worldlib(path: &Path) -> Option<(PathBuf, String)> {
 mod tests {
     use super::*;
     use crate::loader::{two_tone_rgba, write_png_fixture};
-    use ggo_worldlib::sprites::palette565::PAL_SLOTS;
+
+    /// Swatch `slot` of a decoded `.pal` thumbnail, as BGRA.
+    fn swatch_pixel(image: &RenderImage, slot: usize) -> [u8; 4] {
+        let cell = THUMB_PX / PAL_COLS;
+        let (x, y) = (
+            (slot % PAL_COLS) * cell + cell / 2,
+            (slot / PAL_COLS) * cell + cell / 2,
+        );
+        let bytes = image.as_bytes(0).expect("one frame");
+        let at = (y * THUMB_PX + x) * 4;
+        bytes[at..at + 4].try_into().expect("four channels")
+    }
+
+    #[test]
+    fn a_pal_thumbnail_shows_its_sixteen_swatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut palette = [0u16; PAL_SLOTS];
+        palette[1] = 0xF800; // pure 565 red
+        palette[5] = 0x001F; // pure 565 blue
+        let pal = dir.path().join("hero.pal");
+        std::fs::write(&pal, ggo_asset_formats::encode_pal(&palette)).unwrap();
+
+        let image = decode_thumbnail(&pal).expect("pal thumbnail");
+        assert_eq!(
+            image.size(0),
+            gpui::size(THUMB_PX as i32, THUMB_PX as i32).map(|d| d.into())
+        );
+        assert_eq!(swatch_pixel(&image, 1), [0, 0, 255, 255], "BGRA red");
+        assert_eq!(swatch_pixel(&image, 5), [255, 0, 0, 255], "BGRA blue");
+        assert_eq!(
+            swatch_pixel(&image, 0)[3],
+            0,
+            "slot 0 stays the transparent slot"
+        );
+
+        std::fs::write(dir.path().join("short.pal"), [0u8; 4]).unwrap();
+        assert!(decode_thumbnail(&dir.path().join("short.pal")).is_none());
+        assert!(decode_thumbnail(&dir.path().join("nope.pal")).is_none());
+    }
 
     #[test]
     fn png_and_til_thumbnails_are_thumb_sized() {

@@ -186,4 +186,31 @@ mod tests {
             );
         });
     }
+
+    #[gpui::test]
+    fn test_emerald_asset_files_use_their_ggo_icons(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            theme::init(LoadThemes::JustBase, cx);
+
+            for (file, icon) in [
+                ("overworld.map", "ggo_map"),
+                ("hero.pal", "ggo_pal"),
+                ("jump.adp", "ggo_audio"),
+                ("game.cart", "ggo_cart"),
+                ("game.ggo", "ggo_project"),
+            ] {
+                assert_eq!(
+                    FileIcons::get_icon(Path::new(file), cx).as_deref(),
+                    Some(format!("icons/file_icons/{icon}.svg").as_str()),
+                    "{file}",
+                );
+            }
+
+            assert_eq!(
+                FileIcons::get_icon(Path::new("jump.wav"), cx).as_deref(),
+                Some("icons/file_icons/audio.svg"),
+                "upstream audio files keep upstream's icon",
+            );
+        });
+    }
 }
