@@ -27,6 +27,44 @@ pub struct EditorMeta {
     /// no id in the file either, so its identity here is its index too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instance_names: Vec<String>,
+    /// The view toggles this world was last looked at with. `None` is a
+    /// world that has never been opened by a build that stored them, and
+    /// keeps the panel's own defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewMeta>,
+}
+
+/// Grid, snap and zoom, per world. Not document state -- two people
+/// editing the same world disagree about zoom without disagreeing about
+/// the world -- so it rides here with the names rather than in the
+/// `.wrld.toml`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ViewMeta {
+    /// The tile-grid overlay. Defaults ON, as the panel does.
+    #[serde(default = "grid_default")]
+    pub grid: bool,
+    #[serde(default)]
+    pub snap: bool,
+    #[serde(default = "zoom_default")]
+    pub zoom: f64,
+}
+
+fn grid_default() -> bool {
+    true
+}
+
+fn zoom_default() -> f64 {
+    crate::canvas::ZOOM_DEFAULT
+}
+
+impl Default for ViewMeta {
+    fn default() -> Self {
+        ViewMeta {
+            grid: grid_default(),
+            snap: false,
+            zoom: zoom_default(),
+        }
+    }
 }
 
 /// `<rel>.editor.json` under the hidden `.ggo-ide/` dir, preserving the
@@ -73,6 +111,11 @@ mod tests {
         let meta = EditorMeta {
             entity_names: vec!["boss".to_string(), String::new(), "door".to_string()],
             instance_names: vec!["east gate".to_string()],
+            view: Some(ViewMeta {
+                grid: false,
+                snap: true,
+                zoom: 4.0,
+            }),
         };
         save(dir.path(), "worlds/main.wrld.toml", &meta).unwrap();
         assert_eq!(load(dir.path(), "worlds/main.wrld.toml"), meta);
@@ -84,6 +127,34 @@ mod tests {
         assert_eq!(
             load(dir.path(), "worlds/main.wrld.toml"),
             EditorMeta::default()
+        );
+    }
+
+    #[test]
+    fn a_sidecar_with_no_view_block_loads_no_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = EditorMeta {
+            entity_names: vec!["boss".to_string()],
+            ..EditorMeta::default()
+        };
+        save(dir.path(), "main.wrld.toml", &meta).unwrap();
+        assert_eq!(load(dir.path(), "main.wrld.toml").view, None);
+    }
+
+    #[test]
+    fn a_view_block_missing_keys_loads_the_per_field_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(meta_rel_path("main.wrld.toml"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"view":{"snap":true}}"#).unwrap();
+        assert_eq!(
+            load(dir.path(), "main.wrld.toml").view,
+            Some(ViewMeta {
+                grid: true,
+                snap: true,
+                zoom: crate::canvas::ZOOM_DEFAULT,
+            }),
+            "a hand-edited or older sidecar keeps the panel's own defaults              for whatever it does not say"
         );
     }
 

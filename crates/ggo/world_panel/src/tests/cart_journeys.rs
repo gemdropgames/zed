@@ -765,7 +765,7 @@ impl Journey<'_> {
     fn add_background_slot(&mut self, slot: u8) {
         write_test_tileset(self.root(), "tiles/bg.til");
         self.panel.update(self.cx, |panel, cx| {
-            panel.add_background_impl(slot, "tiles/bg.til".into(), cx)
+            panel.add_background_impl(slot, "tiles/bg.til".into(), crate::NEW_BG_DIM, cx)
         });
         self.cx.run_until_parked();
         self.settle();

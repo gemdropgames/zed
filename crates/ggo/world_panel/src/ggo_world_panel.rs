@@ -30,6 +30,7 @@ mod editor_meta;
 mod inspector;
 mod live;
 mod loader;
+mod pickers;
 mod world_canvas_item;
 mod world_dock;
 pub use live::CanvasMode;
@@ -154,9 +155,102 @@ const LIST_WIDTH: Pixels = px(140.);
 /// under the brush -- wider than the inspector because the tileset strip
 /// inside it is a picking surface, not a field.
 const PAINT_WIDTH: Pixels = px(280.);
+/// Side of a freshly generated background map, in tiles -- the value the
+/// retired map editor's "New Map…" used (ggo-ide's `NEW_MAP_DEFAULT_DIM`)
+/// for the same "new map" idea, and what the add-background card seeds
+/// its size field with.
+const NEW_BG_DIM: u16 = 16;
+
 /// Floor for the Ready body so that chrome taller than the dock scrolls
 /// the root instead of flattening the columns to nothing.
 const BODY_MIN_HEIGHT: Pixels = px(120.);
+/// The narrowest a divider drag (or a re-clamp in a narrowed dock) may
+/// leave one of the body's fixed columns, and the room it has to leave
+/// the rest of the body row.
+const MIN_COLUMN: Pixels = px(80.);
+/// The grab strip of a column divider, centred on the column's edge.
+const DIVIDER_SIZE: Pixels = px(6.);
+/// The tallest the layers rail may draw, as a fraction of the window.
+/// The rail is FIXED chrome above the body, so in a short dock its four
+/// slots would otherwise push the body past the dock's bottom edge --
+/// this caps it and lets the rail scroll inside itself instead. A
+/// fraction rather than a constant so a roomy dock never scrolls it.
+const LAYERS_MAX_VH: f32 = 0.3;
+
+/// Which of the body row's three fixed columns a divider drag is sizing.
+/// Session-only: the widths live on the panel, not in the sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnDivider {
+    /// The entity/instance list on the left of the body row.
+    List,
+    /// The inspector beside it.
+    Inspector,
+    /// The paint column, which takes both their places under the brush.
+    Paint,
+}
+
+impl ColumnDivider {
+    /// Index into [`WorldPanel::column_bounds`].
+    fn index(self) -> usize {
+        match self {
+            ColumnDivider::List => 0,
+            ColumnDivider::Inspector => 1,
+            ColumnDivider::Paint => 2,
+        }
+    }
+
+    /// The column's default width before any drag.
+    fn default_width(self) -> Pixels {
+        match self {
+            ColumnDivider::List => LIST_WIDTH,
+            ColumnDivider::Inspector => INSPECTOR_WIDTH,
+            ColumnDivider::Paint => PAINT_WIDTH,
+        }
+    }
+
+    fn handle_selector(self) -> &'static str {
+        match self {
+            ColumnDivider::List => "ggo-world-divider-list",
+            ColumnDivider::Inspector => "ggo-world-divider-inspector",
+            ColumnDivider::Paint => "ggo-world-divider-paint",
+        }
+    }
+}
+
+/// A column divider mid-drag, in `workspace::DraggedDock`'s shape: the
+/// state rides on the drag and the ghost draws nothing, because the
+/// feedback is the resized column rather than a floating chip.
+///
+/// The [`EntityId`] is the panel the handle belongs to. `on_drag_move`
+/// fires in the CAPTURE phase on every mounted listener whose drag type
+/// matches, with no hitbox test, so without it a drag in one world tab
+/// would resize the columns of every other open one too.
+#[derive(Clone, Copy)]
+struct DraggedColumnDivider(ColumnDivider, EntityId);
+
+impl Render for DraggedColumnDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a divider drag at window position `position` into the new
+/// width of the column it sizes: the distance from the column's own left
+/// edge to the pointer, floored at [`MIN_COLUMN`] and capped so the rest
+/// of the body row keeps that much too. Pure, so the clamps are testable
+/// without a window.
+fn column_divider_width(
+    position: gpui::Point<Pixels>,
+    column: Bounds<Pixels>,
+    body: Bounds<Pixels>,
+) -> Pixels {
+    (position.x - column.origin.x).clamp(MIN_COLUMN, column_width_cap(body))
+}
+
+/// The widest one column may be drawn in a body row of `body`'s width.
+fn column_width_cap(body: Bounds<Pixels>) -> Pixels {
+    (body.size.width - MIN_COLUMN).max(MIN_COLUMN)
+}
 /// Paste/duplicate offset when the cursor is not over the canvas: one tile.
 const PASTE_OFFSET_PX: f64 = 16.0;
 
@@ -875,6 +969,10 @@ struct OpenWorld {
     /// The same, for `store.state().instances` -- an `[[instance]]` row
     /// has no id in the file either.
     instance_names: Vec<String>,
+    /// The view toggles as the sidecar last recorded them. Compared
+    /// against the live ones once a frame, which is what turns a change
+    /// into exactly one write -- see [`WorldPanel::persist_view_meta`].
+    written_view: editor_meta::ViewMeta,
     sprite_loads: AssetLoads,
     map_loads: AssetLoads,
     meta_sprite_loads: AssetLoads,
@@ -1051,14 +1149,16 @@ impl OpenWorld {
             .map(|instance| instance.world.clone())
             .collect();
         let loaded_instance_counts = loaded.instance_counts;
-        let names = editor_meta::load(&root, &listing.rel_path);
+        let meta = editor_meta::load(&root, &listing.rel_path);
+        let view_meta = meta.view.unwrap_or_default();
         OpenWorld {
             listing,
             source_rel,
             root,
             store: loaded.store,
-            entity_names: names.entity_names,
-            instance_names: names.instance_names,
+            entity_names: meta.entity_names,
+            instance_names: meta.instance_names,
+            written_view: view_meta,
             sprite_loads: loaded.sprite_loads,
             map_loads: loaded.map_loads,
             meta_sprite_loads: loaded.meta_sprite_loads,
@@ -1067,7 +1167,7 @@ impl OpenWorld {
             schemas: loaded.schemas,
             images: Arc::new(images),
             view: Rc::new(RefCell::new(ViewShared {
-                zoom: canvas::ZOOM_DEFAULT,
+                zoom: view_meta.zoom,
                 pan: None,
                 last_bounds: None,
                 drag: None,
@@ -1075,8 +1175,8 @@ impl OpenWorld {
             })),
             selected: Vec::new(),
             marquee: None,
-            snap: false,
-            grid: true,
+            snap: view_meta.snap,
+            grid: view_meta.grid,
             edit_drag: None,
             affine_drag: None,
             nudge_gesture: None,
@@ -1243,7 +1343,11 @@ fn entity_delete_lines(
     let mut lines = vec![format!(
         "{} entit{} deleted too:",
         indices.len(),
-        if indices.len() == 1 { "y is" } else { "ies are" }
+        if indices.len() == 1 {
+            "y is"
+        } else {
+            "ies are"
+        }
     )];
     lines.extend(indices.into_iter().filter_map(|index| {
         let entity = state.entities.get(index)?;
@@ -1522,14 +1626,25 @@ impl OpenWorld {
         }
     }
 
-    /// Persist the editor-only row names. Failures are logged, not
-    /// surfaced: a lost name must never block or noise up an edit, and
-    /// the names are not document state, so there is no dirty flag to
-    /// defer the write behind.
-    fn write_editor_names(&self) {
+    /// The view toggles as they stand, for the sidecar.
+    fn current_view_meta(&self) -> editor_meta::ViewMeta {
+        editor_meta::ViewMeta {
+            grid: self.grid,
+            snap: self.snap,
+            zoom: self.view.borrow().zoom,
+        }
+    }
+
+    /// Persist the editor-only sidecar: the row names and the view
+    /// toggles. Failures are logged, not surfaced: a lost name must
+    /// never block or noise up an edit, and neither names nor view are
+    /// document state, so there is no dirty flag to defer the write
+    /// behind.
+    fn write_editor_meta(&self) {
         let meta = editor_meta::EditorMeta {
             entity_names: self.entity_names.clone(),
             instance_names: self.instance_names.clone(),
+            view: Some(self.current_view_meta()),
         };
         if let Err(e) = editor_meta::save(&self.root, &self.listing.rel_path, &meta) {
             log::error!(
@@ -3142,6 +3257,33 @@ pub struct WorldPanel {
     /// choices live. Held so the user's choices survive closing the last
     /// world tab, which takes every panel with it.
     dock: Option<WeakEntity<WorldDock>>,
+    /// The entity list's width once a [`ColumnDivider::List`] drag has
+    /// set one; `None` is [`LIST_WIDTH`]. Session-only, like the sprite
+    /// panel's: a column width is not something the document carries.
+    list_width: Option<Pixels>,
+    /// The same for the inspector ([`INSPECTOR_WIDTH`]).
+    inspector_width: Option<Pixels>,
+    /// The same for the paint column ([`PAINT_WIDTH`]).
+    paint_width: Option<Pixels>,
+    /// The body row's on-screen bounds, recorded at prepaint: what the
+    /// dragged widths are re-clamped against.
+    body_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// Each column's own on-screen bounds, by [`ColumnDivider::index`] --
+    /// a drag measures from the column's left edge, which the body row's
+    /// sideways scroll moves independently of the body's.
+    column_bounds: Rc<RefCell<[Option<Bounds<Pixels>>; 3]>>,
+    /// Section eyes (P6), session-only. False collapses the section's
+    /// BODY; its header row -- title, add button, the eye itself --
+    /// always stays, or there would be nothing left to click.
+    entities_visible: bool,
+    layers_visible: bool,
+    inspector_visible: bool,
+    /// Component blocks in the entity inspector that the user has
+    /// collapsed, by component NAME: the block for `Transform` stays
+    /// shut as the selection moves between entities that both have one,
+    /// which is what makes the eye a view preference rather than a
+    /// property of whichever entity happened to be selected.
+    hidden_components: std::collections::HashSet<String>,
 }
 
 impl WorldPanel {
@@ -3184,7 +3326,177 @@ impl WorldPanel {
             live_endpoint: None,
             live_boot_pending: false,
             dock: None,
+            list_width: None,
+            inspector_width: None,
+            paint_width: None,
+            body_bounds: Rc::new(RefCell::new(None)),
+            column_bounds: Rc::new(RefCell::new([None; 3])),
+            entities_visible: true,
+            layers_visible: true,
+            inspector_visible: true,
+            hidden_components: std::collections::HashSet::new(),
         }
+    }
+
+    /// The eye that hides one section's body. The `-on`/`-off` debug
+    /// selector is what a rendered test toggles and reads back (an
+    /// `IconButton`'s id is not a selector).
+    fn visibility_toggle(
+        id: impl Into<SharedString>,
+        visible: bool,
+        toggle: impl Fn(&mut WorldPanel, &mut Context<WorldPanel>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let id: SharedString = id.into();
+        let selector = id.clone();
+        div()
+            .debug_selector(move || format!("{selector}-{}", toggle_suffix(visible)))
+            .child(
+                IconButton::new(
+                    id,
+                    if visible {
+                        IconName::Eye
+                    } else {
+                        IconName::EyeOff
+                    },
+                )
+                .icon_size(IconSize::XSmall)
+                .tooltip(ui::Tooltip::text("Show/hide"))
+                .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+            )
+    }
+
+    /// The width `divider`'s column is DRAWN at: the dragged width (or
+    /// the default) re-clamped against the body row's current width. The
+    /// stored value is left alone -- a dock narrowed after a drag must
+    /// not silently discard it, and widening the dock restores the drag.
+    fn rendered_column_width(&self, divider: ColumnDivider) -> Pixels {
+        let width = match divider {
+            ColumnDivider::List => self.list_width,
+            ColumnDivider::Inspector => self.inspector_width,
+            ColumnDivider::Paint => self.paint_width,
+        }
+        .unwrap_or_else(|| divider.default_width());
+        match *self.body_bounds.borrow() {
+            Some(body) => width.min(column_width_cap(body)),
+            None => width,
+        }
+    }
+
+    /// Apply one step of a column-divider drag. Drops out before
+    /// `notify` when the clamped width is the one already in force: a
+    /// drag emits a move event per mouse position, most of which land in
+    /// the same pixel column once a clamp is biting.
+    fn drag_divider(
+        &mut self,
+        divider: ColumnDivider,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(body), Some(column)) = (
+            *self.body_bounds.borrow(),
+            self.column_bounds.borrow()[divider.index()],
+        ) else {
+            return;
+        };
+        let width = column_divider_width(position, column, body);
+        let changed = match divider {
+            ColumnDivider::List => self.list_width.replace(width) != Some(width),
+            ColumnDivider::Inspector => self.inspector_width.replace(width) != Some(width),
+            ColumnDivider::Paint => self.paint_width.replace(width) != Some(width),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// One column's grab handle, straddling its RIGHT edge.
+    /// `workspace::dock`'s resize-handle shape: an occluding strip that
+    /// starts a [`DraggedColumnDivider`] drag, which the body row's
+    /// `on_drag_move` turns into a width. Wrapped in `deferred` by the
+    /// caller for the dock's own reason -- the strip straddles a border,
+    /// and the column on the far side paints after it and would
+    /// otherwise swallow half the grab area.
+    fn divider_handle(divider: ColumnDivider, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let name = divider.handle_selector();
+        div()
+            .id(name)
+            .debug_selector(move || name.into())
+            .on_drag(
+                DraggedColumnDivider(divider, cx.entity_id()),
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *dragged)
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .occlude()
+    }
+
+    /// The absolutely-positioned grab strip a column hangs off its right
+    /// edge, ready to be `.child()`ed onto a `relative()` column.
+    fn divider_strip(divider: ColumnDivider, cx: &mut Context<Self>) -> gpui::AnyElement {
+        gpui::deferred(
+            Self::divider_handle(divider, cx)
+                .absolute()
+                .top_0()
+                .right(-DIVIDER_SIZE / 2.)
+                .w(DIVIDER_SIZE)
+                .h_full()
+                .cursor_col_resize(),
+        )
+        .into_any_element()
+    }
+
+    /// The column bounds recorder for `divider`'s slot.
+    fn column_bounds_recorder(
+        &self,
+        divider: ColumnDivider,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let cell = self.column_bounds.clone();
+        let index = divider.index();
+        gpui::canvas(
+            move |bounds, _window, _cx| {
+                cell.borrow_mut()[index] = Some(bounds);
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// The body row's bounds recorder. A `cx.notify()` raised inside a
+    /// prepaint closure is DROPPED -- the frame is already being drawn --
+    /// so a width change has to be deferred to the next one, or the
+    /// re-clamp of the dragged column widths stays a frame behind the
+    /// dock that shrank.
+    fn body_bounds_recorder(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cell = self.body_bounds.clone();
+        let panel = cx.entity().downgrade();
+        gpui::canvas(
+            move |bounds, window, cx| {
+                let resized = cell.borrow().map(|previous| previous.size) != Some(bounds.size);
+                *cell.borrow_mut() = Some(bounds);
+                if resized {
+                    window.defer(cx, move |_, cx| {
+                        panel.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .into_any_element()
     }
 
     /// Which renderer this panel's canvas is showing.
@@ -3679,6 +3991,81 @@ impl WorldPanel {
         merge_candidates(&stems, &open.listing.stem, &open.store.state().instances)
     }
 
+    /// Raise the add-instance card ([`pickers::AddInstanceModal`]) over
+    /// the cycle-guarded candidate stems. Gathers everything the card
+    /// needs here and raises it from the SAME update: `toggle_modal`
+    /// reads the new modal for its focus handle, and that modal holds
+    /// only a weak handle to this panel, so nothing re-enters the lease.
+    fn open_add_instance_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let candidates = self.instance_candidates();
+        let (Some(workspace), ViewerState::Ready(open)) = (
+            self.workspace.as_ref().and_then(|w| w.upgrade()),
+            &self.state,
+        ) else {
+            return;
+        };
+        let root = open.root.clone();
+        let panel = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                pickers::AddInstanceModal::new(panel, root, candidates, window, cx)
+            });
+        });
+    }
+
+    /// Raise the add-background card ([`pickers::AddBackgroundModal`])
+    /// for `layer`, over the project's tilesets.
+    fn open_add_background_card(&mut self, layer: u8, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(workspace), ViewerState::Ready(open)) = (
+            self.workspace.as_ref().and_then(|w| w.upgrade()),
+            &self.state,
+        ) else {
+            return;
+        };
+        let root = open.root.clone();
+        // Walked here rather than in the card, for the reason the menu
+        // it replaces walked it lazily: a tileset created while the
+        // world is open shows up the next time the card opens.
+        let tilesets = io::list_tilesets(&root);
+        let panel = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                pickers::AddBackgroundModal::new(panel, layer, root, tilesets, window, cx)
+            });
+        });
+    }
+
+    /// Raise the add-component card ([`pickers::AddComponentModal`]) for
+    /// entity `entity_ix`, over every schema it does not already carry.
+    fn open_add_component_card(
+        &mut self,
+        entity_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(workspace), ViewerState::Ready(open)) = (
+            self.workspace.as_ref().and_then(|w| w.upgrade()),
+            &self.state,
+        ) else {
+            return;
+        };
+        let Some(entity) = open.store.state().entities.get(entity_ix).cloned() else {
+            return;
+        };
+        let schemas: Vec<ComponentSchema> = open
+            .schemas
+            .iter()
+            .filter(|schema| !entity.components.contains_key(&schema.name))
+            .cloned()
+            .collect();
+        let panel = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                pickers::AddComponentModal::new(panel, entity_ix, schemas, window, cx)
+            });
+        });
+    }
+
     /// Add-instance picker pick: re-check the cycle guard at apply time
     /// (a built menu can outlive an undo/redo that changed the instance
     /// graph), then `AddInstance` + a follow-up `MoveInstance` to the
@@ -3749,12 +4136,17 @@ impl WorldPanel {
     /// a deliberate re-add of a layer the user cleared earlier -- must
     /// re-LINK the existing map rather than blank whatever was painted
     /// into it.
-    fn add_background_impl(&mut self, layer: u8, til_rel: String, cx: &mut Context<Self>) {
-        /// Side of a freshly generated background map, in tiles -- the
-        /// value the retired map editor's "New Map…" used (ggo-ide's
-        /// `NEW_MAP_DEFAULT_DIM`) for the same "new map" idea.
-        const NEW_BG_DIM: u16 = 16;
-
+    /// `dimension` is the generated map's side in tiles -- what the
+    /// add-background card's size field supplies. An EXISTING map is
+    /// never resized by it: the re-link promise is exactly about not
+    /// touching painted work.
+    fn add_background_impl(
+        &mut self,
+        layer: u8,
+        til_rel: String,
+        dimension: u16,
+        cx: &mut Context<Self>,
+    ) {
         // Guarded here as well as in `apply_op`: this one writes a `.map`
         // to disk before it ever reaches the store, and a layer push
         // behind the refused op would re-send the background to a cart
@@ -3777,7 +4169,7 @@ impl WorldPanel {
         let write_result = if map_full.exists() {
             io::open_map(&open.root, &map_rel).map(|_| ())
         } else {
-            io::save_new_bound_map(&open.root, &map_rel, NEW_BG_DIM, NEW_BG_DIM, &til_rel)
+            io::save_new_bound_map(&open.root, &map_rel, dimension, dimension, &til_rel)
         };
         if let Err(e) = write_result {
             open.save_error = Some(e.to_string());
@@ -4256,8 +4648,10 @@ impl WorldPanel {
         // The user has to be told: the cells are in the document but not
         // in the picture the cart is drawing.
         if overflowed {
-            open.paint_error =
-                Some("cannot paint: live cell: too many cells owed the cart; its picture is behind".to_string());
+            open.paint_error = Some(
+                "cannot paint: live cell: too many cells owed the cart; its picture is behind"
+                    .to_string(),
+            );
             cx.notify();
         }
     }
@@ -4521,7 +4915,7 @@ impl WorldPanel {
                     open.instance_names.remove(index);
                 }
             }
-            open.write_editor_names();
+            open.write_editor_meta();
         }
         open.note_doc_changed();
         open.selected.clear();
@@ -7620,7 +8014,7 @@ impl WorldPanel {
         if let Some(slot) = names.get_mut(index) {
             *slot = name;
         }
-        open.write_editor_names();
+        open.write_editor_meta();
         cx.notify();
     }
 
@@ -7662,6 +8056,7 @@ impl WorldPanel {
         // sitting in the toolbar: the toolbar is world-wide chrome, and
         // "+" next to "Entities" is what says WHAT gets added.
         let playing = self.live_playing();
+        let entities_visible = self.entities_visible;
         let header = h_flex()
             .px_1()
             .gap_1()
@@ -7676,6 +8071,15 @@ impl WorldPanel {
                             .color(Color::Muted),
                     ),
             )
+            .child(Self::visibility_toggle(
+                "ggo-world-entities-visible",
+                entities_visible,
+                |this, cx| {
+                    this.entities_visible = !this.entities_visible;
+                    cx.notify();
+                },
+                cx,
+            ))
             .child(
                 // The wrapper carries the `debug_selector` because a
                 // DISABLED button records no bounds of its own; the
@@ -7695,140 +8099,162 @@ impl WorldPanel {
         v_flex()
             .id("ggo-world-entity-list")
             .debug_selector(|| "ggo-world-entity-list".into())
-            .w(LIST_WIDTH)
+            .relative()
+            .w(self.rendered_column_width(ColumnDivider::List))
             .h_full()
             .flex_none()
+            .child(self.column_bounds_recorder(ColumnDivider::List, cx))
+            .child(Self::divider_strip(ColumnDivider::List, cx))
             .child(header)
-            .child(
-                div()
-                    .id("ggo-world-entity-rows")
-                    .debug_selector(|| "ggo-world-entity-rows".into())
-                    .flex_1()
-                    // A scroll container's automatic minimum is its
-                    // content, so without this floor the rows would push
-                    // the column taller than the body instead of
-                    // scrolling under the header.
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(v_flex().children(rows.into_iter().enumerate().map(
-                        |(row_index, (target, label))| {
-                        let selected = open.selected.contains(&target);
-                        let renaming = match open.rename.as_ref() {
-                            Some((renamed, editor)) if *renamed == target => Some(editor.clone()),
-                            _ => None,
-                        };
-                        let selector = match target {
-                            Selection::Entity(index) => format!("ggo-world-list-row-{index}"),
-                            Selection::Instance(index) => {
-                                format!("ggo-world-list-instance-{index}")
-                            }
-                        };
-                        // Each action's wrapper carries the
-                        // `debug_selector`, the Save button's reason: a
-                        // DISABLED button records no bounds of its own,
-                        // and greyed-out is a state a test has to be able
-                        // to read. Keyed by ROW index rather than by the
-                        // target's, so an entity and an instance that
-                        // share an index do not share a selector.
-                        let duplicate = matches!(target, Selection::Entity(_)).then(|| {
-                            div()
-                                .debug_selector(move || format!("ggo-world-row-dup-{row_index}"))
-                                .child(
-                                    IconButton::new(
-                                        ("ggo-world-row-dup", row_index),
-                                        IconName::Copy,
-                                    )
-                                    .icon_size(IconSize::XSmall)
-                                    .tooltip(ui::Tooltip::text("Duplicate entity"))
-                                    .disabled(playing)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.duplicate_row(target, cx)
-                                    })),
-                                )
-                        });
-                        let delete = div()
-                            .debug_selector(move || format!("ggo-world-row-delete-{row_index}"))
-                            .child(
-                                IconButton::new(
-                                    ("ggo-world-row-delete", row_index),
-                                    IconName::Trash,
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(ui::Tooltip::text("Delete"))
-                                .disabled(playing)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.delete_row(target, window, cx)
-                                })),
-                            );
-                        let body = match renaming {
-                            Some(editor) => div()
-                                .flex_1()
-                                .min_w_0()
-                                .debug_selector(|| "ggo-world-rename-editor".into())
-                                .child(Self::editor_input(&editor, cx))
-                                .into_any_element(),
-                            None => div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    Label::new(label).size(LabelSize::Small).color(if selected {
-                                        Color::Default
-                                    } else {
-                                        Color::Muted
-                                    }),
-                                )
-                                .into_any_element(),
-                        };
-                        let row = h_flex()
-                            .id(SharedString::from(format!("ggo-world-list-{target:?}")))
-                            .debug_selector(move || selector)
-                            .px_1()
-                            .gap_0p5()
-                            .items_center()
-                            .cursor_pointer()
-                            .when(selected, |this| this.bg(selected_bg))
-                            .child(body)
-                            .children(duplicate)
-                            .child(delete)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    if event.click_count >= 2 {
-                                        this.begin_rename(target, window, cx);
-                                        return;
+            .when(entities_visible, |this| {
+                this.child(
+                    div()
+                        .id("ggo-world-entity-rows")
+                        .debug_selector(|| "ggo-world-entity-rows".into())
+                        .flex_1()
+                        // A scroll container's automatic minimum is its
+                        // content, so without this floor the rows would push
+                        // the column taller than the body instead of
+                        // scrolling under the header.
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(v_flex().children(rows.into_iter().enumerate().map(
+                            |(row_index, (target, label))| {
+                                let selected = open.selected.contains(&target);
+                                let renaming = match open.rename.as_ref() {
+                                    Some((renamed, editor)) if *renamed == target => {
+                                        Some(editor.clone())
                                     }
-                                    this.select_from_list(target, event.modifiers.shift, cx)
-                                }),
-                            );
-                        let Selection::Entity(index) = target else {
-                            return row.into_any_element();
-                        };
-                        if !paintable.get(index).copied().unwrap_or(false) {
-                            return row.into_any_element();
-                        }
-                        let weak = cx.weak_entity();
-                        ui::right_click_menu(SharedString::from(format!(
-                            "ggo-world-list-menu-{index}"
-                        )))
-                        .trigger(move |_menu_open, _window, _cx| row)
-                        .menu(move |window, cx| {
-                            let weak = weak.clone();
-                            ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                                menu.entry("Paint tiles", None, move |_window, cx| {
-                                    weak.update(cx, |this, cx| {
-                                        this.enter_paint_mode(
-                                            PaintTarget::TilemapEntity(index),
-                                            cx,
-                                        );
+                                    _ => None,
+                                };
+                                let selector = match target {
+                                    Selection::Entity(index) => {
+                                        format!("ggo-world-list-row-{index}")
+                                    }
+                                    Selection::Instance(index) => {
+                                        format!("ggo-world-list-instance-{index}")
+                                    }
+                                };
+                                // Each action's wrapper carries the
+                                // `debug_selector`, the Save button's reason: a
+                                // DISABLED button records no bounds of its own,
+                                // and greyed-out is a state a test has to be able
+                                // to read. Keyed by ROW index rather than by the
+                                // target's, so an entity and an instance that
+                                // share an index do not share a selector.
+                                let duplicate =
+                                    matches!(target, Selection::Entity(_)).then(|| {
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("ggo-world-row-dup-{row_index}")
+                                            })
+                                            .child(
+                                                IconButton::new(
+                                                    ("ggo-world-row-dup", row_index),
+                                                    IconName::Copy,
+                                                )
+                                                .icon_size(IconSize::XSmall)
+                                                .tooltip(ui::Tooltip::text("Duplicate entity"))
+                                                .disabled(playing)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.duplicate_row(target, cx)
+                                                })),
+                                            )
+                                    });
+                                let delete = div()
+                                    .debug_selector(move || {
+                                        format!("ggo-world-row-delete-{row_index}")
                                     })
-                                    .ok();
+                                    .child(
+                                        IconButton::new(
+                                            ("ggo-world-row-delete", row_index),
+                                            IconName::Trash,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(ui::Tooltip::text("Delete"))
+                                        .disabled(playing)
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.delete_row(target, window, cx)
+                                            }),
+                                        ),
+                                    );
+                                let body = match renaming {
+                                    Some(editor) => div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .debug_selector(|| "ggo-world-rename-editor".into())
+                                        .child(Self::editor_input(&editor, cx))
+                                        .into_any_element(),
+                                    None => div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Label::new(label).size(LabelSize::Small).color(
+                                            if selected {
+                                                Color::Default
+                                            } else {
+                                                Color::Muted
+                                            },
+                                        ))
+                                        .into_any_element(),
+                                };
+                                let row = h_flex()
+                                    .id(SharedString::from(format!("ggo-world-list-{target:?}")))
+                                    .debug_selector(move || selector)
+                                    .px_1()
+                                    .gap_0p5()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .when(selected, |this| this.bg(selected_bg))
+                                    .child(body)
+                                    .children(duplicate)
+                                    .child(delete)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |this, event: &MouseDownEvent, window, cx| {
+                                                if event.click_count >= 2 {
+                                                    this.begin_rename(target, window, cx);
+                                                    return;
+                                                }
+                                                this.select_from_list(
+                                                    target,
+                                                    event.modifiers.shift,
+                                                    cx,
+                                                )
+                                            },
+                                        ),
+                                    );
+                                let Selection::Entity(index) = target else {
+                                    return row.into_any_element();
+                                };
+                                if !paintable.get(index).copied().unwrap_or(false) {
+                                    return row.into_any_element();
+                                }
+                                let weak = cx.weak_entity();
+                                ui::right_click_menu(SharedString::from(format!(
+                                    "ggo-world-list-menu-{index}"
+                                )))
+                                .trigger(move |_menu_open, _window, _cx| row)
+                                .menu(move |window, cx| {
+                                    let weak = weak.clone();
+                                    ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                                        menu.entry("Paint tiles", None, move |_window, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.enter_paint_mode(
+                                                    PaintTarget::TilemapEntity(index),
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                        })
+                                    })
                                 })
-                            })
-                        })
-                        .into_any_element()
-                        },
-                    ))),
-            )
+                                .into_any_element()
+                            },
+                        ))),
+                )
+            })
             .into_any_element()
     }
 
@@ -8281,7 +8707,7 @@ impl WorldPanel {
 
     /// Add-entity / add-instance / delete / save / undo / redo / snap
     /// row, with the dirty dot on the world's title.
-    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_toolbar is only called in the Ready state");
         };
@@ -8317,29 +8743,6 @@ impl WorldPanel {
         // that would mutate the document is greyed out (Delete is not --
         // it is forwarded to the cart, which owns the despawn).
         let playing = self.live_playing();
-        // The picker has no `disabled`, so Play empties it instead: an
-        // add-instance entry that `add_instance_impl` would refuse is an
-        // affordance that lies.
-        let candidates = if playing {
-            Vec::new()
-        } else {
-            self.instance_candidates()
-        };
-        let weak = cx.weak_entity();
-
-        // Add-instance picker over the cycle-guarded candidate stems.
-        let instance_menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-            for stem in candidates {
-                let weak = weak.clone();
-                let label = world_label(&stem).to_string();
-                menu = menu.entry(SharedString::from(label), None, move |_window, cx| {
-                    let stem = stem.clone();
-                    weak.update(cx, |this, cx| this.add_instance_impl(stem, cx))
-                        .ok();
-                });
-            }
-            menu
-        });
 
         let title = format!(
             "{}{}",
@@ -8436,11 +8839,25 @@ impl WorldPanel {
                     ))
                     .on_click(cx.listener(|this, _, _, cx| this.emulate_popout_impl(cx))),
             )
-            .child(DropdownMenu::new(
-                "ggo-world-add-instance",
-                "+ Instance",
-                instance_menu,
-            ))
+            .child(
+                // The wrapper carries the `debug_selector`: a DISABLED
+                // button records no bounds of its own, and greyed out --
+                // which is what Play makes this, because
+                // `add_instance_impl` would refuse the pick -- is a
+                // state a test has to be able to read.
+                div()
+                    .debug_selector(move || {
+                        format!("ggo-world-add-instance-{}", toggle_suffix(!playing))
+                    })
+                    .child(
+                        Button::new("ggo-world-add-instance", "+ Instance")
+                            .disabled(playing)
+                            .tooltip(ui::Tooltip::text("Instance another world here"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_add_instance_card(window, cx)
+                            })),
+                    ),
+            )
             .child(
                 IconButton::new("ggo-world-delete", IconName::Trash)
                     .icon_size(IconSize::Small)
@@ -8542,11 +8959,8 @@ impl WorldPanel {
                 div()
                     .debug_selector(|| "ggo-world-paint-error".into())
                     .child(
-                        ggo_common::CopyableText::new(
-                            "ggo-world-paint-error-copy",
-                            e.clone(),
-                        )
-                        .size(LabelSize::Small),
+                        ggo_common::CopyableText::new("ggo-world-paint-error-copy", e.clone())
+                            .size(LabelSize::Small),
                     )
             }))
             .into_any_element()
@@ -8776,7 +9190,7 @@ impl WorldPanel {
     /// by an `[[instance]]`'d world, and offering a "clear" on a slot
     /// this document does not declare would silently do nothing (the
     /// undoable `SetBackground` only ever edits the base list).
-    fn render_layers_rail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_layers_rail(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("render_layers_rail is only called in the Ready state");
         };
@@ -8789,11 +9203,40 @@ impl WorldPanel {
         // Stacked, not wrapped: a slot's row is a label plus up to two
         // controls, and a wrapping ribbon breaks BETWEEN those -- a slot's
         // "Add…" landing on the next line under someone else's `bg2`.
-        let mut rail = v_flex().px_1().pb_1().gap_0p5().child(
-            Label::new("Layers")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        );
+        let visible = self.layers_visible;
+        let mut rail = v_flex()
+            .id("ggo-world-layers-rail")
+            .debug_selector(|| "ggo-world-layers-rail".into())
+            .px_1()
+            .pb_1()
+            .gap_0p5()
+            // A flex child's automatic minimum is its content, so the
+            // cap only bites once the rail is allowed to shrink.
+            .min_h_0()
+            .max_h(vh(LAYERS_MAX_VH, window))
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Label::new("Layers")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::visibility_toggle(
+                        "ggo-world-layers-visible",
+                        visible,
+                        |this, cx| {
+                            this.layers_visible = !this.layers_visible;
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            );
+        if !visible {
+            return rail.into_any_element();
+        }
         for layer in 0..world_file::BACKGROUND_LAYER_COUNT as u8 {
             let slot = h_flex()
                 .gap_1()
@@ -8864,66 +9307,31 @@ impl WorldPanel {
                             ),
                     )
                     .into_any_element(),
-                None => {
-                    let root = open.root.clone();
-                    let weak = cx.weak_entity();
-                    slot.child(
-                        // The wrapper carries the `debug_selector`: a
-                        // `PopoverMenu` trigger has to be `Toggleable`, so
-                        // the marker cannot go on a div INSIDE the trigger
-                        // slot, and the `Button` itself records none. Its
-                        // bounds are the trigger's -- the menu is deferred.
+                None => slot
+                    .child(
+                        // The wrapper carries the `debug_selector` for
+                        // the Save button's reason: a DISABLED button
+                        // records no bounds of its own.
                         div()
                             .flex_none()
                             .debug_selector(move || {
                                 format!("ggo-world-bg-slot-{layer}-{}", toggle_suffix(!playing))
                             })
                             .child(
-                                PopoverMenu::new(SharedString::from(format!(
-                                    "ggo-world-bg-menu-{layer}"
-                                )))
-                                .trigger(
-                                    Button::new(
-                                        SharedString::from(format!("ggo-world-bg-slot-{layer}")),
-                                        "Add…",
-                                    )
-                                    .label_size(LabelSize::XSmall)
-                                    .disabled(playing),
+                                Button::new(
+                                    SharedString::from(format!("ggo-world-bg-slot-{layer}")),
+                                    "Add…",
                                 )
-                                // Lazy on purpose: the tileset list is a
-                                // recursive walk of the asset root, and this
-                                // rail renders every frame. It also means a
-                                // tileset created while the world is open
-                                // shows up on the next open of the picker.
-                                .menu(move |window, cx| {
-                                    let tilesets = io::list_tilesets(&root);
-                                    let weak = weak.clone();
-                                    Some(ContextMenu::build(
-                                        window,
-                                        cx,
-                                        move |mut menu, _window, _cx| {
-                                            for til in tilesets {
-                                                let weak = weak.clone();
-                                                menu = menu.entry(
-                                                    SharedString::from(til.clone()),
-                                                    None,
-                                                    move |_window, cx| {
-                                                        let til = til.clone();
-                                                        weak.update(cx, |this, cx| {
-                                                            this.add_background_impl(layer, til, cx)
-                                                        })
-                                                        .ok();
-                                                    },
-                                                );
-                                            }
-                                            menu
-                                        },
-                                    ))
-                                }),
+                                .label_size(LabelSize::XSmall)
+                                .disabled(playing)
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.open_add_background_card(layer, window, cx)
+                                    },
+                                )),
                             ),
                     )
-                    .into_any_element()
-                }
+                    .into_any_element(),
             });
         }
         rail.into_any_element()
@@ -9290,12 +9698,26 @@ impl WorldPanel {
 
         for (component, value) in &entity.components {
             let name = component.clone();
-            let mut panel = v_flex().gap_1().child(
-                h_flex()
-                    .justify_between()
-                    .child(Label::new(SharedString::from(component.clone())))
-                    .child(
-                        h_flex().gap_1().child(
+            let component_visible = !self.hidden_components.contains(component);
+            let toggled = component.clone();
+            let header = h_flex()
+                .justify_between()
+                .child(Label::new(SharedString::from(component.clone())))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(Self::visibility_toggle(
+                            SharedString::from(format!("ggo-world-component-visible-{component}")),
+                            component_visible,
+                            move |this, cx| {
+                                if !this.hidden_components.remove(&toggled) {
+                                    this.hidden_components.insert(toggled.clone());
+                                }
+                                cx.notify();
+                            },
+                            cx,
+                        ))
+                        .child(
                             IconButton::new(
                                 SharedString::from(format!("ggo-remove-{component}")),
                                 IconName::Trash,
@@ -9317,8 +9739,11 @@ impl WorldPanel {
                                 },
                             )),
                         ),
-                    ),
-            );
+                );
+            let fields_selector = component.clone();
+            let mut panel = v_flex()
+                .gap_1()
+                .debug_selector(move || format!("ggo-world-component-fields-{fields_selector}"));
 
             match value.as_object() {
                 Some(fields) => {
@@ -9523,46 +9948,35 @@ impl WorldPanel {
                 }
             }
 
-            col = col.child(panel).child(Divider::horizontal());
+            col = col
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(header)
+                        .when(component_visible, |this| this.child(panel)),
+                )
+                .child(Divider::horizontal());
         }
 
-        // Add-component picker over every schema not already present,
-        // seeded by `defaults_for` -- ggo-ide's `pick_list` flow.
-        let addable: Vec<ComponentSchema> = schemas
+        // Add-component card over every schema not already present,
+        // seeded by `defaults_for` -- ggo-ide's `pick_list` flow, with
+        // the seeded fields shown instead of guessed at.
+        let addable = schemas
             .iter()
-            .filter(|s| !entity.components.contains_key(&s.name))
-            .cloned()
-            .collect();
-        if !addable.is_empty() {
-            let weak = cx.weak_entity();
-            let menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-                for schema in addable {
-                    let weak = weak.clone();
-                    let name = schema.name.clone();
-                    menu = menu.entry(
-                        SharedString::from(name.clone()),
-                        None,
-                        move |_window, cx| {
-                            let defaults = defaults_for(&schema);
-                            let name = name.clone();
-                            weak.update(cx, |this, cx| {
-                                this.apply_op(
-                                    WorldOp::AddComponent {
-                                        entity: entity_ix,
-                                        name,
-                                        defaults,
-                                    },
-                                    cx,
-                                );
-                            })
-                            .ok();
-                        },
-                    );
-                }
-                menu
-            });
+            .any(|schema| !entity.components.contains_key(&schema.name));
+        if addable {
             col = col.child(
-                DropdownMenu::new("ggo-add-component", "Add component…", menu).disabled(playing),
+                div()
+                    .debug_selector(move || {
+                        format!("ggo-add-component-{}", toggle_suffix(!playing))
+                    })
+                    .child(
+                        Button::new("ggo-add-component", "Add component…")
+                            .disabled(playing)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_add_component_card(entity_ix, window, cx)
+                            })),
+                    ),
             );
         }
 
@@ -9629,6 +10043,7 @@ impl WorldPanel {
         };
         let selection = open.primary()?;
         let playing = self.live_playing();
+        let inspector_visible = self.inspector_visible;
         let editors: HashMap<inspector::FieldTarget, Entity<Editor>> = open
             .inspector
             .iter()
@@ -9661,16 +10076,61 @@ impl WorldPanel {
                 )
         });
         Some(
+            // The scroller is INSIDE the sized wrapper, not the wrapper
+            // itself: the divider strip is absolutely positioned, and an
+            // absolute child of a scroll container travels with its
+            // content instead of staying pinned to the column's edge.
             div()
-                .id("ggo-world-inspector")
                 .debug_selector(|| "ggo-world-inspector".into())
-                .w(INSPECTOR_WIDTH)
+                .relative()
+                .w(self.rendered_column_width(ColumnDivider::Inspector))
                 .h_full()
                 .flex_none()
                 .border_l_1()
                 .border_color(cx.theme().colors().border)
-                .overflow_y_scroll()
-                .child(v_flex().p_1().gap_1().children(playing_note).child(body))
+                .child(self.column_bounds_recorder(ColumnDivider::Inspector, cx))
+                .child(Self::divider_strip(ColumnDivider::Inspector, cx))
+                .child(
+                    div()
+                        .id("ggo-world-inspector")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .child(
+                            v_flex()
+                                .p_1()
+                                .gap_1()
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .justify_between()
+                                        .debug_selector(|| "ggo-world-inspector-title".into())
+                                        .child(
+                                            Label::new("Inspector")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(Self::visibility_toggle(
+                                            "ggo-world-inspector-visible",
+                                            inspector_visible,
+                                            |this, cx| {
+                                                this.inspector_visible = !this.inspector_visible;
+                                                cx.notify();
+                                            },
+                                            cx,
+                                        )),
+                                )
+                                .when(inspector_visible, |this| {
+                                    this.child(
+                                        v_flex()
+                                            .debug_selector(|| "ggo-world-inspector-body".into())
+                                            .gap_1()
+                                            .children(playing_note)
+                                            .child(body),
+                                    )
+                                }),
+                        ),
+                )
                 .into_any_element(),
         )
     }
@@ -9710,61 +10170,86 @@ impl WorldPanel {
             .map(|fields| paint_ui::render_resize(fields, cx));
         Some(
             div()
-                .id("ggo-world-paint")
                 // The column's own bounds, so a test can tell the tool
                 // rail's Select button (`ICON-Maximize`) from the PANE's
                 // zoom button, which shares that icon and therefore that
                 // debug selector in a whole-workspace test.
                 .debug_selector(|| "ggo-world-paint".into())
-                .w(PAINT_WIDTH)
+                .relative()
+                .w(self.rendered_column_width(ColumnDivider::Paint))
                 .h_full()
                 .flex_none()
                 .border_l_1()
                 .border_color(cx.theme().colors().border)
-                .overflow_scroll()
+                .child(self.column_bounds_recorder(ColumnDivider::Paint, cx))
+                .child(Self::divider_strip(ColumnDivider::Paint, cx))
                 .child(
-                    v_flex()
-                        .p_1()
-                        .gap_1()
+                    div()
+                        .id("ggo-world-paint")
+                        .size_full()
+                        .overflow_scroll()
                         .child(
-                            h_flex()
+                            v_flex()
+                                .p_1()
                                 .gap_1()
-                                .child(Label::new(rel).size(LabelSize::XSmall))
                                 .child(
-                                    Label::new(format!("{}x{}", state.w, state.h))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                        )
-                        .child(tools)
-                        .child(stamp)
-                        .children(terrains)
-                        .child(strip)
-                        // The colors on screen then aren't the asset's
-                        // own, which is worth saying out loud -- the
-                        // retired standalone footer's warning, kept.
-                        .children(
-                            session
-                                .tileset
-                                .as_ref()
-                                .filter(|tileset| tileset.missing_pal)
-                                .map(|_| {
-                                    Label::new("no .pal — 16-gray fallback")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Warning)
-                                }),
-                        )
-                        .child(h_flex().gap_1().flex_wrap().children(bind).children(resize))
-                        .children(session.save_error.as_ref().map(|e| {
-                            ggo_common::CopyableText::new(
-                                "ggo-world-paint-save-error-copy",
-                                format!("save failed: {e}"),
-                            )
-                            .size(LabelSize::XSmall)
-                        })),
+                                    h_flex()
+                                        .gap_1()
+                                        .child(Label::new(rel).size(LabelSize::XSmall))
+                                        .child(
+                                            Label::new(format!("{}x{}", state.w, state.h))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(tools)
+                                .child(stamp)
+                                .children(terrains)
+                                .child(strip)
+                                // The colors on screen then aren't the asset's
+                                // own, which is worth saying out loud -- the
+                                // retired standalone footer's warning, kept.
+                                .children(
+                                    session
+                                        .tileset
+                                        .as_ref()
+                                        .filter(|tileset| tileset.missing_pal)
+                                        .map(|_| {
+                                            Label::new("no .pal — 16-gray fallback")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning)
+                                        }),
+                                )
+                                .child(h_flex().gap_1().flex_wrap().children(bind).children(resize))
+                                .children(session.save_error.as_ref().map(|e| {
+                                    ggo_common::CopyableText::new(
+                                        "ggo-world-paint-save-error-copy",
+                                        format!("save failed: {e}"),
+                                    )
+                                    .size(LabelSize::XSmall)
+                                })),
+                        ),
                 )
                 .into_any_element(),
         )
+    }
+
+    /// Write the view toggles to the sidecar when they move. Driven
+    /// from the render rather than from each control: the grid and snap
+    /// checkboxes, the zoom bar, Reset AND the canvas's own wheel zoom
+    /// all converge here, and a per-site write is a view that silently
+    /// stops persisting the day a fifth path is added. The compare is
+    /// what keeps it to one write per change rather than one per frame.
+    fn persist_view_meta(&mut self) {
+        let ViewerState::Ready(open) = &mut self.state else {
+            return;
+        };
+        let current = open.current_view_meta();
+        if current == open.written_view {
+            return;
+        }
+        open.written_view = current;
+        open.write_editor_meta();
     }
 
     /// The dock's Ready layout: toolbar, view controls, and either the
@@ -9773,22 +10258,39 @@ impl WorldPanel {
     /// `WorldCanvasItem` (spec 2026-08-20), which calls
     /// [`Self::render_canvas`] against this same entity's state.
     fn render_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.persist_view_meta();
         let paint = self.render_paint_column(cx);
         let entities = paint.is_none().then(|| {
             let inspector = self.render_inspector(window, cx);
             (self.render_entity_list(cx), inspector)
         });
-        let toolbar = self.render_toolbar(window, cx);
+        let toolbar = self.render_toolbar(cx);
         let mut body = h_flex()
             .id("ggo-world-body")
             .debug_selector(|| "ggo-world-body".into())
+            .relative()
             .flex_1()
             // A scroll container's automatic minimum is zero, so without
             // this floor the chrome above would flatten the columns to
             // nothing instead of pushing the root into scrolling.
             .min_h(BODY_MIN_HEIGHT)
             .overflow_x_scroll()
-            .items_stretch();
+            .items_stretch()
+            // The drag listener lives on the whole row, not on the
+            // handles: a fast drag outruns a 6px strip. `on_drag_move`
+            // fires in the CAPTURE phase for the whole window with no
+            // hitbox test, so this row sees divider drags from OTHER
+            // world tabs too -- hence the owner filter.
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedColumnDivider>, _, cx| {
+                    let &DraggedColumnDivider(divider, owner) = event.drag(cx);
+                    if owner != cx.entity_id() {
+                        return;
+                    }
+                    this.drag_divider(divider, event.event.position, cx);
+                },
+            ))
+            .child(self.body_bounds_recorder(cx));
         if let Some((list, inspector)) = entities {
             body = body.child(list).children(inspector);
         }
@@ -9799,7 +10301,7 @@ impl WorldPanel {
             .child(toolbar)
             .children(self.render_live_status(cx))
             .child(self.render_view_controls(cx))
-            .child(self.render_layers_rail(cx))
+            .child(self.render_layers_rail(window, cx))
             .children(self.render_edit_rail(cx))
             .child(body.children(paint))
             .into_any_element()
@@ -13725,7 +14227,11 @@ mod tests {
     ) {
         let entry_id = project
             .read_with(cx, |project, cx| {
-                Some(project.entry_for_path(&project_path(worktree_id, rel), cx)?.id)
+                Some(
+                    project
+                        .entry_for_path(&project_path(worktree_id, rel), cx)?
+                        .id,
+                )
             })
             .unwrap_or_else(|| panic!("{rel} is in the worktree"));
         project.update(cx, |_, cx| {
@@ -15206,7 +15712,7 @@ mod tests {
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
         write_test_tileset(dir.path(), "tiles/bg.til");
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(1, "tiles/bg.til".into(), cx)
+            panel.add_background_impl(1, "tiles/bg.til".into(), NEW_BG_DIM, cx)
         });
         cx.run_until_parked();
         let map = dir.path().join("maps/test.bg1.map");
@@ -15253,7 +15759,7 @@ mod tests {
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
         write_test_tileset(dir.path(), "tiles/bg.til");
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             panel.enter_paint_mode(PaintTarget::BgSlot(0), cx);
         });
         cx.run_until_parked();
@@ -15336,7 +15842,7 @@ mod tests {
                 open_of(panel).images.is_empty(),
                 "the fixture world has no image assets before a layer is added"
             );
-            panel.add_background_impl(1, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(1, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             assert_eq!(
                 panel.test_backgrounds(),
                 vec![Background {
@@ -15421,7 +15927,7 @@ mod tests {
         .unwrap();
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             assert_eq!(
                 panel.test_backgrounds(),
                 vec![Background {
@@ -15458,7 +15964,7 @@ mod tests {
         std::fs::write(&map_path, &garbage).unwrap();
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             assert!(
                 panel.test_backgrounds().is_empty(),
                 "a map that will not open must not be linked"
@@ -15490,7 +15996,7 @@ mod tests {
         write_test_tileset(dir.path(), "tiles/bg.til");
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(2, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(2, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             panel.save_impl(cx);
         });
         // Draw the dock with the rail in its MIXED state -- one linked
@@ -15540,7 +16046,7 @@ mod tests {
         focus_the_panel(&panel, cx);
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             // Nothing selected: a paint-mode click must not put an entity
             // back in the selection.
             panel.clear_selection_impl(cx);
@@ -15663,7 +16169,7 @@ mod tests {
         write_test_tileset(dir.path(), "tiles/bg.til");
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             assert!(panel.test_enter_paint_bg(0, cx));
             assert_eq!(
                 panel.test_paint_mode_rel(),
@@ -15716,7 +16222,7 @@ mod tests {
         focus_the_panel(&panel, cx);
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             assert!(panel.test_enter_paint_bg(0, cx));
         });
         cx.run_until_parked();
@@ -15800,7 +16306,7 @@ mod tests {
         focus_the_panel(&panel, cx);
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             // Written out, so the world store is clean going in: any
             // entity edit that slips through shows up as dirty.
             panel.save_impl(cx);
@@ -15880,7 +16386,7 @@ mod tests {
         focus_the_panel(&panel, cx);
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             panel.clear_selection_impl(cx);
             assert!(panel.test_enter_paint_bg(0, cx));
         });
@@ -16001,7 +16507,7 @@ mod tests {
         focus_the_panel(&panel, cx);
 
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             panel.clear_selection_impl(cx);
             assert!(panel.test_enter_paint_bg(0, cx));
         });
@@ -16301,7 +16807,7 @@ mod tests {
         write_test_tileset(root, "tiles/bg.til");
         focus_the_panel(&panel, cx);
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
             panel.save_impl(cx);
             assert!(panel.test_enter_paint_bg(0, cx), "the slot resolves");
         });
@@ -17268,7 +17774,7 @@ mod tests {
         let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
         write_test_tileset(dir.path(), "tiles/bg.til");
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx)
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx)
         });
         cx.run_until_parked();
         settle_live(&panel, &endpoint, cx);
@@ -21253,7 +21759,7 @@ mod tests {
         let (panel, endpoint, dir, cx) = connected_live_panel(cx).await;
         write_test_tileset(dir.path(), "tiles/bg.til");
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(2, "tiles/bg.til".into(), cx)
+            panel.add_background_impl(2, "tiles/bg.til".into(), NEW_BG_DIM, cx)
         });
         cx.run_until_parked();
         settle_live(&panel, &endpoint, cx);
@@ -21813,7 +22319,7 @@ mod tests {
         // background to refuse to unlink.
         write_test_tileset(dir.path(), "tiles/bg.til");
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg.til".into(), cx)
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx)
         });
         cx.run_until_parked();
         settle_live(&panel, &endpoint, cx);
@@ -21883,7 +22389,7 @@ mod tests {
         // the running cart has left behind.
         panel.update(cx, |panel, cx| panel.clear_background_impl(0, cx));
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(1, "tiles/bg.til".into(), cx)
+            panel.add_background_impl(1, "tiles/bg.til".into(), NEW_BG_DIM, cx)
         });
         panel.update(cx, |panel, cx| {
             panel.copy_impl(cx);
@@ -22571,8 +23077,8 @@ mod tests {
         write_test_tileset(dir.path(), "tiles/bg0.til");
         write_test_tileset(dir.path(), "tiles/bg1.til");
         panel.update(cx, |panel, cx| {
-            panel.add_background_impl(0, "tiles/bg0.til".into(), cx);
-            panel.add_background_impl(1, "tiles/bg1.til".into(), cx);
+            panel.add_background_impl(0, "tiles/bg0.til".into(), NEW_BG_DIM, cx);
+            panel.add_background_impl(1, "tiles/bg1.til".into(), NEW_BG_DIM, cx);
         });
         cx.run_until_parked();
 
@@ -22979,5 +23485,661 @@ mod tests {
             )
             .len()
         })
+    }
+
+    /// P7: each of the body's three fixed columns carries a vertical
+    /// grab handle on its right edge, and dragging one resizes THAT
+    /// column.
+    #[gpui::test]
+    async fn test_the_column_dividers_resize_their_columns(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        for (divider, selector, handle) in [
+            (
+                ColumnDivider::List,
+                "ggo-world-entity-list",
+                "ggo-world-divider-list",
+            ),
+            (
+                ColumnDivider::Inspector,
+                "ggo-world-inspector",
+                "ggo-world-divider-inspector",
+            ),
+        ] {
+            let before = cx.debug_bounds(selector).expect("the column");
+            let grab = cx.debug_bounds(handle).expect("the column's divider");
+            assert!(
+                (grab.center().x - before.right()).abs() <= DIVIDER_SIZE,
+                "{handle} straddles {selector}'s right edge: {grab:?}, {before:?}"
+            );
+
+            let target = gpui::point(before.right() + px(50.), before.center().y);
+            panel.update(cx, |panel, cx| panel.drag_divider(divider, target, cx));
+            cx.run_until_parked();
+
+            let after = cx
+                .debug_bounds(selector)
+                .expect("the column after the drag");
+            assert!(
+                (after.size.width - (before.size.width + px(50.))).abs() < px(2.),
+                "dragging {handle} 50px right must widen {selector} by 50: \
+                 before {before:?}, after {after:?}"
+            );
+        }
+    }
+
+    /// The paint column's handle sizes it the same way, in the mode that
+    /// puts it on screen.
+    #[gpui::test]
+    async fn test_the_paint_divider_resizes_the_paint_column(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        panel.update(cx, |panel, cx| {
+            panel.add_background_impl(0, "tiles/bg.til".into(), NEW_BG_DIM, cx);
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert!(
+                panel.enter_paint_mode(PaintTarget::BgSlot(0), cx),
+                "the linked slot must enter paint mode"
+            );
+        });
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds("ggo-world-paint")
+            .expect("the paint column");
+        assert!(
+            cx.debug_bounds("ggo-world-divider-paint").is_some(),
+            "the paint column carries a divider too"
+        );
+        let target = gpui::point(before.right() + px(40.), before.center().y);
+        panel.update(cx, |panel, cx| {
+            panel.drag_divider(ColumnDivider::Paint, target, cx)
+        });
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds("ggo-world-paint")
+            .expect("the paint column after the drag");
+        assert!(
+            (after.size.width - (before.size.width + px(40.))).abs() < px(2.),
+            "dragging the paint divider must widen the paint column: \
+             before {before:?}, after {after:?}"
+        );
+    }
+
+    /// A dragged width is re-clamped AT RENDER against the body's live
+    /// bounds: a dock narrowed after the drag must not leave a column
+    /// wider than the row it sits in less every other column's floor.
+    #[gpui::test]
+    async fn test_a_narrow_dock_reclamps_a_dragged_column(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        let list = cx
+            .debug_bounds("ggo-world-entity-list")
+            .expect("the column");
+        let target = gpui::point(list.origin.x + px(400.), list.center().y);
+        panel.update(cx, |panel, cx| {
+            panel.drag_divider(ColumnDivider::List, target, cx)
+        });
+        cx.run_until_parked();
+        let wide = cx
+            .debug_bounds("ggo-world-entity-list")
+            .expect("the column");
+        assert!(
+            wide.size.width > px(300.),
+            "the drag must have widened the column first: {wide:?}"
+        );
+
+        cx.simulate_resize(gpui::size(px(240.), px(600.)));
+        cx.run_until_parked();
+
+        let body = cx.debug_bounds("ggo-world-body").expect("the ready body");
+        let narrow = cx
+            .debug_bounds("ggo-world-entity-list")
+            .expect("the column in a narrow dock");
+        assert!(
+            narrow.size.width <= body.size.width - MIN_COLUMN,
+            "a narrow dock must re-clamp the dragged width: {narrow:?} in {body:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.list_width.is_some_and(|width| width > px(300.)),
+                "and the clamp is a RENDER concern -- the stored drag stays, \
+                 so widening the dock restores it"
+            );
+        });
+    }
+
+    /// P6: the Entities header carries an eye that collapses the rows
+    /// under it. The title and the add button stay -- a hidden section
+    /// still has to say what it is and still has to be addable to.
+    #[gpui::test]
+    async fn test_the_entities_eye_collapses_the_rows(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-entity-rows").is_some(),
+            "the rows start visible"
+        );
+        let eye = cx
+            .debug_bounds("ggo-world-entities-visible-on")
+            .expect("the Entities eye, showing");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-entity-rows").is_none(),
+            "the eye collapses the rows"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-entities-title").is_some(),
+            "the title stays"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-add-entity-on").is_some(),
+            "and so does the add button"
+        );
+
+        let eye = cx
+            .debug_bounds("ggo-world-entities-visible-off")
+            .expect("the eye now reads hidden");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-world-entity-rows").is_some(),
+            "and brings them back"
+        );
+    }
+
+    /// The inspector's own header eye collapses it to that title row.
+    #[gpui::test]
+    async fn test_the_inspector_eye_collapses_it_to_its_title(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-inspector-body").is_some(),
+            "the fields start visible"
+        );
+        let eye = cx
+            .debug_bounds("ggo-world-inspector-visible-on")
+            .expect("the inspector eye, showing");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-inspector-body").is_none(),
+            "the eye collapses the inspector"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-inspector-title").is_some(),
+            "the title row stays, so it can be brought back"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-inspector-visible-off").is_some(),
+            "and the eye reads hidden"
+        );
+    }
+
+    /// The layers rail's title carries the same eye.
+    #[gpui::test]
+    async fn test_the_layers_eye_collapses_the_rail(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-bg-row-0").is_some(),
+            "the slots start visible"
+        );
+        let eye = cx
+            .debug_bounds("ggo-world-layers-visible-on")
+            .expect("the Layers eye, showing");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-bg-row-0").is_none(),
+            "the eye collapses the rail's slots"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-layers-visible-off").is_some(),
+            "and the rail keeps its title row"
+        );
+    }
+
+    /// Each component block in the entity inspector gets an eye beside
+    /// its Trash, and it collapses that block's fields alone.
+    #[gpui::test]
+    async fn test_a_component_eye_collapses_only_that_block(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(900.), px(900.)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-component-fields-Transform")
+                .is_some(),
+            "Transform's fields start visible"
+        );
+        let eye = cx
+            .debug_bounds("ggo-world-component-visible-Transform-on")
+            .expect("Transform's eye, showing");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-world-component-fields-Transform")
+                .is_none(),
+            "the eye collapses Transform's fields"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-component-fields-Text").is_some(),
+            "and leaves the sibling block alone"
+        );
+        assert!(
+            cx.debug_bounds("ggo-world-component-visible-Transform-off")
+                .is_some(),
+            "the header (and its eye) stay, so the block can be reopened"
+        );
+    }
+
+    /// P9: the layers rail scrolls on its own rather than pushing the
+    /// body off a short dock.
+    #[gpui::test]
+    async fn test_the_layers_rail_scrolls_in_a_short_dock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        cx.simulate_resize(gpui::size(px(500.), px(220.)));
+        cx.run_until_parked();
+
+        let rail = cx
+            .debug_bounds("ggo-world-layers-rail")
+            .expect("the layers rail");
+        assert!(
+            rail.size.height <= gpui::px(220. * LAYERS_MAX_VH) + px(1.),
+            "the rail must cap its own height in a short dock: {rail:?}"
+        );
+
+        let before = cx
+            .debug_bounds("ggo-world-bg-row-3")
+            .expect("the last slot is rendered even when it is out of view");
+        assert!(
+            before.origin.y > rail.bottom(),
+            "for this to test anything the last slot must start out of \
+             reach: {before:?} below {rail:?}"
+        );
+
+        wheel(cx, rail.center(), (0., -60.));
+
+        let after = cx
+            .debug_bounds("ggo-world-bg-row-3")
+            .expect("the last slot survives the scroll");
+        assert!(
+            after.origin.y < before.origin.y,
+            "wheeling over the rail must bring the last slot into reach: \
+             before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    /// An empty extra world at `stem` under `root`, so a card has more
+    /// than the fixture's two rows to filter.
+    fn write_empty_world(root: &std::path::Path, stem: &str) {
+        write_world(
+            root,
+            &format!("{stem}.wrld.toml"),
+            &WorldFile {
+                entities: vec![],
+                instances: vec![],
+                backgrounds: vec![],
+            },
+        )
+        .unwrap();
+    }
+
+    /// A workspace with `test.wrld.toml` open in a real `WorldPanel` --
+    /// what every creation-card test needs, because a card is a
+    /// workspace modal and there is no workspace behind
+    /// `ready_panel_in_window`.
+    async fn card_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<WorldPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let project = routed_project(cx, root, true).await;
+        write_empty_world(root, "alpha");
+        write_empty_world(root, "beta");
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace_panel(&workspace, root, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_rel_path("test.wrld.toml", window, cx)
+        });
+        cx.run_until_parked();
+        (workspace, panel, cx)
+    }
+
+    /// P1(a): "+ Instance" raises a card whose search field has focus,
+    /// whose list filters on a query, and whose confirm goes through
+    /// `add_instance_impl` -- the same document op the menu produced.
+    #[gpui::test]
+    async fn test_the_add_instance_card_filters_and_adds(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = card_workspace(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_add_instance_card(window, cx)
+        });
+        cx.run_until_parked();
+
+        let card = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<pickers::AddInstanceModal>(cx)
+            })
+            .expect("+ Instance raises the add-instance card");
+        let picker = card.read_with(cx, |card, _| card.picker().clone());
+        assert!(
+            picker.update_in(cx, |picker, window, cx| picker
+                .focus_handle(cx)
+                .is_focused(window)),
+            "the card opens with its search field focused"
+        );
+        assert!(
+            picker
+                .read_with(cx, |picker, _| picker.delegate.match_stems())
+                .contains(&"alpha".to_string()),
+            "every candidate stem is listed before a query"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("alph", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.delegate.match_stems()),
+            vec!["alpha".to_string()],
+            "the query filters the list"
+        );
+        assert_eq!(
+            card.read_with(cx, |card, _| card.selected_stem().map(str::to_string)),
+            Some("alpha".to_string()),
+            "and the top surviving row takes the highlight"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker::PickerDelegate::confirm(&mut picker.delegate, false, window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let stems: Vec<String> = open
+                .store
+                .state()
+                .instances
+                .iter()
+                .map(|instance| instance.world.clone())
+                .collect();
+            assert!(
+                stems.contains(&"alpha".to_string()),
+                "confirm goes through add_instance_impl: {stems:?}"
+            );
+        });
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<pickers::AddInstanceModal>(cx))
+                .is_none(),
+            "and the card dismisses itself"
+        );
+    }
+
+    /// P1(b): a layer's "Add…" raises a card over the project's
+    /// tilesets, with the generated map's size editable; confirm goes
+    /// through `add_background_impl` with THAT size.
+    #[gpui::test]
+    async fn test_the_add_background_card_filters_sizes_and_links(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = card_workspace(cx, dir.path()).await;
+        write_test_tileset(dir.path(), "tiles/bg.til");
+        write_test_tileset(dir.path(), "tiles/other.til");
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_add_background_card(1, window, cx)
+        });
+        cx.run_until_parked();
+
+        let card = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<pickers::AddBackgroundModal>(cx)
+            })
+            .expect("\"Add…\" raises the add-background card");
+        let picker = card.read_with(cx, |card, _| card.picker().clone());
+        assert!(
+            picker.update_in(cx, |picker, window, cx| picker
+                .focus_handle(cx)
+                .is_focused(window)),
+            "the card opens with its search field focused"
+        );
+        let dimension = card.read_with(cx, |card, _| card.dimension_editor().clone());
+        assert_eq!(
+            dimension.read_with(cx, |editor, cx| editor.text(cx)),
+            NEW_BG_DIM.to_string(),
+            "the size field defaults to the generated map's usual side"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("othe", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.delegate.match_rels()),
+            vec!["tiles/other.til".to_string()],
+            "the query filters the tileset list"
+        );
+
+        dimension.update_in(cx, |editor, window, cx| editor.set_text("8", window, cx));
+        picker.update_in(cx, |picker, window, cx| {
+            picker::PickerDelegate::confirm(&mut picker.delegate, false, window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.test_backgrounds(),
+                vec![Background {
+                    layer: 1,
+                    map: "maps/test.bg1.map".into()
+                }],
+                "confirm links the slot through add_background_impl"
+            );
+        });
+        let map = io::open_map(dir.path(), "maps/test.bg1.map").expect("the generated map");
+        assert_eq!(
+            (map.w, map.h),
+            (8, 8),
+            "and generates it at the size the card's field named"
+        );
+    }
+
+    /// P1(c): "Add component…" raises a card over the schemas the entity
+    /// does not carry, previewing the fields the pick would seed;
+    /// confirm is the same `WorldOp::AddComponent` the menu applied.
+    #[gpui::test]
+    async fn test_the_add_component_card_filters_and_adds(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = card_workspace(cx, dir.path()).await;
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_add_component_card(0, window, cx)
+        });
+        cx.run_until_parked();
+
+        let card = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<pickers::AddComponentModal>(cx)
+            })
+            .expect("\"Add component…\" raises the add-component card");
+        let picker = card.read_with(cx, |card, _| card.picker().clone());
+        assert!(
+            picker.update_in(cx, |picker, window, cx| picker
+                .focus_handle(cx)
+                .is_focused(window)),
+            "the card opens with its search field focused"
+        );
+        let offered = picker.read_with(cx, |picker, _| picker.delegate.match_names());
+        assert!(
+            offered.contains(&"Camera".to_string()),
+            "a schema the entity lacks is offered: {offered:?}"
+        );
+        assert!(
+            !offered.contains(&"Transform".to_string()),
+            "one it already carries is not: {offered:?}"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("Camer", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.delegate.match_names()),
+            vec!["Camera".to_string()],
+            "the query filters the schema list"
+        );
+        assert_eq!(
+            card.read_with(cx, |card, _| card.selected_name().map(str::to_string)),
+            Some("Camera".to_string()),
+            "and the top surviving row takes the highlight the preview reads"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker::PickerDelegate::confirm(&mut picker.delegate, false, window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            let entity = &open.store.state().entities[0];
+            let camera = entity
+                .components
+                .get("Camera")
+                .expect("confirm applies AddComponent");
+            assert_eq!(
+                camera,
+                &serde_json::Value::Object(defaults_for(
+                    open.schemas
+                        .iter()
+                        .find(|schema| schema.name == "Camera")
+                        .expect("the Camera schema")
+                )),
+                "seeded by defaults_for, exactly as the menu seeded it"
+            );
+        });
+    }
+
+    /// P3: grid, snap and zoom ride in the world's `.ggo-ide` sidecar --
+    /// written when they move, and read back when the world is opened
+    /// again.
+    #[gpui::test]
+    async fn test_the_view_toggles_persist_per_world(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        assert_eq!(
+            editor_meta::load(&root, "test.wrld.toml").view,
+            None,
+            "a world nobody has changed the view of stores none"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.set_grid(false, cx);
+            panel.set_zoom(4.0, cx);
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.snap = true;
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            editor_meta::load(&root, "test.wrld.toml").view,
+            Some(editor_meta::ViewMeta {
+                grid: false,
+                snap: true,
+                zoom: 4.0,
+            }),
+            "the change reaches the sidecar"
+        );
+
+        // Reopen the same world into a FRESH panel: the toggles come back.
+        panel.update(cx, |panel, cx| {
+            panel.load_rel_path("sub.wrld.toml", None, cx);
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.load_rel_path("test.wrld.toml", None, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(!open.grid, "the stored grid comes back");
+            assert!(open.snap, "and so does snap");
+            assert_eq!(open.view.borrow().zoom, 4.0, "and the zoom");
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.listing.stem, "test",
+                "and it is the world the sidecar belongs to that got them"
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                editor_meta::load(&panel.project_root.clone().unwrap(), "sub.wrld.toml").view,
+                None,
+                "the OTHER world's sidecar is untouched -- the view is per world"
+            );
+        });
     }
 }
