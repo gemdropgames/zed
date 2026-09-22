@@ -76,9 +76,22 @@ impl TilesetEditorItem {
         self.panel.clone()
     }
 
-    #[cfg(test)]
     pub(crate) fn panel(&self) -> &Entity<TilesetPanel> {
         &self.panel
+    }
+
+    /// Follow the document to `rel` -- what a rename through the file
+    /// explorer owes a tab that is still showing the old name (and would
+    /// otherwise save back to a path that no longer exists).
+    pub(crate) fn adopt_rel(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rel == rel {
+            return;
+        }
+        self.rel = rel;
+        let rel = self.rel.clone();
+        self.panel
+            .update(cx, |panel, cx| panel.open_rel_path(&rel, window, cx));
+        cx.emit(TilesetItemEvent::UpdateTab);
     }
 }
 

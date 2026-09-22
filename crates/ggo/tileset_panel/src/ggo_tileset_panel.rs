@@ -26,6 +26,7 @@
 
 mod loader;
 mod palette_widget;
+mod tileset_files;
 mod tileset_item;
 
 use std::cell::RefCell;
@@ -181,18 +182,41 @@ const MIN_BODY_PX: Pixels = px(120.);
 const TOOLBAR_SELECTOR: &str = "ggo-tileset-toolbar";
 const TOOLING_SELECTOR: &str = "ggo-tileset-tooling";
 const INFO_SELECTOR: &str = "ggo-tileset-info";
+const PALETTE_SELECTOR: &str = "ggo-tileset-palette";
 const BODY_SELECTOR: &str = "ggo-tileset-body";
+/// The rename/duplicate report line in the tooling column.
+const FILE_STATUS_SELECTOR: &str = "ggo-tileset-file-status";
+/// The eye toggles over the tooling column's two sections. The rendered
+/// selector is this plus `-on`/`-off`.
+const INFO_VISIBLE_SELECTOR: &str = "ggo-tileset-info-visible";
+const PALETTE_VISIBLE_SELECTOR: &str = "ggo-tileset-palette-visible";
+/// The grab strip between the sheet and the tooling column.
+const TOOLS_DIVIDER_SELECTOR: &str = "ggo-tileset-divider-tools";
+
+/// The divider strip's grab width. `workspace::dock`'s own figure.
+const DIVIDER_PX: Pixels = px(6.);
+
+/// The narrowest the tooling column may be dragged. Below this the
+/// 16-swatch palette grid stops laying out as a grid at all.
+const MIN_TOOLS_PX: Pixels = px(120.);
 
 /// The edge "+" bars' thickness.
 const EDGE_BAR_PX: f32 = 18.0;
 
 /// The tileset extension this editor claims from the file explorer.
-const TILESET_EXT: &str = "til";
+pub(crate) const TILESET_EXT: &str = "til";
 
 pub fn init(cx: &mut App) {
     // Explorer-driven routing: clicking a `.til` in the project panel opens
     // the tileset editor tab instead of a (binary, unreadable) text buffer.
     workspace::register_path_open_interceptor(cx, intercept_tileset_open);
+    // Right-clicking that same `.til` offers the pair-aware file ops
+    // upstream's menu can't (rename/duplicate move BOTH halves and rewrite
+    // every binder's stored rel).
+    workspace::register_context_menu_contributor(cx, tileset_files::contribute_tileset_menu);
+    // And pressing Delete on a `.til`/`.pal` row routes into the confirm
+    // that names what still binds it -- see [`tileset_files`].
+    workspace::register_delete_interceptor(cx, tileset_files::intercept_tileset_delete);
 }
 
 /// `workspace::PathOpenInterceptor` for `*.til`: claim the path and open
@@ -582,6 +606,62 @@ pub struct TilesetPanel {
     /// The pending debounced sidecar write; replaced on every schedule, so
     /// only the trailing edge of a burst actually touches the disk.
     view_meta_write: Option<Task<()>>,
+    /// What the last project-panel file op (rename/duplicate) did, shown
+    /// in the tooling column.
+    file_status: Option<FileStatus>,
+    /// The tooling column's two sections, collapsed to their header rows
+    /// when hidden. Session-only: which sections a user wants open is a
+    /// view preference of THIS tab, not of the document.
+    info_visible: bool,
+    palette_visible: bool,
+    /// The tooling column's dragged width; `None` is [`TOOLS_COL_PX`].
+    /// Session-only for the same reason.
+    tools_width: Option<Pixels>,
+    /// The body row's on-screen bounds, recorded at prepaint -- the frame
+    /// a divider drag resolves in, and the width a stored `tools_width`
+    /// is re-clamped against.
+    body_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+}
+
+/// The one session-only divider this editor has: between the sheet and
+/// the tooling column beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Divider {
+    SheetTools,
+}
+
+/// A divider mid-drag. `workspace::DraggedDock`'s shape: the state rides
+/// on the drag and the ghost renders nothing, because the visible
+/// feedback is the resized layout.
+///
+/// The [`gpui::EntityId`] is the panel the handle belongs to, and it is
+/// load bearing: `on_drag_move` fires in the CAPTURE phase on every
+/// mounted listener whose drag type matches, with no hitbox test, so a
+/// drag in one tileset tab would otherwise resize every open one.
+#[derive(Clone, Copy)]
+struct DraggedDivider(Divider, gpui::EntityId);
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a [`Divider::SheetTools`] drag at window position `position`
+/// into the tooling column's new width, clamped so neither side
+/// collapses. `body` is the sheet+tooling row's bounds.
+///
+/// Pure, so the clamps are provable without a window.
+fn divider_size(position: Point<Pixels>, body: Bounds<Pixels>) -> Pixels {
+    let max = (body.size.width - MIN_SHEET_PX).max(MIN_TOOLS_PX);
+    (body.right() - position.x).clamp(MIN_TOOLS_PX, max)
+}
+
+/// A rename's/duplicate's outcome, as the tooling column renders it.
+pub(crate) struct FileStatus {
+    message: String,
+    /// Failures read as errors, successes as muted notes.
+    failed: bool,
 }
 
 impl TilesetPanel {
@@ -652,6 +732,11 @@ impl TilesetPanel {
             load_generation: 0,
             _load_task: None,
             view_meta_write: None,
+            file_status: None,
+            info_visible: true,
+            palette_visible: true,
+            tools_width: None,
+            body_bounds: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -659,6 +744,97 @@ impl TilesetPanel {
     /// `is_dirty` source.
     pub(crate) fn dirty(&self) -> bool {
         matches!(&self.state, ViewerState::Ready(open) if open.store.dirty())
+    }
+
+    /// Report what a project-panel file op did (or why it didn't) in the
+    /// tooling column, so a menu entry is never a silent no-op.
+    pub(crate) fn set_file_status(&mut self, message: String, failed: bool, cx: &mut Context<Self>) {
+        self.file_status = Some(FileStatus { message, failed });
+        cx.notify();
+    }
+
+    /// The tooling column's width AS RENDERED: the dragged width
+    /// re-clamped against the body row's current width, so a pane
+    /// narrowed AFTER the drag cannot bury the sheet (or push the grab
+    /// strip off the row, where it could not be dragged back).
+    ///
+    /// An UNDRAGGED column passes [`TOOLS_COL_PX`] through untouched:
+    /// the row is deliberately allowed to overflow and scroll sideways
+    /// in a narrow dock rather than shrinking the column to fit, and
+    /// clamping the default would quietly retire that.
+    pub(crate) fn rendered_tools_width(&self) -> Pixels {
+        let Some(width) = self.tools_width else {
+            return px(TOOLS_COL_PX);
+        };
+        let Some(body) = *self.body_bounds.borrow() else {
+            return width;
+        };
+        width.min((body.size.width - MIN_SHEET_PX).max(MIN_TOOLS_PX))
+    }
+
+    /// Apply one step of a divider drag. Drops out before `notify` when
+    /// the clamped size is the one already in force -- a drag emits a
+    /// move event per mouse position, most of which land in the same
+    /// pixel column once a clamp is biting.
+    pub(crate) fn drag_divider(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(body) = *self.body_bounds.borrow() else {
+            return;
+        };
+        let size = divider_size(position, body);
+        if self.tools_width.replace(size) != Some(size) {
+            cx.notify();
+        }
+    }
+
+    /// One of the tooling column's section eyes: Eye/EyeOff over a
+    /// wrapper whose selector says which, so a rendered test can read the
+    /// state off the paint.
+    fn visibility_toggle(
+        id: &'static str,
+        visible: bool,
+        toggle: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .debug_selector(move || format!("{id}-{}", if visible { "on" } else { "off" }))
+            .child(
+                IconButton::new(id, if visible { IconName::Eye } else { IconName::EyeOff })
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Show/hide"))
+                    .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+            )
+    }
+
+    /// A tooling-column section header: the title, which stays put when
+    /// the body is hidden, and the eye that hides it.
+    fn section_header(
+        &self,
+        title: &'static str,
+        id: &'static str,
+        visible: bool,
+        toggle: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                Label::new(title)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(Self::visibility_toggle(id, visible, toggle, cx))
+    }
+
+    /// Drop the open document when the file behind it has just been
+    /// unlinked -- otherwise the tab keeps rendering (and would save
+    /// back) pixels whose file is gone.
+    pub(crate) fn clear_if_deleted(&mut self, rel: &str, cx: &mut Context<Self>) {
+        if self.open_rel_path_now() != Some(rel) {
+            return;
+        }
+        self.state = ViewerState::Empty;
+        cx.notify();
     }
 
     /// Re-discover the project root (the workspace's first visible
@@ -2912,23 +3088,39 @@ impl TilesetPanel {
             summary.push_str(" · ");
             summary.push_str(note);
         }
+        let (rel_path, pal_path) = (open.rel_path.clone(), open.pal_path.clone());
+        let visible = self.info_visible;
         v_flex()
             .debug_selector(|| INFO_SELECTOR.to_string())
             .gap_0p5()
             .p_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(Label::new(open.rel_path.clone()).size(LabelSize::Small))
-            .child(
-                Label::new(open.pal_path.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(summary)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
+            .child(self.section_header(
+                "Info",
+                INFO_VISIBLE_SELECTOR,
+                visible,
+                |this, cx| {
+                    this.info_visible = !this.info_visible;
+                    cx.notify();
+                },
+                cx,
+            ))
+            // Hidden is the header row and nothing else: the title stays
+            // so the section can be found again.
+            .when(visible, |this| {
+                this.child(Label::new(rel_path).size(LabelSize::Small))
+                    .child(
+                        Label::new(pal_path)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(summary)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            })
             .into_any_element()
     }
 
@@ -3243,7 +3435,7 @@ impl TilesetPanel {
         if open.missing_pal {
             editor = editor.note("no .pal found — 16-gray fallback");
         }
-        editor
+        let editor = editor
             .on_select(move |slot, _, cx| {
                 select_target
                     .update(cx, |this, cx| this.select_slot(slot, cx))
@@ -3253,8 +3445,46 @@ impl TilesetPanel {
                 change_target
                     .update(cx, |this, cx| this.set_palette_slot(slot, rgb565, cx))
                     .ok();
-            })
+            });
+        let visible = self.palette_visible;
+        v_flex()
+            .debug_selector(|| PALETTE_SELECTOR.to_string())
+            .px_1()
+            .pt_1()
+            .child(self.section_header(
+                "Palette",
+                PALETTE_VISIBLE_SELECTOR,
+                visible,
+                |this, cx| {
+                    this.palette_visible = !this.palette_visible;
+                    cx.notify();
+                },
+                cx,
+            ))
+            .when(visible, |this| this.child(editor))
             .into_any_element()
+    }
+
+    /// The session-only divider grab handle, sized and positioned by the
+    /// caller. `workspace::dock`'s resize-handle shape: an occluding
+    /// strip that starts a [`DraggedDivider`] drag, which the body row's
+    /// `on_drag_move` turns into a width.
+    fn divider_handle(cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(TOOLS_DIVIDER_SELECTOR)
+            .debug_selector(|| TOOLS_DIVIDER_SELECTOR.to_string())
+            .on_drag(
+                DraggedDivider(Divider::SheetTools, cx.entity_id()),
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *dragged)
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .occlude()
     }
 
     /// The document column on the editor's right side: file info, the
@@ -3264,10 +3494,15 @@ impl TilesetPanel {
             unreachable!("render_tooling is only called in the Ready state");
         };
         let save_error = open.save_error.clone();
+        let file_status = self
+            .file_status
+            .as_ref()
+            .map(|status| (status.message.clone(), status.failed));
         v_flex()
             .id(TOOLING_SELECTOR)
             .debug_selector(|| TOOLING_SELECTOR.to_string())
-            .w(px(TOOLS_COL_PX))
+            .relative()
+            .w(self.rendered_tools_width())
             // Shrinking the column instead would eat into the sheet's
             // own floor; the body row scrolls sideways instead.
             .flex_shrink_0()
@@ -3275,7 +3510,31 @@ impl TilesetPanel {
             .overflow_y_scroll()
             .border_l_1()
             .border_color(cx.theme().colors().border)
+            // `deferred` for the same reason the dock defers its handle:
+            // the strip straddles the border, and the sheet on the far
+            // side paints after it and would swallow half the grab area.
+            .child(gpui::deferred(
+                Self::divider_handle(cx)
+                    .absolute()
+                    .top_0()
+                    .left(-DIVIDER_PX / 2.)
+                    .w(DIVIDER_PX)
+                    .h_full()
+                    .cursor_col_resize(),
+            ))
             .child(self.render_info(cx))
+            .when_some(file_status, |this, (message, failed)| {
+                this.child(
+                    div()
+                        .p_1()
+                        .debug_selector(|| FILE_STATUS_SELECTOR.to_string())
+                        .child(
+                            Label::new(message)
+                                .size(LabelSize::XSmall)
+                                .color(if failed { Color::Error } else { Color::Muted }),
+                        ),
+                )
+            })
             .child(self.render_palette(cx))
             .when_some(save_error, |this, e| {
                 this.child(div().p_1().child(ggo_common::CopyableText::new(
@@ -3339,6 +3598,13 @@ impl TilesetPanel {
     }
 
     fn render_ready(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let bounds_cell = self.body_bounds.clone();
+        // A resize has to REDRAW, not just record: the tooling column's
+        // width is re-clamped against these bounds during render, so a
+        // frame that merely stores the new ones leaves a dragged column
+        // overhanging the sheet until something else happens to notify.
+        // Guarded on a real change, so this settles in one extra frame.
+        let resized = cx.weak_entity();
         v_flex()
             .id("ggo-tileset-ready")
             .size_full()
@@ -3349,10 +3615,42 @@ impl TilesetPanel {
                 h_flex()
                     .id(BODY_SELECTOR)
                     .debug_selector(|| BODY_SELECTOR.to_string())
+                    .relative()
                     .flex_1()
                     .min_h(MIN_BODY_PX)
                     .overflow_x_scroll()
                     .items_stretch()
+                    // The drag listener lives on the whole row, not on
+                    // the 6px strip: a fast drag outruns it.
+                    // `on_drag_move` fires in the CAPTURE phase for the
+                    // whole window with no hitbox test, so this row sees
+                    // divider drags from OTHER tileset tabs too -- hence
+                    // the owner filter.
+                    .on_drag_move(cx.listener(
+                        |this, event: &gpui::DragMoveEvent<DraggedDivider>, _, cx| {
+                            let &DraggedDivider(_, owner) = event.drag(cx);
+                            if owner != cx.entity_id() {
+                                return;
+                            }
+                            this.drag_divider(event.event.position, cx);
+                        },
+                    ))
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _window, cx| {
+                                if bounds_cell.replace(Some(bounds)) != Some(bounds) {
+                                    cx.defer(move |cx| {
+                                        resized.update(cx, |_, cx| cx.notify()).ok();
+                                    });
+                                }
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
                     .child(self.render_sheet(cx))
                     .child(self.render_tooling(cx)),
             )
@@ -7327,5 +7625,164 @@ mod tests {
             before.origin,
             after.origin
         );
+    }
+    /// Class P6: the tooling column's two sections each collapse behind
+    /// an eye. Hidden is the HEADER ROW ONLY -- the title stays, so the
+    /// section can be found and brought back.
+    #[gpui::test]
+    async fn test_the_tooling_sections_collapse_behind_their_eyes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("a temp project");
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        resize(cx, 900., 700.);
+
+        let info_before = cx.debug_bounds(INFO_SELECTOR).expect("info bounds at paint");
+        let palette_before = cx
+            .debug_bounds(PALETTE_SELECTOR)
+            .expect("palette bounds at paint");
+        let eye = cx
+            .debug_bounds("ggo-tileset-info-visible-on")
+            .expect("the info eye paints, open");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-tileset-info-visible-off").is_some(),
+            "the eye flips to EyeOff"
+        );
+        let info_after = cx.debug_bounds(INFO_SELECTOR).expect("the header row stays");
+        assert!(
+            info_after.size.height < info_before.size.height,
+            "hiding leaves the header row only: {info_before:?} -> {info_after:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.info_visible);
+            assert!(panel.palette_visible, "one eye does not close the other");
+        });
+
+        let eye = cx
+            .debug_bounds("ggo-tileset-palette-visible-on")
+            .expect("the palette eye paints, open");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-tileset-palette-visible-off").is_some(),
+            "the palette eye flips too"
+        );
+        let palette_after = cx
+            .debug_bounds(PALETTE_SELECTOR)
+            .expect("the palette header row stays");
+        assert!(
+            palette_after.size.height < palette_before.size.height,
+            "the 16 swatches and the channel steppers go: \
+             {palette_before:?} -> {palette_after:?}"
+        );
+
+        // And back: the eye is a toggle, not a one-way hide.
+        let eye = cx
+            .debug_bounds("ggo-tileset-info-visible-off")
+            .expect("the closed info eye is still there to click");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds(INFO_SELECTOR).map(|b| b.size.height),
+            Some(info_before.size.height),
+            "re-opening restores exactly what was hidden"
+        );
+    }
+
+    /// Class P7: the tooling column is draggable, and a dragged width is
+    /// re-clamped against the body row so a pane narrowed AFTERWARDS
+    /// still leaves the sheet [`MIN_SHEET_PX`] -- and the grab strip on
+    /// the row, where it can be dragged back.
+    #[gpui::test]
+    async fn test_the_tools_divider_resizes_the_column_and_reclamps(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("a temp project");
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        resize(cx, 900., 700.);
+
+        let before = cx
+            .debug_bounds(TOOLING_SELECTOR)
+            .expect("tooling bounds at paint");
+        assert_eq!(
+            before.size.width,
+            px(TOOLS_COL_PX),
+            "an undragged column is the default width"
+        );
+        let handle = cx
+            .debug_bounds(TOOLS_DIVIDER_SELECTOR)
+            .expect("the grab strip paints");
+        assert!(
+            (handle.center().x - before.origin.x).abs() <= DIVIDER_PX,
+            "the strip straddles the column's leading edge: {handle:?} vs {before:?}"
+        );
+
+        // Drag the strip to where a 400px column's leading edge belongs.
+        let body = cx.debug_bounds(BODY_SELECTOR).expect("body bounds");
+        const DRAGGED: Pixels = px(400.);
+        panel.update(cx, |panel, cx| {
+            panel.drag_divider(point(body.right() - DRAGGED, body.center().y), cx);
+        });
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds(TOOLING_SELECTOR)
+            .expect("tooling bounds after the drag");
+        assert_eq!(
+            after.size.width, DRAGGED,
+            "the column follows the strip to the dragged position"
+        );
+
+        // Narrow the window: the stored width no longer fits, so the
+        // RENDERED one gives way rather than burying the sheet.
+        resize(cx, 320., 700.);
+        let body = cx.debug_bounds(BODY_SELECTOR).expect("body bounds");
+        let narrow = cx
+            .debug_bounds(TOOLING_SELECTOR)
+            .expect("tooling bounds in a narrow window");
+        assert!(
+            narrow.size.width <= body.size.width - MIN_SHEET_PX,
+            "the sheet keeps its floor beside a dragged column: \
+             body {body:?}, tooling {narrow:?}"
+        );
+        assert!(
+            narrow.size.width >= MIN_TOOLS_PX,
+            "and the column keeps its own: {narrow:?}"
+        );
+
+        // The clamp is a RENDER concern only, so widening restores the
+        // drag rather than having quietly overwritten it.
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.tools_width, Some(DRAGGED));
+        });
+        resize(cx, 900., 700.);
+        assert_eq!(
+            cx.debug_bounds(TOOLING_SELECTOR).map(|b| b.size.width),
+            Some(DRAGGED),
+            "the dragged width comes back"
+        );
+    }
+
+    /// The clamp itself, without a window: neither side of the divider
+    /// can be dragged out of existence.
+    #[gpui::test]
+    fn divider_size_clamps_both_neighbours(_cx: &mut gpui::App) {
+        let body = gpui::bounds(point(px(0.), px(0.)), size(px(1000.), px(600.)));
+        assert_eq!(divider_size(point(px(700.), px(300.)), body), px(300.));
+        assert_eq!(
+            divider_size(point(px(-50.), px(300.)), body),
+            px(1000.) - MIN_SHEET_PX,
+            "dragging past the left edge leaves the sheet its floor"
+        );
+        assert_eq!(
+            divider_size(point(px(1200.), px(300.)), body),
+            MIN_TOOLS_PX,
+            "dragging past the right edge leaves the column its own"
+        );
+
+        // A body narrower than both floors together: the column's floor
+        // wins, and the row overflows and scrolls, which is what the
+        // sheet's own `min_w` already does.
+        let cramped = gpui::bounds(point(px(0.), px(0.)), size(px(100.), px(600.)));
+        assert_eq!(divider_size(point(px(0.), px(300.)), cramped), MIN_TOOLS_PX);
     }
 }

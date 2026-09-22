@@ -230,14 +230,11 @@ impl RenderOnce for SmallPaletteEditor {
         let selected = self.selected;
         let palette = self.palette;
         let color = palette[selected.min(PAL_SLOTS - 1)];
+        // No title of its own: the host draws the section header (and the
+        // eye that collapses this body to it).
         v_flex()
             .gap_0p5()
             .p_1()
-            .child(
-                Label::new("Palette")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
             .when_some(self.note.clone(), |this, note| {
                 this.child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
             })
