@@ -79,8 +79,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, IntoElement, MouseMoveEvent, Pixels, Render,
-    ScrollStrategy, Styled, Task, UniformListScrollHandle, WeakEntity, Window, div, px,
+    App, Bounds, Context, EntityId, FocusHandle, Focusable, IntoElement, MouseMoveEvent, Pixels,
+    Render, ScrollStrategy, Styled, Task, UniformListScrollHandle, WeakEntity, Window, div, px,
     uniform_list,
 };
 use ui::prelude::*;
@@ -140,6 +140,134 @@ fn run_row_selector(ix: usize) -> String {
 fn device_run_row_selector(ix: usize) -> String {
     format!("ggo-charts-device-run-{ix}")
 }
+
+/// The per-row Re-run entry on perf run `ix` -- the picker's own copy of
+/// the detail header's button, so a run can be sent back to the emulator
+/// without being opened first.
+fn run_rerun_selector(ix: usize) -> String {
+    format!("ggo-charts-run-rerun-{ix}")
+}
+
+/// The per-row Copy-id entry on perf run `ix`. The id is what every other
+/// tool (the MCP, `ggo-diag`, a prompt) names a run by, and it is the one
+/// thing about a run this panel shows that cannot be selected as text.
+fn run_copy_selector(ix: usize) -> String {
+    format!("ggo-charts-run-copy-{ix}")
+}
+
+/// The eye that folds log `kind`'s body. [`ChartsPanel::visibility_toggle`]
+/// appends the `-on`/`-off` half, so the painted selector is
+/// `ggo-charts-console-visible-on` and its like.
+fn log_visible_selector(kind: LogKind) -> String {
+    format!("{}-visible", kind.selector())
+}
+
+/// The eye that folds chart `ix`. Keyed by INDEX for the same reason
+/// [`ChartsPanel::zoom`] is: a chart index means something only within one
+/// selection's chart set.
+fn chart_visible_selector(ix: usize) -> String {
+    format!("ggo-charts-chart-{ix}-visible")
+}
+
+/// Chart `ix`'s canvas box -- what its eye folds, and the only way a test
+/// can see that it did: an unpainted canvas records no bounds of its own.
+fn chart_body_selector(ix: usize) -> String {
+    format!("ggo-charts-chart-body-{ix}")
+}
+
+/// The eye over the picker's "Perf runs" heading.
+const RUNS_VISIBLE_SELECTOR: &str = "ggo-charts-runs-visible";
+
+/// The eye over the picker's "Device runs" heading.
+const HISTORY_VISIBLE_SELECTOR: &str = "ggo-charts-history-visible";
+
+/// Log `kind`'s scroll region -- the box [`Divider::Log`] sizes.
+fn log_list_selector(kind: LogKind) -> String {
+    format!("{}-list", kind.selector())
+}
+
+/// The handle on the bottom edge of log `kind`'s scroll region.
+fn log_divider_selector(kind: LogKind) -> String {
+    format!("{}-divider", kind.selector())
+}
+
+/// The picker column, whether it is the whole body or the left half of
+/// the split.
+const PICKER_SELECTOR: &str = "ggo-charts-picker";
+
+/// The handle between the picker column and the detail beside it.
+const PICKER_DIVIDER_SELECTOR: &str = "ggo-charts-picker-divider";
+
+/// The grab strip's thickness -- `ggo_sprite_panel`'s `DIVIDER_SIZE`.
+const DIVIDER_SIZE: Pixels = px(6.);
+
+/// The shortest a log's scroll region may be dragged. Three rows in the
+/// buffer font: below that the region says less than the line count
+/// beside its title would.
+const MIN_LOG_HEIGHT: Pixels = px(48.);
+
+/// The narrowest the picker column may be dragged -- a run title and its
+/// two entries.
+const MIN_PICKER_WIDTH: Pixels = px(200.);
+
+/// The narrowest a run detail may be squeezed to. A chart canvas below
+/// this is a smear, and the KPI row wraps to one tile per line.
+const MIN_DETAIL_WIDTH: Pixels = px(320.);
+
+/// Which of the panel's session-only dividers a drag is sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Divider {
+    /// The bottom edge of log `kind`'s scroll region: sizes that log.
+    Log(LogKind),
+    /// Between the picker column and the run detail beside it.
+    PickerDetail,
+}
+
+/// A divider mid-drag -- `ggo_sprite_panel`'s `DraggedDivider`, including
+/// the [`EntityId`], which is load bearing for the same reason: gpui
+/// delivers `on_drag_move` in the CAPTURE phase to every mounted listener
+/// whose drag type matches, with no hitbox test, so with two report tabs
+/// open in split panes a drag in one would otherwise resize both.
+#[derive(Clone, Copy)]
+struct DraggedDivider(Divider, EntityId);
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a divider drag at window position `position` into the new size
+/// of the section that divider controls, clamped so neither neighbour
+/// collapses. `body` is the panel body row's bounds; `list` is the
+/// dragged log's scroll region, which a [`Divider::Log`] drag measures
+/// down from and nothing else needs.
+///
+/// Pure so the clamps are testable without a window. `None` when the
+/// drag has no bounds to resolve against -- a log whose region has not
+/// been painted yet.
+fn divider_size(
+    divider: Divider,
+    position: gpui::Point<Pixels>,
+    body: Bounds<Pixels>,
+    list: Option<Bounds<Pixels>>,
+) -> Option<Pixels> {
+    match divider {
+        Divider::Log(_) => {
+            let list = list?;
+            let max = (body.size.height - BODY_MIN_HEIGHT).max(MIN_LOG_HEIGHT);
+            Some((position.y - list.top()).clamp(MIN_LOG_HEIGHT, max))
+        }
+        Divider::PickerDetail => {
+            let max = (body.size.width - MIN_DETAIL_WIDTH).max(MIN_PICKER_WIDTH);
+            Some((position.x - body.left()).clamp(MIN_PICKER_WIDTH, max))
+        }
+    }
+}
+
+/// The picker column's width before anyone drags it: wide enough for a
+/// run title and the date beside it at the default font.
+const PICKER_DEFAULT_WIDTH: Pixels = px(260.);
 
 /// One log line's selector -- a `uniform_list` row's bounds are the only
 /// way a test can see the list scroll sideways, since the list's own box
@@ -230,7 +358,7 @@ const RAW_HEX_CAP: usize = 64 * 1024;
 /// same sentence could be reintroduced with the suite still green. Ask
 /// [`LogKind::empty_state`] instead -- that is what `render_log` uses, so a
 /// test and the renderer cannot disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LogKind {
     /// A perf run's persisted guest UART (`uart`, via `perf_db::run_uart`).
     Console,
@@ -615,6 +743,32 @@ pub struct ChartsPanel {
     /// The drag in progress, if any -- at most one, since it takes a held
     /// button.
     drag: Option<Drag>,
+    /// Log sections the eye has folded. Session-only, like every other
+    /// P6 fold in the fork: it is a reading posture, not document state,
+    /// and nothing writes it anywhere.
+    hidden_logs: std::collections::HashSet<LogKind>,
+    /// Chart indices the eye has folded, keyed like [`Self::zoom`] and
+    /// cleared with it -- a chart index means something only within one
+    /// selection's chart set.
+    hidden_charts: std::collections::HashSet<usize>,
+    /// Whether the picker's perf-runs section is unfolded.
+    runs_visible: bool,
+    /// Whether the picker's device-run rail is unfolded.
+    history_visible: bool,
+    /// Each log's dragged scroll-region height, defaulting to
+    /// [`LOG_HEIGHT`]. Session-only, like every other P7 divider in the
+    /// fork.
+    log_heights: std::collections::HashMap<LogKind, Pixels>,
+    /// The picker column's dragged width, defaulting to
+    /// [`PICKER_DEFAULT_WIDTH`].
+    picker_width: Option<Pixels>,
+    /// Each painted log scroll region's bounds, recorded in its prepaint
+    /// for the same reason [`Self::chart_bounds`] are: a drag has to be
+    /// measured from the edge the region actually got.
+    log_bounds: Rc<RefCell<std::collections::HashMap<LogKind, Bounds<Pixels>>>>,
+    /// The panel body row's bounds -- what every divider clamps against,
+    /// and what decides whether the picker/detail split fits at all.
+    body_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// The frame the user last clicked, already grouped -- `RunPage.tsx`'s
     /// `selFrame`. `None` until a click lands, and dropped whenever the
     /// selection changes (a frame number means nothing across runs).
@@ -667,6 +821,14 @@ impl ChartsPanel {
             zoom: std::collections::HashMap::new(),
             drag: None,
             frame_inspect: None,
+            hidden_logs: std::collections::HashSet::new(),
+            hidden_charts: std::collections::HashSet::new(),
+            runs_visible: true,
+            history_visible: true,
+            log_heights: std::collections::HashMap::new(),
+            picker_width: None,
+            log_bounds: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            body_bounds: Rc::new(RefCell::new(None)),
             profile_sort_ascending: false,
             chart_bounds: Rc::new(RefCell::new(Vec::new())),
             scenes: Rc::new(RefCell::new(Vec::new())),
@@ -818,6 +980,7 @@ impl ChartsPanel {
         self.frame_inspect = None;
         self.historic_enabled = false;
         self.zoom.clear();
+        self.hidden_charts.clear();
         self.drag = None;
         self.chart_bounds.borrow_mut().clear();
         self.scenes.borrow_mut().clear();
@@ -1054,11 +1217,21 @@ impl ChartsPanel {
     /// `rerun::matches_stored`, which reaches into that app's own cart
     /// library and deliberately did not travel in R1.
     fn rerun_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.rerun_note = None;
         let Some(Selection::Perf(run)) = &self.selected else {
             return;
         };
-        let Some(rel) = run.label.clone().filter(|l| !l.is_empty()) else {
+        let rel = run.label.clone();
+        self.rerun_cart(rel, window, cx);
+    }
+
+    /// Re-run the cart at project-relative `rel`, wherever the click came
+    /// from -- the detail header's button ([`Self::rerun_selected`]) and a
+    /// picker row's own entry are the same action on the same run, so they
+    /// are the same code. Both refusals land in [`Self::rerun_note`],
+    /// which both views render.
+    fn rerun_cart(&mut self, rel: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.rerun_note = None;
+        let Some(rel) = rel.filter(|l| !l.is_empty()) else {
             self.rerun_note = Some(NO_RERUN_PATH);
             cx.notify();
             return;
@@ -1214,13 +1387,83 @@ impl ChartsPanel {
         }));
     }
 
+    /// The body row: the picker on its own, or -- when something is
+    /// selected AND the pane has room for both floors -- the picker
+    /// COLUMN beside that selection's detail, with a draggable boundary
+    /// between them.
+    ///
+    /// The split is dropped rather than squeezed below
+    /// [`MIN_PICKER_WIDTH`] + [`MIN_DETAIL_WIDTH`]: in a narrow dock a
+    /// run list stealing 200px from a 360px detail leaves neither
+    /// readable, which is the layout this panel already refused for the
+    /// device rail (see [`Self::render_picker`]).
     fn render_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        match &self.selected {
-            Some(Selection::Perf(_)) => self.render_detail(cx),
-            Some(Selection::Device(run)) => self.render_device_detail(run, cx),
-            Some(Selection::Fault(row)) => self.render_fault_detail(row, cx),
-            None => self.render_picker(cx),
-        }
+        let detail = match &self.selected {
+            Some(Selection::Perf(_)) => Some(self.render_detail(cx)),
+            Some(Selection::Device(run)) => Some(self.render_device_detail(run, cx)),
+            Some(Selection::Fault(row)) => Some(self.render_fault_detail(row, cx)),
+            None => None,
+        };
+        let bounds_cell = self.body_bounds.clone();
+        let row = h_flex()
+            .id("ggo-charts-body")
+            .relative()
+            .size_full()
+            .items_stretch()
+            // The drag listener lives on the whole row, not on the
+            // handles: a fast drag outruns a 6px strip. `on_drag_move`
+            // fires in the CAPTURE phase window-wide with no hitbox test,
+            // so this row also sees divider drags from OTHER report tabs
+            // -- hence the owner filter.
+            .on_drag_move(Self::guarded_listener(
+                cx,
+                |this, event: &gpui::DragMoveEvent<DraggedDivider>, _window, cx| {
+                    let &DraggedDivider(divider, owner) = event.drag(cx);
+                    if owner != cx.entity_id() {
+                        return;
+                    }
+                    this.drag_divider(divider, event.event.position, cx);
+                },
+            ))
+            .child(self.measuring_canvas(cx, move |bounds| {
+                let changed = *bounds_cell.borrow() != Some(bounds);
+                if changed {
+                    *bounds_cell.borrow_mut() = Some(bounds);
+                }
+                changed
+            }));
+        let Some(detail) = detail else {
+            return row.child(self.render_picker(cx)).into_any_element();
+        };
+        let Some(width) = self.rendered_picker_width() else {
+            return row.child(detail).into_any_element();
+        };
+        row.child(
+            div()
+                .relative()
+                .flex_none()
+                .w(width)
+                .h_full()
+                .border_r_1()
+                .border_color(cx.theme().colors().border)
+                .child(self.render_picker(cx))
+                // Inside the column, against its own right edge, rather
+                // than straddling the border in a `deferred`: a deferred
+                // draw registered by a panel that a test paints ad hoc
+                // (`cx.draw`) outlives the element arena the redraw our
+                // measuring canvas asks for then clears.
+                .child(
+                    Self::divider_handle(Divider::PickerDetail, cx)
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .w(DIVIDER_SIZE)
+                        .h_full()
+                        .cursor_col_resize(),
+                ),
+        )
+        .child(div().flex_1().min_w_0().h_full().child(detail))
+        .into_any_element()
     }
 
     /// The picker: this app's own perf runs, then the device-run history
@@ -1229,13 +1472,63 @@ impl ChartsPanel {
     /// readable.
     fn render_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         v_flex()
-            .id("ggo-charts-picker")
+            .id(PICKER_SELECTOR)
+            .debug_selector(|| PICKER_SELECTOR.to_string())
             .size_full()
             .overflow_y_scroll()
             .p_2()
             .gap_3()
             .child(self.render_runs_section(cx))
             .child(self.render_history_rail(cx))
+            .into_any_element()
+    }
+
+    /// A run row's Copy-id entry. The run NUMBER is how every other tool
+    /// names it -- the MCP's `open_run`, `ggo-diag`, a prompt -- and it is
+    /// the one thing the row shows that a reader cannot select as text.
+    fn render_row_copy_id(ix: usize, id: i64) -> gpui::AnyElement {
+        div()
+            .debug_selector(move || run_copy_selector(ix))
+            .child(
+                IconButton::new(("ggo-charts-run-copy", ix), IconName::Copy)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text(format!("Copy run id {id}")))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(id.to_string()));
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// A run row's Re-run entry -- [`Self::render_rerun_button`]'s rule on
+    /// the picker: disabled, with the reason in its tooltip, for a run with
+    /// no cart path, so a refusal is visible before the click rather than
+    /// after it.
+    fn render_row_rerun(
+        &self,
+        ix: usize,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let rel = label.filter(|l| !l.is_empty());
+        let tooltip = match &rel {
+            Some(rel) => format!("Re-run {rel} in the emulator"),
+            None => NO_RERUN_PATH.to_string(),
+        };
+        div()
+            .debug_selector(move || run_rerun_selector(ix))
+            .child(
+                IconButton::new(("ggo-charts-run-rerun", ix), IconName::RotateCcw)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(rel.is_none())
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(Self::guarded_listener(
+                        cx,
+                        move |this, _event, window, cx| {
+                            this.rerun_cart(rel.clone(), window, cx);
+                        },
+                    )),
+            )
             .into_any_element()
     }
 
@@ -1260,14 +1553,16 @@ impl ChartsPanel {
                         .id(("ggo-charts-run", ix))
                         .debug_selector(move || run_row_selector(ix))
                         .w_full()
-                        .justify_between()
                         .gap_2()
                         .px_2()
                         .py_1()
                         .hover(|s| s.bg(cx.theme().colors().element_hover))
                         .cursor_pointer()
                         .child(Label::new(run.display_title()))
+                        .child(div().flex_1())
                         .child(Label::new(run.started_at.clone()).color(Color::Muted))
+                        .child(Self::render_row_copy_id(ix, run.id))
+                        .child(self.render_row_rerun(ix, run.label.clone(), cx))
                         .on_click(Self::guarded_listener(
                             cx,
                             move |this, _event, _window, cx| {
@@ -1280,8 +1575,28 @@ impl ChartsPanel {
         v_flex()
             .w_full()
             .gap_1()
-            .child(Label::new("Perf runs").size(LabelSize::Small))
-            .child(body)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new("Perf runs").size(LabelSize::Small))
+                    .child(Self::visibility_toggle(
+                        RUNS_VISIBLE_SELECTOR.into(),
+                        self.runs_visible,
+                        |this, cx| {
+                            this.runs_visible = !this.runs_visible;
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            )
+            // A row's Re-run refusal has to land somewhere the picker
+            // paints, or the entry is a silent no-op from here: the
+            // detail header (where `rerun_selected`'s note shows) is
+            // exactly the view a picker-row click did NOT open.
+            .children(self.rerun_note.map(Self::note))
+            .children(self.runs_visible.then_some(body))
             .into_any_element()
     }
 
@@ -1345,8 +1660,23 @@ impl ChartsPanel {
             .w_full()
             .gap_1()
             .debug_selector(|| HISTORY_RAIL_SELECTOR.to_string())
-            .child(Label::new("Device runs").size(LabelSize::Small))
-            .children(body)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new("Device runs").size(LabelSize::Small))
+                    .child(Self::visibility_toggle(
+                        HISTORY_VISIBLE_SELECTOR.into(),
+                        self.history_visible,
+                        |this, cx| {
+                            this.history_visible = !this.history_visible;
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            )
+            .children(self.history_visible.then_some(body).into_iter().flatten())
             .into_any_element()
     }
 
@@ -1367,7 +1697,7 @@ impl ChartsPanel {
                 .size_full()
                 .overflow_y_scroll()
                 .p_2()
-                .child(Self::render_log(LogKind::DeviceLog, lines, cx))
+                .child(self.render_log(LogKind::DeviceLog, lines, cx))
                 .into_any_element(),
         };
 
@@ -1580,12 +1910,7 @@ impl ChartsPanel {
             // The one log surface that opens somewhere other than its
             // top: the marked line is the reason the dump exists, and it
             // sits at the tail of the window.
-            .child(Self::render_log_scrolled(
-                LogKind::Fault,
-                text,
-                Some(&self.fault_scroll),
-                cx,
-            ))
+            .child(self.render_log_scrolled(LogKind::Fault, text, Some(&self.fault_scroll), cx))
             // Under the decoded text, and only on request: the bytes are
             // the fallback for a decode that lost something, not the
             // reading order. Formatted by `toggle_fault_raw` on the first
@@ -1594,7 +1919,7 @@ impl ChartsPanel {
                 self.fault_raw_expanded
                     .then(|| self.fault_hex.as_ref())
                     .flatten()
-                    .map(|hex| Self::render_log(LogKind::FaultRaw, hex, cx)),
+                    .map(|hex| self.render_log(LogKind::FaultRaw, hex, cx)),
             )
             .into_any_element()
     }
@@ -1776,7 +2101,7 @@ impl ChartsPanel {
                     .children(hero.map(|spec| self.render_chart(HERO_IX, spec, cx)))
                     .child(self.render_failures_table(&report.diagnostics, cx))
                     .child(self.render_panics_table(&report.diagnostics, cx))
-                    .child(Self::render_log(LogKind::Console, &detail.console, cx))
+                    .child(self.render_log(LogKind::Console, &detail.console, cx))
                     .children(if charts.is_empty() {
                         // An explicit message, never a blank canvas -- and
                         // which message matters. A run that recorded no
@@ -1997,8 +2322,13 @@ impl ChartsPanel {
     /// parameterising all four differences -- more coupling than the
     /// ~20 lines it would save, between two crates that already share the
     /// `uart` TABLE, which is the part that actually has to agree.
-    fn render_log(kind: LogKind, lines: &Arc<Vec<String>>, cx: &mut Context<Self>) -> AnyElement {
-        Self::render_log_scrolled(kind, lines, None, cx)
+    fn render_log(
+        &self,
+        kind: LogKind,
+        lines: &Arc<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_log_scrolled(kind, lines, None, cx)
     }
 
     /// [`Self::render_log`] with the list's scroll position owned by the
@@ -2006,17 +2336,42 @@ impl ChartsPanel {
     /// -- every other log here is read from the top, and handing them a
     /// handle nobody drives would just be state to keep in step.
     fn render_log_scrolled(
+        &self,
         kind: LogKind,
         lines: &Arc<Vec<String>>,
         scroll: Option<&UniformListScrollHandle>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selector = kind.selector();
+        let visible = !self.hidden_logs.contains(&kind);
         let section = v_flex()
             .w_full()
             .gap_1()
             .debug_selector(move || selector.to_string())
-            .child(Label::new(kind.title()).size(LabelSize::Small));
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new(kind.title()).size(LabelSize::Small))
+                    .child(Self::visibility_toggle(
+                        log_visible_selector(kind).into(),
+                        visible,
+                        move |this, cx| {
+                            if !this.hidden_logs.remove(&kind) {
+                                this.hidden_logs.insert(kind);
+                            }
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            );
+        // A folded log is its header row and nothing else -- not even its
+        // empty state, which is a statement about a body nobody asked to
+        // see.
+        if !visible {
+            return section.into_any_element();
+        }
         if lines.is_empty() {
             return section
                 .child(Self::note(kind.empty_state()))
@@ -2026,37 +2381,224 @@ impl ChartsPanel {
         // `'static` and has to own what it reads, and this is the whole
         // run's log.
         let lines = lines.clone();
+        let bounds_cell = self.log_bounds.clone();
         section
             .child(
-                uniform_list(selector, lines.len(), move |range, _window, cx| {
-                    range
-                        .map(|ix| {
-                            div()
-                                .debug_selector(move || log_row_selector(kind, ix))
-                                .child(
-                                    Label::new(lines[ix].clone())
-                                        .size(LabelSize::XSmall)
-                                        .buffer_font(cx),
-                                )
+                div()
+                    .relative()
+                    .w_full()
+                    .debug_selector(move || log_list_selector(kind))
+                    .child(self.measuring_canvas(cx, move |bounds| {
+                        let mut cells = bounds_cell.borrow_mut();
+                        cells.insert(kind, bounds) != Some(bounds)
+                    }))
+                    .child(
+                        uniform_list(selector, lines.len(), move |range, _window, cx| {
+                            range
+                                .map(|ix| {
+                                    div()
+                                        .debug_selector(move || log_row_selector(kind, ix))
+                                        .child(
+                                            Label::new(lines[ix].clone())
+                                                .size(LabelSize::XSmall)
+                                                .buffer_font(cx),
+                                        )
+                                })
+                                .collect::<Vec<_>>()
                         })
-                        .collect::<Vec<_>>()
-                })
-                .when_some(scroll, |list, handle| list.track_scroll(handle))
-                // A log line is fixed-width text in the buffer font -- a
-                // hex dump row is ~75 columns, several times a dock's
-                // width. Fitted to the list (the default) those rows wrap
-                // instead, and a wrapped row is CLIPPED: `uniform_list`
-                // gives every row the one item height it measured
-                // unwrapped, so the second line is painted over the row
-                // below it. Unconstrained lays each row out at its full
-                // width and scrolls the list sideways to reach it.
-                .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::Unconstrained)
-                .h(LOG_HEIGHT)
-                .w_full()
-                .rounded_sm()
-                .bg(cx.theme().colors().editor_background),
+                        .when_some(scroll, |list, handle| list.track_scroll(handle))
+                        // A log line is fixed-width text in the buffer
+                        // font -- a hex dump row is ~75 columns, several
+                        // times a dock's width. Fitted to the list (the
+                        // default) those rows wrap instead, and a wrapped
+                        // row is CLIPPED: `uniform_list` gives every row
+                        // the one item height it measured unwrapped, so
+                        // the second line is painted over the row below
+                        // it. Unconstrained lays each row out at its full
+                        // width and scrolls the list sideways to reach it.
+                        .with_horizontal_sizing_behavior(
+                            gpui::ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .h(self.rendered_log_height(kind))
+                        .w_full()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().editor_background),
+                    )
+                    // Inside the region, against its own bottom edge --
+                    // see the picker handle for why this is not a
+                    // `deferred` draw.
+                    .child(
+                        Self::divider_handle(Divider::Log(kind), cx)
+                            .absolute()
+                            .left_0()
+                            .bottom_0()
+                            .w_full()
+                            .h(DIVIDER_SIZE)
+                            .cursor_row_resize(),
+                    ),
             )
             .into_any_element()
+    }
+
+    /// Apply one step of a divider drag. Drops out before `notify` when
+    /// the clamped size is the one already in force -- a drag emits a
+    /// move event per mouse position, most of which land in the same
+    /// pixel once a clamp is biting.
+    fn drag_divider(
+        &mut self,
+        divider: Divider,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(body) = *self.body_bounds.borrow() else {
+            return;
+        };
+        let list = match divider {
+            Divider::Log(kind) => self.log_bounds.borrow().get(&kind).copied(),
+            Divider::PickerDetail => None,
+        };
+        let Some(size) = divider_size(divider, position, body, list) else {
+            return;
+        };
+        let changed = match divider {
+            Divider::Log(kind) => self.log_heights.insert(kind, size) != Some(size),
+            Divider::PickerDetail => self.picker_width.replace(size) != Some(size),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Log `kind`'s scroll-region height AS RENDERED: the dragged height
+    /// (or [`LOG_HEIGHT`]) re-clamped against the body's current height,
+    /// for the same reason `ggo_sprite_panel::rendered_clips_height`
+    /// re-clamps -- a pane shortened after the drag must still leave the
+    /// rest of the detail its floor.
+    fn rendered_log_height(&self, kind: LogKind) -> Pixels {
+        let height = self.log_heights.get(&kind).copied().unwrap_or(LOG_HEIGHT);
+        let Some(body) = *self.body_bounds.borrow() else {
+            return height;
+        };
+        height.min((body.size.height - BODY_MIN_HEIGHT).max(MIN_LOG_HEIGHT))
+    }
+
+    /// The picker column's width AS RENDERED, or `None` when the body has
+    /// no room for both floors and the detail keeps the whole pane. The
+    /// split needs a measured body, so the first frame of a selection
+    /// never has one -- see the body canvas in [`Self::render_body`],
+    /// which is what asks for the second.
+    fn rendered_picker_width(&self) -> Option<Pixels> {
+        let body = (*self.body_bounds.borrow())?;
+        if body.size.width < MIN_PICKER_WIDTH + MIN_DETAIL_WIDTH {
+            return None;
+        }
+        let max = (body.size.width - MIN_DETAIL_WIDTH).max(MIN_PICKER_WIDTH);
+        Some(
+            self.picker_width
+                .unwrap_or(PICKER_DEFAULT_WIDTH)
+                .clamp(MIN_PICKER_WIDTH, max),
+        )
+    }
+
+    /// `ggo_sprite_panel::divider_handle`'s shape: an occluding strip that
+    /// starts a [`DraggedDivider`] drag, which the body row's
+    /// `on_drag_move` turns into a size. Callers wrap it in `deferred`
+    /// for the same reason the dock does -- the strip straddles a border,
+    /// and whatever paints on the far side would otherwise swallow half
+    /// the grab area.
+    fn divider_handle(divider: Divider, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let name: SharedString = match divider {
+            Divider::Log(kind) => log_divider_selector(kind).into(),
+            Divider::PickerDetail => PICKER_DIVIDER_SELECTOR.into(),
+        };
+        let selector = name.clone();
+        div()
+            .id(name)
+            .debug_selector(move || selector.to_string())
+            .on_drag(
+                DraggedDivider(divider, cx.entity_id()),
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *dragged)
+                },
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                Self::guarded_listener(cx, |_, _: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                }),
+            )
+            .occlude()
+    }
+
+    /// A canvas that records `bounds_cell` and asks for one more frame
+    /// when the box moved.
+    ///
+    /// The re-render is the whole point and it cannot be a plain
+    /// `cx.notify()`: a notify raised inside a PREPAINT closure is
+    /// dropped (the frame being prepainted is already the answer to the
+    /// last one), so the first measurement would never reach a render
+    /// that could use it -- and every size here is decided from a
+    /// measured box. `cx.defer` lands it after the frame instead.
+    /// Guarded on a real change, or the deferred notify would ask for a
+    /// frame that asks for another.
+    fn measuring_canvas(
+        &self,
+        cx: &Context<Self>,
+        record: impl Fn(Bounds<Pixels>) -> bool + 'static,
+    ) -> impl IntoElement {
+        let this = cx.weak_entity();
+        gpui::canvas(
+            move |bounds, _window, cx| {
+                if record(bounds) {
+                    cx.defer(move |cx| {
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// `SpritePanel::visibility_toggle`'s eye, verbatim in behaviour:
+    /// Eye/EyeOff over a wrapper whose `debug_selector` carries the state,
+    /// and a folded section keeps its header row so it can be unfolded.
+    /// Copied rather than shared because the two crates share no UI
+    /// module and this is fifteen lines; what must not drift is the
+    /// SELECTOR shape, which the `-visible-on`/`-off` suffix pins.
+    ///
+    /// Takes the toggle as a boxed closure rather than sprite_panel's `fn`
+    /// pointer: the charts here are folded BY INDEX, and an index cannot
+    /// ride on a function pointer.
+    fn visibility_toggle(
+        id: SharedString,
+        visible: bool,
+        toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let selector = id.clone();
+        div()
+            .debug_selector(move || format!("{selector}-{}", if visible { "on" } else { "off" }))
+            .child(
+                IconButton::new(
+                    id,
+                    if visible {
+                        IconName::Eye
+                    } else {
+                        IconName::EyeOff
+                    },
+                )
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text("Show/hide"))
+                .on_click(Self::guarded_listener(
+                    cx,
+                    move |this, _event: &gpui::ClickEvent, _window, cx| toggle(this, cx),
+                )),
+            )
     }
 
     /// A muted caption -- an empty state, a reason, a hint.
@@ -2502,6 +3044,7 @@ impl ChartsPanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let title = SharedString::from(spec.title.clone());
+        let visible = !self.hidden_charts.contains(&ix);
         let selectable = spec.selectable;
         // Drag-zoom is a LINE chart affordance, exactly as in ggo-ide:
         // `line.rs` owns `zoom_domain` and `stacked.rs`/`histogram.rs`
@@ -2574,10 +3117,28 @@ impl ChartsPanel {
         v_flex()
             .w_full()
             .gap_1()
-            .child(Label::new(title).size(LabelSize::Small))
             .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new(title).size(LabelSize::Small))
+                    .child(Self::visibility_toggle(
+                        chart_visible_selector(ix).into(),
+                        visible,
+                        move |this, cx| {
+                            if !this.hidden_charts.remove(&ix) {
+                                this.hidden_charts.insert(ix);
+                            }
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            )
+            .children(visible.then(|| {
                 div()
                     .id(("ggo-chart", ix))
+                    .debug_selector(move || chart_body_selector(ix))
                     .w_full()
                     .h(CHART_HEIGHT)
                     .rounded_sm()
@@ -2646,9 +3207,9 @@ impl ChartsPanel {
                                 this.clear_hover(ix, cx);
                             }
                         },
-                    )),
-            )
-            .children(inspect_pane)
+                    ))
+            }))
+            .children(inspect_pane.filter(|_| visible))
             .into_any_element()
     }
 
@@ -3032,6 +3593,59 @@ mod tests {
     #[gpui::test]
     fn init_registers_without_panic(cx: &mut gpui::App) {
         init(cx);
+    }
+
+    /// The divider clamps, without a window. Both floors bite from
+    /// either side, and the MAX floor is the neighbour's -- a drag past
+    /// it stops rather than collapsing what is on the other side.
+    #[test]
+    fn divider_sizes_are_clamped_against_both_neighbours() {
+        let body = Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: gpui::size(px(1000.), px(800.)),
+        };
+        let list = Bounds {
+            origin: gpui::point(px(0.), px(100.)),
+            size: gpui::size(px(400.), px(220.)),
+        };
+
+        let at = |y: f32| gpui::point(px(0.), px(y));
+        assert_eq!(
+            divider_size(Divider::Log(LogKind::Console), at(400.), body, Some(list)),
+            Some(px(300.)),
+            "a log's height is measured down from its own top edge"
+        );
+        assert_eq!(
+            divider_size(Divider::Log(LogKind::Console), at(100.), body, Some(list)),
+            Some(MIN_LOG_HEIGHT),
+            "and never below the log's floor"
+        );
+        assert_eq!(
+            divider_size(Divider::Log(LogKind::Console), at(5000.), body, Some(list)),
+            Some(px(800.) - BODY_MIN_HEIGHT),
+            "nor past the floor under the rest of the detail"
+        );
+        assert_eq!(
+            divider_size(Divider::Log(LogKind::Console), at(400.), body, None),
+            None,
+            "a region that has not been painted has no edge to measure from"
+        );
+
+        let at = |x: f32| gpui::point(px(x), px(0.));
+        assert_eq!(
+            divider_size(Divider::PickerDetail, at(300.), body, None),
+            Some(px(300.)),
+            "the picker's width is measured from the body's left edge"
+        );
+        assert_eq!(
+            divider_size(Divider::PickerDetail, at(10.), body, None),
+            Some(MIN_PICKER_WIDTH)
+        );
+        assert_eq!(
+            divider_size(Divider::PickerDetail, at(990.), body, None),
+            Some(px(1000.) - MIN_DETAIL_WIDTH),
+            "a drag right stops where the detail would go under its floor"
+        );
     }
 
     /// The agent's close: gone when there is a tab, `false` when there
@@ -5073,6 +5687,311 @@ mod tests {
         panel.update(cx, |panel, _cx| {
             assert_eq!(panel.rerun_note, Some(NO_CART_RUNNER));
         });
+    }
+
+    /// A panel inside a real workspace showing the PICKER, with the
+    /// seeded run listed and painted -- what a run row's own entries are
+    /// rendered from. The tab is aimed at the fixture database BEFORE it
+    /// is added, because `open_charts_item` refreshes on the way in and
+    /// an unaimed tab would read the developer's real one.
+    async fn picker_panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        ggo_db::TestDb,
+        gpui::Entity<ChartsPanel>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let db = ggo_db::TestDb::new();
+        seed_run_with_samples(db.url(), 4);
+
+        cx.update(|cx| {
+            AppState::test(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let item = cx.new(|cx| ChartsItem::new(workspace.weak_handle(), cx));
+            let panel = item.read(cx).panel().clone();
+            panel.update(cx, |panel, _| {
+                panel.set_connect(loader::test_connect(db.url()))
+            });
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            panel
+        });
+        panel.update(cx, |panel, cx| panel.refresh_runs(cx));
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        (db, panel, cx)
+    }
+
+    /// **P5 on the picker.** A run row carried nothing but a click that
+    /// opened it. It now carries the two entries the detail view has for
+    /// a run -- Re-run and Copy id -- and the Re-run one goes through the
+    /// SAME `rerun_cart` the header's button does, so the row and the
+    /// detail cannot drift into two ideas of what re-running a run means.
+    #[gpui::test]
+    async fn test_a_run_rows_own_entries_rerun_and_copy_that_run(cx: &mut TestAppContext) {
+        let (_db, panel, cx) = picker_panel(cx).await;
+        cx.update(|_window, cx| ggo_common::register_cart_runner(cx, recording_cart_runner));
+
+        assert_eq!(run_rerun_selector(0), "ggo-charts-run-rerun-0");
+        assert_eq!(run_copy_selector(0), "ggo-charts-run-copy-0");
+        let rerun = cx
+            .debug_bounds("ggo-charts-run-rerun-0")
+            .expect("a run row paints its own Re-run button");
+        assert!(
+            cx.debug_bounds("ggo-charts-run-copy-0").is_some(),
+            "and its own Copy-id button"
+        );
+
+        cx.simulate_click(rerun.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_window, cx| cx.default_global::<Reran>().0.clone()),
+            vec!["arena".to_string()],
+            "the row's Re-run hands the runner the same cart path the detail button does"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.selected_run_id().is_none(),
+                "and the row's button must not also open the run it acted on"
+            );
+        });
+    }
+
+    /// **P6 on a log.** Every other folding section in the fork is an eye
+    /// over a title that stays put, and a log is the section most in need
+    /// of one: it is the tallest fixed block on a run detail and the one a
+    /// reader most often wants out of the way to reach the charts under
+    /// it. Hidden is the header row and nothing else.
+    #[gpui::test]
+    async fn test_a_logs_eye_folds_its_body(cx: &mut TestAppContext) {
+        let (_db, _panel, cx) = detail_window(
+            cx,
+            &["one line of uart"],
+            gpui::size(DEFAULT_WIDTH, px(3000.)),
+        )
+        .await;
+        assert_eq!(
+            log_visible_selector(LogKind::Console),
+            "ggo-charts-console-visible"
+        );
+        assert!(
+            cx.debug_bounds("ggo-charts-console-row-0").is_some(),
+            "the console's lines are painted to begin with"
+        );
+        let eye = cx
+            .debug_bounds("ggo-charts-console-visible-on")
+            .expect("the console's title row carries an open eye");
+
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-charts-console-row-0").is_none(),
+            "the eye folds the log's body"
+        );
+        assert!(
+            cx.debug_bounds(LogKind::Console.selector()).is_some(),
+            "and leaves its title row behind, so it can be unfolded"
+        );
+        assert!(
+            cx.debug_bounds("ggo-charts-console-visible-off").is_some(),
+            "the eye reads as closed"
+        );
+    }
+
+    /// **P6 on the picker.** The two picker sections fold the same way,
+    /// so a reader who came for the device rail can put fifty perf runs
+    /// away rather than scrolling past them.
+    #[gpui::test]
+    async fn test_a_picker_sections_eye_folds_its_rows(cx: &mut TestAppContext) {
+        let (_db, _panel, cx) = picker_panel(cx).await;
+        assert!(
+            cx.debug_bounds("ggo-charts-run-0").is_some(),
+            "the seeded run is listed to begin with"
+        );
+        let eye = cx
+            .debug_bounds("ggo-charts-runs-visible-on")
+            .expect("the Perf runs title row carries an open eye");
+
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-charts-run-0").is_none(),
+            "the eye folds the section's rows"
+        );
+        assert!(
+            cx.debug_bounds("ggo-charts-runs-visible-off").is_some(),
+            "and the eye reads as closed"
+        );
+        assert!(
+            cx.debug_bounds(HISTORY_RAIL_SELECTOR).is_some(),
+            "folding one section leaves the other alone"
+        );
+    }
+
+    /// **P6 on a chart.** A fully-gated run draws up to thirteen 240px
+    /// canvases; folding the ones a reader is not comparing is what makes
+    /// the rest reachable without a scroll per chart.
+    #[gpui::test]
+    async fn test_a_charts_eye_folds_its_canvas(cx: &mut TestAppContext) {
+        let (_db, _panel, cx) = drawn_detail_window(cx).await;
+        assert_eq!(chart_body_selector(0), "ggo-charts-chart-body-0");
+        assert!(
+            cx.debug_bounds("ggo-charts-chart-body-0").is_some(),
+            "chart 0's canvas is painted to begin with"
+        );
+        let eye = cx
+            .debug_bounds("ggo-charts-chart-0-visible-on")
+            .expect("a chart's title row carries an open eye");
+
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-charts-chart-body-0").is_none(),
+            "the eye folds that chart's canvas"
+        );
+        assert!(
+            cx.debug_bounds("ggo-charts-chart-body-1").is_some(),
+            "and only that one -- the eye is per chart, like the zoom"
+        );
+        assert!(
+            cx.debug_bounds("ggo-charts-chart-0-visible-off").is_some(),
+            "the eye reads as closed"
+        );
+    }
+
+    /// The whole rendered gesture: the handle starts the drag and the
+    /// BODY row's `on_drag_move` (which fires window-wide, with no hitbox
+    /// test) turns it into a size.
+    fn drag_handle(
+        cx: &mut gpui::VisualTestContext,
+        from: gpui::Point<Pixels>,
+        to: gpui::Point<Pixels>,
+    ) {
+        cx.simulate_mouse_move(from, None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    /// **P7 on a log.** `LOG_HEIGHT` was a constant, so the tallest fixed
+    /// block on a run detail was also the one thing about it a reader
+    /// could not change. It is a per-log session height now, dragged from
+    /// a handle on the region's bottom edge, and a pane shortened
+    /// afterwards re-clamps it rather than leaving the rest of the detail
+    /// under its floor.
+    #[gpui::test]
+    async fn test_the_console_divider_resizes_the_log(cx: &mut TestAppContext) {
+        let (_db, panel, cx) = detail_window(
+            cx,
+            &["one line of uart"],
+            gpui::size(DEFAULT_WIDTH, px(3000.)),
+        )
+        .await;
+        assert_eq!(
+            log_list_selector(LogKind::Console),
+            "ggo-charts-console-list"
+        );
+
+        let before = cx
+            .debug_bounds("ggo-charts-console-list")
+            .expect("the console's scroll region records its bounds");
+        let handle = cx
+            .debug_bounds("ggo-charts-console-divider")
+            .expect("with a handle on its bottom edge");
+        assert!(
+            (handle.center().y - before.bottom()).abs() <= DIVIDER_SIZE,
+            "the handle must straddle the region's bottom edge: {handle:?} under {before:?}"
+        );
+
+        let target = gpui::point(before.center().x, before.bottom() + px(60.));
+        drag_handle(cx, handle.center(), target);
+
+        let after = cx
+            .debug_bounds("ggo-charts-console-list")
+            .expect("the console's scroll region after the drag");
+        assert!(
+            (after.size.height - before.size.height - px(60.)).abs() < px(2.),
+            "dragging the handle 60px down must make the log 60px taller: \
+             before {:?}, after {:?}",
+            before.size,
+            after.size
+        );
+        let dragged = panel.read_with(cx, |panel, _| panel.rendered_log_height(LogKind::Console));
+
+        // Shortened afterwards: the dragged height is a render-time
+        // figure, re-clamped against the pane it now has to fit in.
+        cx.simulate_resize(gpui::size(DEFAULT_WIDTH, px(300.)));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let clamped = panel.rendered_log_height(LogKind::Console);
+            assert!(
+                clamped < dragged,
+                "a short pane must re-clamp the dragged height: {clamped:?} from {dragged:?}"
+            );
+            assert!(clamped >= MIN_LOG_HEIGHT, "and never past the log's floor");
+        });
+    }
+
+    /// **P7 on the picker/detail split.** A pane with room for both keeps
+    /// the run list beside the run, with a handle between them; one
+    /// narrower than the two floors together folds the list away rather
+    /// than crushing the detail, which is the state the 360px dock tests
+    /// below still measure.
+    #[gpui::test]
+    async fn test_the_picker_divider_resizes_the_run_list(cx: &mut TestAppContext) {
+        let (_db, _panel, cx) =
+            detail_window(cx, &["one line"], gpui::size(px(1200.), px(1200.))).await;
+
+        let before = cx
+            .debug_bounds(PICKER_SELECTOR)
+            .expect("a wide pane keeps the picker beside the detail");
+        let handle = cx
+            .debug_bounds(PICKER_DIVIDER_SELECTOR)
+            .expect("with a handle on the boundary between them");
+        assert!(
+            (handle.center().x - before.right()).abs() <= DIVIDER_SIZE,
+            "the handle must straddle the column's right edge: {handle:?} beside {before:?}"
+        );
+
+        let target = gpui::point(before.right() + px(100.), before.center().y);
+        drag_handle(cx, handle.center(), target);
+
+        let after = cx
+            .debug_bounds(PICKER_SELECTOR)
+            .expect("the picker column after the drag");
+        assert!(
+            (after.size.width - before.size.width - px(100.)).abs() < px(2.),
+            "dragging the handle 100px right must make the column 100px wider: \
+             before {:?}, after {:?}",
+            before.size,
+            after.size
+        );
+
+        // Narrowed past both floors together, the split folds away: a
+        // 40px detail column is worse than no list.
+        cx.simulate_resize(gpui::size(DEFAULT_WIDTH, px(1200.)));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(PICKER_DIVIDER_SELECTOR).is_none(),
+            "a pane with no room for both keeps the detail whole"
+        );
+        assert!(
+            cx.debug_bounds(DETAIL_LIST_SELECTOR).is_some(),
+            "and the detail is still the thing on screen"
+        );
     }
 
     // --------------------------- click-to-inspect + the I$ profile table

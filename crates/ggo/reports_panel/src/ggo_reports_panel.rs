@@ -73,6 +73,19 @@ const HISTORY_EVERY_TICKS: u64 = 6;
 /// How a row's time is shown, whatever shape its producer recorded it in.
 const WHEN_FORMAT: &str = "%Y-%m-%d %H:%M";
 
+/// Why a row's three file entries are dead. A perf run and a device run
+/// are rows in the shared database -- there is no file to copy, reveal or
+/// unlink, and an enabled entry that reports that only after the click is
+/// a worse affordance than one that says so up front. **Names a STATE**:
+/// a fault row lands here too once `ggo-uartd` has rotated its dump away.
+const NO_REPORT_FILE: &str = "no file on disk for this report";
+
+/// Why Reveal is dead on a row that DOES have a file: it is not inside
+/// any folder this window has open, so the project panel has nowhere to
+/// put it. A state, not a cause -- the daemon's dump directory is outside
+/// the project on most machines and inside it on some.
+const NOT_IN_PROJECT: &str = "this file is not inside an open project folder";
+
 // Handles for the regions whose overflow behaviour the layout tests
 // assert. `LIST_SELECTOR` is the list's element id as well; the rest are
 // `debug_selector`s, which gpui records only in test builds (the closure
@@ -84,6 +97,21 @@ const LIST_SELECTOR: &str = "ggo-reports-list";
 /// list paints, and what a layout test measures against the panel.
 fn row_title_selector(ix: usize) -> String {
     format!("ggo-reports-row-title-{ix}")
+}
+
+/// The row's own entries, wrapped one selector each so a render test can
+/// aim a real click at the button rather than reaching past it to the
+/// handler ([`ggo_charts_panel`]'s `PROFILE_SORT_SELECTOR` pattern).
+fn row_copy_selector(ix: usize) -> String {
+    format!("ggo-reports-row-copy-{ix}")
+}
+
+fn row_reveal_selector(ix: usize) -> String {
+    format!("ggo-reports-row-reveal-{ix}")
+}
+
+fn row_delete_selector(ix: usize) -> String {
+    format!("ggo-reports-row-delete-{ix}")
 }
 
 pub fn init(cx: &mut App) {
@@ -170,6 +198,15 @@ pub struct ReportRow {
     /// The DEVICE run a fault probably happened during -- never a perf
     /// run id (see `faults::probable_run`).
     pub run_id: Option<String>,
+    /// The file this report was read out of, when it has one and it is
+    /// still there -- the dump `ggo-uartd` wrote. A perf run and a device
+    /// run are rows in the shared database and nothing else, so theirs is
+    /// always `None`, and the row's three file entries say so rather than
+    /// doing nothing.
+    ///
+    /// Never filled by [`merge_rows`], which is pure and has no daemon to
+    /// ask: [`ReportsPanel::load`] resolves it, once per load.
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// Unix seconds for either stamp shape the producers write: ISO-UTC
@@ -230,6 +267,7 @@ pub fn merge_rows(
             // second copy of it under the title says nothing.
             trailer: String::new(),
             run_id: run.run_id,
+            path: None,
         });
     }
     for run in device {
@@ -244,6 +282,7 @@ pub fn merge_rows(
             sort_key,
             trailer: format!("{} · {verdict}", run.state),
             run_id: None,
+            path: None,
         });
     }
     for run in perf {
@@ -257,6 +296,7 @@ pub fn merge_rows(
             sort_key,
             trailer: String::new(),
             run_id: None,
+            path: None,
         });
     }
     rows.sort_by(|a, b| {
@@ -315,6 +355,11 @@ pub struct ReportsPanel {
     loading: bool,
     /// Poll ticks since this activation, for [`reconcile_history_this_tick`].
     poll_tick: u64,
+    /// What the last row action had to say for itself -- a delete that
+    /// could not unlink. Rendered under the header, unlike [`Self::notes`],
+    /// which is the EMPTY state's: a failure the user just caused has to
+    /// be visible over a populated list.
+    action_note: Option<String>,
     /// How this panel reaches the daemon. Perf runs, device runs and
     /// faults all arrive over that socket; the panel opens no database of
     /// its own and never reads the dump directory itself.
@@ -339,6 +384,7 @@ impl ReportsPanel {
             generation: 0,
             loading: false,
             poll_tick: 0,
+            action_note: None,
             connect: ggo_daemon_client::system_connect(),
             _load_task: None,
             _poll_task: None,
@@ -426,13 +472,12 @@ impl ReportsPanel {
             // An unreachable database is an ERROR here, not an empty
             // list: a fault section that silently reads as "no dumps"
             // when the server is down hides the one signal the user has.
-            let faults = match connect()
-                .map_err(|error| format!("{error:#}"))
-                .and_then(|client| {
-                    client
-                        .faults(Some(HISTORY_LIMIT))
-                        .map_err(|error| format!("{error:#}"))
-                }) {
+            let client = connect().map_err(|error| format!("{error:#}"));
+            let faults = match client.as_ref().map_err(Clone::clone).and_then(|client| {
+                client
+                    .faults(Some(HISTORY_LIMIT))
+                    .map_err(|error| format!("{error:#}"))
+            }) {
                 Ok(list) => {
                     // An import that failed is not fatal -- the rows
                     // already stored still list -- but it is also not
@@ -449,13 +494,22 @@ impl ReportsPanel {
                     Vec::new()
                 }
             };
-            (
-                merge_rows(perf, device.clone(), faults),
-                device,
-                device_note,
-                notes,
-                failure,
-            )
+            let mut rows = merge_rows(perf, device.clone(), faults);
+            // The file behind each fault row, resolved once per load
+            // rather than once per render: deciding it is a `stat` over
+            // the socket, and all three of the row's file entries need
+            // the same answer. A dump the daemon has since rotated away
+            // (`KEEP_DUMPS`) leaves the row with no file, which is what
+            // its entries then say.
+            if let Ok(client) = &client {
+                for row in rows.iter_mut().filter(|row| row.kind == ReportKind::Fault) {
+                    row.path = client
+                        .fault_raw_path(&row.id)
+                        .ok()
+                        .filter(|path| path.is_file());
+                }
+            }
+            (rows, device, device_note, notes, failure)
         });
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let (rows, device, device_note, notes, failure) = load.await;
@@ -537,6 +591,98 @@ impl ReportsPanel {
         });
     }
 
+    /// The `ix`th VISIBLE row, which is what a row entry's `ix` means.
+    fn visible_row(&self, ix: usize) -> Option<&ReportRow> {
+        self.visible.get(ix).and_then(|ix| self.rows.get(*ix))
+    }
+
+    /// The project entry the `ix`th visible row's file IS, when this
+    /// window has a folder open that contains it. `None` is what makes
+    /// the Reveal entry `.disabled(..)` with [`NOT_IN_PROJECT`] on it
+    /// rather than a click that goes nowhere.
+    ///
+    /// Reading the workspace from the panel's own render is safe: the
+    /// entity being updated here is the panel, not the workspace.
+    fn row_project_entry(&self, row: &ReportRow, cx: &App) -> Option<project::ProjectEntryId> {
+        let path = row.path.as_ref()?;
+        let workspace = self.workspace.as_ref()?.upgrade()?;
+        let project = workspace.read(cx).project().read(cx);
+        let project_path = project.find_project_path(path, cx)?;
+        Some(project.entry_for_path(&project_path, cx)?.id)
+    }
+
+    /// Show the `ix`th visible row's file in the project panel. The panel
+    /// reveals and activates ITSELF off `project::Event::RevealInProjectPanel`,
+    /// so this emits and nothing more.
+    ///
+    /// Deferred: the reveal is the workspace's work, so it never runs
+    /// inside this panel's lease (the fork's hook rule), and the entry id
+    /// is resolved at RENDER time and handed in rather than looked up
+    /// from inside the deferred body, which may not read the workspace it
+    /// re-enters.
+    fn reveal_row(
+        &mut self,
+        entry: project::ProjectEntryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        cx.defer_in(window, move |_, _window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.project().update(cx, |_, cx| {
+                    cx.emit(project::Event::RevealInProjectPanel(entry))
+                });
+            });
+        });
+    }
+
+    /// Unlink the `ix`th visible row's file, once the user has confirmed
+    /// it by name. The row itself stays: the `fault` row lives in the
+    /// shared database, which this panel only reads -- the cascade line
+    /// says so rather than letting the reader assume a delete here means
+    /// the report is gone.
+    fn delete_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, path)) = self
+            .visible_row(ix)
+            .and_then(|row| Some((row.id.clone(), row.path.clone()?)))
+        else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| id.clone());
+        let confirmed = ggo_common::confirm_destructive_cascade(
+            &format!("Delete the dump file {name}?"),
+            &[
+                format!("report {id} stays listed -- only the file is removed"),
+                path.to_string_lossy().into_owned(),
+            ],
+            "Delete",
+            false,
+            window,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !confirmed.await {
+                return;
+            }
+            let removed = cx
+                .background_spawn(async move {
+                    std::fs::remove_file(&path).map_err(|error| format!("{name}: {error}"))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.action_note = removed.err();
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Reach a different daemon than the one the environment names.
     /// Test hook: production connects through
     /// [`ggo_daemon_client::system_connect`].
@@ -587,6 +733,73 @@ impl ReportsPanel {
             )
     }
 
+    /// A row's three file entries. Every one of them is `.disabled(..)`
+    /// with its reason in the tooltip when it has nothing to act on, so
+    /// the affordance is the same on a perf row (which never has a file)
+    /// as on a fault row whose dump has been rotated away -- and neither
+    /// is a click that silently does nothing.
+    fn render_row_actions(&self, ix: usize, row: &ReportRow, cx: &mut Context<Self>) -> AnyElement {
+        let text = row
+            .path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let copy_tooltip = match &text {
+            Some(text) => format!("Copy path\n{text}"),
+            None => NO_REPORT_FILE.to_string(),
+        };
+        let clipboard = text.clone();
+        let entry = self.row_project_entry(row, cx);
+        let reveal_tooltip = match (&text, entry) {
+            (Some(_), Some(_)) => "Reveal in project panel".to_string(),
+            (Some(_), None) => NOT_IN_PROJECT.to_string(),
+            (None, _) => NO_REPORT_FILE.to_string(),
+        };
+        let delete_tooltip = match &text {
+            Some(text) => format!("Delete {text}"),
+            None => NO_REPORT_FILE.to_string(),
+        };
+        h_flex()
+            .gap_0p5()
+            .child(
+                div().debug_selector(move || row_copy_selector(ix)).child(
+                    IconButton::new(("ggo-reports-row-copy", ix), IconName::Copy)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(clipboard.is_none())
+                        .tooltip(Tooltip::text(copy_tooltip))
+                        .on_click(move |_: &ClickEvent, _, cx| {
+                            if let Some(text) = clipboard.clone() {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                            }
+                        }),
+                ),
+            )
+            .child(
+                div().debug_selector(move || row_reveal_selector(ix)).child(
+                    IconButton::new(("ggo-reports-row-reveal", ix), IconName::FileTree)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(entry.is_none())
+                        .tooltip(Tooltip::text(reveal_tooltip))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            if let Some(entry) = entry {
+                                this.reveal_row(entry, window, cx);
+                            }
+                        })),
+                ),
+            )
+            .child(
+                div().debug_selector(move || row_delete_selector(ix)).child(
+                    IconButton::new(("ggo-reports-row-delete", ix), IconName::Trash)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(text.is_none())
+                        .tooltip(Tooltip::text(delete_tooltip))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.delete_row(ix, window, cx);
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
     fn render_row(&self, ix: usize, row: &ReportRow, cx: &mut Context<Self>) -> AnyElement {
         let trailer = row.trailer.clone();
         let run_id = row.run_id.clone();
@@ -630,7 +843,8 @@ impl ReportsPanel {
                                 Label::new(row.when.clone())
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
-                            ),
+                            )
+                            .child(self.render_row_actions(ix, row, cx)),
                     )
                     .when(!trailer.is_empty(), |this| {
                         this.child(
@@ -699,6 +913,13 @@ impl Render for ReportsPanel {
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .child(self.render_header(cx))
+            .children(self.action_note.clone().map(|note| {
+                div().px_2().py_1().child(
+                    ggo_common::CopyableText::new("ggo-reports-action-note", note)
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+            }))
             .children(self.render_note())
             .child(
                 // Not a `uniform_list`: these rows are one to three lines
@@ -1329,5 +1550,171 @@ mod tests {
             "a 150px-wide header must wrap onto at least two rows: \
              one row is {wide:?}, narrow is {narrow:?}"
         );
+    }
+
+    // ---------------------------------------------- per-row actions (P5)
+
+    /// The dump `dump_panel_in_window` leaves on disk.
+    const DUMP_FIXTURE_ID: &str = "2026-09-02_08-49-33_marker";
+
+    /// A panel as the window ROOT, listing the one dump written under its
+    /// fixture faults directory -- the only report kind that HAS a file,
+    /// and so the only one whose three file entries are live.
+    async fn dump_panel_in_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        TestDb,
+        gpui::Entity<ReportsPanel>,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let db = TestDb::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let faults_dir = temp.path().join("faults");
+        write_dump(&faults_dir, DUMP_FIXTURE_ID);
+
+        let (panel, cx) = cx.add_window_view(|_, cx| ReportsPanel::new(None, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_connect(test_connect(db.url(), &faults_dir));
+            panel.refresh(cx);
+        });
+        cx.run_until_parked();
+        resize(cx, 600., 600.);
+        (temp, db, panel, cx)
+    }
+
+    /// **P5.** A report row was a click and nothing else. It carries the
+    /// three entries a file-backed row owes a reader now -- copy its
+    /// path, reveal it, delete it -- each wrapped in its own selector.
+    #[gpui::test]
+    async fn test_a_report_rows_own_entries_are_painted(cx: &mut TestAppContext) {
+        let (_temp, _db, panel, cx) = dump_panel_in_window(cx).await;
+        panel.read_with(cx, |panel, _| {
+            let rows = panel.all_rows();
+            assert_eq!(rows.len(), 1, "the imported dump is the list");
+            assert!(
+                rows[0].path.is_some(),
+                "a fault row carries the dump file it was read from"
+            );
+        });
+
+        assert_eq!(row_copy_selector(0), "ggo-reports-row-copy-0");
+        assert_eq!(row_reveal_selector(0), "ggo-reports-row-reveal-0");
+        assert_eq!(row_delete_selector(0), "ggo-reports-row-delete-0");
+        assert!(cx.debug_bounds("ggo-reports-row-copy-0").is_some());
+        assert!(cx.debug_bounds("ggo-reports-row-reveal-0").is_some());
+        assert!(cx.debug_bounds("ggo-reports-row-delete-0").is_some());
+    }
+
+    /// **P4 through P5's Delete.** Unlinking what a daemon wrote always
+    /// confirms, the prompt names the file by name, and a cancelled
+    /// confirm leaves it exactly where it was.
+    #[gpui::test]
+    async fn test_deleting_a_report_confirms_before_unlinking_the_dump(cx: &mut TestAppContext) {
+        let (temp, _db, _panel, cx) = dump_panel_in_window(cx).await;
+        let dump = temp
+            .path()
+            .join("faults")
+            .join(format!("{DUMP_FIXTURE_ID}.log"));
+        assert!(dump.is_file(), "the fixture dump is on disk to begin with");
+
+        let delete = cx
+            .debug_bounds("ggo-reports-row-delete-0")
+            .expect("the row paints a Delete entry");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let (message, detail) = cx
+            .pending_prompt()
+            .expect("a delete must always confirm, never act on the click");
+        assert!(
+            message.contains(&format!("{DUMP_FIXTURE_ID}.log")),
+            "the prompt names the file it is about to unlink: {message}"
+        );
+        assert!(
+            detail.contains(DUMP_FIXTURE_ID),
+            "and what survives it: {detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(dump.is_file(), "a cancelled delete keeps the file");
+
+        let delete = cx
+            .debug_bounds("ggo-reports-row-delete-0")
+            .expect("the row still paints its Delete entry");
+        cx.simulate_click(delete.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "the second delete confirms too");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(!dump.exists(), "a confirmed delete unlinks the dump");
+    }
+
+    /// **Reveal's enablement, which is the whole of that entry's
+    /// honesty.** A dump under a folder this window has open resolves to
+    /// a project entry, so the button is live; a file outside every open
+    /// folder, and a row with no file at all, resolve to none -- and the
+    /// entry is then `.disabled(..)` with the reason on it rather than a
+    /// click that goes nowhere.
+    #[gpui::test]
+    async fn test_reveal_is_live_only_for_a_file_inside_an_open_folder(cx: &mut TestAppContext) {
+        // A real worktree scan blocks on real IO.
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let db = TestDb::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_dump(&temp.path().join("faults"), DUMP_FIXTURE_ID);
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+
+        // A REAL fs, because the question is whether a path on disk is
+        // inside a worktree -- which a fake one cannot answer about the
+        // directory the daemon actually wrote to.
+        let project = Project::test(
+            std::sync::Arc::new(project::RealFs::new(None, cx.executor())),
+            [temp.path()],
+            cx,
+        )
+        .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel =
+            cx.update(|_, cx| cx.new(|cx| ReportsPanel::new(Some(workspace.downgrade()), cx)));
+        panel.update(cx, |panel, cx| {
+            panel.set_connect(test_connect(db.url(), &temp.path().join("faults")));
+            panel.refresh(cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let row = panel
+                .all_rows()
+                .first()
+                .cloned()
+                .expect("the imported dump is listed");
+            assert!(
+                panel.row_project_entry(&row, cx).is_some(),
+                "a dump under an open folder is a project entry: {:?}",
+                row.path
+            );
+
+            let mut outside = row.clone();
+            outside.path = Some(elsewhere.path().join("stray.log"));
+            assert!(
+                panel.row_project_entry(&outside, cx).is_none(),
+                "a file outside every open folder is not"
+            );
+
+            let mut fileless = row;
+            fileless.path = None;
+            assert!(
+                panel.row_project_entry(&fileless, cx).is_none(),
+                "and neither is a row with no file at all"
+            );
+        });
     }
 }
