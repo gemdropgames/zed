@@ -11929,3 +11929,49 @@ async fn test_ggo_inline_edit_does_not_leak_into_a_plain_new_file(cx: &mut TestA
         "the plain flow creates the file as before"
     );
 }
+
+/// A seeded inline edit opens on the given text with all of it selected,
+/// so the first keystroke replaces it and Enter alone keeps it -- the
+/// rename entries' "start from the current stem" affordance.
+#[gpui::test]
+async fn test_ggo_inline_edit_opens_on_the_seed_selected(cx: &mut TestAppContext) {
+    let (panel, dir, _fs, mut cx) = ggo_inline_workspace(cx).await;
+    let cx = &mut cx;
+    let committed = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+    let seeded = panel.update_in(cx, |panel, window, cx| {
+        panel.ggo_new_entry_inline_seeded(
+            &dir,
+            Some("arena"),
+            |_| None,
+            {
+                let committed = committed.clone();
+                move |name, _, _| *committed.borrow_mut() = Some(name)
+            },
+            window,
+            cx,
+        )
+    });
+    assert!(seeded, "an existing directory must seed the editor");
+    cx.run_until_parked();
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.filename_editor.update(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "arena", "the editor opens on the seed");
+            let selections = editor
+                .selections
+                .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+            assert_eq!(selections.len(), 1);
+            assert_eq!(selections[0].start, MultiBufferOffset(0));
+            assert_eq!(
+                selections[0].end,
+                MultiBufferOffset("arena".len()),
+                "the whole seed is selected, so typing replaces it"
+            );
+        });
+        // Enter with nothing typed keeps the seed.
+        assert!(panel.confirm_edit(true, window, cx).is_none());
+    });
+    cx.run_until_parked();
+    assert_eq!(committed.borrow().as_deref(), Some("arena"));
+}

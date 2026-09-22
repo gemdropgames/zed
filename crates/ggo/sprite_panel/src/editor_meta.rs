@@ -1,7 +1,8 @@
 //! Per-sprite editor-settings sidecar: things the user tunes in the panel
 //! that the `.spr`/`.til`/`.pal` trio has no field for (tile-picker wrap
-//! width, frame names). Written by the panel after each successful save,
-//! read once at open; a missing or corrupt file is simply the defaults.
+//! width, frame names, the section layout). Written by the panel after
+//! each successful save and whenever the layout changes, read once at
+//! open; a missing or corrupt file is simply the defaults.
 //! Lives at `<project>/.ggo-ide/<rel>.editor.json` -- the same hidden dir
 //! ggo-ide's legacy `.meta.json` sidecars use, so editor droppings stay
 //! out of the asset tree.
@@ -22,6 +23,31 @@ pub struct EditorMeta {
     /// May be shorter than the frame list (missing tail = unnamed).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame_names: Vec<String>,
+    /// The four dragged section sizes, in px; `None` = the panel's own
+    /// default for that section (an auto width, an even split, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_height: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clips_height: Option<f32>,
+    /// The four section eyes; `None` = shown ([`visible`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_visible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiles_visible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames_visible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clips_visible: Option<bool>,
+}
+
+/// Whether a stored section eye means "shown". An absent flag is shown:
+/// a sidecar written before these keys existed must not hide anything.
+pub fn visible(flag: Option<bool>) -> bool {
+    flag.unwrap_or(true)
 }
 
 /// `<rel>.editor.json` under the hidden `.ggo-ide/` dir, preserving the
@@ -78,9 +104,45 @@ mod tests {
         let meta = EditorMeta {
             picker_cols: Some(6),
             frame_names: vec!["idle".to_string(), String::new(), "run".to_string()],
+            ..EditorMeta::default()
         };
         save(dir.path(), "sprites/hero.spr", &meta).unwrap();
         assert_eq!(load(dir.path(), "sprites/hero.spr"), meta);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = EditorMeta {
+            side_width: Some(240.5),
+            frames_width: Some(180.0),
+            reference_height: Some(96.0),
+            clips_height: Some(140.0),
+            reference_visible: Some(false),
+            tiles_visible: Some(true),
+            frames_visible: Some(false),
+            clips_visible: Some(true),
+            ..EditorMeta::default()
+        };
+        save(dir.path(), "sprites/hero.spr", &meta).unwrap();
+        assert_eq!(load(dir.path(), "sprites/hero.spr"), meta);
+    }
+
+    /// An unset flag is "show it" -- a sidecar written before the layout
+    /// keys existed must not hide anything.
+    #[test]
+    fn an_unset_visibility_flag_is_visible() {
+        let meta = EditorMeta::default();
+        for flag in [
+            meta.reference_visible,
+            meta.tiles_visible,
+            meta.frames_visible,
+            meta.clips_visible,
+        ] {
+            assert!(visible(flag));
+        }
+        assert!(!visible(Some(false)));
+        assert!(visible(Some(true)));
     }
 
     #[test]

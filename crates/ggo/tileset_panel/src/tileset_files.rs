@@ -357,8 +357,9 @@ fn stem_of(rel: &str) -> &str {
 }
 
 /// The "Rename Tileset…" entry's handler: seed the project panel's inline
-/// name editor (New File's UX) in the tileset's own directory; the commit
-/// moves the pair and rebinds every document that named it. Split out
+/// name editor (New File's UX) in the tileset's own directory, on the
+/// tileset's current stem and fully selected; the commit moves the pair
+/// and rebinds every document that named it. Split out
 /// from [`contribute_tileset_menu`] so a test can invoke exactly what the
 /// menu invokes -- `ContextMenuEntry` keeps its handler private.
 fn rename_tileset_handler(
@@ -378,8 +379,10 @@ fn rename_tileset_handler(
                 else {
                     return;
                 };
-                panel.ggo_new_entry_inline(
+                let stem = stem_of(&rel).to_string();
+                panel.ggo_new_entry_inline_seeded(
                     &dir,
+                    Some(&stem),
                     rename_validate(worktree_root.clone(), rel.clone()),
                     rename_commit(workspace, worktree_root, rel),
                     window,
@@ -949,13 +952,11 @@ mod tests {
             "an unclaimed file must reach upstream's own prompt: {message}"
         );
     }
-    /// Fire the real "Rename Tileset…" handler, type `name` into the
-    /// project panel's inline editor, and press Enter -- the whole commit
-    /// path a user walks, `ggo_sprite_panel`'s `rename_inline` shape.
-    fn rename_inline(
+    /// Fire the real "Rename Tileset…" handler and leave the project
+    /// panel's inline editor open, as the menu entry does.
+    fn open_rename_inline(
         workspace: &Entity<Workspace>,
         rel: &str,
-        name: &str,
         cx: &mut gpui::VisualTestContext,
     ) {
         let (worktree_id, worktree_root) = workspace.read_with(cx, |workspace, cx| {
@@ -976,6 +977,16 @@ mod tests {
         );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
+    }
+
+    /// [`open_rename_inline`] then type `name` and press Enter.
+    fn rename_inline(
+        workspace: &Entity<Workspace>,
+        rel: &str,
+        name: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        open_rename_inline(workspace, rel, cx);
         let project_panel = workspace.read_with(cx, |workspace, cx| {
             workspace
                 .panel::<ProjectPanel>(cx)
@@ -1015,6 +1026,40 @@ mod tests {
         assert_eq!(contributed("assets/tiles/world.pal", false, cx), 0);
         assert_eq!(contributed("notes.txt", false, cx), 0);
         assert_eq!(contributed("assets/tiles", true, cx), 0);
+    }
+
+    /// The rename field opens on the tileset's CURRENT stem, selected --
+    /// a rename starts from the name it has, and the selection means the
+    /// first keystroke still replaces it wholesale.
+    #[gpui::test]
+    async fn test_the_rename_field_opens_on_the_current_stem(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("a temp project");
+        let (_project, workspace, _worktree_id, cx) = file_ops_workspace(cx, dir.path()).await;
+
+        open_rename_inline(&workspace, "assets/tiles/world.til", cx);
+
+        let project_panel = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<ProjectPanel>(cx)
+                .expect("the project panel is docked")
+        });
+        project_panel.update(cx, |panel, cx| {
+            panel.ggo_test_filename_editor().update(cx, |editor, cx| {
+                assert_eq!(editor.text(cx), "world", "seeded with the current stem");
+                let selections = editor
+                    .selections
+                    .all::<editor::MultiBufferOffset>(&editor.display_snapshot(cx));
+                assert_eq!(selections.len(), 1);
+                assert_eq!(
+                    (selections[0].start, selections[0].end),
+                    (
+                        editor::MultiBufferOffset(0),
+                        editor::MultiBufferOffset("world".len())
+                    ),
+                    "the whole stem is selected, so typing replaces it"
+                );
+            });
+        });
     }
 
     /// **Rename, end to end.** Both halves of the pair move, and every

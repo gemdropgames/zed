@@ -24,6 +24,7 @@
 //! tab machinery; `loader` owns everything off the UI thread (the `.til`
 //! open, the grid compose) plus the pure grid geometry.
 
+mod editor_meta;
 mod loader;
 mod palette_widget;
 mod tileset_files;
@@ -606,16 +607,19 @@ pub struct TilesetPanel {
     /// The pending debounced sidecar write; replaced on every schedule, so
     /// only the trailing edge of a burst actually touches the disk.
     view_meta_write: Option<Task<()>>,
+    /// The same, for the editor-LAYOUT sidecar a divider drag writes.
+    editor_meta_write: Option<Task<()>>,
     /// What the last project-panel file op (rename/duplicate) did, shown
     /// in the tooling column.
     file_status: Option<FileStatus>,
     /// The tooling column's two sections, collapsed to their header rows
-    /// when hidden. Session-only: which sections a user wants open is a
-    /// view preference of THIS tab, not of the document.
+    /// when hidden. Persisted per tileset in the editor-layout sidecar
+    /// ([`Self::persist_layout`]), so a laid-out tileset reopens the way
+    /// it was left.
     info_visible: bool,
     palette_visible: bool,
     /// The tooling column's dragged width; `None` is [`TOOLS_COL_PX`].
-    /// Session-only for the same reason.
+    /// Persisted for the same reason.
     tools_width: Option<Pixels>,
     /// The body row's on-screen bounds, recorded at prepaint -- the frame
     /// a divider drag resolves in, and the width a stored `tools_width`
@@ -623,7 +627,7 @@ pub struct TilesetPanel {
     body_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
 }
 
-/// The one session-only divider this editor has: between the sheet and
+/// The one divider this editor has: between the sheet and
 /// the tooling column beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Divider {
@@ -732,6 +736,7 @@ impl TilesetPanel {
             load_generation: 0,
             _load_task: None,
             view_meta_write: None,
+            editor_meta_write: None,
             file_status: None,
             info_visible: true,
             palette_visible: true,
@@ -782,8 +787,55 @@ impl TilesetPanel {
         };
         let size = divider_size(position, body);
         if self.tools_width.replace(size) != Some(size) {
+            self.persist_layout(cx);
             cx.notify();
         }
+    }
+
+    /// Persist the tooling layout 300ms after the LAST call, for the same
+    /// reason [`Self::schedule_view_meta_write`] debounces: a divider drag
+    /// emits a change per pixel column, and the write is a synchronous
+    /// serialize-and-write on the UI thread.
+    fn persist_layout(&mut self, cx: &mut Context<Self>) {
+        self.editor_meta_write = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            this.update(cx, |this, _| {
+                this.editor_meta_write = None;
+                this.write_editor_meta();
+            })
+            .ok();
+        }));
+    }
+
+    /// Write the editor-layout sidecar for the open tileset. Failures are
+    /// logged, not surfaced -- losing a column width must never noise up
+    /// the editor.
+    fn write_editor_meta(&self) {
+        let (ViewerState::Ready(open), Some(root)) = (&self.state, &self.project_root) else {
+            return;
+        };
+        let meta = editor_meta::EditorMeta {
+            tools_width: self.tools_width.map(f32::from),
+            info_visible: Some(self.info_visible),
+            palette_visible: Some(self.palette_visible),
+        };
+        if let Err(e) = editor_meta::save(root, &open.rel_path, &meta) {
+            log::error!(
+                "GGO: failed to write editor sidecar for {}: {e}",
+                open.rel_path
+            );
+        }
+    }
+
+    /// Adopt the layout an earlier session left in the sidecar. Every
+    /// field is "keep the default" when unset, so a tileset that was
+    /// never laid out opens exactly as before.
+    fn apply_layout(&mut self, meta: &editor_meta::EditorMeta) {
+        self.tools_width = meta.tools_width.map(px);
+        self.info_visible = editor_meta::visible(meta.info_visible);
+        self.palette_visible = editor_meta::visible(meta.palette_visible);
     }
 
     /// One of the tooling column's section eyes: Eye/EyeOff over a
@@ -912,6 +964,7 @@ impl TilesetPanel {
                 }
                 this.state = match result {
                     Ok(loaded) => {
+                        this.apply_layout(&editor_meta::load(&root, &rel));
                         let mut open = OpenTileset::new(rel.clone(), loaded);
                         open.import_alert = import_alert_for(&root, &rel);
                         ViewerState::Ready(Box::new(open))
@@ -3102,6 +3155,7 @@ impl TilesetPanel {
                 visible,
                 |this, cx| {
                     this.info_visible = !this.info_visible;
+                    this.persist_layout(cx);
                     cx.notify();
                 },
                 cx,
@@ -3457,6 +3511,7 @@ impl TilesetPanel {
                 visible,
                 |this, cx| {
                     this.palette_visible = !this.palette_visible;
+                    this.persist_layout(cx);
                     cx.notify();
                 },
                 cx,
@@ -3465,7 +3520,7 @@ impl TilesetPanel {
             .into_any_element()
     }
 
-    /// The session-only divider grab handle, sized and positioned by the
+    /// The divider grab handle, sized and positioned by the
     /// caller. `workspace::dock`'s resize-handle shape: an occluding
     /// strip that starts a [`DraggedDivider`] drag, which the body row's
     /// `on_drag_move` turns into a width.
@@ -7760,6 +7815,44 @@ mod tests {
             Some(DRAGGED),
             "the dragged width comes back"
         );
+    }
+
+    /// A dragged tooling width and a closed section eye are the
+    /// TILESET's settings: both land in the editor sidecar and come back
+    /// when the tileset is reopened in a fresh panel.
+    #[gpui::test]
+    async fn test_the_tooling_layout_survives_a_reopen(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("a temp project");
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        resize(cx, 900., 700.);
+
+        let body = cx.debug_bounds(BODY_SELECTOR).expect("body bounds");
+        const DRAGGED: Pixels = px(400.);
+        panel.update(cx, |panel, cx| {
+            panel.drag_divider(point(body.right() - DRAGGED, body.center().y), cx);
+        });
+        let eye = cx
+            .debug_bounds("ggo-tileset-info-visible-on")
+            .expect("the info eye paints, open");
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        // The sidecar write is debounced to the gesture's trailing edge.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+
+        let reopened = ready_panel(cx, dir.path()).await;
+        reopened.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tools_width,
+                Some(DRAGGED),
+                "the dragged tooling width comes back with the tileset"
+            );
+            assert!(!panel.info_visible, "a closed section stays closed");
+            assert!(
+                panel.palette_visible,
+                "the section that was never closed stays open"
+            );
+        });
     }
 
     /// The clamp itself, without a window: neither side of the divider

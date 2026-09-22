@@ -707,11 +707,9 @@ fn sprite_item_entry_handler(
 /// name editor (New File's UX) in the sprite's own directory, exactly as
 /// the "New …" entries do. The typed name goes through the same
 /// [`rename_target`] rules either way -- they just run while it is being
-/// typed now instead of after the fact.
-///
-/// The field opens EMPTY rather than on the current stem: the inline
-/// editor is `ProjectPanel`'s, and it clears itself when it opens
-/// (`add_entry`), with no seam for a caller to seed text through.
+/// typed now instead of after the fact. The field opens on the sprite's
+/// current stem, fully selected, so typing replaces it and Enter alone
+/// keeps it.
 fn rename_sprite_handler(
     workspace: WeakEntity<Workspace>,
     worktree_id: project::WorktreeId,
@@ -729,8 +727,9 @@ fn rename_sprite_handler(
                 let Some(path) = ggo_common::inline_project_path(worktree_id, dir_rel) else {
                     return;
                 };
-                panel.ggo_new_entry_inline(
+                panel.ggo_new_entry_inline_seeded(
                     &path,
+                    Some(sprite_stem(&rel)),
                     rename_sprite_validate(worktree_root, rel.clone()),
                     rename_sprite_commit(workspace, rel.clone()),
                     window,
@@ -900,7 +899,7 @@ enum PickerView {
     Reference,
 }
 
-/// Which of the viewer's four session-only dividers a drag is sizing.
+/// Which of the viewer's four section dividers a drag is sizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Divider {
     /// Between the preview and the sheets column: sizes the sheets.
@@ -1256,6 +1255,13 @@ fn create_sprite(
 }
 
 // ------------------------------------------------------ renaming a `.spr`
+
+/// `rel`'s file stem -- the rename field's seed, and the half of the name
+/// [`rename_target`] rebuilds the path from.
+fn sprite_stem(rel: &str) -> &str {
+    let file = rel.rsplit('/').next().unwrap_or(rel);
+    file.rsplit_once('.').map_or(file, |(stem, _)| stem)
+}
 
 /// The worktree-relative path a rename of `source_rel` to the typed
 /// `text` targets, or `Err(message)` for a name the panel must refuse.
@@ -1682,11 +1688,10 @@ pub struct SpritePanel {
     state: ViewerState,
     /// The sheets column's width once a [`Divider::PreviewSide`] drag
     /// has set one; `None` means the auto width
-    /// ([`OpenSprite::auto_side_width`]). Never persisted, and PANEL
-    /// lifetime rather than session lifetime: every `.spr` opens its own
-    /// [`SpriteEditorItem`] with its own `SpritePanel`, so a dragged
-    /// layout outlives an in-place refresh or a reload of the SAME file
-    /// and no more than that.
+    /// ([`OpenSprite::auto_side_width`]). Persisted per sprite in the
+    /// editor sidecar ([`Self::persist_layout`]), like the three sizes
+    /// and four eyes below it: how a sprite is laid out is a property of
+    /// the sprite, not of the tab that happened to open it.
     side_width: Option<Pixels>,
     /// The frames library column's width, starting at [`CLIPS_WIDTH`].
     frames_width: Pixels,
@@ -1710,19 +1715,22 @@ pub struct SpritePanel {
     /// reference/picker divider measures down from its top.
     sheets_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// Whether the sheets column's reference/tile sections show their
-    /// sheets at all. Session-only and panel-lifetime, like the dragged
-    /// widths beside them: a hidden section keeps its header row (the
-    /// way back) and hands its space to the other one.
+    /// sheets at all. Persisted per sprite, like the dragged sizes above
+    /// them: a hidden section keeps its header row (the way back) and
+    /// hands its space to the other one.
     reference_visible: bool,
     tiles_visible: bool,
     /// Whether the frames library column shows its strip, and whether
     /// the clips section shows its rows and footer. Same contract as the
-    /// two sheet flags above: session-only, panel-lifetime, and a hidden
-    /// section keeps its header row (the way back).
+    /// two sheet flags above: persisted per sprite, and a hidden section
+    /// keeps its header row (the way back).
     frames_visible: bool,
     clips_visible: bool,
     load_generation: u64,
     _load_task: Option<Task<()>>,
+    /// The pending debounced sidecar write; replaced on every schedule,
+    /// so only the trailing edge of a drag actually touches the disk.
+    _sidecar_write: Option<Task<()>>,
     /// The in-flight delete confirmation, if one is up -- dropping the
     /// panel drops the prompt's continuation with it.
     _confirm_task: Option<Task<()>>,
@@ -1809,6 +1817,7 @@ impl SpritePanel {
             clips_visible: true,
             load_generation: 0,
             _load_task: None,
+            _sidecar_write: None,
             _confirm_task: None,
         }
     }
@@ -2313,12 +2322,14 @@ impl SpritePanel {
                 if this.load_generation != generation {
                     return;
                 }
-                this.state = match result {
+                let next = match result {
                     Ok(loaded) => {
+                        this.apply_layout(&loaded.meta);
                         ViewerState::Ready(Box::new(OpenSprite::new(rel, source_rel, root, loaded)))
                     }
                     Err(e) => ViewerState::Error(e),
                 };
+                this.state = next;
                 cx.notify();
             })
             .ok();
@@ -3090,6 +3101,14 @@ impl SpritePanel {
         let meta = editor_meta::EditorMeta {
             picker_cols: Some(open.picker_cols),
             frame_names: open.frame_names.clone(),
+            side_width: self.side_width.map(f32::from),
+            frames_width: Some(f32::from(self.frames_width)),
+            reference_height: self.reference_height.map(f32::from),
+            clips_height: self.clips_height.map(f32::from),
+            reference_visible: Some(self.reference_visible),
+            tiles_visible: Some(self.tiles_visible),
+            frames_visible: Some(self.frames_visible),
+            clips_visible: Some(self.clips_visible),
         };
         if let Err(e) = editor_meta::save(&open.root, &open.rel_path, &meta) {
             log::error!(
@@ -3097,6 +3116,39 @@ impl SpritePanel {
                 open.rel_path
             );
         }
+    }
+
+    /// Persist the section layout 300ms after the LAST call. Debounced
+    /// because a divider drag emits a change per pixel column and
+    /// [`Self::write_sidecar`] is a synchronous serialize-and-write on
+    /// the UI thread: only the gesture's trailing edge touches the disk.
+    fn persist_layout(&mut self, cx: &mut Context<Self>) {
+        self._sidecar_write = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            this.update(cx, |this, _| {
+                this._sidecar_write = None;
+                this.write_sidecar();
+            })
+            .ok();
+        }));
+    }
+
+    /// Adopt the layout an earlier session left in the sidecar. Every
+    /// field is "keep the default" when unset, so a sprite that was never
+    /// laid out opens exactly as before.
+    fn apply_layout(&mut self, meta: &editor_meta::EditorMeta) {
+        self.side_width = meta.side_width.map(px);
+        if let Some(width) = meta.frames_width {
+            self.frames_width = px(width);
+        }
+        self.reference_height = meta.reference_height.map(px);
+        self.clips_height = meta.clips_height.map(px);
+        self.reference_visible = editor_meta::visible(meta.reference_visible);
+        self.tiles_visible = editor_meta::visible(meta.tiles_visible);
+        self.frames_visible = editor_meta::visible(meta.frames_visible);
+        self.clips_visible = editor_meta::visible(meta.clips_visible);
     }
 
     // ----------------------------------------------------------- tile ops
@@ -3321,6 +3373,7 @@ impl SpritePanel {
             Divider::Clips => self.clips_height.replace(size) != Some(size),
         };
         if changed {
+            self.persist_layout(cx);
             cx.notify();
         }
     }
@@ -4323,7 +4376,7 @@ impl SpritePanel {
             .into_any_element()
     }
 
-    /// One of the three session-only divider grab handles, sized and
+    /// One of the three divider grab handles, sized and
     /// positioned by the caller. `workspace::dock`'s resize-handle
     /// shape: an occluding strip that starts a [`DraggedDivider`] drag,
     /// which the body row's `on_drag_move` turns into a size. Callers
@@ -4432,6 +4485,7 @@ impl SpritePanel {
                             visible,
                             |this, cx| {
                                 this.reference_visible = !this.reference_visible;
+                                this.persist_layout(cx);
                                 cx.notify();
                             },
                             cx,
@@ -4481,6 +4535,7 @@ impl SpritePanel {
                             tiles_visible,
                             |this, cx| {
                                 this.tiles_visible = !this.tiles_visible;
+                                this.persist_layout(cx);
                                 cx.notify();
                             },
                             cx,
@@ -4714,6 +4769,7 @@ impl SpritePanel {
                         visible,
                         |this, cx| {
                             this.clips_visible = !this.clips_visible;
+                            this.persist_layout(cx);
                             cx.notify();
                         },
                         cx,
@@ -4966,6 +5022,7 @@ impl SpritePanel {
                 self.frames_visible,
                 |this, cx| {
                     this.frames_visible = !this.frames_visible;
+                    this.persist_layout(cx);
                     cx.notify();
                 },
                 cx,
@@ -6108,6 +6165,65 @@ mod tests {
                 panel.clips_height,
                 Some(after.size.height),
                 "the clamp is a render concern -- the dragged height survives it"
+            );
+        });
+    }
+
+    /// A dragged section size and a closed section eye are the SPRITE's
+    /// settings, not the tab's: both land in the editor sidecar and come
+    /// back when the sprite is reopened in a fresh panel.
+    #[gpui::test]
+    async fn test_the_layout_survives_a_reopen(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(gpui::size(px(900.), px(800.)));
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds("ggo-sprite-clips-section")
+            .expect("clips section bounds recorded at paint");
+        let handle = cx
+            .debug_bounds("ggo-sprite-divider-clips")
+            .expect("the clips divider handle is painted");
+        let target = gpui::point(before.center().x, before.origin.y - px(100.));
+        cx.simulate_mouse_move(handle.center(), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(
+            handle.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(target, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(target, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let dragged = panel
+            .read_with(cx, |panel, _| panel.clips_height)
+            .expect("the drag recorded a height");
+
+        // And an eye: the frames library closed.
+        panel.update(cx, |panel, cx| {
+            panel.frames_visible = false;
+            panel.persist_layout(cx);
+        });
+        // The sidecar write is debounced to the gesture's trailing edge.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+
+        let reopened = ready_panel(cx, dir.path()).await;
+        reopened.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.clips_height,
+                Some(dragged),
+                "the dragged strip height comes back with the sprite"
+            );
+            assert!(
+                !panel.frames_visible,
+                "a closed section stays closed on reopen"
+            );
+            assert!(
+                panel.reference_visible && panel.tiles_visible && panel.clips_visible,
+                "the sections that were never closed stay open"
             );
         });
     }
@@ -8199,6 +8315,7 @@ mod tests {
             &editor_meta::EditorMeta {
                 picker_cols: Some(1),
                 frame_names: vec!["walk-a".to_string(), "walk-b".to_string()],
+                ..editor_meta::EditorMeta::default()
             },
         )
         .unwrap();
@@ -10264,12 +10381,11 @@ mod tests {
         })
     }
 
-    /// Fire the real "Rename Sprite…" handler, type `name` into the
-    /// project panel's inline editor, and press Enter.
-    fn rename_inline(
+    /// Fire the real "Rename Sprite…" handler and leave the project
+    /// panel's inline editor open, as the menu entry does.
+    fn open_rename_inline(
         workspace: &Entity<Workspace>,
         rel: &str,
-        name: &str,
         cx: &mut gpui::VisualTestContext,
     ) {
         let (worktree_id, worktree_root) = workspace.read_with(cx, |workspace, cx| {
@@ -10290,6 +10406,17 @@ mod tests {
         );
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
+    }
+
+    /// [`open_rename_inline`] then type `name` and press Enter -- the
+    /// whole gesture a user walks.
+    fn rename_inline(
+        workspace: &Entity<Workspace>,
+        rel: &str,
+        name: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        open_rename_inline(workspace, rel, cx);
         let project_panel = docked_project_panel(workspace, cx);
         project_panel.update_in(cx, |panel, window, cx| {
             panel
@@ -11087,6 +11214,37 @@ mod tests {
             "a rename may not move the file: it would strand a sibling sidecar"
         );
         assert!(rename_target("a/hero.spr", "..").is_err());
+    }
+
+    /// The rename field opens on the sprite's CURRENT stem, selected --
+    /// a rename starts from the name it has, and the selection means the
+    /// first keystroke still replaces it wholesale.
+    #[gpui::test]
+    async fn test_the_rename_field_opens_on_the_current_stem(cx: &mut TestAppContext) {
+        let dir = emerald_with_tileset();
+        let (workspace, _panel, _, cx) = emerald_workspace(cx, dir.path()).await;
+
+        open_rename_inline(&workspace, "assets/sprites/hero.spr", cx);
+
+        let project_panel = docked_project_panel(&workspace, cx);
+        project_panel.update_in(cx, |panel, _window, cx| {
+            let editor = panel.ggo_test_filename_editor().clone();
+            editor.update(cx, |editor, cx| {
+                assert_eq!(editor.text(cx), "hero", "seeded with the current stem");
+                let selections = editor
+                    .selections
+                    .all::<editor::MultiBufferOffset>(&editor.display_snapshot(cx));
+                assert_eq!(selections.len(), 1);
+                assert_eq!(
+                    (selections[0].start, selections[0].end),
+                    (
+                        editor::MultiBufferOffset(0),
+                        editor::MultiBufferOffset("hero".len())
+                    ),
+                    "the whole stem is selected, so typing replaces it"
+                );
+            });
+        });
     }
 
     /// Rename end to end: the file moves, **its sidecars do not** -- and

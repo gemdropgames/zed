@@ -2403,6 +2403,22 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.ggo_new_entry_inline_seeded(path, None, validate, on_commit, window, cx)
+    }
+
+    /// GGO: [`Self::ggo_new_entry_inline`] with `seed` already in the
+    /// editor and fully selected -- the rename entries start from the
+    /// current stem, so typing replaces it and Enter alone keeps it.
+    /// `None` opens empty, which is what the New entries want.
+    pub fn ggo_new_entry_inline_seeded(
+        &mut self,
+        path: &ProjectPath,
+        seed: Option<&str>,
+        validate: impl Fn(&str) -> Option<String> + 'static,
+        on_commit: impl FnOnce(String, &mut Window, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(worktree) = self.project.read(cx).worktree_for_id(path.worktree_id, cx) else {
             return false;
         };
@@ -2428,6 +2444,17 @@ impl ProjectPanel {
             validate: Box::new(validate),
             on_commit: Box::new(on_commit),
         });
+        // Arming BEFORE seeding: `set_text` emits `BufferEdited`, and the
+        // validation it triggers must be the contributor's rules, not
+        // upstream's new-file collision checks.
+        if let Some(seed) = seed {
+            self.filename_editor.update(cx, |editor, cx| {
+                editor.set_text(seed, window, cx);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([MultiBufferOffset(0)..MultiBufferOffset(seed.len())])
+                });
+            });
+        }
         true
     }
 
