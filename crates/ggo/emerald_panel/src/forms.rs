@@ -211,13 +211,8 @@ impl GenDraft {
     /// and `invalid field kind "..."` for the field rule (both verified
     /// against `emd 0.2.0`).
     pub fn error(&self) -> Option<String> {
-        if !valid_item_name(&self.name) || (self.kind.pascal_cased() && self.stored_as().is_none())
-        {
-            return Some(format!(
-                "{} names must be snake_case, e.g. {}.",
-                self.kind.noun(),
-                self.kind.example()
-            ));
+        if let Some(error) = item_name_error(self.kind, &self.name) {
+            return Some(error);
         }
         if self.kind.takes_module() && !self.module.is_empty() && !valid_item_name(&self.module) {
             return Some(
@@ -271,6 +266,27 @@ impl GenDraft {
             ],
         }
     }
+}
+
+/// The snake_case rule for an item's name, and the one sentence that
+/// explains it.
+///
+/// Shared by [`GenDraft::error`] and the browser's inline rename, because
+/// `emd mv`'s `<new>` is held to exactly the identifier rule `emd
+/// generate`'s `<name>` is -- worldlib's [`valid_item_name`], which
+/// mirrors emerald's own `validate_ident`. A component additionally has
+/// to survive the PascalCase conversion with something left
+/// ([`to_pascal_case_preview`]), which is the second half of the test.
+pub fn item_name_error(kind: GenKind, typed: &str) -> Option<String> {
+    if valid_item_name(typed) && (!kind.pascal_cased() || !to_pascal_case_preview(typed).is_empty())
+    {
+        return None;
+    }
+    Some(format!(
+        "{} names must be snake_case, e.g. {}.",
+        kind.noun(),
+        kind.example()
+    ))
 }
 
 /// The `emd` argv for an inline "New World…" commit: `generate world

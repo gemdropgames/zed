@@ -121,6 +121,10 @@ const DEFAULT_WIDTH: Pixels = px(420.);
 /// keys it on `""`, which is not a heading.
 const SHARED_MODULE_LABEL: &str = "(shared)";
 
+/// The browser row's tooltip when a rename is actually available -- the
+/// only affordance a double-click has.
+const RENAME_HINT: &str = "Double-click to rename";
+
 /// What a rolled-back mutation says before `emd`'s own compiler message.
 /// Mirrors ggo-ide's "Reverted -- the compiler rejected the change:", which
 /// it rendered as its own block for the same reason.
@@ -1009,6 +1013,16 @@ fn route_label(op: &ManifestOp) -> String {
         ManifestOp::ScheduleSet {
             schedule, module, ..
         } => format!("schedule {}", ops::qualified(module, schedule)),
+        ManifestOp::Rename {
+            kind, from, module, ..
+        } => {
+            let noun = match kind {
+                ManifestKind::Component => "component",
+                ManifestKind::System => "system",
+                ManifestKind::Schedule => "schedule",
+            };
+            format!("{noun} {}", ops::qualified(module, from))
+        }
     }
 }
 
@@ -1236,6 +1250,35 @@ impl BrowseTab {
             BrowseTab::Schedules => ManifestKind::Schedule,
         }
     }
+
+    /// The same kind as the generate forms name it -- what
+    /// [`forms::item_name_error`] needs to hold an inline rename to the
+    /// rule (and the wording) a new item's name is held to.
+    fn gen_kind(self) -> GenKind {
+        match self {
+            BrowseTab::Components => GenKind::Component,
+            BrowseTab::Systems => GenKind::System,
+            BrowseTab::Schedules => GenKind::Schedule,
+        }
+    }
+}
+
+/// The open inline rename on a browser row.
+///
+/// `from` is the entry's CURRENT manifest name, which is both what the
+/// row is found by while the field is open and the `<old>` the `emd mv`
+/// will carry.
+struct RowRename {
+    from: String,
+    editor: Entity<Editor>,
+    /// Why the last commit attempt was refused, shown under the row.
+    /// `None` until a commit is actually tried, so a just-opened field
+    /// does not greet the user with a complaint -- the same rule
+    /// `GenDraft::pristine` enforces for the generate form.
+    error: Option<String>,
+    /// Commits the field when it loses focus. Held here so it dies with
+    /// the rename it belongs to.
+    _blur: gpui::Subscription,
 }
 
 /// Which run's result is coming back, and what to do with it. Carried
@@ -1274,6 +1317,10 @@ pub struct EmeraldPanel {
     selected: Option<String>,
     /// The open "+ Field" row on the selected component, if any.
     field_form: Option<FieldRow>,
+    /// The open inline rename on a browser row, if any. At most one:
+    /// the field commits on blur, so opening a second would close the
+    /// first anyway.
+    row_rename: Option<RowRename>,
     /// The selected SCHEDULE's run list, as the panel is showing it right
     /// now -- which is not always what the manifest says. An edit is shown
     /// the instant its `emd schedule set` starts (the optimistic commit),
@@ -1352,6 +1399,7 @@ impl EmeraldPanel {
             tab: BrowseTab::Components,
             selected: None,
             field_form: None,
+            row_rename: None,
             schedule_order: Vec::new(),
             order_rollback: None,
             lock: LockCheck::Unchecked,
@@ -1930,6 +1978,10 @@ impl EmeraldPanel {
 
     fn select_tab(&mut self, tab: BrowseTab, cx: &mut Context<Self>) {
         if self.tab != tab {
+            // Before `self.tab` moves: a rename left open across the
+            // change would commit against the NEW tab's manifest kind,
+            // which is a `mv` of something the user never touched.
+            self.row_rename = None;
             self.tab = tab;
             // Names are only unique WITHIN a manifest, so a selection can
             // never survive a tab change.
@@ -1949,6 +2001,101 @@ impl EmeraldPanel {
             self.resync_schedule_order();
         }
         cx.notify();
+    }
+
+    /// Open the inline rename on the row named `name`, seeded with that
+    /// name and SELECTED: a rename usually replaces the name outright, so
+    /// a caret parked at the end would make the common case a select-all
+    /// the user has to perform first.
+    ///
+    /// Refuses while mutations are blocked, which is the other half of
+    /// the row's visibly-off state: a field whose only possible outcome
+    /// is nothing happening is the silent no-op this panel's disable rule
+    /// exists to remove.
+    fn begin_row_rename(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutations_blocked() || self.entry_module(name).is_none() {
+            return;
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(name, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor
+        });
+        // Deferred, for the same reason the "+ Field" row's name is: this
+        // runs from the row's own click handler, and the panel root's
+        // `track_focus` claims the focus later in the same dispatch.
+        let handle = editor.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        let blur = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _editor, event: &editor::EditorEvent, window, cx| {
+                if matches!(event, editor::EditorEvent::Blurred) {
+                    this.commit_row_rename(window, cx);
+                }
+            },
+        );
+        self.row_rename = Some(RowRename {
+            from: name.to_string(),
+            editor,
+            error: None,
+            _blur: blur,
+        });
+        cx.notify();
+    }
+
+    /// Commit the inline rename: the trimmed text becomes the entry's new
+    /// name via `emd mv`, through the same [`EmeraldPanel::request_op`]
+    /// pipeline every other mutation runs in.
+    ///
+    /// **The snake_case gate is here, not only on the field**, for the
+    /// reason [`EmeraldPanel::submit_generate`]'s is: blur and Enter both
+    /// reach this directly, and "never shell out with a name the CLI will
+    /// reject" only holds if there is exactly one gate and it is on the
+    /// path to the spawn. A refused name leaves the field OPEN with the
+    /// complaint under the row, where it can be fixed.
+    fn commit_row_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((from, typed)) = self.row_rename.as_ref().map(|rename| {
+            (
+                rename.from.clone(),
+                rename.editor.read(cx).text(cx).trim().to_string(),
+            )
+        }) else {
+            return;
+        };
+        // Unchanged or empty is a cancel rather than a run: `emd mv`
+        // would refuse the first as a taken name and the second as a bad
+        // identifier, and neither is what closing a field means.
+        if typed.is_empty() || typed == from {
+            self.cancel_row_rename(cx);
+            return;
+        }
+        let Some(module) = self.entry_module(&from) else {
+            self.cancel_row_rename(cx);
+            return;
+        };
+        if let Some(error) = forms::item_name_error(self.tab.gen_kind(), &typed) {
+            if let Some(rename) = self.row_rename.as_mut() {
+                rename.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+
+        self.row_rename = None;
+        self.request_op(
+            ManifestOp::rename(self.tab.kind(), &from, &typed, &module),
+            window,
+            cx,
+        );
+    }
+
+    /// Abandon the inline rename, leaving the entry's name as it was.
+    fn cancel_row_rename(&mut self, cx: &mut Context<Self>) {
+        if self.row_rename.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// Open (or close) the "+ Field" row on the selected component.
@@ -2343,6 +2490,19 @@ impl EmeraldPanel {
     /// button; both are no-ops while a run is in flight or the draft is
     /// invalid.
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter inside an open inline rename commits THAT. The keymap has
+        // one Enter binding for this panel's editors, and it reaches both
+        // the dock's rename field and the modal's form -- so which one is
+        // FOCUSED is what decides, exactly as the world panel's
+        // `on_commit_field` decides between its rename and its inspector.
+        if self
+            .row_rename
+            .as_ref()
+            .is_some_and(|rename| rename.editor.focus_handle(cx).is_focused(window))
+        {
+            self.commit_row_rename(window, cx);
+            return;
+        }
         match &self.form {
             Some(PanelForm::Generate(_)) => self.submit_generate(window, cx),
             None => {}
@@ -2564,6 +2724,24 @@ impl EmeraldPanel {
                 };
                 if matches!(op, ManifestOp::Remove { .. }) {
                     self.clear_selection();
+                }
+                // A renamed row keeps its selection, under its NEW name:
+                // the trailer's own `to`, because `emd mv` PascalCases a
+                // component's `<new>` and this side must not keep a
+                // second copy of that convention. `refresh_manifests`
+                // below drops the selection again if no entry by that
+                // name came back, so an unexpected `to` cannot leave the
+                // detail pane pointed at something that is not there.
+                if let ManifestOp::Rename { from, to, .. } = &op
+                    && self.selected.as_deref() == Some(from.as_str())
+                {
+                    let landed = outcome
+                        .result
+                        .as_ref()
+                        .and_then(|trailer| trailer.get("to"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(to.as_str());
+                    self.selected = Some(landed.to_string());
                 }
                 self.refresh_manifests(cx);
                 // Every component-shaped op changes the inspector's schema
@@ -3107,8 +3285,14 @@ impl EmeraldPanel {
         row.into_any_element()
     }
 
-    /// One manifest row: the name (click to select), and the trash button
-    /// that starts a confirmed remove.
+    /// One manifest row: the name (click to select, double-click to
+    /// rename in place), and the trash button that starts a confirmed
+    /// remove.
+    ///
+    /// The name carries the `-on`/`-off` wrapper selector the "+ Field"
+    /// opener does, for the same reason: "renameable" is a state a test
+    /// has to be able to read, and a row that quietly ignored a
+    /// double-click would be indistinguishable from a broken one.
     fn render_row(
         &self,
         ix: usize,
@@ -3120,27 +3304,57 @@ impl EmeraldPanel {
         let for_click = name.to_string();
         let for_remove = name.to_string();
         let blocked = self.mutations_blocked();
+        let renaming = self
+            .row_rename
+            .as_ref()
+            .filter(|rename| rename.from == name);
+        let body = match renaming {
+            Some(rename) => div()
+                .flex_1()
+                .min_w_0()
+                .debug_selector(|| "ggo-emerald-row-rename".into())
+                .child(Self::editor_input(rename.editor.clone(), cx))
+                .into_any_element(),
+            None => {
+                let label = div()
+                    .id(("ggo-emerald-row", ix))
+                    .debug_selector(move || {
+                        format!(
+                            "ggo-emerald-row-{ix}-{}",
+                            if blocked { "off" } else { "on" }
+                        )
+                    })
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(name.to_string()).size(LabelSize::Small).color(
+                        if selected {
+                            Color::Accent
+                        } else {
+                            Color::Default
+                        },
+                    ))
+                    .on_click(cx.listener(
+                        move |this, event: &gpui::ClickEvent, window, cx| {
+                            if event.click_count() >= 2 {
+                                this.begin_row_rename(&for_click, window, cx);
+                            } else {
+                                this.select_item(&for_click, cx);
+                            }
+                        },
+                    ));
+                match self.blocked_reason() {
+                    Some(reason) => label.tooltip(ui::Tooltip::text(reason)),
+                    None => label.tooltip(ui::Tooltip::text(RENAME_HINT)),
+                }
+                .into_any_element()
+            }
+        };
         v_flex()
             .child(
                 h_flex()
                     .gap_1()
                     .items_center()
-                    .child(
-                        div()
-                            .id(("ggo-emerald-row", ix))
-                            .flex_1()
-                            .min_w_0()
-                            .child(Label::new(name.to_string()).size(LabelSize::Small).color(
-                                if selected {
-                                    Color::Accent
-                                } else {
-                                    Color::Default
-                                },
-                            ))
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.select_item(&for_click, cx)),
-                            ),
-                    )
+                    .child(body)
                     .child(
                         IconButton::new(("ggo-emerald-rm", ix), IconName::Trash)
                             .icon_size(IconSize::XSmall)
@@ -3150,12 +3364,29 @@ impl EmeraldPanel {
                             })),
                     ),
             )
+            .children(
+                renaming
+                    .and_then(|rename| rename.error.clone())
+                    .map(|error| {
+                        div().debug_selector(|| "ggo-emerald-rename-error".into()).child(
+                            ggo_common::CopyableText::new(("ggo-emerald-rename-error", ix), error)
+                                .size(LabelSize::Small),
+                        )
+                    }),
+            )
             .children(detail)
             .into_any_element()
     }
 
     /// The selected COMPONENT's fields, each removable, plus the "+ Field"
     /// row that adds one.
+    ///
+    /// **No inline rename on a field row**, unlike the manifest rows
+    /// above: `emd` has no verb that renames a field. `mv` takes a
+    /// component/system/schedule, and add-then-remove is not the same
+    /// operation -- it would drop the field's value in every world that
+    /// placed the component. Until there is a verb for it, the honest
+    /// affordance is none.
     fn render_component_detail(
         &self,
         name: &str,
@@ -3580,7 +3811,12 @@ fn single_line(window: &mut Window, cx: &mut Context<EmeraldPanel>) -> Entity<Ed
 /// `ggo_world_panel`'s inspector schema set need re-reading afterwards?
 fn component_shaped(op: &ManifestOp) -> bool {
     match op {
-        ManifestOp::Remove { kind, .. } => *kind == ManifestKind::Component,
+        // A component rename changes the schema set exactly as a create
+        // or a remove does: the name the inspector offers is the one it
+        // stores on an entity.
+        ManifestOp::Remove { kind, .. } | ManifestOp::Rename { kind, .. } => {
+            *kind == ManifestKind::Component
+        }
         ManifestOp::FieldAdd { .. } | ManifestOp::FieldRemove { .. } => true,
         // Always, not "only when the module declared components": the op
         // carries nothing but the module's name, and a refresh that finds
@@ -3600,6 +3836,14 @@ impl Render for EmeraldPanel {
             .size_full()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Submit, window, cx| this.submit(window, cx)))
+            // Escape in a focused single-line editor resolves to
+            // `editor::Cancel` and, with nothing of its own to dismiss,
+            // propagates -- so this, not `menu::Cancel`, is what an
+            // abandoned inline rename actually arrives as (the generate
+            // modal's own dismissal is wired the same way).
+            .on_action(cx.listener(|this, _: &editor::actions::Cancel, _, cx| {
+                this.cancel_row_rename(cx)
+            }))
             .bg(cx.theme().colors().panel_background)
             .child(div().flex_1().min_h_0().child(body))
     }
@@ -8003,6 +8247,300 @@ mod tests {
             cx.update(|_, cx| name.read(cx).text(cx)),
             "armour",
             "so the first keystroke after the click lands in the name"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    // ---------------------------------------- the inline row rename
+
+    /// A press+release the platform reports as the second click of a
+    /// double click. `simulate_click` only ever sends `click_count: 1`.
+    fn simulate_double_click(cx: &mut gpui::VisualTestContext, at: gpui::Point<Pixels>) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: gpui::MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            button: gpui::MouseButton::Left,
+            click_count: 2,
+        });
+        cx.run_until_parked();
+    }
+
+    /// Double-click the element `debug_selector` names.
+    fn double_click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} must be rendered"));
+        simulate_double_click(cx, bounds.center());
+    }
+
+    /// The Components tab groups by module and the shared bucket sorts
+    /// first, so `Marker` is row 0 and `HeroUnit` is row 1.
+    const HERO_ROW: &str = "ggo-emerald-row-1-on";
+
+    /// The open rename's `(from, editor)`, or `None`.
+    fn open_rename(
+        panel: &Entity<EmeraldPanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<(String, Entity<Editor>)> {
+        panel.read_with(cx, |panel, _| {
+            panel
+                .row_rename
+                .as_ref()
+                .map(|rename| (rename.from.clone(), rename.editor.clone()))
+        })
+    }
+
+    /// **P2 on the browser's rows.** A double-click swaps the name label
+    /// for an editor holding that name, SELECTED -- a rename usually
+    /// replaces the name outright, so the first keystroke must not
+    /// append to it.
+    #[gpui::test]
+    async fn test_double_clicking_a_row_opens_its_name_selected(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+
+        double_click(cx, HERO_ROW);
+
+        let (from, editor) = open_rename(&panel, cx).expect("the double click opens a rename");
+        assert_eq!(from, "HeroUnit", "on the row that was double-clicked");
+        assert!(
+            cx.debug_bounds("ggo-emerald-row-rename").is_some(),
+            "and the row draws the editor in place of its label"
+        );
+        assert_eq!(
+            cx.update(|_, cx| editor.read(cx).text(cx)),
+            "HeroUnit",
+            "seeded with the current name"
+        );
+        assert!(
+            cx.update(|window, cx| editor.read(cx).focus_handle(cx).is_focused(window)),
+            "the field takes focus -- the panel root's own track_focus must \
+             not swallow the click that opened it"
+        );
+
+        cx.simulate_input("foe");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| editor.read(cx).text(cx)),
+            "foe",
+            "the seeded name opens SELECTED, so typing replaces it"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "opening and typing spawns nothing"
+        );
+    }
+
+    /// Enter commits: exactly one `emd mv`, with the typed name, and the
+    /// row stays selected under the name it came back with.
+    #[gpui::test]
+    async fn test_committing_an_inline_rename_runs_emd_mv_once(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let root = dir.path().to_path_buf();
+        // The fake `emd` writes what the real one would, so the refresh
+        // that follows the run has the renamed entry to keep selected.
+        let (runner, calls) = fake_runner(move |_| {
+            std::fs::write(
+                root.join("manifests/components.toml"),
+                "version = 1\n\
+                 [[component]]\nname = \"Foe\"\nmodule = \"gameplay\"\n\
+                 [[component.field]]\nname = \"hp\"\nkind = \"int\"\n\
+                 [[component]]\nname = \"Marker\"\n",
+            )
+            .unwrap();
+            emd_run_outcome(
+                true,
+                &["emd-json: {\"emd\":\"0.2.0\",\"ok\":true,\"kind\":\"component\",\
+                   \"from\":\"HeroUnit\",\"to\":\"Foe\",\"module\":\"gameplay\",\
+                   \"path\":\"crates/game-core/src/modules/gameplay/components/foe.rs\",\
+                   \"renamed_identifiers\":3,\"updated_schedules\":[],\
+                   \"updated_worlds\":[\"arena.wrld.toml\"],\"missing_lines\":[]}"
+                    .to_string()],
+            )
+        });
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        cx.update(|_, cx| ggo_common::bind_default_keymap(cx));
+        panel.update(cx, |panel, cx| panel.select_item("HeroUnit", cx));
+        cx.run_until_parked();
+
+        double_click(cx, HERO_ROW);
+        cx.simulate_input("foe");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "exactly one emd run: {calls:?}");
+            assert_eq!(
+                calls[0].args,
+                [
+                    "mv",
+                    "component",
+                    "HeroUnit",
+                    "foe",
+                    "--module",
+                    "gameplay",
+                    "--json"
+                ]
+            );
+            assert_eq!(calls[0].cwd, dir.path());
+        }
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Renamed component HeroUnit → foe"
+        );
+        assert!(
+            open_rename(&panel, cx).is_none() && cx.debug_bounds("ggo-emerald-row-rename").is_none(),
+            "committing closes the field and the row goes back to a label"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.selected.as_deref(),
+                Some("Foe"),
+                "the renamed row stays selected, under the name emd stored"
+            );
+            let RunState::Done { details, .. } = &panel.run_state else {
+                panic!("a successful rename lands in Done");
+            };
+            assert_eq!(
+                details,
+                &[
+                    "moved to crates/game-core/src/modules/gameplay/components/foe.rs".to_string(),
+                    "updated 1 world: arena.wrld.toml".to_string(),
+                    "renamed 3 identifiers".to_string(),
+                ],
+                "the mv trailer's own fields become the detail lines"
+            );
+        });
+    }
+
+    /// Escape abandons the rename: no run, and the original name is
+    /// still what the row shows. Unchanged and empty text do the same
+    /// thing on a commit -- `emd mv` would refuse both, and neither is
+    /// what closing a field means.
+    #[gpui::test]
+    async fn test_escape_or_unchanged_text_cancels_an_inline_rename(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        cx.update(|_, cx| ggo_common::bind_default_keymap(cx));
+
+        double_click(cx, HERO_ROW);
+        cx.simulate_input("foe");
+        cx.run_until_parked();
+        assert!(
+            open_rename(&panel, cx).is_some(),
+            "the rename is open and holding a DIFFERENT name -- escape has \
+             something to abandon"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        assert!(open_rename(&panel, cx).is_none(), "escape closes the field");
+        assert!(
+            cx.debug_bounds(HERO_ROW).is_some(),
+            "and the row is drawing its label again"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "escape must spawn nothing"
+        );
+
+        double_click(cx, HERO_ROW);
+        assert!(
+            open_rename(&panel, cx).is_some(),
+            "the row opens again after an escape"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            open_rename(&panel, cx).is_none(),
+            "committing the unchanged name closes the field"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "and renaming a thing to its own name spawns nothing"
+        );
+    }
+
+    /// **The gate is on the path to the spawn.** A name `emd mv` would
+    /// reject never reaches the runner; the field stays open with the
+    /// complaint under the row, where the name was typed.
+    #[gpui::test]
+    async fn test_an_invalid_rename_shows_the_error_inline_and_spawns_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        cx.update(|_, cx| ggo_common::bind_default_keymap(cx));
+
+        double_click(cx, HERO_ROW);
+        cx.simulate_input("Foe Unit");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a name the CLI would reject never spawns emd"
+        );
+        let (from, _) = open_rename(&panel, cx).expect("the field stays open to be fixed");
+        assert_eq!(from, "HeroUnit");
+        assert!(
+            cx.debug_bounds("ggo-emerald-rename-error").is_some(),
+            "and the row shows why, inline"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel
+                    .row_rename
+                    .as_ref()
+                    .and_then(|rename| rename.error.clone())
+                    .as_deref(),
+                Some("Component names must be snake_case, e.g. hero_unit."),
+                "the generate form's own sentence, not a second wording"
+            );
+        });
+    }
+
+    /// **The double-click is gated too.** A rename is an `emd` mutation,
+    /// so a blocked panel must not open a field whose only outcome is
+    /// nothing happening -- the same rule the "+ Field" opener follows,
+    /// with the same visible off state.
+    #[gpui::test]
+    async fn test_a_blocked_panel_does_not_open_an_inline_rename(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        assert!(
+            cx.debug_bounds(HERO_ROW).is_some(),
+            "a ready panel offers the row as renameable"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.lock = LockCheck::Unchecked;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(HERO_ROW).is_none(),
+            "a blocked panel must show the row as not renameable"
+        );
+
+        double_click(cx, "ggo-emerald-row-1-off");
+        assert!(
+            open_rename(&panel, cx).is_none(),
+            "and a double-click must not open a field that cannot commit"
         );
         assert!(calls.lock().unwrap().is_empty());
     }

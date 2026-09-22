@@ -15,7 +15,7 @@
 
 use ggo_worldlib::emerald::{
     ManifestKind, build_field_add_args, build_field_rm_args, build_rm_args,
-    build_schedule_set_args, parse_cadenced_ref, system_ref,
+    build_schedule_set_args, mutation_module_args, parse_cadenced_ref, system_ref,
 };
 
 /// What every `cargo check`-backed mutation's confirm says about the part
@@ -90,6 +90,25 @@ pub enum ManifestOp {
     /// of entry sit in, and `emd rm module` takes no `--module` flag to
     /// disambiguate.
     RemoveModule { name: String },
+    /// `emd mv <kind> <from> <to> --module <m>` -- a manifest entry
+    /// renamed, with every reference `emd` can see rewritten to follow
+    /// it (its source file, the schedules that run it, the worlds that
+    /// place it).
+    ///
+    /// `from` is the manifest's own stored name (PascalCase for a
+    /// component); `to` is the snake_case identifier the user typed, which
+    /// `emd` PascalCases for a component exactly as `generate` does.
+    ///
+    /// Built here rather than by a worldlib builder for the same reason
+    /// [`ManifestOp::RemoveModule`] is: worldlib has no `mv` builder yet,
+    /// and the argv is the flat shape below plus the standard
+    /// [`mutation_module_args`].
+    Rename {
+        kind: ManifestKind,
+        from: String,
+        to: String,
+        module: String,
+    },
 }
 
 /// What a [`ManifestOp::ScheduleSet`] is doing to the run list.
@@ -144,6 +163,15 @@ impl ManifestOp {
     pub fn remove_module(name: &str) -> Self {
         ManifestOp::RemoveModule {
             name: name.to_string(),
+        }
+    }
+
+    pub fn rename(kind: ManifestKind, from: &str, to: &str, module: &str) -> Self {
+        ManifestOp::Rename {
+            kind,
+            from: from.to_string(),
+            to: to.to_string(),
+            module: module.to_string(),
         }
     }
 
@@ -204,6 +232,21 @@ impl ManifestOp {
             ManifestOp::RemoveModule { name } => {
                 vec!["rm".to_string(), "module".to_string(), name.clone()]
             }
+            ManifestOp::Rename {
+                kind,
+                from,
+                to,
+                module,
+            } => {
+                let mut args = vec![
+                    "mv".to_string(),
+                    kind_subcommand(*kind).to_string(),
+                    from.clone(),
+                    to.clone(),
+                ];
+                args.extend(mutation_module_args(module));
+                args
+            }
         }
     }
 
@@ -218,9 +261,13 @@ impl ManifestOp {
     /// puts it at the END, not where it was, and its `@N` cadence is gone
     /// too. That is a real loss, and [`confirm_for`] says so in those
     /// words rather than warning in the abstract.
+    ///
+    /// A RENAME is not destructive either: nothing is dropped, the undo
+    /// is renaming back, and `emd mv` refuses a name that is already
+    /// taken rather than overwriting the entry that holds it.
     pub fn destructive(&self) -> bool {
         match self {
-            ManifestOp::FieldAdd { .. } => false,
+            ManifestOp::FieldAdd { .. } | ManifestOp::Rename { .. } => false,
             ManifestOp::ScheduleSet { edit, .. } => {
                 matches!(edit, ScheduleEdit::Remove { .. })
             }
@@ -237,6 +284,9 @@ impl ManifestOp {
                 format!("Removed {} {}", kind_noun(*kind), qualified(module, name))
             }
             ManifestOp::RemoveModule { name } => format!("Removed module {name}"),
+            ManifestOp::Rename { kind, from, to, .. } => {
+                format!("Renamed {} {from} → {to}", kind_noun(*kind))
+            }
             ManifestOp::FieldAdd {
                 component, spec, ..
             } => format!("Added field {spec} to {component}"),
@@ -491,8 +541,10 @@ pub fn confirm_for(op: &ManifestOp, cascade: &Cascade) -> Option<Confirm> {
                 label: "Delete",
             });
         }
-        // `destructive()` already returned early for these two.
-        ManifestOp::FieldAdd { .. } | ManifestOp::ScheduleSet { .. } => return None,
+        // `destructive()` already returned early for these three.
+        ManifestOp::FieldAdd { .. }
+        | ManifestOp::ScheduleSet { .. }
+        | ManifestOp::Rename { .. } => return None,
     };
     lines.push(COMPILER_NOTE.to_string());
     Some(Confirm {
@@ -534,14 +586,25 @@ fn kind_noun(kind: ManifestKind) -> &'static str {
     }
 }
 
+/// The kind as an `emd` SUBCOMMAND spells it. Distinct from
+/// [`kind_noun`], which is display text: this one goes on a command line,
+/// and worldlib keeps its own copy private precisely so a caller cannot
+/// drift from it. This copy exists because worldlib has no `mv` builder
+/// to hide it behind yet -- when it grows one, `ManifestOp::Rename`'s
+/// `args` should delegate and this should go.
+fn kind_subcommand(kind: ManifestKind) -> &'static str {
+    match kind {
+        ManifestKind::Component => "component",
+        ManifestKind::System => "system",
+        ManifestKind::Schedule => "schedule",
+    }
+}
+
 /// The detail lines an `emd rm` trailer earns under the done message:
 /// what was removed and deleted, which files lost a spliced line, which
 /// expected line was not there to strip, and which schedules elsewhere
 /// lost a system. Empty arrays say nothing; a non-removal op has none.
 pub fn rm_details(op: &ManifestOp, trailer: &serde_json::Value) -> Vec<String> {
-    if !matches!(op, ManifestOp::Remove { .. } | ManifestOp::RemoveModule { .. }) {
-        return Vec::new();
-    }
     let strings = |key: &str, from: &serde_json::Value| -> Vec<String> {
         from.get(key)
             .and_then(serde_json::Value::as_array)
@@ -559,6 +622,48 @@ pub fn rm_details(op: &ManifestOp, trailer: &serde_json::Value) -> Vec<String> {
             format!("{verb} {} {}: {}", items.len(), plural(noun, items.len()), items.join(", "))
         })
     };
+    if matches!(op, ManifestOp::Rename { .. }) {
+        let mut lines = Vec::new();
+        if let Some(path) = trailer.get("path").and_then(serde_json::Value::as_str) {
+            lines.push(format!("moved to {path}"));
+        }
+        lines.extend(counted(
+            "updated",
+            "schedule",
+            &strings("updated_schedules", trailer),
+        ));
+        lines.extend(counted(
+            "updated",
+            "world",
+            &strings("updated_worlds", trailer),
+        ));
+        // A COUNT, not a list: the identifiers `emd mv` rewrites are
+        // spread across the project's Rust sources and naming them all
+        // would bury the four lines above. Read as either a number or an
+        // array's length because the trailer's shape for this one field
+        // is the only one not pinned by an existing `emd rm` sighting.
+        let renamed = trailer
+            .get("renamed_identifiers")
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_array().map(|items| items.len() as u64))
+            })
+            .unwrap_or(0);
+        if renamed > 0 {
+            lines.push(format!(
+                "renamed {renamed} {}",
+                plural("identifier", renamed as usize)
+            ));
+        }
+        for line in strings("missing_lines", trailer) {
+            lines.push(format!("no line to strip in: {line}"));
+        }
+        return lines;
+    }
+    if !matches!(op, ManifestOp::Remove { .. } | ManifestOp::RemoveModule { .. }) {
+        return Vec::new();
+    }
     let mut lines = Vec::new();
     if let Some(removed) = trailer.get("removed") {
         for noun in ["schedule", "system", "component"] {
@@ -1022,6 +1127,88 @@ mod tests {
         assert!(
             rm_details(&ManifestOp::field_add("Hero", "gameplay", "hp:u8"), &component).is_empty(),
             "only removals carry rm details"
+        );
+    }
+
+    /// **The rename**: `emd mv <kind> <old> <new> --module <m>`, and no
+    /// confirm -- renaming back is the undo, and `emd` refuses a name
+    /// that is already taken rather than overwriting anything.
+    #[test]
+    fn a_rename_is_mv_and_needs_no_confirm() {
+        let component = ManifestOp::rename(ManifestKind::Component, "HeroUnit", "foe", "gameplay");
+        assert_eq!(
+            component.args(),
+            ["mv", "component", "HeroUnit", "foe", "--module", "gameplay"]
+        );
+        assert!(!component.destructive());
+        assert_eq!(confirm_for(&component, &Cascade::default()), None);
+        assert_eq!(component.done_message(), "Renamed component HeroUnit → foe");
+
+        assert_eq!(
+            ManifestOp::rename(ManifestKind::System, "spawn_enemies", "spawn_foes", "").args(),
+            ["mv", "system", "spawn_enemies", "spawn_foes", "--module", ""],
+            "a shared item still passes --module, precisely empty"
+        );
+        assert_eq!(
+            ManifestOp::rename(ManifestKind::Schedule, "update", "tick", "gameplay").args(),
+            ["mv", "schedule", "update", "tick", "--module", "gameplay"]
+        );
+        assert_eq!(
+            ManifestOp::rename(ManifestKind::System, "spawn_enemies", "spawn_foes", "gameplay")
+                .done_message(),
+            "Renamed system spawn_enemies → spawn_foes"
+        );
+    }
+
+    /// The `emd mv` trailer's own fields become the detail lines: where
+    /// the source file went, what elsewhere was rewritten to follow it,
+    /// and which expected line was not there to rewrite.
+    #[test]
+    fn rename_details_read_the_mv_trailer() {
+        let op = ManifestOp::rename(ManifestKind::Component, "HeroUnit", "foe", "gameplay");
+        let trailer = serde_json::json!({
+            "ok": true,
+            "kind": "component",
+            "from": "HeroUnit",
+            "to": "Foe",
+            "module": "gameplay",
+            "path": "crates/game-core/src/modules/gameplay/components/foe.rs",
+            "renamed_identifiers": 7,
+            "stripped_files": ["crates/game-core/src/modules/gameplay/components/mod.rs"],
+            "inserted_files": ["crates/game-core/src/modules/gameplay/components/mod.rs"],
+            "missing_lines": ["crates/game-core/src/lib.rs: reg.register::<HeroUnit>();"],
+            "updated_schedules": ["update", "render"],
+            "updated_worlds": ["arena.wrld.toml"],
+        });
+        assert_eq!(
+            rm_details(&op, &trailer),
+            vec![
+                "moved to crates/game-core/src/modules/gameplay/components/foe.rs".to_string(),
+                "updated 2 schedules: update, render".to_string(),
+                "updated 1 world: arena.wrld.toml".to_string(),
+                "renamed 7 identifiers".to_string(),
+                "no line to strip in: crates/game-core/src/lib.rs: reg.register::<HeroUnit>();"
+                    .to_string(),
+            ]
+        );
+
+        let quiet = serde_json::json!({
+            "ok": true,
+            "path": "crates/game-core/src/modules/gameplay/systems/spawn_foes.rs",
+            "renamed_identifiers": 0,
+            "updated_schedules": [],
+            "updated_worlds": [],
+            "missing_lines": [],
+        });
+        assert_eq!(
+            rm_details(
+                &ManifestOp::rename(ManifestKind::System, "spawn_enemies", "spawn_foes", ""),
+                &quiet
+            ),
+            vec![
+                "moved to crates/game-core/src/modules/gameplay/systems/spawn_foes.rs".to_string()
+            ],
+            "empty arrays and a zero count say nothing"
         );
     }
 
